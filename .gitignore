@@ -1,0 +1,14 @@
+node_modules/
+.npm-cache/
+.cc-connect/
+dist/
+.vite/
+.env
+.env.*
+!.env.example
+__pycache__/
+.pytest_cache/
+*.py[cod]
+.venv/
+server/data/
+*.log

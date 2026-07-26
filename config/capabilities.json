@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "snapshot": {
+    "dataRows": 200,
+    "dataColumns": 30,
+    "structureRows": 12,
+    "structureColumns": 100
+  },
+  "queryTable": {
+    "maxRows": 250000,
+    "maxColumns": 100,
+    "maxCells": 1000000,
+    "headerScanRows": 12,
+    "defaultLimit": 20,
+    "maxResultRows": 200
+  },
+  "folder": {
+    "maxFiles": 100,
+    "outputFileName": "Excel Bro 结果.xlsx"
+  },
+  "images": {
+    "maxAttachments": 3,
+    "maxBytes": 4194304,
+    "maxSourceBytes": 12582912,
+    "maxDimension": 1600
+  },
+  "conversation": {
+    "maxStoredConversations": 20,
+    "maxMessagesPerConversation": 100,
+    "persistedMessagesPerConversation": 60,
+    "intentHistoryMessages": 6,
+    "intentMessageCharacters": 1000,
+    "maxClarificationRounds": 2
+  },
+  "intentContext": {
+    "maxFieldsPerSheet": 30,
+    "maxPriorResultRows": 20
+  },
+  "savedTools": {
+    "maxItems": 50
+  },
+  "agent": {
+    "maxTurns": 8,
+    "maxReadRows": 200,
+    "maxReadColumns": 30
+  },
+  "turns": {
+    "maxActive": 500,
+    "ttlSeconds": 3600
+  }
+}

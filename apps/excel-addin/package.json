@@ -1,0 +1,28 @@
+{
+  "name": "@excel-bro/addin",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "test": "vitest run",
+    "start:desktop": "office-addin-debugging start manifest.xml desktop",
+    "stop:desktop": "office-addin-debugging stop manifest.xml"
+  },
+  "dependencies": {
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1"
+  },
+  "devDependencies": {
+    "@types/office-js": "^1.0.545",
+    "@types/react": "^19.1.10",
+    "@types/react-dom": "^19.1.7",
+    "@vitejs/plugin-react": "^4.7.0",
+    "office-addin-debugging": "^6.1.2",
+    "office-addin-dev-certs": "^2.0.10",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.7",
+    "vitest": "^3.2.4"
+  }
+}

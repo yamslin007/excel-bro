@@ -1,0 +1,19 @@
+{
+  "name": "excel-bro",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "apps/excel-addin"
+  ],
+  "scripts": {
+    "dev:addin": "npm run dev --workspace @excel-bro/addin",
+    "build:addin": "npm run build --workspace @excel-bro/addin",
+    "test:addin": "npm run test --workspace @excel-bro/addin",
+    "start:excel": "npm run start:desktop --workspace @excel-bro/addin",
+    "stop:excel": "npm run stop:desktop --workspace @excel-bro/addin",
+    "dev:server": "python -m uvicorn server.app.main:app --host 127.0.0.1 --port 8765 --reload",
+    "test:server": "python -m pytest server/tests",
+    "test": "npm run test:addin && npm run test:server"
+  }
+}
+
