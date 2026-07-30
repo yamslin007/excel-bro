@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import asyncio
+import random
 from types import TracebackType
 from typing import Any
 
 import httpx
 
+from ..capabilities import capabilities, capability_float
 from .config import ModelConnection
 from .errors import (
     LLMConnectError,
+    LLMError,
     LLMHTTPStatusError,
     LLMResponseError,
     LLMTimeoutError,
@@ -15,12 +19,53 @@ from .errors import (
 )
 
 
+def _parse_retry_after(value: str | None) -> float | None:
+    """Parse a numeric Retry-After header (seconds). HTTP-date form is ignored."""
+    if not value:
+        return None
+    try:
+        seconds = float(value.strip())
+    except ValueError:
+        return None
+    return seconds if seconds >= 0 else None
+
+
+def _capability_nonneg_int(section: str, key: str) -> int:
+    value = capabilities()[section][key]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise RuntimeError(f"能力配置 {section}.{key} 必须是非负整数")
+    return value
+
+
 class OpenAICompatibleClient:
     """Minimal adapter for OpenAI-compatible chat/completions services."""
 
-    def __init__(self, connection: ModelConnection, *, timeout: float) -> None:
+    def __init__(
+        self,
+        connection: ModelConnection,
+        *,
+        timeout: float,
+        max_retries: int | None = None,
+        retry_base_delay: float | None = None,
+        retry_max_delay: float | None = None,
+    ) -> None:
         self.connection = connection
         self.timeout = timeout
+        self.max_retries = (
+            max_retries
+            if max_retries is not None
+            else _capability_nonneg_int("llm", "maxRetries")
+        )
+        self.retry_base_delay = (
+            retry_base_delay
+            if retry_base_delay is not None
+            else capability_float("llm", "retryBaseDelaySeconds")
+        )
+        self.retry_max_delay = (
+            retry_max_delay
+            if retry_max_delay is not None
+            else capability_float("llm", "retryMaxDelaySeconds")
+        )
         self._client: httpx.AsyncClient | None = None
 
     async def __aenter__(self) -> OpenAICompatibleClient:
@@ -64,6 +109,20 @@ class OpenAICompatibleClient:
         if tool_choice is not None:
             payload["tool_choice"] = tool_choice
 
+        attempt = 0
+        while True:
+            try:
+                return await self._request_once(payload)
+            except LLMError as error:
+                retryable = self._is_retryable(error)
+                if not retryable or attempt >= self.max_retries:
+                    raise
+                delay = self._retry_delay(attempt, error)
+                attempt += 1
+                await asyncio.sleep(delay)
+
+    async def _request_once(self, payload: dict[str, Any]) -> dict[str, Any]:
+        assert self._client is not None
         try:
             response = await self._client.post(
                 f"{self.connection.base_url}/chat/completions",
@@ -76,19 +135,38 @@ class OpenAICompatibleClient:
         except httpx.ConnectError as error:
             raise LLMConnectError("无法连接模型服务") from error
         except httpx.HTTPStatusError as error:
-            raise LLMHTTPStatusError(
+            status_error = LLMHTTPStatusError(
                 error.response.status_code,
                 error.response.text,
-            ) from error
+            )
+            status_error.retry_after = _parse_retry_after(
+                error.response.headers.get("Retry-After")
+            )
+            raise status_error from error
         except httpx.HTTPError as error:
             raise LLMTransportError(
                 f"模型服务连接失败：{type(error).__name__}"
             ) from error
 
         try:
-            payload = response.json()
+            body = response.json()
         except ValueError as error:
             raise LLMResponseError("模型服务没有返回有效 JSON") from error
-        if not isinstance(payload, dict):
+        if not isinstance(body, dict):
             raise LLMResponseError("模型服务返回的 JSON 顶层不是对象")
-        return payload
+        return body
+
+    @staticmethod
+    def _is_retryable(error: LLMError) -> bool:
+        if isinstance(error, LLMHTTPStatusError):
+            return error.retryable
+        # 网络抖动与超时可重试；LLMResponseError 是响应损坏，重试无意义。
+        return isinstance(error, (LLMTimeoutError, LLMConnectError, LLMTransportError))
+
+    def _retry_delay(self, attempt: int, error: LLMError) -> float:
+        retry_after = getattr(error, "retry_after", None)
+        if isinstance(retry_after, (int, float)) and retry_after > 0:
+            return min(float(retry_after), self.retry_max_delay)
+        backoff = self.retry_base_delay * (2**attempt)
+        jitter = backoff * random.uniform(0.0, 0.25)
+        return min(backoff + jitter, self.retry_max_delay)

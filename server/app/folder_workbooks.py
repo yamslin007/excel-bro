@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import re
 import shutil
 import uuid
+import time
+from contextvars import ContextVar
 from copy import copy
-from datetime import datetime
+from datetime import date, datetime
+from functools import cmp_to_key
 from pathlib import Path
 from typing import Literal
 
@@ -25,6 +29,9 @@ from pydantic import BaseModel, Field
 from .models import (
     ActionExecutionResult,
     AnalysisPlan,
+    DataToolRequest,
+    DataToolResult,
+    UnverifiedAction,
     VerificationCheck,
     VerificationReport,
     WorkbookSnapshot,
@@ -37,6 +44,9 @@ COLUMN_LIMIT = capability_int("snapshot", "dataColumns")
 FILE_LIMIT = capability_int("folder", "maxFiles")
 SOURCE_SEPARATOR = " › "
 SUPPORTED_SUFFIXES = {".xlsx", ".xlsm"}
+_OPEN_WRITE_WORKBOOKS: ContextVar[list[Workbook] | None] = ContextVar(
+    "open_write_workbooks", default=None
+)
 OUTPUT_FILE_NAME = capability_text("folder", "outputFileName")
 
 
@@ -59,6 +69,9 @@ class FolderCatalog(BaseModel):
     folderName: str
     folderPath: str
     files: list[FolderFileInfo]
+    totalFiles: int
+    truncated: bool
+    expiresAt: str
 
 
 class FolderSelection(BaseModel):
@@ -81,6 +94,13 @@ class FolderExecuteResponse(BaseModel):
     backups: list[str]
     actionResults: list[ActionExecutionResult]
     verification: VerificationReport
+    executionMs: float = Field(ge=0)
+    verificationMs: float = Field(ge=0)
+
+
+class FolderQueryRequest(BaseModel):
+    sessionId: str
+    request: DataToolRequest
 
 
 class _FolderSession:
@@ -88,9 +108,29 @@ class _FolderSession:
         self.root = root
         self.files = files
         self.selected_targets: dict[str, tuple[Path, str]] = {}
+        self.selected_sources: dict[str, tuple[str, str, Path, str]] = {}
+        self.source_fingerprint: str | None = None
+        self.last_access = time.monotonic()
 
 
 _sessions: dict[str, _FolderSession] = {}
+
+
+def _prune_sessions(*, reserve_slot: bool = False) -> None:
+    ttl = capability_int("folder", "sessionTtlSeconds")
+    cutoff = time.monotonic() - ttl
+    expired = [
+        session_id
+        for session_id, session in _sessions.items()
+        if session.last_access < cutoff
+    ]
+    for session_id in expired:
+        _sessions.pop(session_id, None)
+    capacity = capability_int("folder", "maxSessions")
+    target_size = capacity - 1 if reserve_slot else capacity
+    while len(_sessions) > target_size:
+        oldest = min(_sessions, key=lambda key: _sessions[key].last_access)
+        _sessions.pop(oldest, None)
 
 
 def choose_folder() -> Path | None:
@@ -118,16 +158,21 @@ def _is_supported_file(path: Path) -> bool:
 
 def scan_folder(root: Path) -> FolderCatalog:
     root = root.resolve()
-    candidates = sorted(
+    all_candidates = sorted(
         (path for path in root.rglob("*") if _is_supported_file(path)),
         key=lambda path: str(path.relative_to(root)).casefold(),
-    )[:FILE_LIMIT]
+    )
+    candidates = all_candidates[:FILE_LIMIT]
+    _prune_sessions(reserve_slot=True)
     session_id = uuid.uuid4().hex
     session_files: dict[str, Path] = {}
     files: list[FolderFileInfo] = []
 
     for path in candidates:
-        file_id = uuid.uuid4().hex
+        file_id = uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            str(path.relative_to(root)).replace("\\", "/").casefold(),
+        ).hex
         session_files[file_id] = path
         relative_path = str(path.relative_to(root))
         try:
@@ -170,6 +215,12 @@ def scan_folder(root: Path) -> FolderCatalog:
         folderName=root.name,
         folderPath=str(root),
         files=files,
+        totalFiles=len(all_candidates),
+        truncated=len(all_candidates) > FILE_LIMIT,
+        expiresAt=datetime.fromtimestamp(
+            datetime.now().timestamp()
+            + capability_int("folder", "sessionTtlSeconds")
+        ).astimezone().isoformat(),
     )
 
 
@@ -179,16 +230,55 @@ def select_and_scan_folder() -> FolderCatalog | None:
 
 
 def _session(session_id: str) -> _FolderSession:
+    _prune_sessions()
     try:
-        return _sessions[session_id]
+        session = _sessions[session_id]
+        session.last_access = time.monotonic()
+        return session
     except KeyError as error:
         raise ValueError("文件夹会话已失效，请重新选择文件夹") from error
+
+
+def _selected_files_fingerprint(paths: set[Path]) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(paths, key=lambda item: str(item).casefold()):
+        digest.update(str(path).encode("utf-8"))
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _normalized_openpyxl_value(cell):
+    value = cell.value
+    if isinstance(value, (datetime, date)):
+        return value.date().isoformat() if isinstance(value, datetime) else value.isoformat()
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        if (
+            isinstance(value, (int, float))
+            and re.fullmatch(r"0+", cell.number_format or "")
+        ):
+            return f"{int(value):0{len(cell.number_format)}d}"
+        return value
+    return str(value)
+
+
+def _display_openpyxl_value(cell):
+    value = _normalized_openpyxl_value(cell)
+    if (
+        isinstance(cell.value, (int, float))
+        and "%" in (cell.number_format or "")
+    ):
+        decimals = max(0, (cell.number_format.split("%", 1)[0].partition(".")[2].count("0")))
+        return f"{cell.value * 100:.{decimals}f}%"
+    return value
 
 
 def create_folder_snapshot(request: FolderSnapshotRequest) -> WorkbookSnapshot:
     session = _session(request.sessionId)
     snapshots: list[WorksheetSnapshot] = []
     selected_targets: dict[str, tuple[Path, str]] = {}
+    selected_sources: dict[str, tuple[str, str, Path, str]] = {}
     active_name = ""
 
     for selection in request.selections:
@@ -211,20 +301,39 @@ def create_folder_snapshot(request: FolderSnapshotRequest) -> WorkbookSnapshot:
             sheet = workbook[sheet_name]
             row_count = sheet.max_row
             column_count = sheet.max_column
-            values = [
+            cells = [
                 list(row)
                 for row in sheet.iter_rows(
                     min_row=1,
                     max_row=min(row_count, ROW_LIMIT + 1),
                     max_col=min(column_count, COLUMN_LIMIT),
-                    values_only=True,
                 )
             ]
+            values = [
+                [_normalized_openpyxl_value(cell) for cell in row]
+                for row in cells
+            ]
+            display_values = [
+                [_display_openpyxl_value(cell) for cell in row]
+                for row in cells
+            ]
             display_name = f"{relative_path}{SOURCE_SEPARATOR}{sheet_name}"
+            sheet_id = uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"{selection.fileId}:{sheet_name}",
+            ).hex
             selected_targets[display_name] = (path, sheet_name)
+            selected_sources[display_name] = (
+                selection.fileId,
+                sheet_id,
+                path,
+                sheet_name,
+            )
             snapshots.append(
                 WorksheetSnapshot(
                     name=display_name,
+                    sourceFileId=selection.fileId,
+                    sourceSheetId=sheet_id,
                     sourceFile=relative_path,
                     sourceSheet=sheet_name,
                     usedRange=(
@@ -236,6 +345,7 @@ def create_folder_snapshot(request: FolderSnapshotRequest) -> WorkbookSnapshot:
                     columnCount=column_count,
                     headers=list(values[0]) if values else [],
                     dataRows=[list(row) for row in values[1:]],
+                    displayRows=[list(row) for row in display_values[1:]],
                     truncated=row_count > ROW_LIMIT + 1
                     or column_count > COLUMN_LIMIT,
                 )
@@ -247,12 +357,42 @@ def create_folder_snapshot(request: FolderSnapshotRequest) -> WorkbookSnapshot:
     if not snapshots:
         raise ValueError("请至少选择一个可读取的工作表")
     session.selected_targets = selected_targets
+    session.selected_sources = selected_sources
+    session.source_fingerprint = _selected_files_fingerprint(
+        {path for path, _ in selected_targets.values()}
+    )
     return WorkbookSnapshot(
         name=f"文件夹：{session.root.name}",
         capturedAt=datetime.now().astimezone().isoformat(),
         activeWorksheet=active_name,
+        sourceFingerprint=session.source_fingerprint,
+        sourceFingerprintSheets=list(selected_targets),
         worksheets=snapshots,
     )
+
+
+def query_folder_data(request: FolderQueryRequest) -> DataToolResult:
+    from .folder_data import AuthorizedSheet, execute_folder_query
+
+    session = _session(request.sessionId)
+    if not session.selected_sources:
+        raise ValueError("文件夹数据范围尚未确认，请先生成预览")
+    sources = [
+        AuthorizedSheet(
+            file_id=file_id,
+            sheet_id=sheet_id,
+            path=path,
+            sheet_name=sheet_name,
+            display_name=display_name,
+        )
+        for display_name, (
+            file_id,
+            sheet_id,
+            path,
+            sheet_name,
+        ) in session.selected_sources.items()
+    ]
+    return execute_folder_query(request.request, sources)
 
 
 def _target(
@@ -268,8 +408,13 @@ def _target(
 
 def _load_for_write(path: Path) -> Workbook:
     if path.exists():
-        return load_workbook(path, keep_vba=path.suffix.lower() == ".xlsm")
-    return Workbook()
+        workbook = load_workbook(path, keep_vba=path.suffix.lower() == ".xlsm")
+    else:
+        workbook = Workbook()
+    active = _OPEN_WRITE_WORKBOOKS.get()
+    if active is not None:
+        active.append(workbook)
+    return workbook
 
 
 def _get_or_create_sheet(workbook: Workbook, sheet_name: str):
@@ -298,6 +443,220 @@ def _values_equal(actual: object, expected: object) -> bool:
     ):
         return float(actual) == float(expected)
     return actual == expected
+
+
+def _normalized_range(address: str) -> str:
+    local_address = address.rsplit("!", 1)[-1]
+    return local_address.replace("$", "").strip().upper()
+
+
+def _compare_sort_values(left: object, right: object) -> int:
+    left_blank = left in (None, "")
+    right_blank = right in (None, "")
+    if left_blank or right_blank:
+        if left_blank and right_blank:
+            return 0
+        return 1 if left_blank else -1
+    if (
+        isinstance(left, (int, float))
+        and not isinstance(left, bool)
+        and isinstance(right, (int, float))
+        and not isinstance(right, bool)
+    ):
+        return (float(left) > float(right)) - (float(left) < float(right))
+    if isinstance(left, bool) and isinstance(right, bool):
+        return int(left) - int(right)
+    left_text = str(left).casefold()
+    right_text = str(right).casefold()
+    return (left_text > right_text) - (left_text < right_text)
+
+
+def _compare_sorted_rows(left: list[object], right: list[object], keys) -> int:
+    for key in keys:
+        left_value = left[key.column]
+        right_value = right[key.column]
+        comparison = _compare_sort_values(left_value, right_value)
+        if comparison == 0:
+            continue
+        if left_value in (None, "") or right_value in (None, ""):
+            return comparison
+        return comparison if key.ascending else -comparison
+    return 0
+
+
+def _range_is_sorted(values: list[list[object]], keys, has_headers: bool) -> bool:
+    rows = values[1:] if has_headers else values
+    if not keys or any(
+        key.column < 0 or any(key.column >= len(row) for row in rows)
+        for key in keys
+    ):
+        return False
+    return all(
+        _compare_sorted_rows(rows[index - 1], rows[index], keys) <= 0
+        for index in range(1, len(rows))
+    )
+
+
+def _normalized_color(value: object) -> str:
+    rgb = getattr(value, "rgb", value)
+    text = str(rgb or "").removeprefix("#")
+    return f"#{text[-6:].upper()}" if len(text) >= 6 else text.upper()
+
+
+def _openpyxl_border_style(style: str, weight: str) -> str | None:
+    if style == "none":
+        return None
+    if style == "continuous":
+        return {
+            "hairline": "hair",
+            "thin": "thin",
+            "medium": "medium",
+            "thick": "thick",
+        }[weight]
+    if style == "dash":
+        return "mediumDashed" if weight in {"medium", "thick"} else "dashed"
+    if style == "dashDot":
+        return "mediumDashDot" if weight in {"medium", "thick"} else "dashDot"
+    if style == "dot":
+        return "dotted"
+    return "double"
+
+
+def _range_format_matches(sheet, criterion) -> bool:
+    cells = [cell for row in _iter_range(sheet, criterion.range) for cell in row]
+    if criterion.fillColor is not None and not all(
+        cell.fill.fill_type == "solid"
+        and _normalized_color(cell.fill.fgColor) == _normalized_color(criterion.fillColor)
+        for cell in cells
+    ):
+        return False
+    if criterion.bold is not None and not all(
+        cell.font.bold == criterion.bold for cell in cells
+    ):
+        return False
+    if criterion.fontColor is not None and not all(
+        _normalized_color(cell.font.color) == _normalized_color(criterion.fontColor)
+        for cell in cells
+    ):
+        return False
+    if criterion.numberFormat is not None and not all(
+        cell.number_format == criterion.numberFormat for cell in cells
+    ):
+        return False
+    expected_horizontal = {
+        "centerAcrossSelection": "centerContinuous"
+    }.get(criterion.horizontal, criterion.horizontal)
+    if criterion.horizontal is not None and not all(
+        cell.alignment.horizontal == expected_horizontal for cell in cells
+    ):
+        return False
+    if criterion.vertical is not None and not all(
+        cell.alignment.vertical == criterion.vertical for cell in cells
+    ):
+        return False
+    if criterion.wrapText is not None and not all(
+        cell.alignment.wrap_text == criterion.wrapText for cell in cells
+    ):
+        return False
+    min_col, min_row, max_col, max_row = range_boundaries(criterion.range)
+    if criterion.rowHeight is not None and not all(
+        sheet.row_dimensions[row].height is not None
+        and abs(sheet.row_dimensions[row].height - criterion.rowHeight) <= 0.1
+        for row in range(min_row, max_row + 1)
+    ):
+        return False
+    if criterion.columnWidth is not None and not all(
+        sheet.column_dimensions[get_column_letter(column)].width is not None
+        and abs(
+            sheet.column_dimensions[get_column_letter(column)].width
+            - criterion.columnWidth
+        )
+        <= 0.1
+        for column in range(min_col, max_col + 1)
+    ):
+        return False
+    return True
+
+
+def _borders_match(sheet, criterion) -> bool:
+    side_names = {
+        "top": "top",
+        "bottom": "bottom",
+        "left": "left",
+        "right": "right",
+        "insideHorizontal": "horizontal",
+        "insideVertical": "vertical",
+    }
+    expected_style = _openpyxl_border_style(criterion.style, criterion.weight)
+    for row in _iter_range(sheet, criterion.range):
+        for cell in row:
+            for side in criterion.sides:
+                actual = getattr(cell.border, side_names[side])
+                if actual.style != expected_style:
+                    return False
+                if (
+                    expected_style is not None
+                    and _normalized_color(actual.color)
+                    != _normalized_color(criterion.color)
+                ):
+                    return False
+    return True
+
+
+def _data_validation_matches(sheet, criterion) -> bool:
+    expected_type = {
+        "wholeNumber": "whole",
+        "textLength": "textLength",
+    }.get(criterion.validationType, criterion.validationType)
+    expected_operator = {
+        "equalTo": "equal",
+        "notEqualTo": "notEqual",
+        "greaterThanOrEqualTo": "greaterThanOrEqual",
+        "lessThanOrEqualTo": "lessThanOrEqual",
+    }.get(criterion.operator, criterion.operator)
+    expected_formula1 = (
+        '"' + ",".join(str(value) for value in criterion.values) + '"'
+        if expected_type == "list"
+        else criterion.formula1
+    )
+    for validation in sheet.data_validations.dataValidation:
+        ranges = {
+            _normalized_range(str(cell_range))
+            for cell_range in validation.sqref.ranges
+        }
+        if _normalized_range(criterion.range) not in ranges:
+            continue
+        return (
+            validation.type == expected_type
+            and validation.operator == expected_operator
+            and str(
+                "" if validation.formula1 is None else validation.formula1
+            )
+            == str("" if expected_formula1 is None else expected_formula1)
+            and str(
+                "" if validation.formula2 is None else validation.formula2
+            )
+            == str("" if criterion.formula2 is None else criterion.formula2)
+            and bool(validation.allow_blank) == criterion.allowBlank
+            and (
+                criterion.prompt is None
+                or validation.prompt == criterion.prompt
+            )
+            and (
+                criterion.errorMessage is None
+                or validation.error == criterion.errorMessage
+            )
+        )
+    return False
+
+
+def _freeze_panes_position(sheet) -> tuple[int, int]:
+    location = sheet.freeze_panes
+    if location is None:
+        return 0, 0
+    coordinate = getattr(location, "coordinate", str(location))
+    min_col, min_row, _, _ = range_boundaries(coordinate)
+    return min_row - 1, min_col - 1
 
 
 def _iter_range(sheet, address: str):
@@ -333,6 +692,201 @@ def _folder_mode_unsupported(action_type: str) -> None:
     )
 
 
+def _preflight_range_shape(address: str) -> tuple[int, int]:
+    min_column, min_row, max_column, max_row = range_boundaries(address)
+    if min_column < 1 or min_row < 1 or max_column > 16_384 or max_row > 1_048_576:
+        raise ValueError("超出 Excel 工作表边界")
+    return max_row - min_row + 1, max_column - min_column + 1
+
+
+def _action_range_fields(action) -> list[tuple[str, str]]:
+    fields: list[tuple[str, str]] = []
+    for attribute, label in (
+        ("range", "区域"),
+        ("startCell", "起始位置"),
+        ("cell", "单元格"),
+        ("sourceRange", "源区域"),
+        ("targetRange", "目标区域"),
+        ("destinationCell", "目标位置"),
+    ):
+        value = getattr(action, attribute, None)
+        if value:
+            fields.append((label, value))
+    return fields
+
+
+def _preflight_folder_plan(
+    session: _FolderSession,
+    plan: AnalysisPlan,
+) -> None:
+    unsupported = {
+        "insertRange",
+        "deleteRange",
+        "createPivotTable",
+        "addShape",
+    }
+    sheet_names: dict[Path, set[str]] = {}
+    object_names: dict[Path, set[str]] = {}
+
+    def names_for(path: Path) -> set[str]:
+        existing = sheet_names.get(path)
+        if existing is not None:
+            return existing
+        if path.exists():
+            workbook = load_workbook(
+                path,
+                read_only=True,
+                data_only=False,
+                keep_vba=path.suffix.lower() == ".xlsm",
+            )
+            try:
+                existing = set(workbook.sheetnames)
+            finally:
+                workbook.close()
+        else:
+            existing = {"Sheet"}
+        sheet_names[path] = existing
+        return existing
+
+    def objects_for(path: Path) -> set[str]:
+        existing = object_names.get(path)
+        if existing is not None:
+            return existing
+        if not path.exists():
+            existing = set()
+        else:
+            workbook = load_workbook(
+                path,
+                read_only=False,
+                data_only=False,
+                keep_vba=path.suffix.lower() == ".xlsm",
+            )
+            try:
+                existing = {
+                    name.casefold() for name in workbook.defined_names.keys()
+                }
+                existing.update(
+                    table.name.casefold()
+                    for worksheet in workbook.worksheets
+                    for table in worksheet.tables.values()
+                )
+            finally:
+                workbook.close()
+        object_names[path] = existing
+        return existing
+
+    issues: list[str] = []
+    for index, action in enumerate(plan.actions):
+        if action.type in unsupported:
+            issues.append(
+                f"第 {index + 1} 步：文件夹模式暂不支持 {action.type}"
+            )
+            continue
+
+        path, sheet_name, _ = _target(session, action.sheet)
+        current_names = names_for(path)
+        invalid_range = False
+        shapes: dict[str, tuple[int, int]] = {}
+        for label, address in _action_range_fields(action):
+            try:
+                shapes[address] = _preflight_range_shape(address)
+            except (TypeError, ValueError) as error:
+                issues.append(
+                    f"第 {index + 1} 步：{label}「{address}」无效（{error}）"
+                )
+                invalid_range = True
+        if invalid_range:
+            continue
+
+        if action.type in {"writeValues", "writeFormulas"}:
+            matrix = (
+                action.values
+                if action.type == "writeValues"
+                else action.formulas
+            )
+            expected_shape = (len(matrix), len(matrix[0]))
+            if shapes[action.range] != expected_shape:
+                rows, columns = shapes[action.range]
+                issues.append(
+                    f"第 {index + 1} 步：目标区域 {action.range} 是"
+                    f" {rows}×{columns}，但写入矩阵是"
+                    f" {expected_shape[0]}×{expected_shape[1]}"
+                )
+        if action.type == "writeTable" and shapes[action.startCell] != (1, 1):
+            issues.append(
+                f"第 {index + 1} 步：表格起始位置必须是单个单元格"
+            )
+        if action.type == "sortRange":
+            columns = shapes[action.range][1]
+            for key in action.keys:
+                if key.column >= columns:
+                    issues.append(
+                        f"第 {index + 1} 步：排序列索引 {key.column} "
+                        f"超出 {action.range} 的 {columns} 列范围"
+                    )
+        if action.type == "filterRange":
+            columns = shapes[action.range][1]
+            if action.column >= columns:
+                issues.append(
+                    f"第 {index + 1} 步：筛选列索引 {action.column} "
+                    f"超出 {action.range} 的 {columns} 列范围"
+                )
+
+        if action.type in {"createTable", "addNamedRange"}:
+            object_name = (
+                action.name
+                if action.type == "addNamedRange" or action.name
+                else f"ExcelBroTable{index + 1}"
+            )
+            names = objects_for(path)
+            if object_name.casefold() in names:
+                issues.append(
+                    f"第 {index + 1} 步：表格或命名区域名称"
+                    f"「{object_name}」已存在"
+                )
+            else:
+                names.add(object_name.casefold())
+
+        if action.type == "deleteWorksheet":
+            if sheet_name not in current_names:
+                issues.append(
+                    f"第 {index + 1} 步：未找到工作表「{sheet_name}」"
+                )
+            elif len(current_names) == 1:
+                issues.append(
+                    f"第 {index + 1} 步：不能删除工作簿中唯一的工作表"
+                )
+            else:
+                current_names.remove(sheet_name)
+            continue
+
+        if (
+            action.type == "splitGroupAggregate"
+            and sheet_name not in current_names
+        ):
+            issues.append(
+                f"第 {index + 1} 步：未找到源工作表「{sheet_name}」"
+            )
+            continue
+
+        if action.type == "copyRange":
+            source_path, source_name, _ = _target(
+                session, action.sourceSheet
+            )
+            if source_name not in names_for(source_path):
+                issues.append(
+                    f"第 {index + 1} 步：未找到复制源工作表"
+                    f"「{action.sourceSheet}」"
+                )
+                continue
+
+        if action.type != "splitGroupAggregate":
+            current_names.add(sheet_name)
+
+    if issues:
+        raise ValueError("执行前检查未通过：" + "；".join(issues))
+
+
 def _verify_folder_plan(
     session: _FolderSession, plan: AnalysisPlan
 ) -> VerificationReport:
@@ -356,7 +910,6 @@ def _verify_folder_plan(
                 load_workbook(
                     path,
                     data_only=False,
-                    read_only=True,
                     keep_vba=path.suffix.lower() == ".xlsm",
                 ),
             )
@@ -395,6 +948,162 @@ def _verify_folder_plan(
                 continue
 
             sheet = workbook[sheet_name]
+            if criterion.type == "filterApplied":
+                filter_columns = {
+                    item.colId: item for item in sheet.auto_filter.filterColumn
+                }
+                filter_column = filter_columns.get(criterion.column)
+                actual_values = (
+                    list(filter_column.filters.filter)
+                    if filter_column is not None
+                    and filter_column.filters is not None
+                    else []
+                )
+                passed = (
+                    _normalized_range(sheet.auto_filter.ref or "")
+                    == _normalized_range(criterion.range)
+                    and sorted(str(value) for value in actual_values)
+                    == sorted(str(value) for value in criterion.values)
+                )
+                checks.append(
+                    VerificationCheck(
+                        criterion=criterion,
+                        passed=passed,
+                        message=(
+                            f"「{sheet_name}」{criterion.range} 第 "
+                            f"{criterion.column + 1} 列筛选条件一致"
+                            if passed
+                            else f"「{sheet_name}」{criterion.range} 的筛选范围或条件与预期不一致"
+                        ),
+                    )
+                )
+                continue
+            if criterion.type == "filterCleared":
+                passed = not sheet.auto_filter.filterColumn
+                checks.append(
+                    VerificationCheck(
+                        criterion=criterion,
+                        passed=passed,
+                        message=(
+                            f"工作表「{sheet_name}」的筛选条件已清除"
+                            if passed
+                            else f"工作表「{sheet_name}」仍有筛选条件"
+                        ),
+                    )
+                )
+                continue
+            if criterion.type == "tableExists":
+                expected_range = _normalized_range(criterion.range)
+                matching_table = next(
+                    (
+                        table
+                        for table in sheet.tables.values()
+                        if (
+                            criterion.name is None
+                            or table.name.casefold() == criterion.name.casefold()
+                        )
+                        and _normalized_range(table.ref) == expected_range
+                    ),
+                    None,
+                )
+                actual_headers = (
+                    matching_table is not None
+                    and getattr(matching_table, "headerRowCount", 1) != 0
+                )
+                passed = (
+                    matching_table is not None
+                    and actual_headers == criterion.hasHeaders
+                )
+                checks.append(
+                    VerificationCheck(
+                        criterion=criterion,
+                        passed=passed,
+                        message=(
+                            f"「{sheet_name}」{criterion.range} 的表格范围与表头状态一致"
+                            if passed
+                            else f"「{sheet_name}」{criterion.range} 未找到符合预期的表格"
+                        ),
+                    )
+                )
+                continue
+            if criterion.type == "rangeFormatMatches":
+                passed = _range_format_matches(sheet, criterion)
+                checks.append(
+                    VerificationCheck(
+                        criterion=criterion,
+                        passed=passed,
+                        message=(
+                            f"「{sheet_name}」{criterion.range} 的格式属性一致"
+                            if passed
+                            else f"「{sheet_name}」{criterion.range} 的格式属性与预期不一致"
+                        ),
+                    )
+                )
+                continue
+            if criterion.type == "bordersMatch":
+                passed = _borders_match(sheet, criterion)
+                checks.append(
+                    VerificationCheck(
+                        criterion=criterion,
+                        passed=passed,
+                        message=(
+                            f"「{sheet_name}」{criterion.range} 的边框属性一致"
+                            if passed
+                            else f"「{sheet_name}」{criterion.range} 的边框属性与预期不一致"
+                        ),
+                    )
+                )
+                continue
+            if criterion.type == "dataValidationMatches":
+                passed = _data_validation_matches(sheet, criterion)
+                checks.append(
+                    VerificationCheck(
+                        criterion=criterion,
+                        passed=passed,
+                        message=(
+                            f"「{sheet_name}」{criterion.range} 的数据验证规则一致"
+                            if passed
+                            else f"「{sheet_name}」{criterion.range} 的数据验证规则与预期不一致"
+                        ),
+                    )
+                )
+                continue
+            if criterion.type == "freezePanesMatches":
+                actual_rows, actual_columns = _freeze_panes_position(sheet)
+                passed = (
+                    actual_rows == criterion.rows
+                    and actual_columns == criterion.columns
+                )
+                checks.append(
+                    VerificationCheck(
+                        criterion=criterion,
+                        passed=passed,
+                        message=(
+                            f"工作表「{sheet_name}」的冻结窗格位置一致"
+                            if passed
+                            else f"工作表「{sheet_name}」的冻结窗格位置与预期不一致"
+                        ),
+                    )
+                )
+                continue
+            if criterion.type in {"chartExists", "pivotTableExists"}:
+                checks.append(
+                    VerificationCheck(
+                        criterion=criterion,
+                        passed=False,
+                        message=(
+                            "文件夹模式当前不能独立验证"
+                            + (
+                                "图表"
+                                if criterion.type == "chartExists"
+                                else "数据透视表"
+                            )
+                            + "对象"
+                        ),
+                    )
+                )
+                continue
+
             min_column, min_row, max_column, max_row = range_boundaries(
                 criterion.range
             )
@@ -408,6 +1117,10 @@ def _verify_folder_plan(
             if criterion.type == "rangeEmpty":
                 passed = all(
                     value in (None, "") for row in actual for value in row
+                )
+            elif criterion.type == "rangeSorted":
+                passed = _range_is_sorted(
+                    actual, criterion.keys, criterion.hasHeaders
                 )
             else:
                 passed = len(actual) == len(criterion.expected) and all(
@@ -429,9 +1142,13 @@ def _verify_folder_plan(
                             f"「{sheet_name}」{criterion.range} 已清空"
                             if criterion.type == "rangeEmpty"
                             else (
-                                f"「{sheet_name}」{criterion.range} 公式一致"
-                                if criterion.type == "formulasEqual"
-                                else f"「{sheet_name}」{criterion.range} 写入值一致"
+                                f"「{sheet_name}」{criterion.range} 排序顺序一致"
+                                if criterion.type == "rangeSorted"
+                                else (
+                                    f"「{sheet_name}」{criterion.range} 公式一致"
+                                    if criterion.type == "formulasEqual"
+                                    else f"「{sheet_name}」{criterion.range} 写入值一致"
+                                )
                             )
                         )
                         if passed
@@ -444,23 +1161,372 @@ def _verify_folder_plan(
         for workbook in readers.values():
             workbook.close()
 
+    def same_range(criterion, sheet: str, address: str) -> bool:
+        return (
+            hasattr(criterion, "range")
+            and criterion.sheet.casefold() == sheet.casefold()
+            and _normalized_range(criterion.range) == _normalized_range(address)
+        )
+
+    def has_criterion(predicate) -> bool:
+        return any(predicate(criterion) for criterion in plan.acceptanceCriteria)
+
+    unverified_actions: list[UnverifiedAction] = []
+    for index, action in enumerate(plan.actions):
+        verified = False
+        later_actions = plan.actions[index + 1 :]
+
+        def later_same_range(action_type: str):
+            if not hasattr(action, "range"):
+                return []
+            return [
+                later
+                for later in later_actions
+                if later.type == action_type
+                and later.sheet.casefold() == action.sheet.casefold()
+                and hasattr(later, "range")
+                and _normalized_range(later.range)
+                == _normalized_range(action.range)
+            ]
+
+        if action.type == "createWorksheet":
+            verified = has_criterion(
+                lambda criterion: criterion.type == "worksheetExists"
+                and criterion.sheet.casefold() == action.sheet.casefold()
+            )
+        elif action.type == "deleteWorksheet":
+            verified = has_criterion(
+                lambda criterion: criterion.type == "worksheetMissing"
+                and criterion.sheet.casefold() == action.sheet.casefold()
+            )
+        elif action.type == "writeValues":
+            verified = has_criterion(
+                lambda criterion: criterion.type == "rangeEquals"
+                and same_range(criterion, action.sheet, action.range)
+            )
+        elif action.type == "writeFormulas":
+            verified = has_criterion(
+                lambda criterion: criterion.type == "formulasEqual"
+                and same_range(criterion, action.sheet, action.range)
+            )
+        elif action.type == "writeTable":
+            start_column, start_row, _, _ = range_boundaries(
+                action.startCell
+            )
+            target_range = (
+                f"{get_column_letter(start_column)}{start_row}:"
+                f"{get_column_letter(start_column + len(action.headers) - 1)}"
+                f"{start_row + len(action.rows)}"
+            )
+            verified = has_criterion(
+                lambda criterion: criterion.type == "rangeEquals"
+                and same_range(criterion, action.sheet, target_range)
+            )
+        elif action.type == "clearRange":
+            verified = action.applyTo in {"all", "contents"} and has_criterion(
+                lambda criterion: criterion.type == "rangeEmpty"
+                and same_range(criterion, action.sheet, action.range)
+            )
+        elif action.type == "copyRange":
+            verified = has_criterion(
+                lambda criterion: criterion.type
+                in {"rangeEquals", "formulasEqual"}
+                and same_range(criterion, action.sheet, action.targetRange)
+            )
+        elif action.type == "sortRange":
+            verified = has_criterion(
+                lambda criterion: criterion.type == "rangeSorted"
+                and same_range(criterion, action.sheet, action.range)
+            )
+        elif action.type == "filterRange":
+            verified = any(
+                later.type in {"filterRange", "clearFilter"}
+                and later.sheet.casefold() == action.sheet.casefold()
+                for later in later_actions
+            ) or has_criterion(
+                lambda criterion: criterion.type == "filterApplied"
+                and same_range(criterion, action.sheet, action.range)
+                and criterion.column == action.column
+            )
+        elif action.type == "clearFilter":
+            verified = any(
+                later.type in {"filterRange", "clearFilter"}
+                and later.sheet.casefold() == action.sheet.casefold()
+                for later in later_actions
+            ) or has_criterion(
+                lambda criterion: criterion.type == "filterCleared"
+                and criterion.sheet.casefold() == action.sheet.casefold()
+            )
+        elif action.type == "createTable":
+            verified = has_criterion(
+                lambda criterion: criterion.type == "tableExists"
+                and same_range(criterion, action.sheet, action.range)
+            )
+        elif action.type == "setFill":
+            verified = bool(later_same_range("setFill")) or has_criterion(
+                lambda criterion: criterion.type == "rangeFormatMatches"
+                and same_range(criterion, action.sheet, action.range)
+                and criterion.fillColor is not None
+                and criterion.fillColor.casefold() == action.color.casefold()
+            )
+        elif action.type == "setFont":
+            verified = (
+                action.bold is None
+                or any(
+                    later.bold is not None
+                    for later in later_same_range("setFont")
+                )
+                or has_criterion(
+                    lambda criterion: criterion.type == "rangeFormatMatches"
+                    and same_range(criterion, action.sheet, action.range)
+                    and criterion.bold == action.bold
+                )
+            ) and (
+                action.color is None
+                or any(
+                    later.color is not None
+                    for later in later_same_range("setFont")
+                )
+                or has_criterion(
+                    lambda criterion: criterion.type == "rangeFormatMatches"
+                    and same_range(criterion, action.sheet, action.range)
+                    and criterion.fontColor is not None
+                    and criterion.fontColor.casefold() == action.color.casefold()
+                )
+            )
+        elif action.type == "setNumberFormat":
+            verified = bool(
+                later_same_range("setNumberFormat")
+            ) or has_criterion(
+                lambda criterion: criterion.type == "rangeFormatMatches"
+                and same_range(criterion, action.sheet, action.range)
+                and criterion.numberFormat == action.formatCode
+            )
+        elif action.type == "setAlignment":
+            verified = (
+                action.horizontal is None
+                or any(
+                    later.horizontal is not None
+                    for later in later_same_range("setAlignment")
+                )
+                or has_criterion(
+                    lambda criterion: criterion.type == "rangeFormatMatches"
+                    and same_range(criterion, action.sheet, action.range)
+                    and criterion.horizontal == action.horizontal
+                )
+            ) and (
+                action.vertical is None
+                or any(
+                    later.vertical is not None
+                    for later in later_same_range("setAlignment")
+                )
+                or has_criterion(
+                    lambda criterion: criterion.type == "rangeFormatMatches"
+                    and same_range(criterion, action.sheet, action.range)
+                    and criterion.vertical == action.vertical
+                )
+            ) and (
+                action.wrapText is None
+                or any(
+                    later.wrapText is not None
+                    for later in later_same_range("setAlignment")
+                )
+                or has_criterion(
+                    lambda criterion: criterion.type == "rangeFormatMatches"
+                    and same_range(criterion, action.sheet, action.range)
+                    and criterion.wrapText == action.wrapText
+                )
+            )
+        elif action.type == "resizeRange":
+            verified = (
+                action.rowHeight is None
+                or any(
+                    later.rowHeight is not None
+                    for later in later_same_range("resizeRange")
+                )
+                or has_criterion(
+                    lambda criterion: criterion.type == "rangeFormatMatches"
+                    and same_range(criterion, action.sheet, action.range)
+                    and criterion.rowHeight == action.rowHeight
+                )
+            ) and (
+                action.columnWidth is None
+                or any(
+                    later.columnWidth is not None
+                    for later in later_same_range("resizeRange")
+                )
+                or has_criterion(
+                    lambda criterion: criterion.type == "rangeFormatMatches"
+                    and same_range(criterion, action.sheet, action.range)
+                    and criterion.columnWidth == action.columnWidth
+                )
+            )
+        elif action.type == "setBorders":
+            verified = has_criterion(
+                lambda criterion: criterion.type == "bordersMatch"
+                and same_range(criterion, action.sheet, action.range)
+            )
+        elif action.type == "setDataValidation":
+            verified = bool(
+                later_same_range("setDataValidation")
+            ) or has_criterion(
+                lambda criterion: criterion.type == "dataValidationMatches"
+                and same_range(criterion, action.sheet, action.range)
+            )
+        elif action.type == "freezePanes":
+            verified = any(
+                later.type == "freezePanes"
+                and later.sheet.casefold() == action.sheet.casefold()
+                for later in later_actions
+            ) or has_criterion(
+                lambda criterion: criterion.type == "freezePanesMatches"
+                and criterion.sheet.casefold() == action.sheet.casefold()
+                and criterion.rows == action.rows
+                and criterion.columns == action.columns
+            )
+        elif action.type == "createChart":
+            verified = has_criterion(
+                lambda criterion: criterion.type == "chartExists"
+                and criterion.sheet.casefold() == action.sheet.casefold()
+                and _normalized_range(criterion.sourceRange)
+                == _normalized_range(action.sourceRange)
+            )
+        elif action.type == "createPivotTable":
+            verified = has_criterion(
+                lambda criterion: criterion.type == "pivotTableExists"
+                and criterion.sheet.casefold() == action.sheet.casefold()
+                and criterion.name.casefold() == action.name.casefold()
+            )
+        if not verified:
+            unverified_actions.append(
+                UnverifiedAction(
+                    index=index,
+                    type=action.type,
+                    sheet=action.sheet,
+                    message=(
+                        f"第 {index + 1} 步 {action.type} 已执行，"
+                        "但当前验收协议不能独立验证该操作的具体效果"
+                    ),
+                )
+            )
+
+    if any(not check.passed for check in checks):
+        status = "failed"
+    elif unverified_actions or not checks:
+        status = "executed_unverified"
+    else:
+        status = "verified"
     return VerificationReport(
-        passed=bool(checks) and all(check.passed for check in checks),
+        status=status,
+        passed=status == "verified",
         checks=checks,
+        unverifiedActions=unverified_actions,
     )
 
 
-def execute_folder_plan(request: FolderExecuteRequest) -> FolderExecuteResponse:
+def _save_workbooks_atomically(
+    session: _FolderSession,
+    workbooks: dict[Path, Workbook],
+    modified_paths: set[Path],
+) -> tuple[list[str], list[str]]:
+    targets = [
+        (path, workbooks[path])
+        for path in workbooks
+        if path in modified_paths
+    ]
+    temporary_paths: dict[Path, Path] = {}
+    existed_before = {path: path.exists() for path, _ in targets}
+    try:
+        for path, workbook in targets:
+            temporary = path.with_name(
+                f".{path.name}.excel-bro-tmp-{uuid.uuid4().hex}{path.suffix}"
+            )
+            workbook.save(temporary)
+            temporary_paths[path] = temporary
+    except Exception:
+        for temporary in temporary_paths.values():
+            temporary.unlink(missing_ok=True)
+        raise
+    finally:
+        for workbook in workbooks.values():
+            workbook.close()
+
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backups_by_path: dict[Path, Path] = {}
+    try:
+        for path, _ in targets:
+            if not existed_before[path]:
+                continue
+            backup = path.with_name(
+                f"{path.name}.excel-bro-backup-{timestamp}-"
+                f"{uuid.uuid4().hex[:8]}{path.suffix}"
+            )
+            shutil.copy2(path, backup)
+            backups_by_path[path] = backup
+    except Exception:
+        for temporary in temporary_paths.values():
+            temporary.unlink(missing_ok=True)
+        raise
+
+    replaced: list[Path] = []
+    try:
+        for path, _ in targets:
+            temporary_paths[path].replace(path)
+            replaced.append(path)
+    except Exception as replace_error:
+        rollback_errors: list[str] = []
+        for path in reversed(replaced):
+            try:
+                backup = backups_by_path.get(path)
+                if backup is not None:
+                    shutil.copy2(backup, path)
+                elif not existed_before[path]:
+                    path.unlink(missing_ok=True)
+            except Exception as rollback_error:
+                rollback_errors.append(f"{path.name}: {rollback_error}")
+        for path, temporary in temporary_paths.items():
+            if path not in replaced:
+                temporary.unlink(missing_ok=True)
+        detail = (
+            f"；恢复失败：{'；'.join(rollback_errors)}"
+            if rollback_errors
+            else ""
+        )
+        raise RuntimeError(
+            f"替换工作簿失败，已恢复先前文件：{replace_error}{detail}"
+        ) from replace_error
+
+    modified = [str(path.relative_to(session.root)) for path, _ in targets]
+    backups = [
+        str(backups_by_path[path].relative_to(session.root))
+        for path, _ in targets
+        if path in backups_by_path
+    ]
+    return modified, backups
+
+
+def _execute_folder_plan(request: FolderExecuteRequest) -> FolderExecuteResponse:
     session = _session(request.sessionId)
+    if session.source_fingerprint is not None:
+        if request.plan.sourceFingerprint is None:
+            raise ValueError("计划缺少数据来源指纹，请重新生成预览")
+        if request.plan.sourceFingerprint != session.source_fingerprint:
+            raise ValueError("计划的数据来源指纹已失效，请重新生成预览")
+        current_fingerprint = _selected_files_fingerprint(
+            {path for path, _ in session.selected_targets.values()}
+        )
+        if current_fingerprint != session.source_fingerprint:
+            raise ValueError("预览后所选文件已发生变化，请重新生成预览后再执行")
+    _preflight_folder_plan(session, request.plan)
+    execution_started = time.perf_counter()
     workbooks: dict[Path, Workbook] = {}
-    modified_sources: set[Path] = set()
+    modified_paths: set[Path] = set()
     action_results: list[ActionExecutionResult] = []
 
     for index, action in enumerate(request.plan.actions):
-        path, sheet_name, target_kind = _target(session, action.sheet)
+        path, sheet_name, _ = _target(session, action.sheet)
         workbook = workbooks.setdefault(path, _load_for_write(path))
-        if target_kind == "source":
-            modified_sources.add(path)
+        modified_paths.add(path)
 
         if action.type == "deleteWorksheet":
             if sheet_name not in workbook.sheetnames:
@@ -797,16 +1863,15 @@ def execute_folder_plan(request: FolderExecuteRequest) -> FolderExecuteResponse:
                 [sheet.cell(row=row, column=col).value for col in range(min_col, max_col + 1)]
                 for row in range(first_data_row, max_row + 1)
             ]
-            for key in reversed(action.keys):
-                if key.column >= len(rows[0]) if rows else False:
-                    raise ValueError("排序列索引超出范围")
-                rows.sort(
-                    key=lambda row, column=key.column: (
-                        row[column] is None,
-                        str(row[column]).casefold(),
-                    ),
-                    reverse=not key.ascending,
+            if rows and any(key.column >= len(rows[0]) for key in action.keys):
+                raise ValueError("排序列索引超出范围")
+            rows.sort(
+                key=cmp_to_key(
+                    lambda left, right: _compare_sorted_rows(
+                        left, right, action.keys
+                    )
                 )
+            )
             for row_offset, values in enumerate(rows):
                 for column_offset, value in enumerate(values):
                     sheet.cell(
@@ -892,14 +1957,7 @@ def execute_folder_plan(request: FolderExecuteRequest) -> FolderExecuteResponse:
                     cell.number_format = action.formatCode
         elif action.type == "setBorders":
             side = Side(
-                style={
-                    "continuous": "thin",
-                    "dash": "dashed",
-                    "dashDot": "dashDot",
-                    "dot": "dotted",
-                    "double": "double",
-                    "none": None,
-                }[action.style],
+                style=_openpyxl_border_style(action.style, action.weight),
                 color=action.color.removeprefix("#"),
             )
             for row in _iter_range(sheet, action.range):
@@ -967,6 +2025,8 @@ def execute_folder_plan(request: FolderExecuteRequest) -> FolderExecuteResponse:
                 displayName=action.name or f"ExcelBroTable{index + 1}",
                 ref=action.range,
             )
+            if not action.hasHeaders:
+                table.headerRowCount = 0
             table.tableStyleInfo = TableStyleInfo(
                 name=action.style or "TableStyleMedium2",
                 showFirstColumn=False,
@@ -1079,24 +2139,33 @@ def execute_folder_plan(request: FolderExecuteRequest) -> FolderExecuteResponse:
             )
         )
 
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    backups: list[str] = []
-    modified: list[str] = []
-    for path, workbook in workbooks.items():
-        if path in modified_sources and path.exists():
-            backup = path.with_name(
-                f"{path.name}.excel-bro-backup-{timestamp}{path.suffix}"
-            )
-            shutil.copy2(path, backup)
-            backups.append(str(backup.relative_to(session.root)))
-        workbook.save(path)
-        workbook.close()
-        modified.append(str(path.relative_to(session.root)))
+    modified, backups = _save_workbooks_atomically(
+        session, workbooks, modified_paths
+    )
 
+    verification_started = time.perf_counter()
+    execution_ms = (verification_started - execution_started) * 1000
     verification = _verify_folder_plan(session, request.plan)
+    verification_ms = (time.perf_counter() - verification_started) * 1000
     return FolderExecuteResponse(
         filesModified=modified,
         backups=backups,
         actionResults=action_results,
         verification=verification,
+        executionMs=execution_ms,
+        verificationMs=verification_ms,
     )
+
+
+def execute_folder_plan(request: FolderExecuteRequest) -> FolderExecuteResponse:
+    opened: list[Workbook] = []
+    token = _OPEN_WRITE_WORKBOOKS.set(opened)
+    try:
+        return _execute_folder_plan(request)
+    finally:
+        for workbook in opened:
+            try:
+                workbook.close()
+            except Exception:
+                pass
+        _OPEN_WRITE_WORKBOOKS.reset(token)

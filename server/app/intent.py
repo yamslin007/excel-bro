@@ -8,7 +8,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from .capabilities import capability_int
+from .capabilities import capability_int, model_timeout_seconds
 from .llm import ModelConnection, OpenAICompatibleClient
 from .models import (
     IntentCheckRequest,
@@ -33,7 +33,8 @@ INTENT_SYSTEM_PROMPT = """
 - 删除、覆盖、清空等高风险动作的目标是否明确。
 
 用户手动选中的工作表是默认且不可扩大的数据边界。不要建议读取未选中的工作表。
-query_table 目前只用于 sourceMode=workbook；文件夹来源返回 proceed。
+query_table 同时支持 sourceMode=workbook 和 sourceMode=folder；文件夹模式由受控
+pandas 工具读取用户已选择的文件和工作表。
 优先结合“上一轮结构化意图”和“上一轮紧凑结果”理解“那最低的呢、换成平均值、只看某地区”等承接式追问，
 不得要求用户重复已经明确的信息。
 用户完成一次确认后，不要重复询问同一个问题；但自定义回答仍存在新的关键歧义时，
@@ -62,7 +63,10 @@ proceed。如果不明确，只问一个最能消除关键歧义的问题，提�
 "value":"可选值"}],"groupBy":["分组字段"],"metrics":[{"operation":"countRows|countDistinct|sum|average|min|max",
 "field":"countRows 可省略，其余必填","outputName":"输出字段名","ratioOutputName":"可选，占总量比例的输出名"}],
 "profileField":"profile 模式的字段","sortBy":"字段或指标名",
-"sortDirection":"asc|desc","limit":20}}}
+"sortDirection":"asc|desc","limit":20,
+"combine":{"mode":"union|deduplicate|join","deduplicateBy":["去重字段"],
+"leftSourceSheetId":"关联左表工作表ID","rightSourceSheetId":"关联右表工作表ID",
+"leftKey":"左键","rightKey":"右键","joinHow":"inner|left|right|outer"}}}}
 """.strip()
 MAX_CLARIFICATION_ROUNDS = capability_int(
     "conversation", "maxClarificationRounds"
@@ -144,7 +148,7 @@ async def check_intent(
         f"上次工具失败：{json.dumps(request.toolFailure.model_dump() if request.toolFailure else None, ensure_ascii=False)}\n"
         f"数据范围结构摘要（不含数据行）：{json.dumps(scope_payload, ensure_ascii=False)}"
     )
-    full_timeout = float(os.getenv("AI_TIMEOUT_SECONDS", "60"))
+    full_timeout = model_timeout_seconds()
     timeout = float(
         os.getenv(
             "AI_INTENT_TIMEOUT_SECONDS",

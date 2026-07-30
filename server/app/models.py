@@ -32,6 +32,8 @@ INTENT_MAX_PRIOR_RESULT_ROWS = capability_int(
 
 class WorksheetSnapshot(BaseModel):
     name: SheetName
+    sourceFileId: str | None = Field(default=None, max_length=100)
+    sourceSheetId: str | None = Field(default=None, max_length=100)
     sourceFile: str | None = Field(default=None, max_length=500)
     sourceSheet: str | None = Field(default=None, max_length=100)
     usedRange: str | None = None
@@ -39,6 +41,7 @@ class WorksheetSnapshot(BaseModel):
     columnCount: int = Field(ge=0)
     headers: list[CellValue] = Field(default_factory=list, max_length=100)
     dataRows: list[list[CellValue]] = Field(default_factory=list, max_length=200)
+    displayRows: list[list[CellValue]] = Field(default_factory=list, max_length=200)
     truncated: bool = False
 
 
@@ -47,6 +50,8 @@ class WorkbookSnapshot(BaseModel):
     capturedAt: str
     activeWorksheet: str
     selectedRange: RangeAddress | None = None
+    sourceFingerprint: str | None = Field(default=None, min_length=1, max_length=128)
+    sourceFingerprintSheets: list[SheetName] = Field(default_factory=list, max_length=100)
     worksheets: list[WorksheetSnapshot] = Field(min_length=1, max_length=100)
 
 
@@ -532,12 +537,154 @@ class FormulasEqualCriterion(BaseModel):
         return self
 
 
+class RangeSortedCriterion(BaseModel):
+    type: Literal["rangeSorted"]
+    sheet: SheetName
+    range: RangeAddress
+    keys: list[SortKey] = Field(min_length=1, max_length=20)
+    hasHeaders: bool = True
+
+
+class FilterAppliedCriterion(BaseModel):
+    type: Literal["filterApplied"]
+    sheet: SheetName
+    range: RangeAddress
+    column: int = Field(ge=0, le=16383)
+    values: list[CellValue] = Field(min_length=1, max_length=500)
+
+
+class FilterClearedCriterion(BaseModel):
+    type: Literal["filterCleared"]
+    sheet: SheetName
+
+
+class TableExistsCriterion(BaseModel):
+    type: Literal["tableExists"]
+    sheet: SheetName
+    range: RangeAddress
+    name: str | None = Field(default=None, min_length=1, max_length=255)
+    hasHeaders: bool = True
+
+
+class RangeFormatMatchesCriterion(BaseModel):
+    type: Literal["rangeFormatMatches"]
+    sheet: SheetName
+    range: RangeAddress
+    fillColor: Annotated[
+        str, StringConstraints(pattern=r"^#[0-9A-Fa-f]{6}$")
+    ] | None = None
+    bold: bool | None = None
+    fontColor: Annotated[
+        str, StringConstraints(pattern=r"^#[0-9A-Fa-f]{6}$")
+    ] | None = None
+    numberFormat: str | None = Field(default=None, min_length=1, max_length=100)
+    horizontal: str | None = Field(default=None, min_length=1, max_length=50)
+    vertical: str | None = Field(default=None, min_length=1, max_length=50)
+    wrapText: bool | None = None
+    rowHeight: float | None = Field(default=None, ge=0, le=409)
+    columnWidth: float | None = Field(default=None, ge=0, le=255)
+
+    @model_validator(mode="after")
+    def require_expected_property(self) -> "RangeFormatMatchesCriterion":
+        fields = self.model_dump(exclude={"type", "sheet", "range"}, exclude_none=True)
+        if not fields:
+            raise ValueError("rangeFormatMatches 至少需要一个格式属性")
+        return self
+
+
+class BordersMatchCriterion(BaseModel):
+    type: Literal["bordersMatch"]
+    sheet: SheetName
+    range: RangeAddress
+    sides: list[
+        Literal[
+            "top",
+            "bottom",
+            "left",
+            "right",
+            "insideHorizontal",
+            "insideVertical",
+        ]
+    ] = Field(min_length=1, max_length=6)
+    style: Literal[
+        "continuous", "dash", "dashDot", "dot", "double", "none"
+    ]
+    color: Annotated[str, StringConstraints(pattern=r"^#[0-9A-Fa-f]{6}$")]
+    weight: Literal["hairline", "thin", "medium", "thick"]
+
+
+class DataValidationMatchesCriterion(BaseModel):
+    type: Literal["dataValidationMatches"]
+    sheet: SheetName
+    range: RangeAddress
+    validationType: Literal[
+        "list", "wholeNumber", "decimal", "date", "textLength", "custom"
+    ]
+    values: list[CellValue] = Field(default_factory=list, max_length=500)
+    formula1: str | int | float | None = None
+    formula2: str | int | float | None = None
+    operator: Literal[
+        "between",
+        "notBetween",
+        "equalTo",
+        "notEqualTo",
+        "greaterThan",
+        "lessThan",
+        "greaterThanOrEqualTo",
+        "lessThanOrEqualTo",
+    ]
+    allowBlank: bool
+    prompt: str | None = Field(default=None, max_length=255)
+    errorMessage: str | None = Field(default=None, max_length=255)
+
+
+class FreezePanesMatchesCriterion(BaseModel):
+    type: Literal["freezePanesMatches"]
+    sheet: SheetName
+    rows: int = Field(ge=0, le=1000)
+    columns: int = Field(ge=0, le=1000)
+
+
+class ChartExistsCriterion(BaseModel):
+    type: Literal["chartExists"]
+    sheet: SheetName
+    name: str | None = Field(default=None, min_length=1, max_length=255)
+    chartType: str = Field(min_length=1, max_length=100)
+    sourceRange: RangeAddress
+    title: str | None = Field(default=None, max_length=255)
+    targetRange: RangeAddress | None = None
+
+
+class PivotTableExistsCriterion(BaseModel):
+    type: Literal["pivotTableExists"]
+    sheet: SheetName
+    sourceSheet: SheetName
+    sourceRange: RangeAddress
+    name: str = Field(min_length=1, max_length=255)
+    destinationCell: RangeAddress
+    rowFields: list[str] = Field(default_factory=list, max_length=50)
+    columnFields: list[str] = Field(default_factory=list, max_length=50)
+    valueFields: list[PivotValueField] = Field(
+        default_factory=list, max_length=50
+    )
+
+
 VerificationCriterion = Annotated[
     WorksheetExistsCriterion
     | WorksheetMissingCriterion
     | RangeEqualsCriterion
     | RangeEmptyCriterion
-    | FormulasEqualCriterion,
+    | FormulasEqualCriterion
+    | RangeSortedCriterion
+    | FilterAppliedCriterion
+    | FilterClearedCriterion
+    | TableExistsCriterion
+    | RangeFormatMatchesCriterion
+    | BordersMatchCriterion
+    | DataValidationMatchesCriterion
+    | FreezePanesMatchesCriterion
+    | ChartExistsCriterion
+    | PivotTableExistsCriterion,
     Field(discriminator="type"),
 ]
 
@@ -588,6 +735,8 @@ class AnalysisPlan(BaseModel):
     id: str = Field(min_length=1, max_length=100)
     title: str = Field(min_length=1, max_length=100)
     summary: str = Field(min_length=1, max_length=1000)
+    sourceFingerprint: str | None = Field(default=None, min_length=1, max_length=128)
+    sourceFingerprintSheets: list[SheetName] = Field(default_factory=list, max_length=100)
     assumptions: list[str] = Field(default_factory=list, max_length=20)
     warnings: list[str] = Field(default_factory=list, max_length=20)
     actions: list[ExcelAction] = Field(min_length=1, max_length=50)
@@ -611,6 +760,16 @@ class AnalysisPlan(BaseModel):
             | RangeEqualsCriterion
             | RangeEmptyCriterion
             | FormulasEqualCriterion
+            | RangeSortedCriterion
+            | FilterAppliedCriterion
+            | FilterClearedCriterion
+            | TableExistsCriterion
+            | RangeFormatMatchesCriterion
+            | BordersMatchCriterion
+            | DataValidationMatchesCriterion
+            | FreezePanesMatchesCriterion
+            | ChartExistsCriterion
+            | PivotTableExistsCriterion
         ] = list(self.acceptanceCriteria)
         criterion_keys = {
             criterion.model_dump_json(exclude_none=True) for criterion in criteria
@@ -621,14 +780,56 @@ class AnalysisPlan(BaseModel):
             | WorksheetMissingCriterion
             | RangeEqualsCriterion
             | RangeEmptyCriterion
-            | FormulasEqualCriterion,
+            | FormulasEqualCriterion
+            | RangeSortedCriterion
+            | FilterAppliedCriterion
+            | FilterClearedCriterion
+            | TableExistsCriterion
+            | RangeFormatMatchesCriterion
+            | BordersMatchCriterion
+            | DataValidationMatchesCriterion
+            | FreezePanesMatchesCriterion
+            | ChartExistsCriterion
+            | PivotTableExistsCriterion
         ) -> None:
             key = criterion.model_dump_json(exclude_none=True)
             if key not in criterion_keys:
                 criteria.append(criterion)
                 criterion_keys.add(key)
 
-        for action in self.actions:
+        for action_index, action in enumerate(self.actions):
+            later_actions = self.actions[action_index + 1 :]
+
+            def range_is_sorted_later(address: str) -> bool:
+                normalized = address.replace("$", "").strip().upper()
+                return any(
+                    later.type == "sortRange"
+                    and later.sheet.casefold() == action.sheet.casefold()
+                    and later.range.replace("$", "").strip().upper() == normalized
+                    for later in later_actions
+                )
+
+            filter_changes_later = any(
+                later.type in {"filterRange", "clearFilter"}
+                and later.sheet.casefold() == action.sheet.casefold()
+                for later in later_actions
+            )
+
+            def later_same_range(action_type: str) -> list[ExcelAction]:
+                normalized = getattr(action, "range", "").replace(
+                    "$", ""
+                ).strip().upper()
+                return [
+                    later
+                    for later in later_actions
+                    if later.type == action_type
+                    and later.sheet.casefold() == action.sheet.casefold()
+                    and getattr(later, "range", "")
+                    .replace("$", "")
+                    .strip()
+                    .upper()
+                    == normalized
+                ]
             if action.type == "deleteWorksheet":
                 add_criterion(
                     WorksheetMissingCriterion(
@@ -643,7 +844,9 @@ class AnalysisPlan(BaseModel):
                     sheet=action.sheet,
                 )
             )
-            if action.type == "writeValues":
+            if action.type == "writeValues" and not range_is_sorted_later(
+                action.range
+            ):
                 add_criterion(
                     RangeEqualsCriterion(
                         type="rangeEquals",
@@ -677,7 +880,7 @@ class AnalysisPlan(BaseModel):
                 target_range = _matrix_range(
                     action.startCell, len(values), len(action.headers)
                 )
-                if target_range:
+                if target_range and not range_is_sorted_later(target_range):
                     add_criterion(
                         RangeEqualsCriterion(
                             type="rangeEquals",
@@ -686,6 +889,223 @@ class AnalysisPlan(BaseModel):
                             expected=values,
                         )
                     )
+            elif action.type == "sortRange":
+                add_criterion(
+                    RangeSortedCriterion(
+                        type="rangeSorted",
+                        sheet=action.sheet,
+                        range=action.range,
+                        keys=action.keys,
+                        hasHeaders=action.hasHeaders,
+                    )
+                )
+            elif action.type == "filterRange" and not filter_changes_later:
+                add_criterion(
+                    FilterAppliedCriterion(
+                        type="filterApplied",
+                        sheet=action.sheet,
+                        range=action.range,
+                        column=action.column,
+                        values=action.values,
+                    )
+                )
+            elif action.type == "clearFilter" and not filter_changes_later:
+                add_criterion(
+                    FilterClearedCriterion(
+                        type="filterCleared",
+                        sheet=action.sheet,
+                    )
+                )
+            elif action.type == "createTable":
+                add_criterion(
+                    TableExistsCriterion(
+                        type="tableExists",
+                        sheet=action.sheet,
+                        range=action.range,
+                        name=action.name,
+                        hasHeaders=action.hasHeaders,
+                    )
+                )
+            elif action.type == "setFill" and not later_same_range("setFill"):
+                add_criterion(
+                    RangeFormatMatchesCriterion(
+                        type="rangeFormatMatches",
+                        sheet=action.sheet,
+                        range=action.range,
+                        fillColor=action.color,
+                    )
+                )
+            elif action.type == "setFont":
+                later_fonts = later_same_range("setFont")
+                expected_bold = (
+                    None
+                    if any(later.bold is not None for later in later_fonts)
+                    else action.bold
+                )
+                expected_color = (
+                    None
+                    if any(later.color is not None for later in later_fonts)
+                    else action.color
+                )
+                if expected_bold is None and expected_color is None:
+                    continue
+                add_criterion(
+                    RangeFormatMatchesCriterion(
+                        type="rangeFormatMatches",
+                        sheet=action.sheet,
+                        range=action.range,
+                        bold=expected_bold,
+                        fontColor=expected_color,
+                    )
+                )
+            elif action.type == "setNumberFormat" and not later_same_range(
+                "setNumberFormat"
+            ):
+                add_criterion(
+                    RangeFormatMatchesCriterion(
+                        type="rangeFormatMatches",
+                        sheet=action.sheet,
+                        range=action.range,
+                        numberFormat=action.formatCode,
+                    )
+                )
+            elif action.type == "setAlignment":
+                later_alignments = later_same_range("setAlignment")
+                expected_horizontal = (
+                    None
+                    if any(
+                        later.horizontal is not None
+                        for later in later_alignments
+                    )
+                    else action.horizontal
+                )
+                expected_vertical = (
+                    None
+                    if any(
+                        later.vertical is not None
+                        for later in later_alignments
+                    )
+                    else action.vertical
+                )
+                expected_wrap_text = (
+                    None
+                    if any(
+                        later.wrapText is not None
+                        for later in later_alignments
+                    )
+                    else action.wrapText
+                )
+                if (
+                    expected_horizontal is None
+                    and expected_vertical is None
+                    and expected_wrap_text is None
+                ):
+                    continue
+                add_criterion(
+                    RangeFormatMatchesCriterion(
+                        type="rangeFormatMatches",
+                        sheet=action.sheet,
+                        range=action.range,
+                        horizontal=expected_horizontal,
+                        vertical=expected_vertical,
+                        wrapText=expected_wrap_text,
+                    )
+                )
+            elif action.type == "resizeRange":
+                later_resizes = later_same_range("resizeRange")
+                expected_row_height = (
+                    None
+                    if any(
+                        later.rowHeight is not None for later in later_resizes
+                    )
+                    else action.rowHeight
+                )
+                expected_column_width = (
+                    None
+                    if any(
+                        later.columnWidth is not None
+                        for later in later_resizes
+                    )
+                    else action.columnWidth
+                )
+                if expected_row_height is None and expected_column_width is None:
+                    continue
+                add_criterion(
+                    RangeFormatMatchesCriterion(
+                        type="rangeFormatMatches",
+                        sheet=action.sheet,
+                        range=action.range,
+                        rowHeight=expected_row_height,
+                        columnWidth=expected_column_width,
+                    )
+                )
+            elif action.type == "setBorders":
+                later_borders = later_same_range("setBorders")
+                expected_sides = [
+                    side
+                    for side in action.sides
+                    if not any(
+                        side in later.sides for later in later_borders
+                    )
+                ]
+                if not expected_sides:
+                    continue
+                add_criterion(
+                    BordersMatchCriterion(
+                        type="bordersMatch",
+                        sheet=action.sheet,
+                        range=action.range,
+                        sides=expected_sides,
+                        style=action.style,
+                        color=action.color,
+                        weight=action.weight,
+                    )
+                )
+            elif action.type == "setDataValidation" and not later_same_range(
+                "setDataValidation"
+            ):
+                add_criterion(
+                    DataValidationMatchesCriterion(
+                        type="dataValidationMatches",
+                        sheet=action.sheet,
+                        range=action.range,
+                        validationType=action.validationType,
+                        values=action.values,
+                        formula1=action.formula1,
+                        formula2=action.formula2,
+                        operator=action.operator,
+                        allowBlank=action.allowBlank,
+                        prompt=action.prompt,
+                        errorMessage=action.errorMessage,
+                    )
+                )
+            elif action.type == "freezePanes" and not any(
+                later.type == "freezePanes"
+                and later.sheet.casefold() == action.sheet.casefold()
+                for later in later_actions
+            ):
+                add_criterion(
+                    FreezePanesMatchesCriterion(
+                        type="freezePanesMatches",
+                        sheet=action.sheet,
+                        rows=action.rows,
+                        columns=action.columns,
+                    )
+                )
+            elif action.type == "createPivotTable":
+                add_criterion(
+                    PivotTableExistsCriterion(
+                        type="pivotTableExists",
+                        sheet=action.sheet,
+                        sourceSheet=action.sourceSheet,
+                        sourceRange=action.sourceRange,
+                        name=action.name,
+                        destinationCell=action.destinationCell,
+                        rowFields=action.rowFields,
+                        columnFields=action.columnFields,
+                        valueFields=action.valueFields,
+                    )
+                )
         destructive_types = {"deleteWorksheet", "clearRange", "deleteRange"}
         if any(action.type in destructive_types for action in self.actions) or any(
             action.type == "splitGroupAggregate"
@@ -714,7 +1134,8 @@ class ActionExecutionResult(BaseModel):
     index: int = Field(ge=0)
     type: str
     sheet: str
-    status: Literal["succeeded"]
+    status: Literal["succeeded", "failed", "not_run"]
+    message: str | None = Field(default=None, max_length=1000)
 
 
 class VerificationCheck(BaseModel):
@@ -724,9 +1145,28 @@ class VerificationCheck(BaseModel):
     actual: list[list[CellValue]] | None = None
 
 
+class UnverifiedAction(BaseModel):
+    index: int = Field(ge=0)
+    type: str
+    sheet: str
+    message: str = Field(min_length=1, max_length=1000)
+
+
 class VerificationReport(BaseModel):
+    status: Literal["verified", "executed_unverified", "failed"]
     passed: bool
     checks: list[VerificationCheck]
+    unverifiedActions: list[UnverifiedAction] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_status(self) -> "VerificationReport":
+        if self.passed != (self.status == "verified"):
+            raise ValueError("passed 必须与 verification status 一致")
+        if self.status == "verified" and self.unverifiedActions:
+            raise ValueError("verified 结果不能包含未验证动作")
+        if self.status == "executed_unverified" and not self.unverifiedActions:
+            raise ValueError("executed_unverified 必须说明未验证动作")
+        return self
 
 
 class ResultContext(BaseModel):
@@ -877,6 +1317,31 @@ class DataMetric(BaseModel):
     ratioOutputName: str | None = Field(default=None, max_length=200)
 
 
+class DataCombine(BaseModel):
+    mode: Literal["union", "deduplicate", "join"] = "union"
+    deduplicateBy: list[str] = Field(default_factory=list, max_length=30)
+    leftSourceSheetId: str | None = Field(default=None, max_length=100)
+    rightSourceSheetId: str | None = Field(default=None, max_length=100)
+    leftKey: str | None = Field(default=None, max_length=200)
+    rightKey: str | None = Field(default=None, max_length=200)
+    joinHow: Literal["inner", "left", "right", "outer"] = "inner"
+
+    @model_validator(mode="after")
+    def validate_combine(self) -> "DataCombine":
+        if self.mode == "deduplicate" and not self.deduplicateBy:
+            raise ValueError("deduplicate 合并需要 deduplicateBy")
+        if self.mode == "join" and not all(
+            (
+                self.leftSourceSheetId,
+                self.rightSourceSheetId,
+                self.leftKey,
+                self.rightKey,
+            )
+        ):
+            raise ValueError("join 合并需要左右工作表 ID 和关联键")
+        return self
+
+
 class QueryTableArguments(BaseModel):
     mode: Literal["rows", "aggregate", "profile"]
     scope: Literal["selected", "active"] = "selected"
@@ -884,6 +1349,7 @@ class QueryTableArguments(BaseModel):
     filters: list[DataFilter] = Field(default_factory=list, max_length=20)
     groupBy: list[str] = Field(default_factory=list, max_length=10)
     metrics: list[DataMetric] = Field(default_factory=list, max_length=10)
+    combine: DataCombine | None = None
     profileField: str | None = Field(default=None, max_length=200)
     sortBy: str | None = Field(default=None, max_length=200)
     sortDirection: Literal["asc", "desc"] = "desc"
@@ -912,6 +1378,17 @@ class DataToolRequest(BaseModel):
     arguments: QueryTableArguments
 
 
+class DeterministicQueryTemplate(BaseModel):
+    id: str = Field(min_length=1, max_length=100)
+    name: str = Field(min_length=1, max_length=100)
+    description: str = Field(min_length=1, max_length=500)
+    sourceMode: Literal["workbook", "folder"]
+    request: DataToolRequest
+    sourceSheetNames: list[str] = Field(default_factory=list, max_length=100)
+    sourceSheetIds: list[str] = Field(default_factory=list, max_length=100)
+    expectedHeaders: list[str] = Field(default_factory=list, max_length=50)
+
+
 class DataToolResult(BaseModel):
     requestId: str = Field(min_length=1, max_length=100)
     tool: Literal["query_table"] = "query_table"
@@ -930,6 +1407,78 @@ class DataToolResult(BaseModel):
         if any(len(row) != width for row in self.rows):
             raise ValueError("数据工具结果的每一行必须与 headers 等宽")
         return self
+
+
+class ManagedModelConnectionResponse(BaseModel):
+    id: str
+    catalogModelId: str
+    label: str
+    baseUrl: str
+    modelId: str
+    supportsVision: bool
+    apiKeyConfigured: bool
+    apiKeyHint: str | None = None
+
+
+class ModelSettingsResponse(BaseModel):
+    baseUrl: str | None = None
+    defaultModel: str | None = None
+    apiKeyConfigured: bool
+    apiKeyHint: str | None = None
+    connections: list[ManagedModelConnectionResponse] = Field(
+        default_factory=list,
+        max_length=50,
+    )
+
+
+class UpdateModelSettingsRequest(BaseModel):
+    apiKey: Annotated[
+        str,
+        StringConstraints(strip_whitespace=True, min_length=1, max_length=4096),
+    ]
+
+
+class UpsertModelConnectionRequest(BaseModel):
+    id: Annotated[
+        str,
+        StringConstraints(
+            strip_whitespace=True,
+            min_length=8,
+            max_length=80,
+            pattern=r"^[A-Za-z0-9_-]+$",
+        ),
+    ] | None = None
+    label: Annotated[
+        str,
+        StringConstraints(strip_whitespace=True, min_length=1, max_length=80),
+    ]
+    baseUrl: Annotated[
+        str,
+        StringConstraints(strip_whitespace=True, min_length=8, max_length=500),
+    ]
+    modelId: Annotated[
+        str,
+        StringConstraints(strip_whitespace=True, min_length=1, max_length=200),
+    ]
+    apiKey: Annotated[
+        str,
+        StringConstraints(strip_whitespace=True, min_length=1, max_length=4096),
+    ] | None = None
+    clearApiKey: bool = False
+    supportsVision: bool = False
+
+    @field_validator("baseUrl")
+    @classmethod
+    def validate_base_url(cls, value: str) -> str:
+        normalized = value.rstrip("/")
+        if not normalized.startswith(("http://", "https://")):
+            raise ValueError("服务地址必须以 http:// 或 https:// 开头")
+        return normalized
+
+
+class TestModelConnectionResponse(BaseModel):
+    ok: bool
+    message: str
 
 
 class IntentClarification(BaseModel):
@@ -1003,6 +1552,15 @@ AssistantResponse = Annotated[
     PlanResponse | AnswerResponse,
     Field(discriminator="kind"),
 ]
+
+
+class TurnStepEvent(BaseModel):
+    """流式分步进度事件；仅用于 /api/turn/stream 的 step 事件，不参与写入契约。"""
+
+    phase: Literal["planning"] = "planning"
+    title: str = Field(min_length=1, max_length=200)
+    detail: str | None = Field(default=None, max_length=500)
+    completedStep: str | None = Field(default=None, max_length=200)
 
 TurnRequest = IntentCheckRequest | PlanRequest
 TurnResponse = Annotated[

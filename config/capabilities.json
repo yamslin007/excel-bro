@@ -10,12 +10,15 @@
     "maxRows": 250000,
     "maxColumns": 100,
     "maxCells": 1000000,
+    "chunkRows": 5000,
     "headerScanRows": 12,
     "defaultLimit": 20,
     "maxResultRows": 200
   },
   "folder": {
     "maxFiles": 100,
+    "maxSessions": 20,
+    "sessionTtlSeconds": 1800,
     "outputFileName": "Excel Bro 结果.xlsx"
   },
   "images": {
@@ -42,7 +45,14 @@
   "agent": {
     "maxTurns": 8,
     "maxReadRows": 200,
-    "maxReadColumns": 30
+    "maxReadColumns": 30,
+    "maxOutputTokens": 4000
+  },
+  "llm": {
+    "maxRetries": 5,
+    "retryBaseDelaySeconds": 1.5,
+    "retryMaxDelaySeconds": 45.0,
+    "timeoutSeconds": 60.0
   },
   "turns": {
     "maxActive": 500,

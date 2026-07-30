@@ -2,6 +2,8 @@ export type CellValue = string | number | boolean | null;
 
 export interface WorksheetSnapshot {
   name: string;
+  sourceFileId?: string | null;
+  sourceSheetId?: string | null;
   sourceFile?: string | null;
   sourceSheet?: string | null;
   usedRange: string | null;
@@ -10,6 +12,7 @@ export interface WorksheetSnapshot {
   headers: CellValue[];
   previewRows?: CellValue[][];
   dataRows: CellValue[][];
+  displayRows?: CellValue[][];
   truncated: boolean;
 }
 
@@ -18,6 +21,8 @@ export interface WorkbookSnapshot {
   capturedAt: string;
   activeWorksheet: string;
   selectedRange?: string | null;
+  sourceFingerprint?: string | null;
+  sourceFingerprintSheets?: string[];
   worksheets: WorksheetSnapshot[];
 }
 
@@ -252,12 +257,109 @@ export type VerificationCriterion =
       sheet: string;
       range: string;
       expected: string[][];
+    }
+  | {
+      type: "rangeSorted";
+      sheet: string;
+      range: string;
+      keys: Array<{ column: number; ascending: boolean }>;
+      hasHeaders: boolean;
+    }
+  | {
+      type: "filterApplied";
+      sheet: string;
+      range: string;
+      column: number;
+      values: CellValue[];
+    }
+  | { type: "filterCleared"; sheet: string }
+  | {
+      type: "tableExists";
+      sheet: string;
+      range: string;
+      name?: string | null;
+      hasHeaders: boolean;
+    }
+  | {
+      type: "rangeFormatMatches";
+      sheet: string;
+      range: string;
+      fillColor?: string | null;
+      bold?: boolean | null;
+      fontColor?: string | null;
+      numberFormat?: string | null;
+      horizontal?: string | null;
+      vertical?: string | null;
+      wrapText?: boolean | null;
+      rowHeight?: number | null;
+      columnWidth?: number | null;
+    }
+  | {
+      type: "bordersMatch";
+      sheet: string;
+      range: string;
+      sides: Array<
+        "top" | "bottom" | "left" | "right" | "insideHorizontal" | "insideVertical"
+      >;
+      style: string;
+      color: string;
+      weight: string;
+    }
+  | {
+      type: "dataValidationMatches";
+      sheet: string;
+      range: string;
+      validationType:
+        | "list"
+        | "wholeNumber"
+        | "decimal"
+        | "date"
+        | "textLength"
+        | "custom";
+      values: CellValue[];
+      formula1?: string | number | null;
+      formula2?: string | number | null;
+      operator: string;
+      allowBlank: boolean;
+      prompt?: string | null;
+      errorMessage?: string | null;
+    }
+  | {
+      type: "freezePanesMatches";
+      sheet: string;
+      rows: number;
+      columns: number;
+    }
+  | {
+      type: "chartExists";
+      sheet: string;
+      name?: string | null;
+      chartType: string;
+      sourceRange: string;
+      title?: string | null;
+      targetRange?: string | null;
+    }
+  | {
+      type: "pivotTableExists";
+      sheet: string;
+      sourceSheet: string;
+      sourceRange: string;
+      name: string;
+      destinationCell: string;
+      rowFields: string[];
+      columnFields: string[];
+      valueFields: Array<{
+        field: string;
+        aggregation: "sum" | "count" | "average" | "max" | "min";
+      }>;
     };
 
 export interface AnalysisPlan {
   id: string;
   title: string;
   summary: string;
+  sourceFingerprint?: string | null;
+  sourceFingerprintSheets?: string[];
   assumptions: string[];
   warnings: string[];
   actions: ExcelAction[];
@@ -366,6 +468,15 @@ export interface QueryTableArguments {
   filters?: DataFilter[];
   groupBy?: string[];
   metrics?: DataMetric[];
+  combine?: {
+    mode: "union" | "deduplicate" | "join";
+    deduplicateBy?: string[];
+    leftSourceSheetId?: string | null;
+    rightSourceSheetId?: string | null;
+    leftKey?: string | null;
+    rightKey?: string | null;
+    joinHow?: "inner" | "left" | "right" | "outer";
+  } | null;
   profileField?: string | null;
   sortBy?: string | null;
   sortDirection?: "asc" | "desc";
@@ -378,9 +489,103 @@ export interface DataToolRequest {
   arguments: QueryTableArguments;
 }
 
+export interface DeterministicQueryTemplate {
+  id: string;
+  name: string;
+  description: string;
+  sourceMode: "workbook" | "folder";
+  request: DataToolRequest;
+  sourceSheetNames: string[];
+  sourceSheetIds: string[];
+  expectedHeaders: string[];
+}
+
 export interface IntentMemory {
   confirmedPrompt: string;
   toolRequest?: DataToolRequest | null;
+}
+
+export interface ModelSettings {
+  baseUrl: string | null;
+  defaultModel: string | null;
+  apiKeyConfigured: boolean;
+  apiKeyHint: string | null;
+  connections: ManagedModelConnection[];
+}
+
+export interface ManagedModelConnection {
+  id: string;
+  catalogModelId: string;
+  label: string;
+  baseUrl: string;
+  modelId: string;
+  supportsVision: boolean;
+  apiKeyConfigured: boolean;
+  apiKeyHint: string | null;
+}
+
+export interface UpdateModelSettingsRequest {
+  apiKey: string;
+}
+
+export interface UpsertModelConnectionRequest {
+  id?: string | null;
+  label: string;
+  baseUrl: string;
+  modelId: string;
+  apiKey?: string | null;
+  clearApiKey?: boolean;
+  supportsVision: boolean;
+}
+
+export interface TestModelConnectionResponse {
+  ok: boolean;
+  message: string;
+}
+
+export function assertTestModelConnectionResponse(
+  value: unknown
+): asserts value is TestModelConnectionResponse {
+  if (!value || typeof value !== "object") {
+    throw new Error("服务返回的连接测试结果不是有效对象");
+  }
+  const result = value as Partial<TestModelConnectionResponse>;
+  if (result.ok !== true || typeof result.message !== "string") {
+    throw new Error("服务返回的连接测试结果缺少必要字段");
+  }
+}
+
+export function assertModelSettings(
+  value: unknown
+): asserts value is ModelSettings {
+  if (!value || typeof value !== "object") {
+    throw new Error("服务返回的模型设置不是有效对象");
+  }
+  const settings = value as Partial<ModelSettings>;
+  if (
+    (settings.baseUrl !== null && typeof settings.baseUrl !== "string") ||
+    (settings.defaultModel !== null &&
+      typeof settings.defaultModel !== "string") ||
+    typeof settings.apiKeyConfigured !== "boolean" ||
+    (settings.apiKeyHint !== null &&
+      typeof settings.apiKeyHint !== "string") ||
+    !Array.isArray(settings.connections) ||
+    settings.connections.some(
+      (connection) =>
+        !connection ||
+        typeof connection.id !== "string" ||
+        typeof connection.catalogModelId !== "string" ||
+        typeof connection.label !== "string" ||
+        typeof connection.baseUrl !== "string" ||
+        typeof connection.modelId !== "string" ||
+        typeof connection.supportsVision !== "boolean" ||
+        typeof connection.apiKeyConfigured !== "boolean" ||
+        (connection.apiKeyHint !== null &&
+          typeof connection.apiKeyHint !== "string")
+    )
+  ) {
+    throw new Error("服务返回的模型设置无效");
+  }
 }
 
 export interface DataToolResult {
@@ -394,6 +599,32 @@ export interface DataToolResult {
   complete: boolean;
   calculation: string;
   warnings: string[];
+}
+
+export function assertDataToolResult(
+  value: unknown
+): asserts value is DataToolResult {
+  const item = value as Partial<DataToolResult>;
+  if (
+    !item ||
+    typeof item !== "object" ||
+    typeof item.requestId !== "string" ||
+    item.tool !== "query_table" ||
+    typeof item.title !== "string" ||
+    !Array.isArray(item.headers) ||
+    !item.headers.every((header) => typeof header === "string") ||
+    !Array.isArray(item.rows) ||
+    !item.rows.every((row) => Array.isArray(row)) ||
+    !Array.isArray(item.sourceSheets) ||
+    !item.sourceSheets.every((sheet) => typeof sheet === "string") ||
+    typeof item.scannedRows !== "number" ||
+    typeof item.complete !== "boolean" ||
+    typeof item.calculation !== "string" ||
+    !Array.isArray(item.warnings) ||
+    !item.warnings.every((warning) => typeof warning === "string")
+  ) {
+    throw new Error("本地服务返回了无效的数据工具结果");
+  }
 }
 
 export interface IntentClarification {
@@ -508,6 +739,9 @@ export interface FolderCatalog {
   folderName: string;
   folderPath: string;
   files: FolderFileInfo[];
+  totalFiles: number;
+  truncated: boolean;
+  expiresAt: string;
 }
 
 export interface FolderSelection {
@@ -520,13 +754,16 @@ export interface FolderExecuteResult {
   backups: string[];
   actionResults: ActionExecutionResult[];
   verification: VerificationReport;
+  executionMs: number;
+  verificationMs: number;
 }
 
 export interface ActionExecutionResult {
   index: number;
   type: ExcelAction["type"];
   sheet: string;
-  status: "succeeded";
+  status: "succeeded" | "failed" | "not_run";
+  message?: string | null;
 }
 
 export interface VerificationCheck {
@@ -536,14 +773,43 @@ export interface VerificationCheck {
   actual?: CellValue[][] | null;
 }
 
+export interface UnverifiedAction {
+  index: number;
+  type: ExcelAction["type"];
+  sheet: string;
+  message: string;
+}
+
 export interface VerificationReport {
+  status: "verified" | "executed_unverified" | "failed";
   passed: boolean;
   checks: VerificationCheck[];
+  unverifiedActions: UnverifiedAction[];
 }
 
 export interface PlanExecutionResult {
   actionResults: ActionExecutionResult[];
   verification: VerificationReport;
+  undoSnapshot?: ExecutionUndoSnapshot | null;
+  executionMs: number;
+  verificationMs: number;
+}
+
+export interface UndoRangeSnapshot {
+  actionIndex: number;
+  sheet: string;
+  range: string;
+  formulas: CellValue[][];
+  numberFormat: string[][];
+  fillColor: string;
+  fontBold: boolean;
+  fontColor: string;
+}
+
+export interface ExecutionUndoSnapshot {
+  planId: string;
+  capturedAt: string;
+  ranges: UndoRangeSnapshot[];
 }
 
 export type AssistantResponse =
@@ -560,6 +826,13 @@ export type AssistantResponse =
       provider: "model" | "local";
       turnId?: string | null;
     };
+
+export interface TurnStepEvent {
+  phase: "planning";
+  title: string;
+  detail?: string | null;
+  completedStep?: string | null;
+}
 
 const allowedActionTypes = new Set<ExcelAction["type"]>([
   "createWorksheet",
@@ -603,7 +876,17 @@ const allowedCriterionTypes = new Set<VerificationCriterion["type"]>([
   "worksheetMissing",
   "rangeEquals",
   "rangeEmpty",
-  "formulasEqual"
+  "formulasEqual",
+  "rangeSorted",
+  "filterApplied",
+  "filterCleared",
+  "tableExists",
+  "rangeFormatMatches",
+  "bordersMatch",
+  "dataValidationMatches",
+  "freezePanesMatches",
+  "chartExists",
+  "pivotTableExists"
 ]);
 
 function rangeDimensions(address: string): [number, number] | null {
@@ -678,6 +961,119 @@ export function assertAssistantResponse(
       throw new Error("验收条件只能检查计划实际操作的工作表");
     }
     if (
+      [
+        "rangeSorted",
+        "filterApplied",
+        "tableExists",
+        "rangeFormatMatches",
+        "bordersMatch",
+        "dataValidationMatches"
+      ].includes(
+        criterion.type
+      ) &&
+      typeof (criterion as { range?: unknown }).range !== "string"
+    ) {
+      throw new Error(`${criterion.type} 缺少有效范围`);
+    }
+    if (
+      criterion.type === "rangeSorted" &&
+      (!Array.isArray(criterion.keys) ||
+        criterion.keys.length === 0 ||
+        typeof criterion.hasHeaders !== "boolean" ||
+        criterion.keys.some(
+          (key) =>
+            !Number.isInteger(key?.column) ||
+            key.column < 0 ||
+            typeof key.ascending !== "boolean"
+        ))
+    ) {
+      throw new Error("rangeSorted 的排序键无效");
+    }
+    if (
+      criterion.type === "filterApplied" &&
+      (!Number.isInteger(criterion.column) ||
+        criterion.column < 0 ||
+        !Array.isArray(criterion.values) ||
+        criterion.values.length === 0)
+    ) {
+      throw new Error("filterApplied 的筛选条件无效");
+    }
+    if (
+      criterion.type === "tableExists" &&
+      (typeof criterion.hasHeaders !== "boolean" ||
+        (criterion.name !== undefined &&
+          criterion.name !== null &&
+          typeof criterion.name !== "string"))
+    ) {
+      throw new Error("tableExists 的表格条件无效");
+    }
+    if (criterion.type === "rangeFormatMatches") {
+      const expectedProperties = [
+        criterion.fillColor,
+        criterion.bold,
+        criterion.fontColor,
+        criterion.numberFormat,
+        criterion.horizontal,
+        criterion.vertical,
+        criterion.wrapText,
+        criterion.rowHeight,
+        criterion.columnWidth
+      ];
+      if (expectedProperties.every((property) => property == null)) {
+        throw new Error("rangeFormatMatches 缺少格式属性");
+      }
+    }
+    if (
+      criterion.type === "bordersMatch" &&
+      (!Array.isArray(criterion.sides) ||
+        criterion.sides.length === 0 ||
+        typeof criterion.style !== "string" ||
+        typeof criterion.color !== "string" ||
+        typeof criterion.weight !== "string")
+    ) {
+      throw new Error("bordersMatch 的边框条件无效");
+    }
+    if (
+      criterion.type === "dataValidationMatches" &&
+      (typeof criterion.validationType !== "string" ||
+        !Array.isArray(criterion.values) ||
+        typeof criterion.operator !== "string" ||
+        typeof criterion.allowBlank !== "boolean")
+    ) {
+      throw new Error("dataValidationMatches 的验证条件无效");
+    }
+    if (
+      criterion.type === "freezePanesMatches" &&
+      (!Number.isInteger(criterion.rows) ||
+        criterion.rows < 0 ||
+        !Number.isInteger(criterion.columns) ||
+        criterion.columns < 0)
+    ) {
+      throw new Error("freezePanesMatches 的冻结位置无效");
+    }
+    if (
+      criterion.type === "chartExists" &&
+      (typeof criterion.chartType !== "string" ||
+        typeof criterion.sourceRange !== "string" ||
+        (criterion.name != null && typeof criterion.name !== "string") ||
+        (criterion.targetRange != null &&
+          typeof criterion.targetRange !== "string"))
+    ) {
+      throw new Error("chartExists 的图表条件无效");
+    }
+    if (
+      criterion.type === "pivotTableExists" &&
+      (typeof criterion.name !== "string" ||
+        typeof criterion.sourceSheet !== "string" ||
+        typeof criterion.sourceRange !== "string" ||
+        typeof criterion.destinationCell !== "string" ||
+        !Array.isArray(criterion.rowFields) ||
+        !Array.isArray(criterion.columnFields) ||
+        !Array.isArray(criterion.valueFields))
+    ) {
+      throw new Error("pivotTableExists 的数据透视表条件无效");
+    }
+    if (
       criterion.type === "rangeEquals" ||
       criterion.type === "formulasEqual"
     ) {
@@ -704,4 +1100,21 @@ export function assertAssistantResponse(
       }
     }
   }
+}
+
+export function parseTurnStepEvent(value: unknown): TurnStepEvent | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const event = value as Partial<TurnStepEvent>;
+  if (event.phase !== "planning" || typeof event.title !== "string" || !event.title) {
+    return null;
+  }
+  return {
+    phase: "planning",
+    title: event.title,
+    detail: typeof event.detail === "string" ? event.detail : null,
+    completedStep:
+      typeof event.completedStep === "string" ? event.completedStep : null
+  };
 }

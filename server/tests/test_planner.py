@@ -2,16 +2,21 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 
 import httpx
 import pytest
 
+import server.app.llm.config as llm_config
 from server.app.models import PlanRequest
 from server.app.planner import create_plan
 
 
 @pytest.fixture(autouse=True)
-def clear_model_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+def clear_model_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     for name in (
         "AI_API_KEY",
         "AI_BASE_URL",
@@ -23,6 +28,11 @@ def clear_model_environment(monkeypatch: pytest.MonkeyPatch) -> None:
         "OPENAI_MODEL",
     ):
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(
+        llm_config,
+        "_config_path",
+        lambda: tmp_path / "config.env",
+    )
 
 
 def _request() -> PlanRequest:
@@ -879,6 +889,53 @@ def test_agent_tool_schemas_do_not_contain_local_references() -> None:
     assert '"$ref"' not in serialized
 
 
+def test_submit_plan_schema_is_compacted_but_preserves_action_fields() -> None:
+    from server.app.excel_agent import AGENT_TOOLS
+
+    plan_tool = next(
+        tool
+        for tool in AGENT_TOOLS
+        if tool["function"]["name"] == "submit_plan"
+    )
+    plan_schema = plan_tool["function"]["parameters"]["properties"]["plan"]
+    plan_properties = plan_schema["properties"]
+
+    # 业务字段 title 必须保留（曾因元数据剥离误删导致必填校验失败）。
+    assert "title" in plan_properties
+    # acceptanceCriteria 由验证器自动推断，不应再向模型公布这段最大子 schema。
+    assert "acceptanceCriteria" not in plan_properties
+    # 动作字段级结构必须完整保留，模型才知道每种动作的字段。
+    assert "items" in plan_properties["actions"]
+    # Pydantic 自动生成的 title 元数据应已剥离（顶层不再有裸 title 注解）。
+    assert "title" not in plan_schema
+
+    # 精简后 token 体积应显著低于未精简的完整内联 schema。
+    serialized = json.dumps(plan_tool, ensure_ascii=False)
+    assert len(serialized) < 26000
+
+
+def test_plan_without_acceptance_criteria_still_validates() -> None:
+    from server.app.models import AnalysisPlan
+
+    plan = AnalysisPlan.model_validate(
+        {
+            "id": "t1",
+            "title": "写入测试",
+            "summary": "在 A1 写入一个值",
+            "actions": [
+                {
+                    "type": "writeValues",
+                    "sheet": "Sheet1",
+                    "range": "A1",
+                    "values": [[1]],
+                }
+            ],
+        }
+    )
+    # 模型省略 acceptanceCriteria 时，验证器仍能自动推断出确定性验收条件。
+    assert plan.acceptanceCriteria
+
+
 def test_request_can_force_local_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1031,3 +1088,275 @@ def test_openai_environment_names_are_supported(
 
     assert response.provider == "model"
     assert captured_headers["authorization"] == "Bearer test-key"
+
+
+def _find_fields_agent_handler(
+    call_log: list[dict[str, object]],
+):
+    """两轮：先 find_fields，再 submit_plan（写公式）。"""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        call_log.append(body)
+        # 每次 create_plan 都会重新从第 1 轮开始，故按“本次请求内的顺序”判断。
+        tool_messages = [
+            message
+            for message in body["messages"]
+            if isinstance(message, dict) and message.get("role") == "tool"
+        ]
+        if not tool_messages:
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "field-call",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "find_fields",
+                                            "arguments": json.dumps(
+                                                {"query": "得分"},
+                                                ensure_ascii=False,
+                                            ),
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "submit-call",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "submit_plan",
+                                        "arguments": json.dumps(
+                                            {
+                                                "plan": {
+                                                    "id": "formula-plan",
+                                                    "title": "写入得分合计公式",
+                                                    "summary": "在 A5 写入得分合计公式",
+                                                    "actions": [
+                                                        {
+                                                            "type": "writeFormulas",
+                                                            "sheet": "Sheet1",
+                                                            "range": "A5",
+                                                            "formulas": [
+                                                                ["=SUM(B2:B4)"]
+                                                            ],
+                                                        }
+                                                    ],
+                                                }
+                                            },
+                                            ensure_ascii=False,
+                                        ),
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            },
+        )
+
+    return handler
+
+
+def test_tool_cache_reuses_readonly_results_across_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AI_BASE_URL", "http://127.0.0.1:11434/v1")
+    monkeypatch.setenv("AI_MODEL", "tool-model")
+
+    call_log: list[dict[str, object]] = []
+    transport = httpx.MockTransport(_find_fields_agent_handler(call_log))
+    original_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: original_client(transport=transport, **kwargs),
+    )
+
+    import server.app.excel_agent as excel_agent
+
+    find_calls = {"count": 0}
+    real_find_fields = excel_agent._find_fields
+
+    def spy_find_fields(request, query):
+        find_calls["count"] += 1
+        return real_find_fields(request, query)
+
+    monkeypatch.setattr(excel_agent, "_find_fields", spy_find_fields)
+
+    request = _score_request("请在A5里面写一个计算总和的公式，针对得分的")
+    tool_cache: dict[str, object] = {}
+
+    first = asyncio.run(create_plan(request, tool_cache=tool_cache))
+    second = asyncio.run(create_plan(request, tool_cache=tool_cache))
+
+    assert first.kind == "plan"
+    assert second.kind == "plan"
+    # find_fields 只真正执行一次；第二轮 create_plan 命中缓存。
+    assert find_calls["count"] == 1
+    assert any("find_fields" in json.dumps(body) for body in call_log)
+
+
+def test_tool_cache_isolates_distinct_arguments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import server.app.excel_agent as excel_agent
+
+    request = _score_request("测试")
+    cache: dict[str, object] = {}
+    key_a = excel_agent._tool_cache_key("find_fields", {"query": "得分"})
+    key_b = excel_agent._tool_cache_key("find_fields", {"query": "人员"})
+
+    assert key_a != key_b
+
+
+def _tool_names(body: dict[str, object]) -> set[str]:
+    tools = body.get("tools") or []
+    names: set[str] = set()
+    for tool in tools:
+        if isinstance(tool, dict):
+            function = tool.get("function") or {}
+            name = function.get("name")
+            if isinstance(name, str):
+                names.add(name)
+    return names
+
+
+def _answer_handler(call_log: list[dict[str, object]]):
+    """单轮：模型直接 submit_answer（数据已在手时的典型路径）。"""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        call_log.append(body)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "answer-call",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "submit_answer",
+                                        "arguments": json.dumps(
+                                            {"message": "得分最高的是阿里，44 分。"},
+                                            ensure_ascii=False,
+                                        ),
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            },
+        )
+
+    return handler
+
+
+def _data_result_request() -> PlanRequest:
+    return PlanRequest.model_validate(
+        {
+            "prompt": "谁的得分最高",
+            "workbook": {
+                "name": "scores.xlsx",
+                "capturedAt": "2026-07-24T00:00:00Z",
+                "activeWorksheet": "Sheet1",
+                "worksheets": [
+                    {
+                        "name": "Sheet1",
+                        "usedRange": "Sheet1!A1:B4",
+                        "rowCount": 4,
+                        "columnCount": 2,
+                        "headers": ["人员", "得分"],
+                        "dataRows": [["嘟嘟嘟", 33], ["阿里", 44]],
+                        "truncated": False,
+                    }
+                ],
+            },
+            "dataResults": [
+                {
+                    "requestId": "q1",
+                    "tool": "query_table",
+                    "title": "得分排序",
+                    "headers": ["人员", "得分"],
+                    "rows": [["阿里", 44], ["嘟嘟嘟", 33]],
+                    "sourceSheets": ["Sheet1"],
+                    "scannedRows": 3,
+                    "complete": True,
+                    "calculation": "按得分降序排列。",
+                }
+            ],
+        }
+    )
+
+
+def _install_mock_model(
+    monkeypatch: pytest.MonkeyPatch, handler
+) -> None:
+    monkeypatch.setenv("AI_BASE_URL", "http://127.0.0.1:11434/v1")
+    monkeypatch.setenv("AI_MODEL", "tool-model")
+    transport = httpx.MockTransport(handler)
+    original_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: original_client(transport=transport, **kwargs),
+    )
+
+
+def test_agent_drops_readonly_tools_when_data_results_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    call_log: list[dict[str, object]] = []
+    _install_mock_model(monkeypatch, _answer_handler(call_log))
+
+    response = asyncio.run(create_plan(_data_result_request()))
+
+    assert response.kind == "answer"
+    assert call_log, "模型应至少被调用一次"
+    names = _tool_names(call_log[0])
+    assert "get_workbook_context" not in names
+    assert "find_fields" not in names
+    assert "read_range" not in names
+    assert {"submit_answer", "submit_plan"} <= names
+
+
+def test_agent_keeps_readonly_tools_without_data_results(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    call_log: list[dict[str, object]] = []
+    _install_mock_model(monkeypatch, _answer_handler(call_log))
+
+    response = asyncio.run(create_plan(_score_request("谁的得分最高")))
+
+    assert response.kind == "answer"
+    assert call_log
+    names = _tool_names(call_log[0])
+    assert {
+        "get_workbook_context",
+        "find_fields",
+        "read_range",
+        "submit_answer",
+        "submit_plan",
+    } <= names

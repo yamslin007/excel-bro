@@ -1,6 +1,8 @@
 import {
   assertAssistantResponse,
   type AnalysisPlan,
+  type DataToolRequest,
+  type DeterministicQueryTemplate,
   type ExcelAction,
   type WorkbookSnapshot
 } from "./contracts";
@@ -10,6 +12,7 @@ const STORAGE_KEY = "excel-bro.tools.v2";
 const LEGACY_TOOL_STORAGE_KEY = "excel-bro.tools.v1";
 const LEGACY_AUTOMATION_STORAGE_KEY = "excel-bro.automations.v1";
 const TOOL_LIMIT = capabilities.savedTools.maxItems;
+const QUERY_TOOL_STORAGE_KEY = "excel-bro.query-tools.v1";
 
 interface ParameterBase {
   id: string;
@@ -117,6 +120,125 @@ export interface SavedTool {
   planTemplate: AnalysisPlan;
   parameters: ToolParameter[];
   approvals: ToolRiskApproval[];
+}
+
+export interface SavedQueryTool extends DeterministicQueryTemplate {
+  version: 1;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface QueryToolCompatibility {
+  runnable: boolean;
+  requiresModel: boolean;
+  reasons: string[];
+}
+
+export function createQueryTool(
+  name: string,
+  description: string,
+  request: DataToolRequest,
+  sourceMode: "workbook" | "folder",
+  sourceSheetNames: string[],
+  sourceSheetIds: string[] = [],
+  expectedHeaders: string[] = []
+): SavedQueryTool {
+  const now = new Date().toISOString();
+  return {
+    id: identifier(),
+    version: 1,
+    name: name.trim() || "本地查询",
+    description: description.trim() || "重复运行确定性本地查询",
+    sourceMode,
+    request: structuredClone(request),
+    sourceSheetNames: [...sourceSheetNames],
+    sourceSheetIds: [...sourceSheetIds],
+    expectedHeaders: [...expectedHeaders],
+    createdAt: now,
+    updatedAt: now
+  };
+}
+
+export function loadQueryTools(): SavedQueryTool[] {
+  return readArray(QUERY_TOOL_STORAGE_KEY).filter(
+    (value): value is SavedQueryTool =>
+      Boolean(
+        value &&
+          typeof value === "object" &&
+          (value as Partial<SavedQueryTool>).version === 1 &&
+          (value as Partial<SavedQueryTool>).request
+      )
+  );
+}
+
+export function saveQueryTool(tool: SavedQueryTool): SavedQueryTool[] {
+  const next = [
+    { ...tool, updatedAt: new Date().toISOString() },
+    ...loadQueryTools().filter((item) => item.id !== tool.id)
+  ].slice(0, TOOL_LIMIT);
+  localStorage.setItem(QUERY_TOOL_STORAGE_KEY, JSON.stringify(next));
+  return next;
+}
+
+export function analyzeQueryToolCompatibility(
+  tool: SavedQueryTool,
+  workbook: WorkbookSnapshot
+): QueryToolCompatibility {
+  const reasons: string[] = [];
+  const availableSheets = new Map(
+    workbook.worksheets.map((sheet) => [normalize(sheet.name), sheet])
+  );
+  for (const name of tool.sourceSheetNames) {
+    const sheet = availableSheets.get(normalize(name));
+    if (!sheet) {
+      reasons.push(`来源工作表「${name}」不存在`);
+      continue;
+    }
+    const availableFields = new Set(
+      sheet.headers.map((header) => normalize(String(header ?? "")))
+    );
+    const requestedFields = [
+      ...(tool.request.arguments.fields ?? []),
+      ...(tool.request.arguments.groupBy ?? []),
+      ...(tool.request.arguments.filters ?? []).map((item) => item.field),
+      ...(tool.request.arguments.metrics ?? [])
+        .map((item) => item.field)
+        .filter((field): field is string => Boolean(field)),
+      ...(tool.request.arguments.profileField
+        ? [tool.request.arguments.profileField]
+        : [])
+    ];
+    const missing = requestedFields.filter(
+      (field) => !availableFields.has(normalize(field))
+    );
+    if (missing.length > 0) {
+      reasons.push(`「${name}」缺少字段：${[...new Set(missing)].join("、")}`);
+    }
+  }
+  if (tool.sourceMode === "folder" && tool.sourceSheetIds.length === 0) {
+    reasons.push("文件夹查询缺少稳定工作表 ID");
+  } else if (tool.sourceMode === "folder") {
+    const currentIds = tool.sourceSheetNames
+      .map((name) => availableSheets.get(normalize(name))?.sourceSheetId)
+      .filter((value): value is string => Boolean(value))
+      .sort();
+    const savedIds = [...tool.sourceSheetIds].sort();
+    if (JSON.stringify(currentIds) !== JSON.stringify(savedIds)) {
+      reasons.push("文件夹来源 ID 已变化，请重新确认数据来源");
+    }
+  }
+  return {
+    runnable: reasons.length === 0,
+    requiresModel: reasons.length > 0,
+    reasons
+  };
+}
+
+export function instantiateQueryTool(tool: SavedQueryTool): DataToolRequest {
+  return {
+    ...structuredClone(tool.request),
+    id: `saved-query-${tool.id}-${Date.now()}`
+  };
 }
 
 interface LegacySavedTool {

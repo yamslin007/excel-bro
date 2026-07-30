@@ -1,7 +1,24 @@
 from __future__ import annotations
 
 import os
+import json
 from dataclasses import dataclass
+from pathlib import Path
+import uuid
+
+from dotenv import set_key
+
+
+class ModelConnectionStoreError(RuntimeError):
+    pass
+
+
+class ModelConnectionNotFoundError(ValueError):
+    pass
+
+
+class DuplicateModelConnectionError(ValueError):
+    pass
 
 
 def _first_env(*names: str) -> str:
@@ -44,6 +61,219 @@ class ModelSettings:
         return "*" in self.vision_models or normalized in self.vision_models
 
 
+@dataclass(frozen=True, slots=True)
+class ManagedModelConnection:
+    id: str
+    label: str
+    base_url: str
+    model: str
+    api_key: str
+    supports_vision: bool
+
+    @property
+    def catalog_id(self) -> str:
+        return f"connection:{self.id}"
+
+
+def _config_path() -> Path:
+    configured_directory = os.getenv("EXCEL_BRO_CONFIG_DIR", "").strip()
+    if configured_directory:
+        return Path(configured_directory) / ".env"
+    return Path("server/.env")
+
+
+def _connection_store_path() -> Path:
+    return _config_path().parent / "model-connections.json"
+
+
+def load_managed_connections() -> tuple[ManagedModelConnection, ...]:
+    path = _connection_store_path()
+    if not path.exists():
+        return ()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as error:
+        raise ModelConnectionStoreError(
+            "无法读取模型连接配置文件"
+        ) from error
+    except ValueError as error:
+        raise ModelConnectionStoreError(
+            "模型连接配置文件已损坏，请先修复或备份该文件"
+        ) from error
+    if not isinstance(payload, dict) or not isinstance(
+        payload.get("connections", []), list
+    ):
+        raise ModelConnectionStoreError("模型连接配置文件格式无效")
+    items = payload.get("connections", [])
+    connections: list[ManagedModelConnection] = []
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ModelConnectionStoreError(
+                f"模型连接配置文件第 {index + 1} 项格式无效"
+            )
+        connection_id = str(item.get("id", "")).strip()
+        label = str(item.get("label", "")).strip()
+        base_url = str(item.get("baseUrl", "")).strip().rstrip("/")
+        model = str(item.get("modelId", "")).strip()
+        api_key = str(item.get("apiKey", "")).strip()
+        if not connection_id or not label or not base_url or not model:
+            raise ModelConnectionStoreError(
+                f"模型连接配置文件第 {index + 1} 项缺少必要字段"
+            )
+        connections.append(
+            ManagedModelConnection(
+                id=connection_id,
+                label=label,
+                base_url=base_url,
+                model=model,
+                api_key=api_key,
+                supports_vision=item.get("supportsVision") is True,
+            )
+        )
+    return tuple(connections)
+
+
+def _write_managed_connections(
+    connections: tuple[ManagedModelConnection, ...],
+) -> None:
+    path = _connection_store_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": 1,
+        "connections": [
+            {
+                "id": connection.id,
+                "label": connection.label,
+                "baseUrl": connection.base_url,
+                "modelId": connection.model,
+                "apiKey": connection.api_key,
+                "supportsVision": connection.supports_vision,
+            }
+            for connection in connections
+        ],
+    }
+    temporary = path.with_suffix(f"{path.suffix}.tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def upsert_managed_connection(
+    *,
+    connection_id: str | None,
+    label: str,
+    base_url: str,
+    model: str,
+    api_key: str | None,
+    clear_api_key: bool,
+    supports_vision: bool,
+) -> dict[str, object]:
+    current = list(load_managed_connections())
+    existing = next(
+        (
+            connection
+            for connection in current
+            if connection.id == connection_id
+        ),
+        None,
+    )
+    if connection_id and existing is None:
+        raise ModelConnectionNotFoundError("要编辑的模型连接不存在")
+    normalized_base_url = base_url.strip().rstrip("/")
+    normalized_model = model.strip()
+    duplicate = next(
+        (
+            connection
+            for connection in current
+            if connection.id != connection_id
+            and connection.base_url.casefold() == normalized_base_url.casefold()
+            and connection.model.casefold() == normalized_model.casefold()
+        ),
+        None,
+    )
+    if duplicate is not None:
+        raise DuplicateModelConnectionError(
+            f"模型「{duplicate.label} · {duplicate.model}」已经使用相同的服务地址"
+        )
+    resolved_id = connection_id or f"model-{uuid.uuid4().hex}"
+    resolved_api_key = (
+        ""
+        if clear_api_key
+        else api_key.strip()
+        if api_key is not None
+        else existing.api_key
+        if existing
+        else ""
+    )
+    replacement = ManagedModelConnection(
+        id=resolved_id,
+        label=label.strip(),
+        base_url=normalized_base_url,
+        model=normalized_model,
+        api_key=resolved_api_key,
+        supports_vision=supports_vision,
+    )
+    next_connections = tuple(
+        replacement if connection.id == resolved_id else connection
+        for connection in current
+    )
+    if existing is None:
+        next_connections = (*next_connections, replacement)
+    _write_managed_connections(next_connections)
+    return model_settings_view()
+
+
+def draft_model_connection(
+    *,
+    connection_id: str | None,
+    base_url: str,
+    model: str,
+    api_key: str | None,
+    clear_api_key: bool,
+    supports_vision: bool,
+) -> ModelConnection:
+    existing = next(
+        (
+            connection
+            for connection in load_managed_connections()
+            if connection.id == connection_id
+        ),
+        None,
+    )
+    if connection_id and existing is None:
+        raise ModelConnectionNotFoundError("要测试的模型连接不存在")
+    resolved_api_key = (
+        ""
+        if clear_api_key
+        else api_key.strip()
+        if api_key is not None
+        else existing.api_key
+        if existing
+        else ""
+    )
+    return ModelConnection(
+        base_url=base_url.strip().rstrip("/"),
+        model=model.strip(),
+        api_key=resolved_api_key,
+        supports_vision=supports_vision,
+    )
+
+
+def delete_managed_connection(connection_id: str) -> dict[str, object]:
+    current = load_managed_connections()
+    remaining = tuple(
+        connection
+        for connection in current
+        if connection.id != connection_id
+    )
+    if len(remaining) == len(current):
+        raise ModelConnectionNotFoundError("要删除的模型连接不存在")
+    _write_managed_connections(remaining)
+    return model_settings_view()
+
+
 def load_model_settings() -> ModelSettings | None:
     base_url = _first_env("AI_BASE_URL", "OPENAI_BASE_URL").rstrip("/")
     default_model = _first_env("AI_MODEL", "OPENAI_MODEL")
@@ -75,10 +305,36 @@ def selected_model_config(
 ) -> ModelConnection | None:
     if model_id == "local":
         return None
+    managed = load_managed_connections()
+    if model_id and model_id.startswith("connection:"):
+        selected = next(
+            (
+                connection
+                for connection in managed
+                if connection.catalog_id == model_id
+            ),
+            None,
+        )
+        if selected is None:
+            raise ValueError("所选模型连接不存在")
+        return ModelConnection(
+            base_url=selected.base_url,
+            model=selected.model,
+            api_key=selected.api_key,
+            supports_vision=selected.supports_vision,
+        )
     settings = load_model_settings()
     if settings is None:
         if model_id:
             raise ValueError("所选模型尚未在本地服务中配置")
+        if managed:
+            selected = managed[0]
+            return ModelConnection(
+                base_url=selected.base_url,
+                model=selected.model,
+                api_key=selected.api_key,
+                supports_vision=selected.supports_vision,
+            )
         return None
     selected_model = model_id or settings.default_model
     if selected_model not in settings.models:
@@ -93,6 +349,7 @@ def selected_model_config(
 
 def model_catalog() -> dict[str, object]:
     settings = load_model_settings()
+    managed = load_managed_connections()
     options: list[dict[str, str | bool]] = [
         {
             "id": "local",
@@ -102,27 +359,45 @@ def model_catalog() -> dict[str, object]:
             "supportsVision": False,
         }
     ]
-    if settings is None:
-        return {"defaultModelId": "local", "models": options}
+    if settings is not None:
+        options.extend(
+            {
+                "id": model,
+                "label": model,
+                "provider": "model",
+                "available": True,
+                "supportsVision": settings.supports_vision(model),
+            }
+            for model in settings.models
+        )
     options.extend(
         {
-            "id": model,
-            "label": model,
+            "id": connection.catalog_id,
+            "label": (
+                connection.model
+                if connection.label == connection.model
+                else f"{connection.label} · {connection.model}"
+            ),
             "provider": "model",
             "available": True,
-            "supportsVision": settings.supports_vision(model),
+            "supportsVision": connection.supports_vision,
         }
-        for model in settings.models
+        for connection in managed
     )
     return {
-        "defaultModelId": settings.default_model,
+        "defaultModelId": (
+            settings.default_model
+            if settings is not None
+            else managed[0].catalog_id if managed else "local"
+        ),
         "models": options,
     }
 
 
 def model_status() -> dict[str, str | bool | None]:
     settings = load_model_settings()
-    if settings is None:
+    managed = load_managed_connections()
+    if settings is None and not managed:
         return {
             "configured": False,
             "mode": "local",
@@ -131,5 +406,52 @@ def model_status() -> dict[str, str | bool | None]:
     return {
         "configured": True,
         "mode": "model",
-        "model": settings.default_model,
+        "model": (
+            settings.default_model
+            if settings is not None
+            else managed[0].model
+        ),
     }
+
+
+def model_settings_view() -> dict[str, object]:
+    settings = load_model_settings()
+    api_key = _first_env("AI_API_KEY", "OPENAI_API_KEY")
+    connections = load_managed_connections()
+    return {
+        "baseUrl": settings.base_url if settings else None,
+        "defaultModel": settings.default_model if settings else None,
+        "apiKeyConfigured": bool(api_key),
+        "apiKeyHint": f"••••{api_key[-4:]}" if api_key else None,
+        "connections": [
+            {
+                "id": connection.id,
+                "catalogModelId": connection.catalog_id,
+                "label": connection.label,
+                "baseUrl": connection.base_url,
+                "modelId": connection.model,
+                "supportsVision": connection.supports_vision,
+                "apiKeyConfigured": bool(connection.api_key),
+                "apiKeyHint": (
+                    f"••••{connection.api_key[-4:]}"
+                    if connection.api_key
+                    else None
+                ),
+            }
+            for connection in connections
+        ],
+    }
+
+
+def update_model_api_key(api_key: str) -> dict[str, object]:
+    config_path = _config_path()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.touch(exist_ok=True)
+    set_key(
+        str(config_path),
+        "AI_API_KEY",
+        api_key,
+        quote_mode="always",
+    )
+    os.environ["AI_API_KEY"] = api_key
+    return model_settings_view()

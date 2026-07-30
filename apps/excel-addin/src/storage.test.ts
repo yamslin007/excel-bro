@@ -1,7 +1,13 @@
 import { describe, expect, it } from "vitest";
-import type { AnalysisPlan, WorkbookSnapshot } from "./contracts";
+import type {
+  AnalysisPlan,
+  DataToolRequest,
+  WorkbookSnapshot
+} from "./contracts";
 import {
+  analyzeQueryToolCompatibility,
   analyzeToolEligibility,
+  createQueryTool,
   createTool,
   instantiateTool
 } from "./storage";
@@ -240,6 +246,33 @@ describe("saved tools", () => {
       type: "sortRange",
       sheet: "本月数据",
       range: "A1:E20"
+    });
+  });
+
+  it("rejects a saved folder query when the stable source id changes", () => {
+    const request: DataToolRequest = {
+      id: "saved-folder-query",
+      tool: "query_table",
+      arguments: { mode: "rows", fields: ["门店"] }
+    };
+    const tool = createQueryTool(
+      "门店查询",
+      "读取门店",
+      request,
+      "folder",
+      ["本月数据"],
+      ["old-sheet-id"],
+      ["门店"]
+    );
+    const current = structuredClone(workbook);
+    current.worksheets[0].sourceSheetId = "new-sheet-id";
+
+    expect(analyzeQueryToolCompatibility(tool, current)).toMatchObject({
+      runnable: false,
+      requiresModel: true,
+      reasons: expect.arrayContaining([
+        "文件夹来源 ID 已变化，请重新确认数据来源"
+      ])
     });
   });
 });

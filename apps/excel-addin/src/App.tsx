@@ -10,11 +10,18 @@ import {
 import {
   checkHealth,
   checkIntent,
-  createAssistantResponse,
+  streamAssistantResponse,
   createFolderSnapshot,
+  deleteModelConnection,
   executeFolderPlan,
+  executeFolderQuery,
+  getModelSettings,
+  isLocalServiceConnectionError,
   listModels,
-  selectFolder
+  saveModelConnection,
+  selectFolder,
+  testModelConnection,
+  updateModelSettings
 } from "./api";
 import type { ModelOption, ServiceHealth } from "./api";
 import type {
@@ -22,12 +29,16 @@ import type {
   FolderCatalog,
   FolderSelection,
   DataToolResult,
+  ExecutionUndoSnapshot,
   IntentCheckResponse,
   IntentClarification,
   IntentMemory,
   IntentOption,
   IntentScopeContext,
+  ModelSettings,
+  QueryTableArguments,
   ResultContext,
+  UpsertModelConnectionRequest,
   VerificationReport,
   WorkbookSnapshot
 } from "./contracts";
@@ -35,9 +46,15 @@ import { demoWorkbook } from "./demo";
 import {
   captureSelectionContext,
   captureWorkbook,
+  captureWorkbookSourceFingerprint,
   captureWorkbookStructure,
+  dataEpochsChanged,
   executePlan,
-  isRunningInExcel
+  isRunningInExcel,
+  PlanExecutionError,
+  snapshotDataEpochs,
+  undoExecution,
+  watchWorkbookStructureChanges
 } from "./excel";
 import {
   DataToolExecutionError,
@@ -45,32 +62,67 @@ import {
 } from "./dataTools";
 import {
   analyzeToolEligibility,
+  createQueryTool,
   createTool,
   deleteTool,
   instantiateTool,
+  loadQueryTools,
   loadTools,
+  saveQueryTool,
   saveTool,
+  type SavedQueryTool,
   type SavedTool,
   type ToolParameter
 } from "./storage";
+import {
+  executeSavedQueryTool,
+  SavedQueryToolFallbackError
+} from "./deterministicTools";
 import {
   MAX_IMAGE_ATTACHMENTS,
   prepareImageFile,
   type PendingImage
 } from "./imageAttachments";
 import { extractWorkbookDataPeriod } from "./workbookIdentity";
+import { chooseAvailableModel } from "./modelSelection";
 import capabilities from "../../../config/capabilities.json";
+import {
+  currentModelCallCount,
+  exportDiagnosticReport,
+  recordDiagnosticEvent
+} from "./diagnostics";
 
 type Status = "idle" | "scanning" | "planning" | "tooling" | "executing";
 type MessageRole = "assistant" | "user" | "system";
 type SourceMode = "workbook" | "folder";
 type WorkbookScopeMode = "auto" | "manual";
 
+interface ActivityStep {
+  label: string;
+  elapsedMs: number;
+}
+
 interface ActivityProgress {
   title: string;
   detail: string;
-  completed: string[];
+  completed: ActivityStep[];
   startedAt: number;
+  lastStepAt: number;
+}
+
+interface ActivityLog {
+  steps: ActivityStep[];
+  totalMs: number;
+}
+
+interface ModelConnectionDraft {
+  id: string | null;
+  label: string;
+  baseUrl: string;
+  modelId: string;
+  apiKey: string;
+  clearApiKey: boolean;
+  supportsVision: boolean;
 }
 
 interface MessageClarification extends IntentClarification {
@@ -93,7 +145,12 @@ interface ChatMessage {
   intentMemory?: IntentMemory;
   verification?: VerificationReport;
   clarification?: MessageClarification;
+  activityLog?: ActivityLog;
+  reused?: boolean;
   provider?: "model" | "local";
+  querySourceMode?: SourceMode;
+  querySourceSheetNames?: string[];
+  querySourceSheetIds?: string[];
   createdAt: string;
 }
 
@@ -113,6 +170,7 @@ interface ChatHistoryState {
 const CHAT_STORAGE_KEY = "excel-bro.chat.v4";
 const LEGACY_CHAT_STORAGE_KEY = "excel-bro.chat.v3";
 const MODEL_STORAGE_KEY = "excel-bro.model.v2";
+const PET_VISIBILITY_STORAGE_KEY = "excel-bro.pet.visibility.v1";
 const MAX_STORED_CONVERSATIONS =
   capabilities.conversation.maxStoredConversations;
 const MAX_MESSAGES_PER_CONVERSATION =
@@ -131,7 +189,54 @@ const INTENT_MAX_PRIOR_RESULT_ROWS =
 const COMPOSER_MAX_HEIGHT = 156;
 const COMPOSER_MIN_HEIGHT = 44;
 
+export function normalizePetVisibility(value: string | null): boolean {
+  return value !== "hidden";
+}
+
+function emptyModelConnectionDraft(): ModelConnectionDraft {
+  return {
+    id: null,
+    label: "",
+    baseUrl: "",
+    modelId: "",
+    apiKey: "",
+    clearApiKey: false,
+    supportsVision: false
+  };
+}
+
+function verificationSummary(report: VerificationReport): string {
+  if (report.status === "verified") return "并通过独立验证";
+  if (report.status === "executed_unverified") {
+    return "；写入已完成，但部分操作暂时无法独立验证";
+  }
+  return "，但结果验证未通过";
+}
+
+export function normalizeStoredVerification(
+  report: VerificationReport | undefined
+): VerificationReport | undefined {
+  if (!report) return undefined;
+  return {
+    ...report,
+    status:
+      report.status ??
+      (report.passed ? "verified" : "failed"),
+    unverifiedActions: Array.isArray(report.unverifiedActions)
+      ? report.unverifiedActions
+      : []
+  };
+}
+
+function formatStepElapsed(ms: number): string {
+  if (ms < 1000) return `${Math.max(0, Math.round(ms))}ms`;
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
 function intentScopeFingerprint(scope: IntentScopeContext): string {
+  // selectedRange (光标位置) 不纳入指纹：查询不依赖它，写入落点由预览确认兜底。
+  // 把它算进来只会在用户移动光标时造成误判（"数据范围已经变化"）。
+  // activeWorksheet 在 auto 模式下决定扫描哪张表，切表意味着数据真的变了，仍需保留。
   return JSON.stringify({
     workbookName: scope.workbookName,
     sourceMode: scope.sourceMode,
@@ -139,8 +244,7 @@ function intentScopeFingerprint(scope: IntentScopeContext): string {
     sheets: scope.sheets.map((sheet) => sheet.name),
     ...(scope.selectionMode === "auto"
       ? {
-          activeWorksheet: scope.activeWorksheet,
-          selectedRange: scope.selectedRange ?? null
+          activeWorksheet: scope.activeWorksheet
         }
       : {})
   });
@@ -161,6 +265,99 @@ function latestResultContext(items: ChatMessage[]): ResultContext | null {
 function messageId(): string {
   return globalThis.crypto?.randomUUID?.() ??
     `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+// ── 结论复用缓存 ──────────────────────────────────────────────────────
+// 同一只读需求（结构化意图相同）且数据未变（dataEpoch 未变）时，直接复用上次
+// 结论，跳过 checkIntent / 本地全表扫描 / 模型生成。缓存只放内存、不进
+// localStorage，跨会话不自动复用（关闭期间文件可能被外部改动，监听器无从得知）。
+const RESULT_CACHE_LIMIT = 24;
+const PROMPT_KEY_CACHE_LIMIT = 48;
+// 模块加载时生成一次的会话 id；换会话（刷新页面）即失效缓存。
+const CACHE_SESSION_ID =
+  globalThis.crypto?.randomUUID?.() ?? `session-${Date.now()}`;
+
+interface CachedConclusion {
+  intentKey: string;
+  resultContext: ResultContext;
+  answerText: string;
+  sourceSheets: string[];
+  dataEpochSnapshot: Record<string, number>;
+  completeness: "complete" | "truncated";
+  sourceMode: SourceMode;
+  sessionId: string;
+  querySourceSheetNames?: string[];
+  querySourceSheetIds?: string[];
+  createdAt: number;
+}
+
+// Map 迭代顺序即插入顺序，超限时删最早的键 => 朴素 LRU。
+function lruSet<K, V>(cache: Map<K, V>, key: K, value: V, limit: number): void {
+  if (cache.has(key)) cache.delete(key);
+  cache.set(key, value);
+  while (cache.size > limit) {
+    const oldest = cache.keys().next().value as K | undefined;
+    if (oldest === undefined) break;
+    cache.delete(oldest);
+  }
+}
+
+function lruGet<K, V>(cache: Map<K, V>, key: K): V | undefined {
+  const value = cache.get(key);
+  if (value !== undefined) {
+    cache.delete(key);
+    cache.set(key, value);
+  }
+  return value;
+}
+
+// 原样文本命中的一级 key：去首尾空白、内部空白折叠、小写。
+export function normalizePrompt(text: string): string {
+  return text.trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+// 结构化意图 key：归一化 QueryTableArguments + scope 后排序序列化。
+// filters 是 AND 关系、顺序无关 => 排序；groupBy/metrics/fields 顺序影响输出 => 保序。
+// 归一化从严：误 miss（多算一次）可接受，误命中（拿错结论）危险。
+export function normalizeIntentKey(
+  args: QueryTableArguments,
+  scope: IntentScopeContext
+): string {
+  const field = (value?: string | null): string =>
+    (value ?? "").trim().toLowerCase();
+  const filters = (args.filters ?? [])
+    .map((filter) => ({
+      f: field(filter.field),
+      o: filter.operator,
+      v: filter.value ?? null
+    }))
+    .sort((a, b) =>
+      `${a.f}|${a.o}|${String(a.v)}`.localeCompare(
+        `${b.f}|${b.o}|${String(b.v)}`
+      )
+    );
+  const metrics = (args.metrics ?? []).map((metric) => ({
+    op: metric.operation,
+    f: field(metric.field),
+    out: field(metric.outputName),
+    ratio: field(metric.ratioOutputName)
+  }));
+  return JSON.stringify({
+    mode: args.mode,
+    scope: args.scope ?? null,
+    fields: (args.fields ?? []).map(field),
+    filters,
+    groupBy: (args.groupBy ?? []).map(field),
+    metrics,
+    combine: args.combine ?? null,
+    profileField: field(args.profileField),
+    sortBy: field(args.sortBy),
+    sortDirection: args.sortDirection ?? null,
+    limit: typeof args.limit === "number" ? args.limit : null,
+    workbookName: scope.workbookName,
+    sourceMode: scope.sourceMode,
+    sheets: [...scope.sheets.map((sheet) => sheet.name)].sort()
+  });
 }
 
 function welcomeMessage(): ChatMessage {
@@ -193,6 +390,32 @@ function createConversation(messages = [welcomeMessage()]): ChatConversation {
   };
 }
 
+export function deleteConversationFromHistory(
+  current: ChatHistoryState,
+  conversationId: string
+): ChatHistoryState {
+  const remaining = current.conversations.filter(
+    (conversation) => conversation.id !== conversationId
+  );
+  if (remaining.length === current.conversations.length) {
+    return current;
+  }
+  if (remaining.length === 0) {
+    const replacement = createConversation();
+    return {
+      activeConversationId: replacement.id,
+      conversations: [replacement]
+    };
+  }
+  return {
+    activeConversationId:
+      current.activeConversationId === conversationId
+        ? remaining[0].id
+        : current.activeConversationId,
+    conversations: remaining
+  };
+}
+
 function loadChatHistory(): ChatHistoryState {
   try {
     const stored = JSON.parse(
@@ -217,10 +440,16 @@ function loadChatHistory(): ChatHistoryState {
           const now = new Date().toISOString();
           return {
             ...conversation,
-            messages: conversation.messages.map((message) =>
-              message.clarification
+            messages: conversation.messages.map((message) => {
+              const normalizedMessage = {
+                ...message,
+                verification: normalizeStoredVerification(
+                  message.verification
+                )
+              };
+              return message.clarification
                 ? {
-                    ...message,
+                    ...normalizedMessage,
                     clarification: {
                       ...message.clarification,
                       round:
@@ -233,8 +462,8 @@ function loadChatHistory(): ChatHistoryState {
                           : message.clarification.status
                     }
                   }
-                : message
-            ),
+                : normalizedMessage;
+            }),
             title:
               typeof conversation.title === "string"
                 ? conversation.title
@@ -398,8 +627,32 @@ export default function App() {
   const [sheetSearch, setSheetSearch] = useState("");
   const [composerHeight, setComposerHeight] = useState<number | null>(null);
   const [tools, setTools] = useState<SavedTool[]>(loadTools);
+  const [queryTools, setQueryTools] =
+    useState<SavedQueryTool[]>(loadQueryTools);
   const [toolsOpen, setToolsOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [petVisible, setPetVisible] = useState(() =>
+    normalizePetVisibility(
+      localStorage.getItem(PET_VISIBILITY_STORAGE_KEY)
+    )
+  );
+  const [modelMenuOpen, setModelMenuOpen] = useState(false);
+  const [modelCatalogLoaded, setModelCatalogLoaded] = useState(false);
+  const [modelGuideDismissed, setModelGuideDismissed] = useState(false);
+  const [modelSettings, setModelSettings] = useState<ModelSettings | null>(null);
+  const [apiKeyDraft, setApiKeyDraft] = useState("");
+  const [showApiKey, setShowApiKey] = useState(false);
+  const [settingsSaving, setSettingsSaving] = useState(false);
+  const [settingsTesting, setSettingsTesting] = useState(false);
+  const [settingsLoading, setSettingsLoading] = useState(false);
+  const [settingsFeedback, setSettingsFeedback] = useState("");
+  const [connectionDraft, setConnectionDraft] =
+    useState<ModelConnectionDraft | null>(null);
+  const [pendingDeleteConnectionId, setPendingDeleteConnectionId] =
+    useState<string | null>(null);
+  const [pendingDeleteConversationId, setPendingDeleteConversationId] =
+    useState<string | null>(null);
   const [selectedToolId, setSelectedToolId] = useState<string | null>(null);
   const [toolParameterValues, setToolParameterValues] = useState<
     Record<string, string>
@@ -410,6 +663,8 @@ export default function App() {
   const [verifiedPlanIds, setVerifiedPlanIds] = useState<Set<string>>(
     () => new Set()
   );
+  const [lastUndoSnapshot, setLastUndoSnapshot] =
+    useState<ExecutionUndoSnapshot | null>(null);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const [toolName, setToolName] = useState("");
   const [toolDescription, setToolDescription] = useState("");
@@ -432,6 +687,14 @@ export default function App() {
     startHeight: number;
   } | null>(null);
   const copyFeedbackTimerRef = useRef<number | null>(null);
+  const queryAbortRef = useRef<AbortController | null>(null);
+  // 结论复用缓存（见 CachedConclusion）。intentKey → 结论；normalizedPrompt → intentKey。
+  const resultCacheRef = useRef<Map<string, CachedConclusion>>(new Map());
+  const promptKeyCacheRef = useRef<Map<string, string>>(new Map());
+  // "仍要重新计算"按钮设为 true，绕过命中判定并在重算后覆写缓存。
+  const forceRecomputeRef = useRef(false);
+  // sendMessage 起点记录的原始用户文本，写缓存时作为一级 prompt key。
+  const rawPromptRef = useRef("");
 
   const busy = status !== "idle";
   const activeConversation =
@@ -448,6 +711,23 @@ export default function App() {
     [modelOptions, selectedModelId]
   );
   const supportsVision = selectedModel?.supportsVision === true;
+  const hasConfiguredModel = modelOptions.some(
+    (option) => option.provider === "model" && option.available
+  );
+  const showFirstModelGuide =
+    serverOnline &&
+    modelCatalogLoaded &&
+    !hasConfiguredModel &&
+    !modelGuideDismissed &&
+    !settingsOpen;
+  const hasEnvironmentModel =
+    Boolean(modelSettings?.baseUrl) && Boolean(modelSettings?.defaultModel);
+  const hasManagedModels = (modelSettings?.connections.length ?? 0) > 0;
+  const editingConnection = connectionDraft?.id
+    ? modelSettings?.connections.find(
+        (connection) => connection.id === connectionDraft.id
+      )
+    : null;
   const workbookDataPeriod = useMemo(
     () => (workbook ? extractWorkbookDataPeriod(workbook.name) : null),
     [workbook]
@@ -468,13 +748,30 @@ export default function App() {
   );
 
   function beginActivity(title: string, detail: string) {
+    const now = Date.now();
     setActivity({
       title,
       detail,
       completed: [],
-      startedAt: Date.now()
+      startedAt: now,
+      lastStepAt: now
     });
     setActivitySeconds(0);
+  }
+
+  function togglePetVisibility() {
+    setPetVisible((current) => {
+      const next = !current;
+      try {
+        localStorage.setItem(
+          PET_VISIBILITY_STORAGE_KEY,
+          next ? "visible" : "hidden"
+        );
+      } catch {
+        // The preference remains active for this session if storage is blocked.
+      }
+      return next;
+    });
   }
 
   function advanceActivity(
@@ -482,19 +779,54 @@ export default function App() {
     detail: string,
     completedStep?: string
   ) {
-    setActivity((current) => ({
-      title,
-      detail,
-      completed: completedStep
-        ? [...(current?.completed ?? []), completedStep]
-        : current?.completed ?? [],
-      startedAt: current?.startedAt ?? Date.now()
-    }));
+    setActivity((current) => {
+      const now = Date.now();
+      const startedAt = current?.startedAt ?? now;
+      const lastStepAt = current?.lastStepAt ?? startedAt;
+      const completed =
+        completedStep && completedStep.trim()
+          ? [
+              ...(current?.completed ?? []),
+              { label: completedStep, elapsedMs: now - lastStepAt }
+            ]
+          : current?.completed ?? [];
+      return {
+        title,
+        detail,
+        completed,
+        startedAt,
+        lastStepAt: completedStep && completedStep.trim() ? now : lastStepAt
+      };
+    });
+  }
+
+  // 把当前 activity 的已完成步骤固化成一条日志，挂到最近一条 assistant 消息上，
+  // 让用户执行结束后仍能展开回看「做了哪些步骤、各花多久」。
+  function persistActivityLog() {
+    setActivity((current) => {
+      if (current && current.completed.length > 0) {
+        const log: ActivityLog = {
+          steps: current.completed,
+          totalMs: Date.now() - current.startedAt
+        };
+        setMessages((messages) => {
+          const lastAssistantIndex = [...messages]
+            .reverse()
+            .findIndex((message) => message.role === "assistant");
+          if (lastAssistantIndex === -1) return messages;
+          const index = messages.length - 1 - lastAssistantIndex;
+          return messages.map((message, i) =>
+            i === index ? { ...message, activityLog: log } : message
+          );
+        });
+      }
+      return null;
+    });
+    setActivitySeconds(0);
   }
 
   function finishActivity() {
-    setActivity(null);
-    setActivitySeconds(0);
+    persistActivityLog();
   }
 
   useEffect(() => {
@@ -571,6 +903,60 @@ export default function App() {
     ]);
   }
 
+  // 命中判定：所有安全闸通过才返回缓存结论，否则 undefined（miss，静默重算）。
+  function lookupCachedConclusion(
+    intentKey: string
+  ): CachedConclusion | undefined {
+    const hit = lruGet(resultCacheRef.current, intentKey);
+    if (!hit) return undefined;
+    if (hit.sourceMode !== sourceMode) return undefined; // 闸4: 来源不同
+    if (hit.sessionId !== CACHE_SESSION_ID) return undefined; // 闸5: 跨会话
+    if (hit.completeness !== "complete") return undefined; // 闸6: 截断结果不复用
+    if (dataEpochsChanged(hit.dataEpochSnapshot)) return undefined; // 闸1: 数据变更
+    return hit;
+  }
+
+  // 命中后直接产出复用消息，跳过意图确认 / 本地扫描 / 模型生成。
+  function reuseCachedConclusion(hit: CachedConclusion): void {
+    appendMessage({
+      role: "assistant",
+      text: hit.answerText,
+      resultContext: hit.resultContext,
+      reused: true,
+      provider: "local",
+      querySourceMode: hit.sourceMode,
+      querySourceSheetNames: hit.querySourceSheetNames,
+      querySourceSheetIds: hit.querySourceSheetIds
+    });
+  }
+
+  // 写缓存：仅只读 answer 结论且数据完整时写入；写入操作永不缓存。
+  function cacheConclusion(
+    intentKey: string,
+    conclusion: Omit<
+      CachedConclusion,
+      "intentKey" | "sourceMode" | "sessionId" | "createdAt"
+    >
+  ): void {
+    const entry: CachedConclusion = {
+      ...conclusion,
+      intentKey,
+      sourceMode,
+      sessionId: CACHE_SESSION_ID,
+      createdAt: Date.now()
+    };
+    lruSet(resultCacheRef.current, intentKey, entry, RESULT_CACHE_LIMIT);
+    const normPrompt = normalizePrompt(rawPromptRef.current);
+    if (normPrompt) {
+      lruSet(
+        promptKeyCacheRef.current,
+        normPrompt,
+        intentKey,
+        PROMPT_KEY_CACHE_LIMIT
+      );
+    }
+  }
+
   async function copyMessage(message: ChatMessage) {
     const text = message.text?.trim();
     if (!text) return;
@@ -639,10 +1025,11 @@ export default function App() {
   }
 
   async function scan(options?: { announce?: boolean }) {
+    const diagnosticStartedAt = performance.now();
     setStatus("scanning");
     try {
       const snapshot = isRunningInExcel()
-        ? await captureWorkbook(
+        ? await captureWorkbookStructure(
             sourceMode === "workbook" && workbookScopeMode === "manual"
               ? selectedSheetNames
               : undefined
@@ -665,7 +1052,22 @@ export default function App() {
           text: `已重新读取「${snapshot.name}」：${snapshot.worksheets.length} 个工作表。`
         });
       }
+      recordDiagnosticEvent({
+        timestamp: new Date().toISOString(),
+        phase: "scan",
+        durationMs: performance.now() - diagnosticStartedAt,
+        modelCalls: 0,
+        status: "succeeded"
+      });
     } catch (reason) {
+      recordDiagnosticEvent({
+        timestamp: new Date().toISOString(),
+        phase: "scan",
+        durationMs: performance.now() - diagnosticStartedAt,
+        modelCalls: 0,
+        status: "failed",
+        errorCategory: "data"
+      });
       appendMessage({
         role: "system",
         text: reason instanceof Error ? reason.message : "读取工作簿失败"
@@ -687,13 +1089,16 @@ export default function App() {
         const catalog = await listModels();
         if (!active) return;
         setModelOptions(catalog.models);
-        setSelectedModelId((current) =>
-          catalog.models.some(
+        setModelCatalogLoaded(true);
+        setSelectedModelId((current) => {
+          const next = catalog.models.some(
             (option) => option.id === current && option.available
           )
             ? current
-            : catalog.defaultModelId
-        );
+            : catalog.defaultModelId;
+          localStorage.setItem(MODEL_STORAGE_KEY, next);
+          return next;
+        });
       } catch {
         // The health indicator remains useful if an older service lacks /api/models.
       }
@@ -718,11 +1123,22 @@ export default function App() {
       setSelectedSheetNames([demoWorkbook.activeWorksheet]);
       return;
     }
-    Office.onReady(() => void scan());
+    let dispose: (() => void) | undefined;
+    Office.onReady(async () => {
+      await scan();
+      if (isRunningInExcel()) {
+        dispose = await watchWorkbookStructureChanges(() => {
+          setSelectionConfirmed(false);
+          setLastUndoSnapshot(null);
+        });
+      }
+    });
+    return () => dispose?.();
   }, []);
 
   function newChat() {
     if (busy) return;
+    setModelMenuOpen(false);
     if (
       activeConversation &&
       !activeConversation.messages.some(
@@ -735,6 +1151,7 @@ export default function App() {
       setContextOpen(false);
       setHistoryOpen(false);
       setToolsOpen(false);
+      closeSettings();
       setSaveCandidate(null);
       return;
     }
@@ -752,6 +1169,7 @@ export default function App() {
     setContextOpen(false);
     setHistoryOpen(false);
     setToolsOpen(false);
+    closeSettings();
     setSaveCandidate(null);
   }
 
@@ -766,36 +1184,28 @@ export default function App() {
     setImageError("");
     setContextOpen(false);
     setHistoryOpen(false);
+    closeSettings();
     setSaveCandidate(null);
   }
 
   function deleteConversation(conversationId: string) {
     if (busy) return;
-    const target = chatHistory.conversations.find(
-      (conversation) => conversation.id === conversationId
-    );
-    if (!target || !window.confirm(`确定删除历史对话「${target.title}」吗？`)) {
+    if (
+      !chatHistory.conversations.some(
+        (conversation) => conversation.id === conversationId
+      )
+    ) {
       return;
     }
-    setChatHistory((current) => {
-      const remaining = current.conversations.filter(
-        (conversation) => conversation.id !== conversationId
-      );
-      if (remaining.length === 0) {
-        const replacement = createConversation();
-        return {
-          activeConversationId: replacement.id,
-          conversations: [replacement]
-        };
-      }
-      return {
-        activeConversationId:
-          current.activeConversationId === conversationId
-            ? remaining[0].id
-            : current.activeConversationId,
-        conversations: remaining
-      };
-    });
+    setPendingDeleteConversationId(conversationId);
+  }
+
+  function confirmDeleteConversation() {
+    if (!pendingDeleteConversationId) return;
+    setChatHistory((current) =>
+      deleteConversationFromHistory(current, pendingDeleteConversationId)
+    );
+    setPendingDeleteConversationId(null);
   }
 
   function formatConversationTime(value: string): string {
@@ -1126,41 +1536,103 @@ export default function App() {
         [...messages]
           .reverse()
           .find((message) => message.resultContext)?.resultContext ?? null;
-      const response = await createAssistantResponse({
-        turnId,
-        prompt: confirmedPrompt,
-        workbook: requestWorkbook,
-        lastResult,
-        images: sentImages.map(({ name, mediaType, data }) => ({
-          name,
-          mediaType,
-          data
-        })),
-        dataResults,
-        modelId: selectedModelId || null
-      });
+      const response = await streamAssistantResponse(
+        {
+          turnId,
+          prompt: confirmedPrompt,
+          workbook: requestWorkbook,
+          lastResult,
+          images: sentImages.map(({ name, mediaType, data }) => ({
+            name,
+            mediaType,
+            data
+          })),
+          dataResults,
+          modelId: selectedModelId || null
+        },
+        {
+          onStep: (step) =>
+            advanceActivity(
+              step.title,
+              step.detail ?? "",
+              step.completedStep ?? undefined
+            )
+        }
+      );
       setServerOnline(true);
       if (response.kind === "answer") {
+        const querySourceSheetIds = currentWorksheets
+          .map((sheet) => sheet.sourceSheetId)
+          .filter((value): value is string => Boolean(value));
         appendMessage({
           role: "assistant",
           text: response.message,
           resultContext: response.resultContext ?? undefined,
           intentMemory,
+          ...(dataResults.length > 0
+            ? {
+                querySourceMode: sourceMode,
+                querySourceSheetNames: effectiveSheetNames,
+                querySourceSheetIds
+              }
+            : {}),
           provider: response.provider
         });
+        // 写缓存：只缓存 workbook 只读结论。folder 外部文件不可控（闸4）；
+        // 写入分支（else）永不缓存（闸3）。completeness 由本地工具 complete 派生，
+        // 无法可靠判定时按 truncated（不复用），安全优先（闸6）。
+        const toolRequest = intentMemory?.toolRequest;
+        if (
+          sourceMode === "workbook" &&
+          dataResults.length > 0 &&
+          toolRequest &&
+          response.resultContext
+        ) {
+          const intentKey = normalizeIntentKey(
+            toolRequest.arguments,
+            latestScope
+          );
+          const completeness = dataResults.every(
+            (result) => result.complete === true
+          )
+            ? "complete"
+            : "truncated";
+          cacheConclusion(intentKey, {
+            resultContext: response.resultContext,
+            answerText: response.message,
+            sourceSheets: response.resultContext.sourceSheets,
+            dataEpochSnapshot: snapshotDataEpochs(effectiveSheetNames),
+            completeness,
+            querySourceSheetNames: effectiveSheetNames,
+            querySourceSheetIds
+          });
+        }
       } else {
+        const sourceFingerprint =
+          sourceMode === "workbook" && isRunningInExcel()
+            ? await captureWorkbookSourceFingerprint(effectiveSheetNames)
+            : latestWorkbook.sourceFingerprint;
+        const plan: AnalysisPlan = {
+          ...response.plan,
+          sourceFingerprint,
+          sourceFingerprintSheets: effectiveSheetNames
+        };
         appendMessage({
           role: "assistant",
-          text: response.plan.summary,
-          plan: response.plan,
+          text: plan.summary,
+          plan,
           intentMemory,
           provider: response.provider
         });
       }
     } catch (reason) {
       setPendingImages(sentImages);
-      setServerOnline(false);
-      setServiceHealth(null);
+      if (isLocalServiceConnectionError(reason)) {
+        setServerOnline(false);
+        setServiceHealth(null);
+      } else {
+        setServerOnline(true);
+      }
       appendMessage({
         role: "system",
         text:
@@ -1181,6 +1653,44 @@ export default function App() {
     correctionAttempt = 0
   ) {
     if (!workbook) return;
+    if (sourceMode === "folder") {
+      if (!folderCatalog) return;
+      setStatus("tooling");
+      advanceActivity(
+        "正在读取文件夹完整数据",
+        "pandas 只会读取本次已选择的文件和工作表。"
+      );
+      try {
+        const result = await executeFolderQuery(
+          folderCatalog.sessionId,
+          intent.request
+        );
+        await analyzeConfirmedIntent(
+          intent.confirmedPrompt,
+          sentImages,
+          undefined,
+          clarificationMessageId,
+          [result],
+          workbook,
+          {
+            confirmedPrompt: intent.confirmedPrompt,
+            toolRequest: intent.request
+          },
+          intent.turnId
+        );
+      } catch (reason) {
+        appendMessage({
+          role: "system",
+          text:
+            reason instanceof Error
+              ? `文件夹数据工具未完成：${reason.message}`
+              : "文件夹数据工具未完成"
+        });
+        setStatus("idle");
+        finishActivity();
+      }
+      return;
+    }
     if (sourceMode !== "workbook" || !isRunningInExcel()) {
       await analyzeConfirmedIntent(
         intent.confirmedPrompt,
@@ -1198,11 +1708,38 @@ export default function App() {
       return;
     }
     setStatus("tooling");
+    const diagnosticStartedAt = performance.now();
+    const modelCallsBefore = currentModelCallCount();
+    const queryArgs = intent.request.arguments;
+    const planParts: string[] = [];
+    if (queryArgs.groupBy && queryArgs.groupBy.length > 0) {
+      planParts.push(`按「${queryArgs.groupBy.join("、")}」分组`);
+    }
+    if (queryArgs.metrics && queryArgs.metrics.length > 0) {
+      planParts.push(
+        `聚合 ${queryArgs.metrics.map((metric) => metric.field).join("、")}`
+      );
+    }
+    if (queryArgs.sortBy) {
+      planParts.push(
+        `按 ${queryArgs.sortBy} ${queryArgs.sortDirection === "asc" ? "升序" : "降序"}`
+      );
+    }
+    if (typeof queryArgs.limit === "number") {
+      planParts.push(`取前 ${queryArgs.limit} 条`);
+    }
     advanceActivity(
       "正在本地读取并计算",
       `将扫描 ${selectedNamesFor(workbook).length} 张已选工作表；完整数据只在 Excel 本地处理。`,
       "需求已确认，已选择本地数据工具"
     );
+    if (planParts.length > 0) {
+      advanceActivity(
+        "已确定计算方式",
+        `本地执行：${planParts.join("，")}。`,
+        `计算方式：${planParts.join("，")}`
+      );
+    }
     let correctionScope: IntentScopeContext | null = null;
     try {
       const selection = await captureSelectionContext();
@@ -1243,15 +1780,52 @@ export default function App() {
         });
         return;
       }
+      // 二级命中：结构化意图相同且数据未变时，跳过本地全表扫描直接复用结论。
+      if (!forceRecomputeRef.current) {
+        const intentKey = normalizeIntentKey(
+          intent.request.arguments,
+          liveScope
+        );
+        const hit = lookupCachedConclusion(intentKey);
+        if (hit) {
+          reuseCachedConclusion(hit);
+          setStatus("idle");
+          return;
+        }
+      }
+      const controller = new AbortController();
+      queryAbortRef.current = controller;
       const result = await executeQueryTableTool(
         intent.request,
         effectiveSheetNames,
-        selection.activeWorksheet
+        selection.activeWorksheet,
+        {
+          signal: controller.signal,
+          onProgress: ({ scannedRows, totalRows, sheet }) => {
+            setActivity((current) =>
+              current
+                ? {
+                    ...current,
+                    detail: `正在读取「${sheet}」：${scannedRows.toLocaleString()} / ${totalRows.toLocaleString()} 行`
+                  }
+                : current
+            );
+          }
+        }
       );
+      recordDiagnosticEvent({
+        timestamp: new Date().toISOString(),
+        phase: "local_query",
+        durationMs: performance.now() - diagnosticStartedAt,
+        scannedRows: result.scannedRows,
+        modelCalls: currentModelCallCount() - modelCallsBefore,
+        status: "succeeded"
+      });
+      queryAbortRef.current = null;
       advanceActivity(
         "本地计算完成",
         `已扫描 ${result.scannedRows.toLocaleString()} 行，正在准备紧凑结果。`,
-        `完成 ${effectiveSheetNames.length} 张工作表的本地查询`
+        `扫描 ${result.scannedRows.toLocaleString()} 行，得到 ${result.rows.length.toLocaleString()} 条结果`
       );
       setWorkbook(liveWorkbook);
       setSelectedSheetNames(effectiveSheetNames);
@@ -1270,6 +1844,19 @@ export default function App() {
         intent.turnId
       );
     } catch (reason) {
+      recordDiagnosticEvent({
+        timestamp: new Date().toISOString(),
+        phase: "local_query",
+        durationMs: performance.now() - diagnosticStartedAt,
+        modelCalls: currentModelCallCount() - modelCallsBefore,
+        status:
+          reason instanceof DataToolExecutionError &&
+          reason.code === "CANCELLED"
+            ? "cancelled"
+            : "failed",
+        errorCategory: "data_tool"
+      });
+      queryAbortRef.current = null;
       if (correctionAttempt < 1 && correctionScope) {
         try {
           const failureMessage =
@@ -1612,14 +2199,20 @@ export default function App() {
     setContextOpen(true);
   }
 
-  async function sendMessage() {
-    const enteredText = prompt.trim();
+  async function sendMessage(options?: {
+    forceRecompute?: boolean;
+    overrideText?: string;
+  }) {
+    const enteredText = (options?.overrideText ?? prompt).trim();
     const text =
       enteredText ||
       (pendingImages.length > 0
         ? "请结合附件图片分析当前工作簿，并说明发现的问题。"
         : "");
     if (!workbook || !text || busy) return;
+    // "仍要重新计算"绕过整个命中判定，并在重算后覆写缓存。
+    forceRecomputeRef.current = options?.forceRecompute === true;
+    rawPromptRef.current = text;
     if (pendingImages.length > 0 && !supportsVision) {
       setImageError("当前模型不支持图片，请切换模型或移除附件。");
       return;
@@ -1703,6 +2296,25 @@ export default function App() {
     setPrompt("");
     setPendingImages([]);
     setImageError("");
+    // 一级 prompt 缓存：原样再问且无图片、非强制重算时，跳过 checkIntent 直接复用。
+    // folder 模式外部文件监听器无从得知变化，永不复用。
+    if (
+      !forceRecomputeRef.current &&
+      sourceMode === "workbook" &&
+      sentImages.length === 0
+    ) {
+      const intentKey = promptKeyCacheRef.current.get(
+        normalizePrompt(text)
+      );
+      const hit = intentKey
+        ? lookupCachedConclusion(intentKey)
+        : undefined;
+      if (hit) {
+        reuseCachedConclusion(hit);
+        setStatus("idle");
+        return;
+      }
+    }
     setStatus("planning");
     if (!(sourceMode === "workbook" && isRunningInExcel())) {
       beginActivity(
@@ -1749,8 +2361,12 @@ export default function App() {
       finishActivity();
     } catch (reason) {
       setPendingImages(sentImages);
-      setServerOnline(false);
-      setServiceHealth(null);
+      if (isLocalServiceConnectionError(reason)) {
+        setServerOnline(false);
+        setServiceHealth(null);
+      } else {
+        setServerOnline(true);
+      }
       appendMessage({
         role: "system",
         text:
@@ -1769,18 +2385,33 @@ export default function App() {
       setStatus("executing");
       try {
         const result = await executeFolderPlan(folderCatalog.sessionId, plan);
+        recordDiagnosticEvent({
+          timestamp: new Date().toISOString(),
+          phase: "execution",
+          durationMs: result.executionMs,
+          modelCalls: 0,
+          status: "succeeded"
+        });
+        recordDiagnosticEvent({
+          timestamp: new Date().toISOString(),
+          phase: "verification",
+          durationMs: result.verificationMs,
+          modelCalls: 0,
+          status:
+            result.verification.status === "failed" ? "failed" : "succeeded"
+        });
         appendMessage({
           role: "assistant",
           text: `「${plan.title}」已执行 ${
             result.actionResults.length
-          } 步并完成验证。已写入：${result.filesModified.join("、")}${
+          } 步${verificationSummary(result.verification)}。已写入：${result.filesModified.join("、")}${
             result.backups.length > 0
               ? `；已备份：${result.backups.join("、")}`
               : ""
           }`,
           verification: result.verification
         });
-        if (result.verification.passed) {
+        if (result.verification.status === "verified") {
           setVerifiedPlanIds((current) => new Set(current).add(plan.id));
         }
       } catch (reason) {
@@ -1805,19 +2436,85 @@ export default function App() {
     setStatus("executing");
     try {
       const result = await executePlan(plan);
+      recordDiagnosticEvent({
+        timestamp: new Date().toISOString(),
+        phase: "execution",
+        durationMs: result.executionMs,
+        modelCalls: 0,
+        status: "succeeded"
+      });
+      recordDiagnosticEvent({
+        timestamp: new Date().toISOString(),
+        phase: "verification",
+        durationMs: result.verificationMs,
+        modelCalls: 0,
+        status:
+          result.verification.status === "failed" ? "failed" : "succeeded"
+      });
       appendMessage({
         role: "assistant",
-        text: `「${plan.title}」已执行 ${result.actionResults.length} 步并完成验证。原始工作表没有被删除或清空。`,
+        text: `「${plan.title}」已执行 ${result.actionResults.length} 步${verificationSummary(result.verification)}。${
+          result.undoSnapshot
+            ? `已记录 ${result.undoSnapshot.ranges.length} 项本次执行撤销数据。`
+            : ""
+        }原始工作表没有被删除或清空。`,
         verification: result.verification
       });
-      if (result.verification.passed) {
+      setLastUndoSnapshot(result.undoSnapshot ?? null);
+      if (result.verification.status === "verified") {
         setVerifiedPlanIds((current) => new Set(current).add(plan.id));
       }
       await scan();
     } catch (reason) {
+      if (reason instanceof PlanExecutionError) {
+        const succeeded = reason.actionResults.filter(
+          (result) => result.status === "succeeded"
+        ).length;
+        const failed = reason.actionResults.find(
+          (result) => result.status === "failed"
+        );
+        const notRun = reason.actionResults.filter(
+          (result) => result.status === "not_run"
+        ).length;
+        appendMessage({
+          role: "system",
+          text: `${reason.message}。${
+            succeeded > 0
+              ? `已有 ${succeeded} 步成功写入当前工作簿；`
+              : "本次没有步骤成功写入；"
+          }${failed ? `失败步骤：${failed.type}（${failed.sheet}）；` : ""}${
+            notRun > 0 ? `其余 ${notRun} 步未执行。` : ""
+          }`
+        });
+        return;
+      }
       appendMessage({
         role: "system",
         text: reason instanceof Error ? reason.message : "执行计划失败"
+      });
+    } finally {
+      setStatus("idle");
+    }
+  }
+
+  async function undoLastExecution() {
+    if (!lastUndoSnapshot || busy || !isRunningInExcel()) return;
+    if (!window.confirm("撤销上一次 Excel Bro 执行中可恢复的单元格更改？")) {
+      return;
+    }
+    setStatus("executing");
+    try {
+      await undoExecution(lastUndoSnapshot);
+      setLastUndoSnapshot(null);
+      appendMessage({
+        role: "system",
+        text: "已撤销上一次执行中记录的单元格值、公式和常用格式。"
+      });
+      await scan();
+    } catch (reason) {
+      appendMessage({
+        role: "system",
+        text: reason instanceof Error ? reason.message : "撤销上一次执行失败"
       });
     } finally {
       setStatus("idle");
@@ -2004,7 +2701,9 @@ export default function App() {
   }
 
   async function openTools() {
+    setModelMenuOpen(false);
     setHistoryOpen(false);
+    closeSettings();
     setToolsOpen(true);
     const selected =
       tools.find((tool) => tool.id === selectedToolId) ?? tools[0];
@@ -2035,13 +2734,258 @@ export default function App() {
   }
 
   function openHistory() {
+    setModelMenuOpen(false);
     setToolsOpen(false);
+    closeSettings();
     setHistoryOpen(true);
   }
 
-  function previewTool(tool: SavedTool) {
+  function closeSettings() {
+    setSettingsOpen(false);
+    setApiKeyDraft("");
+    setShowApiKey(false);
+    setSettingsLoading(false);
+    setSettingsTesting(false);
+    setSettingsFeedback("");
+    setConnectionDraft(null);
+    setPendingDeleteConnectionId(null);
+  }
+
+  async function openSettings(): Promise<boolean> {
+    setModelMenuOpen(false);
+    setToolsOpen(false);
+    setHistoryOpen(false);
+    setSettingsOpen(true);
+    setApiKeyDraft("");
+    setShowApiKey(false);
+    setSettingsFeedback("");
+    setConnectionDraft(null);
+    setPendingDeleteConnectionId(null);
+    setSettingsLoading(true);
+    try {
+      setModelSettings(await getModelSettings());
+      return true;
+    } catch (reason) {
+      setModelSettings(null);
+      setSettingsFeedback(
+        reason instanceof Error
+          ? reason.message
+          : "无法读取模型设置，请确认本地服务已经启动。"
+      );
+      return false;
+    } finally {
+      setSettingsLoading(false);
+    }
+  }
+
+  async function openConnectionCreator() {
+    setModelMenuOpen(false);
+    if (await openSettings()) {
+      setConnectionDraft(emptyModelConnectionDraft());
+    }
+  }
+
+  function selectModel(modelId: string) {
+    setSelectedModelId(modelId);
+    localStorage.setItem(MODEL_STORAGE_KEY, modelId);
+    setModelMenuOpen(false);
+  }
+
+  function dismissModelGuide() {
+    setModelGuideDismissed(true);
+  }
+
+  async function saveApiKey() {
+    const apiKey = apiKeyDraft.trim();
+    if (!apiKey) {
+      setSettingsFeedback("请输入新的 API Key。");
+      return;
+    }
+    setSettingsSaving(true);
+    setSettingsFeedback("");
+    try {
+      const saved = await updateModelSettings({ apiKey });
+      setModelSettings(saved);
+      setApiKeyDraft("");
+      setShowApiKey(false);
+      setSettingsFeedback("API Key 已保存并立即生效。");
+      const [health, catalog] = await Promise.all([
+        checkHealth(),
+        listModels()
+      ]);
+      setServiceHealth(health);
+      setServerOnline(health !== null);
+      setModelOptions(catalog.models);
+      setSelectedModelId((current) => {
+        const next = catalog.models.some(
+          (option) => option.id === current && option.available
+        )
+          ? current
+          : catalog.defaultModelId;
+        localStorage.setItem(MODEL_STORAGE_KEY, next);
+        return next;
+      });
+    } catch (reason) {
+      setSettingsFeedback(
+        reason instanceof Error ? reason.message : "API Key 保存失败。"
+      );
+    } finally {
+      setSettingsSaving(false);
+    }
+  }
+
+  function editModelConnection(connectionId: string) {
+    const connection = modelSettings?.connections.find(
+      (item) => item.id === connectionId
+    );
+    if (!connection) return;
+    setShowApiKey(false);
+    setConnectionDraft({
+      id: connection.id,
+      label: connection.label,
+      baseUrl: connection.baseUrl,
+      modelId: connection.modelId,
+      apiKey: "",
+      clearApiKey: false,
+      supportsVision: connection.supportsVision
+    });
+    setSettingsFeedback("");
+  }
+
+  async function refreshModelsAfterSettings(
+    saved: ModelSettings,
+    preferredModelId?: string
+  ) {
+    setModelSettings(saved);
+    const [health, catalog] = await Promise.all([
+      checkHealth(),
+      listModels()
+    ]);
+    setServiceHealth(health);
+    setServerOnline(health !== null);
+    setModelOptions(catalog.models);
+    setSelectedModelId((current) => {
+      const next = chooseAvailableModel(
+        catalog.models,
+        current,
+        catalog.defaultModelId,
+        preferredModelId
+      );
+      localStorage.setItem(MODEL_STORAGE_KEY, next);
+      return next;
+    });
+  }
+
+  function connectionRequest(): UpsertModelConnectionRequest | null {
+    if (!connectionDraft) return null;
+    const label = connectionDraft.label.trim();
+    const baseUrl = connectionDraft.baseUrl.trim();
+    const modelId = connectionDraft.modelId.trim();
+    if (!label || !baseUrl || !modelId) {
+      setSettingsFeedback("请填写连接名称、服务地址和模型 ID。");
+      return null;
+    }
+    return {
+      id: connectionDraft.id,
+      label,
+      baseUrl,
+      modelId,
+      apiKey: connectionDraft.apiKey.trim() || null,
+      clearApiKey: connectionDraft.clearApiKey,
+      supportsVision: connectionDraft.supportsVision
+    };
+  }
+
+  async function verifyConnection() {
+    const request = connectionRequest();
+    if (!request) return;
+    setSettingsTesting(true);
+    setSettingsFeedback("");
+    try {
+      const result = await testModelConnection(request);
+      setSettingsFeedback(result.message);
+    } catch (reason) {
+      setSettingsFeedback(
+        reason instanceof Error ? reason.message : "模型连接测试失败。"
+      );
+    } finally {
+      setSettingsTesting(false);
+    }
+  }
+
+  async function saveConnection() {
+    const request = connectionRequest();
+    if (!request || !connectionDraft) return;
+    const wasCreating = !connectionDraft.id;
+    const previousConnectionIds = new Set(
+      modelSettings?.connections.map((connection) => connection.id) ?? []
+    );
+    setSettingsSaving(true);
+    setSettingsFeedback("");
+    try {
+      const saved = await saveModelConnection(request);
+      const createdConnection = wasCreating
+        ? saved.connections.find(
+            (connection) => !previousConnectionIds.has(connection.id)
+          )
+        : null;
+      await refreshModelsAfterSettings(
+        saved,
+        createdConnection?.catalogModelId
+      );
+      setShowApiKey(false);
+      setConnectionDraft(null);
+      setSettingsFeedback(
+        wasCreating
+          ? "模型连接已添加，并已切换为当前模型。"
+          : "模型连接已更新。"
+      );
+    } catch (reason) {
+      setSettingsFeedback(
+        reason instanceof Error ? reason.message : "模型连接保存失败。"
+      );
+    } finally {
+      setSettingsSaving(false);
+    }
+  }
+
+  async function removeConnection(connectionId: string) {
+    setSettingsSaving(true);
+    setSettingsFeedback("");
+    try {
+      const saved = await deleteModelConnection(connectionId);
+      await refreshModelsAfterSettings(saved);
+      setPendingDeleteConnectionId(null);
+      setConnectionDraft((current) =>
+        current?.id === connectionId ? null : current
+      );
+      setSettingsFeedback("模型连接已删除。");
+    } catch (reason) {
+      setSettingsFeedback(
+        reason instanceof Error ? reason.message : "模型连接删除失败。"
+      );
+    } finally {
+      setSettingsSaving(false);
+    }
+  }
+
+  async function previewTool(tool: SavedTool) {
     try {
       const plan = instantiateTool(tool, toolParameterValues, workbook);
+      if (
+        sourceMode === "workbook" &&
+        isRunningInExcel() &&
+        workbook
+      ) {
+        const sourceSheets = selectedNamesFor(workbook);
+        plan.sourceFingerprintSheets = sourceSheets;
+        plan.sourceFingerprint = await captureWorkbookSourceFingerprint(
+          sourceSheets
+        );
+      } else if (sourceMode === "folder" && workbook) {
+        plan.sourceFingerprintSheets = selectedNamesFor(workbook);
+        plan.sourceFingerprint = workbook.sourceFingerprint;
+      }
       appendMessage({
         role: "assistant",
         text: `已加载工具「${tool.name}」。请确认下面的执行预览。`,
@@ -2054,6 +2998,106 @@ export default function App() {
         role: "system",
         text: reason instanceof Error ? reason.message : "无法加载工具"
       });
+    }
+  }
+
+  // "仍要重新计算"：取复用消息前最近的用户提问，绕过缓存重发并覆写缓存。
+  function recomputeReusedMessage(message: ChatMessage) {
+    if (busy) return;
+    const index = messages.findIndex((item) => item.id === message.id);
+    if (index < 0) return;
+    let originalPrompt = "";
+    for (let i = index - 1; i >= 0; i -= 1) {
+      const candidate = messages[i];
+      if (candidate.role === "user" && candidate.text?.trim()) {
+        originalPrompt = candidate.text.trim();
+        break;
+      }
+    }
+    if (!originalPrompt) return;
+    void sendMessage({ forceRecompute: true, overrideText: originalPrompt });
+  }
+
+  function saveQueryFromMessage(message: ChatMessage) {
+    const request = message.intentMemory?.toolRequest;
+    if (!request || !workbook) return;
+    const sourceNames = message.querySourceSheetNames;
+    const querySourceMode = message.querySourceMode;
+    if (!sourceNames || !querySourceMode) {
+      appendMessage({
+        role: "system",
+        text: "这条历史结果缺少原始数据范围，不能保存为固化查询。"
+      });
+      return;
+    }
+    const sourceIds = message.querySourceSheetIds ?? [];
+    const tool = createQueryTool(
+      message.resultContext?.title ?? "本地查询",
+      message.text ?? "重复运行确定性本地查询",
+      request,
+      querySourceMode,
+      sourceNames,
+      sourceIds,
+      message.resultContext?.headers ?? []
+    );
+    setQueryTools(saveQueryTool(tool));
+    appendMessage({
+      role: "system",
+      text: `已保存固化查询「${tool.name}」。重复运行将直接使用本地执行器。`
+    });
+  }
+
+  async function runQueryTool(tool: SavedQueryTool) {
+    if (!workbook) return;
+    setStatus("tooling");
+    beginActivity("正在运行固化查询", "直接调用本地确定性执行器。");
+    try {
+      if (tool.sourceMode !== sourceMode) {
+        throw new SavedQueryToolFallbackError([
+          `工具来源是${tool.sourceMode === "folder" ? "文件夹" : "当前工作簿"}，与当前数据来源不一致`
+        ]);
+      }
+      const result = await executeSavedQueryTool(tool, workbook, {
+        workbook: (request) =>
+          executeQueryTableTool(
+            request,
+            tool.sourceSheetNames,
+            workbook.activeWorksheet
+          ),
+        folder: (request) => {
+          if (!folderCatalog) {
+            throw new Error("文件夹会话已失效，请重新选择文件夹");
+          }
+          return executeFolderQuery(folderCatalog.sessionId, request);
+        }
+      });
+      appendMessage({
+        role: "assistant",
+        text: `固化查询「${tool.name}」已完成：扫描 ${result.scannedRows.toLocaleString()} 行，返回 ${result.rows.length} 行；模型调用 0 次。`,
+        resultContext: {
+          kind: "table",
+          title: result.title,
+          headers: result.headers.map(String),
+          rows: result.rows,
+          sourceSheets: result.sourceSheets,
+          warnings: result.warnings
+        },
+        provider: "local"
+      });
+      setToolsOpen(false);
+    } catch (reason) {
+      appendMessage({
+        role: "system",
+        text:
+          reason instanceof SavedQueryToolFallbackError
+            ? `${reason.message}。请重新描述需求，由模型确认是否更新工具。`
+            : reason instanceof Error
+              ? reason.message
+              : "固化查询执行失败"
+      });
+    } finally {
+      setStatus("idle");
+      finishActivity();
     }
   }
 
@@ -2150,30 +3194,67 @@ export default function App() {
               ? "本地服务未连接"
               : (selectedModelId || serviceHealth?.model || "local") === "local"
                 ? "本地服务已连接 · 基础模式"
-                : `模型：${selectedModelId || serviceHealth?.model}`}
+                : `模型：${selectedModel?.label ?? serviceHealth?.model}`}
           </span>
         </div>
-        <label className="model-picker" title="选择本次对话使用的模型">
-          <span>模型</span>
-          <select
-            value={selectedModelId || "local"}
+        <div
+          className={`model-picker${showFirstModelGuide ? " needs-model" : ""}`}
+        >
+          <button
+            type="button"
+            className="model-picker-trigger"
             disabled={!serverOnline || busy}
-            onChange={(event) => {
-              setSelectedModelId(event.target.value);
-              localStorage.setItem(MODEL_STORAGE_KEY, event.target.value);
+            aria-haspopup="menu"
+            aria-expanded={modelMenuOpen}
+            title="选择或添加模型"
+            onClick={() => {
+              setHistoryOpen(false);
+              setToolsOpen(false);
+              closeSettings();
+              setModelMenuOpen((current) => !current);
             }}
           >
-            {modelOptions.map((option) => (
-              <option
-                key={option.id}
-                value={option.id}
-                disabled={!option.available}
-              >
-                {option.label}
-              </option>
-            ))}
-          </select>
-        </label>
+            <span>{hasConfiguredModel ? selectedModel?.label : "添加模型"}</span>
+            <svg viewBox="0 0 16 16" aria-hidden="true">
+              <path d="m4 6 4 4 4-4" />
+            </svg>
+          </button>
+          {modelMenuOpen && (
+            <div className="model-menu" role="menu" aria-label="模型">
+              <span className="model-menu-title">选择模型</span>
+              {modelOptions.map((option) => (
+                <button
+                  type="button"
+                  role="menuitemradio"
+                  aria-checked={option.id === (selectedModelId || "local")}
+                  key={option.id}
+                  disabled={!option.available}
+                  onClick={() => selectModel(option.id)}
+                >
+                  <i />
+                  <span>{option.label}</span>
+                  {option.id === (selectedModelId || "local") && <b>✓</b>}
+                </button>
+              ))}
+              <div className="model-menu-actions">
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => void openConnectionCreator()}
+                >
+                  ＋ 添加模型连接
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => void openSettings()}
+                >
+                  管理模型连接
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
         <button
           className="header-button labeled-header-button history-entry"
           onClick={openHistory}
@@ -2202,6 +3283,20 @@ export default function App() {
           <span>工具</span>
         </button>
         <button
+          className={`header-button pet-toggle${petVisible ? " active" : ""}`}
+          onClick={togglePetVisibility}
+          title={petVisible ? "隐藏宠物" : "显示宠物"}
+          aria-label={petVisible ? "隐藏宠物" : "显示宠物"}
+          aria-pressed={petVisible}
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+            <circle cx="7.1" cy="8.1" r="2.1" />
+            <circle cx="12" cy="5.8" r="2.1" />
+            <circle cx="16.9" cy="8.1" r="2.1" />
+            <path d="M6.2 15.6c0-3.2 2.6-5.7 5.8-5.7s5.8 2.5 5.8 5.7c0 2-1.4 3.3-3.2 3.3-.9 0-1.8-.3-2.6-.9-.8.6-1.7.9-2.6.9-1.8 0-3.2-1.3-3.2-3.3Z" />
+          </svg>
+        </button>
+        <button
           className="header-button"
           onClick={newChat}
           disabled={busy}
@@ -2211,6 +3306,443 @@ export default function App() {
           ＋
         </button>
       </header>
+
+      {showFirstModelGuide && (
+        <section className="first-model-guide" aria-label="首次模型设置引导">
+          <div className="guide-spark" aria-hidden="true">
+            <i />
+            <i />
+            <i />
+          </div>
+          <div>
+            <strong>添加你的第一个大模型</strong>
+            <span>
+              Excel Bro 不会预置模型或密钥，由你选择 Kimi、DeepSeek、OpenAI
+              或其他兼容服务。
+            </span>
+          </div>
+          <div className="first-model-guide-actions">
+            <button type="button" onClick={dismissModelGuide}>
+              稍后
+            </button>
+            <button
+              type="button"
+              className="primary"
+              onClick={() => void openConnectionCreator()}
+            >
+              现在添加
+            </button>
+          </div>
+        </section>
+      )}
+
+      {settingsOpen && (
+        <aside className="tool-drawer settings-drawer" aria-label="模型设置">
+          <div className="tool-drawer-header">
+            <div>
+              <strong>模型设置</strong>
+              <span>密钥仅保存在这台电脑的本地服务中</span>
+            </div>
+            <button
+              type="button"
+              className="drawer-text-action"
+              onClick={exportDiagnosticReport}
+              title="导出不含原始数据和密钥的诊断 JSON"
+            >
+              导出诊断
+            </button>
+            <button onClick={closeSettings} aria-label="关闭">
+              ×
+            </button>
+          </div>
+          <div className="settings-content">
+            {settingsLoading ? (
+              <div className="settings-loading">
+                <i />
+                正在读取本地模型连接…
+              </div>
+            ) : (
+              <>
+                {hasEnvironmentModel ? (
+                  <>
+                    <section className="settings-summary">
+                      <div>
+                        <span>服务地址</span>
+                        <strong>{modelSettings?.baseUrl}</strong>
+                      </div>
+                      <div>
+                        <span>默认模型</span>
+                        <strong>{modelSettings?.defaultModel}</strong>
+                      </div>
+                      <div>
+                        <span>API Key</span>
+                        <strong>
+                          {modelSettings?.apiKeyConfigured
+                            ? `已配置 ${modelSettings.apiKeyHint ?? ""}`
+                            : "未配置（本地服务可无需密钥）"}
+                        </strong>
+                      </div>
+                    </section>
+
+                    <section className="api-key-settings">
+                      <div>
+                        <strong>更换默认连接的 API Key</strong>
+                        <span>保存后立即用于新的模型请求，无需重启后端。</span>
+                      </div>
+                      <label>
+                        <span>新的 API Key</span>
+                        <div className="api-key-input-row">
+                          <input
+                            type={showApiKey ? "text" : "password"}
+                            value={apiKeyDraft}
+                            disabled={settingsSaving || !serverOnline}
+                            autoComplete="off"
+                            spellCheck={false}
+                            placeholder={
+                              modelSettings?.apiKeyConfigured
+                                ? "留空不会覆盖现有密钥"
+                                : "粘贴 API Key"
+                            }
+                            onChange={(event) => {
+                              setApiKeyDraft(event.target.value);
+                              setSettingsFeedback("");
+                            }}
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter") void saveApiKey();
+                            }}
+                          />
+                          <button
+                            type="button"
+                            disabled={!apiKeyDraft || settingsSaving}
+                            onClick={() =>
+                              setShowApiKey((current) => !current)
+                            }
+                          >
+                            {showApiKey ? "隐藏" : "显示"}
+                          </button>
+                        </div>
+                      </label>
+                      <p>
+                        完整密钥不会从后端读回，也不会保存到聊天记录或浏览器存储。
+                      </p>
+                      <button
+                        className="tool-preview-button"
+                        disabled={
+                          !apiKeyDraft.trim() ||
+                          settingsSaving ||
+                          !serverOnline
+                        }
+                        onClick={() => void saveApiKey()}
+                      >
+                        {settingsSaving ? "正在保存…" : "保存并立即生效"}
+                      </button>
+                    </section>
+                  </>
+                ) : (
+                  <section className="settings-first-run">
+                    <div className="settings-first-run-icon">＋</div>
+                    <div>
+                      <strong>
+                        {hasManagedModels
+                          ? "你的模型连接"
+                          : "从添加第一个模型开始"}
+                      </strong>
+                      <span>
+                        {hasManagedModels
+                          ? "模型和密钥都由下方连接独立管理。"
+                          : "没有预置模型，也不需要先去后端修改配置。填写服务地址、模型 ID 和自己的 API Key 即可。"}
+                      </span>
+                    </div>
+                  </section>
+                )}
+
+            <section className="connection-settings">
+              <div className="connection-settings-header">
+                <div>
+                  <strong>
+                    {hasEnvironmentModel ? "其他模型连接" : "模型连接"}
+                  </strong>
+                  <span>每个连接使用独立的服务地址、模型和 API Key。</span>
+                </div>
+                {!connectionDraft && (
+                  <button
+                    type="button"
+                    disabled={settingsSaving || !serverOnline}
+                    onClick={() => {
+                      setShowApiKey(false);
+                      setConnectionDraft(emptyModelConnectionDraft())
+                    }}
+                  >
+                    ＋ 添加
+                  </button>
+                )}
+              </div>
+
+              {(modelSettings?.connections.length ?? 0) === 0 &&
+              !connectionDraft ? (
+                <div className="connection-empty">
+                  还没有额外连接。可以添加 DeepSeek、OpenAI 或其他
+                  OpenAI-compatible 模型。
+                </div>
+              ) : (
+                <div className="connection-list">
+                  {(modelSettings?.connections ?? []).map((connection) => (
+                    <article
+                      className={`connection-card${
+                        selectedModelId === connection.catalogModelId
+                          ? " current"
+                          : ""
+                      }`}
+                      key={connection.id}
+                    >
+                      <div>
+                        <div className="connection-card-title">
+                          <strong>{connection.label}</strong>
+                          {selectedModelId === connection.catalogModelId && (
+                            <b>当前使用</b>
+                          )}
+                        </div>
+                        <span>{connection.modelId}</span>
+                        <small>{connection.baseUrl}</small>
+                        <small>
+                          Key：
+                          {connection.apiKeyConfigured
+                            ? `已配置 ${connection.apiKeyHint ?? ""}`
+                            : "未配置"}
+                          {connection.supportsVision ? " · 支持图片" : ""}
+                        </small>
+                      </div>
+                      {pendingDeleteConnectionId === connection.id ? (
+                        <div className="connection-card-actions confirm">
+                          <button
+                            type="button"
+                            onClick={() => setPendingDeleteConnectionId(null)}
+                          >
+                            取消
+                          </button>
+                          <button
+                            type="button"
+                            className="delete"
+                            disabled={settingsSaving || settingsTesting}
+                            onClick={() => void removeConnection(connection.id)}
+                          >
+                            确认删除
+                          </button>
+                        </div>
+                      ) : (
+                        <div className="connection-card-actions">
+                          <button
+                            type="button"
+                            disabled={settingsSaving || settingsTesting}
+                            onClick={() => editModelConnection(connection.id)}
+                          >
+                            编辑
+                          </button>
+                          <button
+                            type="button"
+                            className="delete"
+                            disabled={settingsSaving}
+                            onClick={() =>
+                              setPendingDeleteConnectionId(connection.id)
+                            }
+                          >
+                            删除
+                          </button>
+                        </div>
+                      )}
+                    </article>
+                  ))}
+                </div>
+              )}
+
+              {connectionDraft && (
+                <div className="connection-editor">
+                  <div>
+                    <strong>
+                      {connectionDraft.id ? "编辑模型连接" : "添加模型连接"}
+                    </strong>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowApiKey(false);
+                        setConnectionDraft(null);
+                      }}
+                      aria-label="关闭连接编辑"
+                    >
+                      ×
+                    </button>
+                  </div>
+                  <p>
+                    兼容 OpenAI /chat/completions
+                    的服务均可接入。可以先测试，确认无误后再保存。
+                  </p>
+                  <label>
+                    <span>连接名称</span>
+                    <input
+                      value={connectionDraft.label}
+                      placeholder="例如 DeepSeek"
+                      onChange={(event) =>
+                        setConnectionDraft((current) =>
+                          current
+                            ? { ...current, label: event.target.value }
+                            : current
+                        )
+                      }
+                    />
+                  </label>
+                  <label>
+                    <span>服务地址</span>
+                    <input
+                      value={connectionDraft.baseUrl}
+                      placeholder="https://api.example.com/v1"
+                      onChange={(event) =>
+                        setConnectionDraft((current) =>
+                          current
+                            ? { ...current, baseUrl: event.target.value }
+                            : current
+                        )
+                      }
+                    />
+                  </label>
+                  <label>
+                    <span>模型 ID</span>
+                    <input
+                      value={connectionDraft.modelId}
+                      placeholder="供应商实际接受的模型 ID"
+                      onChange={(event) =>
+                        setConnectionDraft((current) =>
+                          current
+                            ? { ...current, modelId: event.target.value }
+                            : current
+                        )
+                      }
+                    />
+                  </label>
+                  <label>
+                    <span>API Key</span>
+                    <input
+                      type={showApiKey ? "text" : "password"}
+                      value={connectionDraft.apiKey}
+                      disabled={connectionDraft.clearApiKey}
+                      autoComplete="off"
+                      spellCheck={false}
+                      placeholder={
+                        connectionDraft.id
+                          ? "留空保留现有密钥"
+                          : "本地无鉴权服务可留空"
+                      }
+                      onChange={(event) =>
+                        setConnectionDraft((current) =>
+                          current
+                            ? {
+                                ...current,
+                                apiKey: event.target.value,
+                                clearApiKey: false
+                              }
+                            : current
+                        )
+                      }
+                    />
+                    <button
+                      type="button"
+                      className="connection-key-toggle"
+                      disabled={
+                        !connectionDraft.apiKey ||
+                        connectionDraft.clearApiKey
+                      }
+                      onClick={() => setShowApiKey((current) => !current)}
+                    >
+                      {showApiKey ? "隐藏 Key" : "显示 Key"}
+                    </button>
+                  </label>
+                  {connectionDraft.id &&
+                    editingConnection?.apiKeyConfigured && (
+                      <label className="connection-clear-key">
+                        <input
+                          type="checkbox"
+                          checked={connectionDraft.clearApiKey}
+                          onChange={(event) =>
+                            setConnectionDraft((current) =>
+                              current
+                                ? {
+                                    ...current,
+                                    apiKey: "",
+                                    clearApiKey: event.target.checked
+                                  }
+                                : current
+                            )
+                          }
+                        />
+                        <span>
+                          清除现有 API Key（仅适用于无需鉴权的本地服务）
+                        </span>
+                      </label>
+                    )}
+                  <label className="connection-vision-toggle">
+                    <input
+                      type="checkbox"
+                      checked={connectionDraft.supportsVision}
+                      onChange={(event) =>
+                        setConnectionDraft((current) =>
+                          current
+                            ? {
+                                ...current,
+                                supportsVision: event.target.checked
+                              }
+                            : current
+                        )
+                      }
+                    />
+                    <span>这个模型支持图片输入</span>
+                  </label>
+                  <div className="connection-editor-actions">
+                    <button
+                      type="button"
+                      disabled={
+                        settingsSaving || settingsTesting || !serverOnline
+                      }
+                      onClick={() => void verifyConnection()}
+                    >
+                      {settingsTesting ? "正在测试…" : "测试连接"}
+                    </button>
+                    <button
+                      type="button"
+                      className="tool-preview-button"
+                      disabled={
+                        settingsSaving || settingsTesting || !serverOnline
+                      }
+                      onClick={() => void saveConnection()}
+                    >
+                      {settingsSaving
+                        ? "正在保存…"
+                        : connectionDraft.id
+                          ? "保存修改"
+                          : "添加并使用"}
+                    </button>
+                  </div>
+                </div>
+              )}
+            </section>
+              </>
+            )}
+
+            {settingsFeedback && (
+              <div
+                className={
+                  (settingsFeedback.includes("已") ||
+                    settingsFeedback.includes("成功")) &&
+                  !settingsFeedback.startsWith("请")
+                    ? "settings-feedback success"
+                    : "settings-feedback"
+                }
+                role="status"
+              >
+                {settingsFeedback}
+              </div>
+            )}
+          </div>
+        </aside>
+      )}
 
       {toolsOpen && (
         <aside className="tool-drawer" aria-label="我的工具">
@@ -2329,13 +3861,34 @@ export default function App() {
                     <button
                       className="tool-preview-button"
                       disabled={busy || !workbook}
-                      onClick={() => previewTool(tool)}
+                      onClick={() => void previewTool(tool)}
                     >
                       生成执行预览
                     </button>
                   </section>
                 ))}
             </div>
+          )}
+          {queryTools.length > 0 && (
+            <section className="tool-detail">
+              <div className="tool-detail-title">
+                <div>
+                  <strong>固化查询</strong>
+                  <span>本地重复执行 · 模型调用 0 次</span>
+                </div>
+              </div>
+              <p>字段或来源发生变化时会停止本地执行并要求重新确认。</p>
+              {queryTools.map((tool) => (
+                <button
+                  key={tool.id}
+                  className="tool-preview-button"
+                  disabled={busy || !workbook}
+                  onClick={() => void runQueryTool(tool)}
+                >
+                  运行 · {tool.name}
+                </button>
+              ))}
+            </section>
           )}
         </aside>
       )}
@@ -2405,6 +3958,57 @@ export default function App() {
           </button>
         </aside>
       )}
+
+      {pendingDeleteConversationId &&
+        chatHistory.conversations
+          .filter(
+            (conversation) =>
+              conversation.id === pendingDeleteConversationId
+          )
+          .map((conversation) => (
+            <div
+              className="tool-dialog-backdrop"
+              role="presentation"
+              key={conversation.id}
+            >
+              <section
+                className="tool-dialog history-delete-dialog"
+                role="dialog"
+                aria-modal="true"
+                aria-label="删除历史对话"
+              >
+                <div className="tool-dialog-title">
+                  <div>
+                    <strong>删除历史对话？</strong>
+                    <span>此操作无法撤销</span>
+                  </div>
+                  <button
+                    onClick={() => setPendingDeleteConversationId(null)}
+                    aria-label="关闭"
+                  >
+                    ×
+                  </button>
+                </div>
+                <p>
+                  确定删除「{conversation.title}」吗？删除后不会影响已保存的工具。
+                </p>
+                <div className="tool-dialog-actions">
+                  <button
+                    className="secondary-button"
+                    onClick={() => setPendingDeleteConversationId(null)}
+                  >
+                    取消
+                  </button>
+                  <button
+                    className="danger-button"
+                    onClick={confirmDeleteConversation}
+                  >
+                    确认删除
+                  </button>
+                </div>
+              </section>
+            </div>
+          ))}
 
       {saveCandidate && (
         <div className="tool-dialog-backdrop" role="presentation">
@@ -2511,6 +4115,28 @@ export default function App() {
       )}
 
       <section className="message-stream" aria-live="polite">
+        {petVisible && (
+          <section className="pet-home-placeholder" aria-label="宠物小屋">
+            <div className="pet-home-mark" aria-hidden="true">
+              <i />
+              <i />
+              <i />
+              <b />
+            </div>
+            <div>
+              <strong>宠物小屋准备中</strong>
+              <span>角色方案已保留，选定后会住进这里</span>
+            </div>
+            <button
+              type="button"
+              onClick={togglePetVisibility}
+              aria-label="隐藏宠物"
+              title="隐藏宠物"
+            >
+              ×
+            </button>
+          </section>
+        )}
         {messages.map((message) => (
           <article
             className={`message-row ${message.role}`}
@@ -2531,7 +4157,30 @@ export default function App() {
                   )}
                 </span>
               )}
+              {message.reused && (
+                <div className="reuse-badge">
+                  <span>♻ 复用上次结果（数据未变化）</span>
+                  <button
+                    type="button"
+                    className="link-button"
+                    disabled={busy}
+                    onClick={() => recomputeReusedMessage(message)}
+                  >
+                    仍要重新计算
+                  </button>
+                </div>
+              )}
               {message.text && <p className="message-text">{message.text}</p>}
+              {message.intentMemory?.toolRequest && message.resultContext && (
+                <button
+                  type="button"
+                  className="secondary-button"
+                  disabled={busy}
+                  onClick={() => saveQueryFromMessage(message)}
+                >
+                  保存为固化查询
+                </button>
+              )}
               {message.attachmentNames &&
                 message.attachmentNames.length > 0 && (
                   <div className="message-attachments">
@@ -2686,16 +4335,43 @@ export default function App() {
                   )}
                 </section>
               )}
+              {message.activityLog &&
+                message.activityLog.steps.length > 0 && (
+                  <details className="activity-log-card">
+                    <summary>
+                      执行过程 · {message.activityLog.steps.length} 步 ·{" "}
+                      {formatStepElapsed(message.activityLog.totalMs)}
+                    </summary>
+                    <ul className="activity-steps">
+                      {message.activityLog.steps.map((step, index) => (
+                        <li key={`${step.label}-${index}`}>
+                          <span
+                            className="activity-step-check"
+                            aria-hidden="true"
+                          >
+                            ✓
+                          </span>
+                          <span className="activity-step-label">
+                            {step.label}
+                          </span>
+                          <span className="activity-step-time">
+                            {formatStepElapsed(step.elapsedMs)}
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+                  </details>
+                )}
               {message.verification && (
                 <div
-                  className={`verification-card ${
-                    message.verification.passed ? "passed" : "failed"
-                  }`}
+                  className={`verification-card ${message.verification.status}`}
                 >
                   <strong>
-                    {message.verification.passed
+                    {message.verification.status === "verified"
                       ? "验证通过"
-                      : "执行完成，但验证未通过"}
+                      : message.verification.status === "executed_unverified"
+                        ? "已执行，部分操作未独立验证"
+                        : "执行完成，但验证未通过"}
                   </strong>
                   <span>
                     {
@@ -2703,8 +4379,11 @@ export default function App() {
                         .length
                     }
                     /{message.verification.checks.length} 项符合预期
+                    {message.verification.unverifiedActions.length > 0
+                      ? `；${message.verification.unverifiedActions.length} 步缺少独立验收`
+                      : ""}
                   </span>
-                  {!message.verification.passed && (
+                  {message.verification.status === "failed" && (
                     <ul>
                       {message.verification.checks
                         .filter((check) => !check.passed)
@@ -2713,6 +4392,20 @@ export default function App() {
                             {check.message}
                           </li>
                         ))}
+                    </ul>
+                  )}
+                  {message.verification.status ===
+                    "executed_unverified" && (
+                    <ul>
+                      {message.verification.unverifiedActions.map(
+                        (action) => (
+                          <li
+                            key={`${message.id}-unverified-${action.index}`}
+                          >
+                            {action.message}
+                          </li>
+                        )
+                      )}
                     </ul>
                   )}
                 </div>
@@ -2854,10 +4547,26 @@ export default function App() {
                 <time>{activitySeconds} 秒</time>
               </div>
               {activity?.detail && <p>{activity.detail}</p>}
+              {status === "tooling" && (
+                <button
+                  type="button"
+                  onClick={() => queryAbortRef.current?.abort()}
+                >
+                  取消本地查询
+                </button>
+              )}
               {activity && activity.completed.length > 0 && (
-                <ul>
+                <ul className="activity-steps">
                   {activity.completed.map((step, index) => (
-                    <li key={`${step}-${index}`}>{step}</li>
+                    <li key={`${step.label}-${index}`}>
+                      <span className="activity-step-check" aria-hidden="true">
+                        ✓
+                      </span>
+                      <span className="activity-step-label">{step.label}</span>
+                      <span className="activity-step-time">
+                        {formatStepElapsed(step.elapsedMs)}
+                      </span>
+                    </li>
                   ))}
                 </ul>
               )}
@@ -3227,6 +4936,16 @@ export default function App() {
                 </svg>
                 <span>图片</span>
               </button>
+              {lastUndoSnapshot && (
+                <button
+                  className="attach-image-button"
+                  disabled={busy}
+                  onClick={() => void undoLastExecution()}
+                  title="撤销上一次 Excel Bro 执行"
+                >
+                  ↶ <span>撤销</span>
+                </button>
+              )}
               <button
                 className="send-button"
                 disabled={

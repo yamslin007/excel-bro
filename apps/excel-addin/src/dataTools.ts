@@ -8,10 +8,12 @@ import type {
 } from "./contracts";
 import capabilities from "../../../config/capabilities.json";
 import { detectHeaderIndex, normalizeField } from "./tableSchema";
+import { normalizeCellValue } from "./cellNormalization";
 
 const MAX_TOOL_ROWS = capabilities.queryTable.maxRows;
 const MAX_TOOL_COLUMNS = capabilities.queryTable.maxColumns;
 const MAX_TOOL_CELLS = capabilities.queryTable.maxCells;
+const TOOL_CHUNK_ROWS = capabilities.queryTable.chunkRows;
 const HEADER_SCAN_ROWS = capabilities.queryTable.headerScanRows;
 
 export interface SheetValues {
@@ -23,7 +25,19 @@ export type DataToolErrorCode =
   | "UNSUPPORTED_TOOL"
   | "SCOPE_VIOLATION"
   | "FIELD_NOT_FOUND"
-  | "TOOL_LIMIT_EXCEEDED";
+  | "TOOL_LIMIT_EXCEEDED"
+  | "CANCELLED";
+
+export interface QueryToolProgress {
+  scannedRows: number;
+  totalRows: number;
+  sheet: string;
+}
+
+export interface QueryToolOptions {
+  signal?: AbortSignal;
+  onProgress?: (progress: QueryToolProgress) => void;
+}
 
 export class DataToolExecutionError extends Error {
   constructor(
@@ -37,7 +51,16 @@ export class DataToolExecutionError extends Error {
   }
 }
 
-type RecordRow = Record<string, CellValue>;
+interface RecordSchema {
+  headers: string[];
+  fieldIndexes: ReadonlyMap<string, number>;
+  requestedFieldIndexes: Map<string, number | null>;
+}
+
+interface RecordRow {
+  values: CellValue[];
+  schema: RecordSchema;
+}
 
 function comparableNumber(value: CellValue): number | null {
   if (typeof value === "number" && Number.isFinite(value)) return value;
@@ -86,55 +109,61 @@ function requiredFields(arguments_: QueryTableArguments): string[] {
   ];
 }
 
-function recordsFromSheet(
+function* recordsFromSheet(
   sheet: SheetValues,
-  arguments_: QueryTableArguments,
+  required: string[],
   warnings: string[]
-): RecordRow[] {
-  if (sheet.values.length === 0) return [];
-  const headerIndex = detectHeaderIndex(
-    sheet.values,
-    requiredFields(arguments_)
-  );
+): Generator<RecordRow> {
+  if (sheet.values.length === 0) return;
+  const headerIndex = detectHeaderIndex(sheet.values, required);
   const rawHeaders = sheet.values[headerIndex] ?? [];
   const headers = rawHeaders.map((value, index) => {
     const text = String(value ?? "").trim();
     return text || `未命名列${index + 1}`;
   });
-  const normalizedHeaders = [
-    ...headers.map(normalizeField),
-    normalizeField("工作表")
-  ];
-  const wanted = requiredFields(arguments_).map(normalizeField);
+  const recordHeaders = ["工作表", ...headers];
+  const fieldIndexes = new Map<string, number>();
+  recordHeaders.forEach((header, index) => {
+    const normalized = normalizeField(header);
+    if (!fieldIndexes.has(normalized)) {
+      fieldIndexes.set(normalized, index);
+    }
+  });
+  const wanted = required.map(normalizeField);
   const missing = wanted.filter(
-    (field) => field && !normalizedHeaders.includes(field)
+    (field) => field && !fieldIndexes.has(field)
   );
   if (missing.length > 0) {
     warnings.push(
       `「${sheet.name}」未找到字段：${[...new Set(missing)].join("、")}`
     );
-    return [];
+    return;
   }
-  return sheet.values
-    .slice(headerIndex + 1)
-    .filter((row) => row.some((value) => value !== null && value !== ""))
-    .map((row) => {
-      const record: RecordRow = {
-        工作表: sheet.name
-      };
-      headers.forEach((header, index) => {
-        record[header] = row[index] ?? null;
-      });
-      return record;
-    });
+  const schema: RecordSchema = {
+    headers: recordHeaders,
+    fieldIndexes,
+    requestedFieldIndexes: new Map()
+  };
+  for (const row of sheet.values.slice(headerIndex + 1)) {
+    if (!row.some((value) => value !== null && value !== "")) continue;
+    yield {
+      values: [
+        sheet.name,
+        ...headers.map((_, index) => row[index] ?? null)
+      ],
+      schema
+    };
+  }
 }
 
 function fieldValue(record: RecordRow, field: string): CellValue {
-  const normalized = normalizeField(field);
-  const key = Object.keys(record).find(
-    (candidate) => normalizeField(candidate) === normalized
-  );
-  return key ? record[key] : null;
+  let index = record.schema.requestedFieldIndexes.get(field);
+  if (index === undefined) {
+    index =
+      record.schema.fieldIndexes.get(normalizeField(field)) ?? null;
+    record.schema.requestedFieldIndexes.set(field, index);
+  }
+  return index === null ? null : record.values[index] ?? null;
 }
 
 function matchesFilter(record: RecordRow, filter: DataFilter): boolean {
@@ -166,24 +195,33 @@ function matchesFilter(record: RecordRow, filter: DataFilter): boolean {
 
 function metricValue(rows: RecordRow[], metric: DataMetric): CellValue {
   if (metric.operation === "countRows") return rows.length;
-  const values = rows
-    .map((row) => fieldValue(row, metric.field ?? ""))
-    .filter((value) => value !== null && value !== "");
   if (metric.operation === "countDistinct") {
-    return new Set(values.map((value) => String(value))).size;
+    const distinct = new Set<string>();
+    for (const row of rows) {
+      const value = fieldValue(row, metric.field ?? "");
+      if (value !== null && value !== "") distinct.add(String(value));
+    }
+    return distinct.size;
   }
-  const numbers = values
-    .map(comparableNumber)
-    .filter((value): value is number => value !== null);
-  if (numbers.length === 0) return null;
-  if (metric.operation === "sum") {
-    return numbers.reduce((total, value) => total + value, 0);
+  let count = 0;
+  let total = 0;
+  let minimum = Infinity;
+  let maximum = -Infinity;
+  for (const row of rows) {
+    const number = comparableNumber(
+      fieldValue(row, metric.field ?? "")
+    );
+    if (number === null) continue;
+    count += 1;
+    total += number;
+    if (number < minimum) minimum = number;
+    if (number > maximum) maximum = number;
   }
-  if (metric.operation === "average") {
-    return numbers.reduce((total, value) => total + value, 0) / numbers.length;
-  }
-  if (metric.operation === "min") return Math.min(...numbers);
-  return Math.max(...numbers);
+  if (count === 0) return null;
+  if (metric.operation === "sum") return total;
+  if (metric.operation === "average") return total / count;
+  if (metric.operation === "min") return minimum;
+  return maximum;
 }
 
 function sortAndLimit(
@@ -210,20 +248,386 @@ function sortAndLimit(
   );
 }
 
+export interface QueryTableAccumulator {
+  addSheet(sheet: SheetValues): void;
+  finish(): DataToolResult;
+}
+
+export function createQueryTableAccumulator(
+  request: DataToolRequest
+): QueryTableAccumulator {
+  const arguments_ = request.arguments;
+  if (arguments_.combine && arguments_.combine.mode !== "union") {
+    throw new DataToolExecutionError(
+      "UNSUPPORTED_TOOL",
+      "当前工作簿暂不支持多表去重或关联，请切换到文件夹模式",
+      false
+    );
+  }
+  type MetricAccumulator = {
+    count: number;
+    total: number;
+    minimum: number;
+    maximum: number;
+    distinct: Set<string>;
+  };
+  const required = requiredFields(arguments_);
+  const warnings: string[] = [];
+  const availableFields = new Set<string>();
+  const sourceSheets: string[] = [];
+  const fields =
+    arguments_.fields && arguments_.fields.length > 0
+      ? arguments_.fields
+      : null;
+  let effectiveFields: string[] = fields ?? [];
+  const rowCandidates: CellValue[][] = [];
+  const profileCounts = new Map<string, { value: CellValue; count: number }>();
+  const groupBy = arguments_.groupBy ?? [];
+  const metrics = arguments_.metrics ?? [];
+  const groups = new Map<
+    string,
+    { values: CellValue[]; metrics: MetricAccumulator[] }
+  >();
+  let scannedRows = 0;
+  let filteredRows = 0;
+  const limit = arguments_.limit ?? capabilities.queryTable.defaultLimit;
+  const newMetricAccumulator = (): MetricAccumulator => ({
+    count: 0,
+    total: 0,
+    minimum: Infinity,
+    maximum: -Infinity,
+    distinct: new Set()
+  });
+  const updateMetric = (
+    state: MetricAccumulator,
+    record: RecordRow,
+    metric: DataMetric
+  ) => {
+    if (metric.operation === "countRows") {
+      state.count += 1;
+      return;
+    }
+    const value = fieldValue(record, metric.field ?? "");
+    if (metric.operation === "countDistinct") {
+      if (value !== null && value !== "") {
+        state.distinct.add(JSON.stringify(value));
+      }
+      return;
+    }
+    const numeric = comparableNumber(value);
+    if (numeric === null) return;
+    state.count += 1;
+    state.total += numeric;
+    if (numeric < state.minimum) state.minimum = numeric;
+    if (numeric > state.maximum) state.maximum = numeric;
+  };
+  const metricResult = (
+    state: MetricAccumulator,
+    metric: DataMetric
+  ): CellValue => {
+    if (metric.operation === "countRows") return state.count;
+    if (metric.operation === "countDistinct") return state.distinct.size;
+    if (state.count === 0) return null;
+    if (metric.operation === "sum") return state.total;
+    if (metric.operation === "average") return state.total / state.count;
+    if (metric.operation === "min") return state.minimum;
+    return state.maximum;
+  };
+
+  return {
+    addSheet(sheet) {
+      if (!sourceSheets.includes(sheet.name)) sourceSheets.push(sheet.name);
+      sheet.values
+        .slice(0, HEADER_SCAN_ROWS)
+        .flat()
+        .map((value) => String(value ?? "").trim())
+        .filter(Boolean)
+        .forEach((field) => availableFields.add(field));
+      const sheetWarnings: string[] = [];
+      for (const record of recordsFromSheet(sheet, required, sheetWarnings)) {
+        scannedRows += 1;
+        if (
+          !(arguments_.filters ?? []).every((filter) =>
+            matchesFilter(record, filter)
+          )
+        ) {
+          continue;
+        }
+        filteredRows += 1;
+        if (arguments_.mode === "profile") {
+          const value = fieldValue(record, arguments_.profileField!);
+          const key = JSON.stringify(value);
+          const current = profileCounts.get(key);
+          profileCounts.set(key, {
+            value,
+            count: (current?.count ?? 0) + 1
+          });
+          continue;
+        }
+        if (arguments_.mode === "aggregate") {
+          const values = groupBy.map((field) => fieldValue(record, field));
+          const key = JSON.stringify(values);
+          const group = groups.get(key) ?? {
+            values,
+            metrics: metrics.map(newMetricAccumulator)
+          };
+          metrics.forEach((metric, index) =>
+            updateMetric(group.metrics[index], record, metric)
+          );
+          groups.set(key, group);
+          continue;
+        }
+        if (effectiveFields.length === 0) {
+          effectiveFields = record.schema.headers.slice(0, 30);
+        }
+        rowCandidates.push(
+          effectiveFields.map((field) => fieldValue(record, field))
+        );
+        if (rowCandidates.length > limit * 2) {
+          rowCandidates.splice(
+            0,
+            rowCandidates.length,
+            ...sortAndLimit(effectiveFields, rowCandidates, arguments_)
+          );
+        }
+      }
+      for (const warning of sheetWarnings) {
+        if (!warnings.includes(warning)) warnings.push(warning);
+      }
+    },
+    finish() {
+      if (scannedRows === 0 && warnings.length > 0 && required.length > 0) {
+        throw new DataToolExecutionError(
+          "FIELD_NOT_FOUND",
+          warnings.join("；"),
+          true,
+          [...availableFields].slice(0, 100)
+        );
+      }
+      if (arguments_.mode === "profile") {
+        const field = arguments_.profileField!;
+        const headers = [field, "数量", "占比"];
+        const rows = [...profileCounts.values()].map(({ value, count }) => [
+          value,
+          count,
+          filteredRows > 0 ? count / filteredRows : 0
+        ]);
+        return {
+          requestId: request.id,
+          tool: "query_table",
+          title: `${field}分布`,
+          headers,
+          rows: sortAndLimit(headers, rows, {
+            ...arguments_,
+            sortBy: arguments_.sortBy ?? "数量"
+          }),
+          sourceSheets,
+          scannedRows,
+          complete: warnings.length === 0,
+          calculation: `按「${field}」统计数量，占比 = 该值数量 ÷ 筛选后总记录数。`,
+          warnings
+        };
+      }
+      if (arguments_.mode === "aggregate") {
+        const metricHeaders = metrics.flatMap((metric) => [
+          metric.outputName,
+          ...(metric.ratioOutputName ? [metric.ratioOutputName] : [])
+        ]);
+        const headers = [...groupBy, ...metricHeaders];
+        const baseRows = [...groups.values()].map((group) => ({
+          values: group.values,
+          metrics: metrics.map((metric, index) =>
+            metricResult(group.metrics[index], metric)
+          )
+        }));
+        const totals = metrics.map((_, index) =>
+          baseRows.reduce(
+            (total, row) =>
+              total + (comparableNumber(row.metrics[index]) ?? 0),
+            0
+          )
+        );
+        const rows = baseRows.map((row) => {
+          const output: CellValue[] = [...row.values];
+          metrics.forEach((metric, index) => {
+            const value = row.metrics[index];
+            output.push(value);
+            if (metric.ratioOutputName) {
+              const numeric = comparableNumber(value) ?? 0;
+              output.push(totals[index] > 0 ? numeric / totals[index] : 0);
+            }
+          });
+          return output;
+        });
+        return {
+          requestId: request.id,
+          tool: "query_table",
+          title: "分组统计结果",
+          headers,
+          rows: sortAndLimit(headers, rows, arguments_),
+          sourceSheets,
+          scannedRows,
+          complete: warnings.length === 0,
+          calculation: `筛选后按 ${groupBy.join("、") || "全部记录"} 分组，执行 ${metrics
+            .map((metric) => `${metric.outputName}=${metric.operation}`)
+            .join("；")}。`,
+          warnings
+        };
+      }
+      return {
+        requestId: request.id,
+        tool: "query_table",
+        title: "查询结果",
+        headers: effectiveFields,
+        rows: sortAndLimit(effectiveFields, rowCandidates, arguments_),
+        sourceSheets,
+        scannedRows,
+        complete: warnings.length === 0,
+        calculation: `按 ${arguments_.filters?.length ?? 0} 个条件筛选，并返回指定字段。`,
+        warnings
+      };
+    }
+  };
+}
+
 export function executeQueryTableData(
   request: DataToolRequest,
   sheets: SheetValues[]
 ): DataToolResult {
+  const accumulator = createQueryTableAccumulator(request);
+  for (const sheet of sheets) accumulator.addSheet(sheet);
+  return accumulator.finish();
+}
+
+function executeQueryTableDataLegacy(
+  request: DataToolRequest,
+  sheets: SheetValues[]
+): DataToolResult {
   const arguments_ = request.arguments;
+  if (arguments_.combine && arguments_.combine.mode !== "union") {
+    throw new DataToolExecutionError(
+      "UNSUPPORTED_TOOL",
+      "当前工作簿暂不支持多表去重或关联，请切换到文件夹模式",
+      false
+    );
+  }
   const warnings: string[] = [];
-  const allRecords = sheets.flatMap((sheet) =>
-    recordsFromSheet(sheet, arguments_, warnings)
-  );
-  if (
-    allRecords.length === 0 &&
-    warnings.length > 0 &&
-    requiredFields(arguments_).length > 0
-  ) {
+  const required = requiredFields(arguments_);
+  type MetricAccumulator = {
+    count: number;
+    total: number;
+    minimum: number;
+    maximum: number;
+    distinct: Set<string>;
+  };
+  const newMetricAccumulator = (): MetricAccumulator => ({
+    count: 0,
+    total: 0,
+    minimum: Infinity,
+    maximum: -Infinity,
+    distinct: new Set()
+  });
+  const updateMetric = (
+    state: MetricAccumulator,
+    record: RecordRow,
+    metric: DataMetric
+  ) => {
+    if (metric.operation === "countRows") {
+      state.count += 1;
+      return;
+    }
+    const value = fieldValue(record, metric.field ?? "");
+    if (metric.operation === "countDistinct") {
+      if (value !== null && value !== "") state.distinct.add(JSON.stringify(value));
+      return;
+    }
+    const numeric = comparableNumber(value);
+    if (numeric === null) return;
+    state.count += 1;
+    state.total += numeric;
+    if (numeric < state.minimum) state.minimum = numeric;
+    if (numeric > state.maximum) state.maximum = numeric;
+  };
+  const metricResult = (
+    state: MetricAccumulator,
+    metric: DataMetric
+  ): CellValue => {
+    if (metric.operation === "countRows") return state.count;
+    if (metric.operation === "countDistinct") return state.distinct.size;
+    if (state.count === 0) return null;
+    if (metric.operation === "sum") return state.total;
+    if (metric.operation === "average") return state.total / state.count;
+    if (metric.operation === "min") return state.minimum;
+    return state.maximum;
+  };
+
+  const fields = arguments_.fields && arguments_.fields.length > 0
+    ? arguments_.fields
+    : null;
+  let effectiveFields: string[] = fields ?? [];
+  const rowCandidates: CellValue[][] = [];
+  const profileCounts = new Map<string, { value: CellValue; count: number }>();
+  const groupBy = arguments_.groupBy ?? [];
+  const metrics = arguments_.metrics ?? [];
+  const groups = new Map<
+    string,
+    { values: CellValue[]; metrics: MetricAccumulator[] }
+  >();
+  let scannedRows = 0;
+  let filteredRows = 0;
+  const limit = arguments_.limit ?? capabilities.queryTable.defaultLimit;
+
+  for (const sheet of sheets) {
+    for (const record of recordsFromSheet(sheet, required, warnings)) {
+      scannedRows += 1;
+      if (
+        !(arguments_.filters ?? []).every((filter) =>
+          matchesFilter(record, filter)
+        )
+      ) {
+        continue;
+      }
+      filteredRows += 1;
+      if (arguments_.mode === "profile") {
+        const value = fieldValue(record, arguments_.profileField!);
+        const key = JSON.stringify(value);
+        const current = profileCounts.get(key);
+        profileCounts.set(key, {
+          value,
+          count: (current?.count ?? 0) + 1
+        });
+        continue;
+      }
+      if (arguments_.mode === "aggregate") {
+        const values = groupBy.map((field) => fieldValue(record, field));
+        const key = JSON.stringify(values);
+        const group = groups.get(key) ?? {
+          values,
+          metrics: metrics.map(newMetricAccumulator)
+        };
+        metrics.forEach((metric, index) =>
+          updateMetric(group.metrics[index], record, metric)
+        );
+        groups.set(key, group);
+        continue;
+      }
+      if (effectiveFields.length === 0) {
+        effectiveFields = record.schema.headers.slice(0, 30);
+      }
+      rowCandidates.push(
+        effectiveFields.map((field) => fieldValue(record, field))
+      );
+      if (rowCandidates.length > limit * 2) {
+        rowCandidates.splice(
+          0,
+          rowCandidates.length,
+          ...sortAndLimit(effectiveFields, rowCandidates, arguments_)
+        );
+      }
+    }
+  }
+
+  if (scannedRows === 0 && warnings.length > 0 && required.length > 0) {
     const availableFields = [
       ...new Set(
         sheets.flatMap((sheet) =>
@@ -242,29 +646,14 @@ export function executeQueryTableData(
       availableFields
     );
   }
-  const records = allRecords.filter((record) =>
-    (arguments_.filters ?? []).every((filter) =>
-      matchesFilter(record, filter)
-    )
-  );
 
   if (arguments_.mode === "profile") {
     const field = arguments_.profileField!;
-    const counts = new Map<string, { value: CellValue; count: number }>();
-    for (const record of records) {
-      const value = fieldValue(record, field);
-      const key = JSON.stringify(value);
-      const current = counts.get(key);
-      counts.set(key, {
-        value,
-        count: (current?.count ?? 0) + 1
-      });
-    }
     const headers = [field, "数量", "占比"];
-    const rows = [...counts.values()].map(({ value, count }) => [
+    const rows = [...profileCounts.values()].map(({ value, count }) => [
       value,
       count,
-      records.length > 0 ? count / records.length : 0
+      filteredRows > 0 ? count / filteredRows : 0
     ]);
     return {
       requestId: request.id,
@@ -276,7 +665,7 @@ export function executeQueryTableData(
         sortBy: arguments_.sortBy ?? "数量"
       }),
       sourceSheets: sheets.map((sheet) => sheet.name),
-      scannedRows: allRecords.length,
+      scannedRows,
       complete: warnings.length === 0,
       calculation: `按「${field}」统计数量，占比 = 该值数量 ÷ 筛选后总记录数。`,
       warnings
@@ -284,16 +673,6 @@ export function executeQueryTableData(
   }
 
   if (arguments_.mode === "aggregate") {
-    const groupBy = arguments_.groupBy ?? [];
-    const groups = new Map<string, { values: CellValue[]; rows: RecordRow[] }>();
-    for (const record of records) {
-      const values = groupBy.map((field) => fieldValue(record, field));
-      const key = JSON.stringify(values);
-      const group = groups.get(key) ?? { values, rows: [] };
-      group.rows.push(record);
-      groups.set(key, group);
-    }
-    const metrics = arguments_.metrics ?? [];
     const metricHeaders = metrics.flatMap((metric) => [
       metric.outputName,
       ...(metric.ratioOutputName ? [metric.ratioOutputName] : [])
@@ -301,13 +680,15 @@ export function executeQueryTableData(
     const headers = [...groupBy, ...metricHeaders];
     const baseRows = [...groups.values()].map((group) => ({
       values: group.values,
-      metrics: metrics.map((metric) => metricValue(group.rows, metric))
+      metrics: metrics.map((metric, index) =>
+        metricResult(group.metrics[index], metric)
+      )
     }));
     const totals = metrics.map((_, index) =>
-      baseRows.reduce((total, row) => {
-        const value = comparableNumber(row.metrics[index]);
-        return total + (value ?? 0);
-      }, 0)
+      baseRows.reduce(
+        (total, row) => total + (comparableNumber(row.metrics[index]) ?? 0),
+        0
+      )
     );
     const rows = baseRows.map((row) => {
       const output: CellValue[] = [...row.values];
@@ -328,7 +709,7 @@ export function executeQueryTableData(
       headers,
       rows: sortAndLimit(headers, rows, arguments_),
       sourceSheets: sheets.map((sheet) => sheet.name),
-      scannedRows: allRecords.length,
+      scannedRows,
       complete: warnings.length === 0,
       calculation: `筛选后按 ${groupBy.join("、") || "全部记录"} 分组，执行 ${metrics
         .map((metric) => `${metric.outputName}=${metric.operation}`)
@@ -337,21 +718,14 @@ export function executeQueryTableData(
     };
   }
 
-  const fields =
-    arguments_.fields && arguments_.fields.length > 0
-      ? arguments_.fields
-      : Object.keys(records[0] ?? {}).slice(0, 30);
-  const rows = records.map((record) =>
-    fields.map((field) => fieldValue(record, field))
-  );
   return {
     requestId: request.id,
     tool: "query_table",
     title: "查询结果",
-    headers: fields,
-    rows: sortAndLimit(fields, rows, arguments_),
+    headers: effectiveFields,
+    rows: sortAndLimit(effectiveFields, rowCandidates, arguments_),
     sourceSheets: sheets.map((sheet) => sheet.name),
-    scannedRows: allRecords.length,
+    scannedRows,
     complete: warnings.length === 0,
     calculation: `按 ${arguments_.filters?.length ?? 0} 个条件筛选，并返回指定字段。`,
     warnings
@@ -361,12 +735,23 @@ export function executeQueryTableData(
 export async function executeQueryTableTool(
   request: DataToolRequest,
   allowedSheetNames: string[],
-  activeWorksheet: string
+  activeWorksheet: string,
+  options: QueryToolOptions = {}
 ): Promise<DataToolResult> {
   if (request.tool !== "query_table") {
     throw new DataToolExecutionError(
       "UNSUPPORTED_TOOL",
       "不支持的数据工具",
+      false
+    );
+  }
+  if (
+    request.arguments.combine &&
+    request.arguments.combine.mode !== "union"
+  ) {
+    throw new DataToolExecutionError(
+      "UNSUPPORTED_TOOL",
+      "当前工作簿暂不支持多表去重或关联，请切换到文件夹模式",
       false
     );
   }
@@ -400,8 +785,8 @@ export async function executeQueryTableTool(
 
     let totalRows = 0;
     let totalCells = 0;
-    const ranges = pending.map(({ name, worksheet, usedRange }) => {
-      if (usedRange.isNullObject) return { name, range: null };
+    for (const { name, usedRange } of pending) {
+      if (usedRange.isNullObject) continue;
       if (usedRange.columnCount > MAX_TOOL_COLUMNS) {
         throw new DataToolExecutionError(
           "TOOL_LIMIT_EXCEEDED",
@@ -411,15 +796,7 @@ export async function executeQueryTableTool(
       }
       totalRows += usedRange.rowCount;
       totalCells += usedRange.rowCount * usedRange.columnCount;
-      const range = worksheet.getRangeByIndexes(
-        usedRange.rowIndex,
-        usedRange.columnIndex,
-        usedRange.rowCount,
-        usedRange.columnCount
-      );
-      range.load("values");
-      return { name, range };
-    });
+    }
     if (totalRows > MAX_TOOL_ROWS || totalCells > MAX_TOOL_CELLS) {
       throw new DataToolExecutionError(
         "TOOL_LIMIT_EXCEEDED",
@@ -427,21 +804,61 @@ export async function executeQueryTableTool(
         false
       );
     }
-    await context.sync();
-
-    const sheets: SheetValues[] = ranges.map(({ name, range }) => ({
-      name,
-      values: (range?.values ?? []).map((row) =>
-        row.map((value) =>
-          value === null ||
-          typeof value === "string" ||
-          typeof value === "number" ||
-          typeof value === "boolean"
-            ? value
-            : String(value)
-        )
-      )
-    }));
-    return executeQueryTableData(request, sheets);
+    const accumulator = createQueryTableAccumulator(request);
+    let scannedRows = 0;
+    for (const { name, worksheet, usedRange } of pending) {
+      let header: CellValue[] | null = null;
+      if (!usedRange.isNullObject) {
+        for (
+          let rowOffset = 0;
+          rowOffset < usedRange.rowCount;
+          rowOffset += TOOL_CHUNK_ROWS
+        ) {
+          if (options.signal?.aborted) {
+            throw new DataToolExecutionError(
+              "CANCELLED",
+              "本地查询已取消，未生成或写入任何结果",
+              false
+            );
+          }
+          const rowCount = Math.min(
+            TOOL_CHUNK_ROWS,
+            usedRange.rowCount - rowOffset
+          );
+          const range = worksheet.getRangeByIndexes(
+            usedRange.rowIndex + rowOffset,
+            usedRange.columnIndex,
+            rowCount,
+            usedRange.columnCount
+          );
+          range.load("values,text,numberFormat");
+          await context.sync();
+          const values = range.values.map((row, rowIndex) =>
+            row.map((value, columnIndex) =>
+                normalizeCellValue(
+                  value,
+                  range.text[rowIndex]?.[columnIndex] ?? "",
+                  range.numberFormat[rowIndex]?.[columnIndex] ?? "General"
+                )
+              )
+          );
+          if (header === null) {
+            const headerIndex = detectHeaderIndex(
+              values,
+              requiredFields(request.arguments)
+            );
+            header = values[headerIndex] ?? [];
+            accumulator.addSheet({ name, values });
+          } else {
+            accumulator.addSheet({ name, values: [header, ...values] });
+          }
+          scannedRows += rowCount;
+          options.onProgress?.({ scannedRows, totalRows, sheet: name });
+        }
+      } else {
+        accumulator.addSheet({ name, values: [] });
+      }
+    }
+    return accumulator.finish();
   });
 }

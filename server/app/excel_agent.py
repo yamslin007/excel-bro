@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from pydantic import ValidationError
@@ -20,6 +21,7 @@ from .models import (
 MAX_AGENT_TURNS = capability_int("agent", "maxTurns")
 MAX_READ_ROWS = capability_int("agent", "maxReadRows")
 MAX_READ_COLUMNS = capability_int("agent", "maxReadColumns")
+MAX_OUTPUT_TOKENS = capability_int("agent", "maxOutputTokens")
 
 AGENT_SYSTEM_PROMPT = """
 你是 Excel Bro 的规划 Agent。你的工作是理解目标、按需查看工作簿，再提交一个
@@ -223,9 +225,58 @@ def _inline_json_schema(schema: dict[str, Any]) -> dict[str, Any]:
     return expand(schema)
 
 
-def _tools() -> list[dict[str, Any]]:
-    plan_schema = _inline_json_schema(AnalysisPlan.model_json_schema())
-    result_context_schema = _inline_json_schema(ResultContext.model_json_schema())
+def _strip_metadata(node: Any) -> Any:
+    """Remove Pydantic-generated title/description annotations that bloat schema.
+
+    模型需要的是字段结构和取值约束，不是自动生成的字段名标题。剥离后可显著
+    降低每轮 Agent 请求携带的 schema token，不改变任何字段或校验规则。
+
+    注意：只能剥离作为 JSON Schema 元数据的 title/description，不能误删
+    properties 内部同名的业务字段（例如 AnalysisPlan 自身就有 title 字段）。
+    因此进入 properties / $defs 等“键即字段名”的容器时不再当作元数据处理。
+    """
+    if isinstance(node, list):
+        return [_strip_metadata(item) for item in node]
+    if not isinstance(node, dict):
+        return node
+    result: dict[str, Any] = {}
+    for key, value in node.items():
+        if key in ("title", "description") and not isinstance(value, (dict, list)):
+            # 标量的 title/description 是 schema 注解，安全剥离。
+            continue
+        if key in ("properties", "$defs", "definitions") and isinstance(value, dict):
+            # 这些容器的键是字段名，值继续递归但键本身保留。
+            result[key] = {
+                field: _strip_metadata(field_schema)
+                for field, field_schema in value.items()
+            }
+        else:
+            result[key] = _strip_metadata(value)
+    return result
+
+
+def _plan_tool_schema() -> dict[str, Any]:
+    """Compact submit_plan schema.
+
+    在完整内联 schema 基础上做两处安全裁剪：
+    1. 移除 acceptanceCriteria 字段——它由 AnalysisPlan 的
+       add_deterministic_acceptance_criteria 验证器自动推断；模型即便仍主动
+       提交，Pydantic 的 default_factory 也照常接受，因此不必在工具里向模型
+       公布这段最大的子 schema。
+    2. 剥离 Pydantic 自动生成的 title 元数据。
+    动作(actions)的字段级结构完整保留，模型仍能看到全部动作类型及其字段。
+    """
+    schema = _inline_json_schema(AnalysisPlan.model_json_schema())
+    properties = schema.get("properties")
+    if isinstance(properties, dict):
+        properties.pop("acceptanceCriteria", None)
+    required = schema.get("required")
+    if isinstance(required, list) and "acceptanceCriteria" in required:
+        required.remove("acceptanceCriteria")
+    return _strip_metadata(schema)
+
+
+def _readonly_tools() -> list[dict[str, Any]]:
     return [
         {
             "type": "function",
@@ -269,6 +320,15 @@ def _tools() -> list[dict[str, Any]]:
                 },
             },
         },
+    ]
+
+
+def _terminal_tools() -> list[dict[str, Any]]:
+    plan_schema = _plan_tool_schema()
+    result_context_schema = _strip_metadata(
+        _inline_json_schema(ResultContext.model_json_schema())
+    )
+    return [
         {
             "type": "function",
             "function": {
@@ -303,7 +363,12 @@ def _tools() -> list[dict[str, Any]]:
     ]
 
 
-AGENT_TOOLS = _tools()
+# 完整工具集：需要模型自行查数据时使用。
+AGENT_TOOLS = [*_readonly_tools(), *_terminal_tools()]
+# 数据已由前端确定性算好并随 dataResults 带入时，去掉三个只读工具，
+# 让模型直接用现成结果提交回答或计划。减少每轮携带的 token，也避免模型
+# 多绕几轮重复读取，从而缩短真实耗时、降低撞上超时中断的概率。
+AGENT_TOOLS_WITH_DATA = _terminal_tools()
 
 
 def _parse_content(content: str) -> AssistantResponse:
@@ -349,12 +414,52 @@ def _execute_tool(
     raise ValueError(f"未知工具：{name}")
 
 
+READONLY_TOOLS = frozenset(
+    {"get_workbook_context", "find_fields", "read_range"}
+)
+
+
+def _tool_cache_key(name: str, arguments: dict[str, Any]) -> str:
+    return f"{name}:{json.dumps(arguments, ensure_ascii=False, sort_keys=True)}"
+
+
+def _tool_step(name: str, arguments: dict[str, Any]) -> str | None:
+    """把只读工具调用翻译成用户可读的步骤文案。"""
+    if name == "get_workbook_context":
+        return "正在查看工作簿结构"
+    if name == "find_fields":
+        query = str(arguments.get("query", "")).strip()
+        return f"正在查找字段「{query}」" if query else "正在查找字段"
+    if name == "read_range":
+        sheet = str(arguments.get("sheet", "")).strip()
+        cell_range = str(arguments.get("range", "")).strip()
+        if sheet and cell_range:
+            return f"正在读取 {sheet}!{cell_range}"
+        return "正在读取数据范围"
+    return None
+
+
 async def run_excel_agent(
     request: PlanRequest,
     *,
     connection: ModelConnection,
     timeout: float,
+    tool_cache: dict[str, Any] | None = None,
+    on_event: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
 ) -> AssistantResponse:
+    cache = tool_cache
+
+    async def emit(
+        title: str, detail: str | None = None, completed: str | None = None
+    ) -> None:
+        if on_event is None:
+            return
+        event: dict[str, Any] = {"phase": "planning", "title": title}
+        if detail is not None:
+            event["detail"] = detail
+        if completed is not None:
+            event["completedStep"] = completed
+        await on_event(event)
     user_text = (
         f"用户需求：\n{request.prompt}\n\n"
         f"初始工作簿上下文：\n"
@@ -386,12 +491,23 @@ async def run_excel_agent(
         },
     ]
 
+    await emit("正在理解需求")
+    last_step: str | None = None
+    # 前端已带回确定性查询结果时，去掉只读工具，直接进入提交。
+    tools = AGENT_TOOLS_WITH_DATA if request.dataResults else AGENT_TOOLS
     async with OpenAICompatibleClient(connection, timeout=timeout) as client:
-        for _ in range(MAX_AGENT_TURNS):
+        for turn_index in range(MAX_AGENT_TURNS):
+            await emit(
+                "正在规划操作"
+                if turn_index == 0
+                else f"正在规划操作（第 {turn_index + 1} 步）",
+                completed=last_step,
+            )
             payload = await client.chat_completions(
                 messages=messages,
-                tools=AGENT_TOOLS,
+                tools=tools,
                 tool_choice="auto",
+                max_tokens=MAX_OUTPUT_TOKENS,
             )
             message = payload["choices"][0]["message"]
             tool_calls = message.get("tool_calls") or []
@@ -421,10 +537,22 @@ async def run_excel_agent(
                 name = str(function.get("name", ""))
                 try:
                     arguments = json.loads(function.get("arguments") or "{}")
-                    result = _execute_tool(request, name, arguments)
-                    if isinstance(result, (PlanResponse, AnswerResponse)):
-                        return result
-                    tool_content = json.dumps(result, ensure_ascii=False)
+                    step_text = _tool_step(name, arguments)
+                    if step_text is not None:
+                        await emit(step_text, completed=last_step)
+                        last_step = step_text
+                    cache_key: str | None = None
+                    if cache is not None and name in READONLY_TOOLS:
+                        cache_key = _tool_cache_key(name, arguments)
+                    if cache_key is not None and cache_key in cache:
+                        tool_content = cache[cache_key]
+                    else:
+                        result = _execute_tool(request, name, arguments)
+                        if isinstance(result, (PlanResponse, AnswerResponse)):
+                            return result
+                        tool_content = json.dumps(result, ensure_ascii=False)
+                        if cache_key is not None:
+                            cache[cache_key] = tool_content
                 except (ValueError, ValidationError, json.JSONDecodeError) as error:
                     tool_content = json.dumps(
                         {"error": str(error)}, ensure_ascii=False

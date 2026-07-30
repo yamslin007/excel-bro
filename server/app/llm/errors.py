@@ -25,6 +25,7 @@ class LLMHTTPStatusError(LLMError):
     def __init__(self, status_code: int, body: str) -> None:
         self.status_code = status_code
         self.body = body.strip()[:300]
+        self.retry_after: float | None = None
         super().__init__(
             f"模型服务返回 HTTP {status_code}"
             f"{f'：{self.body}' if self.body else ''}"

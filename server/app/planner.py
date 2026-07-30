@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-import os
 import re
 import uuid
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 from pydantic import ValidationError
 
+from .capabilities import model_timeout_seconds
 from .excel_agent import run_excel_agent
 from .llm import selected_model_config
 from .models import (
@@ -1831,7 +1833,12 @@ def _local_data_tool_response(request: PlanRequest) -> AnswerResponse | None:
     )
 
 
-async def create_plan(request: PlanRequest) -> AssistantResponse:
+async def create_plan(
+    request: PlanRequest,
+    *,
+    tool_cache: dict[str, Any] | None = None,
+    on_event: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+) -> AssistantResponse:
     config = selected_model_config(request.modelId)
     if config is None:
         if request.images:
@@ -1844,12 +1851,14 @@ async def create_plan(request: PlanRequest) -> AssistantResponse:
         raise ValueError(
             f"模型「{config.model}」未配置图片能力；请在 AI_VISION_MODELS 中声明"
         )
-    timeout = float(os.getenv("AI_TIMEOUT_SECONDS", "60"))
+    timeout = model_timeout_seconds()
     try:
         return await run_excel_agent(
             request,
             connection=config,
             timeout=timeout,
+            tool_cache=tool_cache,
+            on_event=on_event,
         )
     except (KeyError, IndexError, TypeError, ValidationError) as error:
         raise ValueError(f"模型计划无法通过安全校验：{error}") from error

@@ -41,7 +41,8 @@ conda config --set auto_activate_base false
 
 ## 3. 模型配置
 
-编辑 `server/.env`：
+推荐直接在任务窗格顶部点击“添加模型”。如需使用旧环境变量方式，可编辑
+`server/.env`：
 
 ```env
 AI_BASE_URL=https://api.moonshot.cn/v1
@@ -59,7 +60,13 @@ AI_TIMEOUT_SECONDS=60
 - `AI_MODELS` 用英文逗号分隔可切换模型。
 - 只有列入 `AI_VISION_MODELS` 的模型才能接收图片。
 - 本地 Ollama、LM Studio 等无鉴权网关可以留空 `AI_API_KEY`。
-- 修改 `.env` 后必须重启 FastAPI 服务。
+- 新安装的配置模板不会预置服务商或模型；未配置时只显示基础模式和首次添加引导。
+- 任务窗格顶部模型菜单同时提供选择、添加和管理入口。每个独立连接拥有自己的服务地址、模型 ID 和 Key，并写入配置文件同目录下的 `model-connections.json`。
+- 设置页修改会立即生效，完整 Key 不会返回前端。`model-connections.json` 包含密钥，已被 Git 忽略，不能截图、记录日志或手动提交。
+- “测试连接”会发送一个内容固定、输出极短的模型请求，不会读取或发送工作簿数据，也不会保存尚未确认的连接。
+- 新增连接保存后会自动切换到新模型。编辑连接时，Key 留空会保留旧值；需要接入无鉴权本地服务时可显式勾选清除。
+- 同一服务地址和模型 ID 不能重复添加；如果 `model-connections.json` 损坏，服务会明确报错并保留原文件，避免静默覆盖密钥。
+- 手动修改 `.env` 中的服务地址、模型列表或其他参数后，仍需重启 FastAPI 服务。
 - 不要把真实 Key 写入 `.env.example`、前端代码、截图、日志或提交记录。
 
 ## 4. 日常启动
@@ -78,6 +85,7 @@ npm run dev:server
 ```powershell
 Invoke-RestMethod http://127.0.0.1:8765/health
 Invoke-RestMethod http://127.0.0.1:8765/api/models
+Invoke-RestMethod http://127.0.0.1:8765/api/settings/model
 ```
 
 ### 终端 2：任务窗格前端
@@ -94,13 +102,28 @@ npm run dev:addin
 npm run start:excel
 ```
 
-停止旁加载：
+该命令会创建并打开一个临时测试工作簿，加载项只旁加载到该工作簿。普通新建
+工作簿不会继承这次开发旁加载。停止旁加载：
 
 ```powershell
 npm run stop:excel
 ```
 
 修改 `manifest.xml` 后应停止再重新旁加载。普通 React/CSS 修改通常只需刷新任务窗格。
+普通工作簿需要通过 Windows 共享加载项目录进行本地测试安装；正式发布使用
+Microsoft 365 集中部署或 AppSource。
+
+### 个人 Windows 安装包
+
+执行 `npm run build:installer` 生成的安装包会自动创建
+`\\<电脑名>\ExcelBroAddins` 本机共享并注册到 Office 可信加载项目录。使用实际
+计算机名而不是 `localhost`，以兼容只枚举标准 UNC 服务器名的 Office 版本。创建共享
+需要一次 UAC 管理员授权。安装后完全退出并重开 Excel，再依次选择
+**开始 → 加载项 → 更多加载项 → 高级 → 共享文件夹**，选择 **Excel Bro**
+并点击 **添加**。Office 要求用户完成这次首次确认，安装器不能代替点击。
+
+卸载时还会请求一次 UAC 权限以删除本机共享，并清除可信目录、启动项、证书和
+程序文件；`%LOCALAPPDATA%\Excel Bro` 中的个人模型配置默认保留。
 
 ## 5. 浏览器与 Excel 调试
 
@@ -143,6 +166,9 @@ npm test
 
 # Python 语法编译检查
 python -m compileall -q server/app
+
+# 构建 Windows 本地安装包
+npm run build:installer
 ```
 
 提交前推荐：
@@ -161,6 +187,7 @@ python -m compileall -q server/app
 | 对话布局、按钮、输入框 | `apps/excel-addin/src/App.tsx`, `styles.css` |
 | Excel 读取或写入 | `apps/excel-addin/src/excel.ts` |
 | 本地筛选、统计、占比 | `apps/excel-addin/src/dataTools.ts` |
+| 单元格类型标准化 | `apps/excel-addin/src/cellNormalization.ts` |
 | 拆分工作表并聚合 | `apps/excel-addin/src/splitAggregate.ts` |
 | API 请求与错误显示 | `apps/excel-addin/src/api.ts`, `server/app/main.py` |
 | 需求确认机制 | `server/app/intent.py` |
@@ -168,8 +195,9 @@ python -m compileall -q server/app
 | 模型 Agent 工具 | `server/app/excel_agent.py` |
 | 基础模式和模型选择 | `server/app/planner.py` |
 | Excel 动作协议 | `contracts.ts`, `server/app/models.py` |
-| 文件夹 Excel | `server/app/folder_workbooks.py` |
-| 固化工具 | `apps/excel-addin/src/storage.ts` |
+| 文件夹 Excel | `server/app/folder_workbooks.py`, `server/app/folder_data.py` |
+| 固化工具 | `apps/excel-addin/src/storage.ts`, `deterministicTools.ts` |
+| 本地诊断 | `apps/excel-addin/src/diagnostics.ts`, `server/app/main.py` |
 | 限额 | `config/capabilities.json` |
 | 功能区按钮与地址 | `apps/excel-addin/manifest.xml` |
 
@@ -189,10 +217,15 @@ python -m compileall -q server/app
 3. 实现 Office.js 执行。
 4. 决定文件夹模式支持还是明确拒绝。
 5. 增加执行预览文字和风险分类。
-6. 增加执行后验收。
-7. 检查固化工具是否需要新增参数绑定。
-8. 补前后端测试。
-9. 更新架构文档。
+6. 增加执行后验收，并明确该动作是 `verified` 还是 `executed_unverified`；不能用工作表存在代替复杂效果验证。排序应读取真实值顺序，筛选应读取 AutoFilter 条件，表格应读取真实名称、范围和表头状态；格式、数据验证和冻结窗格也应读取保存后的具体属性；图表和数据透视表应核对真实数据源与位置。无法跨执行通道稳定核对的属性必须保留为未独立验证。
+7. 执行器先预检整份计划的工作表依赖、区域与矩阵尺寸、对象名称和 API 版本；中途失败时返回 `succeeded`、`failed` 和 `not_run` 动作明细。
+8. 检查固化工具是否需要新增参数绑定。
+9. 补前后端测试。
+10. 更新架构文档。
+
+图表强验收依赖 ExcelApi 1.12 的系列维度读取；数据透视表强验收依赖
+ExcelApi 1.15 的数据源字符串读取。修改最低版本时必须同步预检测试和用户
+可读错误，不能在执行后才因缺少 API 失败。
 
 ### 模型行为改动
 
@@ -210,6 +243,9 @@ python -m compileall -q server/app
 - `contracts.test.ts`：协议断言
 - `api.test.ts`：请求和错误封装
 - `dataTools.test.ts`：确定性查询
+- `cellNormalization.test.ts`：日期、编码和展示值标准化
+- `deterministicTools.test.ts`：固化查询本地执行与模型调用指标
+- `diagnostics.test.ts`：无敏感内容的结构化诊断
 - `excel.test.ts`：执行辅助逻辑
 - `splitAggregate.test.ts`：拆分聚合
 - `storage.test.ts`：固化工具与迁移
@@ -222,6 +258,7 @@ python -m compileall -q server/app
 - `test_models.py`：Pydantic 模型
 - `test_planner.py`：基础模式和规划
 - `test_folder_workbooks.py`：文件夹执行
+- `test_folder_data.py`：pandas 完整数据、跨文件 ID、权限边界、合并和关联
 - `test_no_business_hardcoding.py`：防止行业字段重新硬编码
 
 修复缺陷时优先先增加一个能够复现问题的测试。

@@ -5,7 +5,7 @@ import hashlib
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 from .capabilities import capability_int
 from .models import (
@@ -42,6 +42,9 @@ class TurnState:
         default_factory=asyncio.Lock,
         repr=False,
     )
+    # 只读工具（get_workbook_context/find_fields/read_range）的确定性结果缓存，
+    # 按 turn_id 存活，使失败重试不必重复读取同一份快照。
+    tool_cache: dict[str, Any] = field(default_factory=dict, repr=False)
 
 
 class TurnRegistry:
