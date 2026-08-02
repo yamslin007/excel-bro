@@ -818,6 +818,10 @@ export default function App() {
   // pendingSteerRef：转向时先掐掉当前 turn，把新话暂存这里；等 busy 回落到 idle，
   // 由 effect 带着这句新话重新发起一个 turn（硬转向 = abort + 带新话重跑）。
   const pendingSteerRef = useRef<string | null>(null);
+  // steerBasePromptRef：转向时被打断那一句的原始意图。被打断的 turn 没跑完，
+  // 不会沉淀出 priorIntent/priorResult，导致重跑时新话（多为承接式追问）失去锚点。
+  // 这里保留原句，重跑时并入新话，让 checkIntent 收到完整意图。
+  const steerBasePromptRef = useRef<string | null>(null);
   // 结论复用缓存（见 CachedConclusion）。intentKey → 结论；normalizedPrompt → intentKey。
   const resultCacheRef = useRef<Map<string, CachedConclusion>>(new Map());
   const promptKeyCacheRef = useRef<Map<string, string>>(new Map());
@@ -2389,9 +2393,10 @@ export default function App() {
     setContextOpen(true);
   }
 
-  // 纯停止：掐掉当前 turn，不再重跑。清掉待转向文本，避免误触发重跑。
+  // 纯停止：掐掉当前 turn，不再重跑。清掉待转向文本与被打断意图，避免误触发重跑或串味。
   function stopTurn() {
     pendingSteerRef.current = null;
+    steerBasePromptRef.current = null;
     turnAbortRef.current?.abort();
     queryAbortRef.current?.abort();
   }
@@ -2405,6 +2410,8 @@ export default function App() {
       return;
     }
     pendingSteerRef.current = trimmed;
+    // 记下被打断那一句在飞的意图，重跑时并入新话，避免承接式追问丢失前一句约束。
+    steerBasePromptRef.current = busy ? rawPromptRef.current || null : null;
     setPrompt("");
     turnAbortRef.current?.abort();
     queryAbortRef.current?.abort();
@@ -2432,9 +2439,17 @@ export default function App() {
         ? "请结合附件图片分析当前工作簿，并说明发现的问题。"
         : "");
     if (!workbook || !text || busy) return;
+    // 转向重跑：把被打断那句的意图并进这句，让 checkIntent 收到完整承接式需求。
+    // 仅影响送模型与缓存的意图文本（intentText），气泡仍只显示用户实际输入（text）。
+    const steerBasePrompt = steerBasePromptRef.current;
+    steerBasePromptRef.current = null;
+    const intentText =
+      steerBasePrompt && steerBasePrompt !== text
+        ? `${steerBasePrompt}；补充：${text}`
+        : text;
     // "仍要重新计算"绕过整个命中判定，并在重算后覆写缓存。
     forceRecomputeRef.current = options?.forceRecompute === true;
-    rawPromptRef.current = text;
+    rawPromptRef.current = intentText;
     if (pendingImages.length > 0 && !supportsVision) {
       setImageError("当前模型不支持图片，请切换模型或移除附件。");
       return;
@@ -2526,7 +2541,7 @@ export default function App() {
       sentImages.length === 0
     ) {
       const intentKey = promptKeyCacheRef.current.get(
-        normalizePrompt(text)
+        normalizePrompt(intentText)
       );
       const hit = intentKey
         ? lookupCachedConclusion(intentKey)
@@ -2554,7 +2569,7 @@ export default function App() {
     );
     try {
       const intent = await checkIntent({
-        prompt: text,
+        prompt: intentText,
         scope: intentScope,
         imageCount: sentImages.length,
         conversation: messages
@@ -2586,7 +2601,7 @@ export default function App() {
       );
       await continueIntentDecision(
         intent,
-        text,
+        intentText,
         sentImages,
         scopeFingerprint
       );
