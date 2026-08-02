@@ -152,7 +152,10 @@ sequenceDiagram
 | `src/imageAttachments.ts` | 图片校验、压缩和附件准备 |
 | `src/workbookIdentity.ts` | 从文件名提取数据周期等工作簿身份信息 |
 | `src/demo.ts` | 浏览器模式演示工作簿 |
-| `src/styles.css` | 任务窗格样式 |
+| `src/styles.css` | 任务窗格样式、Fluent 语义字号和响应式布局 |
+| `src/focusState.ts` | 任务窗格与专注窗口共享的只读展示快照类型 |
+| `src/FocusWorkspace.tsx` | 专注窗口的只读对话与工具浏览界面 |
+| `src/focus.tsx` / `focus.html` / `src/focus.css` | Office Dialog 独立入口与专注窗口样式 |
 | `manifest.xml` | Excel 功能区和任务窗格旁加载清单 |
 
 ### 5.1 `App.tsx` 的职责边界
@@ -165,6 +168,26 @@ sequenceDiagram
 - 可复用的确定性数据处理放入 `dataTools.ts` 或新模块；
 - 协议类型与断言放入 `contracts.ts`；
 - 组件只负责状态编排和交互。
+
+### 5.2 排版与窗口层级
+
+任务窗格使用 Office/Fluent 兼容的语义字号，而不是按组件任意缩放：正文
+`14/20px`、说明文字 `12/16px`、小标题 `16/22px`、标题 `20/26px`、页面标题
+`24/32px`。基础字体优先使用 `Segoe UI Variable Text`、`Segoe UI`，并提供
+Microsoft YaHei UI、Microsoft YaHei 和 PingFang SC 等中文回退。正常界面文字
+不得小于 12px。
+
+顶部“显示方式”入口提供三种阅读空间：
+
+- 标准任务窗格：默认宽度，保留完整 Excel 工作区；
+- 加宽任务窗格：通过 `TaskPaneApi 1.1` 在宿主允许范围内切换宽度；
+- 专注窗口：通过 Office Dialog 打开约 90% 的独立只读窗口，用于查看长对话、
+  计划结果和工具说明。
+
+Office Dialog 是独立运行时，不能直接执行 Office.js 工作簿操作。任务窗格只向
+专注窗口发送当前界面的有限展示快照；执行、写入、预览和用户确认仍全部留在
+任务窗格。支持 `DialogApi 1.2` 时使用 `messageChild` 传递快照，旧宿主使用
+同源 `localStorage` 作为只读启动快照回退。
 
 ## 6. 后端模块
 
@@ -279,9 +302,16 @@ Agent 可以通过受控工具读取快照中的有限数据，限制由：
 7. “工作表存在”只验证工作表本身，不能替代格式、筛选、图表、透视表等复杂动作的效果验证；缺少对应验收能力时列出 `unverifiedActions`；
 8. 若执行中途失败，工作簿模式返回 `succeeded`、`failed` 和 `not_run` 动作明细，避免把部分写入误报成整体失败；
 9. 只有状态为 `verified` 的计划才能保存到“我的工具”。
-10. 计划携带预览时的数据来源指纹；Office.js 对全部授权来源单元格分块计算完整指纹，文件夹计划必须携带会话预览指纹，执行前缺失或不一致都拒绝写入。
+10. 一次性计划携带预览时的数据来源内容指纹；Office.js 对全部授权来源单元格分块计算完整指纹，执行前不一致会拒绝写入。当前工作簿中的固化工具使用结构兼容指纹，只要求授权来源工作表和工具实际依赖的字段仍存在；行数、数据值、使用范围、表格位置、字段顺序以及无关字段变化不会让工具失效。文件夹计划仍必须携带会话预览内容指纹。
 11. 文件夹模式把所有修改先保存为同目录临时文件，全部成功后才备份并替换目标。
 12. Office.js 的值、公式、仅清空内容、填充和字体等可恢复动作记录本次执行前快照；任务窗格提供一次性的“撤销”入口。无法完整恢复的清空格式等动作不会误标为可撤销。
+
+`splitGroupAggregate` 会先在本地一次扫描中完成拆分和聚合，再按
+`config/capabilities.json` 的 `excelExecution.splitAggregateBatchSheets`
+批量创建、写入和格式化结果表。默认每 25 张结果表同步一次 Office.js，
+避免逐表 `context.sync()` 的往返开销，同时限制单次提交规模；覆盖已有结果表
+时，批次会先统一读取待清空区域，再提交写入。任一批次失败后仍会尽力删除
+本轮新建的结果表。
 
 排序验收读取执行后的完整目标范围，并按多关键字和方向检查真实值顺序；
 筛选验收读取 AutoFilter 的范围、列和值条件；表格验收读取真实表格名称、
@@ -312,6 +342,8 @@ openpyxl 能稳定读取的对象提供强验收：图表保持 `executed_unveri
 - 要求用户确认固定值和破坏性动作；
 - 参数化来源工作表、输出工作表、源数据范围和字段；
 - 切换来源表时重新读取字段和实际 `usedRange`；
+- 当前工作簿运行时按所需字段做结构兼容检查，不锁死保存时的行数、数据值、
+  使用范围或字段位置；
 - 运行前检查工作表存在、输出名称冲突和字段有效性；
 - 编译出新的计划，再进入正常预览流程；
 - 迁移 v1 和早期 v2 工具。
@@ -335,7 +367,9 @@ openpyxl 能稳定读取的对象提供强验收：图表保持 `executed_unveri
 - 工具：`excel-bro.tools.v2`
 - 固化查询：`excel-bro.query-tools.v1`
 - 旧工具兼容：`excel-bro.tools.v1`
+- 专注窗口临时快照：`excel-bro.focus.v1`
 
+专注窗口快照只包含界面已经展示的对话、计划结果和工具说明，不提供写入能力。
 图片只随当前请求发送，不持久化到对话历史。API Key 不进入前端存储；设置页的输入值只保存在当前组件内存中，保存或关闭后即清空。
 
 前端 `diagnostics.ts` 只记录阶段、耗时、扫描行数、状态、错误分类和模型调用
@@ -361,12 +395,20 @@ openpyxl 能稳定读取的对象提供强验收：图表保持 `executed_unveri
 - `POST /api/intent`、`POST /api/plan`：兼容入口，新功能优先接入 `/api/turn`。
 - `GET /api/diagnostics`、`GET /api/capabilities`、`GET /health`、模型设置与文件夹相关端点见对应章节。
 
-个人 Windows 安装包不再用 `Wef\Developer` 代替加载项安装。安装器使用实际
-Windows 计算机名创建一个
-仅包含 `manifest.xml`、只授予当前用户读取权限的本机 SMB 共享，并将其写入
+个人 Windows 安装包使用实际 Windows 计算机名创建一个仅包含
+`manifest.xml`、只授予当前用户读取权限的本机 SMB 共享，并将其写入
 `HKCU\Software\Microsoft\Office\16.0\Wef\TrustedCatalogs`。用户首次在 Excel
-的“共享文件夹”中确认添加后，功能区可用于普通工作簿。创建和删除 SMB 共享
-需要 UAC 管理员授权；卸载器同时删除可信目录注册和共享，但保留用户模型配置。
+的“共享文件夹”中确认添加后，功能区可用于普通工作簿。`Wef\Developer` 注册只
+为包含 WebExtension 引用的旁加载测试文档提供清单查找，不能把未发布加载项全局
+安装到所有普通工作簿。创建和删除 SMB 共享需要 UAC 管理员授权；卸载器同时删除
+可信目录注册和共享，但保留用户模型配置。
+
+外层安装生命周期由 Inno Setup 管理，而不是由 PyInstaller 自解压程序模拟。
+PyInstaller 只冻结本地 FastAPI 服务。Inno Setup 提供可选安装目录、开始菜单、
+安装确认、进度、标准卸载确认和 Windows“已安装的应用”注册。安装与卸载都以
+当前用户模式运行，仅 SMB 共享操作通过受控 PowerShell 子进程请求 UAC；因此
+HKCU、证书和 `%LOCALAPPDATA%` 始终属于发起安装的用户。卸载共享失败会在 Inno
+删除文件和注册项之前中止，避免再次产生“卸载入口消失但程序仍在”的半卸载状态。
 
 模型服务必须兼容 `/chat/completions`。新安装不预置任何供应商或模型，前端在模型目录只有基础模式时显示首次添加引导；顶部统一菜单承担模型选择、添加和管理。旧环境变量配置仍可通过 `AI_MODEL` 和 `AI_MODELS` 让多个模型共享一个 Base URL 和 Key；任务窗格还可以创建多个独立模型连接，每个连接拥有自己的名称、Base URL、模型 ID、API Key 和视觉能力标记。模型目录使用服务端生成的连接 ID，真正发送给供应商的仍是连接内的模型 ID。
 

@@ -103,7 +103,9 @@ npm run start:excel
 ```
 
 该命令会创建并打开一个临时测试工作簿，加载项只旁加载到该工作簿。普通新建
-工作簿不会继承这次开发旁加载。停止旁加载：
+工作簿不会继承这次开发旁加载。`start:excel` 使用 `--no-debug`：它只注册并
+旁加载清单，不开启依赖 Visual Studio 的 Office 直接调试器；前端仍由 Vite
+提供热更新，浏览器开发者工具仍可检查任务窗格。停止旁加载：
 
 ```powershell
 npm run stop:excel
@@ -115,15 +117,31 @@ Microsoft 365 集中部署或 AppSource。
 
 ### 个人 Windows 安装包
 
-执行 `npm run build:installer` 生成的安装包会自动创建
+构建机需安装 Inno Setup 7，并让 `ISCC.exe` 可从 `PATH` 找到，或设置
+`INNO_SETUP_COMPILER` 指向它。执行 `npm run build:installer` 会先用 PyInstaller
+冻结本地服务，再由 Inno Setup 生成标准 Windows 安装向导。安装向导提供安装目录、
+开始菜单、确认、进度和完成页面，默认目录为
+`%LOCALAPPDATA%\Programs\Excel Bro`，但允许用户修改。
+
+Office 加载项清单的 `<Version>` 必须至少为 `1.0.0.0`，并包含顶层 `IconUrl`
+和 `HighResolutionIconUrl`；构建脚本会在冻结运行时前检查这些要求。需要做完整
+兼容性验证时，运行
+`node node_modules\office-addin-manifest/cli.js validate apps/excel-addin/manifest.xml`
+调用 Microsoft manifest 验证服务。
+
+安装过程会自动创建
 `\\<电脑名>\ExcelBroAddins` 本机共享并注册到 Office 可信加载项目录。使用实际
 计算机名而不是 `localhost`，以兼容只枚举标准 UNC 服务器名的 Office 版本。创建共享
 需要一次 UAC 管理员授权。安装后完全退出并重开 Excel，再依次选择
 **开始 → 加载项 → 更多加载项 → 高级 → 共享文件夹**，选择 **Excel Bro**
-并点击 **添加**。Office 要求用户完成这次首次确认，安装器不能代替点击。
+并点击 **添加**。Office 要求用户完成这次首次获取；本地安装器写入
+`Wef\Developer` 只能为特定旁加载文档提供清单查找，不能让未发布加载项在所有
+普通工作簿中自动出现。
 
-卸载时还会请求一次 UAC 权限以删除本机共享，并清除可信目录、启动项、证书和
-程序文件；`%LOCALAPPDATA%\Excel Bro` 中的个人模型配置默认保留。
+卸载入口由 Inno Setup 注册到 Windows“已安装的应用”和开始菜单。标准卸载器会先
+要求用户确认，再请求一次 UAC 删除本机共享；UAC 被取消或共享删除失败时卸载会
+中止，不会先删掉卸载入口或留下半卸载状态。成功后由 Inno Setup 删除程序文件、
+可信目录、启动项和证书；`%LOCALAPPDATA%\Excel Bro` 中的个人模型配置默认保留。
 
 ## 5. 浏览器与 Excel 调试
 
@@ -136,6 +154,10 @@ Microsoft 365 集中部署或 AppSource。
 - 不会真实写入 Excel；
 - 无法完整验证 Office.js 行为。
 
+也可以直接打开 `https://localhost:3000/focus.html` 检查专注窗口的响应式布局。
+直接打开时只有本机缓存的最近展示快照；窗口通信、实时内容同步和关闭行为仍须
+从 Excel 任务窗格中的“显示方式 → 打开专注窗口”验证。
+
 ### Excel 模式
 
 必须在 Excel 中验证：
@@ -145,7 +167,11 @@ Microsoft 365 集中部署或 AppSource。
 - Office.js 动作；
 - 图表、透视表、图片等 API 兼容性；
 - 写入后的真实验收；
-- 任务窗格宽度和触屏交互。
+- 标准宽度（约 350px）和加宽任务窗格的布局、键盘及触屏交互；
+- `TaskPaneApi 1.1` 不可用时的加宽降级提示；
+- 专注窗口打开、内容同步、返回任务窗格，以及 `DialogApi 1.2` 不可用时的
+  本地快照回退；
+- 专注窗口中没有 Excel 执行入口，所有写入仍回到任务窗格预览确认。
 
 开发者工具可从 Excel 加载项调试入口打开。前端错误优先查看 WebView 控制台，后端错误查看运行 FastAPI 的终端。
 
@@ -198,7 +224,7 @@ python -m compileall -q server/app
 | 文件夹 Excel | `server/app/folder_workbooks.py`, `server/app/folder_data.py` |
 | 固化工具 | `apps/excel-addin/src/storage.ts`, `deterministicTools.ts` |
 | 本地诊断 | `apps/excel-addin/src/diagnostics.ts`, `server/app/main.py` |
-| 限额 | `config/capabilities.json` |
+| 限额与 Excel 批处理参数 | `config/capabilities.json` |
 | 功能区按钮与地址 | `apps/excel-addin/manifest.xml` |
 
 ## 8. 标准开发流程
@@ -206,9 +232,12 @@ python -m compileall -q server/app
 ### UI 小改动
 
 1. 在浏览器模式确认不同宽度。
-2. 在 Excel 窄任务窗格确认真实布局。
-3. 检查鼠标、键盘和触屏状态。
-4. 运行前端测试和构建。
+2. 在 Excel 的标准与加宽任务窗格确认真实布局。
+3. 涉及长内容时同时检查专注窗口。
+4. 检查文字是否只使用 `styles.css` 中 12/14/16/20/24px 的语义字号，并确保正文
+   默认采用 14/20px。
+5. 检查鼠标、键盘和触屏状态。
+6. 运行前端测试和构建。
 
 ### 协议或 Excel 动作改动
 
@@ -226,6 +255,11 @@ python -m compileall -q server/app
 图表强验收依赖 ExcelApi 1.12 的系列维度读取；数据透视表强验收依赖
 ExcelApi 1.15 的数据源字符串读取。修改最低版本时必须同步预检测试和用户
 可读错误，不能在执行后才因缺少 API 失败。
+
+拆分聚合的 Office.js 同步批次由
+`excelExecution.splitAggregateBatchSheets` 控制。调整该值时需要同时测试
+少量输出、超过一个批次、覆盖已有工作表及批次失败清理；不要恢复为每张
+结果表一次 `context.sync()`。
 
 ### 模型行为改动
 

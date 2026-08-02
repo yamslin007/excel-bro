@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type {
   AnalysisPlan,
   DataToolRequest,
@@ -9,7 +9,11 @@ import {
   analyzeToolEligibility,
   createQueryTool,
   createTool,
-  instantiateTool
+  deleteQueryTool,
+  deleteTool,
+  instantiateTool,
+  saveQueryTool,
+  saveTool
 } from "./storage";
 
 const splitPlan: AnalysisPlan = {
@@ -274,5 +278,50 @@ describe("saved tools", () => {
         "文件夹来源 ID 已变化，请重新确认数据来源"
       ])
     });
+  });
+
+  it("deletes workflow and query tools from persistent storage", () => {
+    const values = new Map<string, string>();
+    vi.stubGlobal("localStorage", {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, value),
+      removeItem: (key: string) => values.delete(key),
+      clear: () => values.clear(),
+      key: (index: number) => [...values.keys()][index] ?? null,
+      get length() {
+        return values.size;
+      }
+    });
+    try {
+      const workflow = createTool(
+        splitPlan,
+        "影院影片拆分",
+        "生成影片子表",
+        ["旧数据"]
+      );
+      const query = createQueryTool(
+        "门店查询",
+        "读取门店",
+        {
+          id: "saved-query",
+          tool: "query_table",
+          arguments: { mode: "rows", fields: ["门店"] }
+        },
+        "workbook",
+        ["本月数据"]
+      );
+
+      saveTool(workflow);
+      saveQueryTool(query);
+
+      expect(deleteTool(workflow.id)).toEqual([]);
+      expect(deleteQueryTool(query.id)).toEqual([]);
+      expect(JSON.parse(values.get("excel-bro.tools.v2") ?? "[]")).toEqual([]);
+      expect(
+        JSON.parse(values.get("excel-bro.query-tools.v1") ?? "[]")
+      ).toEqual([]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });

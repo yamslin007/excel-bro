@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { ExcelAction } from "./contracts";
 import {
+  batchSplitAggregateOutputs,
   buildSplitAggregateOutputs,
   safeWorksheetBaseName
 } from "./splitAggregate";
@@ -83,5 +84,21 @@ describe("buildSplitAggregateOutputs", () => {
     );
     expect(safeWorksheetBaseName("'报表［终版］'")).toBe("报表 终版");
     expect(safeWorksheetBaseName("History")).toBe("History 结果");
+  });
+
+  it("batches worksheet outputs to reduce Office.js sync round trips", () => {
+    const outputs = Array.from({ length: 26 }, (_, index) => ({
+      splitValue: `影片 ${index + 1}`,
+      headers: ["影院名称", "影片名称", "数量"],
+      rows: [["影院", `影片 ${index + 1}`, 1]],
+      ratioColumnIndexes: []
+    }));
+
+    expect(
+      batchSplitAggregateOutputs(outputs, 25).map((batch) => batch.length)
+    ).toEqual([25, 1]);
+    expect(() => batchSplitAggregateOutputs(outputs, 0)).toThrow(
+      "批次大小必须是正整数"
+    );
   });
 });

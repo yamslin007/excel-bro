@@ -180,6 +180,12 @@ export function saveQueryTool(tool: SavedQueryTool): SavedQueryTool[] {
   return next;
 }
 
+export function deleteQueryTool(toolId: string): SavedQueryTool[] {
+  const next = loadQueryTools().filter((tool) => tool.id !== toolId);
+  localStorage.setItem(QUERY_TOOL_STORAGE_KEY, JSON.stringify(next));
+  return next;
+}
+
 export function analyzeQueryToolCompatibility(
   tool: SavedQueryTool,
   workbook: WorkbookSnapshot

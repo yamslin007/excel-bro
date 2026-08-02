@@ -12,6 +12,20 @@ export interface SplitAggregateOutput {
   ratioColumnIndexes: number[];
 }
 
+export function batchSplitAggregateOutputs(
+  outputs: SplitAggregateOutput[],
+  batchSize: number
+): SplitAggregateOutput[][] {
+  if (!Number.isInteger(batchSize) || batchSize < 1) {
+    throw new Error("拆分聚合同步批次大小必须是正整数");
+  }
+  const batches: SplitAggregateOutput[][] = [];
+  for (let index = 0; index < outputs.length; index += batchSize) {
+    batches.push(outputs.slice(index, index + batchSize));
+  }
+  return batches;
+}
+
 export function safeWorksheetBaseName(value: CellValue): string {
   let cleaned = String(value ?? "")
     .replace(/[\u0000-\u001f:：\\＼/／?？*＊\[\]［］]/g, " ")

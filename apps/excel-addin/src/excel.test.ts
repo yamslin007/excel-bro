@@ -6,6 +6,7 @@ import {
   snapshotDataEpochs,
   sourceFingerprintForSnapshot,
   sortedRangePasses,
+  toolSchemaFingerprintForSnapshot,
   verificationGaps,
   valuesEqual
 } from "./excel";
@@ -45,6 +46,99 @@ describe("workbook source fingerprint", () => {
     };
     expect(sourceFingerprintForSnapshot(changed, ["数据"])).not.toBe(
       sourceFingerprintForSnapshot(snapshot, ["数据"])
+    );
+  });
+});
+
+describe("saved tool schema fingerprint", () => {
+  const plan: AnalysisPlan = {
+    id: "tool-plan",
+    title: "按分类拆分",
+    summary: "按名称和编码聚合",
+    sourceFingerprintSheets: ["数据"],
+    assumptions: [],
+    warnings: [],
+    actions: [
+      {
+        type: "splitGroupAggregate",
+        sheet: "数据",
+        splitBy: "分类",
+        groupBy: ["名称", "编码"],
+        metrics: [
+          {
+            operation: "countRows",
+            outputName: "数量",
+            ratioOutputName: "占比"
+          }
+        ],
+        includeBlankSplitValues: false,
+        existingSheetPolicy: "rename",
+        maxOutputSheets: 100
+      }
+    ]
+  };
+  const snapshot = {
+    worksheets: [
+      {
+        name: "数据",
+        usedRange: "数据!A1:D20",
+        rowCount: 20,
+        columnCount: 4,
+        headers: ["名称", "编码", "分类", "备注"],
+        dataRows: [["甲", "001", "A", "旧值"]],
+        truncated: false
+      }
+    ]
+  };
+
+  it("allows row, value, range and column-order changes", () => {
+    const changed = {
+      worksheets: [
+        {
+          ...snapshot.worksheets[0],
+          usedRange: "数据!F8:I12",
+          rowCount: 5,
+          headers: ["备注", "分类", "编码", "名称"],
+          dataRows: [["新值", "B", "002", "乙"]]
+        }
+      ]
+    };
+
+    expect(toolSchemaFingerprintForSnapshot(plan, changed)).toBe(
+      toolSchemaFingerprintForSnapshot(plan, snapshot)
+    );
+  });
+
+  it("allows unrelated fields to be added or removed", () => {
+    const changed = {
+      worksheets: [
+        {
+          ...snapshot.worksheets[0],
+          headers: ["分类", "编码", "名称", "新增说明"]
+        }
+      ]
+    };
+
+    expect(toolSchemaFingerprintForSnapshot(plan, changed)).toBe(
+      toolSchemaFingerprintForSnapshot(plan, snapshot)
+    );
+  });
+
+  it("rejects missing required fields or source sheets", () => {
+    const missingField = {
+      worksheets: [
+        {
+          ...snapshot.worksheets[0],
+          headers: ["名称", "分类", "备注"]
+        }
+      ]
+    };
+
+    expect(toolSchemaFingerprintForSnapshot(plan, missingField)).not.toBe(
+      toolSchemaFingerprintForSnapshot(plan, snapshot)
+    );
+    expect(toolSchemaFingerprintForSnapshot(plan, { worksheets: [] })).not.toBe(
+      toolSchemaFingerprintForSnapshot(plan, snapshot)
     );
   });
 });

@@ -23,6 +23,7 @@ export default defineConfig(async ({ command }) => {
       rollupOptions: {
         input: {
           taskpane: path.resolve(__dirname, "index.html"),
+          focus: path.resolve(__dirname, "focus.html"),
           commands: path.resolve(__dirname, "commands.html")
         }
       }

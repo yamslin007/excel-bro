@@ -120,13 +120,15 @@ async function requestError(
 }
 
 export async function createAssistantResponse(
-  request: PlanRequest
+  request: PlanRequest,
+  signal?: AbortSignal
 ): Promise<AssistantResponse> {
   recordModelCall();
   const response = await fetch(`${API_BASE_URL}/api/turn`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(request)
+    body: JSON.stringify(request),
+    signal
   });
 
   if (!response.ok) {
@@ -140,6 +142,8 @@ export async function createAssistantResponse(
 
 interface StreamHooks {
   onStep?: (event: TurnStepEvent) => void;
+  // signal：打断/转向时掐掉流式请求。已吐出的 step 由调用方保留做上下文。
+  signal?: AbortSignal;
 }
 
 function parseSseFrame(frame: string): { event: string; data: string } | null {
@@ -164,17 +168,19 @@ export async function streamAssistantResponse(
 ): Promise<AssistantResponse> {
   recordModelCall();
 
+  const signal = hooks.signal;
   let response: Response;
   try {
     response = await fetch(`${API_BASE_URL}/api/turn/stream`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(request)
+      body: JSON.stringify(request),
+      signal
     });
   } catch (reason) {
     // 网络/连接错误发生在收到任何事件之前：回退到非流式端点。
     if (isLocalServiceConnectionError(reason)) {
-      return createAssistantResponse(request);
+      return createAssistantResponse(request, signal);
     }
     throw reason;
   }
@@ -182,7 +188,7 @@ export async function streamAssistantResponse(
   if (!response.ok || !response.body) {
     // 旧后端无此端点（404）或代理不支持流式：回退到非流式端点。
     if (response.status === 404 || response.status === 405 || !response.body) {
-      return createAssistantResponse(request);
+      return createAssistantResponse(request, signal);
     }
     throw await requestError(response, "本地 AI 服务流式请求失败");
   }
@@ -261,13 +267,15 @@ export async function streamAssistantResponse(
 }
 
 export async function checkIntent(
-  request: IntentCheckRequest
+  request: IntentCheckRequest,
+  signal?: AbortSignal
 ): Promise<IntentCheckResponse> {
   recordModelCall();
   const response = await fetch(`${API_BASE_URL}/api/turn`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(request)
+    body: JSON.stringify(request),
+    signal
   });
 
   if (!response.ok) {

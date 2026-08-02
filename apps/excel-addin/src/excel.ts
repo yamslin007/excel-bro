@@ -15,6 +15,7 @@ import type {
 import capabilities from "../../../config/capabilities.json";
 import { detectSheetFields } from "./tableSchema";
 import {
+  batchSplitAggregateOutputs,
   buildSplitAggregateOutputs,
   safeWorksheetBaseName
 } from "./splitAggregate";
@@ -31,6 +32,8 @@ const STRUCTURE_COLUMN_LIMIT = capabilities.snapshot.structureColumns;
 const FINGERPRINT_CHUNK_ROWS = capabilities.queryTable.chunkRows;
 const FINGERPRINT_CHUNK_CELLS =
   capabilities.queryTable.chunkRows * capabilities.queryTable.maxColumns;
+const SPLIT_AGGREGATE_BATCH_SHEETS =
+  capabilities.excelExecution.splitAggregateBatchSheets;
 let structureCache:
   | { key: string; snapshot: WorkbookSnapshot }
   | null = null;
@@ -207,6 +210,96 @@ export function sourceFingerprintForSnapshot(
     hash = Math.imul(hash, 0x01000193);
   }
   return `fnv1a32:${(hash >>> 0).toString(16).padStart(8, "0")}`;
+}
+
+const TOOL_SCHEMA_FINGERPRINT_PREFIX = "tool-schema-fnv1a32:";
+
+function normalizeSchemaName(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+function requiredToolFieldsBySheet(
+  plan: AnalysisPlan
+): Map<string, Set<string>> {
+  const required = new Map<string, Set<string>>();
+  const add = (sheet: string, fields: Array<string | null | undefined>) => {
+    const key = normalizeSchemaName(sheet);
+    const current = required.get(key) ?? new Set<string>();
+    fields.forEach((field) => {
+      if (field?.trim()) current.add(normalizeSchemaName(field));
+    });
+    required.set(key, current);
+  };
+  for (const action of plan.actions) {
+    if (action.type === "splitGroupAggregate") {
+      add(action.sheet, [
+        action.splitBy,
+        ...action.groupBy,
+        ...action.metrics.map((metric) => metric.field)
+      ]);
+    }
+    if (action.type === "createPivotTable") {
+      add(action.sourceSheet, [
+        ...action.rowFields,
+        ...action.columnFields,
+        ...action.valueFields.map((value) => value.field)
+      ]);
+    }
+  }
+  return required;
+}
+
+/**
+ * Saved tools are reusable recipes, so their safety gate follows the schema
+ * they need instead of pinning every source cell. Row counts, values, used
+ * ranges and column order may change; missing source sheets or required fields
+ * still invalidate the preview.
+ */
+export function toolSchemaFingerprintForSnapshot(
+  plan: AnalysisPlan,
+  snapshot: Pick<WorkbookSnapshot, "worksheets">
+): string {
+  const requiredBySheet = requiredToolFieldsBySheet(plan);
+  const requested = [...new Set(plan.sourceFingerprintSheets ?? [])]
+    .map(normalizeSchemaName)
+    .sort();
+  const available = new Map(
+    snapshot.worksheets.map((sheet) => [
+      normalizeSchemaName(sheet.name),
+      new Set(
+        sheet.headers
+          .map((header) => normalizeSchemaName(String(header ?? "")))
+          .filter(Boolean)
+      )
+    ])
+  );
+  const serialized = JSON.stringify({
+    version: 1,
+    sheets: requested.map((sheet) => {
+      const fields = available.get(sheet);
+      const requiredFields = [...(requiredBySheet.get(sheet) ?? [])].sort();
+      return {
+        sheet,
+        exists: Boolean(fields),
+        requiredFields: requiredFields.map((field) => ({
+          field,
+          exists: fields?.has(field) === true
+        }))
+      };
+    })
+  });
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < serialized.length; index += 1) {
+    hash ^= serialized.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return `${TOOL_SCHEMA_FINGERPRINT_PREFIX}${(hash >>> 0)
+    .toString(16)
+    .padStart(8, "0")}`;
+}
+
+function isToolSchemaFingerprint(value: string): boolean {
+  return value.startsWith(TOOL_SCHEMA_FINGERPRINT_PREFIX);
 }
 
 function updateFingerprint(seed: number, text: string): number {
@@ -2334,92 +2427,124 @@ async function executeAction(
       await context.sync();
     };
 
-    for (const output of outputs) {
-      const baseName = safeWorksheetBaseName(output.splitValue);
-      const normalizedBase = baseName.toLocaleLowerCase();
-      let targetName = baseName;
-      let targetSheet: Excel.Worksheet;
-      let createdNewSheet = false;
-      const existingName = existingNames.get(normalizedBase);
-      const collidesWithCurrentRun = generatedNames.has(normalizedBase);
+    for (const outputBatch of batchSplitAggregateOutputs(
+      outputs,
+      SPLIT_AGGREGATE_BATCH_SHEETS
+    )) {
+      const jobs: Array<{
+        output: (typeof outputBatch)[number];
+        targetName: string;
+        targetSheet: Excel.Worksheet;
+        matrix: CellValue[][];
+        usedRange: Excel.Range | null;
+      }> = [];
 
-      if (
-        existingName &&
-        action.existingSheetPolicy === "skip" &&
-        !collidesWithCurrentRun
-      ) {
-        criteria.push({
-          type: "worksheetExists",
-          sheet: existingName
-        });
-        continue;
-      }
-      if (
-        existingName &&
-        action.existingSheetPolicy === "replace" &&
-        !collidesWithCurrentRun
-      ) {
-        if (normalizedBase === sourceName) {
-          throw new Error(`不能用拆分结果覆盖源工作表「${sourceSheet.name}」`);
-        }
-        targetSheet = worksheets.getItem(existingName);
-        const used = targetSheet.getUsedRangeOrNullObject();
-        used.load("isNullObject");
-        await context.sync();
-        if (!used.isNullObject) used.clear("All");
-      } else {
-        if (existingName) targetName = renamed(baseName);
-        targetSheet = worksheets.add(targetName);
-        createdNewSheet = true;
-        existingNames.set(targetName.toLocaleLowerCase(), targetName);
-      }
-      generatedNames.add(targetName.toLocaleLowerCase());
+      for (const output of outputBatch) {
+        const baseName = safeWorksheetBaseName(output.splitValue);
+        const normalizedBase = baseName.toLocaleLowerCase();
+        let targetName = baseName;
+        let targetSheet: Excel.Worksheet;
+        let usedRange: Excel.Range | null = null;
+        const existingName = existingNames.get(normalizedBase);
+        const collidesWithCurrentRun = generatedNames.has(normalizedBase);
 
-      const matrix = [output.headers, ...output.rows];
-      const target = targetSheet
-        .getRange("A1")
-        .getResizedRange(matrix.length - 1, matrix[0].length - 1);
-      for (
-        let columnIndex = 0;
-        columnIndex < action.groupBy.length + 1;
-        columnIndex += 1
-      ) {
         if (
-          matrix
-            .slice(1)
-            .some((row) => typeof row[columnIndex] === "string")
+          existingName &&
+          action.existingSheetPolicy === "skip" &&
+          !collidesWithCurrentRun
         ) {
-          const dimensionRange = targetSheet.getRange(
-            `${columnName(columnIndex + 1)}1:${columnName(columnIndex + 1)}${
-              matrix.length
-            }`
-          );
-          dimensionRange.numberFormat = Array.from(
-            { length: matrix.length },
-            () => ["@"]
-          );
+          criteria.push({
+            type: "worksheetExists",
+            sheet: existingName
+          });
+          continue;
         }
+        if (
+          existingName &&
+          action.existingSheetPolicy === "replace" &&
+          !collidesWithCurrentRun
+        ) {
+          if (normalizedBase === sourceName) {
+            throw new Error(`不能用拆分结果覆盖源工作表「${sourceSheet.name}」`);
+          }
+          targetSheet = worksheets.getItem(existingName);
+          usedRange = targetSheet.getUsedRangeOrNullObject();
+          usedRange.load("isNullObject");
+        } else {
+          if (existingName) targetName = renamed(baseName);
+          targetSheet = worksheets.add(targetName);
+          createdInThisRun.push(targetName);
+          existingNames.set(targetName.toLocaleLowerCase(), targetName);
+        }
+        generatedNames.add(targetName.toLocaleLowerCase());
+        jobs.push({
+          output,
+          targetName,
+          targetSheet,
+          matrix: [output.headers, ...output.rows],
+          usedRange
+        });
       }
-      target.values = matrix;
-      const header = target.getRow(0);
-      header.format.font.bold = true;
-      header.format.fill.color = "#DFF3E4";
-      for (const columnIndex of output.ratioColumnIndexes) {
-        const ratioRange = targetSheet.getRange(
-          `${columnName(columnIndex + 1)}2:${columnName(columnIndex + 1)}${
-            matrix.length
-          }`
-        );
-        ratioRange.numberFormat = Array.from(
-          { length: matrix.length - 1 },
-          () => ["0.00%"]
-        );
-      }
-      target.format.autofitColumns();
-      target.format.autofitRows();
+
+      if (jobs.length === 0) continue;
+      const batchLabel = jobs
+        .slice(0, 3)
+        .map((job) => job.targetName)
+        .join("、");
       try {
+        if (jobs.some((job) => job.usedRange)) {
+          await context.sync();
+          for (const job of jobs) {
+            if (job.usedRange && !job.usedRange.isNullObject) {
+              job.usedRange.clear("All");
+            }
+          }
+        }
+
+        for (const { output, targetSheet, matrix } of jobs) {
+          const target = targetSheet
+            .getRange("A1")
+            .getResizedRange(matrix.length - 1, matrix[0].length - 1);
+          for (
+            let columnIndex = 0;
+            columnIndex < action.groupBy.length + 1;
+            columnIndex += 1
+          ) {
+            if (
+              matrix
+                .slice(1)
+                .some((row) => typeof row[columnIndex] === "string")
+            ) {
+              const dimensionRange = targetSheet.getRange(
+                `${columnName(columnIndex + 1)}1:${columnName(columnIndex + 1)}${
+                  matrix.length
+                }`
+              );
+              dimensionRange.numberFormat = Array.from(
+                { length: matrix.length },
+                () => ["@"]
+              );
+            }
+          }
+          target.values = matrix;
+          const header = target.getRow(0);
+          header.format.font.bold = true;
+          header.format.fill.color = "#DFF3E4";
+          for (const columnIndex of output.ratioColumnIndexes) {
+            const ratioRange = targetSheet.getRange(
+              `${columnName(columnIndex + 1)}2:${columnName(columnIndex + 1)}${
+                matrix.length
+              }`
+            );
+            ratioRange.numberFormat = Array.from(
+              { length: matrix.length - 1 },
+              () => ["0.00%"]
+            );
+          }
+          target.format.autofitColumns();
+          target.format.autofitRows();
+        }
         await context.sync();
-        if (createdNewSheet) createdInThisRun.push(targetName);
       } catch (reason) {
         try {
           await rollbackCreatedSheets();
@@ -2427,21 +2552,25 @@ async function executeAction(
           // Keep the original Excel error; cleanup is best-effort.
         }
         throw new Error(
-          `生成工作表「${targetName}」失败：${excelErrorDetail(reason)}`
+          `生成工作表批次「${batchLabel}${
+            jobs.length > 3 ? "等" : ""
+          }」失败：${excelErrorDetail(reason)}`
         );
       }
 
-      const range = matrixRange("A1", matrix.length, matrix[0].length);
-      criteria.push(
-        range && matrix.length <= 500
-          ? {
-              type: "rangeEquals",
-              sheet: targetName,
-              range,
-              expected: matrix
-            }
-          : { type: "worksheetExists", sheet: targetName }
-      );
+      for (const { targetName, matrix } of jobs) {
+        const range = matrixRange("A1", matrix.length, matrix[0].length);
+        criteria.push(
+          range && matrix.length <= 500
+            ? {
+                type: "rangeEquals",
+                sheet: targetName,
+                range,
+                expected: matrix
+              }
+            : { type: "worksheetExists", sheet: targetName }
+        );
+      }
     }
     return criteria;
   }
@@ -2847,12 +2976,17 @@ export async function undoExecution(
 
 export async function executePlan(plan: AnalysisPlan): Promise<PlanExecutionResult> {
   if (plan.sourceFingerprint && plan.sourceFingerprintSheets?.length) {
-    const current = await captureWorkbookSourceFingerprint(
-      plan.sourceFingerprintSheets
-    );
+    const current = isToolSchemaFingerprint(plan.sourceFingerprint)
+      ? toolSchemaFingerprintForSnapshot(
+          plan,
+          await captureWorkbookStructure(plan.sourceFingerprintSheets)
+        )
+      : await captureWorkbookSourceFingerprint(plan.sourceFingerprintSheets);
     if (current !== plan.sourceFingerprint) {
       throw new PlanExecutionError(
-        "预览后数据来源已发生变化，请重新生成预览后再执行",
+        isToolSchemaFingerprint(plan.sourceFingerprint)
+          ? "工具所需的来源工作表或字段已发生变化，请重新选择后再执行"
+          : "预览后数据来源已发生变化，请重新生成预览后再执行",
         incompleteActionResults(plan, new Map())
       );
     }

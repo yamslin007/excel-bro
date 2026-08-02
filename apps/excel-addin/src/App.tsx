@@ -53,6 +53,7 @@ import {
   isRunningInExcel,
   PlanExecutionError,
   snapshotDataEpochs,
+  toolSchemaFingerprintForSnapshot,
   undoExecution,
   watchWorkbookStructureChanges
 } from "./excel";
@@ -64,6 +65,7 @@ import {
   analyzeToolEligibility,
   createQueryTool,
   createTool,
+  deleteQueryTool,
   deleteTool,
   instantiateTool,
   loadQueryTools,
@@ -78,6 +80,7 @@ import {
   executeSavedQueryTool,
   SavedQueryToolFallbackError
 } from "./deterministicTools";
+import { renderToolDsl } from "./toolDsl";
 import {
   MAX_IMAGE_ATTACHMENTS,
   prepareImageFile,
@@ -91,15 +94,31 @@ import {
   exportDiagnosticReport,
   recordDiagnosticEvent
 } from "./diagnostics";
+import {
+  FOCUS_PAYLOAD_STORAGE_KEY,
+  type FocusPayload
+} from "./focusState";
+import PetCompanion from "./PetCompanion";
 
 type Status = "idle" | "scanning" | "planning" | "tooling" | "executing";
 type MessageRole = "assistant" | "user" | "system";
 type SourceMode = "workbook" | "folder";
 type WorkbookScopeMode = "auto" | "manual";
+type ToolDrawerView = "library" | "detail" | "run";
+type ToolDetailMode = "standard" | "expert";
+type PendingToolDeletion = {
+  kind: "workflow" | "query";
+  id: string;
+  name: string;
+};
 
 interface ActivityStep {
   label: string;
   elapsedMs: number;
+  // note：模型对这一步的真实判断（第一层，默认可见），例如「它把需求理解成了什么」。
+  note?: string;
+  // detail：原始明细（第二层，展开「查看详情」才显示），例如锁定的执行指令、结构化返回。
+  detail?: string;
 }
 
 interface ActivityProgress {
@@ -231,6 +250,98 @@ export function normalizeStoredVerification(
 function formatStepElapsed(ms: number): string {
   if (ms < 1000) return `${Math.max(0, Math.round(ms))}ms`;
   return `${(ms / 1000).toFixed(1)}s`;
+}
+
+// isAbortError：区分「用户主动打断」和真正的错误。fetch 被 abort 时抛 AbortError，
+// 本地工具取消抛 DataToolExecutionError(code=CANCELLED)。这两种都不该弹错误提示。
+function isAbortError(reason: unknown): boolean {
+  if (reason instanceof DOMException && reason.name === "AbortError") {
+    return true;
+  }
+  if (
+    reason instanceof DataToolExecutionError &&
+    reason.code === "CANCELLED"
+  ) {
+    return true;
+  }
+  return false;
+}
+
+// 把本地工具查询参数翻译成一句人能读懂的话，供「查看详情」里展示。
+function describeQueryArguments(args: QueryTableArguments): string {
+  const parts: string[] = [];
+  const modeLabel =
+    args.mode === "aggregate"
+      ? "分组汇总"
+      : args.mode === "profile"
+        ? "字段画像"
+        : "取明细行";
+  parts.push(`方式：${modeLabel}`);
+  if (args.fields?.length) parts.push(`字段：${args.fields.join("、")}`);
+  if (args.groupBy?.length) parts.push(`分组：${args.groupBy.join("、")}`);
+  if (args.metrics?.length) {
+    parts.push(
+      `指标：${args.metrics
+        .map((metric) => `${metric.operation}(${metric.field ?? "*"})`)
+        .join("、")}`
+    );
+  }
+  if (args.filters?.length) parts.push(`筛选：${args.filters.length} 个条件`);
+  if (args.combine?.mode) parts.push(`合并：${args.combine.mode}`);
+  if (typeof args.limit === "number") parts.push(`上限：${args.limit} 行`);
+  return parts.join("\n");
+}
+
+// describeIntentDecision：把需求确认的结构化结果翻译成「用户看得懂的判断」。
+// 返回 label（步骤标题）、note（模型的真实理解，第一层默认可见）、
+// detail（原始明细，第二层展开「查看详情」才显示），让用户判断模型是否偏离了轨迹。
+function describeIntentDecision(intent: IntentCheckResponse): {
+  label: string;
+  note?: string;
+  detail?: string;
+} {
+  const source = intent.provider === "model" ? "模型" : "本地规则";
+  if (intent.kind === "clarification") {
+    const clarification = intent.clarification;
+    const optionText = clarification.options
+      .map((option, index) => `${index + 1}. ${option.label}`)
+      .join("\n");
+    return {
+      label: `${source}判断需要先澄清需求`,
+      note: clarification.summary || clarification.question,
+      detail: [
+        `理解：${clarification.summary}`,
+        `追问：${clarification.question}`,
+        clarification.reason ? `原因：${clarification.reason}` : "",
+        clarification.options.length ? `可选项：\n${optionText}` : ""
+      ]
+        .filter(Boolean)
+        .join("\n\n")
+    };
+  }
+  if (intent.kind === "tool_request") {
+    return {
+      label: `${source}决定先用本地工具取数`,
+      note: intent.summary,
+      detail: [
+        `理解：${intent.summary}`,
+        `锁定执行：${intent.confirmedPrompt}`,
+        `本地查询：\n${describeQueryArguments(intent.request.arguments)}`
+      ]
+        .filter(Boolean)
+        .join("\n\n")
+    };
+  }
+  return {
+    label: `${source}确认可以直接分析`,
+    note: intent.summary,
+    detail: [
+      `理解：${intent.summary}`,
+      `锁定执行：${intent.confirmedPrompt}`
+    ]
+      .filter(Boolean)
+      .join("\n\n")
+  };
 }
 
 function intentScopeFingerprint(scope: IntentScopeContext): string {
@@ -638,6 +749,8 @@ export default function App() {
     )
   );
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
+  const [viewMenuOpen, setViewMenuOpen] = useState(false);
+  const [focusOpening, setFocusOpening] = useState(false);
   const [modelCatalogLoaded, setModelCatalogLoaded] = useState(false);
   const [modelGuideDismissed, setModelGuideDismissed] = useState(false);
   const [modelSettings, setModelSettings] = useState<ModelSettings | null>(null);
@@ -654,6 +767,15 @@ export default function App() {
   const [pendingDeleteConversationId, setPendingDeleteConversationId] =
     useState<string | null>(null);
   const [selectedToolId, setSelectedToolId] = useState<string | null>(null);
+  const [selectedQueryToolId, setSelectedQueryToolId] =
+    useState<string | null>(null);
+  const [toolDrawerView, setToolDrawerView] =
+    useState<ToolDrawerView>("library");
+  const [toolDetailMode, setToolDetailMode] =
+    useState<ToolDetailMode>("standard");
+  const [pendingToolDeletion, setPendingToolDeletion] =
+    useState<PendingToolDeletion | null>(null);
+  const [copiedToolDslId, setCopiedToolDslId] = useState<string | null>(null);
   const [toolParameterValues, setToolParameterValues] = useState<
     Record<string, string>
   >({});
@@ -687,7 +809,15 @@ export default function App() {
     startHeight: number;
   } | null>(null);
   const copyFeedbackTimerRef = useRef<number | null>(null);
+  const toolDslCopyTimerRef = useRef<number | null>(null);
+  const focusDialogRef = useRef<Office.Dialog | null>(null);
   const queryAbortRef = useRef<AbortController | null>(null);
+  // turnAbortRef：整个 turn（需求确认→本地取数→生成方案）共用的打断句柄。
+  // 每个 turn 开始时新建；用户中途插话/停止时 abort，串在链上的模型请求会一起 reject。
+  const turnAbortRef = useRef<AbortController | null>(null);
+  // pendingSteerRef：转向时先掐掉当前 turn，把新话暂存这里；等 busy 回落到 idle，
+  // 由 effect 带着这句新话重新发起一个 turn（硬转向 = abort + 带新话重跑）。
+  const pendingSteerRef = useRef<string | null>(null);
   // 结论复用缓存（见 CachedConclusion）。intentKey → 结论；normalizedPrompt → intentKey。
   const resultCacheRef = useRef<Map<string, CachedConclusion>>(new Map());
   const promptKeyCacheRef = useRef<Map<string, string>>(new Map());
@@ -777,7 +907,10 @@ export default function App() {
   function advanceActivity(
     title: string,
     detail: string,
-    completedStep?: string
+    completedStep?: string,
+    // stepInsight：把模型对刚完成这步的判断（note）与原始明细（detail）一并记录，
+    // 让用户能看清模型「理解成了什么、锁定要做什么」，及时发现是否偏离轨迹。
+    stepInsight?: { note?: string; detail?: string }
   ) {
     setActivity((current) => {
       const now = Date.now();
@@ -787,7 +920,12 @@ export default function App() {
         completedStep && completedStep.trim()
           ? [
               ...(current?.completed ?? []),
-              { label: completedStep, elapsedMs: now - lastStepAt }
+              {
+                label: completedStep,
+                elapsedMs: now - lastStepAt,
+                note: stepInsight?.note,
+                detail: stepInsight?.detail
+              }
             ]
           : current?.completed ?? [];
       return {
@@ -872,6 +1010,11 @@ export default function App() {
       if (copyFeedbackTimerRef.current !== null) {
         window.clearTimeout(copyFeedbackTimerRef.current);
       }
+      if (toolDslCopyTimerRef.current !== null) {
+        window.clearTimeout(toolDslCopyTimerRef.current);
+      }
+      focusDialogRef.current?.close();
+      focusDialogRef.current = null;
     },
     []
   );
@@ -1551,6 +1694,7 @@ export default function App() {
           modelId: selectedModelId || null
         },
         {
+          signal: turnAbortRef.current?.signal,
           onStep: (step) =>
             advanceActivity(
               step.title,
@@ -1626,6 +1770,11 @@ export default function App() {
         });
       }
     } catch (reason) {
+      // 用户在生成方案途中打断：静默退出，已吐出的 step 留作上下文。
+      if (isAbortError(reason)) {
+        setStatus("idle");
+        return;
+      }
       setPendingImages(sentImages);
       if (isLocalServiceConnectionError(reason)) {
         setServerOnline(false);
@@ -1793,7 +1942,9 @@ export default function App() {
           return;
         }
       }
-      const controller = new AbortController();
+      // 本地取数复用 turn 级 controller：打断整个 turn 时它也会一起停。
+      // turnAbortRef 为空（如从缓存直接进入的边缘路径）时兜底自建一个。
+      const controller = turnAbortRef.current ?? new AbortController();
       queryAbortRef.current = controller;
       const result = await executeQueryTableTool(
         intent.request,
@@ -1857,6 +2008,11 @@ export default function App() {
         errorCategory: "data_tool"
       });
       queryAbortRef.current = null;
+      // 用户主动打断：不做自纠重试，直接静默收尾。
+      if (isAbortError(reason)) {
+        setStatus("idle");
+        return;
+      }
       if (correctionAttempt < 1 && correctionScope) {
         try {
           const failureMessage =
@@ -1873,6 +2029,7 @@ export default function App() {
             imageCount: sentImages.length,
             intentConfirmed: true,
             clarificationRound: 1,
+
             conversation: messages
               .filter(
                 (message) =>
@@ -1899,7 +2056,7 @@ export default function App() {
               request: intent.request
             },
             modelId: selectedModelId || null
-          });
+          }, turnAbortRef.current?.signal);
           await continueIntentDecision(
             corrected,
             intent.confirmedPrompt,
@@ -2043,6 +2200,9 @@ export default function App() {
       return;
     }
     setStatus("planning");
+    // 澄清后的确认也是一个新 turn，同样建 controller 供打断。
+    const turnController = new AbortController();
+    turnAbortRef.current = turnController;
     beginActivity(
       "正在处理确认结果",
       `正在核对 ${sheetNames.length} 张已选工作表的字段结构。`
@@ -2075,7 +2235,7 @@ export default function App() {
             .find((item) => item.intentMemory)?.intentMemory ?? null,
         priorResult: latestResultContext(messages),
         modelId: selectedModelId || null
-      });
+      }, turnController.signal);
       advanceActivity(
         "需求确认完成",
         "正在根据确认结果选择本地工具或生成操作预览。",
@@ -2106,6 +2266,13 @@ export default function App() {
       });
       clarificationImagesRef.current.delete(clarification.id);
       setStatus("idle");
+      const decision = describeIntentDecision(intent);
+      advanceActivity(
+        decision.label,
+        decision.note ?? "正在根据确认结果继续。",
+        decision.label,
+        { note: decision.note, detail: decision.detail }
+      );
       await continueIntentDecision(
         intent,
         confirmedPrompt,
@@ -2119,6 +2286,25 @@ export default function App() {
       );
       finishActivity();
     } catch (reason) {
+      // 用户主动打断：把澄清状态复位为 pending，静默收尾。
+      if (isAbortError(reason)) {
+        setMessages((current) =>
+          current.map((item) =>
+            item.id === message.id && item.clarification
+              ? {
+                  ...item,
+                  clarification: {
+                    ...item.clarification,
+                    status: "pending"
+                  }
+                }
+              : item
+          )
+        );
+        setStatus("idle");
+        finishActivity();
+        return;
+      }
       setPendingImages(sentImages);
       setMessages((current) =>
         current.map((item) =>
@@ -2142,6 +2328,10 @@ export default function App() {
       });
       setStatus("idle");
       finishActivity();
+    } finally {
+      if (turnAbortRef.current === turnController) {
+        turnAbortRef.current = null;
+      }
     }
   }
 
@@ -2198,6 +2388,38 @@ export default function App() {
     setPrompt(message.clarification.originalPrompt);
     setContextOpen(true);
   }
+
+  // 纯停止：掐掉当前 turn，不再重跑。清掉待转向文本，避免误触发重跑。
+  function stopTurn() {
+    pendingSteerRef.current = null;
+    turnAbortRef.current?.abort();
+    queryAbortRef.current?.abort();
+  }
+
+  // 硬转向：把新话暂存，掐掉当前 turn。等 busy 回落，下面的 effect 会带这句话重跑。
+  // 新话不清空输入框内容？——这里选择先清空，重跑走 overrideText，体验和正常发送一致。
+  function steerTurn(text: string) {
+    const trimmed = text.trim();
+    if (!trimmed) {
+      stopTurn();
+      return;
+    }
+    pendingSteerRef.current = trimmed;
+    setPrompt("");
+    turnAbortRef.current?.abort();
+    queryAbortRef.current?.abort();
+  }
+
+  // 当一个 turn 被打断、status 归 idle 后，若有待转向的话，就带着它重跑一个新 turn。
+  useEffect(() => {
+    if (busy) return;
+    const steerText = pendingSteerRef.current;
+    if (!steerText) return;
+    pendingSteerRef.current = null;
+    void sendMessage({ overrideText: steerText });
+    // sendMessage / busy 是稳定引用与派生状态，这里仅在 busy 变化时检查一次。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [busy]);
 
   async function sendMessage(options?: {
     forceRecompute?: boolean;
@@ -2316,6 +2538,9 @@ export default function App() {
       }
     }
     setStatus("planning");
+    // 开启一个新的 turn：建 controller 存进 ref，串到本 turn 所有模型请求上。
+    const turnController = new AbortController();
+    turnAbortRef.current = turnController;
     if (!(sourceMode === "workbook" && isRunningInExcel())) {
       beginActivity(
         "正在准备需求上下文",
@@ -2349,9 +2574,16 @@ export default function App() {
             .find((message) => message.intentMemory)?.intentMemory ?? null,
         priorResult: latestResultContext(messages),
         modelId: selectedModelId || null
-      });
+      }, turnController.signal);
       setServerOnline(true);
       setStatus("idle");
+      const decision = describeIntentDecision(intent);
+      advanceActivity(
+        decision.label,
+        decision.note ?? "正在根据确认结果继续。",
+        decision.label,
+        { note: decision.note, detail: decision.detail }
+      );
       await continueIntentDecision(
         intent,
         text,
@@ -2360,6 +2592,12 @@ export default function App() {
       );
       finishActivity();
     } catch (reason) {
+      // 用户主动打断：静默收尾，不弹错误。转向时新 turn 已在 steerTurn 里另起。
+      if (isAbortError(reason)) {
+        setStatus("idle");
+        finishActivity();
+        return;
+      }
       setPendingImages(sentImages);
       if (isLocalServiceConnectionError(reason)) {
         setServerOnline(false);
@@ -2376,6 +2614,11 @@ export default function App() {
       });
       setStatus("idle");
       finishActivity();
+    } finally {
+      // 只清自己这个 turn 的 controller；若已被新 turn 覆盖则不动。
+      if (turnAbortRef.current === turnController) {
+        turnAbortRef.current = null;
+      }
     }
   }
 
@@ -2499,9 +2742,6 @@ export default function App() {
 
   async function undoLastExecution() {
     if (!lastUndoSnapshot || busy || !isRunningInExcel()) return;
-    if (!window.confirm("撤销上一次 Excel Bro 执行中可恢复的单元格更改？")) {
-      return;
-    }
     setStatus("executing");
     try {
       await undoExecution(lastUndoSnapshot);
@@ -2625,9 +2865,7 @@ export default function App() {
             (header) =>
               header.toLocaleLowerCase() ===
               parameter.defaultValue.toLocaleLowerCase()
-          ) ??
-          headers[0] ??
-          parameter.defaultValue;
+          ) ?? "";
       }
     }
     setToolParameterValues(values);
@@ -2692,24 +2930,289 @@ export default function App() {
             (header) =>
               header.toLocaleLowerCase() ===
               candidate.defaultValue.toLocaleLowerCase()
-          ) ??
-          headers[0] ??
-          "";
+          ) ?? "";
       }
       return next;
     });
   }
 
-  async function openTools() {
+  function renderToolParameter(tool: SavedTool, parameter: ToolParameter) {
+    return (
+      <label key={parameter.id}>
+        <span>{parameter.label}</span>
+        {parameter.type === "outputWorksheet" ||
+        parameter.type === "range" ? (
+          <input
+            value={
+              toolParameterValues[parameter.id] ?? parameter.defaultValue
+            }
+            placeholder={
+              parameter.type === "outputWorksheet"
+                ? "输入新的工作表名称"
+                : "例如 A1:E812"
+            }
+            onChange={(event) =>
+              updateToolParameter(tool, parameter, event.target.value)
+            }
+          />
+        ) : (
+          <select
+            value={
+              toolParameterValues[parameter.id] ?? parameter.defaultValue
+            }
+            onChange={(event) =>
+              updateToolParameter(tool, parameter, event.target.value)
+            }
+          >
+            {parameter.type === "worksheet"
+              ? (workbook?.worksheets ?? []).map((sheet) => (
+                  <option key={sheet.name} value={sheet.name}>
+                    {sheet.name}
+                  </option>
+                ))
+              : [
+                  <option key="field-placeholder" value="">
+                    请选择对应字段
+                  </option>,
+                  ...fieldOptions(tool, parameter).map((field) => (
+                    <option key={field} value={field}>
+                      {field}
+                    </option>
+                  ))
+                ]}
+          </select>
+        )}
+      </label>
+    );
+  }
+
+  function workflowToolPresentation(tool: SavedTool) {
+    const actionTypes = new Set(
+      tool.planTemplate.actions.map((action) => action.type)
+    );
+    if (actionTypes.has("splitGroupAggregate")) {
+      return { label: "拆分统计", glyph: "分", tone: "sage" };
+    }
+    if (
+      actionTypes.has("createPivotTable") ||
+      actionTypes.has("createChart")
+    ) {
+      return { label: "分析呈现", glyph: "析", tone: "blue" };
+    }
+    if (
+      actionTypes.has("filterRange") ||
+      actionTypes.has("sortRange")
+    ) {
+      return { label: "整理数据", glyph: "整", tone: "amber" };
+    }
+    return { label: "工作流程", glyph: "工", tone: "slate" };
+  }
+
+  function formatToolDate(value: string): string {
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) return "";
+    return new Intl.DateTimeFormat("zh-CN", {
+      month: "numeric",
+      day: "numeric"
+    }).format(parsed);
+  }
+
+  function buildFocusPayload(
+    initialView: FocusPayload["initialView"]
+  ): FocusPayload {
+    return {
+      type: "focus-state",
+      workbookName: workbook?.name ?? "",
+      initialView,
+      activeConversationId: chatHistory.activeConversationId,
+      conversations: chatHistory.conversations.map((conversation) => ({
+        id: conversation.id,
+        title: conversation.title,
+        updatedAt: conversation.updatedAt,
+        messages: conversation.messages.slice(-100).map((message) => ({
+          id: message.id,
+          role: message.role,
+          text: message.text ?? "",
+          createdAt: message.createdAt,
+          plan: message.plan
+            ? {
+                title: message.plan.title,
+                summary: message.plan.summary,
+                steps: message.plan.actions.map(actionLabel)
+              }
+            : undefined,
+          result: message.resultContext
+            ? {
+                title: message.resultContext.title,
+                headers: message.resultContext.headers,
+                rows: message.resultContext.rows.slice(0, 200)
+              }
+            : undefined
+        }))
+      })),
+      tools: [
+        ...tools.map((tool) => ({
+          id: tool.id,
+          kind: "workflow" as const,
+          name: tool.name,
+          description: tool.description,
+          category: workflowToolPresentation(tool).label,
+          steps: tool.planTemplate.actions.length,
+          stepLabels: tool.planTemplate.actions.map(actionLabel),
+          dsl: renderToolDsl(tool.planTemplate)
+        })),
+        ...queryTools.map((tool) => ({
+          id: tool.id,
+          kind: "query" as const,
+          name: tool.name,
+          description: tool.description,
+          category: "本地查询",
+          steps: 1,
+          stepLabels: []
+        }))
+      ]
+    };
+  }
+
+  function openFocusWindow() {
+    setViewMenuOpen(false);
+    if (!isRunningInExcel()) {
+      appendMessage({
+        role: "system",
+        text: "专注窗口需要从 Excel 任务窗格打开。"
+      });
+      return;
+    }
+    const initialView: FocusPayload["initialView"] = toolsOpen
+      ? "tools"
+      : "conversation";
+    const payload = buildFocusPayload(initialView);
+    try {
+      localStorage.setItem(FOCUS_PAYLOAD_STORAGE_KEY, JSON.stringify(payload));
+    } catch {
+      // DialogApi 1.2 messaging remains the primary synchronization path.
+    }
+    const canMessageChild = Office.context.requirements.isSetSupported(
+      "DialogApi",
+      "1.2"
+    );
+    if (focusDialogRef.current) {
+      if (canMessageChild) {
+        focusDialogRef.current.messageChild(JSON.stringify(payload));
+      }
+      return;
+    }
+    setFocusOpening(true);
+    const url = new URL("focus.html", window.location.href).toString();
+    Office.context.ui.displayDialogAsync(
+      url,
+      { height: 90, width: 90, displayInIframe: false },
+      (result) => {
+        if (result.status !== Office.AsyncResultStatus.Succeeded) {
+          setFocusOpening(false);
+          appendMessage({
+            role: "system",
+            text: `无法打开专注窗口：${result.error.message}`
+          });
+          return;
+        }
+        const dialog = result.value;
+        focusDialogRef.current = dialog;
+        dialog.addEventHandler(
+          Office.EventType.DialogMessageReceived,
+          (event) => {
+            if (!("message" in event)) return;
+            try {
+              const message = JSON.parse(event.message) as { type?: string };
+              if (message.type === "focus-ready" && canMessageChild) {
+                dialog.messageChild(JSON.stringify(payload));
+                setFocusOpening(false);
+              }
+              if (message.type === "focus-ready" && !canMessageChild) {
+                setFocusOpening(false);
+              }
+              if (message.type === "focus-close") {
+                dialog.close();
+                focusDialogRef.current = null;
+                setFocusOpening(false);
+              }
+            } catch {
+              // Ignore messages that don't belong to the focus workspace.
+            }
+          }
+        );
+        dialog.addEventHandler(Office.EventType.DialogEventReceived, () => {
+          focusDialogRef.current = null;
+          setFocusOpening(false);
+        });
+      }
+    );
+  }
+
+  function openTools() {
     setModelMenuOpen(false);
+    setViewMenuOpen(false);
     setHistoryOpen(false);
     closeSettings();
+    setToolDrawerView("library");
+    setSelectedToolId(null);
+    setSelectedQueryToolId(null);
+    setToolDetailMode("standard");
+    setPendingToolDeletion(null);
     setToolsOpen(true);
-    const selected =
-      tools.find((tool) => tool.id === selectedToolId) ?? tools[0];
-    if (!selected) return;
+  }
+
+  function openWorkflowToolDetail(tool: SavedTool) {
+    setSelectedToolId(tool.id);
+    setSelectedQueryToolId(null);
+    setToolDetailMode("standard");
+    setToolDrawerView("detail");
+  }
+
+  function openQueryToolDetail(tool: SavedQueryTool) {
+    setSelectedQueryToolId(tool.id);
+    setSelectedToolId(null);
+    setToolDetailMode("standard");
+    setToolDrawerView("detail");
+  }
+
+  async function copyToolDsl(tool: SavedTool) {
+    const text = renderToolDsl(tool.planTemplate);
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        const textarea = document.createElement("textarea");
+        textarea.value = text;
+        textarea.setAttribute("readonly", "");
+        textarea.style.position = "fixed";
+        textarea.style.opacity = "0";
+        document.body.appendChild(textarea);
+        textarea.select();
+        const copied = document.execCommand("copy");
+        textarea.remove();
+        if (!copied) throw new Error("copy failed");
+      }
+      setCopiedToolDslId(tool.id);
+      if (toolDslCopyTimerRef.current !== null) {
+        window.clearTimeout(toolDslCopyTimerRef.current);
+      }
+      toolDslCopyTimerRef.current = window.setTimeout(() => {
+        setCopiedToolDslId((current) => (current === tool.id ? null : current));
+        toolDslCopyTimerRef.current = null;
+      }, 1600);
+    } catch {
+      appendMessage({
+        role: "system",
+        text: "复制专家脚本失败，请手动选择脚本内容后复制。"
+      });
+    }
+  }
+
+  async function prepareToolRun(tool: SavedTool) {
     if (!isRunningInExcel() || !workbook) {
-      selectTool(selected);
+      selectTool(tool);
+      setToolDrawerView("run");
       return;
     }
     setStatus("scanning");
@@ -2718,7 +3221,8 @@ export default function App() {
         workbookScopeMode === "manual" ? selectedSheetNames : undefined
       );
       setWorkbook(snapshot);
-      selectTool(selected, snapshot);
+      selectTool(tool, snapshot);
+      setToolDrawerView("run");
     } catch (reason) {
       appendMessage({
         role: "system",
@@ -2727,7 +3231,8 @@ export default function App() {
             ? `读取工具所需字段失败：${reason.message}`
             : "读取工具所需字段失败"
       });
-      selectTool(selected);
+      selectTool(tool);
+      setToolDrawerView("run");
     } finally {
       setStatus("idle");
     }
@@ -2735,6 +3240,7 @@ export default function App() {
 
   function openHistory() {
     setModelMenuOpen(false);
+    setViewMenuOpen(false);
     setToolsOpen(false);
     closeSettings();
     setHistoryOpen(true);
@@ -2979,8 +3485,9 @@ export default function App() {
       ) {
         const sourceSheets = selectedNamesFor(workbook);
         plan.sourceFingerprintSheets = sourceSheets;
-        plan.sourceFingerprint = await captureWorkbookSourceFingerprint(
-          sourceSheets
+        plan.sourceFingerprint = toolSchemaFingerprintForSnapshot(
+          plan,
+          workbook
         );
       } else if (sourceMode === "folder" && workbook) {
         plan.sourceFingerprintSheets = selectedNamesFor(workbook);
@@ -3101,18 +3608,38 @@ export default function App() {
     }
   }
 
-  function removeTool(tool: SavedTool) {
-    if (!window.confirm(`确定删除工具「${tool.name}」吗？`)) return;
-    const next = deleteTool(tool.id);
-    setTools(next);
-    const replacement = next[0] ?? null;
-    setSelectedToolId(replacement?.id ?? null);
-    if (replacement) selectTool(replacement);
+  function requestToolDeletion(
+    kind: PendingToolDeletion["kind"],
+    tool: Pick<SavedTool | SavedQueryTool, "id" | "name">
+  ) {
+    setPendingToolDeletion({ kind, id: tool.id, name: tool.name });
+  }
+
+  function confirmToolDeletion() {
+    if (!pendingToolDeletion) return;
+    if (pendingToolDeletion.kind === "workflow") {
+      setTools(deleteTool(pendingToolDeletion.id));
+      setSelectedToolId((current) =>
+        current === pendingToolDeletion.id ? null : current
+      );
+    } else {
+      setQueryTools(deleteQueryTool(pendingToolDeletion.id));
+      setSelectedQueryToolId((current) =>
+        current === pendingToolDeletion.id ? null : current
+      );
+    }
+    setPendingToolDeletion(null);
+    setToolDrawerView("library");
   }
 
   function handleComposerKeyDown(event: React.KeyboardEvent<HTMLTextAreaElement>) {
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
+      // 运行中回车 = 转向（带这句话打断重跑）；空闲回车 = 正常发送。
+      if (busy) {
+        steerTurn(prompt);
+        return;
+      }
       void sendMessage();
     }
   }
@@ -3208,6 +3735,7 @@ export default function App() {
             aria-expanded={modelMenuOpen}
             title="选择或添加模型"
             onClick={() => {
+              setViewMenuOpen(false);
               setHistoryOpen(false);
               setToolsOpen(false);
               closeSettings();
@@ -3282,6 +3810,35 @@ export default function App() {
           </svg>
           <span>工具</span>
         </button>
+        <div className="view-menu-wrap">
+          <button
+            className="header-button"
+            onClick={() => {
+              setModelMenuOpen(false);
+              setViewMenuOpen((current) => !current);
+            }}
+            title="调整窗口"
+            aria-label="调整窗口"
+            aria-haspopup="menu"
+            aria-expanded={viewMenuOpen}
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <path d="M9 4H4v5M15 4h5v5M9 20H4v-5M15 20h5v-5" />
+            </svg>
+          </button>
+          {viewMenuOpen && (
+            <div className="view-menu" role="menu" aria-label="窗口显示方式">
+              <button
+                role="menuitem"
+                onClick={openFocusWindow}
+                disabled={focusOpening}
+              >
+                <strong>{focusOpening ? "正在打开…" : "打开专注窗口"}</strong>
+                <span>使用接近全屏的大窗口查看对话、结果和工具</span>
+              </button>
+            </div>
+          )}
+        </div>
         <button
           className={`header-button pet-toggle${petVisible ? " active" : ""}`}
           onClick={togglePetVisibility}
@@ -3748,149 +4305,494 @@ export default function App() {
         <aside className="tool-drawer" aria-label="我的工具">
           <div className="tool-drawer-header">
             <div>
-              <strong>我的工具</strong>
-              <span>已审核并固化的个人工作流</span>
+              <strong>
+                {toolDrawerView === "library"
+                  ? "我的工具"
+                  : toolDrawerView === "detail"
+                    ? "工具说明"
+                    : "运行工具"}
+              </strong>
+              <span>
+                {toolDrawerView === "library"
+                  ? "先选择工具，了解清楚后再运行"
+                  : toolDrawerView === "detail"
+                    ? "确认用途、输入和结果"
+                    : "逐步确认本次运行所需信息"}
+              </span>
             </div>
             <button onClick={() => setToolsOpen(false)} aria-label="关闭">
               ×
             </button>
           </div>
-          {tools.length === 0 ? (
-            <div className="tool-empty">
-              <i>▦</i>
-              <strong>还没有保存工具</strong>
-              <span>在执行计划卡片中点击“保存为工具”。</span>
+
+          {toolDrawerView === "library" && (
+            <div className="tool-library">
+              {tools.length === 0 && queryTools.length === 0 ? (
+                <div className="tool-empty">
+                  <i>▦</i>
+                  <strong>工具箱还是空的</strong>
+                  <span>执行并验证一个计划后，可以把它保存到这里。</span>
+                </div>
+              ) : (
+                <>
+                  <div className="tool-library-intro">
+                    <span>工具箱</span>
+                    <strong>今天想用哪一个？</strong>
+                    <p>
+                      每个工具都保留自己的处理规则。选择后先看说明，不会立即执行。
+                    </p>
+                  </div>
+                  <div className="tool-card-grid">
+                    {tools.map((tool) => {
+                      const presentation = workflowToolPresentation(tool);
+                      return (
+                        <article className="tool-card-wrap" key={tool.id}>
+                          <button
+                            className="tool-card"
+                            onClick={() => openWorkflowToolDetail(tool)}
+                          >
+                            <span
+                              className={`tool-card-icon tone-${presentation.tone}`}
+                            >
+                              {presentation.glyph}
+                            </span>
+                            <span className="tool-card-copy">
+                              <small>{presentation.label}</small>
+                              <strong>{tool.name}</strong>
+                              <span>{tool.description}</span>
+                            </span>
+                          </button>
+                          <div className="tool-card-footer">
+                            <span className="tool-card-meta">
+                              {tool.planTemplate.actions.length} 个步骤
+                              {formatToolDate(tool.updatedAt)
+                                ? ` · ${formatToolDate(tool.updatedAt)} 更新`
+                                : ""}
+                            </span>
+                            <button
+                              className="tool-card-delete"
+                              aria-label={`删除工具「${tool.name}」`}
+                              title={`删除「${tool.name}」`}
+                              onClick={() =>
+                                requestToolDeletion("workflow", tool)
+                              }
+                            >
+                              删除
+                            </button>
+                          </div>
+                        </article>
+                      );
+                    })}
+                    {queryTools.map((tool) => (
+                      <article className="tool-card-wrap" key={tool.id}>
+                        <button
+                          className="tool-card"
+                          onClick={() => openQueryToolDetail(tool)}
+                        >
+                          <span className="tool-card-icon tone-blue">查</span>
+                          <span className="tool-card-copy">
+                            <small>本地查询</small>
+                            <strong>{tool.name}</strong>
+                            <span>{tool.description}</span>
+                          </span>
+                        </button>
+                        <div className="tool-card-footer">
+                          <span className="tool-card-meta">
+                            模型调用 0 次
+                            {formatToolDate(tool.updatedAt)
+                              ? ` · ${formatToolDate(tool.updatedAt)} 更新`
+                              : ""}
+                          </span>
+                          <button
+                            className="tool-card-delete"
+                            aria-label={`删除工具「${tool.name}」`}
+                            title={`删除「${tool.name}」`}
+                            onClick={() => requestToolDeletion("query", tool)}
+                          >
+                            删除
+                          </button>
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                </>
+              )}
             </div>
-          ) : (
-            <div className="tool-layout">
-              <div className="tool-list">
-                {tools.map((tool) => (
-                  <button
-                    key={tool.id}
-                    className={selectedToolId === tool.id ? "selected" : ""}
-                    onClick={() => selectTool(tool)}
-                  >
-                    <strong>{tool.name}</strong>
-                    <span>{tool.description}</span>
-                  </button>
-                ))}
-              </div>
-              {tools
-                .filter((tool) => tool.id === selectedToolId)
-                .map((tool) => (
-                  <section className="tool-detail" key={tool.id}>
-                    <div className="tool-detail-title">
+          )}
+
+          {toolDrawerView === "detail" &&
+            tools
+              .filter((tool) => tool.id === selectedToolId)
+              .map((tool) => {
+                const presentation = workflowToolPresentation(tool);
+                return (
+                  <section className="tool-page tool-detail-page" key={tool.id}>
+                    <button
+                      className="tool-back-button"
+                      onClick={() => setToolDrawerView("library")}
+                    >
+                      ← 返回工具箱
+                    </button>
+                    <div className="tool-detail-hero">
+                      <span
+                        className={`tool-card-icon large tone-${presentation.tone}`}
+                      >
+                        {presentation.glyph}
+                      </span>
                       <div>
+                        <small>{presentation.label}</small>
                         <strong>{tool.name}</strong>
-                        <span>版本 {tool.version} · {tool.planTemplate.actions.length} 步</span>
+                        <span>
+                          版本 {tool.version} ·{" "}
+                          {tool.planTemplate.actions.length} 个处理步骤
+                        </span>
                       </div>
-                      <button onClick={() => removeTool(tool)}>删除</button>
                     </div>
-                    <p>{tool.description}</p>
-                    {tool.parameters.length > 0 ? (
-                      <div className="tool-parameters">
-                        <strong>本次运行参数</strong>
-                        {tool.parameters.map((parameter) => (
-                          <label key={parameter.id}>
-                            <span>{parameter.label}</span>
-                            {parameter.type === "outputWorksheet" ||
-                            parameter.type === "range" ? (
-                              <input
-                                value={
-                                  toolParameterValues[parameter.id] ??
-                                  parameter.defaultValue
-                                }
-                                placeholder={
-                                  parameter.type === "outputWorksheet"
-                                    ? "输入新的工作表名称"
-                                    : "例如 A1:E812"
-                                }
-                                onChange={(event) =>
-                                  updateToolParameter(
-                                    tool,
-                                    parameter,
-                                    event.target.value
-                                  )
-                                }
-                              />
-                            ) : (
-                              <select
-                                value={
-                                  toolParameterValues[parameter.id] ??
-                                  parameter.defaultValue
-                                }
-                                onChange={(event) =>
-                                  updateToolParameter(
-                                    tool,
-                                    parameter,
-                                    event.target.value
-                                  )
-                                }
-                              >
-                                {parameter.type === "worksheet"
-                                  ? (workbook?.worksheets ?? []).map((sheet) => (
-                                      <option key={sheet.name} value={sheet.name}>
-                                        {sheet.name}
-                                      </option>
-                                    ))
-                                  : fieldOptions(tool, parameter).map((field) => (
-                                      <option key={field} value={field}>
-                                        {field}
-                                      </option>
-                                    ))}
-                              </select>
-                            )}
-                          </label>
-                        ))}
-                      </div>
+                    <div
+                      className="tool-view-switch"
+                      role="tablist"
+                      aria-label="工具说明视图"
+                    >
+                      <button
+                        role="tab"
+                        aria-selected={toolDetailMode === "standard"}
+                        className={toolDetailMode === "standard" ? "active" : ""}
+                        onClick={() => setToolDetailMode("standard")}
+                      >
+                        普通视图
+                      </button>
+                      <button
+                        role="tab"
+                        aria-selected={toolDetailMode === "expert"}
+                        className={toolDetailMode === "expert" ? "active" : ""}
+                        onClick={() => setToolDetailMode("expert")}
+                      >
+                        专家视图
+                      </button>
+                    </div>
+                    {toolDetailMode === "standard" ? (
+                      <>
+                        <div className="tool-purpose">
+                          <strong>它会为你完成什么</strong>
+                          <p>{tool.description}</p>
+                        </div>
+                        <div className="tool-facts">
+                          <div>
+                            <span>处理方式</span>
+                            <strong>{presentation.label}</strong>
+                          </div>
+                          <div>
+                            <span>执行步骤</span>
+                            <strong>{tool.planTemplate.actions.length} 步</strong>
+                          </div>
+                          <div>
+                            <span>安全机制</span>
+                            <strong>运行前预览</strong>
+                          </div>
+                        </div>
+                        <div className="tool-conversation-note">
+                          <span>运行时怎么沟通</span>
+                          <p>
+                            我会先识别当前工作簿和字段。能够自动匹配的内容不会打扰你，
+                            只有发现字段变化时才会请你确认。
+                          </p>
+                        </div>
+                        <details className="tool-steps">
+                          <summary>
+                            查看完整处理步骤（{tool.planTemplate.actions.length}）
+                          </summary>
+                          <ol>
+                            {tool.planTemplate.actions.map((action, index) => (
+                              <li key={`${tool.id}-${index}`}>
+                                {actionLabel(action)}
+                              </li>
+                            ))}
+                          </ol>
+                        </details>
+                      </>
                     ) : (
-                      <div className="tool-fixed-note">
-                        此工具不需要运行参数，将按保存时的固定设置执行。
+                      <div className="tool-expert-view">
+                        <div className="tool-expert-heading">
+                          <div>
+                            <small>CONTROLLED PLAN</small>
+                            <strong>专家脚本</strong>
+                            <span>由保存的白名单计划确定性生成</span>
+                          </div>
+                          <button
+                            className="tool-copy-dsl"
+                            onClick={() => void copyToolDsl(tool)}
+                          >
+                            {copiedToolDslId === tool.id ? "已复制" : "复制脚本"}
+                          </button>
+                        </div>
+                        <div className="tool-expert-badges">
+                          <span>只读展示</span>
+                          <span>运行前预览</span>
+                          <span>禁止任意代码</span>
+                        </div>
+                        <pre className="tool-dsl" tabIndex={0}>
+                          <code>{renderToolDsl(tool.planTemplate)}</code>
+                        </pre>
+                        <p className="tool-expert-note">
+                          这里和普通视图是同一份工具。复制脚本不会执行；实际运行仍使用受控
+                          AnalysisPlan，并在写入前让你确认预览。
+                        </p>
                       </div>
                     )}
-                    <details className="tool-steps">
-                      <summary>查看固化逻辑</summary>
-                      <ol>
-                        {tool.planTemplate.actions.map((action, index) => (
-                          <li key={`${tool.id}-${index}`}>
-                            {actionLabel(action)}
-                          </li>
-                        ))}
-                      </ol>
-                    </details>
+                    <div className="tool-run-actions">
+                      <button
+                        className="tool-preview-button"
+                        disabled={busy || !workbook}
+                        onClick={() => void prepareToolRun(tool)}
+                      >
+                        使用这个工具
+                      </button>
+                      <span>下一步先确认本次数据来源，不会立即修改工作簿</span>
+                    </div>
+                  </section>
+                );
+              })}
+
+          {toolDrawerView === "detail" &&
+            queryTools
+              .filter((tool) => tool.id === selectedQueryToolId)
+              .map((tool) => (
+                <section className="tool-page tool-detail-page" key={tool.id}>
+                  <button
+                    className="tool-back-button"
+                    onClick={() => setToolDrawerView("library")}
+                  >
+                    ← 返回工具箱
+                  </button>
+                  <div className="tool-detail-hero">
+                    <span className="tool-card-icon large tone-blue">查</span>
+                    <div>
+                      <small>本地查询</small>
+                      <strong>{tool.name}</strong>
+                      <span>确定性执行 · 不调用模型</span>
+                    </div>
+                  </div>
+                  <div className="tool-purpose">
+                    <strong>它会为你查什么</strong>
+                    <p>{tool.description}</p>
+                  </div>
+                  <div className="tool-facts">
+                    <div>
+                      <span>运行位置</span>
+                      <strong>本地</strong>
+                    </div>
+                    <div>
+                      <span>模型调用</span>
+                      <strong>0 次</strong>
+                    </div>
+                    <div>
+                      <span>字段变化</span>
+                      <strong>停止并提醒</strong>
+                    </div>
+                  </div>
+                  <div className="tool-conversation-note">
+                    <span>运行前检查</span>
+                    <p>
+                      如果来源或字段发生变化，工具会停止，不会用错误字段继续计算。
+                    </p>
+                  </div>
+                  <div className="tool-run-actions">
                     <button
                       className="tool-preview-button"
                       disabled={busy || !workbook}
-                      onClick={() => void previewTool(tool)}
+                      onClick={() => void runQueryTool(tool)}
                     >
-                      生成执行预览
+                      运行这个查询
                     </button>
-                  </section>
-                ))}
-            </div>
-          )}
-          {queryTools.length > 0 && (
-            <section className="tool-detail">
-              <div className="tool-detail-title">
-                <div>
-                  <strong>固化查询</strong>
-                  <span>本地重复执行 · 模型调用 0 次</span>
-                </div>
-              </div>
-              <p>字段或来源发生变化时会停止本地执行并要求重新确认。</p>
-              {queryTools.map((tool) => (
-                <button
-                  key={tool.id}
-                  className="tool-preview-button"
-                  disabled={busy || !workbook}
-                  onClick={() => void runQueryTool(tool)}
-                >
-                  运行 · {tool.name}
-                </button>
+                    <span>查询结果会回到当前对话，不会写入工作簿</span>
+                  </div>
+                </section>
               ))}
-            </section>
-          )}
+
+          {toolDrawerView === "run" &&
+            tools
+              .filter((tool) => tool.id === selectedToolId)
+              .map((tool) => {
+                const primaryParameters = tool.parameters.filter(
+                  (parameter) =>
+                    parameter.type === "worksheet" ||
+                    parameter.type === "outputWorksheet"
+                );
+                const advancedParameters = tool.parameters.filter(
+                  (parameter) =>
+                    parameter.type === "field" ||
+                    parameter.type === "range"
+                );
+                const fieldParameters = advancedParameters.filter(
+                  (parameter) => parameter.type === "field"
+                );
+                const missingFieldCount = fieldParameters.filter(
+                  (parameter) =>
+                    !(toolParameterValues[parameter.id] ?? "").trim()
+                ).length;
+                return (
+                  <section className="tool-page tool-run-page" key={tool.id}>
+                    <button
+                      className="tool-back-button"
+                      onClick={() => setToolDrawerView("detail")}
+                    >
+                      ← 返回工具说明
+                    </button>
+                    <div className="tool-run-heading">
+                      <small>正在准备</small>
+                      <strong>{tool.name}</strong>
+                      <span>
+                        我会逐项确认本次运行环境，已匹配的内容保持收起。
+                      </span>
+                    </div>
+                    <div className="tool-run-guide">
+                      <section className="tool-guide-step">
+                        <span className="tool-guide-number">1</span>
+                        <div className="tool-guide-content">
+                          <div className="tool-guide-title">
+                            <div>
+                              <strong>选择数据来源</strong>
+                              <span>这次要处理哪张工作表？</span>
+                            </div>
+                            <small>需要确认</small>
+                          </div>
+                          <div className="tool-guide-fields">
+                            {primaryParameters.length > 0 ? (
+                              primaryParameters.map((parameter) =>
+                                renderToolParameter(tool, parameter)
+                              )
+                            ) : (
+                              <span>使用保存时的固定数据来源。</span>
+                            )}
+                          </div>
+                        </div>
+                      </section>
+                      <section
+                        className={`tool-guide-step${
+                          missingFieldCount > 0 ? " needs-attention" : ""
+                        }`}
+                      >
+                        <span className="tool-guide-number">2</span>
+                        <div className="tool-guide-content">
+                          <div className="tool-guide-title">
+                            <div>
+                              <strong>核对字段</strong>
+                              <span>
+                                {fieldParameters.length === 0
+                                  ? "这个工具不需要字段匹配"
+                                  : missingFieldCount > 0
+                                  ? `有 ${missingFieldCount} 个字段需要你指定`
+                                  : `${fieldParameters.length} 个字段已按表头自动匹配`}
+                              </span>
+                            </div>
+                            <small>
+                              {missingFieldCount > 0 ? "待处理" : "已完成"}
+                            </small>
+                          </div>
+                          {advancedParameters.length > 0 && (
+                            <details
+                              className="tool-field-mapping"
+                              open={missingFieldCount > 0}
+                            >
+                              <summary>
+                                <span>
+                                  {missingFieldCount > 0
+                                    ? "完成字段匹配"
+                                    : "查看字段映射"}
+                                </span>
+                                <small>
+                                  {fieldParameters.length > 0
+                                    ? `${
+                                        fieldParameters.length -
+                                        missingFieldCount
+                                      }/${fieldParameters.length} 已匹配`
+                                    : `${advancedParameters.length} 项设置`}
+                                </small>
+                              </summary>
+                              <div>
+                                <p>
+                                  只有字段名称发生变化时才需要调整；数据范围也可以在这里检查。
+                                </p>
+                                {advancedParameters.map((parameter) =>
+                                  renderToolParameter(tool, parameter)
+                                )}
+                              </div>
+                            </details>
+                          )}
+                        </div>
+                      </section>
+                      <section className="tool-guide-step">
+                        <span className="tool-guide-number">3</span>
+                        <div className="tool-guide-content">
+                          <div className="tool-guide-title">
+                            <div>
+                              <strong>生成安全预览</strong>
+                              <span>
+                                下一步只展示将要执行的内容，不会立即修改工作簿。
+                              </span>
+                            </div>
+                            <small>最后确认</small>
+                          </div>
+                        </div>
+                      </section>
+                    </div>
+                    <div className="tool-run-actions">
+                      <button
+                        className="tool-preview-button"
+                        disabled={
+                          busy || !workbook || missingFieldCount > 0
+                        }
+                        onClick={() => void previewTool(tool)}
+                      >
+                        查看执行预览
+                      </button>
+                      <span>
+                        预览确认后才会执行；当前页面不会直接写入 Excel
+                      </span>
+                    </div>
+                  </section>
+                );
+              })}
         </aside>
+      )}
+
+      {pendingToolDeletion && (
+        <div className="tool-dialog-backdrop" role="presentation">
+          <section
+            className="tool-dialog history-delete-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-label="删除保存的工具"
+          >
+            <div className="tool-dialog-title">
+              <div>
+                <strong>删除这个工具？</strong>
+                <span>删除后无法恢复，但不会影响工作簿中的数据</span>
+              </div>
+              <button
+                onClick={() => setPendingToolDeletion(null)}
+                aria-label="关闭"
+              >
+                ×
+              </button>
+            </div>
+            <p>确定从工具箱删除「{pendingToolDeletion.name}」吗？</p>
+            <div className="tool-dialog-actions">
+              <button
+                className="secondary-button"
+                onClick={() => setPendingToolDeletion(null)}
+              >
+                取消
+              </button>
+              <button
+                className="danger-button"
+                onClick={confirmToolDeletion}
+              >
+                确认删除
+              </button>
+            </div>
+          </section>
+        </div>
       )}
 
       {historyOpen && (
@@ -4115,28 +5017,6 @@ export default function App() {
       )}
 
       <section className="message-stream" aria-live="polite">
-        {petVisible && (
-          <section className="pet-home-placeholder" aria-label="宠物小屋">
-            <div className="pet-home-mark" aria-hidden="true">
-              <i />
-              <i />
-              <i />
-              <b />
-            </div>
-            <div>
-              <strong>宠物小屋准备中</strong>
-              <span>角色方案已保留，选定后会住进这里</span>
-            </div>
-            <button
-              type="button"
-              onClick={togglePetVisibility}
-              aria-label="隐藏宠物"
-              title="隐藏宠物"
-            >
-              ×
-            </button>
-          </section>
-        )}
         {messages.map((message) => (
           <article
             className={`message-row ${message.role}`}
@@ -4351,9 +5231,22 @@ export default function App() {
                           >
                             ✓
                           </span>
-                          <span className="activity-step-label">
-                            {step.label}
-                          </span>
+                          <div className="activity-step-body">
+                            <span className="activity-step-label">
+                              {step.label}
+                            </span>
+                            {step.note && (
+                              <span className="activity-step-note">
+                                {step.note}
+                              </span>
+                            )}
+                            {step.detail && (
+                              <details className="activity-step-detail">
+                                <summary>查看详情</summary>
+                                <pre>{step.detail}</pre>
+                              </details>
+                            )}
+                          </div>
                           <span className="activity-step-time">
                             {formatStepElapsed(step.elapsedMs)}
                           </span>
@@ -4547,12 +5440,13 @@ export default function App() {
                 <time>{activitySeconds} 秒</time>
               </div>
               {activity?.detail && <p>{activity.detail}</p>}
-              {status === "tooling" && (
+              {busy && (
                 <button
                   type="button"
-                  onClick={() => queryAbortRef.current?.abort()}
+                  className="activity-stop-button"
+                  onClick={stopTurn}
                 >
-                  取消本地查询
+                  停止
                 </button>
               )}
               {activity && activity.completed.length > 0 && (
@@ -4562,7 +5456,18 @@ export default function App() {
                       <span className="activity-step-check" aria-hidden="true">
                         ✓
                       </span>
-                      <span className="activity-step-label">{step.label}</span>
+                      <div className="activity-step-body">
+                        <span className="activity-step-label">{step.label}</span>
+                        {step.note && (
+                          <span className="activity-step-note">{step.note}</span>
+                        )}
+                        {step.detail && (
+                          <details className="activity-step-detail">
+                            <summary>查看详情</summary>
+                            <pre>{step.detail}</pre>
+                          </details>
+                        )}
+                      </div>
                       <span className="activity-step-time">
                         {formatStepElapsed(step.elapsedMs)}
                       </span>
@@ -4914,58 +5819,82 @@ export default function App() {
                   void addImageFiles(files);
                 }}
               />
-              <button
-                className="attach-image-button"
-                disabled={!supportsVision || busy}
-                onClick={() => imageInputRef.current?.click()}
-                title={
-                  supportsVision
-                    ? "添加图片，也可以直接粘贴或拖入截图"
-                    : "当前模型不支持图片"
-                }
-                aria-label="添加图片"
-              >
-                <svg
-                  viewBox="0 0 24 24"
-                  aria-hidden="true"
-                  focusable="false"
-                >
-                  <rect x="3.5" y="4.5" width="17" height="15" rx="2.5" />
-                  <circle cx="9" cy="9.5" r="1.5" />
-                  <path d="m5.5 17 4.2-4.4 3.1 3 2.2-2.2 3.5 3.6" />
-                </svg>
-                <span>图片</span>
-              </button>
-              {lastUndoSnapshot && (
+              <div className="composer-tools-left">
                 <button
                   className="attach-image-button"
-                  disabled={busy}
-                  onClick={() => void undoLastExecution()}
-                  title="撤销上一次 Excel Bro 执行"
+                  disabled={!supportsVision || busy}
+                  onClick={() => imageInputRef.current?.click()}
+                  title={
+                    supportsVision
+                      ? "添加图片，也可以直接粘贴或拖入截图"
+                      : "当前模型不支持图片"
+                  }
+                  aria-label="添加图片"
                 >
-                  ↶ <span>撤销</span>
+                  <svg
+                    viewBox="0 0 24 24"
+                    aria-hidden="true"
+                    focusable="false"
+                  >
+                    <rect x="3.5" y="4.5" width="17" height="15" rx="2.5" />
+                    <circle cx="9" cy="9.5" r="1.5" />
+                    <path d="m5.5 17 4.2-4.4 3.1 3 2.2-2.2 3.5 3.6" />
+                  </svg>
+                  <span>图片</span>
+                </button>
+                {lastUndoSnapshot && (
+                  <button
+                    className="attach-image-button"
+                    disabled={busy}
+                    onClick={() => void undoLastExecution()}
+                    title="撤销上一次 Excel Bro 执行"
+                  >
+                    ↶ <span>撤销</span>
+                  </button>
+                )}
+              </div>
+              {busy ? (
+                // 运行中：有字=转向（带话打断重跑），无字=纯停止。
+                <button
+                  className={`send-button ${
+                    prompt.trim() ? "is-steer" : "is-stop"
+                  }`}
+                  onClick={() =>
+                    prompt.trim() ? steerTurn(prompt) : stopTurn()
+                  }
+                  aria-label={prompt.trim() ? "打断并补充" : "停止"}
+                  title={
+                    prompt.trim()
+                      ? "打断当前处理，带上这句话重新开始"
+                      : "停止当前处理"
+                  }
+                >
+                  {prompt.trim() ? "↑" : "■"}
+                </button>
+              ) : (
+                <button
+                  className="send-button"
+                  disabled={
+                    !workbook ||
+                    (!prompt.trim() && pendingImages.length === 0) ||
+                    (pendingImages.length > 0 && !supportsVision)
+                  }
+                  onClick={() => void sendMessage()}
+                  aria-label="发送"
+                >
+                  ↑
                 </button>
               )}
-              <button
-                className="send-button"
-                disabled={
-                  busy ||
-                  !workbook ||
-                  (!prompt.trim() && pendingImages.length === 0) ||
-                  (pendingImages.length > 0 && !supportsVision)
-                }
-                onClick={() => void sendMessage()}
-                aria-label="发送"
-              >
-                ↑
-              </button>
             </div>
           </div>
         </div>
         <span>
-          Enter 发送 · Shift + Enter 换行 · 可粘贴截图 · 写入操作会先预览
+          {busy
+            ? "运行中：输入新内容按 Enter 可打断并转向，留空点 ■ 停止"
+            : "Enter 发送 · Shift + Enter 换行 · 可粘贴截图 · 写入操作会先预览"}
         </span>
       </footer>
+      {petVisible && <PetCompanion busy={busy} />}
     </main>
   );
 }

@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "test": "vitest run",
-    "start:desktop": "office-addin-debugging start manifest.xml desktop",
+    "start:desktop": "office-addin-debugging start manifest.xml desktop --no-debug",
     "stop:desktop": "office-addin-debugging stop manifest.xml"
   },
   "dependencies": {

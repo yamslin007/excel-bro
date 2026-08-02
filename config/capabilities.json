@@ -15,6 +15,9 @@
     "defaultLimit": 20,
     "maxResultRows": 200
   },
+  "excelExecution": {
+    "splitAggregateBatchSheets": 25
+  },
   "folder": {
     "maxFiles": 100,
     "maxSessions": 20,
