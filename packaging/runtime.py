@@ -34,10 +34,16 @@ def _serve_frontend(install_root: Path) -> None:
     server.serve_forever()
 
 
+def _data_root() -> Path:
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "Excel Bro"
+    return Path(os.environ["LOCALAPPDATA"]) / "Excel Bro"
+
+
 def main() -> None:
     install_root = Path(sys.executable).resolve().parent
     bundle_root = _bundle_root()
-    data_root = Path(os.environ["LOCALAPPDATA"]) / "Excel Bro"
+    data_root = _data_root()
     data_root.mkdir(parents=True, exist_ok=True)
     os.environ["EXCEL_BRO_CONFIG_DIR"] = str(data_root)
     os.environ["EXCEL_BRO_CAPABILITIES_PATH"] = str(

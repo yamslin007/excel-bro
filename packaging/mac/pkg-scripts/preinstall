@@ -1,0 +1,14 @@
+#!/bin/bash
+set -euo pipefail
+
+INSTALL_DIR="/Applications/Excel Bro"
+PLIST_LABEL="com.excelbro.runtime"
+
+pkill -x ExcelBro 2>/dev/null || true
+
+CONSOLE_USER="$(stat -f %Su /dev/console 2>/dev/null || true)"
+if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != "root" ]; then
+    CONSOLE_UID="$(id -u "$CONSOLE_USER")"
+    launchctl bootout "gui/$CONSOLE_UID/$PLIST_LABEL" 2>/dev/null || true
+    rm -f "/Users/$CONSOLE_USER/Library/LaunchAgents/$PLIST_LABEL.plist"
+fi

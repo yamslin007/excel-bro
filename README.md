@@ -201,6 +201,29 @@ npm run build:installer
 组织内正式分发仍应把 Web 应用部署到 HTTPS 服务器，再通过 Microsoft 365
 管理中心部署清单或提交 Microsoft Marketplace。
 
+## macOS 本地安装包
+
+macOS 安装包由 GitHub Actions 构建（PyInstaller 不能交叉编译）：在仓库
+**Actions → Build macOS installer → Run workflow** 手动触发，或推送 `v*`
+标签。产物为 `dist/Excel-Bro-Setup-<版本>-<arm64|x86_64>.pkg`，按 Mac 芯片
+选择对应架构。
+
+安装包会把本地服务安装到 `/Applications/Excel Bro`，并自动完成：
+
+- 把加载项清单放入 Mac Excel 旁加载目录
+  `~/Library/Containers/com.microsoft.Excel/Data/Documents/wef`；
+- 把 `localhost` HTTPS 证书信任到系统钥匙串；
+- 注册 LaunchAgent，登录时自动启动只监听本机的服务；
+- 安装末尾做健康检查，失败会回滚证书和自启动。
+
+安装包未做 Apple 签名公证，首次打开会被 Gatekeeper 拦截：在 Finder 中
+**右键 → 打开** 即可继续。安装后完全退出并重开 Excel，依次选择
+**插入 → 加载项 → 我的加载项**，即可看到 **Excel Bro**。
+
+卸载：在终端执行 `sudo bash "/Applications/Excel Bro/uninstall.sh"`。卸载会
+移除程序、旁加载清单、证书和自启动，但保留
+`~/Library/Application Support/Excel Bro` 中的个人模型配置。
+
 ## 安全边界
 
 - 本地服务默认只监听 `127.0.0.1`。

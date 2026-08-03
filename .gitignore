@@ -11,26 +11,7 @@ __pycache__/
 *.py[cod]
 .venv/
 server/data/
+outputs/
 *.log
 model-connections.json
 .tmp/
-
-# 运行时日志
-server-runtime.err.log
-server-runtime.out.log
-
-# 本地临时/检查文件
-cc-check.md
-
-# 新增补充规则
-Thumbs.db
-.DS_Store
-.vscode/
-*.swp
-*.swo
-outputs/
-*.egg-info/
-.tox/
-*.xlsx~
-*.xls~
-*.tmp.xlsx

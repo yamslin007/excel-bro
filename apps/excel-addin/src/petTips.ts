@@ -69,7 +69,7 @@ export const PET_TIPS: PetTip[] = [
     id: "flash-fill",
     category: "录入编辑",
     title: "快速填充识别规律",
-    detail: "手动示范一两个想要的结果，按下后 Excel 会按规律自动补全整列，拆分姓名、提取数字都好用。",
+    detail: "手动示范一两个想要的结果，按下后 Excel 会按规律自动补全整列，拆分文本、提取数字都好用。",
     shortcut: "Ctrl + E"
   },
   {

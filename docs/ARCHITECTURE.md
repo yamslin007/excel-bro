@@ -382,9 +382,12 @@ openpyxl 能稳定读取的对象提供强验收：图表保持 `executed_unveri
 - FastAPI：`http://127.0.0.1:8765`
 - 前端可用 `VITE_API_BASE_URL` 覆盖 API 地址
 - 后端模型配置：`server/.env`
-- 安装包模式的用户配置：`%LOCALAPPDATA%\Excel Bro`
-- 安装包程序目录：`%LOCALAPPDATA%\Programs\Excel Bro`
-- 个人安装的清单共享：`\\<电脑名>\ExcelBroAddins`
+- 安装包模式的用户配置：Windows 为 `%LOCALAPPDATA%\Excel Bro`，macOS 为
+  `~/Library/Application Support/Excel Bro`
+- Windows 安装包程序目录：`%LOCALAPPDATA%\Programs\Excel Bro`
+- macOS 安装包程序目录：`/Applications/Excel Bro`
+- 个人 Windows 安装的清单共享：`\\<电脑名>\ExcelBroAddins`
+- macOS 旁加载目录：`~/Library/Containers/com.microsoft.Excel/Data/Documents/wef`
 - 独立模型连接：环境配置文件同目录下的 `model-connections.json`
 - 项目能力限额：`config/capabilities.json`（含 `agent` 与 `llm` 节点；`llm.maxRetries`/`llm.retryBaseDelaySeconds`/`llm.retryMaxDelaySeconds` 控制退避重试，`llm.timeoutSeconds` 控制模型请求超时，可被 env `AI_TIMEOUT_SECONDS` 覆盖）
 
@@ -409,6 +412,15 @@ PyInstaller 只冻结本地 FastAPI 服务。Inno Setup 提供可选安装目录
 当前用户模式运行，仅 SMB 共享操作通过受控 PowerShell 子进程请求 UAC；因此
 HKCU、证书和 `%LOCALAPPDATA%` 始终属于发起安装的用户。卸载共享失败会在 Inno
 删除文件和注册项之前中止，避免再次产生“卸载入口消失但程序仍在”的半卸载状态。
+
+macOS 安装包由 `.github/workflows/build-mac.yml` 在 GitHub Actions 构建（
+x86_64 与 arm64 两个 `.pkg`），本机有 Mac 时也可运行 `packaging/build_mac.sh`。
+`.pkg` 的 preinstall/postinstall 脚本以 root 运行，承担 Windows 上
+`install_tasks.ps1` 的职责：清单直接拷入 Mac Excel 容器内的 `wef` 旁加载目录
+（以桌面用户身份写入），`localhost` 证书信任到系统钥匙串，自启动使用
+LaunchAgent `com.excelbro.runtime`，安装末尾健康检查失败会回滚。卸载使用安装
+目录内的 `uninstall.sh`，同样保留用户模型配置。安装包未做 Apple 签名公证，
+适合个人与小范围使用。
 
 模型服务必须兼容 `/chat/completions`。新安装不预置任何供应商或模型，前端在模型目录只有基础模式时显示首次添加引导；顶部统一菜单承担模型选择、添加和管理。旧环境变量配置仍可通过 `AI_MODEL` 和 `AI_MODELS` 让多个模型共享一个 Base URL 和 Key；任务窗格还可以创建多个独立模型连接，每个连接拥有自己的名称、Base URL、模型 ID、API Key 和视觉能力标记。模型目录使用服务端生成的连接 ID，真正发送给供应商的仍是连接内的模型 ID。
 

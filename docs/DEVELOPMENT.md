@@ -143,6 +143,34 @@ Office 加载项清单的 `<Version>` 必须至少为 `1.0.0.0`，并包含顶�
 中止，不会先删掉卸载入口或留下半卸载状态。成功后由 Inno Setup 删除程序文件、
 可信目录、启动项和证书；`%LOCALAPPDATA%\Excel Bro` 中的个人模型配置默认保留。
 
+### macOS 安装包
+
+mac 包只能在 macOS 上构建，仓库通过 `.github/workflows/build-mac.yml` 在
+GitHub Actions 上完成：`workflow_dispatch` 手动触发或推送 `v*` 标签，matrix
+同时产出 x86_64（macos-13）和 arm64（macos-14）两个 `.pkg`。本地有 Mac 时也可
+直接执行：
+
+```bash
+pip install -r server/requirements.txt pyinstaller
+bash packaging/build_mac.sh
+```
+
+`packaging/build_mac.sh` 与 Windows 的 `build_installer.ps1` 步骤一致（manifest
+守卫、前端构建、证书生成、PyInstaller onedir 冻结），最后用 `pkgbuild` +
+`productbuild` 生成安装包。系统集成由 `packaging/mac/pkg-scripts/` 中 root 运行
+的 preinstall/postinstall 完成，对应 Windows 的 `install_tasks.ps1`：
+
+- 旁加载不依赖共享目录，直接把 `manifest.xml` 拷入 Mac Excel 容器的 `wef` 目录
+  （必须以桌面用户身份写入，否则 Excel 沙盒读不到）；
+- `localhost` 证书通过 `security add-trusted-cert` 信任到系统钥匙串，替换同名
+  旧证书；
+- 自启动使用 LaunchAgent `com.excelbro.runtime`，安装末尾轮询 `/health`，失败
+  回滚证书与自启动并让安装器报错。
+
+卸载使用安装目录内的 `uninstall.sh`（需要 sudo），保留
+`~/Library/Application Support/Excel Bro` 中的模型配置。安装包未做 Apple 签名
+公证，分发时告知用户首次右键打开即可。
+
 ## 5. 浏览器与 Excel 调试
 
 ### 浏览器模式

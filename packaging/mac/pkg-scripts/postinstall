@@ -1,0 +1,87 @@
+#!/bin/bash
+set -euo pipefail
+
+INSTALL_DIR="/Applications/Excel Bro"
+PLIST_LABEL="com.excelbro.runtime"
+CERT_SUBJECT="Excel Bro localhost"
+SYSTEM_KEYCHAIN="/Library/Keychains/System.keychain"
+
+CONSOLE_USER="$(stat -f %Su /dev/console 2>/dev/null || true)"
+if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = "root" ]; then
+    echo "未检测到已登录的桌面用户，无法完成 Excel Bro 集成。" >&2
+    exit 1
+fi
+CONSOLE_UID="$(id -u "$CONSOLE_USER")"
+USER_HOME="/Users/$CONSOLE_USER"
+
+for required in \
+    "$INSTALL_DIR/ExcelBro" \
+    "$INSTALL_DIR/manifest.xml" \
+    "$INSTALL_DIR/localhost.cer"; do
+    if [ ! -f "$required" ]; then
+        echo "安装文件不完整：$required" >&2
+        exit 1
+    fi
+done
+
+pkill -x ExcelBro 2>/dev/null || true
+
+# 旁加载清单：Mac Excel 只读容器内的 wef 目录，必须归属桌面用户。
+WEF_DIR="$USER_HOME/Library/Containers/com.microsoft.Excel/Data/Documents/wef"
+sudo -u "$CONSOLE_USER" mkdir -p "$WEF_DIR"
+sudo -u "$CONSOLE_USER" cp "$INSTALL_DIR/manifest.xml" "$WEF_DIR/manifest.xml"
+
+# 证书信任：先清理同名旧证书，再信任本次安装的 localhost 证书。
+while IFS= read -r hash; do
+    [ -n "$hash" ] && security delete-certificate -Z "$hash" "$SYSTEM_KEYCHAIN" || true
+done < <(security find-certificate -c "$CERT_SUBJECT" -a -Z "$SYSTEM_KEYCHAIN" 2>/dev/null |
+    sed -n 's/^SHA-256 hash: //p')
+security add-trusted-cert -d -r trustRoot -k "$SYSTEM_KEYCHAIN" \
+    "$INSTALL_DIR/localhost.cer"
+
+# 开机自启：LaunchAgent 以桌面用户身份运行本地服务。
+PLIST_PATH="$USER_HOME/Library/LaunchAgents/$PLIST_LABEL.plist"
+sudo -u "$CONSOLE_USER" mkdir -p "$USER_HOME/Library/LaunchAgents"
+sudo -u "$CONSOLE_USER" tee "$PLIST_PATH" > /dev/null <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$PLIST_LABEL</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$INSTALL_DIR/ExcelBro</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>$INSTALL_DIR</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+</dict>
+</plist>
+PLIST
+
+launchctl bootout "gui/$CONSOLE_UID/$PLIST_LABEL" 2>/dev/null || true
+launchctl bootstrap "gui/$CONSOLE_UID" "$PLIST_PATH"
+
+# 健康检查：失败时回滚证书和自启动，让安装器报错。
+healthy=""
+for _ in $(seq 1 40); do
+    if curl -fsS --max-time 1 http://127.0.0.1:8765/health > /dev/null 2>&1; then
+        healthy="yes"
+        break
+    fi
+    sleep 0.5
+done
+if [ -z "$healthy" ]; then
+    echo "Excel Bro 本地服务未能启动。" >&2
+    launchctl bootout "gui/$CONSOLE_UID/$PLIST_LABEL" 2>/dev/null || true
+    rm -f "$PLIST_PATH"
+    while IFS= read -r hash; do
+        [ -n "$hash" ] && security delete-certificate -Z "$hash" "$SYSTEM_KEYCHAIN" || true
+    done < <(security find-certificate -c "$CERT_SUBJECT" -a -Z "$SYSTEM_KEYCHAIN" 2>/dev/null |
+        sed -n 's/^SHA-256 hash: //p')
+    exit 1
+fi
