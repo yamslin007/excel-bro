@@ -20,11 +20,15 @@ import sys
 import xml.etree.ElementTree as ET
 
 manifest = ET.parse(sys.argv[1]).getroot()
-version = [int(part) for part in manifest.findtext("Version").split(".")]
+namespace = {"office": "http://schemas.microsoft.com/office/appforoffice/1.1"}
+version_text = manifest.findtext("office:Version", namespaces=namespace)
+if not version_text:
+    raise SystemExit("Office 加载项 manifest 缺少 Version。")
+version = [int(part) for part in version_text.split(".")]
 if version < [1, 0, 0, 0]:
-    raise SystemExit(f"Office 加载项 manifest 版本不能低于 1.0.0.0：{manifest.findtext('Version')}")
+    raise SystemExit(f"Office 加载项 manifest 版本不能低于 1.0.0.0：{version_text}")
 for tag in ("IconUrl", "HighResolutionIconUrl"):
-    node = manifest.find(tag)
+    node = manifest.find(f"office:{tag}", namespace)
     if node is None or not (node.get("DefaultValue") or "").strip():
         raise SystemExit("Office 加载项 manifest 必须包含 IconUrl 和 HighResolutionIconUrl。")
 PY
