@@ -4452,6 +4452,37 @@ export default function App() {
               </div>
             </div>
           )}
+          {showFirstModelGuide && (
+            <section
+              className="first-model-guide"
+              aria-label="首次模型设置引导"
+            >
+              <div className="guide-spark" aria-hidden="true">
+                <i />
+                <i />
+                <i />
+              </div>
+              <div>
+                <strong>添加你的第一个大模型</strong>
+                <span>
+                  Excel Bro 不会预置模型或密钥，由你选择 Kimi、DeepSeek、OpenAI
+                  或其他兼容服务。
+                </span>
+              </div>
+              <div className="first-model-guide-actions">
+                <button type="button" onClick={dismissModelGuide}>
+                  稍后
+                </button>
+                <button
+                  type="button"
+                  className="primary"
+                  onClick={() => void openConnectionCreator()}
+                >
+                  现在添加
+                </button>
+              </div>
+            </section>
+          )}
         </div>
         <div className="header-actions">
           <button
@@ -4561,35 +4592,6 @@ export default function App() {
           </div>
         </div>
       </header>
-
-      {showFirstModelGuide && (
-        <section className="first-model-guide" aria-label="首次模型设置引导">
-          <div className="guide-spark" aria-hidden="true">
-            <i />
-            <i />
-            <i />
-          </div>
-          <div>
-            <strong>添加你的第一个大模型</strong>
-            <span>
-              Excel Bro 不会预置模型或密钥，由你选择 Kimi、DeepSeek、OpenAI
-              或其他兼容服务。
-            </span>
-          </div>
-          <div className="first-model-guide-actions">
-            <button type="button" onClick={dismissModelGuide}>
-              稍后
-            </button>
-            <button
-              type="button"
-              className="primary"
-              onClick={() => void openConnectionCreator()}
-            >
-              现在添加
-            </button>
-          </div>
-        </section>
-      )}
 
       {settingsOpen && (
         <aside className="tool-drawer settings-drawer" aria-label="模型设置">

@@ -95,7 +95,7 @@
         <bt:Url id="Taskpane.Url" DefaultValue="https://localhost:3000/index.html" />
         <bt:Url id="Functions.Script.Url" DefaultValue="https://localhost:3000/functions.html" />
         <bt:Url id="Functions.Page.Url" DefaultValue="https://localhost:3000/functions.html" />
-        <bt:Url id="Functions.Metadata.Url" DefaultValue="https://localhost:3000/src/functions/functions.json" />
+        <bt:Url id="Functions.Metadata.Url" DefaultValue="https://localhost:3000/functions.json" />
       </bt:Urls>
       <bt:ShortStrings>
         <bt:String id="Tab.Label" DefaultValue="Excel Bro" />
