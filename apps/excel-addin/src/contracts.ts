@@ -1,5 +1,28 @@
 export type CellValue = string | number | boolean | null;
 
+// /function 短链：AI 生成原生 Excel 公式（主路径）
+export interface FormulaDictionarySheet {
+  name: string;
+  rows: string[][];
+}
+
+export interface GenerateFormulaRequest {
+  description: string;
+  activeCell: string;
+  headers?: string[];
+  columns?: string[];
+  sampleRows?: string[][];
+  dictionary?: FormulaDictionarySheet | null;
+  modelId?: string | null;
+}
+
+export interface GenerateFormulaResponse {
+  modernFormula: string;
+  modernExplanation: string;
+  compatFormula: string;
+  compatExplanation: string;
+}
+
 export interface WorksheetSnapshot {
   name: string;
   sourceFileId?: string | null;
@@ -85,7 +108,14 @@ export type ExcelAction =
       skipBlanks: boolean;
       transpose: boolean;
     }
-  | { type: "writeFormulas"; sheet: string; range: string; formulas: string[][] }
+  | {
+      type: "writeFormulas";
+      sheet: string;
+      range: string;
+      formulas: string[][];
+      // 锚点无关的 R1C1 形式；存在时按区域形状铺满，相对引用逐格自动平移
+      formulaR1C1?: string;
+    }
   | {
       type: "sortRange";
       sheet: string;
@@ -257,6 +287,12 @@ export type VerificationCriterion =
       sheet: string;
       range: string;
       expected: string[][];
+    }
+  | {
+      type: "formulasR1C1Equal";
+      sheet: string;
+      range: string;
+      expected: string;
     }
   | {
       type: "rangeSorted";
@@ -510,6 +546,8 @@ export interface ModelSettings {
   defaultModel: string | null;
   apiKeyConfigured: boolean;
   apiKeyHint: string | null;
+  // /function 公式专用模型的 catalog id；空串=跟随全局选择。
+  formulaModelId: string;
   connections: ManagedModelConnection[];
 }
 
@@ -536,6 +574,10 @@ export interface UpsertModelConnectionRequest {
   apiKey?: string | null;
   clearApiKey?: boolean;
   supportsVision: boolean;
+}
+
+export interface SetFormulaModelRequest {
+  modelId: string;
 }
 
 export interface TestModelConnectionResponse {
@@ -569,6 +611,8 @@ export function assertModelSettings(
     typeof settings.apiKeyConfigured !== "boolean" ||
     (settings.apiKeyHint !== null &&
       typeof settings.apiKeyHint !== "string") ||
+    (settings.formulaModelId !== undefined &&
+      typeof settings.formulaModelId !== "string") ||
     !Array.isArray(settings.connections) ||
     settings.connections.some(
       (connection) =>
@@ -877,6 +921,7 @@ const allowedCriterionTypes = new Set<VerificationCriterion["type"]>([
   "rangeEquals",
   "rangeEmpty",
   "formulasEqual",
+  "formulasR1C1Equal",
   "rangeSorted",
   "filterApplied",
   "filterCleared",
@@ -1097,6 +1142,19 @@ export function assertAssistantResponse(
         dimensions[1] !== width
       ) {
         throw new Error(`${criterion.type} 的范围与 expected 尺寸不一致`);
+      }
+    }
+    if (criterion.type === "formulasR1C1Equal") {
+      const dimensions =
+        typeof criterion.range === "string"
+          ? rangeDimensions(criterion.range)
+          : null;
+      if (
+        typeof criterion.expected !== "string" ||
+        criterion.expected.length === 0 ||
+        !dimensions
+      ) {
+        throw new Error("formulasR1C1Equal 的范围或 expected 无效");
       }
     }
   }

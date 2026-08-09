@@ -160,6 +160,7 @@ def test_model_api_key_can_be_updated_without_exposing_it(
         "defaultModel": "example-model",
         "apiKeyConfigured": True,
         "apiKeyHint": "••••cret",
+        "formulaModelId": "",
         "connections": [],
     }
     assert "replacement-secret" not in response.text

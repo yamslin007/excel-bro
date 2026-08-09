@@ -1,0 +1,74 @@
+{
+  "functions": [
+    {
+      "id": "EB",
+      "name": "EB",
+      "description": "执行 Excel Bro 自定义规则",
+      "helpUrl": "https://localhost:3000",
+      "result": {
+        "type": "any",
+        "dimensionality": "scalar"
+      },
+      "parameters": [
+        {
+          "name": "ruleName",
+          "description": "规则名称，例如：\"隐形字符清理\"",
+          "type": "string",
+          "dimensionality": "scalar"
+        },
+        {
+          "name": "args",
+          "description": "规则参数",
+          "type": "any",
+          "dimensionality": "scalar",
+          "repeating": true
+        }
+      ],
+      "options": {
+        "volatile": false
+      }
+    },
+    {
+      "id": "EBCLEAN",
+      "name": "EB.CLEAN",
+      "description": "隐形字符清理：清除零宽空格、不间断空格 CHAR(160)、控制字符、方向标记，并合并多余空格。比原生 CLEAN/TRIM 更彻底，适合清洗从网页或业务系统复制的脏文本。",
+      "helpUrl": "https://localhost:3000",
+      "result": {
+        "type": "string",
+        "dimensionality": "scalar"
+      },
+      "parameters": [
+        {
+          "name": "text",
+          "description": "要清理的文本（如 A1），返回清理后的干净文本",
+          "type": "string",
+          "dimensionality": "scalar"
+        }
+      ],
+      "options": {
+        "volatile": false
+      }
+    },
+    {
+      "id": "EBEMPTY",
+      "name": "EB.EMPTY",
+      "description": "伪空白检测：先清除隐形字符再判断是否为空，返回 TRUE/FALSE。能识别原生 ISBLANK 漏掉的伪空白——看着为空但实际含零宽空格、不间断空格或公式残留空字符串的单元格。",
+      "helpUrl": "https://localhost:3000",
+      "result": {
+        "type": "boolean",
+        "dimensionality": "scalar"
+      },
+      "parameters": [
+        {
+          "name": "value",
+          "description": "要检测的单元格（如 A1），伪空白返回 TRUE，有实际内容返回 FALSE",
+          "type": "any",
+          "dimensionality": "scalar"
+        }
+      ],
+      "options": {
+        "volatile": false
+      }
+    }
+  ]
+}

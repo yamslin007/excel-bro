@@ -15,10 +15,12 @@ import {
   deleteModelConnection,
   executeFolderPlan,
   executeFolderQuery,
+  generateFormula,
   getModelSettings,
   isLocalServiceConnectionError,
   listModels,
   saveModelConnection,
+  setFormulaModel,
   selectFolder,
   testModelConnection,
   updateModelSettings
@@ -30,6 +32,7 @@ import type {
   FolderSelection,
   DataToolResult,
   ExecutionUndoSnapshot,
+  FormulaDictionarySheet,
   IntentCheckResponse,
   IntentClarification,
   IntentMemory,
@@ -50,7 +53,10 @@ import {
   captureWorkbookStructure,
   dataEpochsChanged,
   executePlan,
+  isExplicitA1Address,
   isRunningInExcel,
+  readSelectedRange,
+  previewFormulaFirstCell,
   PlanExecutionError,
   snapshotDataEpochs,
   toolSchemaFingerprintForSnapshot,
@@ -99,6 +105,8 @@ import {
   type FocusPayload
 } from "./focusState";
 import PetCompanion from "./PetCompanion";
+import { RuleManager } from "./RuleManager";
+import { SlashCommandAutocomplete, type SlashCommand } from "./SlashCommandAutocomplete";
 
 type Status = "idle" | "scanning" | "planning" | "tooling" | "executing";
 type MessageRole = "assistant" | "user" | "system";
@@ -170,7 +178,41 @@ interface ChatMessage {
   querySourceMode?: SourceMode;
   querySourceSheetNames?: string[];
   querySourceSheetIds?: string[];
+  functionPreview?: FunctionPreview;
   createdAt: string;
+}
+
+// /function 短链预览卡：两阶段。
+// phase=target：先确定写入单元格（预填智能建议，可改/可拾取），此时未生成公式。
+// phase=preview：已按目标首格生成，展示两版公式，可切换、确认写入。
+interface FunctionPreview {
+  phase: "target" | "preview";
+  // 用户描述，target 阶段确认后据此调模型生成
+  description: string;
+  sheet: string;
+  // 写入目标：裸 A1 地址（E2 / E2:E20），生成/试算/写入统一锚在其首格
+  writeTarget: string;
+  pickingTarget?: boolean;
+  targetError?: string;
+  // 以下 preview 阶段才有值
+  version: "modern" | "compat";
+  modernFormula: string;
+  modernExplanation: string;
+  modernResult: string;
+  compatFormula: string;
+  compatExplanation: string;
+  compatResult: string;
+  appliedTarget?: string;
+  applied?: boolean;
+  cancelled?: boolean;
+  // 生成耗时（毫秒）：从调模型到两版公式试算完成，preview 阶段才有值
+  generateMs?: number;
+}
+
+// 生成耗时格式化：<1s 显示毫秒，否则显示秒（保留一位小数）。
+function formatGenerateMs(ms: number): string {
+  if (ms < 1000) return `${ms} 毫秒`;
+  return `${(ms / 1000).toFixed(1)} 秒`;
 }
 
 interface ChatConversation {
@@ -376,6 +418,113 @@ function latestResultContext(items: ChatMessage[]): ResultContext | null {
 function messageId(): string {
   return globalThis.crypto?.randomUUID?.() ??
     `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+// 从选区地址取首格：兼容 "Sheet1!E2:E50" / "E2:E50" / "E2"。
+function firstCellOfRange(address: string): string | null {
+  const bare = address.includes("!") ? address.split("!").pop()! : address;
+  const first = bare.split(":")[0]?.trim();
+  if (!first || !/^\$?[A-Za-z]{1,3}\$?\d+$/.test(first)) return null;
+  return first.replace(/\$/g, "");
+}
+
+// 复制文本到剪贴板：优先 navigator.clipboard，退化到 execCommand。
+async function copyTextToClipboard(text: string): Promise<boolean> {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.setAttribute("readonly", "");
+    textarea.style.position = "fixed";
+    textarea.style.opacity = "0";
+    document.body.appendChild(textarea);
+    textarea.select();
+    const copied = document.execCommand("copy");
+    textarea.remove();
+    return copied;
+  } catch {
+    return false;
+  }
+}
+
+// 列号 → 列字母（0→A, 25→Z, 26→AA）。
+function columnLetterFromIndex(index: number): string {
+  let n = index;
+  let letters = "";
+  do {
+    letters = String.fromCharCode(65 + (n % 26)) + letters;
+    n = Math.floor(n / 26) - 1;
+  } while (n >= 0);
+  return letters;
+}
+
+// 列字母 → 列号（A→0, Z→25, AA→26）。
+function columnIndexFromLetter(letter: string): number {
+  let index = 0;
+  for (const ch of letter.toUpperCase()) {
+    index = index * 26 + (ch.charCodeAt(0) - 64);
+  }
+  return index - 1;
+}
+
+// 从 usedRange 地址取起始列字母（"A1:E20" → "A"，"Sheet1!C2:E9" → "C"）。
+function startColumnOfRange(address: string | null): string | null {
+  if (!address) return null;
+  const bare = address.includes("!") ? address.split("!").pop()! : address;
+  const match = bare.match(/^\$?([A-Za-z]{1,3})/);
+  return match ? match[1].toUpperCase() : null;
+}
+
+// 智能建议写入目标：数据区右侧第一空列 + 数据首行（表头下一行）。
+// 解析 usedRange（如 "A1:D20"）取末列右移一列、起始行 +1。解析失败退回 "A2"。
+function suggestWriteTarget(usedRange: string | null): string {
+  if (!usedRange) return "A2";
+  const bare = usedRange.includes("!")
+    ? usedRange.split("!").pop()!
+    : usedRange;
+  const match = bare.match(
+    /^\$?([A-Za-z]{1,3})\$?(\d+)(?::\$?([A-Za-z]{1,3})\$?(\d+))?$/
+  );
+  if (!match) return "A2";
+  const startRow = Number(match[2]);
+  const endColLetter = (match[3] ?? match[1]).toUpperCase();
+  const nextCol = columnLetterFromIndex(columnIndexFromLetter(endColLetter) + 1);
+  return `${nextCol}${startRow + 1}`;
+}
+
+// /function 上下文：扫描名字含"字典"/"映射"的表，读其内容注入生成提示。
+async function loadDictionaryForFormula(
+  activeSheetName: string
+): Promise<FormulaDictionarySheet | null> {
+  try {
+    return await Excel.run(async (context) => {
+      const sheets = context.workbook.worksheets;
+      sheets.load("items/name");
+      await context.sync();
+
+      const match = sheets.items.find(
+        (sheet) =>
+          sheet.name !== activeSheetName &&
+          (sheet.name.includes("字典") || sheet.name.includes("映射"))
+      );
+      if (!match) return null;
+
+      const usedRange = match.getUsedRangeOrNullObject(true);
+      usedRange.load("values,rowCount,isNullObject");
+      await context.sync();
+      if (usedRange.isNullObject || usedRange.rowCount === 0) return null;
+
+      const rows = (usedRange.values as unknown[][])
+        .slice(0, 200)
+        .map((row) => row.map((cell) => String(cell ?? "")));
+      return { name: match.name, rows };
+    });
+  } catch {
+    return null;
+  }
 }
 
 // ── 结论复用缓存 ──────────────────────────────────────────────────────
@@ -736,6 +885,12 @@ export default function App() {
   );
   const [contextOpen, setContextOpen] = useState(false);
   const [sheetSearch, setSheetSearch] = useState("");
+
+  // 斜杠命令自动补全状态
+  const [showSlashAutocomplete, setShowSlashAutocomplete] = useState(false);
+  const [slashFilter, setSlashFilter] = useState("");
+  // slashMode：command=选一级命令；model=已进入 /model 的模型选择二级菜单。
+  const [slashMode, setSlashMode] = useState<"command" | "model">("command");
   const [composerHeight, setComposerHeight] = useState<number | null>(null);
   const [tools, setTools] = useState<SavedTool[]>(loadTools);
   const [queryTools, setQueryTools] =
@@ -749,12 +904,13 @@ export default function App() {
     )
   );
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
-  const [viewMenuOpen, setViewMenuOpen] = useState(false);
+  const [moreMenuOpen, setMoreMenuOpen] = useState(false);
   const [focusOpening, setFocusOpening] = useState(false);
   const [modelCatalogLoaded, setModelCatalogLoaded] = useState(false);
   const [modelGuideDismissed, setModelGuideDismissed] = useState(false);
   const [modelSettings, setModelSettings] = useState<ModelSettings | null>(null);
   const [apiKeyDraft, setApiKeyDraft] = useState("");
+  const [isRuleManagerOpen, setIsRuleManagerOpen] = useState(false);
   const [showApiKey, setShowApiKey] = useState(false);
   const [settingsSaving, setSettingsSaving] = useState(false);
   const [settingsTesting, setSettingsTesting] = useState(false);
@@ -788,6 +944,9 @@ export default function App() {
   const [lastUndoSnapshot, setLastUndoSnapshot] =
     useState<ExecutionUndoSnapshot | null>(null);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
+  const [copiedFunctionPreviewId, setCopiedFunctionPreviewId] = useState<
+    string | null
+  >(null);
   const [toolName, setToolName] = useState("");
   const [toolDescription, setToolDescription] = useState("");
   const [selectedSheetNames, setSelectedSheetNames] = useState<string[]>([]);
@@ -809,6 +968,7 @@ export default function App() {
     startHeight: number;
   } | null>(null);
   const copyFeedbackTimerRef = useRef<number | null>(null);
+  const functionCopyTimerRef = useRef<number | null>(null);
   const toolDslCopyTimerRef = useRef<number | null>(null);
   const focusDialogRef = useRef<Office.Dialog | null>(null);
   const queryAbortRef = useRef<AbortController | null>(null);
@@ -829,6 +989,39 @@ export default function App() {
   const forceRecomputeRef = useRef(false);
   // sendMessage 起点记录的原始用户文本，写缓存时作为一级 prompt key。
   const rawPromptRef = useRef("");
+
+  // 一级斜杠命令定义
+  const slashCommands: SlashCommand[] = useMemo(
+    () => [
+      {
+        value: "function",
+        description: "AI 生成原生 Excel 公式（快捷输入，智能补全）"
+      },
+      {
+        value: "model",
+        description: "切换模型（使用你已配置的 API 连接）"
+      }
+    ],
+    []
+  );
+
+  // /model 二级菜单：把已配置的模型连接映射成候选项，标注当前生效项。
+  const slashModelCommands: SlashCommand[] = useMemo(
+    () =>
+      modelOptions.map((option) => ({
+        value: option.id,
+        label: option.label,
+        showSlashPrefix: false,
+        active: option.id === (selectedModelId || "local"),
+        disabled: !option.available,
+        description: option.available
+          ? option.supportsVision
+            ? "支持图片输入"
+            : "文本模型"
+          : "未配置或不可用"
+      })),
+    [modelOptions, selectedModelId]
+  );
 
   const busy = status !== "idle";
   const activeConversation =
@@ -1039,15 +1232,19 @@ export default function App() {
       input.scrollHeight > COMPOSER_MAX_HEIGHT ? "auto" : "hidden";
   }, [prompt, composerHeight]);
 
-  function appendMessage(message: Omit<ChatMessage, "id" | "createdAt">) {
+  function appendMessage(
+    message: Omit<ChatMessage, "id" | "createdAt">
+  ): string {
+    const id = messageId();
     setMessages((current) => [
       ...current,
       {
         ...message,
-        id: messageId(),
+        id,
         createdAt: new Date().toISOString()
       }
     ]);
+    return id;
   }
 
   // 命中判定：所有安全闸通过才返回缓存结论，否则 undefined（miss，静默重算）。
@@ -1286,6 +1483,7 @@ export default function App() {
   function newChat() {
     if (busy) return;
     setModelMenuOpen(false);
+    setMoreMenuOpen(false);
     if (
       activeConversation &&
       !activeConversation.messages.some(
@@ -2428,6 +2626,167 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [busy]);
 
+  // /function 阶段一：不立即生成，先弹「确定写入单元格」卡（预填智能建议）。
+  // 光标点哪都无所谓——目标由用户在卡里确认后，才作 activeCell 生成+试算。
+  async function handleFunctionCommand(description: string) {
+    setPrompt("");
+    appendMessage({ role: "user", text: `/function ${description}` });
+
+    if (!isRunningInExcel()) {
+      appendMessage({
+        role: "system",
+        text: "当前是浏览器演示模式，/function 需在 Excel 中打开任务窗格后使用。"
+      });
+      return;
+    }
+
+    setStatus("planning");
+    // 同 confirmFunctionTarget：建 activity 让计时器起步，否则 planning 卡显示"0 秒"。
+    beginActivity("正在准备公式生成", "正在读取当前选区与表结构，建议写入位置。");
+    try {
+      const selection = await captureSelectionContext();
+      const sheetName = selection.activeWorksheet;
+      // 智能建议：数据区右侧第一空列首行。取不到就退到当前选区首格 / A2。
+      const snapshot = await captureWorkbook([sheetName]);
+      const activeSheet = snapshot.worksheets.find(
+        (sheet) => sheet.name === sheetName
+      );
+      const suggested = suggestWriteTarget(activeSheet?.usedRange ?? null);
+
+      appendMessage({
+        role: "assistant",
+        functionPreview: {
+          phase: "target",
+          description,
+          sheet: sheetName,
+          writeTarget: suggested,
+          version: "compat",
+          modernFormula: "",
+          modernExplanation: "",
+          modernResult: "",
+          compatFormula: "",
+          compatExplanation: "",
+          compatResult: ""
+        }
+      });
+    } catch (reason) {
+      appendMessage({
+        role: "system",
+        text: reason instanceof Error ? reason.message : "准备公式生成失败"
+      });
+    } finally {
+      finishActivity();
+      setStatus("idle");
+    }
+  }
+
+  // /function 阶段二：用户确认写入单元格后，以目标首格作 activeCell 生成两版公式，
+  // 就地试算，翻到 preview 阶段。生成/试算/写入三者同锚，R1C1 错位不再发生。
+  async function confirmFunctionTarget(message: ChatMessage) {
+    const preview = message.functionPreview;
+    if (!preview || preview.phase !== "target" || busy) return;
+
+    const resolved = resolveWriteTarget(preview);
+    if (!resolved.address) {
+      markFunctionPreview(message.id, { targetError: resolved.error });
+      return;
+    }
+    const firstCell = firstCellOfRange(resolved.address);
+    if (!firstCell) {
+      markFunctionPreview(message.id, {
+        targetError: `「${resolved.address}」不是有效的写入位置。`
+      });
+      return;
+    }
+
+    setStatus("planning");
+    // 建 activity 让实时计时器起步：不建的话计时 effect 因 activity 为空提前返回，
+    // 生成公式的多秒模型调用期间会一直显示"0 秒"。
+    beginActivity("正在生成公式", `目标 ${resolved.address}，正在结合表结构生成两版公式。`);
+    try {
+      const sheetName = preview.sheet;
+      // 抓活动表列头/样本行喂模型；扫描"字典/映射"表注入其内容。
+      const snapshot = await captureWorkbook([sheetName]);
+      const activeSheet = snapshot.worksheets.find(
+        (sheet) => sheet.name === sheetName
+      );
+      const headers = activeSheet?.headers.map((cell) => String(cell ?? "")) ?? [];
+      // 列头对应的列字母：从 usedRange 起始列往右枚举，喂给模型建立"列头→列"映射，
+      // 避免模型猜错列（如把输出列当输入列导致循环引用）。
+      const startCol = startColumnOfRange(activeSheet?.usedRange ?? null);
+      const startIndex = startCol ? columnIndexFromLetter(startCol) : 0;
+      const columns = headers.map((_, i) =>
+        columnLetterFromIndex(startIndex + i)
+      );
+      const sampleRows = (activeSheet?.dataRows ?? [])
+        .slice(0, 5)
+        .map((row) => row.map((cell) => String(cell ?? "")));
+      const dictionary = await loadDictionaryForFormula(sheetName);
+
+      // 计时起点：从此刻(调模型)到两版公式试算完成，作为"生成耗时"展示。
+      const generateStart = performance.now();
+
+      // 后端优先用「/function 公式模型」（模型配置里单独选的那个），忽略 modelId。
+      // modelId 仅作回退：若公式模型设为「跟随全局」，才用全局选择。这让 /function
+      // 与聊天窗口全局选择脱钩，避免有人切推理模型时公式生成被 reasoning 卡住。
+      const result = await generateFormula({
+        description: preview.description,
+        activeCell: firstCell,
+        headers,
+        columns,
+        sampleRows,
+        dictionary,
+        modelId: selectedModelId || null
+      });
+
+      // 两版公式各在目标首格真实试算（试算失败不阻断预览，让用户自行判断）。
+      const trialCalc = async (formula: string): Promise<string> => {
+        if (!formula) return "";
+        try {
+          const trial = await previewFormulaFirstCell(
+            sheetName,
+            firstCell,
+            formula
+          );
+          return trial.sampleResult;
+        } catch (previewError) {
+          const detail =
+            previewError instanceof Error ? previewError.message : "";
+          return detail
+            ? `（试算失败：${detail}）`
+            : "（试算失败，请检查公式）";
+        }
+      };
+
+      const modernResult = await trialCalc(result.modernFormula);
+      const compatResult = await trialCalc(result.compatFormula);
+
+      const generateMs = Math.round(performance.now() - generateStart);
+
+      markFunctionPreview(message.id, {
+        phase: "preview",
+        writeTarget: resolved.address,
+        targetError: undefined,
+        pickingTarget: false,
+        version: "compat",
+        modernFormula: result.modernFormula,
+        modernExplanation: result.modernExplanation,
+        modernResult,
+        compatFormula: result.compatFormula,
+        compatExplanation: result.compatExplanation,
+        compatResult,
+        generateMs
+      });
+    } catch (reason) {
+      markFunctionPreview(message.id, {
+        targetError: reason instanceof Error ? reason.message : "生成公式失败"
+      });
+    } finally {
+      finishActivity();
+      setStatus("idle");
+    }
+  }
+
   async function sendMessage(options?: {
     forceRecompute?: boolean;
     overrideText?: string;
@@ -2439,6 +2798,15 @@ export default function App() {
         ? "请结合附件图片分析当前工作簿，并说明发现的问题。"
         : "");
     if (!workbook || !text || busy) return;
+    // /function 短链：绕开 planner（checkIntent/streamAssistantResponse），
+    // 命中式单发生成原生公式 + 首格真实试算 + 预览卡。
+    if (enteredText.startsWith("/function ")) {
+      const description = enteredText.slice("/function ".length).trim();
+      if (description) {
+        await handleFunctionCommand(description);
+        return;
+      }
+    }
     // 转向重跑：把被打断那句的意图并进这句，让 checkIntent 收到完整承接式需求。
     // 仅影响送模型与缓存的意图文本（intentText），气泡仍只显示用户实际输入（text）。
     const steerBasePrompt = steerBasePromptRef.current;
@@ -2753,6 +3121,209 @@ export default function App() {
     } finally {
       setStatus("idle");
     }
+  }
+
+  // 更新某条消息的 functionPreview（确认/取消后标记状态）。
+  function markFunctionPreview(
+    messageId: string,
+    patch: Partial<FunctionPreview>
+  ) {
+    setMessages((current) =>
+      current.map((message) =>
+        message.id === messageId && message.functionPreview
+          ? {
+              ...message,
+              functionPreview: { ...message.functionPreview, ...patch }
+            }
+          : message
+      )
+    );
+  }
+
+  // 解析写入目标：接受裸 A1（E2 / E2:E20）或与预览同表的「表名!地址」。
+  // 拒绝跨表与整列/整行（E:E、2:2），后者会写出百万格公式。
+  function resolveWriteTarget(preview: FunctionPreview): {
+    address?: string;
+    error?: string;
+  } {
+    const raw = preview.writeTarget.trim();
+    if (!raw) {
+      return { error: "请先输入或拾取要写入的单元格/区域。" };
+    }
+    let address = raw;
+    if (raw.includes("!")) {
+      const sheetPart = raw.slice(0, raw.indexOf("!")).replace(/^'|'$/g, "");
+      if (sheetPart !== preview.sheet) {
+        return {
+          error: `只能写入当前工作表「${preview.sheet}」，请先在该表中操作。`
+        };
+      }
+      address = raw.slice(raw.indexOf("!") + 1);
+    }
+    address = address.replace(/\$/g, "").trim();
+    if (/^[A-Za-z]{1,3}:[A-Za-z]{1,3}$/.test(address) || /^\d+:\d+$/.test(address)) {
+      return { error: "请指定具体单元格区域（如 E2:E20），暂不支持整列/整行写入。" };
+    }
+    if (!isExplicitA1Address(address)) {
+      return { error: `「${raw}」不是有效的 A1 地址（如 E2 或 E2:E20）。` };
+    }
+    return { address };
+  }
+
+  // 复制当前版本公式到剪贴板，按钮短暂显示「已复制」。
+  async function copyFunctionFormula(message: ChatMessage) {
+    const preview = message.functionPreview;
+    if (!preview) return;
+    const formula =
+      preview.version === "modern"
+        ? preview.modernFormula
+        : preview.compatFormula;
+    if (!formula) return;
+    const copied = await copyTextToClipboard(formula);
+    if (!copied) {
+      markFunctionPreview(message.id, { targetError: "复制失败，请手动选择公式文本复制。" });
+      return;
+    }
+    setCopiedFunctionPreviewId(message.id);
+    if (functionCopyTimerRef.current !== null) {
+      window.clearTimeout(functionCopyTimerRef.current);
+    }
+    functionCopyTimerRef.current = window.setTimeout(() => {
+      setCopiedFunctionPreviewId((current) =>
+        current === message.id ? null : current
+      );
+      functionCopyTimerRef.current = null;
+    }, 1500);
+  }
+
+  // 拾取：即刻读当前工作表选区填入写入目标。用户先在表里选好，再点此按钮。
+  // 跨表选择被拒（只能写当前预览表），提示用户切回该表再选。
+  async function pickFunctionTarget(message: ChatMessage) {
+    const preview = message.functionPreview;
+    if (!preview || preview.pickingTarget || busy) return;
+    markFunctionPreview(message.id, {
+      pickingTarget: true,
+      targetError: undefined
+    });
+    try {
+      const picked = await readSelectedRange();
+      if (!picked) {
+        markFunctionPreview(message.id, {
+          pickingTarget: false,
+          targetError: "没读到选区，请先在表里点选目标单元格再点拾取。"
+        });
+        return;
+      }
+      if (picked.sheet !== preview.sheet) {
+        markFunctionPreview(message.id, {
+          pickingTarget: false,
+          targetError: `请在工作表「${preview.sheet}」里选，当前选区在「${picked.sheet}」。`
+        });
+        return;
+      }
+      markFunctionPreview(message.id, {
+        pickingTarget: false,
+        writeTarget: picked.address,
+        targetError: undefined
+      });
+    } catch {
+      markFunctionPreview(message.id, {
+        pickingTarget: false,
+        targetError: "拾取失败，请手动输入地址。"
+      });
+    }
+  }
+
+  // 确认写入：写入目标即生成时的锚点，公式落在其首格。多格区域按 R1C1 铺满、
+  // 相对引用逐格平移——R1C1 在写入前从目标首格现取（此时锚点已正确）。
+  // 复用 runPlan 的撤销与独立验收。
+  async function applyFunctionPreview(message: ChatMessage) {
+    const preview = message.functionPreview;
+    if (
+      !preview ||
+      preview.phase !== "preview" ||
+      preview.applied ||
+      preview.cancelled ||
+      busy
+    )
+      return;
+    const resolved = resolveWriteTarget(preview);
+    if (!resolved.address) {
+      markFunctionPreview(message.id, { targetError: resolved.error });
+      return;
+    }
+    const formula =
+      preview.version === "modern"
+        ? preview.modernFormula
+        : preview.compatFormula;
+    const explanation =
+      preview.version === "modern"
+        ? preview.modernExplanation
+        : preview.compatExplanation;
+
+    // 多格区域才需 R1C1 铺满；单格直写字面公式。R1C1 从目标首格现取。
+    let formulaR1C1 = "";
+    if (resolved.address.includes(":")) {
+      const firstCell = firstCellOfRange(resolved.address);
+      if (firstCell) {
+        try {
+          const trial = await previewFormulaFirstCell(
+            preview.sheet,
+            firstCell,
+            formula
+          );
+          formulaR1C1 = trial.formulaR1C1;
+        } catch {
+          formulaR1C1 = "";
+        }
+      }
+    }
+
+    const plan: AnalysisPlan = {
+      id: `function-${message.id}`,
+      title: "填入公式",
+      summary: explanation,
+      assumptions: [],
+      warnings: [],
+      actions: [
+        {
+          type: "writeFormulas",
+          sheet: preview.sheet,
+          range: resolved.address,
+          formulas: [[formula]],
+          ...(formulaR1C1 ? { formulaR1C1 } : {})
+        }
+      ],
+      // 显式挂验收条件：verificationGaps 只看 acceptanceCriteria，不看内部推断，
+      // 不挂会误报"缺少独立验收"。多格用 R1C1、单格用字面公式各自对应。
+      acceptanceCriteria: [
+        formulaR1C1
+          ? {
+              type: "formulasR1C1Equal",
+              sheet: preview.sheet,
+              range: resolved.address,
+              expected: formulaR1C1
+            }
+          : {
+              type: "formulasEqual",
+              sheet: preview.sheet,
+              range: resolved.address,
+              expected: [[formula]]
+            }
+      ]
+    };
+    markFunctionPreview(message.id, {
+      applied: true,
+      appliedTarget: resolved.address,
+      targetError: undefined,
+      pickingTarget: false
+    });
+    await runPlan(plan);
+  }
+
+  function cancelFunctionPreview(message: ChatMessage) {
+    if (!message.functionPreview) return;
+    markFunctionPreview(message.id, { cancelled: true, pickingTarget: false });
   }
 
   async function undoLastExecution() {
@@ -3090,7 +3661,6 @@ export default function App() {
   }
 
   function openFocusWindow() {
-    setViewMenuOpen(false);
     if (!isRunningInExcel()) {
       appendMessage({
         role: "system",
@@ -3166,7 +3736,7 @@ export default function App() {
 
   function openTools() {
     setModelMenuOpen(false);
-    setViewMenuOpen(false);
+    setMoreMenuOpen(false);
     setHistoryOpen(false);
     closeSettings();
     setToolDrawerView("library");
@@ -3255,7 +3825,7 @@ export default function App() {
 
   function openHistory() {
     setModelMenuOpen(false);
-    setViewMenuOpen(false);
+    setMoreMenuOpen(false);
     setToolsOpen(false);
     closeSettings();
     setHistoryOpen(true);
@@ -3274,6 +3844,7 @@ export default function App() {
 
   async function openSettings(): Promise<boolean> {
     setModelMenuOpen(false);
+    setMoreMenuOpen(false);
     setToolsOpen(false);
     setHistoryOpen(false);
     setSettingsOpen(true);
@@ -3490,6 +4061,26 @@ export default function App() {
     }
   }
 
+  async function saveFormulaModel(modelId: string) {
+    setSettingsSaving(true);
+    setSettingsFeedback("");
+    try {
+      const saved = await setFormulaModel({ modelId });
+      await refreshModelsAfterSettings(saved);
+      setSettingsFeedback(
+        modelId
+          ? "/function 公式模型已更新。"
+          : "/function 公式模型已恢复为跟随全局选择。"
+      );
+    } catch (reason) {
+      setSettingsFeedback(
+        reason instanceof Error ? reason.message : "公式模型保存失败。"
+      );
+    } finally {
+      setSettingsSaving(false);
+    }
+  }
+
   async function previewTool(tool: SavedTool) {
     try {
       const plan = instantiateTool(tool, toolParameterValues, workbook);
@@ -3647,7 +4238,71 @@ export default function App() {
     setToolDrawerView("library");
   }
 
+  // 当输入内容变化时检测斜杠命令：仅当整段以 "/" 开头且尚未含空格时展开候选。
+  function handleComposerChange(event: React.ChangeEvent<HTMLTextAreaElement>) {
+    const value = event.target.value;
+    setPrompt(value);
+    // 仅在开头处触发：以 / 开头、还未输入空格（即仍在拼命令名）时显示补全。
+    // "/model " 之后进入模型选择二级菜单，空格后的文字作为模型过滤词。
+    const modelMatch = /^\/model\s+(.*)$/.exec(value);
+    if (modelMatch) {
+      setSlashMode("model");
+      setSlashFilter(modelMatch[1]);
+      setShowSlashAutocomplete(true);
+      return;
+    }
+    // 仍在拼一级命令名：以 / 开头且未含空格。
+    const commandMatch = /^\/([^\s]*)$/.exec(value);
+    if (commandMatch) {
+      setSlashMode("command");
+      setSlashFilter(commandMatch[1]);
+      setShowSlashAutocomplete(true);
+    } else {
+      setShowSlashAutocomplete(false);
+    }
+  }
+
+  // 选中某个斜杠命令或模型：一级命令填入 "/命令 " 继续打字；模型项直接切换并清空输入。
+  function handleSlashCommandSelect(value: string) {
+    if (slashMode === "model") {
+      // 模型选择：直接切换，清空输入框，关闭补全。
+      selectModel(value);
+      setPrompt("");
+      setShowSlashAutocomplete(false);
+    } else {
+      // 一级命令：/function 填入等继续输入描述；/model 进二级菜单。
+      if (value === "model") {
+        setPrompt("/model ");
+        setSlashMode("model");
+        setSlashFilter("");
+        // 保持补全开启，接下来会切到模型列表。
+      } else {
+        const nextValue = `/${value} `;
+        setPrompt(nextValue);
+        setShowSlashAutocomplete(false);
+        const input = composerInputRef.current;
+        if (input) {
+          input.focus();
+          requestAnimationFrame(() => {
+            input.setSelectionRange(nextValue.length, nextValue.length);
+          });
+        }
+      }
+    }
+  }
+
   function handleComposerKeyDown(event: React.KeyboardEvent<HTMLTextAreaElement>) {
+    // 补全菜单展开时，方向键/回车/Tab 交给菜单处理（见 SlashCommandAutocomplete）。
+    if (
+      showSlashAutocomplete &&
+      ["ArrowDown", "ArrowUp", "Enter", "Tab"].includes(event.key)
+    ) {
+      return;
+    }
+    if (event.key === "Escape" && showSlashAutocomplete) {
+      setShowSlashAutocomplete(false);
+      return;
+    }
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
       // 运行中回车 = 转向（带这句话打断重跑）；空闲回车 = 正常发送。
@@ -3750,14 +4405,14 @@ export default function App() {
             aria-expanded={modelMenuOpen}
             title="选择或添加模型"
             onClick={() => {
-              setViewMenuOpen(false);
               setHistoryOpen(false);
               setToolsOpen(false);
+              setMoreMenuOpen(false);
               closeSettings();
               setModelMenuOpen((current) => !current);
             }}
           >
-            <span>{hasConfiguredModel ? selectedModel?.label : "添加模型"}</span>
+            <span>{hasConfiguredModel ? "模型" : "添加模型"}</span>
             <svg viewBox="0 0 16 16" aria-hidden="true">
               <path d="m4 6 4 4 4-4" />
             </svg>
@@ -3798,85 +4453,113 @@ export default function App() {
             </div>
           )}
         </div>
-        <button
-          className="header-button labeled-header-button history-entry"
-          onClick={openHistory}
-          disabled={busy}
-          title="历史对话"
-          aria-label="历史对话"
-        >
-          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-            <path d="M4.7 8.2A8 8 0 1 1 4 12" />
-            <path d="M4.7 3.8v4.4H9M12 7.5V12l3 1.8" />
-          </svg>
-          <span>历史</span>
-        </button>
-        <button
-          className="header-button labeled-header-button tools-entry"
-          onClick={openTools}
-          disabled={busy}
-          title="我的工具"
-          aria-label="我的工具"
-        >
-          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-            <path d="M8.5 7V5.8c0-1 .8-1.8 1.8-1.8h3.4c1 0 1.8.8 1.8 1.8V7" />
-            <rect x="3" y="7" width="18" height="12.5" rx="2.5" />
-            <path d="M3.5 11.5h17M10 11.5v2h4v-2" />
-          </svg>
-          <span>工具</span>
-        </button>
-        <div className="view-menu-wrap">
+        <div className="header-actions">
           <button
-            className="header-button"
-            onClick={() => {
-              setModelMenuOpen(false);
-              setViewMenuOpen((current) => !current);
-            }}
-            title="调整窗口"
-            aria-label="调整窗口"
-            aria-haspopup="menu"
-            aria-expanded={viewMenuOpen}
+            className="header-button labeled-header-button new-chat-entry"
+            onClick={newChat}
+            disabled={busy}
+            title="新对话"
+            aria-label="新对话"
+          >
+            <span aria-hidden="true">＋</span>
+            <span>新对话</span>
+          </button>
+          <button
+            className="header-button labeled-header-button tools-entry"
+            onClick={openTools}
+            disabled={busy}
+            title="我的工具"
+            aria-label="我的工具"
           >
             <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-              <path d="M9 4H4v5M15 4h5v5M9 20H4v-5M15 20h5v-5" />
+              <path d="M8.5 7V5.8c0-1 .8-1.8 1.8-1.8h3.4c1 0 1.8.8 1.8 1.8V7" />
+              <rect x="3" y="7" width="18" height="12.5" rx="2.5" />
+              <path d="M3.5 11.5h17M10 11.5v2h4v-2" />
+            </svg>
+            <span>工具</span>
+          </button>
+          <button
+            className={`header-button pet-toggle${petVisible ? " active" : ""}`}
+            onClick={togglePetVisibility}
+            title={petVisible ? "隐藏格仔" : "显示格仔"}
+            aria-label={petVisible ? "隐藏格仔" : "显示格仔"}
+            aria-pressed={petVisible}
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <ellipse cx="6.3" cy="10" rx="1.9" ry="2.4" />
+              <ellipse cx="10.4" cy="7.1" rx="1.9" ry="2.5" />
+              <ellipse cx="14.6" cy="7.1" rx="1.9" ry="2.5" />
+              <ellipse cx="18.7" cy="10" rx="1.9" ry="2.4" />
+              <path d="M7.4 16c0-2.7 2-4.5 4.6-4.5s4.6 1.8 4.6 4.5c0 2.4-1.9 4-4.6 4s-4.6-1.6-4.6-4Z" />
             </svg>
           </button>
-          {viewMenuOpen && (
-            <div className="view-menu" role="menu" aria-label="窗口显示方式">
-              <button
-                role="menuitem"
-                onClick={openFocusWindow}
-                disabled={focusOpening}
-              >
-                <strong>{focusOpening ? "正在打开…" : "打开专注窗口"}</strong>
-                <span>使用接近全屏的大窗口查看对话、结果和工具</span>
-              </button>
-            </div>
-          )}
+          <div className="view-menu-wrap">
+            <button
+              className="header-button"
+              onClick={() => {
+                setModelMenuOpen(false);
+                setHistoryOpen(false);
+                setToolsOpen(false);
+                closeSettings();
+                setMoreMenuOpen((current) => !current);
+              }}
+              aria-haspopup="menu"
+              aria-expanded={moreMenuOpen}
+              title="更多"
+              aria-label="更多"
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                <circle cx="5" cy="12" r="1.6" />
+                <circle cx="12" cy="12" r="1.6" />
+                <circle cx="19" cy="12" r="1.6" />
+              </svg>
+            </button>
+            {moreMenuOpen && (
+              <>
+                <div
+                  className="more-menu-backdrop"
+                  onClick={() => setMoreMenuOpen(false)}
+                  aria-hidden="true"
+                />
+                <div className="view-menu" role="menu" aria-label="更多">
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={openHistory}
+                    disabled={busy}
+                  >
+                    <strong>历史对话</strong>
+                    <span>查看并恢复以前的对话</span>
+                  </button>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      setMoreMenuOpen(false);
+                      setIsRuleManagerOpen(true);
+                    }}
+                    disabled={busy}
+                  >
+                    <strong>EB 函数说明</strong>
+                    <span>查看内置 =EB() 函数用法</span>
+                  </button>
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      setMoreMenuOpen(false);
+                      openFocusWindow();
+                    }}
+                    disabled={focusOpening}
+                  >
+                    <strong>{focusOpening ? "正在打开…" : "专注窗口"}</strong>
+                    <span>在独立窗口中打开对话</span>
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
         </div>
-        <button
-          className={`header-button pet-toggle${petVisible ? " active" : ""}`}
-          onClick={togglePetVisibility}
-          title={petVisible ? "隐藏宠物" : "显示宠物"}
-          aria-label={petVisible ? "隐藏宠物" : "显示宠物"}
-          aria-pressed={petVisible}
-        >
-          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-            <circle cx="7.1" cy="8.1" r="2.1" />
-            <circle cx="12" cy="5.8" r="2.1" />
-            <circle cx="16.9" cy="8.1" r="2.1" />
-            <path d="M6.2 15.6c0-3.2 2.6-5.7 5.8-5.7s5.8 2.5 5.8 5.7c0 2-1.4 3.3-3.2 3.3-.9 0-1.8-.3-2.6-.9-.8.6-1.7.9-2.6.9-1.8 0-3.2-1.3-3.2-3.3Z" />
-          </svg>
-        </button>
-        <button
-          className="header-button"
-          onClick={newChat}
-          disabled={busy}
-          title="新对话"
-          aria-label="新对话"
-        >
-          ＋
-        </button>
       </header>
 
       {showFirstModelGuide && (
@@ -4082,6 +4765,10 @@ export default function App() {
                             ? `已配置 ${connection.apiKeyHint ?? ""}`
                             : "未配置"}
                           {connection.supportsVision ? " · 支持图片" : ""}
+                          {modelSettings?.formulaModelId ===
+                          connection.catalogModelId
+                            ? " · /function 公式模型"
+                            : ""}
                         </small>
                       </div>
                       {pendingDeleteConnectionId === connection.id ? (
@@ -4294,6 +4981,37 @@ export default function App() {
                   </div>
                 </div>
               )}
+            </section>
+
+            <section className="connection-settings">
+              <div className="connection-settings-header">
+                <div>
+                  <strong>/function 公式模型</strong>
+                  <span>
+                    /function 生成公式走的是短链、小任务，可单独选一个极速（非推理）模型，与上方聊天所选模型无关。
+                  </span>
+                </div>
+              </div>
+              <label className="connection-formula-field">
+                <span>用于生成公式的模型</span>
+                <select
+                  className="connection-formula-select"
+                  value={modelSettings?.formulaModelId ?? ""}
+                  disabled={settingsSaving || !serverOnline}
+                  onChange={(event) =>
+                    void saveFormulaModel(event.target.value)
+                  }
+                >
+                  <option value="">跟随全局选择（默认）</option>
+                  {modelOptions
+                    .filter((option) => option.id !== "local")
+                    .map((option) => (
+                      <option key={option.id} value={option.id}>
+                        {option.label}
+                      </option>
+                    ))}
+                </select>
+              </label>
             </section>
               </>
             )}
@@ -5318,6 +6036,212 @@ export default function App() {
                   )}
                 </div>
               )}
+              {message.functionPreview &&
+                message.functionPreview.phase === "target" && (
+                  <div className="inline-plan">
+                    <div className="inline-plan-title">
+                      <div>
+                        <span>写入单元格内</span>
+                        <strong>{message.functionPreview.sheet}</strong>
+                      </div>
+                    </div>
+                    <p className="function-preview-explain">
+                      确定公式要写到哪个单元格或区域，再生成。已为你预填建议位置，可直接改，或先在表里点选目标格、再点「拾取当前选区」。
+                    </p>
+                    <div className="function-write-target">
+                      <input
+                        className="function-write-target-input"
+                        type="text"
+                        value={message.functionPreview.writeTarget}
+                        disabled={busy || message.functionPreview.pickingTarget}
+                        placeholder="如 E2 或 E2:E20"
+                        spellCheck={false}
+                        onChange={(event) =>
+                          markFunctionPreview(message.id, {
+                            writeTarget: event.target.value,
+                            targetError: undefined
+                          })
+                        }
+                      />
+                      <button
+                        className="secondary-button"
+                        disabled={busy}
+                        onClick={() => void pickFunctionTarget(message)}
+                      >
+                        {message.functionPreview.pickingTarget
+                          ? "读取中…"
+                          : "拾取当前选区"}
+                      </button>
+                    </div>
+                    <div className="inline-notes function-pick-hint">
+                      拾取方式：先在工作表里点一下（或框选）目标单元格，再点上面的「拾取当前选区」，会自动填入那一刻选中的位置。
+                    </div>
+                    {message.functionPreview.targetError && (
+                      <div className="function-write-target-error">
+                        {message.functionPreview.targetError}
+                      </div>
+                    )}
+                    <div className="inline-plan-buttons">
+                      <button
+                        className="secondary-button"
+                        disabled={busy}
+                        onClick={() => cancelFunctionPreview(message)}
+                      >
+                        取消
+                      </button>
+                      <button
+                        className="primary-button"
+                        disabled={busy}
+                        onClick={() => void confirmFunctionTarget(message)}
+                      >
+                        {status === "planning" ? "正在生成…" : "确定并生成"}
+                      </button>
+                    </div>
+                  </div>
+                )}
+              {message.functionPreview &&
+                message.functionPreview.phase === "preview" && (
+                  <div className="inline-plan">
+                    <div className="inline-plan-title">
+                      <div>
+                        <span>公式预览</span>
+                        <strong>{message.functionPreview.writeTarget}</strong>
+                      </div>
+                      {message.functionPreview.generateMs !== undefined && (
+                        <span className="function-preview-timing">
+                          生成耗时 {formatGenerateMs(message.functionPreview.generateMs)}
+                        </span>
+                      )}
+                    </div>
+
+                    {!message.functionPreview.applied &&
+                      !message.functionPreview.cancelled && (
+                        <div className="function-preview-versions">
+                          <button
+                            className={
+                              message.functionPreview.version === "compat"
+                                ? "version-tab active"
+                                : "version-tab"
+                            }
+                            onClick={() =>
+                              markFunctionPreview(message.id, {
+                                version: "compat"
+                              })
+                            }
+                          >
+                            兼容版 · 2016/2019
+                          </button>
+                          <button
+                            className={
+                              message.functionPreview.version === "modern"
+                                ? "version-tab active"
+                                : "version-tab"
+                            }
+                            onClick={() =>
+                              markFunctionPreview(message.id, {
+                                version: "modern"
+                              })
+                            }
+                          >
+                            现代版 · 365/2021
+                          </button>
+                        </div>
+                      )}
+
+                    <pre className="function-preview-formula">
+                      {message.functionPreview.version === "modern"
+                        ? message.functionPreview.modernFormula
+                        : message.functionPreview.compatFormula}
+                    </pre>
+
+                    <div className="function-preview-trial">
+                      <span>首格试算</span>
+                      <strong>
+                        {message.functionPreview.version === "modern"
+                          ? message.functionPreview.modernResult
+                          : message.functionPreview.compatResult}
+                      </strong>
+                    </div>
+
+                    {(message.functionPreview.version === "modern"
+                      ? message.functionPreview.modernExplanation
+                      : message.functionPreview.compatExplanation) && (
+                      <p className="function-preview-explain">
+                        {message.functionPreview.version === "modern"
+                          ? message.functionPreview.modernExplanation
+                          : message.functionPreview.compatExplanation}
+                      </p>
+                    )}
+
+                    {message.functionPreview.applied ? (
+                      <div className="inline-notes">
+                        已写入 {message.functionPreview.appliedTarget}。
+                      </div>
+                    ) : message.functionPreview.cancelled ? (
+                      <div className="inline-notes">已取消。</div>
+                    ) : (
+                      <>
+                        <div className="function-write-target">
+                          <input
+                            className="function-write-target-input"
+                            type="text"
+                            value={message.functionPreview.writeTarget}
+                            disabled={
+                              busy || message.functionPreview.pickingTarget
+                            }
+                            placeholder="如 E2 或 E2:E20"
+                            spellCheck={false}
+                            onChange={(event) =>
+                              markFunctionPreview(message.id, {
+                                writeTarget: event.target.value,
+                                targetError: undefined
+                              })
+                            }
+                          />
+                          <button
+                            className="secondary-button"
+                            disabled={busy}
+                            onClick={() => void pickFunctionTarget(message)}
+                          >
+                            {message.functionPreview.pickingTarget
+                              ? "读取中…"
+                              : "拾取当前选区"}
+                          </button>
+                        </div>
+                        {message.functionPreview.targetError && (
+                          <div className="function-write-target-error">
+                            {message.functionPreview.targetError}
+                          </div>
+                        )}
+                        <div className="inline-plan-buttons">
+                          <button
+                            className="secondary-button"
+                            disabled={busy}
+                            onClick={() => void copyFunctionFormula(message)}
+                          >
+                            {copiedFunctionPreviewId === message.id
+                              ? "已复制"
+                              : "复制公式"}
+                          </button>
+                          <button
+                            className="secondary-button"
+                            disabled={busy}
+                            onClick={() => cancelFunctionPreview(message)}
+                          >
+                            取消
+                          </button>
+                          <button
+                            className="primary-button"
+                            disabled={busy}
+                            onClick={() => void applyFunctionPreview(message)}
+                          >
+                            {status === "executing" ? "正在写入…" : "确认写入"}
+                          </button>
+                        </div>
+                      </>
+                    )}
+                  </div>
+                )}
               {message.plan && (
                 <div className="inline-plan">
                   <div className="inline-plan-title">
@@ -5723,11 +6647,14 @@ export default function App() {
         >
           <i aria-hidden="true">▦</i>
           <span>
-            <small title={workbook?.name}>
-              {workbook && sourceMode === "workbook"
-                ? `当前文件 · ${workbook.name}`
-                : "数据范围"}
-            </small>
+            {workbook && sourceMode === "workbook" && (
+              <>
+                <small title={workbook.name}>{workbook.name}</small>
+                <span className="scope-sep" aria-hidden="true">
+                  |
+                </span>
+              </>
+            )}
             <strong>
               {!workbook
                 ? "正在读取工作簿"
@@ -5740,12 +6667,12 @@ export default function App() {
                         workbookDataPeriod
                           ? `${workbookDataPeriod} · `
                           : ""
-                      }当前工作表 · ${workbook.activeWorksheet}`
+                      }当前表 ${workbook.activeWorksheet}`
                     : `${
                         workbookDataPeriod
                           ? `${workbookDataPeriod} · `
                           : ""
-                      }已固定选择 ${selectedSheetNames.length} 个工作表`}
+                      }已固定 ${selectedSheetNames.length} 个工作表`}
             </strong>
           </span>
           <b>{contextOpen ? "⌄" : "⌃"}</b>
@@ -5783,13 +6710,21 @@ export default function App() {
             <i />
           </div>
           <div className="composer-box">
+            <SlashCommandAutocomplete
+              visible={showSlashAutocomplete}
+              commands={slashMode === "model" ? slashModelCommands : slashCommands}
+              onSelect={handleSlashCommandSelect}
+              filter={slashFilter}
+              title={slashMode === "model" ? "选择模型" : undefined}
+            />
             <textarea
               ref={composerInputRef}
               aria-label="给 Excel Bro 发消息"
               value={prompt}
-              onChange={(event) => setPrompt(event.target.value)}
+              onChange={handleComposerChange}
               onKeyDown={handleComposerKeyDown}
               onPaste={handleImagePaste}
+              onBlur={() => setShowSlashAutocomplete(false)}
               placeholder={
                 workbook
                   ? "描述你想查询、分析或修改的内容…"
@@ -5910,6 +6845,10 @@ export default function App() {
         </span>
       </footer>
       {petVisible && <PetCompanion busy={busy} />}
+      <RuleManager
+        isOpen={isRuleManagerOpen}
+        onClose={() => setIsRuleManagerOpen(false)}
+      />
     </main>
   );
 }

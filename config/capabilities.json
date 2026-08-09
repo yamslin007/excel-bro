@@ -51,6 +51,9 @@
     "maxReadColumns": 30,
     "maxOutputTokens": 4000
   },
+  "formula": {
+    "maxOutputTokens": 8000
+  },
   "llm": {
     "maxRetries": 5,
     "retryBaseDelaySeconds": 1.5,

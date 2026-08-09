@@ -34,6 +34,15 @@ const FINGERPRINT_CHUNK_CELLS =
   capabilities.queryTable.chunkRows * capabilities.queryTable.maxColumns;
 const SPLIT_AGGREGATE_BATCH_SHEETS =
   capabilities.excelExecution.splitAggregateBatchSheets;
+// EB 规则系统早期把规则存进这两张隐藏工作表（见 docs/EB_FUNCTIONS.md）。
+// 现已改为纯内置规则，代码不再读写它们，但用户的旧文件里可能残留。
+// 用精确名单过滤，避免误伤用户自己以 # 开头命名的正常表。
+const EB_SYSTEM_SHEETS = new Set(["#EB_RULES", "#EB_RULES_BACKUP"]);
+
+function isEBSystemSheet(name: string): boolean {
+  return EB_SYSTEM_SHEETS.has(name);
+}
+
 let structureCache:
   | { key: string; snapshot: WorkbookSnapshot }
   | null = null;
@@ -444,6 +453,65 @@ export async function captureSelectionContext(): Promise<{
   });
 }
 
+/**
+ * 试算公式：把 formula 临时写进首格，读回 Excel 真算值，随即还原原公式。
+ * 用于 /function 预览——让用户看到 Excel 亲算的真实结果，而非模型自报。
+ */
+export async function previewFormulaFirstCell(
+  sheetName: string,
+  firstCell: string,
+  formula: string
+): Promise<{ sampleResult: string; sampleInput: string; formulaR1C1: string }> {
+  return Excel.run(async (context) => {
+    const sheet = context.workbook.worksheets.getItem(sheetName);
+    const cell = sheet.getRange(firstCell);
+    cell.load("formulas");
+    await context.sync();
+
+    const original = cell.formulas as unknown[][];
+
+    cell.formulas = [[formula]];
+    await context.sync();
+
+    cell.load("text,formulasR1C1");
+    await context.sync();
+    const sampleResult = String((cell.text as string[][])[0]?.[0] ?? "");
+    // 锚点无关的 R1C1 形式，写入其他位置时保持相对引用正确平移
+    const formulaR1C1 = String(
+      (cell.formulasR1C1 as unknown[][])[0]?.[0] ?? ""
+    );
+
+    // 还原
+    cell.formulas = original as (string | number | boolean)[][];
+    await context.sync();
+
+    const originalCell = String(original[0]?.[0] ?? "");
+    return { sampleResult, sampleInput: originalCell, formulaR1C1 };
+  });
+}
+
+// 即刻读取当前工作表选区，返回 { sheet, address }（裸 A1，无 $）。
+// 交互：用户先在表里点/框选目标，再点「拾取」，本函数读回那一刻的选区。
+// 供 /function 写入目标拾取用；调用方按当前预览表校验是否跨表。
+export async function readSelectedRange(): Promise<{
+  sheet: string;
+  address: string;
+} | null> {
+  return Excel.run(async (context) => {
+    const range = context.workbook.getSelectedRange();
+    const sheet = range.worksheet;
+    range.load("address");
+    sheet.load("name");
+    await context.sync();
+    const rawAddress = String(range.address ?? "");
+    if (!rawAddress) return null;
+    const bare = rawAddress.includes("!")
+      ? rawAddress.split("!").pop()!
+      : rawAddress;
+    return { sheet: String(sheet.name ?? ""), address: bare.replace(/\$/g, "") };
+  });
+}
+
 export async function captureWorkbook(
   dataSheetNames?: string[]
 ): Promise<WorkbookSnapshot> {
@@ -458,11 +526,13 @@ export async function captureWorkbook(
     selectedRange.load("address");
     await context.sync();
 
-    const pending = worksheets.items.map((worksheet) => {
-      const usedRange = worksheet.getUsedRangeOrNullObject(true);
-      usedRange.load("address,rowCount,columnCount,rowIndex,columnIndex,isNullObject");
-      return { worksheet, usedRange };
-    });
+    const pending = worksheets.items
+      .filter((worksheet) => !isEBSystemSheet(worksheet.name))
+      .map((worksheet) => {
+        const usedRange = worksheet.getUsedRangeOrNullObject(true);
+        usedRange.load("address,rowCount,columnCount,rowIndex,columnIndex,isNullObject");
+        return { worksheet, usedRange };
+      });
     await context.sync();
 
     const sheetsToRead = new Set(
@@ -575,13 +645,15 @@ export async function captureWorkbookStructure(
     selectedRange.load("address");
     await context.sync();
 
-    const pending = worksheets.items.map((worksheet) => {
-      const usedRange = worksheet.getUsedRangeOrNullObject(true);
-      usedRange.load(
-        "address,rowCount,columnCount,rowIndex,columnIndex,isNullObject"
-      );
-      return { worksheet, usedRange };
-    });
+    const pending = worksheets.items
+      .filter((worksheet) => !isEBSystemSheet(worksheet.name))
+      .map((worksheet) => {
+        const usedRange = worksheet.getUsedRangeOrNullObject(true);
+        usedRange.load(
+          "address,rowCount,columnCount,rowIndex,columnIndex,isNullObject"
+        );
+        return { worksheet, usedRange };
+      });
     await context.sync();
 
     const sheetsToRead = new Set(
@@ -770,12 +842,21 @@ function inferredCriteria(
         });
       }
     } else if (action.type === "writeFormulas") {
-      addCriterion({
-        type: "formulasEqual",
-        sheet: action.sheet,
-        range: action.range,
-        expected: action.formulas
-      });
+      if (action.formulaR1C1) {
+        addCriterion({
+          type: "formulasR1C1Equal",
+          sheet: action.sheet,
+          range: action.range,
+          expected: action.formulaR1C1
+        });
+      } else {
+        addCriterion({
+          type: "formulasEqual",
+          sheet: action.sheet,
+          range: action.range,
+          expected: action.formulas
+        });
+      }
     } else if (
       action.type === "clearRange" &&
       (action.applyTo === "all" || action.applyTo === "contents")
@@ -1020,7 +1101,8 @@ export function verificationGaps(
       case "writeFormulas":
         verified = hasCriterion(
           (criterion) =>
-            criterion.type === "formulasEqual" &&
+            (criterion.type === "formulasEqual" ||
+              criterion.type === "formulasR1C1Equal") &&
             sameRange(criterion, action.sheet, action.range)
         );
         break;
@@ -1572,6 +1654,7 @@ async function verifyPlan(
       criterion.type !== "rangeEquals" &&
       criterion.type !== "rangeEmpty" &&
       criterion.type !== "formulasEqual" &&
+      criterion.type !== "formulasR1C1Equal" &&
       criterion.type !== "rangeSorted"
     ) {
       continue;
@@ -1579,7 +1662,13 @@ async function verifyPlan(
     const sheet = sheetsByName.get(criterion.sheet)!;
     if (sheet.isNullObject) continue;
     const range = sheet.getRange(criterion.range);
-    range.load(criterion.type === "formulasEqual" ? "formulas" : "values");
+    range.load(
+      criterion.type === "formulasEqual"
+        ? "formulas"
+        : criterion.type === "formulasR1C1Equal"
+          ? "formulasR1C1"
+          : "values"
+    );
     valueRanges.set(criterion, range);
   }
   if (valueRanges.size > 0) await context.sync();
@@ -1927,18 +2016,27 @@ async function verifyPlan(
     const actual =
       criterion.type === "formulasEqual"
         ? range.formulas.map((row) => row.map(normalizeValue))
-        : range.values.map((row) => row.map(normalizeValue));
+        : criterion.type === "formulasR1C1Equal"
+          ? range.formulasR1C1.map((row) => row.map(normalizeValue))
+          : range.values.map((row) => row.map(normalizeValue));
+    // R1C1 验收：期望值是与区域同形、逐格相同的矩阵，复用矩阵比较与差异定位
+    const expected =
+      criterion.type === "formulasR1C1Equal"
+        ? actual.map((row) => row.map(() => normalizeValue(criterion.expected)))
+        : criterion.type === "rangeEquals" || criterion.type === "formulasEqual"
+          ? criterion.expected
+          : [];
     const passed =
       criterion.type === "rangeEmpty"
         ? isBlankMatrix(actual)
         : criterion.type === "rangeSorted"
           ? sortedRangePasses(actual, criterion.keys, criterion.hasHeaders)
-          : matricesEqual(actual, criterion.expected);
+          : matricesEqual(actual, expected);
     const difference =
       !passed &&
       criterion.type !== "rangeEmpty" &&
       criterion.type !== "rangeSorted"
-        ? firstMatrixDifference(actual, criterion.expected)
+        ? firstMatrixDifference(actual, expected)
         : null;
     checks.push({
       criterion,
@@ -1948,7 +2046,8 @@ async function verifyPlan(
           ? `「${criterion.sheet}」${criterion.range} 已清空`
           : criterion.type === "rangeSorted"
             ? `「${criterion.sheet}」${criterion.range} 排序顺序一致`
-          : criterion.type === "formulasEqual"
+          : criterion.type === "formulasEqual" ||
+              criterion.type === "formulasR1C1Equal"
             ? `「${criterion.sheet}」${criterion.range} 公式一致`
             : `「${criterion.sheet}」${criterion.range} 写入值一致`
         : `「${criterion.sheet}」${criterion.range} ${
@@ -2081,7 +2180,7 @@ function explicitA1RangeShape(
   };
 }
 
-function isExplicitA1Address(address: string): boolean {
+export function isExplicitA1Address(address: string): boolean {
   if (explicitA1RangeShape(address)) return true;
   const normalized = address.trim().replace(/\$/g, "");
   const columns = normalized.match(/^([A-Z]{1,3}):([A-Z]{1,3})$/i);
@@ -2241,6 +2340,10 @@ export function preflightPlanActions(
     }
 
     if (action.type === "writeValues" || action.type === "writeFormulas") {
+      // R1C1 模式按区域形状自动铺满，不要求 formulas 矩阵与区域同形
+      if (action.type === "writeFormulas" && action.formulaR1C1) {
+        return;
+      }
       const matrix =
         action.type === "writeValues" ? action.values : action.formulas;
       const shape = explicitA1RangeShape(action.range);
@@ -2601,6 +2704,16 @@ async function executeAction(
     }
     case "writeFormulas": {
       const target = sheet.getRange(action.range);
+      if (action.formulaR1C1) {
+        // R1C1 与锚点无关：同一字符串铺满整个区域，相对引用逐格自动平移
+        target.load("rowCount,columnCount");
+        await context.sync();
+        const r1c1 = action.formulaR1C1;
+        target.formulasR1C1 = Array.from({ length: target.rowCount }, () =>
+          Array.from({ length: target.columnCount }, () => r1c1)
+        );
+        return;
+      }
       target.formulas = action.formulas;
       return;
     }

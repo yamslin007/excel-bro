@@ -31,19 +31,21 @@ export default function PetCompanion({ busy }: PetCompanionProps) {
       </button>
       {open && (
         <div className="pet-bubble" role="dialog" aria-label="格仔小提示">
-          {tip.category && (
-            <span className="pet-bubble-eyebrow">{tip.category}</span>
-          )}
+          <div className="pet-bubble-head">
+            {tip.category && (
+              <span className="pet-bubble-eyebrow">{tip.category}</span>
+            )}
+            <button
+              type="button"
+              className="pet-next"
+              onClick={() => setTipIndex((current) => current + 1)}
+            >
+              换一条
+            </button>
+          </div>
           <strong>{tip.title}</strong>
           <p>{tip.detail}</p>
           {tip.shortcut && <kbd className="pet-shortcut">{tip.shortcut}</kbd>}
-          <button
-            type="button"
-            className="pet-next"
-            onClick={() => setTipIndex((current) => current + 1)}
-          >
-            换一条
-          </button>
         </div>
       )}
     </div>

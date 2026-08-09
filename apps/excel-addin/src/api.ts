@@ -20,7 +20,10 @@ import {
   type TestModelConnectionResponse,
   type UpdateModelSettingsRequest,
   type UpsertModelConnectionRequest,
-  type WorkbookSnapshot
+  type SetFormulaModelRequest,
+  type WorkbookSnapshot,
+  type GenerateFormulaRequest,
+  type GenerateFormulaResponse
 } from "./contracts";
 import { recordModelCall } from "./diagnostics";
 
@@ -374,6 +377,19 @@ export async function testModelConnection(
   return value;
 }
 
+export async function setFormulaModel(
+  request: SetFormulaModelRequest
+): Promise<ModelSettings> {
+  const response = await fetch(`${API_BASE_URL}/api/settings/model/formula`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(request)
+  });
+  const value: unknown = await responseJson(response);
+  assertModelSettings(value);
+  return value;
+}
+
 export async function deleteModelConnection(
   connectionId: string
 ): Promise<ModelSettings> {
@@ -432,4 +448,15 @@ export async function executeFolderQuery(
   const value: unknown = await response.json();
   assertDataToolResult(value);
   return value;
+}
+
+export async function generateFormula(
+  request: GenerateFormulaRequest
+): Promise<GenerateFormulaResponse> {
+  const response = await fetch(`${API_BASE_URL}/api/formulas/generate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(request)
+  });
+  return responseJson<GenerateFormulaResponse>(response);
 }

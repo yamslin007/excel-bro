@@ -133,13 +133,33 @@ def load_managed_connections() -> tuple[ManagedModelConnection, ...]:
     return tuple(connections)
 
 
+def load_formula_model_id() -> str:
+    """读取顶层 formulaModelId：/function 专用模型选择。空串=跟随全局。"""
+    path = _connection_store_path()
+    if not path.exists():
+        return ""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    return str(payload.get("formulaModelId", "")).strip()
+
+
 def _write_managed_connections(
     connections: tuple[ManagedModelConnection, ...],
+    formula_model_id: str | None = None,
 ) -> None:
     path = _connection_store_path()
     path.parent.mkdir(parents=True, exist_ok=True)
+    # 保留已有的 formulaModelId（除非本次显式传入新值），避免写连接时丢掉公式模型选择。
+    resolved_formula_id = (
+        load_formula_model_id() if formula_model_id is None else formula_model_id
+    )
     payload = {
         "version": 1,
+        "formulaModelId": resolved_formula_id,
         "connections": [
             {
                 "id": connection.id,
@@ -270,7 +290,29 @@ def delete_managed_connection(connection_id: str) -> dict[str, object]:
     )
     if len(remaining) == len(current):
         raise ModelConnectionNotFoundError("要删除的模型连接不存在")
-    _write_managed_connections(remaining)
+    # 删掉的正好是公式专用模型时，清空 formulaModelId，回退到跟随全局。
+    formula_id = load_formula_model_id()
+    deleted_catalog_id = f"connection:{connection_id}"
+    next_formula_id = "" if formula_id == deleted_catalog_id else formula_id
+    _write_managed_connections(remaining, formula_model_id=next_formula_id)
+    return model_settings_view()
+
+
+def set_formula_model_id(model_id: str) -> dict[str, object]:
+    """设置 /function 公式专用模型。空串=跟随全局；否则须是已配置的模型。"""
+    normalized = (model_id or "").strip()
+    if normalized:
+        catalog = model_catalog()
+        valid_ids = {
+            str(option["id"])
+            for option in catalog["models"]  # type: ignore[index]
+            if str(option["id"]) != "local"
+        }
+        if normalized not in valid_ids:
+            raise ValueError("所选公式模型不存在或未配置")
+    _write_managed_connections(
+        load_managed_connections(), formula_model_id=normalized
+    )
     return model_settings_view()
 
 
@@ -345,6 +387,15 @@ def selected_model_config(
         api_key=settings.api_key,
         supports_vision=settings.supports_vision(selected_model),
     )
+
+
+def formula_model_config() -> ModelConnection | None:
+    """解析 /function 公式专用模型（顶层 formulaModelId）为可调用连接。
+    未设置（空串）则返回 None，调用方据此回退到全局选择逻辑。"""
+    formula_id = load_formula_model_id()
+    if not formula_id:
+        return None
+    return selected_model_config(formula_id)
 
 
 def model_catalog() -> dict[str, object]:
@@ -423,6 +474,7 @@ def model_settings_view() -> dict[str, object]:
         "defaultModel": settings.default_model if settings else None,
         "apiKeyConfigured": bool(api_key),
         "apiKeyHint": f"••••{api_key[-4:]}" if api_key else None,
+        "formulaModelId": load_formula_model_id(),
         "connections": [
             {
                 "id": connection.id,

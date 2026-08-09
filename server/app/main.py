@@ -35,6 +35,7 @@ from .models import (
     ModelSettingsResponse,
     PlanRequest,
     TestModelConnectionResponse,
+    SetFormulaModelRequest,
     TurnRequest,
     TurnResponse,
     UpdateModelSettingsRequest,
@@ -56,11 +57,17 @@ from .llm import (
     ModelConnectionNotFoundError,
     ModelConnectionStoreError,
     selected_model_config,
+    set_formula_model_id,
     test_model_connection,
     upsert_managed_connection,
     update_model_api_key,
 )
 from .planner import create_plan
+from .rule_generator import (
+    GenerateFormulaRequest,
+    GenerateFormulaResponse,
+    generate_formula,
+)
 from .turn_state import TurnStateError, turn_registry
 
 load_dotenv("server/.env")
@@ -283,6 +290,40 @@ async def save_model_connection(
             500,
             "MODEL_SETTINGS_WRITE_FAILED",
             "无法保存模型连接，请检查本地配置目录是否可写。",
+            retryable=False,
+        ) from error
+
+
+@app.put(
+    "/api/settings/model/formula",
+    response_model=ModelSettingsResponse,
+)
+async def save_formula_model(
+    request: SetFormulaModelRequest,
+) -> ModelSettingsResponse:
+    """设置 /function 公式专用模型（空串=跟随全局选择）。"""
+    try:
+        result = await run_in_threadpool(set_formula_model_id, request.modelId)
+        return ModelSettingsResponse.model_validate(result)
+    except ValueError as error:
+        raise service_error(
+            400,
+            "FORMULA_MODEL_INVALID",
+            str(error),
+            retryable=False,
+        ) from error
+    except ModelConnectionStoreError as error:
+        raise service_error(
+            500,
+            "MODEL_CONNECTION_STORE_INVALID",
+            str(error),
+            retryable=False,
+        ) from error
+    except OSError as error:
+        raise service_error(
+            500,
+            "MODEL_SETTINGS_WRITE_FAILED",
+            "无法保存公式模型选择，请检查本地配置目录是否可写。",
             retryable=False,
         ) from error
 
@@ -555,6 +596,27 @@ async def folder_query(request: FolderQueryRequest) -> DataToolResult:
     except (OSError, ValueError) as error:
         raise service_error(
             422, "FOLDER_DATA_TOOL_ERROR", str(error), retryable=True
+        ) from error
+
+
+@app.post("/api/formulas/generate", response_model=GenerateFormulaResponse)
+async def generate_native_formula(request: GenerateFormulaRequest) -> GenerateFormulaResponse:
+    """/function 短链：根据描述和表格上下文生成原生 Excel 公式"""
+    try:
+        return await generate_formula(request)
+    except ValueError as error:
+        raise service_error(
+            422, "FORMULA_GENERATION_ERROR", str(error), retryable=False
+        ) from error
+    except (
+        LLMConnectError,
+        LLMHTTPStatusError,
+        LLMResponseError,
+        LLMTimeoutError,
+        LLMTransportError,
+    ) as error:
+        raise service_error(
+            502, "MODEL_UNAVAILABLE", f"模型服务连接失败：{error}", retryable=True
         ) from error
 
 

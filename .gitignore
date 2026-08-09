@@ -8,10 +8,12 @@ dist/
 !.env.example
 __pycache__/
 .pytest_cache/
+server/.pytest_tmp/
 *.py[cod]
 .venv/
 server/data/
 outputs/
 *.log
+apps/excel-addin/request-log.txt
 model-connections.json
 .tmp/

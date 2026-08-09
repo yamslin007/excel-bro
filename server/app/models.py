@@ -1425,6 +1425,8 @@ class ModelSettingsResponse(BaseModel):
     defaultModel: str | None = None
     apiKeyConfigured: bool
     apiKeyHint: str | None = None
+    # /function 公式专用模型的 catalog id；空串=跟随全局选择。
+    formulaModelId: str = ""
     connections: list[ManagedModelConnectionResponse] = Field(
         default_factory=list,
         max_length=50,
@@ -1474,6 +1476,14 @@ class UpsertModelConnectionRequest(BaseModel):
         if not normalized.startswith(("http://", "https://")):
             raise ValueError("服务地址必须以 http:// 或 https:// 开头")
         return normalized
+
+
+class SetFormulaModelRequest(BaseModel):
+    # /function 公式专用模型的 catalog id；空串=跟随全局选择（默认）。
+    modelId: Annotated[
+        str,
+        StringConstraints(strip_whitespace=True, max_length=200),
+    ] = ""
 
 
 class TestModelConnectionResponse(BaseModel):
