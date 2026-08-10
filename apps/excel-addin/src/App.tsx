@@ -249,6 +249,9 @@ const INTENT_MAX_PRIOR_RESULT_ROWS =
   capabilities.intentContext.maxPriorResultRows;
 const COMPOSER_MAX_HEIGHT = 156;
 const COMPOSER_MIN_HEIGHT = 44;
+// 首次引导第一步「拉宽窗格」的阈值：窗格宽度达到该值即视为已拉宽，
+// 之后承接模型引导。与内联窄窗格判断共用，避免两处口径漂移。
+const PANE_WIDEN_THRESHOLD = 380;
 
 export function normalizePetVisibility(value: string | null): boolean {
   return value !== "hidden";
@@ -906,6 +909,14 @@ export default function App() {
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [moreMenuOpen, setMoreMenuOpen] = useState(false);
   const [focusOpening, setFocusOpening] = useState(false);
+  // 首次引导链路第一步「拉宽窗格」：窄窗格才需要，拉过阈值或跳过即视为完成，
+  // 之后承接模型引导。都是会话内 state——配好模型整条链路消失，无需持久化。
+  const [isNarrowPane, setIsNarrowPane] = useState(
+    () =>
+      typeof window !== "undefined" &&
+      window.innerWidth < PANE_WIDEN_THRESHOLD
+  );
+  const [widenStepDone, setWidenStepDone] = useState(false);
   const [modelCatalogLoaded, setModelCatalogLoaded] = useState(false);
   const [modelGuideDismissed, setModelGuideDismissed] = useState(false);
   const [modelSettings, setModelSettings] = useState<ModelSettings | null>(null);
@@ -1047,6 +1058,12 @@ export default function App() {
     !hasConfiguredModel &&
     !modelGuideDismissed &&
     !settingsOpen;
+  // 两步引导互斥、永不同屏：窄窗格且拉宽步未完成 → 只弹「拉宽」；
+  // 拉过阈值(≥PANE_WIDEN_THRESHOLD)或点跳过、以及本就宽窗格 → 承接「模型」引导。
+  const showWidenGuide =
+    showFirstModelGuide && isNarrowPane && !widenStepDone;
+  const showModelGuide =
+    showFirstModelGuide && (!isNarrowPane || widenStepDone);
   const hasEnvironmentModel =
     Boolean(modelSettings?.baseUrl) && Boolean(modelSettings?.defaultModel);
   const hasManagedModels = (modelSettings?.connections.length ?? 0) > 0;
@@ -1201,6 +1218,18 @@ export default function App() {
   useEffect(() => {
     messageEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
+
+  // 监听窗格宽度变化：用户把面板拖到 ≥PANE_WIDEN_THRESHOLD 即视为「拉宽」，
+  // 同时标记 isNarrowPane=false 并完成拉宽步，由 showModelGuide 承接下一步。
+  useEffect(() => {
+    const handleResize = () => {
+      const wide = window.innerWidth >= PANE_WIDEN_THRESHOLD;
+      setIsNarrowPane(!wide);
+      if (wide) setWidenStepDone(true);
+    };
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, []);
 
   useEffect(
     () => () => {
@@ -4395,7 +4424,7 @@ export default function App() {
           </span>
         </div>
         <div
-          className={`model-picker${showFirstModelGuide ? " needs-model" : ""}`}
+          className={`model-picker${showModelGuide ? " needs-model" : ""}`}
         >
           <button
             type="button"
@@ -4452,7 +4481,7 @@ export default function App() {
               </div>
             </div>
           )}
-          {showFirstModelGuide && (
+          {showModelGuide && (
             <section
               className="first-model-guide"
               aria-label="首次模型设置引导"
@@ -4592,6 +4621,28 @@ export default function App() {
           </div>
         </div>
       </header>
+
+      {showWidenGuide && (
+        <section
+          className="widen-pane-guide"
+          aria-label="拉宽窗格引导"
+        >
+          <div className="guide-spark" aria-hidden="true">
+            <i />
+            <i />
+            <i />
+          </div>
+          <strong>把面板拉宽一点</strong>
+          <span>
+            向左拖动面板左边缘，留出更多对话空间，然后我们会引导你添加第一个大模型。
+          </span>
+          <div className="widen-pane-guide-actions">
+            <button type="button" onClick={() => setWidenStepDone(true)}>
+              跳过
+            </button>
+          </div>
+        </section>
+      )}
 
       {settingsOpen && (
         <aside className="tool-drawer settings-drawer" aria-label="模型设置">

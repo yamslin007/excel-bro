@@ -39,7 +39,7 @@ body,
 }
 
 body {
-  min-width: 360px;
+  min-width: 0;
   background: #f8faf8;
 }
 
@@ -1142,6 +1142,7 @@ textarea:focus-visible {
 }
 
 .chat-header {
+  position: relative;
   z-index: 4;
   display: flex;
   align-items: center;
@@ -1345,10 +1346,15 @@ textarea:focus-visible {
 .first-model-guide {
   position: absolute;
   top: calc(100% + 9px);
-  right: 0;
+  /* 以 .model-picker 中心对称展开（而非贴右缘往左伸）：贴右缘会让 288px
+     气泡左边缘冲出窗格被 #root overflow:hidden 裁掉，看起来"变窄"。
+     居中用 margin-left 而非 transform —— translateX 会和入场动画的
+     transform(translateY+scale) 互相覆盖。此法在所有断点自动跟随 picker。 */
+  left: 50%;
+  margin-left: -144px;
   z-index: 25;
   display: grid;
-  width: min(292px, calc(100vw - 24px));
+  width: 288px;
   gap: 9px;
   border: 1px solid #bcd8c5;
   border-radius: 14px;
@@ -1364,7 +1370,10 @@ textarea:focus-visible {
 .first-model-guide::before {
   position: absolute;
   top: -7px;
-  right: 52px;
+  /* 箭头同样居中于 picker：气泡以 picker 中心展开，故箭头就在气泡水平中点。
+     margin-left:-6px = 半个箭头宽(12/2)。随气泡一起跟随 picker，无需分断点。 */
+  left: 50%;
+  margin-left: -6px;
   width: 12px;
   height: 12px;
   border-top: 1px solid #bcd8c5;
@@ -1456,6 +1465,81 @@ textarea:focus-visible {
   to {
     opacity: 1;
     transform: translateY(0) scale(1);
+  }
+}
+
+/* 首次引导第一步「拉宽窗格」：贴左边缘、箭头指向左侧拖拽边。 */
+.widen-pane-guide {
+  position: absolute;
+  top: 60px;
+  left: 14px;
+  z-index: 25;
+  display: grid;
+  width: 220px;
+  gap: 9px;
+  border: 1px solid #bcd8c5;
+  border-radius: 14px;
+  background:
+    radial-gradient(
+      circle at 10% 0%,
+      rgba(121, 204, 145, 0.2),
+      transparent 38%
+    ),
+    #fbfefc;
+  padding: 13px;
+  box-shadow: 0 16px 38px rgba(30, 79, 45, 0.16);
+  animation: widen-guide-in 420ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+.widen-pane-guide::before {
+  position: absolute;
+  top: 50%;
+  left: -7px;
+  margin-top: -6px;
+  width: 12px;
+  height: 12px;
+  border-bottom: 1px solid #bcd8c5;
+  border-left: 1px solid #bcd8c5;
+  background: #f7fcf8;
+  content: "";
+  transform: rotate(45deg);
+}
+
+.widen-pane-guide strong {
+  color: #254b32;
+  font-size: var(--font-size-caption);
+}
+
+.widen-pane-guide span {
+  color: #6e7e73;
+  font-size: var(--font-size-caption);
+  line-height: 1.55;
+}
+
+.widen-pane-guide-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.widen-pane-guide-actions button {
+  min-height: 28px;
+  border: 1px solid #d8e3db;
+  border-radius: 8px;
+  background: white;
+  color: #66746b;
+  padding: 5px 10px;
+  font-size: var(--font-size-caption);
+  font-weight: 700;
+}
+
+@keyframes widen-guide-in {
+  from {
+    opacity: 0;
+    transform: translateX(-10px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0) scale(1);
   }
 }
 
@@ -4624,6 +4708,7 @@ textarea:focus-visible {
 @media (prefers-reduced-motion: reduce) {
   .model-picker.needs-model .model-picker-trigger,
   .first-model-guide,
+  .widen-pane-guide,
   .guide-spark i,
   .settings-loading i {
     animation: none;

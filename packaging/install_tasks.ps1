@@ -154,32 +154,105 @@ $operation
     }
 }
 
+$certificateForegroundHelper = @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+public static class ExcelBroForeground {
+    [DllImport("user32.dll")] private static extern bool EnumWindows(EnumWindowsProc cb, IntPtr p);
+    [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr h);
+    [DllImport("user32.dll", CharSet = CharSet.Auto)] private static extern int GetClassName(IntPtr h, StringBuilder s, int n);
+    [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] private static extern bool AttachThreadInput(uint a, uint b, bool f);
+    [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr h);
+    [DllImport("user32.dll")] private static extern bool BringWindowToTop(IntPtr h);
+    [DllImport("user32.dll")] private static extern bool ShowWindow(IntPtr h, int cmd);
+    [DllImport("kernel32.dll")] private static extern uint GetCurrentThreadId();
+    private delegate bool EnumWindowsProc(IntPtr h, IntPtr p);
+    private const int SW_SHOW = 5;
+    public static bool BringDialogToFront(uint targetPid) {
+        IntPtr target = IntPtr.Zero;
+        EnumWindows(delegate(IntPtr h, IntPtr p) {
+            uint pid;
+            GetWindowThreadProcessId(h, out pid);
+            if (pid != targetPid) return true;
+            if (!IsWindowVisible(h)) return true;
+            StringBuilder sb = new StringBuilder(64);
+            GetClassName(h, sb, sb.Capacity);
+            if (sb.ToString() == "#32770") { target = h; return false; }
+            return true;
+        }, IntPtr.Zero);
+        if (target == IntPtr.Zero) return false;
+        uint dummy;
+        uint fgThread = GetWindowThreadProcessId(GetForegroundWindow(), out dummy);
+        uint thisThread = GetCurrentThreadId();
+        AttachThreadInput(thisThread, fgThread, true);
+        ShowWindow(target, SW_SHOW);
+        BringWindowToTop(target);
+        SetForegroundWindow(target);
+        AttachThreadInput(thisThread, fgThread, false);
+        return true;
+    }
+}
+'@
+
 function Install-RootCertificate {
     param([Parameter(Mandatory = $true)][string]$CertificatePath)
 
     $certificate = [Security.Cryptography.X509Certificates.X509Certificate2]::new(
         $CertificatePath
     )
-    $store = [Security.Cryptography.X509Certificates.X509Store]::new(
-        "Root",
-        [Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser
-    )
-    $store.Open(
-        [Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite
-    )
-    try {
-        $store.Add($certificate)
-        foreach ($existing in @($store.Certificates)) {
-            if (
-                $existing.Subject -eq $certificateSubject -and
-                $existing.Thumbprint -ne $certificate.Thumbprint
-            ) {
-                $store.Remove($existing)
+
+    if (-not ("ExcelBroForeground" -as [type])) {
+        Add-Type -TypeDefinition $certificateForegroundHelper
+    }
+
+    # $store.Add() 会弹出系统的证书信任"安全警告"对话框。因为本进程
+    # 由安装器以隐藏窗口方式启动，该对话框默认会被压在安装向导后面。
+    # 把 Add 放到后台 runspace 执行，主线程轮询把对话框强制拉到前台。
+    $powerShell = [PowerShell]::Create()
+    $powerShell.AddScript({
+        param($StorePath, $Subject, $Thumbprint)
+        $cert = [Security.Cryptography.X509Certificates.X509Certificate2]::new(
+            $StorePath
+        )
+        $rootStore = [Security.Cryptography.X509Certificates.X509Store]::new(
+            "Root",
+            [Security.Cryptography.X509Certificates.StoreLocation]::CurrentUser
+        )
+        $rootStore.Open(
+            [Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite
+        )
+        try {
+            $rootStore.Add($cert)
+            foreach ($existing in @($rootStore.Certificates)) {
+                if (
+                    $existing.Subject -eq $Subject -and
+                    $existing.Thumbprint -ne $Thumbprint
+                ) {
+                    $rootStore.Remove($existing)
+                }
             }
         }
+        finally {
+            $rootStore.Close()
+        }
+    }).AddArgument($CertificatePath).AddArgument(
+        $certificateSubject
+    ).AddArgument($certificate.Thumbprint) | Out-Null
+
+    $currentPid = [System.Diagnostics.Process]::GetCurrentProcess().Id
+    $async = $powerShell.BeginInvoke()
+    try {
+        while (-not $async.IsCompleted) {
+            [ExcelBroForeground]::BringDialogToFront($currentPid) | Out-Null
+            Start-Sleep -Milliseconds 150
+        }
+        $powerShell.EndInvoke($async)
     }
     finally {
-        $store.Close()
+        $powerShell.Dispose()
     }
 }
 
