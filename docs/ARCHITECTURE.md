@@ -400,11 +400,12 @@ openpyxl 能稳定读取的对象提供强验收：图表保持 `executed_unveri
 
 个人 Windows 安装包使用实际 Windows 计算机名创建一个仅包含
 `manifest.xml`、只授予当前用户读取权限的本机 SMB 共享，并将其写入
-`HKCU\Software\Microsoft\Office\16.0\Wef\TrustedCatalogs`。用户首次在 Excel
-的“共享文件夹”中确认添加后，功能区可用于普通工作簿。`Wef\Developer` 注册只
-为包含 WebExtension 引用的旁加载测试文档提供清单查找，不能把未发布加载项全局
-安装到所有普通工作簿。创建和删除 SMB 共享需要 UAC 管理员授权；卸载器同时删除
-可信目录注册和共享，但保留用户模型配置。
+`HKCU\Software\Microsoft\Office\16.0\Wef\TrustedCatalogs`。同时还会把清单写入
+`HKCU\Software\Microsoft\Office\16.0\Wef\Developer\{清单 Id}` 做直连注册（与
+`office-addin-debugging` 旁加载一致），因此安装后重启 Excel，功能区即可在普通
+工作簿中自动出现，无需用户先在“共享文件夹”里手动添加。共享目录仍保留，作为
+手动添加的备选入口。创建和删除 SMB 共享需要 UAC 管理员授权；卸载器同时删除
+可信目录注册、直连注册和共享，但保留用户模型配置。
 
 外层安装生命周期由 Inno Setup 管理，而不是由 PyInstaller 自解压程序模拟。
 PyInstaller 只冻结本地 FastAPI 服务。Inno Setup 提供可选安装目录、开始菜单、

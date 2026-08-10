@@ -130,13 +130,12 @@ Office 加载项清单的 `<Version>` 必须至少为 `1.0.0.0`，并包含顶�
 调用 Microsoft manifest 验证服务。
 
 安装过程会自动创建
-`\\<电脑名>\ExcelBroAddins` 本机共享并注册到 Office 可信加载项目录。使用实际
-计算机名而不是 `localhost`，以兼容只枚举标准 UNC 服务器名的 Office 版本。创建共享
-需要一次 UAC 管理员授权。安装后完全退出并重开 Excel，再依次选择
-**开始 → 加载项 → 更多加载项 → 高级 → 共享文件夹**，选择 **Excel Bro**
-并点击 **添加**。Office 要求用户完成这次首次获取；本地安装器写入
-`Wef\Developer` 只能为特定旁加载文档提供清单查找，不能让未发布加载项在所有
-普通工作簿中自动出现。
+`\\<电脑名>\ExcelBroAddins` 本机共享并注册到 Office 可信加载项目录，同时写入
+`HKCU\Software\Microsoft\Office\16.0\Wef\Developer\{清单 Id}` 直连注册（与
+`office-addin-debugging` 旁加载相同）。使用实际计算机名而不是 `localhost`，
+以兼容只枚举标准 UNC 服务器名的 Office 版本。创建共享需要一次 UAC 管理员授权。
+安装后完全退出并重开 Excel，**Excel Bro** 标签会直接出现在功能区，普通工作簿
+可用，无需再在“共享文件夹”里手动添加。卸载时 Inno Setup 会移除该注册值。
 
 卸载入口由 Inno Setup 注册到 Windows“已安装的应用”和开始菜单。标准卸载器会先
 要求用户确认，再请求一次 UAC 删除本机共享；UAC 被取消或共享删除失败时卸载会

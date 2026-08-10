@@ -216,12 +216,10 @@ npm run build:installer
 `INNO_SETUP_COMPILER` 指定完整路径。PyInstaller 只负责冻结本地服务，外层安装和
 卸载生命周期由 Inno Setup 管理。
 
-输出文件为 `dist/Excel-Bro-Setup-0.1.0.exe`。运行后完全关闭并重新打开 Excel，
-首次使用依次选择 **开始 → 加载项 → 更多加载项 → 高级 → 共享文件夹**，
-选择 **Excel Bro** 并点击 **添加**。这是 Office 对本机加载项目录的首次获取；
-未经 Microsoft Marketplace 发布或 Microsoft 365 管理员集中部署，Windows
-安装器不能代替用户完成这一步。完成一次后，普通工作簿可显示
-**Excel Bro** 功能区。
+输出文件为 `dist/Excel-Bro-Setup-0.1.0.exe`。安装器同时注册本机共享加载项目录
+和直连注册（等同旁加载），运行后完全关闭并重新打开 Excel，**Excel Bro** 标签会
+自动出现在功能区，普通工作簿直接可用，无需手动添加。卸载时会一并移除注册与
+共享，但保留 `%LOCALAPPDATA%\Excel Bro` 中的个人模型配置。
 
 该安装方式适合个人单机使用、开发和验收，不需要 Microsoft 365 企业管理员。
 组织内正式分发仍应把 Web 应用部署到 HTTPS 服务器，再通过 Microsoft 365
