@@ -5,6 +5,7 @@ import type {
   ExecutionUndoSnapshot,
   ExcelAction,
   PlanExecutionResult,
+  UndoWorksheetSnapshot,
   VerificationCheck,
   VerificationCriterion,
   VerificationReport,
@@ -29,6 +30,8 @@ const DATA_ROW_LIMIT = capabilities.snapshot.dataRows;
 const DATA_COLUMN_LIMIT = capabilities.snapshot.dataColumns;
 const STRUCTURE_ROW_LIMIT = capabilities.snapshot.structureRows;
 const STRUCTURE_COLUMN_LIMIT = capabilities.snapshot.structureColumns;
+// 删除工作表撤销的拍照格数上限：超过则该表不提供撤销（内存保护）。
+const UNDO_WORKSHEET_MAX_CELLS = 100_000;
 const FINGERPRINT_CHUNK_ROWS = capabilities.queryTable.chunkRows;
 const FINGERPRINT_CHUNK_CELLS =
   capabilities.queryTable.chunkRows * capabilities.queryTable.maxColumns;
@@ -98,6 +101,24 @@ export function dataEpochsChanged(
 
 export function invalidateWorkbookStructureCache(): void {
   structureCache = null;
+}
+
+// 执行完计划后，若含增删工作表的结构操作，先失效结构缓存再重扫。
+// 不能只依赖 worksheets.onAdded/onDeleted 事件：执行后紧跟 scan() 时事件可能
+// 尚未派发，scan 会拿旧缓存回填，导致整轮对话都读到陈旧的工作表集合。
+export function invalidateStructureCacheForActions(
+  actions: ExcelAction[]
+): void {
+  if (
+    actions.some(
+      (action) =>
+        action.type === "createWorksheet" ||
+        action.type === "deleteWorksheet" ||
+        action.type === "splitGroupAggregate"
+    )
+  ) {
+    invalidateWorkbookStructureCache();
+  }
 }
 
 interface SheetChangeEventArgs {
@@ -628,10 +649,22 @@ export async function captureWorkbookStructure(
   if (structureCacheEnabled && structureCache?.key === cacheKey) {
     const cached = structuredClone(structureCache.snapshot);
     // 结构缓存只在工作表数据/集合变化时失效，切换活动工作表不会失效。
-    // 命中缓存时用一次轻量选区读取刷新 activeWorksheet，避免拿过期值构建
+    // 命中缓存时用一次轻量选区读取刷新活动表与选区，避免拿过期值构建
     // 指纹，导致确认期与运行期不一致的误判。
     const selection = await captureSelectionContext();
     cached.activeWorksheet = selection.activeWorksheet;
+    cached.selectedRange = selection.selectedRange;
+    // 活动表不在缓存的工作表集合里，说明集合已变（如新建/删除表）但缓存
+    // 尚未失效；此时放弃缓存走全量重扫，避免 activeWorksheet 悬空导致
+    // 前端构造出空 sheets 被后端拒绝。
+    if (
+      !cached.worksheets.some(
+        (sheet) => sheet.name === selection.activeWorksheet
+      )
+    ) {
+      structureCache = null;
+      return captureWorkbookStructure(dataSheetNames);
+    }
     return cached;
   }
   return Excel.run(async (context) => {
@@ -2446,9 +2479,17 @@ export function incompleteActionResults(
   }));
 }
 
-async function executeAction(
+// 动作执行过程中收集的撤销数据：新建工作表、被覆盖(替换)工作表原有内容。
+interface ActionUndoCollector {
+  createdWorksheets: string[];
+  overwrittenRanges: ExecutionUndoSnapshot["ranges"][number][];
+}
+
+export async function executeAction(
   context: Excel.RequestContext,
-  action: ExcelAction
+  action: ExcelAction,
+  actionIndex: number,
+  collector: ActionUndoCollector
 ): Promise<VerificationCriterion[] | void> {
   if (action.type === "deleteWorksheet") {
     const existing = context.workbook.worksheets.getItemOrNullObject(action.sheet);
@@ -2572,11 +2613,14 @@ async function executeAction(
           }
           targetSheet = worksheets.getItem(existingName);
           usedRange = targetSheet.getUsedRangeOrNullObject();
-          usedRange.load("isNullObject");
+          usedRange.load(
+            "isNullObject,address,formulas,numberFormat,format/fill/color,format/font/bold,format/font/color"
+          );
         } else {
           if (existingName) targetName = renamed(baseName);
           targetSheet = worksheets.add(targetName);
           createdInThisRun.push(targetName);
+          collector.createdWorksheets.push(targetName);
           existingNames.set(targetName.toLocaleLowerCase(), targetName);
         }
         generatedNames.add(targetName.toLocaleLowerCase());
@@ -2598,8 +2642,52 @@ async function executeAction(
         if (jobs.some((job) => job.usedRange)) {
           await context.sync();
           for (const job of jobs) {
-            if (job.usedRange && !job.usedRange.isNullObject) {
+            if (!job.usedRange) continue;
+            // 撤销时按快照数组的逆序回放：先清空本次写入区，再把原占用区
+            // 内容写回，因此这里先推「原内容恢复」，后推「写入区清空」。
+            if (!job.usedRange.isNullObject) {
+              // 覆盖前拍下原有内容，撤销时原样写回。
+              collector.overwrittenRanges.push({
+                actionIndex,
+                sheet: job.targetName,
+                range:
+                  job.usedRange.address.split("!").pop() ??
+                  job.usedRange.address,
+                formulas: job.usedRange.formulas.map((row) =>
+                  row.map(normalizeValue)
+                ),
+                numberFormat: job.usedRange.numberFormat,
+                fillColor: job.usedRange.format.fill.color,
+                fontBold: job.usedRange.format.font.bold,
+                fontColor: job.usedRange.format.font.color
+              });
               job.usedRange.clear("All");
+            }
+            // 清空本次写入区（含写入区超出原占用区的部分），被替换的
+            // 空表因此也能还原为空白。
+            const writeArea = matrixRange(
+              "A1",
+              job.matrix.length,
+              job.matrix[0].length
+            );
+            if (writeArea) {
+              const emptyMatrix = Array.from(
+                { length: job.matrix.length },
+                () => Array<CellValue>(job.matrix[0].length).fill(null)
+              );
+              collector.overwrittenRanges.push({
+                actionIndex,
+                sheet: job.targetName,
+                range: writeArea,
+                formulas: emptyMatrix,
+                numberFormat: Array.from(
+                  { length: job.matrix.length },
+                  () => Array(job.matrix[0].length).fill("")
+                ),
+                fillColor: "",
+                fontBold: false,
+                fontColor: ""
+              });
             }
           }
         }
@@ -3069,10 +3157,69 @@ async function captureUndoRange(
   };
 }
 
+interface DeletedWorksheetCapture {
+  snapshot: UndoWorksheetSnapshot | null;
+  skipped: boolean;
+}
+
+async function captureDeletedWorksheet(
+  context: Excel.RequestContext,
+  sheetName: string,
+  originalPosition?: number
+): Promise<DeletedWorksheetCapture> {
+  const sheet = context.workbook.worksheets.getItemOrNullObject(sheetName);
+  sheet.load("isNullObject,position");
+  await context.sync();
+  if (sheet.isNullObject) return { snapshot: null, skipped: false };
+  const used = sheet.getUsedRangeOrNullObject(true);
+  used.load(
+    "address,rowCount,columnCount,rowIndex,columnIndex,isNullObject"
+  );
+  await context.sync();
+  if (used.isNullObject) return { snapshot: null, skipped: false };
+  if (used.rowCount * used.columnCount > UNDO_WORKSHEET_MAX_CELLS) {
+    return { snapshot: null, skipped: true };
+  }
+  const range = sheet.getRangeByIndexes(
+    used.rowIndex,
+    used.columnIndex,
+    used.rowCount,
+    used.columnCount
+  );
+  range.load("formulas,numberFormat");
+  await context.sync();
+  return {
+    snapshot: {
+      sheet: sheetName,
+      position: originalPosition ?? sheet.position,
+      usedRange: used.address.split("!").pop() ?? used.address,
+      formulas: range.formulas.map((row) => row.map(normalizeValue)),
+      numberFormat: range.numberFormat
+    },
+    skipped: false
+  };
+}
+
 export async function undoExecution(
   snapshot: ExecutionUndoSnapshot
 ): Promise<void> {
   await Excel.run(async (context) => {
+    // 先恢复被删除的工作表，让引用它们的单元格撤销能落回原表。
+    const worksheets = context.workbook.worksheets;
+    // 按原始位置升序逐个恢复：每个被删表原本位于其前面的工作表（无论
+    // 残留还是已恢复）数量不小于其原始位置，因此直接赋回位置不会越界。
+    const deletedSorted = [...snapshot.deletedWorksheets].sort(
+      (a, b) => a.position - b.position
+    );
+    for (const saved of deletedSorted) {
+      const ws = worksheets.add(saved.sheet);
+      const range = ws.getRange(saved.usedRange);
+      range.formulas = saved.formulas;
+      range.numberFormat = saved.numberFormat;
+      ws.position = saved.position;
+    }
+    await context.sync();
+    // 再恢复单元格值/公式/常用格式。
     for (const saved of [...snapshot.ranges].reverse()) {
       const range = context.workbook.worksheets
         .getItem(saved.sheet)
@@ -3082,6 +3229,13 @@ export async function undoExecution(
       range.format.fill.color = saved.fillColor;
       range.format.font.bold = saved.fontBold;
       range.format.font.color = saved.fontColor;
+    }
+    // 最后移除本次执行新建的工作表。
+    for (const name of snapshot.createdWorksheets) {
+      const ws = context.workbook.worksheets.getItemOrNullObject(name);
+      ws.load("isNullObject");
+      await context.sync();
+      if (!ws.isNullObject) ws.delete();
     }
     await context.sync();
   });
@@ -3106,7 +3260,7 @@ export async function executePlan(plan: AnalysisPlan): Promise<PlanExecutionResu
   }
   return Excel.run(async (context) => {
     const worksheets = context.workbook.worksheets;
-    worksheets.load("items/name");
+    worksheets.load("items/name,items/position");
     const tables = context.workbook.tables;
     tables.load("items/name");
     const names = context.workbook.names;
@@ -3118,6 +3272,10 @@ export async function executePlan(plan: AnalysisPlan): Promise<PlanExecutionResu
       : null;
     pivotTables?.load("items/name");
     await context.sync();
+    // 记录各工作表在计划执行前的原始位置，供删除撤销时精确还原顺序。
+    const positionByName = new Map<string, number>(
+      worksheets.items.map((ws) => [ws.name, ws.position])
+    );
     const needsShapeCatalog =
       Office.context.requirements.isSetSupported("ExcelApi", "1.9") &&
       plan.actions.some(
@@ -3166,14 +3324,48 @@ export async function executePlan(plan: AnalysisPlan): Promise<PlanExecutionResu
     const actionResults: ActionExecutionResult[] = [];
     const dynamicCriteria: VerificationCriterion[] = [];
     const undoRanges: ExecutionUndoSnapshot["ranges"] = [];
+    const createdWorksheets: string[] = [];
+    const deletedWorksheets: UndoWorksheetSnapshot[] = [];
+    const skippedWorksheets: string[] = [];
     const executionStartedAt = performance.now();
     for (const [index, action] of plan.actions.entries()) {
       try {
         const undoRange = await captureUndoRange(context, action, index);
-        const actionCriteria = await executeAction(context, action);
+        const deletedCapture =
+          action.type === "deleteWorksheet"
+            ? await captureDeletedWorksheet(
+                context,
+                action.sheet,
+                positionByName.get(action.sheet)
+              )
+            : null;
+        const actionUndo: ActionUndoCollector = {
+          createdWorksheets: [],
+          overwrittenRanges: []
+        };
+        const actionCriteria = await executeAction(
+          context,
+          action,
+          index,
+          actionUndo
+        );
         if (actionCriteria) dynamicCriteria.push(...actionCriteria);
         await context.sync();
         if (undoRange) undoRanges.push(undoRange);
+        if (actionUndo.overwrittenRanges.length > 0) {
+          undoRanges.push(...actionUndo.overwrittenRanges);
+        }
+        if (action.type === "createWorksheet") {
+          createdWorksheets.push(action.sheet);
+        }
+        if (actionUndo.createdWorksheets.length > 0) {
+          createdWorksheets.push(...actionUndo.createdWorksheets);
+        }
+        if (deletedCapture?.snapshot) {
+          deletedWorksheets.push(deletedCapture.snapshot);
+        } else if (deletedCapture?.skipped) {
+          skippedWorksheets.push(action.sheet);
+        }
       } catch (reason) {
         const detail = excelErrorDetail(reason);
         throw new PlanExecutionError(
@@ -3202,11 +3394,16 @@ export async function executePlan(plan: AnalysisPlan): Promise<PlanExecutionResu
       executionMs,
       verificationMs,
       undoSnapshot:
-        undoRanges.length > 0
+        undoRanges.length > 0 ||
+        createdWorksheets.length > 0 ||
+        deletedWorksheets.length > 0
           ? {
               planId: plan.id,
               capturedAt: new Date().toISOString(),
-              ranges: undoRanges
+              ranges: undoRanges,
+              createdWorksheets,
+              deletedWorksheets,
+              skippedWorksheets
             }
           : null
     };

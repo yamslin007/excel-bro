@@ -850,10 +850,25 @@ export interface UndoRangeSnapshot {
   fontColor: string;
 }
 
+// 被删除工作表的撤销快照：删前把整张表内容拍下来，撤销时新建并原样恢复。
+export interface UndoWorksheetSnapshot {
+  sheet: string;
+  position: number;
+  usedRange: string;
+  formulas: CellValue[][];
+  numberFormat: string[][];
+}
+
 export interface ExecutionUndoSnapshot {
   planId: string;
   capturedAt: string;
   ranges: UndoRangeSnapshot[];
+  // 本次执行新建的工作表名，撤销时移除。
+  createdWorksheets: string[];
+  // 本次执行删除的工作表，撤销时恢复。
+  deletedWorksheets: UndoWorksheetSnapshot[];
+  // 删除但因过大未记录撤销快照的工作表名（无法恢复）。
+  skippedWorksheets: string[];
 }
 
 export type AssistantResponse =
