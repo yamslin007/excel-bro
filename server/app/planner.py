@@ -227,20 +227,10 @@ def _local_formula_plan(
     if "公式" not in normalized:
         return None
 
-    operation: tuple[str, str] | None = None
-    operation_groups = (
-        ("SUM", ("合计", "总计", "总和", "求和")),
-        ("AVERAGE", ("平均", "均值")),
-        ("MAX", ("最大", "最高")),
-        ("MIN", ("最小", "最低")),
-        ("COUNT", ("计数", "数量", "个数")),
-    )
-    for function_name, markers in operation_groups:
-        if any(marker in normalized for marker in markers):
-            operation = function_name, markers[0]
-            break
+    operation = _match_aggregate_operation(normalized)
     if operation is None:
         return None
+    _op_id, op_label, op_formula = operation
 
     destination_match = re.search(
         r"(?:(?P<sheet>[^!，,\s]+)!)?"
@@ -293,7 +283,7 @@ def _local_formula_plan(
         if source_sheet.name == destination_sheet
         else f"'{source_sheet.name.replace(chr(39), chr(39) * 2)}'!{source_range}"
     )
-    formula = f"={operation[0]}({qualified_source})"
+    formula = f"={op_formula}({qualified_source})"
     if (
         source_sheet.name == destination_sheet
         and _cell_in_range(destination_cell, source_range)
@@ -309,7 +299,7 @@ def _local_formula_plan(
     plan = AnalysisPlan.model_validate(
         {
             "id": f"local-formula-{uuid.uuid4().hex[:10]}",
-            "title": f"写入{operation[1]}公式",
+            "title": f"写入{op_label}公式",
             "summary": (
                 f"在「{destination_sheet}」{destination_cell} 写入针对"
                 f"「{source_sheet.name}」字段「{header}」的公式 {formula}。"
@@ -558,6 +548,33 @@ def _local_edit_plan(
         }
     )
     return PlanResponse(plan=plan, provider="local")
+
+
+# 聚合操作单一来源：id（内部标识）、formula（Excel 函数名）、
+# markers（匹配用户输入的关键词，取并集避免各命令漂移）、label（展示中文名）。
+# 新增操作只改这里，formula / aggregate / 分析请求判定三处共享。
+_AGGREGATE_OPERATIONS: tuple[tuple[str, str, tuple[str, ...], str], ...] = (
+    ("sum", "SUM", ("合计", "总计", "总和", "求和", "一共"), "合计"),
+    ("average", "AVERAGE", ("平均", "均值"), "平均值"),
+    ("max", "MAX", ("最大", "最高"), "最大值"),
+    ("min", "MIN", ("最小", "最低", "最少"), "最小值"),
+    ("count", "COUNT", ("计数", "数量", "个数"), "计数"),
+)
+
+
+def _match_aggregate_operation(
+    normalized: str, supported: frozenset[str] | None = None
+) -> tuple[str, str, str] | None:
+    """匹配归一化文本中的聚合操作，返回 (id, label, formula) 或 None。
+
+    supported 限定可选操作（例如 aggregate 只支持 sum/average/max/min）。
+    """
+    for op_id, formula, markers, label in _AGGREGATE_OPERATIONS:
+        if supported is not None and op_id not in supported:
+            continue
+        if any(marker in normalized for marker in markers):
+            return op_id, label, formula
+    return None
 
 
 _REMOVE_DUPLICATES_MARKERS = ("去重", "删除重复", "去除重复", "删除重复行", "去重复")
@@ -1579,17 +1596,12 @@ def _local_aggregate_response(
     if not asks_for_result and not wants_written_output:
         return None
 
-    operation: str | None = None
-    if "平均" in prompt:
-        operation = "average"
-    elif any(keyword in prompt for keyword in ("合计", "总计", "总和", "一共")):
-        operation = "sum"
-    elif any(keyword in prompt for keyword in ("最大", "最高")):
-        operation = "max"
-    elif any(keyword in prompt for keyword in ("最小", "最低", "最少")):
-        operation = "min"
-    if operation is None:
+    matched = _match_aggregate_operation(
+        prompt, supported=frozenset({"sum", "average", "max", "min"})
+    )
+    if matched is None:
         return None
+    operation, op_label, _ = matched
 
     scope, source_sheets = _aggregate_scope(request, source_sheets)
     groups: dict[str, dict[str, object]] = {}
@@ -1699,16 +1711,13 @@ def _local_aggregate_response(
             continue
         if operation == "average":
             result = sum(values) / len(values)
-            label = "平均值"
         elif operation == "sum":
             result = sum(values)
-            label = "合计"
         elif operation == "max":
             result = max(values)
-            label = "最大值"
         else:
             result = min(values)
-            label = "最小值"
+        label = op_label
         display_header = (
             f"{sheet_names[0]} › {header}"
             if scope == "separate" and sheet_names
@@ -1787,26 +1796,14 @@ def _local_aggregate_response(
     )
 
 
+_ANALYSIS_INTENT_MARKERS = ("比较", "对比", "汇总", "统计", "分析", "异常", "分布")
+
+
 def _is_analysis_request(prompt: str) -> bool:
     prompt = _normalize_lookup_text(prompt)
-    return any(
-        keyword in prompt
-        for keyword in (
-            "比较",
-            "对比",
-            "汇总",
-            "统计",
-            "分析",
-            "平均",
-            "合计",
-            "总计",
-            "最大",
-            "最小",
-            "最少",
-            "异常",
-            "分布",
-        )
-    )
+    if any(keyword in prompt for keyword in _ANALYSIS_INTENT_MARKERS):
+        return True
+    return _match_aggregate_operation(prompt) is not None
 
 
 def _local_analysis(request: PlanRequest) -> AssistantResponse:
