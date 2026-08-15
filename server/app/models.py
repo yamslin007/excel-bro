@@ -30,6 +30,22 @@ INTENT_MAX_PRIOR_RESULT_ROWS = capability_int(
 )
 
 
+class DataFilter(BaseModel):
+    field: str = Field(min_length=1, max_length=200)
+    operator: Literal[
+        "equals",
+        "notEquals",
+        "contains",
+        "greaterThan",
+        "greaterThanOrEqual",
+        "lessThan",
+        "lessThanOrEqual",
+        "isBlank",
+        "isNotBlank",
+    ]
+    value: CellValue = None
+
+
 class WorksheetSnapshot(BaseModel):
     name: SheetName
     sourceFileId: str | None = Field(default=None, max_length=100)
@@ -125,6 +141,8 @@ class ClearRangeAction(BaseModel):
     sheet: SheetName
     range: RangeAddress
     applyTo: Literal["all", "contents", "formats", "hyperlinks"] = "all"
+    filters: list[DataFilter] = Field(default_factory=list, max_length=20)
+    hasHeaders: bool = True
 
 
 class InsertRangeAction(BaseModel):
@@ -139,6 +157,8 @@ class DeleteRangeAction(BaseModel):
     sheet: SheetName
     range: RangeAddress
     shift: Literal["up", "left"]
+    filters: list[DataFilter] = Field(default_factory=list, max_length=20)
+    hasHeaders: bool = True
 
 
 class CopyRangeAction(BaseModel):
@@ -150,6 +170,8 @@ class CopyRangeAction(BaseModel):
     copyType: Literal["all", "values", "formulas", "formats", "link"] = "all"
     skipBlanks: bool = False
     transpose: bool = False
+    filters: list[DataFilter] = Field(default_factory=list, max_length=20)
+    hasHeaders: bool = True
 
 
 class WriteFormulasAction(BaseModel):
@@ -177,6 +199,22 @@ class SortRangeAction(BaseModel):
     range: RangeAddress
     keys: list[SortKey] = Field(min_length=1, max_length=20)
     hasHeaders: bool = True
+
+
+class RemoveDuplicatesAction(BaseModel):
+    type: Literal["removeDuplicates"]
+    sheet: SheetName
+    range: RangeAddress
+    columns: list[int] = Field(min_length=1, max_length=100)
+    hasHeaders: bool = True
+    filters: list[DataFilter] = Field(default_factory=list, max_length=20)
+
+    @field_validator("columns")
+    @classmethod
+    def validate_columns(cls, columns: list[int]) -> list[int]:
+        if any(column < 0 or column > 16383 for column in columns):
+            raise ValueError("removeDuplicates 的依据列索引必须在 0 到 16383 之间")
+        return columns
 
 
 class FilterRangeAction(BaseModel):
@@ -458,6 +496,7 @@ ExcelAction = Annotated[
     | CopyRangeAction
     | WriteFormulasAction
     | SortRangeAction
+    | RemoveDuplicatesAction
     | FilterRangeAction
     | ClearFilterAction
     | SetDataValidationAction
@@ -864,10 +903,11 @@ class AnalysisPlan(BaseModel):
                         expected=action.formulas,
                     )
                 )
-            elif action.type == "clearRange" and action.applyTo in {
-                "all",
-                "contents",
-            }:
+            elif (
+                action.type == "clearRange"
+                and action.applyTo in {"all", "contents"}
+                and not action.filters
+            ):
                 add_criterion(
                     RangeEmptyCriterion(
                         type="rangeEmpty",
@@ -1285,22 +1325,6 @@ class IntentOption(BaseModel):
     description: str = Field(min_length=1, max_length=240)
     resolution: str = Field(min_length=1, max_length=500)
     action: Literal["resolve", "editScope"] = "resolve"
-
-
-class DataFilter(BaseModel):
-    field: str = Field(min_length=1, max_length=200)
-    operator: Literal[
-        "equals",
-        "notEquals",
-        "contains",
-        "greaterThan",
-        "greaterThanOrEqual",
-        "lessThan",
-        "lessThanOrEqual",
-        "isBlank",
-        "isNotBlank",
-    ]
-    value: CellValue = None
 
 
 class DataMetric(BaseModel):

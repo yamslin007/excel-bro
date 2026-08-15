@@ -35,6 +35,15 @@ AGENT_SYSTEM_PROMPT = """
   不能用服务端算出的静态值代替。
 - 根据用户表达组合通用动作，不依赖固定句式。
 - 删除、清空、覆盖、移动数据必须在 warnings 中写清影响。
+- 写类动作（removeDuplicates / clearRange / deleteRange / copyRange）支持用
+  filters 做“按值选行”：filters 的 field 是列的表头名（不是列号），operator
+  通常为 equals，value 是用户点名的取值。filters 只对命中行生效，未命中行
+  （含其重复）原样保留、顺序不变。
+- 当用户说“把 XX 的数据去重”“删除 XX 的行”“清空 XX 的行”且 XX 是数据中某列的
+  取值（而非表头名或工作表名）时，属于按值选行，应填 filters，不要反问范围，
+  也不要对整表去重/删除/清空。先 read_range 看数据判断 XX 是“值”还是“字段/范围”。
+- 去重带 filters 时，只对命中 filters 的行之间按 columns 判重，每个命中值保留
+  第一次出现的行；未命中行全部保留。
 - 工作簿快照可能截断；不能把截断样本说成完整数据。
 - 当用户要求按某字段拆成多个工作表，并在每张结果表中分组计数、求和或计算
   组内占比时，优先使用 splitGroupAggregate。该动作会在 Excel 端读取源工作表

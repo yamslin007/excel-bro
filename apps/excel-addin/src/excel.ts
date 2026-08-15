@@ -25,6 +25,7 @@ import {
   displayCellValue,
   normalizeCellValue
 } from "./cellNormalization";
+import { resolveFilteredRowIndices } from "./dataTools";
 
 const DATA_ROW_LIMIT = capabilities.snapshot.dataRows;
 const DATA_COLUMN_LIMIT = capabilities.snapshot.dataColumns;
@@ -1157,6 +1158,7 @@ export function verificationGaps(
       case "clearRange":
         verified =
           (action.applyTo === "all" || action.applyTo === "contents") &&
+          !action.filters?.length &&
           hasCriterion(
             (criterion) =>
               criterion.type === "rangeEmpty" &&
@@ -1179,6 +1181,17 @@ export function verificationGaps(
           (criterion) =>
             criterion.type === "rangeSorted" &&
             sameRange(criterion, action.sheet, action.range)
+        );
+        break;
+      case "removeDuplicates":
+        verified = hasCriterion(
+          (criterion) =>
+            criterion.type === "rangeEquals" &&
+            "range" in criterion &&
+            criterion.sheet.toLocaleLowerCase() ===
+              action.sheet.toLocaleLowerCase() &&
+            normalizedRangeAddress(criterion.range).split(":")[0] ===
+              normalizedRangeAddress(action.range).split(":")[0]
         );
         break;
       case "filterRange":
@@ -2163,6 +2176,7 @@ function positionShape(
 function minimumExcelApiVersion(action: ExcelAction): string {
   const versions: Partial<Record<ExcelAction["type"], string>> = {
     sortRange: "1.2",
+    removeDuplicates: "1.4",
     setConditionalFormat: "1.6",
     freezePanes: "1.7",
     setHyperlink: "1.7",
@@ -2410,6 +2424,30 @@ export function preflightPlanActions(
           });
         }
       }
+    }
+    if (action.type === "removeDuplicates") {
+      const shape = explicitA1RangeShape(action.range);
+      for (const column of action.columns) {
+        if (shape && column >= shape.columns) {
+          issues.push({
+            index,
+            message: `去重依据列索引 ${column} 超出 ${action.range} 的 ${shape.columns} 列范围`
+          });
+        }
+      }
+    }
+    if (
+      (action.type === "removeDuplicates" ||
+        action.type === "clearRange" ||
+        action.type === "deleteRange" ||
+        action.type === "copyRange") &&
+      action.filters?.length &&
+      !action.hasHeaders
+    ) {
+      issues.push({
+        index,
+        message: `带过滤条件的 ${action.type} 操作需要表头行（hasHeaders），否则无法按字段名定位列`
+      });
     }
     if (action.type === "filterRange") {
       const shape = explicitA1RangeShape(action.range);
@@ -2805,29 +2843,93 @@ export async function executeAction(
       target.formulas = action.formulas;
       return;
     }
-    case "clearRange":
-      sheet
-        .getRange(action.range)
-        .clear(
-          ({ all: "All", contents: "Contents", formats: "Formats", hyperlinks: "Hyperlinks" } as const)[
-            action.applyTo
-          ]
-        );
+    case "clearRange": {
+      const clearType = (
+        {
+          all: "All",
+          contents: "Contents",
+          formats: "Formats",
+          hyperlinks: "Hyperlinks"
+        } as const
+      )[action.applyTo];
+      if (!action.filters?.length) {
+        sheet.getRange(action.range).clear(clearType);
+        return;
+      }
+      const target = sheet.getRange(action.range);
+      target.load("values");
+      await context.sync();
+      const values = target.values as CellValue[][];
+      const matchIndices = resolveFilteredRowIndices(
+        values,
+        (action.hasHeaders ?? true) ? 0 : -1,
+        action.filters
+      );
+      for (const rowIndex of matchIndices) {
+        target.getRow(rowIndex).clear(clearType);
+      }
       return;
+    }
     case "insertRange":
       sheet.getRange(action.range).insert(action.shift === "down" ? "Down" : "Right");
       return;
-    case "deleteRange":
-      sheet.getRange(action.range).delete(action.shift === "up" ? "Up" : "Left");
-      return;
-    case "copyRange": {
-      const sourceSheet = context.workbook.worksheets.getItem(action.sourceSheet);
-      sheet.getRange(action.targetRange).copyFrom(
-        sourceSheet.getRange(action.sourceRange),
-        enumText(action.copyType) as Excel.RangeCopyType,
-        action.skipBlanks,
-        action.transpose
+    case "deleteRange": {
+      if (!action.filters?.length) {
+        sheet
+          .getRange(action.range)
+          .delete(action.shift === "up" ? "Up" : "Left");
+        return;
+      }
+      const target = sheet.getRange(action.range);
+      target.load("values");
+      await context.sync();
+      const values = target.values as CellValue[][];
+      const matchIndices = resolveFilteredRowIndices(
+        values,
+        (action.hasHeaders ?? true) ? 0 : -1,
+        action.filters
       );
+      // 从下往上删除命中行，避免行号错位
+      for (let i = matchIndices.length - 1; i >= 0; i--) {
+        target.getRow(matchIndices[i]).delete("Up");
+      }
+      return;
+    }
+    case "copyRange": {
+      if (!action.filters?.length) {
+        const sourceSheet = context.workbook.worksheets.getItem(
+          action.sourceSheet
+        );
+        sheet.getRange(action.targetRange).copyFrom(
+          sourceSheet.getRange(action.sourceRange),
+          enumText(action.copyType) as Excel.RangeCopyType,
+          action.skipBlanks,
+          action.transpose
+        );
+        return;
+      }
+      const sourceSheet = context.workbook.worksheets.getItem(
+        action.sourceSheet
+      );
+      const source = sourceSheet.getRange(action.sourceRange);
+      source.load("values");
+      await context.sync();
+      const values = source.values as CellValue[][];
+      const headerRowIndex = (action.hasHeaders ?? true) ? 0 : -1;
+      const matchIndices = resolveFilteredRowIndices(
+        values,
+        headerRowIndex,
+        action.filters
+      );
+      const headerRows =
+        headerRowIndex >= 0 ? [values[headerRowIndex]] : [];
+      const keptRows = matchIndices.map((index) => values[index]);
+      const filtered = [...headerRows, ...keptRows];
+      if (filtered.length === 0 || filtered[0].length === 0) return;
+      sheet
+        .getRange(action.targetRange)
+        .getResizedRange(filtered.length - 1, filtered[0].length - 1).values =
+        filtered;
       return;
     }
     case "sortRange":
@@ -2837,6 +2939,48 @@ export async function executeAction(
         action.hasHeaders
       );
       return;
+    case "removeDuplicates": {
+      if (!action.filters?.length) {
+        sheet
+          .getRange(action.range)
+          .removeDuplicates(action.columns, action.hasHeaders);
+        return;
+      }
+      const target = sheet.getRange(action.range);
+      target.load("values");
+      await context.sync();
+      const values = target.values as CellValue[][];
+      const headerRowIndex = action.hasHeaders ? 0 : -1;
+      const matchIndices = resolveFilteredRowIndices(
+        values,
+        headerRowIndex,
+        action.filters
+      );
+      const dataStart = headerRowIndex >= 0 ? headerRowIndex + 1 : 0;
+      const seen = new Set<string>();
+      const rowsToDelete: number[] = [];
+      for (const rowIndex of matchIndices) {
+        if (rowIndex < dataStart) continue;
+        const key = action.columns
+          .map((column) => {
+            const value = values[rowIndex][column];
+            return value === null || value === undefined
+              ? "∅"
+              : `${typeof value}:${String(value)}`;
+          })
+          .join("\u001f");
+        if (seen.has(key)) {
+          rowsToDelete.push(rowIndex);
+        } else {
+          seen.add(key);
+        }
+      }
+      // 从下往上删除命中行，避免行号错位
+      for (let i = rowsToDelete.length - 1; i >= 0; i--) {
+        target.getRow(rowsToDelete[i]).delete("Up");
+      }
+      return;
+    }
     case "filterRange":
       sheet.autoFilter.apply(sheet.getRange(action.range), action.column, {
         filterOn: "Values",

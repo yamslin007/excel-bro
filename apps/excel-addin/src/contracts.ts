@@ -85,6 +85,8 @@ export type ExcelAction =
       sheet: string;
       range: string;
       applyTo: "all" | "contents" | "formats" | "hyperlinks";
+      filters?: DataFilter[];
+      hasHeaders?: boolean;
     }
   | {
       type: "insertRange";
@@ -97,6 +99,8 @@ export type ExcelAction =
       sheet: string;
       range: string;
       shift: "up" | "left";
+      filters?: DataFilter[];
+      hasHeaders?: boolean;
     }
   | {
       type: "copyRange";
@@ -107,6 +111,8 @@ export type ExcelAction =
       copyType: "all" | "values" | "formulas" | "formats" | "link";
       skipBlanks: boolean;
       transpose: boolean;
+      filters?: DataFilter[];
+      hasHeaders?: boolean;
     }
   | {
       type: "writeFormulas";
@@ -122,6 +128,14 @@ export type ExcelAction =
       range: string;
       keys: Array<{ column: number; ascending: boolean }>;
       hasHeaders: boolean;
+    }
+  | {
+      type: "removeDuplicates";
+      sheet: string;
+      range: string;
+      columns: number[];
+      hasHeaders: boolean;
+      filters?: DataFilter[];
     }
   | {
       type: "filterRange";
@@ -908,6 +922,7 @@ const allowedActionTypes = new Set<ExcelAction["type"]>([
   "copyRange",
   "writeFormulas",
   "sortRange",
+  "removeDuplicates",
   "filterRange",
   "clearFilter",
   "setDataValidation",

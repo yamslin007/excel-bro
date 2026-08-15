@@ -1360,3 +1360,93 @@ def test_agent_keeps_readonly_tools_without_data_results(
         "submit_answer",
         "submit_plan",
     } <= names
+
+
+def test_local_remove_duplicates_by_column() -> None:
+    response = asyncio.run(
+        create_plan(
+            _score_request(
+                "按人员去重",
+                rows=[["阿里", 44], ["阿里", 50], ["企鹅", -3]],
+            )
+        )
+    )
+
+    assert response.kind == "plan"
+    action = response.plan.actions[0]
+    assert action.type == "removeDuplicates"
+    assert action.sheet == "Sheet1"
+    assert action.range == "A1:B4"
+    assert action.columns == [0]
+    assert action.hasHeaders is True
+    criterion = response.plan.acceptanceCriteria[0]
+    assert criterion.type == "rangeEquals"
+    assert criterion.range == "A1:B3"
+    assert criterion.expected == [["人员", "得分"], ["阿里", 44], ["企鹅", -3]]
+
+
+def test_local_remove_duplicates_whole_row() -> None:
+    response = asyncio.run(
+        create_plan(
+            _score_request(
+                "把这列数据去重",
+                rows=[["阿里", 44], ["阿里", 44], ["企鹅", -3]],
+            )
+        )
+    )
+
+    assert response.kind == "plan"
+    action = response.plan.actions[0]
+    assert action.type == "removeDuplicates"
+    assert action.columns == [0, 1]
+
+
+def test_local_remove_duplicates_value_filter() -> None:
+    response = asyncio.run(
+        create_plan(
+            _score_request(
+                "阿里去重",
+                rows=[
+                    ["阿里", 44],
+                    ["企鹅", -3],
+                    ["阿里", 50],
+                    ["企鹅", -8],
+                ],
+            )
+        )
+    )
+
+    assert response.kind == "plan"
+    action = response.plan.actions[0]
+    assert action.type == "removeDuplicates"
+    assert action.sheet == "Sheet1"
+    assert action.range == "A1:B5"
+    assert action.columns == [0]
+    assert action.hasHeaders is True
+    assert len(action.filters) == 1
+    assert action.filters[0].field == "人员"
+    assert action.filters[0].operator == "equals"
+    assert action.filters[0].value == "阿里"
+    criterion = response.plan.acceptanceCriteria[0]
+    assert criterion.type == "rangeEquals"
+    assert criterion.range == "A1:B4"
+    assert criterion.expected == [
+        ["人员", "得分"],
+        ["阿里", 44],
+        ["企鹅", -3],
+        ["企鹅", -8],
+    ]
+
+
+def test_local_remove_duplicates_no_duplicates_answers() -> None:
+    response = asyncio.run(
+        create_plan(
+            _score_request(
+                "去重",
+                rows=[["阿里", 44], ["企鹅", -3]],
+            )
+        )
+    )
+
+    assert response.kind == "answer"
+    assert "没有重复行" in response.message

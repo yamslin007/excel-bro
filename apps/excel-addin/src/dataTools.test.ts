@@ -2,7 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   createQueryTableAccumulator,
   DataToolExecutionError,
-  executeQueryTableData
+  executeQueryTableData,
+  resolveFilteredRowIndices
 } from "./dataTools";
 import type { DataToolRequest } from "./contracts";
 
@@ -339,5 +340,53 @@ describe("executeQueryTableData", () => {
     expect(() => executeQueryTableData(request, [])).toThrow(
       "请切换到文件夹模式"
     );
+  });
+});
+
+describe("resolveFilteredRowIndices", () => {
+  const values = [
+    ["人员", "得分"],
+    ["阿里", 44],
+    ["企鹅", -3],
+    ["阿里", 50],
+    ["企鹅", -8]
+  ];
+
+  it("matches equals on a header-named field", () => {
+    const indices = resolveFilteredRowIndices(values, 0, [
+      { field: "人员", operator: "equals", value: "阿里" }
+    ]);
+    expect(indices).toEqual([1, 3]);
+  });
+
+  it("ANDs multiple filters", () => {
+    const indices = resolveFilteredRowIndices(values, 0, [
+      { field: "人员", operator: "equals", value: "阿里" },
+      { field: "得分", operator: "greaterThan", value: 45 }
+    ]);
+    expect(indices).toEqual([3]);
+  });
+
+  it("matches contains case-insensitively", () => {
+    const indices = resolveFilteredRowIndices(
+      [["名称"], ["北京烤鸭"], ["上海小笼"]],
+      0,
+      [{ field: "名称", operator: "contains", value: "烤" }]
+    );
+    expect(indices).toEqual([1]);
+  });
+
+  it("returns empty when the field is not found", () => {
+    const indices = resolveFilteredRowIndices(values, 0, [
+      { field: "不存在", operator: "equals", value: "阿里" }
+    ]);
+    expect(indices).toEqual([]);
+  });
+
+  it("returns empty when there is no header row", () => {
+    const indices = resolveFilteredRowIndices(values, -1, [
+      { field: "人员", operator: "equals", value: "阿里" }
+    ]);
+    expect(indices).toEqual([]);
   });
 });

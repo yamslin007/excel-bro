@@ -166,8 +166,7 @@ function fieldValue(record: RecordRow, field: string): CellValue {
   return index === null ? null : record.values[index] ?? null;
 }
 
-function matchesFilter(record: RecordRow, filter: DataFilter): boolean {
-  const actual = fieldValue(record, filter.field);
+function matchesFilterValue(actual: CellValue, filter: DataFilter): boolean {
   const expected = filter.value ?? null;
   switch (filter.operator) {
     case "isBlank":
@@ -191,6 +190,43 @@ function matchesFilter(record: RecordRow, filter: DataFilter): boolean {
     case "lessThanOrEqual":
       return compareValues(actual, expected) <= 0;
   }
+}
+
+function matchesFilter(record: RecordRow, filter: DataFilter): boolean {
+  return matchesFilterValue(fieldValue(record, filter.field), filter);
+}
+
+// 在 values（二维数组）中解析 filters：headerRowIndex 指向表头行（无表头时传 -1，
+// 此时字段名无法解析，返回空）。返回所有命中行（AND 逻辑）的下标数组。
+export function resolveFilteredRowIndices(
+  values: CellValue[][],
+  headerRowIndex: number,
+  filters: DataFilter[]
+): number[] {
+  if (filters.length === 0 || values.length === 0) return [];
+  if (headerRowIndex < 0 || headerRowIndex >= values.length) return [];
+  const headers = values[headerRowIndex];
+  const fieldIndexes = new Map<string, number>();
+  headers.forEach((header, index) => {
+    const text = String(header ?? "").trim();
+    const normalized = normalizeField(text || `未命名列${index + 1}`);
+    if (!fieldIndexes.has(normalized)) fieldIndexes.set(normalized, index);
+  });
+  const resolved: Array<{ column: number; filter: DataFilter }> = [];
+  for (const filter of filters) {
+    const index = fieldIndexes.get(normalizeField(filter.field));
+    if (index === undefined) return [];
+    resolved.push({ column: index, filter });
+  }
+  const result: number[] = [];
+  for (let row = headerRowIndex + 1; row < values.length; row++) {
+    const cells = values[row];
+    const matches = resolved.every(({ column, filter }) =>
+      matchesFilterValue(cells[column] ?? null, filter)
+    );
+    if (matches) result.push(row);
+  }
+  return result;
 }
 
 function metricValue(rows: RecordRow[], metric: DataMetric): CellValue {

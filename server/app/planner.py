@@ -560,6 +560,178 @@ def _local_edit_plan(
     return PlanResponse(plan=plan, provider="local")
 
 
+_REMOVE_DUPLICATES_MARKERS = ("去重", "删除重复", "去除重复", "删除重复行", "去重复")
+
+
+def _local_remove_duplicates_plan(
+    request: PlanRequest, source_sheets: list[object]
+) -> AssistantResponse | None:
+    normalized = _normalize_lookup_text(request.prompt)
+    if not any(marker in normalized for marker in _REMOVE_DUPLICATES_MARKERS):
+        return None
+
+    target_sheet = _resolve_target_sheet(request, None)
+    sheet = next(
+        (item for item in source_sheets if item.name == target_sheet),
+        None,
+    )
+    if sheet is None:
+        if len(source_sheets) == 1:
+            sheet = source_sheets[0]
+        else:
+            return AnswerResponse(
+                provider="local",
+                message="当前有多个工作表，请指定要在哪张表上去重。",
+            )
+
+    if sheet.truncated:
+        return AnswerResponse(
+            provider="local",
+            message=(
+                f"「{sheet.name}」的数据快照被截断，无法在本地精确去重。"
+                "请缩小数据范围或配置模型后重试。"
+            ),
+        )
+
+    matched_columns = [
+        column_index
+        for column_index, header in enumerate(sheet.headers)
+        if header not in (None, "") and _header_matches_prompt(header, normalized)
+    ]
+
+    column_count = max(
+        len(sheet.headers),
+        max((len(row) for row in sheet.dataRows), default=0),
+    )
+    if column_count == 0:
+        return AnswerResponse(
+            provider="local", message=f"「{sheet.name}」没有可去重的数据。"
+        )
+
+    filters: list[dict[str, object]] = []
+    filter_column: int | None = None
+    filter_value_text: str | None = None
+    if not matched_columns:
+        # 未命中表头时，尝试把提示里出现的值当作过滤条件（如「阿里去重」→ 人员=阿里）
+        for column_index in range(column_count):
+            header = (
+                sheet.headers[column_index]
+                if column_index < len(sheet.headers)
+                else None
+            )
+            if header in (None, ""):
+                continue
+            for row in sheet.dataRows:
+                value = row[column_index] if column_index < len(row) else None
+                if value in (None, ""):
+                    continue
+                value_text = _normalize_lookup_text(value)
+                if len(value_text) >= 2 and value_text in normalized:
+                    filter_column = column_index
+                    filter_value_text = value_text
+                    filters = [
+                        {
+                            "field": str(header or ""),
+                            "operator": "equals",
+                            "value": value,
+                        }
+                    ]
+                    break
+            if filter_column is not None:
+                break
+
+    if matched_columns:
+        dedupe_columns = matched_columns
+        by_text = "、".join(str(sheet.headers[i]) for i in matched_columns)
+    elif filter_column is not None:
+        dedupe_columns = [filter_column]
+        by_text = f"「{filters[0]['field']}」等于「{filters[0]['value']}」的行"
+    else:
+        dedupe_columns = list(range(column_count))
+        by_text = "整行"
+
+    def pad_row(row: list[object]) -> list[object]:
+        return [row[i] if i < len(row) else None for i in range(column_count)]
+
+    def matches_filters(row: list[object]) -> bool:
+        if filter_column is None:
+            return True
+        value = row[filter_column] if filter_column < len(row) else None
+        if value in (None, ""):
+            return False
+        return _normalize_lookup_text(value) == filter_value_text
+
+    seen: set[tuple[object, ...]] = set()
+    unique_rows: list[list[object]] = []
+    for row in sheet.dataRows:
+        if not matches_filters(row):
+            # 未命中过滤条件的行原样保留（含其重复）
+            unique_rows.append(row)
+            continue
+        key = tuple(row[i] if i < len(row) else None for i in dedupe_columns)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_rows.append(row)
+
+    removed_count = len(sheet.dataRows) - len(unique_rows)
+    if removed_count == 0:
+        return AnswerResponse(
+            provider="local",
+            message=f"「{sheet.name}」的当前数据里没有重复行，无需去重。",
+        )
+
+    start_column, start_row = _used_range_origin(sheet.usedRange)
+    start_letter = _column_letter(start_column)
+    end_letter = _column_letter(start_column + column_count - 1)
+    range_address = (
+        f"{start_letter}{start_row}:{end_letter}{start_row + len(sheet.dataRows)}"
+    )
+    result_range = (
+        f"{start_letter}{start_row}:{end_letter}{start_row + len(unique_rows)}"
+    )
+    result_rows = [pad_row(sheet.headers), *[pad_row(row) for row in unique_rows]]
+
+    plan = AnalysisPlan.model_validate(
+        {
+            "id": f"local-dedupe-{uuid.uuid4().hex[:10]}",
+            "title": f"去重「{sheet.name}」",
+            "summary": (
+                f"准备对「{sheet.name}」按 {by_text} 去重，"
+                f"预计删除 {removed_count} 行重复数据。"
+            ),
+            "assumptions": (
+                ["首行是字段名称，重复数据删除整行。"]
+                if not filters
+                else [
+                    "首行是字段名称，重复数据删除整行。",
+                    "仅对命中过滤条件的行去重，未命中行原样保留。",
+                ]
+            ),
+            "warnings": ["去重会删除整行数据；请确认被删除的是多余重复行。"],
+            "actions": [
+                {
+                    "type": "removeDuplicates",
+                    "sheet": sheet.name,
+                    "range": range_address,
+                    "columns": dedupe_columns,
+                    "hasHeaders": True,
+                    **({"filters": filters} if filters else {}),
+                }
+            ],
+            "acceptanceCriteria": [
+                {
+                    "type": "rangeEquals",
+                    "sheet": sheet.name,
+                    "range": result_range,
+                    "expected": result_rows,
+                }
+            ],
+        }
+    )
+    return PlanResponse(plan=plan, provider="local")
+
+
 def _local_lookup(
     request: PlanRequest, source_sheets: list[object]
 ) -> AnswerResponse | None:
@@ -1665,6 +1837,10 @@ def _local_analysis(request: PlanRequest) -> AssistantResponse:
     edit = _local_edit_plan(request, source_sheets)
     if edit is not None:
         return edit
+
+    remove_duplicates = _local_remove_duplicates_plan(request, source_sheets)
+    if remove_duplicates is not None:
+        return remove_duplicates
 
     location = _local_location(request, source_sheets)
     if location is not None:

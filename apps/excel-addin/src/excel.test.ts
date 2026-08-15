@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   dataEpochsChanged,
+  executeAction,
   incompleteActionResults,
   preflightPlanActions,
   snapshotDataEpochs,
@@ -10,7 +11,12 @@ import {
   verificationGaps,
   valuesEqual
 } from "./excel";
-import type { AnalysisPlan } from "./contracts";
+import type {
+  AnalysisPlan,
+  CellValue,
+  DataFilter,
+  ExcelAction
+} from "./contracts";
 
 describe("workbook source fingerprint", () => {
   const snapshot = {
@@ -767,5 +773,164 @@ describe("Excel verification coverage", () => {
     };
 
     expect(verificationGaps(plan)).toEqual([]);
+  });
+});
+
+describe("executeAction filtered row-scoped actions", () => {
+  type OpCall =
+    | { op: "clear"; row: number; applyTo: string }
+    | { op: "delete"; row: number; shift: string };
+
+  interface MockWorld {
+    context: unknown;
+    calls: OpCall[];
+    writes: Array<{ range: string; values: CellValue[][] }>;
+  }
+
+  function makeMockExcel(sheets: Record<string, CellValue[][]>): MockWorld {
+    const calls: OpCall[] = [];
+    const writes: Array<{ range: string; values: CellValue[][] }> = [];
+
+    const makeRange = (address: string, values: CellValue[][] | undefined) => {
+      const range: any = {
+        values,
+        load: () => {},
+        getRow: (row: number) => ({
+          clear: (applyTo: string) => calls.push({ op: "clear", row, applyTo }),
+          delete: (shift: string) => calls.push({ op: "delete", row, shift })
+        }),
+        getResizedRange: () => {
+          const target: any = {};
+          Object.defineProperty(target, "values", {
+            set(values: CellValue[][]) {
+              writes.push({ range: address, values });
+            }
+          });
+          return target;
+        }
+      };
+      return range;
+    };
+
+    const makeWorksheet = (name: string) => {
+      const worksheet: any = {
+        load: () => {},
+        isNullObject: false,
+        getRange: (address: string) => makeRange(address, sheets[name] ?? [])
+      };
+      return worksheet;
+    };
+
+    const context: any = {
+      sync: async () => {},
+      workbook: {
+        worksheets: {
+          getItemOrNullObject: (name: string) => makeWorksheet(name),
+          getItem: (name: string) => makeWorksheet(name),
+          add: (name: string) => makeWorksheet(name)
+        }
+      }
+    };
+
+    return { context, calls, writes };
+  }
+
+  const rows: CellValue[][] = [
+    ["人员", "得分"],
+    ["阿里", 44],
+    ["企鹅", -3],
+    ["阿里", 50],
+    ["企鹅", -8]
+  ];
+
+  const collector = { createdWorksheets: [], overwrittenRanges: [] };
+
+  const peopleEquals = (value: string): DataFilter => ({
+    field: "人员",
+    operator: "equals",
+    value
+  });
+
+  it("clearRange clears only rows matching the filters", async () => {
+    const world = makeMockExcel({ 数据: rows });
+    const action: ExcelAction = {
+      type: "clearRange",
+      sheet: "数据",
+      range: "A1:B5",
+      applyTo: "contents",
+      hasHeaders: true,
+      filters: [peopleEquals("阿里")]
+    };
+
+    await executeAction(world.context as any, action, 0, collector as any);
+
+    expect(world.calls).toEqual([
+      { op: "clear", row: 1, applyTo: "Contents" },
+      { op: "clear", row: 3, applyTo: "Contents" }
+    ]);
+  });
+
+  it("deleteRange deletes matching rows bottom-up to avoid index shifting", async () => {
+    const world = makeMockExcel({ 数据: rows });
+    const action: ExcelAction = {
+      type: "deleteRange",
+      sheet: "数据",
+      range: "A1:B5",
+      shift: "up",
+      hasHeaders: true,
+      filters: [peopleEquals("阿里")]
+    };
+
+    await executeAction(world.context as any, action, 0, collector as any);
+
+    expect(world.calls).toEqual([
+      { op: "delete", row: 3, shift: "Up" },
+      { op: "delete", row: 1, shift: "Up" }
+    ]);
+  });
+
+  it("copyRange writes header plus matching rows to the target range", async () => {
+    const world = makeMockExcel({ 数据: rows });
+    const action: ExcelAction = {
+      type: "copyRange",
+      sheet: "结果",
+      sourceSheet: "数据",
+      sourceRange: "A1:B5",
+      targetRange: "D1:E3",
+      copyType: "values",
+      skipBlanks: false,
+      transpose: false,
+      hasHeaders: true,
+      filters: [peopleEquals("企鹅")]
+    };
+
+    await executeAction(world.context as any, action, 0, collector as any);
+
+    expect(world.writes).toEqual([
+      {
+        range: "D1:E3",
+        values: [
+          ["人员", "得分"],
+          ["企鹅", -3],
+          ["企鹅", -8]
+        ]
+      }
+    ]);
+  });
+
+  it("removeDuplicates deletes only duplicate rows within the filtered set", async () => {
+    const world = makeMockExcel({ 数据: rows });
+    const action: ExcelAction = {
+      type: "removeDuplicates",
+      sheet: "数据",
+      range: "A1:B5",
+      columns: [0],
+      hasHeaders: true,
+      filters: [peopleEquals("阿里")]
+    };
+
+    await executeAction(world.context as any, action, 0, collector as any);
+
+    expect(world.calls).toEqual([{ op: "delete", row: 3, shift: "Up" }]);
   });
 });

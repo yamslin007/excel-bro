@@ -35,6 +35,8 @@ INTENT_SYSTEM_PROMPT = """
 用户手动选中的工作表是默认且不可扩大的数据边界。不要建议读取未选中的工作表。
 query_table 同时支持 sourceMode=workbook 和 sourceMode=folder；文件夹模式由受控
 pandas 工具读取用户已选择的文件和工作表。
+query_table 的 combine.deduplicate / combine.join 仅用于文件夹模式的多表去重或关联；
+单表「去重」（修改原表）不是只读查询，不要用 query_table 的 combine 表达。
 优先结合“上一轮结构化意图”和“上一轮紧凑结果”理解“那最低的呢、换成平均值、只看某地区”等承接式追问，
 不得要求用户重复已经明确的信息。
 用户完成一次确认后，不要重复询问同一个问题；但自定义回答仍存在新的关键歧义时，
@@ -43,7 +45,10 @@ pandas 工具读取用户已选择的文件和工作表。
 若提供了“上次工具失败”，请根据错误和可用字段修正工具参数，不要原样重试。
 如果需求明确且属于查询、筛选、比较、统计或汇总，返回 tool_request，让 Excel
 本地工具完成确定性计算。只有不需要读取数据即可规划的格式、结构或写入操作才返回
-proceed。如果不明确，只问一个最能消除关键歧义的问题，提供 2 到 4 个互斥选项。
+proceed。「去重」「删除重复行」「删除 XX 的行」「清空 XX 的行」都会修改原表，属于
+写入操作，应返回 proceed（交给规划 Agent 生成 removeDuplicates / deleteRange /
+clearRange 动作），不要返回 tool_request。如果不明确，只问一个最能消除关键歧义的
+问题，提供 2 到 4 个互斥选项。
 所有内容使用简体中文。
 
 只返回 JSON，不要使用 Markdown。格式：
