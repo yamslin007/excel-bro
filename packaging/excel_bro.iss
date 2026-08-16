@@ -81,14 +81,6 @@ Root: HKCU; \
     Subkey: "Software\Microsoft\Office\16.0\Wef\TrustedCatalogs\{#CatalogId}"; \
     ValueType: dword; ValueName: "Flags"; ValueData: "1"; \
     Flags: uninsdeletekey
-; 直连注册（等同 office-addin-debugging 旁加载）：Excel 重启后功能区自动出现
-; Excel Bro 标签，无需用户先在"共享文件夹"里手动添加一次。值名 = 清单 Id，
-; 值数据 = 本机清单文件路径。卸载时由 uninsdeletevalue 自动移除。
-Root: HKCU; \
-    Subkey: "Software\Microsoft\Office\16.0\Wef\Developer"; \
-    ValueType: string; ValueName: "{#ManifestId}"; \
-    ValueData: "{app}\catalog\manifest.xml"; \
-    Flags: uninsdeletevalue
 
 [Code]
 function GetCatalogUrl(Param: String): String;

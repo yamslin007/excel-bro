@@ -54,6 +54,9 @@
   "formula": {
     "maxOutputTokens": 8000
   },
+  "safety": {
+    "allowHyperlink": false
+  },
   "llm": {
     "maxRetries": 5,
     "retryBaseDelaySeconds": 1.5,

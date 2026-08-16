@@ -107,6 +107,9 @@ if (`$null -ne `$existing) {
 }
 New-SmbShare -Name $shareLiteral -Path $catalogLiteral -ReadAccess $principalLiteral |
     Out-Null
+Get-NetFirewallRule -Direction Inbound |
+    Where-Object { `$_.DisplayName -match 'SMB-In' } |
+    Enable-NetFirewallRule -ErrorAction SilentlyContinue
 "@
     }
     else {
@@ -321,6 +324,146 @@ function Start-ExcelBroRuntime {
     throw "Excel Bro 本地服务未能启动。"
 }
 
+function Register-ExcelBroAddin {
+    param([Parameter(Mandatory = $true)][string]$ManifestPath)
+
+    $manifestText = [IO.File]::ReadAllText(
+        $ManifestPath,
+        [Text.UTF8Encoding]::new($false)
+    )
+    [xml]$manifestXml = $manifestText
+    $manifestId = [string]$manifestXml.OfficeApp.Id
+    $manifestVersion = [string]$manifestXml.OfficeApp.Version
+
+    $storeId = "\\$env:COMPUTERNAME\$shareName"
+    $storeIdJson = $storeId.Replace("\", "\\")
+
+    $wefRoot = Join-Path $env:LOCALAPPDATA "Microsoft\Office\16.0\WEF"
+    $filesystemExcelDir = Join-Path $wefRoot "AddinInfo\1\filesystem\Excel"
+    $addinDir = Join-Path $filesystemExcelDir "1\${manifestId}_${manifestVersion}"
+    New-Item -ItemType Directory -Force -Path $addinDir | Out-Null
+
+    $bootJson = (
+        '{"solid":"' + $manifestId +
+        '","storeid":"' + $storeIdJson +
+        '","appversion":"' + $manifestVersion +
+        '","equivalentaddins":[]}'
+    )
+    [IO.File]::WriteAllText(
+        (Join-Path $addinDir "boot.json"),
+        $bootJson,
+        [Text.UTF8Encoding]::new($false)
+    )
+
+    $metaPath = Join-Path $filesystemExcelDir "meta.json"
+    $unixNow = [int64][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $metaJson = '{"minorversion":1,"lastupdate":' + $unixNow + '}'
+    [IO.File]::WriteAllText(
+        $metaPath,
+        $metaJson,
+        [Text.UTF8Encoding]::new($false)
+    )
+
+    # 功能区（AppCommands）只有在加载项被「添加」到受信任目录后才会生成。
+    # 「添加」状态记录在 Providers\<hash>\AppStates\<id>_<version>，其中
+    # <hash> = base64(MD5(UTF-16LE(目录 URL)))，'/' 替换为 '_'。
+    $providerHash = [Convert]::ToBase64String(
+        [Security.Cryptography.MD5]::Create().ComputeHash(
+            [Text.Encoding]::Unicode.GetBytes($storeId)
+        )
+    ).Replace('/', '_')
+
+    $providerKey = (
+        "HKCU:\Software\Microsoft\Office\16.0\WEF\Providers\" + $providerHash
+    )
+    if (-not (Test-Path $providerKey)) {
+        New-Item -Path $providerKey -Force | Out-Null
+    }
+    New-ItemProperty `
+        -Path $providerKey `
+        -Name "UniqueId" `
+        -Value $storeId `
+        -PropertyType String `
+        -Force | Out-Null
+
+    New-ItemProperty `
+        -Path $providerKey `
+        -Name "Entitlements" `
+        -Value ([DateTime]::UtcNow.ToFileTime()) `
+        -PropertyType QWord `
+        -Force | Out-Null
+
+    $appStatesKey = Join-Path $providerKey "AppStates"
+    if (-not (Test-Path $appStatesKey)) {
+        New-Item -Path $appStatesKey -Force | Out-Null
+    }
+    New-ItemProperty `
+        -Path $appStatesKey `
+        -Name "${manifestId}_${manifestVersion}" `
+        -Value ([DateTime]::UtcNow.ToFileTime()) `
+        -PropertyType QWord `
+        -Force | Out-Null
+}
+
+function Get-WefProviderHash {
+    param([Parameter(Mandatory = $true)][string]$UniqueId)
+
+    return [Convert]::ToBase64String(
+        [Security.Cryptography.MD5]::Create().ComputeHash(
+            [Text.Encoding]::Unicode.GetBytes($UniqueId)
+        )
+    ).Replace('/', '_')
+}
+
+function Remove-StaleWefState {
+    $wefRoot = "HKCU:\Software\Microsoft\Office\16.0\WEF"
+    $cacheRoot = Join-Path `
+        $env:LOCALAPPDATA `
+        "Microsoft\Office\16.0\WEF\{96F651A8-A028-49B0-BA44-B9088B0ACC78}"
+
+    # 功能区（AppCommands）只由共享文件夹 (TrustedCatalog) 的「已添加」状态
+    # 驱动；旧的开发者旁加载直连（Wef\Developer）不会生成功能区，还会把同一
+    # 清单 Id 抢占过去。这里连根移除，让 Excel 只走共享文件夹路径。
+    $developerKey = Join-Path $wefRoot "Developer"
+    if (Test-Path $developerKey) {
+        Remove-Item -Path $developerKey -Recurse -Force
+    }
+
+    $stalePrefixes = @("developer", "\\localhost\", "\\127.0.0.1\")
+    $providersRoot = Join-Path $wefRoot "Providers"
+    if (Test-Path $providersRoot) {
+        foreach ($provider in Get-ChildItem $providersRoot) {
+            $uniqueId = (Get-ItemProperty `
+                -Path $provider.PSPath `
+                -Name "UniqueId" `
+                -ErrorAction SilentlyContinue).UniqueId
+            if ([string]::IsNullOrWhiteSpace($uniqueId)) {
+                continue
+            }
+            $stale = $false
+            foreach ($prefix in $stalePrefixes) {
+                if ($uniqueId.StartsWith(
+                    $prefix,
+                    [StringComparison]::OrdinalIgnoreCase
+                )) {
+                    $stale = $true
+                    break
+                }
+            }
+            if (-not $stale) {
+                continue
+            }
+            Remove-Item -Path $provider.PSPath -Recurse -Force
+
+            $hash = Get-WefProviderHash $uniqueId
+            $cacheDir = Join-Path $cacheRoot $hash
+            if (Test-Path -LiteralPath $cacheDir) {
+                Remove-Item -LiteralPath $cacheDir -Recurse -Force
+            }
+        }
+    }
+}
+
 $resolvedInstallDir = Resolve-ValidatedInstallDir $InstallDir
 $catalogDir = Join-Path $resolvedInstallDir "catalog"
 $manifestPath = Join-Path $catalogDir $manifestName
@@ -343,6 +486,8 @@ if ($Action -eq "Install") {
         Stop-ExcelBroRuntime
         Invoke-ElevatedShareAction -ShareAction Install -CatalogDir $catalogDir
         $shareCreated = $true
+        Remove-StaleWefState
+        Register-ExcelBroAddin $manifestPath
         Install-RootCertificate $certificatePath
         Remove-LegacyInstall $resolvedInstallDir
         Start-ExcelBroRuntime `
