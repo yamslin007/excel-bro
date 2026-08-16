@@ -15,10 +15,12 @@
     "react-dom": "^19.1.1"
   },
   "devDependencies": {
+    "@testing-library/react": "^16.3.2",
     "@types/office-js": "^1.0.545",
     "@types/react": "^19.1.10",
     "@types/react-dom": "^19.1.7",
     "@vitejs/plugin-react": "^4.7.0",
+    "jsdom": "^29.1.1",
     "office-addin-debugging": "^6.1.2",
     "office-addin-dev-certs": "^2.0.10",
     "typescript": "^5.9.2",
