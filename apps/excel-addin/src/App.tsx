@@ -8,40 +8,28 @@ import {
   type DragEvent
 } from "react";
 import {
-  checkHealth,
   checkIntent,
   streamAssistantResponse,
   createFolderSnapshot,
-  deleteModelConnection,
   executeFolderPlan,
   executeFolderQuery,
   generateFormula,
-  getModelSettings,
   isLocalServiceConnectionError,
-  listModels,
-  saveModelConnection,
-  setFormulaModel,
   selectFolder,
-  testModelConnection,
-  updateModelSettings
 } from "./api";
-import type { ModelOption, ServiceHealth } from "./api";
 import type {
   AnalysisPlan,
   FolderCatalog,
   FolderSelection,
   DataToolResult,
-  ExecutionUndoSnapshot,
   FormulaDictionarySheet,
   IntentCheckResponse,
   IntentClarification,
   IntentMemory,
   IntentOption,
   IntentScopeContext,
-  ModelSettings,
   QueryTableArguments,
   ResultContext,
-  UpsertModelConnectionRequest,
   VerificationReport,
   WorkbookSnapshot
 } from "./contracts";
@@ -60,7 +48,6 @@ import {
   PlanExecutionError,
   snapshotDataEpochs,
   toolSchemaFingerprintForSnapshot,
-  undoExecution,
   watchWorkbookStructureChanges
 } from "./excel";
 import {
@@ -68,16 +55,9 @@ import {
   executeQueryTableTool
 } from "./dataTools";
 import {
-  analyzeToolEligibility,
   createQueryTool,
   createTool,
-  deleteQueryTool,
-  deleteTool,
   instantiateTool,
-  loadQueryTools,
-  loadTools,
-  saveQueryTool,
-  saveTool,
   type SavedQueryTool,
   type SavedTool,
   type ToolParameter
@@ -93,7 +73,6 @@ import {
   type PendingImage
 } from "./imageAttachments";
 import { extractWorkbookDataPeriod } from "./workbookIdentity";
-import { chooseAvailableModel } from "./modelSelection";
 import capabilities from "../../../config/capabilities.json";
 import {
   currentModelCallCount,
@@ -107,50 +86,23 @@ import {
 import PetCompanion from "./PetCompanion";
 import { RuleManager } from "./RuleManager";
 import { SlashCommandAutocomplete, type SlashCommand } from "./SlashCommandAutocomplete";
+import { useActivityProgress, type ActivityLog, type ActivityProgress } from "./hooks/useActivityProgress";
+import { useConversation } from "./hooks/useConversation";
+import { useCopyFeedback } from "./hooks/useCopyFeedback";
+import { useExecutionApproval } from "./hooks/useExecutionApproval";
+import { useModelManagement } from "./hooks/useModelManagement";
+import { useServiceHealth } from "./hooks/useServiceHealth";
+import { useToolManagement } from "./hooks/useToolManagement";
+import { useUIState } from "./hooks/useUIState";
+import { useScopeSelection } from "./hooks/useScopeSelection";
+import { useUndoSnapshot } from "./hooks/useUndoSnapshot";
+import { folderSheetKey } from "./utils";
 
-type Status = "idle" | "scanning" | "planning" | "tooling" | "executing";
+export type { ActivityLog, ActivityProgress } from "./hooks/useActivityProgress";
+export type Status = "idle" | "scanning" | "planning" | "tooling" | "executing";
 type MessageRole = "assistant" | "user" | "system";
-type SourceMode = "workbook" | "folder";
-type WorkbookScopeMode = "auto" | "manual";
-type ToolDrawerView = "library" | "detail" | "run";
-type ToolDetailMode = "standard" | "expert";
-type PendingToolDeletion = {
-  kind: "workflow" | "query";
-  id: string;
-  name: string;
-};
-
-interface ActivityStep {
-  label: string;
-  elapsedMs: number;
-  // note：模型对这一步的真实判断（第一层，默认可见），例如「它把需求理解成了什么」。
-  note?: string;
-  // detail：原始明细（第二层，展开「查看详情」才显示），例如锁定的执行指令、结构化返回。
-  detail?: string;
-}
-
-interface ActivityProgress {
-  title: string;
-  detail: string;
-  completed: ActivityStep[];
-  startedAt: number;
-  lastStepAt: number;
-}
-
-interface ActivityLog {
-  steps: ActivityStep[];
-  totalMs: number;
-}
-
-interface ModelConnectionDraft {
-  id: string | null;
-  label: string;
-  baseUrl: string;
-  modelId: string;
-  apiKey: string;
-  clearApiKey: boolean;
-  supportsVision: boolean;
-}
+export type SourceMode = "workbook" | "folder";
+export type WorkbookScopeMode = "auto" | "manual";
 
 interface MessageClarification extends IntentClarification {
   turnId?: string;
@@ -162,7 +114,7 @@ interface MessageClarification extends IntentClarification {
   resolvedLabel?: string;
 }
 
-interface ChatMessage {
+export interface ChatMessage {
   id: string;
   role: MessageRole;
   text?: string;
@@ -179,13 +131,14 @@ interface ChatMessage {
   querySourceSheetNames?: string[];
   querySourceSheetIds?: string[];
   functionPreview?: FunctionPreview;
+  executedPlanId?: string;
   createdAt: string;
 }
 
 // /function 短链预览卡：两阶段。
 // phase=target：先确定写入单元格（预填智能建议，可改/可拾取），此时未生成公式。
 // phase=preview：已按目标首格生成，展示两版公式，可切换、确认写入。
-interface FunctionPreview {
+export interface FunctionPreview {
   phase: "target" | "preview";
   // 用户描述，target 阶段确认后据此调模型生成
   description: string;
@@ -230,8 +183,6 @@ interface ChatHistoryState {
 
 const CHAT_STORAGE_KEY = "excel-bro.chat.v4";
 const LEGACY_CHAT_STORAGE_KEY = "excel-bro.chat.v3";
-const MODEL_STORAGE_KEY = "excel-bro.model.v2";
-const PET_VISIBILITY_STORAGE_KEY = "excel-bro.pet.visibility.v1";
 const MAX_STORED_CONVERSATIONS =
   capabilities.conversation.maxStoredConversations;
 const MAX_MESSAGES_PER_CONVERSATION =
@@ -249,25 +200,6 @@ const INTENT_MAX_PRIOR_RESULT_ROWS =
   capabilities.intentContext.maxPriorResultRows;
 const COMPOSER_MAX_HEIGHT = 156;
 const COMPOSER_MIN_HEIGHT = 44;
-// 首次引导第一步「拉宽窗格」的阈值：窗格宽度达到该值即视为已拉宽，
-// 之后承接模型引导。与内联窄窗格判断共用，避免两处口径漂移。
-const PANE_WIDEN_THRESHOLD = 380;
-
-export function normalizePetVisibility(value: string | null): boolean {
-  return value !== "hidden";
-}
-
-function emptyModelConnectionDraft(): ModelConnectionDraft {
-  return {
-    id: null,
-    label: "",
-    baseUrl: "",
-    modelId: "",
-    apiKey: "",
-    clearApiKey: false,
-    supportsVision: false
-  };
-}
 
 function verificationSummary(report: VerificationReport): string {
   if (report.status === "verified") return "并通过独立验证";
@@ -429,28 +361,6 @@ function firstCellOfRange(address: string): string | null {
   const first = bare.split(":")[0]?.trim();
   if (!first || !/^\$?[A-Za-z]{1,3}\$?\d+$/.test(first)) return null;
   return first.replace(/\$/g, "");
-}
-
-// 复制文本到剪贴板：优先 navigator.clipboard，退化到 execCommand。
-async function copyTextToClipboard(text: string): Promise<boolean> {
-  try {
-    if (navigator.clipboard?.writeText) {
-      await navigator.clipboard.writeText(text);
-      return true;
-    }
-    const textarea = document.createElement("textarea");
-    textarea.value = text;
-    textarea.setAttribute("readonly", "");
-    textarea.style.position = "fixed";
-    textarea.style.opacity = "0";
-    document.body.appendChild(textarea);
-    textarea.select();
-    const copied = document.execCommand("copy");
-    textarea.remove();
-    return copied;
-  } catch {
-    return false;
-  }
 }
 
 // 列号 → 列字母（0→A, 25→Z, 26→AA）。
@@ -855,6 +765,8 @@ function actionLabel(action: AnalysisPlan["actions"][number]): string {
       return `在「${action.sheet}」${action.targetRange} 添加图片`;
     case "addShape":
       return `在「${action.sheet}」${action.targetRange} 添加形状`;
+    default:
+      return "未知操作";
   }
 }
 
@@ -867,25 +779,130 @@ export default function App() {
     Record<string, string>
   >({});
   const [draggingImage, setDraggingImage] = useState(false);
-  const [chatHistory, setChatHistory] =
-    useState<ChatHistoryState>(loadChatHistory);
+
+  // 对话管理（使用自定义 Hook）
+  const conversationHook = useConversation();
+  const {
+    chatHistory,
+    activeConversation,
+    messages,
+    pendingDeleteConversationId: pendingDeleteConvId,
+    setMessages,
+    newChat,
+    openConversation,
+    deleteConversation,
+    confirmDeleteConversation,
+    cancelDeleteConversation,
+    setChatHistory,
+    setPendingDeleteConversationId
+  } = conversationHook;
+
   const [status, setStatus] = useState<Status>("idle");
-  const [activity, setActivity] = useState<ActivityProgress | null>(null);
-  const [activitySeconds, setActivitySeconds] = useState(0);
-  const [serverOnline, setServerOnline] = useState(false);
-  const [serviceHealth, setServiceHealth] = useState<ServiceHealth | null>(null);
-  const [modelOptions, setModelOptions] = useState<ModelOption[]>([
-    {
-      id: "local",
-      label: "基础模式",
-      provider: "local",
-      available: true,
-      supportsVision: false
+  // 活动进度管理（自定义 Hook）
+  const activityHook = useActivityProgress({
+    onPersistLog: (log) => {
+      setMessages((messages) => {
+        const lastAssistantIndex = [...messages]
+          .reverse()
+          .findIndex((message) => message.role === "assistant");
+        if (lastAssistantIndex === -1) return messages;
+        const index = messages.length - 1 - lastAssistantIndex;
+        return messages.map((message, i) =>
+          i === index ? { ...message, activityLog: log } : message
+        );
+      });
     }
-  ]);
-  const [selectedModelId, setSelectedModelId] = useState(
-    () => localStorage.getItem(MODEL_STORAGE_KEY) ?? ""
-  );
+  });
+  const {
+    activity,
+    activitySeconds,
+    startActivity: beginActivity,
+    advanceActivity,
+    updateActivityDetail,
+    completeActivity: finishActivity
+  } = activityHook;
+
+  // 服务健康状态为模型管理提供模型目录刷新能力。
+  const serviceHealthHook = useServiceHealth();
+  const {
+    serverOnline,
+    serviceHealth,
+    modelOptions,
+    modelCatalogLoaded,
+    refreshServiceState,
+    markServerOnline,
+    markServerOffline
+  } = serviceHealthHook;
+
+  const modelManagementHook = useModelManagement({
+    refreshServiceHealth: refreshServiceState
+  });
+  const {
+    selectedModelId,
+    modelSettings,
+    apiKeyDraft,
+    showApiKey,
+    connectionDraft,
+    pendingDeleteConnectionId,
+    settingsSaving,
+    settingsTesting,
+    settingsLoading,
+    settingsFeedback,
+    modelGuideDismissed,
+    selectModel,
+    dismissModelGuide,
+    openSettings,
+    openConnectionCreator,
+    saveApiKey,
+    editModelConnection,
+    verifyConnection,
+    saveConnection,
+    removeConnection,
+    saveFormulaModel,
+    setApiKeyDraft,
+    setShowApiKey,
+    setConnectionDraft,
+    setPendingDeleteConnectionId,
+    setSettingsLoading,
+    setSettingsTesting,
+    setSettingsFeedback
+  } = modelManagementHook;
+
+  const toolManagementHook = useToolManagement({
+    workbook,
+    onToolDslCopyError: () => {
+      appendMessage({
+        role: "system",
+        text: "复制专家脚本失败，请手动选择脚本内容后复制。"
+      });
+    }
+  });
+  const {
+    tools,
+    queryTools,
+    selectedToolId,
+    selectedQueryToolId,
+    toolDrawerView,
+    toolDetailMode,
+    pendingToolDeletion,
+    copiedToolDslId,
+    toolParameterValues,
+    saveTool,
+    saveQueryTool,
+    requestToolDeletion,
+    confirmToolDeletion,
+    resetToolDrawer,
+    openWorkflowToolDetail,
+    openQueryToolDetail,
+    selectTool,
+    fieldOptions,
+    updateToolParameter,
+    copyToolDsl,
+    setToolDrawerView,
+    setToolDetailMode,
+    setPendingToolDeletion
+  } = toolManagementHook;
+
   const [contextOpen, setContextOpen] = useState(false);
   const [sheetSearch, setSheetSearch] = useState("");
 
@@ -894,79 +911,84 @@ export default function App() {
   const [slashFilter, setSlashFilter] = useState("");
   // slashMode：command=选一级命令；model=已进入 /model 的模型选择二级菜单。
   const [slashMode, setSlashMode] = useState<"command" | "model">("command");
-  const [composerHeight, setComposerHeight] = useState<number | null>(null);
-  const [tools, setTools] = useState<SavedTool[]>(loadTools);
-  const [queryTools, setQueryTools] =
-    useState<SavedQueryTool[]>(loadQueryTools);
-  const [toolsOpen, setToolsOpen] = useState(false);
-  const [historyOpen, setHistoryOpen] = useState(false);
-  const [settingsOpen, setSettingsOpen] = useState(false);
-  const [petVisible, setPetVisible] = useState(() =>
-    normalizePetVisibility(
-      localStorage.getItem(PET_VISIBILITY_STORAGE_KEY)
-    )
-  );
-  const [modelMenuOpen, setModelMenuOpen] = useState(false);
-  const [moreMenuOpen, setMoreMenuOpen] = useState(false);
-  const [focusOpening, setFocusOpening] = useState(false);
-  // 首次引导链路第一步「拉宽窗格」：窄窗格才需要，拉过阈值或跳过即视为完成，
-  // 之后承接模型引导。都是会话内 state——配好模型整条链路消失，无需持久化。
-  const [isNarrowPane, setIsNarrowPane] = useState(
-    () =>
-      typeof window !== "undefined" &&
-      window.innerWidth < PANE_WIDEN_THRESHOLD
-  );
-  const [widenStepDone, setWidenStepDone] = useState(false);
-  const [modelCatalogLoaded, setModelCatalogLoaded] = useState(false);
-  const [modelGuideDismissed, setModelGuideDismissed] = useState(false);
-  const [modelSettings, setModelSettings] = useState<ModelSettings | null>(null);
-  const [apiKeyDraft, setApiKeyDraft] = useState("");
-  const [isRuleManagerOpen, setIsRuleManagerOpen] = useState(false);
-  const [showApiKey, setShowApiKey] = useState(false);
-  const [settingsSaving, setSettingsSaving] = useState(false);
-  const [settingsTesting, setSettingsTesting] = useState(false);
-  const [settingsLoading, setSettingsLoading] = useState(false);
-  const [settingsFeedback, setSettingsFeedback] = useState("");
-  const [connectionDraft, setConnectionDraft] =
-    useState<ModelConnectionDraft | null>(null);
-  const [pendingDeleteConnectionId, setPendingDeleteConnectionId] =
-    useState<string | null>(null);
-  const [pendingDeleteConversationId, setPendingDeleteConversationId] =
-    useState<string | null>(null);
-  const [selectedToolId, setSelectedToolId] = useState<string | null>(null);
-  const [selectedQueryToolId, setSelectedQueryToolId] =
-    useState<string | null>(null);
-  const [toolDrawerView, setToolDrawerView] =
-    useState<ToolDrawerView>("library");
-  const [toolDetailMode, setToolDetailMode] =
-    useState<ToolDetailMode>("standard");
-  const [pendingToolDeletion, setPendingToolDeletion] =
-    useState<PendingToolDeletion | null>(null);
-  const [copiedToolDslId, setCopiedToolDslId] = useState<string | null>(null);
-  const [toolParameterValues, setToolParameterValues] = useState<
-    Record<string, string>
-  >({});
-  const [saveCandidate, setSaveCandidate] = useState<AnalysisPlan | null>(null);
-  const [approveFixedContent, setApproveFixedContent] = useState(false);
-  const [approveDestructive, setApproveDestructive] = useState(false);
-  const [verifiedPlanIds, setVerifiedPlanIds] = useState<Set<string>>(
-    () => new Set()
-  );
-  const [lastUndoSnapshot, setLastUndoSnapshot] =
-    useState<ExecutionUndoSnapshot | null>(null);
-  const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
-  const [copiedFunctionPreviewId, setCopiedFunctionPreviewId] = useState<
-    string | null
-  >(null);
-  const [toolName, setToolName] = useState("");
-  const [toolDescription, setToolDescription] = useState("");
-  const [selectedSheetNames, setSelectedSheetNames] = useState<string[]>([]);
-  const [selectionConfirmed, setSelectionConfirmed] = useState(false);
-  const [sourceMode, setSourceMode] = useState<SourceMode>("workbook");
-  const [workbookScopeMode, setWorkbookScopeMode] =
-    useState<WorkbookScopeMode>("auto");
-  const [folderCatalog, setFolderCatalog] = useState<FolderCatalog | null>(null);
-  const [folderSheetKeys, setFolderSheetKeys] = useState<string[]>([]);
+
+  // UI 状态管理
+  const {
+    toolsOpen, setToolsOpen,
+    historyOpen, setHistoryOpen,
+    settingsOpen, setSettingsOpen,
+    closeAllDrawers,
+    modelMenuOpen, setModelMenuOpen,
+    moreMenuOpen, setMoreMenuOpen,
+    isRuleManagerOpen, setIsRuleManagerOpen,
+    closeAllMenus,
+    petVisible, setPetVisible,
+    focusOpening, setFocusOpening,
+    isNarrowPane, setIsNarrowPane,
+    widenStepDone, setWidenStepDone,
+    composerHeight, setComposerHeight,
+    togglePetVisibility
+  } = useUIState();
+
+  // 执行验收与工具固化批准状态（自定义 Hook）
+  const {
+    saveCandidate,
+    setSaveCandidate,
+    approveFixedContent,
+    setApproveFixedContent,
+    approveDestructive,
+    setApproveDestructive,
+    verifiedPlanIds,
+    markPlanVerified,
+    saveEligibility,
+    beginSaveCandidate,
+    closeSaveCandidate
+  } = useExecutionApproval();
+  // 复制反馈状态与定时器（自定义 Hook）
+  const {
+    copiedMessageId,
+    copiedFunctionPreviewId,
+    copyMessageText,
+    copyFunctionFormula
+  } = useCopyFeedback({
+    onMessageCopyError: () => {
+      appendMessage({
+        role: "system",
+        text: "复制失败，请选中文字后手动复制。"
+      });
+    },
+    onFormulaCopyError: (messageId) => {
+      markFunctionPreview(messageId, {
+        targetError: "复制失败，请手动选择公式文本复制。"
+      });
+    }
+  });
+  // 数据范围与工具保存字段状态（自定义 Hook）
+  const {
+    toolName,
+    setToolName,
+    toolDescription,
+    setToolDescription,
+    selectedSheetNames,
+    setSelectedSheetNames,
+    selectionConfirmed,
+    setSelectionConfirmed,
+    sourceMode,
+    workbookScopeMode,
+    folderCatalog,
+    folderSheetKeys,
+    applyWorkbookSnapshotSelection,
+    toggleSheet,
+    toggleFolderSheet,
+    applyFolderCatalog,
+    chooseAutomaticScope,
+    chooseManualScope,
+    chooseFolderScope,
+    folderSelections,
+    selectedNamesFor,
+    selectAllSheets,
+    clearSelectedSheets
+  } = useScopeSelection();
   const messageEndRef = useRef<HTMLDivElement>(null);
   const composerInputRef = useRef<HTMLTextAreaElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
@@ -978,9 +1000,6 @@ export default function App() {
     startY: number;
     startHeight: number;
   } | null>(null);
-  const copyFeedbackTimerRef = useRef<number | null>(null);
-  const functionCopyTimerRef = useRef<number | null>(null);
-  const toolDslCopyTimerRef = useRef<number | null>(null);
   const focusDialogRef = useRef<Office.Dialog | null>(null);
   const queryAbortRef = useRef<AbortController | null>(null);
   // turnAbortRef：整个 turn（需求确认→本地取数→生成方案）共用的打断句柄。
@@ -1035,12 +1054,23 @@ export default function App() {
   );
 
   const busy = status !== "idle";
-  const activeConversation =
-    chatHistory.conversations.find(
-      (conversation) =>
-        conversation.id === chatHistory.activeConversationId
-    ) ?? chatHistory.conversations[0];
-  const messages = activeConversation?.messages ?? [];
+  // 撤销快照管理（自定义 Hook）
+  const {
+    lastUndoSnapshot,
+    setLastUndoSnapshot,
+    clearUndoSnapshot,
+    undoLastExecution
+  } = useUndoSnapshot({
+    isBusy: busy,
+    onStatusChange: setStatus,
+    onMessage: (text) => {
+      appendMessage({
+        role: "system",
+        text
+      });
+    },
+    onAfterUndo: () => scan()
+  });
   const selectedModel = useMemo(
     () =>
       modelOptions.find(
@@ -1076,10 +1106,6 @@ export default function App() {
     () => (workbook ? extractWorkbookDataPeriod(workbook.name) : null),
     [workbook]
   );
-  const saveEligibility = useMemo(
-    () => (saveCandidate ? analyzeToolEligibility(saveCandidate) : null),
-    [saveCandidate]
-  );
   const filteredWorksheets = useMemo(
     () => {
       const query = sheetSearch.trim().toLocaleLowerCase();
@@ -1090,107 +1116,6 @@ export default function App() {
     },
     [sheetSearch, workbook]
   );
-
-  function beginActivity(title: string, detail: string) {
-    const now = Date.now();
-    setActivity({
-      title,
-      detail,
-      completed: [],
-      startedAt: now,
-      lastStepAt: now
-    });
-    setActivitySeconds(0);
-  }
-
-  function togglePetVisibility() {
-    setPetVisible((current) => {
-      const next = !current;
-      try {
-        localStorage.setItem(
-          PET_VISIBILITY_STORAGE_KEY,
-          next ? "visible" : "hidden"
-        );
-      } catch {
-        // The preference remains active for this session if storage is blocked.
-      }
-      return next;
-    });
-  }
-
-  function advanceActivity(
-    title: string,
-    detail: string,
-    completedStep?: string,
-    // stepInsight：把模型对刚完成这步的判断（note）与原始明细（detail）一并记录，
-    // 让用户能看清模型「理解成了什么、锁定要做什么」，及时发现是否偏离轨迹。
-    stepInsight?: { note?: string; detail?: string }
-  ) {
-    setActivity((current) => {
-      const now = Date.now();
-      const startedAt = current?.startedAt ?? now;
-      const lastStepAt = current?.lastStepAt ?? startedAt;
-      const completed =
-        completedStep && completedStep.trim()
-          ? [
-              ...(current?.completed ?? []),
-              {
-                label: completedStep,
-                elapsedMs: now - lastStepAt,
-                note: stepInsight?.note,
-                detail: stepInsight?.detail
-              }
-            ]
-          : current?.completed ?? [];
-      return {
-        title,
-        detail,
-        completed,
-        startedAt,
-        lastStepAt: completedStep && completedStep.trim() ? now : lastStepAt
-      };
-    });
-  }
-
-  // 把当前 activity 的已完成步骤固化成一条日志，挂到最近一条 assistant 消息上，
-  // 让用户执行结束后仍能展开回看「做了哪些步骤、各花多久」。
-  function persistActivityLog() {
-    setActivity((current) => {
-      if (current && current.completed.length > 0) {
-        const log: ActivityLog = {
-          steps: current.completed,
-          totalMs: Date.now() - current.startedAt
-        };
-        setMessages((messages) => {
-          const lastAssistantIndex = [...messages]
-            .reverse()
-            .findIndex((message) => message.role === "assistant");
-          if (lastAssistantIndex === -1) return messages;
-          const index = messages.length - 1 - lastAssistantIndex;
-          return messages.map((message, i) =>
-            i === index ? { ...message, activityLog: log } : message
-          );
-        });
-      }
-      return null;
-    });
-    setActivitySeconds(0);
-  }
-
-  function finishActivity() {
-    persistActivityLog();
-  }
-
-  useEffect(() => {
-    if (!activity) return;
-    const updateElapsed = () =>
-      setActivitySeconds(
-        Math.max(0, Math.floor((Date.now() - activity.startedAt) / 1000))
-      );
-    updateElapsed();
-    const timer = window.setInterval(updateElapsed, 1000);
-    return () => window.clearInterval(timer);
-  }, [activity?.startedAt]);
 
   useEffect(() => {
     try {
@@ -1219,26 +1144,8 @@ export default function App() {
     messageEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  // 监听窗格宽度变化：用户把面板拖到 ≥PANE_WIDEN_THRESHOLD 即视为「拉宽」，
-  // 同时标记 isNarrowPane=false 并完成拉宽步，由 showModelGuide 承接下一步。
-  useEffect(() => {
-    const handleResize = () => {
-      const wide = window.innerWidth >= PANE_WIDEN_THRESHOLD;
-      setIsNarrowPane(!wide);
-      if (wide) setWidenStepDone(true);
-    };
-    window.addEventListener("resize", handleResize);
-    return () => window.removeEventListener("resize", handleResize);
-  }, []);
-
   useEffect(
     () => () => {
-      if (copyFeedbackTimerRef.current !== null) {
-        window.clearTimeout(copyFeedbackTimerRef.current);
-      }
-      if (toolDslCopyTimerRef.current !== null) {
-        window.clearTimeout(toolDslCopyTimerRef.current);
-      }
       focusDialogRef.current?.close();
       focusDialogRef.current = null;
     },
@@ -1330,73 +1237,6 @@ export default function App() {
     }
   }
 
-  async function copyMessage(message: ChatMessage) {
-    const text = message.text?.trim();
-    if (!text) return;
-    try {
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(text);
-      } else {
-        const textarea = document.createElement("textarea");
-        textarea.value = text;
-        textarea.setAttribute("readonly", "");
-        textarea.style.position = "fixed";
-        textarea.style.opacity = "0";
-        document.body.appendChild(textarea);
-        textarea.select();
-        const copied = document.execCommand("copy");
-        textarea.remove();
-        if (!copied) throw new Error("copy failed");
-      }
-      setCopiedMessageId(message.id);
-      if (copyFeedbackTimerRef.current !== null) {
-        window.clearTimeout(copyFeedbackTimerRef.current);
-      }
-      copyFeedbackTimerRef.current = window.setTimeout(() => {
-        setCopiedMessageId((current) =>
-          current === message.id ? null : current
-        );
-        copyFeedbackTimerRef.current = null;
-      }, 1600);
-    } catch {
-      appendMessage({
-        role: "system",
-        text: "复制失败，请选中文字后手动复制。"
-      });
-    }
-  }
-
-  function setMessages(
-    update:
-      | ChatMessage[]
-      | ((current: ChatMessage[]) => ChatMessage[])
-  ) {
-    setChatHistory((current) => {
-      const now = new Date().toISOString();
-      return {
-        ...current,
-        conversations: current.conversations.map((conversation) => {
-          if (conversation.id !== current.activeConversationId) {
-            return conversation;
-          }
-          const nextMessages =
-            typeof update === "function"
-              ? update(conversation.messages)
-              : update;
-          const trimmedMessages = nextMessages.slice(
-            -MAX_MESSAGES_PER_CONVERSATION
-          );
-          return {
-            ...conversation,
-            title: conversationTitle(trimmedMessages),
-            messages: trimmedMessages,
-            updatedAt: now
-          };
-        })
-      };
-    });
-  }
-
   async function scan(options?: { announce?: boolean }) {
     const diagnosticStartedAt = performance.now();
     setStatus("scanning");
@@ -1409,15 +1249,7 @@ export default function App() {
           )
         : demoWorkbook;
       setWorkbook(snapshot);
-      setSelectedSheetNames((current) => {
-        if (sourceMode === "workbook" && workbookScopeMode === "auto") {
-          return [snapshot.activeWorksheet];
-        }
-        const available = new Set(snapshot.worksheets.map((sheet) => sheet.name));
-        const preserved = current.filter((name) => available.has(name));
-        return preserved.length > 0 ? preserved : [snapshot.activeWorksheet];
-      });
-      setSelectionConfirmed(true);
+      applyWorkbookSnapshotSelection(snapshot);
       setContextOpen(false);
       if (options?.announce) {
         appendMessage({
@@ -1451,46 +1283,6 @@ export default function App() {
   }
 
   useEffect(() => {
-    let active = true;
-    async function refreshServiceState() {
-      const health = await checkHealth();
-      if (!active) return;
-      setServiceHealth(health);
-      setServerOnline(health !== null);
-      if (!health) return;
-      try {
-        const catalog = await listModels();
-        if (!active) return;
-        setModelOptions(catalog.models);
-        setModelCatalogLoaded(true);
-        setSelectedModelId((current) => {
-          const next = catalog.models.some(
-            (option) => option.id === current && option.available
-          )
-            ? current
-            : catalog.defaultModelId;
-          localStorage.setItem(MODEL_STORAGE_KEY, next);
-          return next;
-        });
-      } catch {
-        // The health indicator remains useful if an older service lacks /api/models.
-      }
-    }
-
-    void refreshServiceState();
-    const intervalId = window.setInterval(() => {
-      void refreshServiceState();
-    }, 5000);
-    const handleFocus = () => void refreshServiceState();
-    window.addEventListener("focus", handleFocus);
-    return () => {
-      active = false;
-      window.clearInterval(intervalId);
-      window.removeEventListener("focus", handleFocus);
-    };
-  }, []);
-
-  useEffect(() => {
     if (typeof Office === "undefined") {
       setWorkbook(demoWorkbook);
       setSelectedSheetNames([demoWorkbook.activeWorksheet]);
@@ -1502,14 +1294,15 @@ export default function App() {
       if (isRunningInExcel()) {
         dispose = await watchWorkbookStructureChanges(() => {
           setSelectionConfirmed(false);
-          setLastUndoSnapshot(null);
+          clearUndoSnapshot();
         });
       }
     });
     return () => dispose?.();
   }, []);
 
-  function newChat() {
+  // UI 协调包装函数（调用 Hook 的方法并处理 UI 状态）
+  function handleNewChat() {
     if (busy) return;
     setModelMenuOpen(false);
     setMoreMenuOpen(false);
@@ -1526,17 +1319,10 @@ export default function App() {
       setHistoryOpen(false);
       setToolsOpen(false);
       closeSettings();
-      setSaveCandidate(null);
+      closeSaveCandidate();
       return;
     }
-    const conversation = createConversation();
-    setChatHistory((current) => ({
-      activeConversationId: conversation.id,
-      conversations: [
-        conversation,
-        ...current.conversations
-      ].slice(0, MAX_STORED_CONVERSATIONS)
-    }));
+    conversationHook.newChat();
     setPrompt("");
     setPendingImages([]);
     setImageError("");
@@ -1544,42 +1330,24 @@ export default function App() {
     setHistoryOpen(false);
     setToolsOpen(false);
     closeSettings();
-    setSaveCandidate(null);
+    closeSaveCandidate();
   }
 
-  function openConversation(conversationId: string) {
+  function handleOpenConversation(conversationId: string) {
     if (busy) return;
-    setChatHistory((current) => ({
-      ...current,
-      activeConversationId: conversationId
-    }));
+    conversationHook.openConversation(conversationId);
     setPrompt("");
     setPendingImages([]);
     setImageError("");
     setContextOpen(false);
     setHistoryOpen(false);
     closeSettings();
-    setSaveCandidate(null);
+    closeSaveCandidate();
   }
 
-  function deleteConversation(conversationId: string) {
+  function handleDeleteConversation(conversationId: string) {
     if (busy) return;
-    if (
-      !chatHistory.conversations.some(
-        (conversation) => conversation.id === conversationId
-      )
-    ) {
-      return;
-    }
-    setPendingDeleteConversationId(conversationId);
-  }
-
-  function confirmDeleteConversation() {
-    if (!pendingDeleteConversationId) return;
-    setChatHistory((current) =>
-      deleteConversationFromHistory(current, pendingDeleteConversationId)
-    );
-    setPendingDeleteConversationId(null);
+    conversationHook.deleteConversation(conversationId);
   }
 
   function formatConversationTime(value: string): string {
@@ -1648,38 +1416,13 @@ export default function App() {
     void addImageFiles(files);
   }
 
-  function toggleSheet(sheetName: string) {
-    setSelectedSheetNames((current) =>
-      current.includes(sheetName)
-        ? current.filter((name) => name !== sheetName)
-        : [...current, sheetName]
-    );
-    setSelectionConfirmed(false);
-  }
-
-  function folderSheetKey(fileId: string, sheetName: string) {
-    return `${fileId}\u0000${sheetName}`;
-  }
-
-  function toggleFolderSheet(fileId: string, sheetName: string) {
-    const key = folderSheetKey(fileId, sheetName);
-    setFolderSheetKeys((current) =>
-      current.includes(key)
-        ? current.filter((item) => item !== key)
-        : [...current, key]
-    );
-    setSelectionConfirmed(false);
-  }
-
   async function browseFolder() {
     setStatus("scanning");
     try {
       const catalog = await selectFolder();
       if (!catalog) return;
-      setFolderCatalog(catalog);
-      setFolderSheetKeys([]);
-      setSelectionConfirmed(false);
-      setServerOnline(true);
+      applyFolderCatalog(catalog);
+      markServerOnline();
     } catch (reason) {
       appendMessage({
         role: "system",
@@ -1688,41 +1431,6 @@ export default function App() {
     } finally {
       setStatus("idle");
     }
-  }
-
-  function chooseAutomaticScope() {
-    setSourceMode("workbook");
-    setWorkbookScopeMode("auto");
-    if (workbook) setSelectedSheetNames([workbook.activeWorksheet]);
-    setSelectionConfirmed(true);
-  }
-
-  function chooseManualScope() {
-    setSourceMode("workbook");
-    setWorkbookScopeMode("manual");
-    if (selectedSheetNames.length === 0 && workbook) {
-      setSelectedSheetNames([workbook.activeWorksheet]);
-    }
-    setSelectionConfirmed(selectedSheetNames.length > 0 || workbook !== null);
-  }
-
-  function chooseFolderScope() {
-    setSourceMode("folder");
-    setSelectionConfirmed(folderSheetKeys.length > 0);
-  }
-
-  function folderSelections(): FolderSelection[] {
-    if (!folderCatalog) return [];
-    return folderCatalog.files
-      .map((file) => ({
-        fileId: file.id,
-        sheets: file.worksheets
-          .filter((sheet) =>
-            folderSheetKeys.includes(folderSheetKey(file.id, sheet.name))
-          )
-          .map((sheet) => sheet.name)
-      }))
-      .filter((selection) => selection.sheets.length > 0);
   }
 
   async function confirmSheetSelection() {
@@ -1752,15 +1460,6 @@ export default function App() {
     if (!workbook || selectedSheetNames.length === 0) return;
     setSelectionConfirmed(true);
     setContextOpen(false);
-  }
-
-  function selectedNamesFor(snapshot: WorkbookSnapshot): string[] {
-    if (sourceMode === "workbook" && workbookScopeMode === "auto") {
-      return [snapshot.activeWorksheet];
-    }
-    const available = new Set(snapshot.worksheets.map((sheet) => sheet.name));
-    const selected = selectedSheetNames.filter((name) => available.has(name));
-    return selected.length > 0 ? selected : [snapshot.activeWorksheet];
   }
 
   function buildIntentScope(
@@ -1801,6 +1500,7 @@ export default function App() {
         sourceMode === "folder" ? "folder" : workbookScopeMode,
       activeWorksheet: snapshot.activeWorksheet,
       selectedRange: snapshot.selectedRange ?? null,
+      worksheetNames: snapshot.worksheets.map((ws) => ws.name),
       totalWorksheetCount:
         sourceMode === "folder"
           ? Math.max(folderSheetCount, sheets.length)
@@ -1934,7 +1634,7 @@ export default function App() {
             )
         }
       );
-      setServerOnline(true);
+      markServerOnline();
       if (response.kind === "answer") {
         const querySourceSheetIds = currentWorksheets
           .map((sheet) => sheet.sourceSheetId)
@@ -2008,10 +1708,9 @@ export default function App() {
       }
       setPendingImages(sentImages);
       if (isLocalServiceConnectionError(reason)) {
-        setServerOnline(false);
-        setServiceHealth(null);
+        markServerOffline();
       } else {
-        setServerOnline(true);
+        markServerOnline();
       }
       appendMessage({
         role: "system",
@@ -2184,13 +1883,8 @@ export default function App() {
         {
           signal: controller.signal,
           onProgress: ({ scannedRows, totalRows, sheet }) => {
-            setActivity((current) =>
-              current
-                ? {
-                    ...current,
-                    detail: `正在读取「${sheet}」：${scannedRows.toLocaleString()} / ${totalRows.toLocaleString()} 行`
-                  }
-                : current
+            updateActivityDetail(
+              `正在读取「${sheet}」：${scannedRows.toLocaleString()} / ${totalRows.toLocaleString()} 行`
             );
           }
         }
@@ -2987,7 +2681,7 @@ export default function App() {
         priorResult: latestResultContext(messages),
         modelId: selectedModelId || null
       }, turnController.signal);
-      setServerOnline(true);
+      markServerOnline();
       setStatus("idle");
       const decision = describeIntentDecision(intent);
       advanceActivity(
@@ -3012,10 +2706,9 @@ export default function App() {
       }
       setPendingImages(sentImages);
       if (isLocalServiceConnectionError(reason)) {
-        setServerOnline(false);
-        setServiceHealth(null);
+        markServerOffline();
       } else {
-        setServerOnline(true);
+        markServerOnline();
       }
       appendMessage({
         role: "system",
@@ -3067,7 +2760,7 @@ export default function App() {
           verification: result.verification
         });
         if (result.verification.status === "verified") {
-          setVerifiedPlanIds((current) => new Set(current).add(plan.id));
+          markPlanVerified(plan.id);
         }
       } catch (reason) {
         appendMessage({
@@ -3117,7 +2810,7 @@ export default function App() {
       });
       setLastUndoSnapshot(result.undoSnapshot ?? null);
       if (result.verification.status === "verified") {
-        setVerifiedPlanIds((current) => new Set(current).add(plan.id));
+        markPlanVerified(plan.id);
       }
       await scan();
     } catch (reason) {
@@ -3197,32 +2890,6 @@ export default function App() {
       return { error: `「${raw}」不是有效的 A1 地址（如 E2 或 E2:E20）。` };
     }
     return { address };
-  }
-
-  // 复制当前版本公式到剪贴板，按钮短暂显示「已复制」。
-  async function copyFunctionFormula(message: ChatMessage) {
-    const preview = message.functionPreview;
-    if (!preview) return;
-    const formula =
-      preview.version === "modern"
-        ? preview.modernFormula
-        : preview.compatFormula;
-    if (!formula) return;
-    const copied = await copyTextToClipboard(formula);
-    if (!copied) {
-      markFunctionPreview(message.id, { targetError: "复制失败，请手动选择公式文本复制。" });
-      return;
-    }
-    setCopiedFunctionPreviewId(message.id);
-    if (functionCopyTimerRef.current !== null) {
-      window.clearTimeout(functionCopyTimerRef.current);
-    }
-    functionCopyTimerRef.current = window.setTimeout(() => {
-      setCopiedFunctionPreviewId((current) =>
-        current === message.id ? null : current
-      );
-      functionCopyTimerRef.current = null;
-    }, 1500);
   }
 
   // 拾取：即刻读当前工作表选区填入写入目标。用户先在表里选好，再点此按钮。
@@ -3355,33 +3022,10 @@ export default function App() {
     markFunctionPreview(message.id, { cancelled: true, pickingTarget: false });
   }
 
-  async function undoLastExecution() {
-    if (!lastUndoSnapshot || busy || !isRunningInExcel()) return;
-    setStatus("executing");
-    try {
-      await undoExecution(lastUndoSnapshot);
-      setLastUndoSnapshot(null);
-      appendMessage({
-        role: "system",
-        text: "已撤销上一次执行中记录的单元格值、公式和常用格式。"
-      });
-      await scan();
-    } catch (reason) {
-      appendMessage({
-        role: "system",
-        text: reason instanceof Error ? reason.message : "撤销上一次执行失败"
-      });
-    } finally {
-      setStatus("idle");
-    }
-  }
-
   function beginSaveTool(plan: AnalysisPlan) {
-    setSaveCandidate(plan);
+    beginSaveCandidate(plan);
     setToolName(plan.title);
     setToolDescription(plan.summary);
-    setApproveFixedContent(false);
-    setApproveDestructive(false);
   }
 
   function confirmSaveTool() {
@@ -3397,8 +3041,8 @@ export default function App() {
           destructive: approveDestructive
         }
       );
-      setTools(saveTool(tool));
-      setSaveCandidate(null);
+      saveTool(tool);
+      closeSaveCandidate();
       appendMessage({
         role: "system",
         text: `已把「${tool.name}」保存为参数化工作流。`
@@ -3409,146 +3053,6 @@ export default function App() {
         text: reason instanceof Error ? reason.message : "无法保存工具"
       });
     }
-  }
-
-  function selectTool(
-    tool: SavedTool,
-    snapshot: WorkbookSnapshot | null = workbook
-  ) {
-    setSelectedToolId(tool.id);
-    const available = new Set(
-      (snapshot?.worksheets ?? []).map((sheet) => sheet.name)
-    );
-    const fallback =
-      snapshot?.activeWorksheet ?? snapshot?.worksheets[0]?.name ?? "";
-    const suggestOutputName = (requested: string) => {
-      if (
-        ![...available].some(
-          (name) =>
-            name.toLocaleLowerCase() === requested.toLocaleLowerCase()
-        )
-      ) {
-        return requested;
-      }
-      for (let index = 2; index < 1000; index += 1) {
-        const suffix = ` (${index})`;
-        const candidate = `${requested.slice(0, 31 - suffix.length)}${suffix}`;
-        if (
-          ![...available].some(
-            (name) =>
-              name.toLocaleLowerCase() === candidate.toLocaleLowerCase()
-          )
-        ) {
-          return candidate;
-        }
-      }
-      return requested.slice(0, 27) + " 副本";
-    };
-    const values: Record<string, string> = {};
-    for (const parameter of tool.parameters) {
-      if (parameter.type === "worksheet") {
-        values[parameter.id] = available.has(parameter.defaultValue)
-          ? parameter.defaultValue
-          : fallback;
-      } else if (parameter.type === "outputWorksheet") {
-        values[parameter.id] = suggestOutputName(parameter.defaultValue);
-      }
-    }
-    for (const parameter of tool.parameters) {
-      if (parameter.type === "range") {
-        const source = parameter.sourceParameterId
-          ? values[parameter.sourceParameterId]
-          : "";
-        values[parameter.id] =
-          snapshot?.worksheets.find((sheet) => sheet.name === source)
-            ?.usedRange ??
-          parameter.defaultValue;
-      } else if (parameter.type !== "field") {
-        continue;
-      }
-      if (parameter.type === "field") {
-        const source = values[parameter.sourceParameterId];
-        const headers = (
-          snapshot?.worksheets.find((sheet) => sheet.name === source)
-            ?.headers ?? []
-        )
-          .map((header) => String(header ?? "").trim())
-          .filter(Boolean);
-        values[parameter.id] = parameter.defaultValue;
-        values[parameter.id] =
-          headers.find(
-            (header) =>
-              header.toLocaleLowerCase() ===
-              parameter.defaultValue.toLocaleLowerCase()
-          ) ?? "";
-      }
-    }
-    setToolParameterValues(values);
-  }
-
-  function fieldOptions(
-    tool: SavedTool,
-    parameter: Extract<ToolParameter, { type: "field" }>
-  ): string[] {
-    const sourceParameter = tool.parameters.find(
-      (candidate) => candidate.id === parameter.sourceParameterId
-    );
-    const sourceSheet =
-      toolParameterValues[parameter.sourceParameterId] ??
-      sourceParameter?.defaultValue;
-    const sheet = workbook?.worksheets.find(
-      (candidate) => candidate.name === sourceSheet
-    );
-    const detected = [
-      ...new Set(
-        (sheet?.headers ?? [])
-          .map((header) => String(header ?? "").trim())
-          .filter(Boolean)
-      )
-    ];
-    return detected.length > 0 ? detected : [parameter.defaultValue];
-  }
-
-  function updateToolParameter(
-    tool: SavedTool,
-    parameter: ToolParameter,
-    value: string
-  ) {
-    setToolParameterValues((current) => {
-      const next = { ...current, [parameter.id]: value };
-      if (parameter.type !== "worksheet") return next;
-      for (const candidate of tool.parameters) {
-        if (
-          candidate.type === "range" &&
-          candidate.sourceParameterId === parameter.id
-        ) {
-          next[candidate.id] =
-            workbook?.worksheets.find((sheet) => sheet.name === value)
-              ?.usedRange ??
-            candidate.defaultValue;
-          continue;
-        }
-        if (
-          candidate.type !== "field" ||
-          candidate.sourceParameterId !== parameter.id
-        ) {
-          continue;
-        }
-        const headers = (
-          workbook?.worksheets.find((sheet) => sheet.name === value)?.headers ??
-          []
-        )
-          .map((header) => String(header ?? "").trim())
-          .filter(Boolean);
-        next[candidate.id] =
-          headers.find(
-            (header) =>
-              header.toLocaleLowerCase() ===
-              candidate.defaultValue.toLocaleLowerCase()
-          ) ?? "";
-      }
-      return next;
-    });
   }
 
   function renderToolParameter(tool: SavedTool, parameter: ToolParameter) {
@@ -3768,59 +3272,8 @@ export default function App() {
     setMoreMenuOpen(false);
     setHistoryOpen(false);
     closeSettings();
-    setToolDrawerView("library");
-    setSelectedToolId(null);
-    setSelectedQueryToolId(null);
-    setToolDetailMode("standard");
-    setPendingToolDeletion(null);
+    resetToolDrawer();
     setToolsOpen(true);
-  }
-
-  function openWorkflowToolDetail(tool: SavedTool) {
-    setSelectedToolId(tool.id);
-    setSelectedQueryToolId(null);
-    setToolDetailMode("standard");
-    setToolDrawerView("detail");
-  }
-
-  function openQueryToolDetail(tool: SavedQueryTool) {
-    setSelectedQueryToolId(tool.id);
-    setSelectedToolId(null);
-    setToolDetailMode("standard");
-    setToolDrawerView("detail");
-  }
-
-  async function copyToolDsl(tool: SavedTool) {
-    const text = renderToolDsl(tool.planTemplate);
-    try {
-      if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(text);
-      } else {
-        const textarea = document.createElement("textarea");
-        textarea.value = text;
-        textarea.setAttribute("readonly", "");
-        textarea.style.position = "fixed";
-        textarea.style.opacity = "0";
-        document.body.appendChild(textarea);
-        textarea.select();
-        const copied = document.execCommand("copy");
-        textarea.remove();
-        if (!copied) throw new Error("copy failed");
-      }
-      setCopiedToolDslId(tool.id);
-      if (toolDslCopyTimerRef.current !== null) {
-        window.clearTimeout(toolDslCopyTimerRef.current);
-      }
-      toolDslCopyTimerRef.current = window.setTimeout(() => {
-        setCopiedToolDslId((current) => (current === tool.id ? null : current));
-        toolDslCopyTimerRef.current = null;
-      }, 1600);
-    } catch {
-      appendMessage({
-        role: "system",
-        text: "复制专家脚本失败，请手动选择脚本内容后复制。"
-      });
-    }
   }
 
   async function prepareToolRun(tool: SavedTool) {
@@ -3871,243 +3324,29 @@ export default function App() {
     setPendingDeleteConnectionId(null);
   }
 
-  async function openSettings(): Promise<boolean> {
+  async function handleOpenSettings(): Promise<boolean> {
     setModelMenuOpen(false);
     setMoreMenuOpen(false);
     setToolsOpen(false);
     setHistoryOpen(false);
     setSettingsOpen(true);
     setApiKeyDraft("");
-    setShowApiKey(false);
-    setSettingsFeedback("");
-    setConnectionDraft(null);
-    setPendingDeleteConnectionId(null);
-    setSettingsLoading(true);
-    try {
-      setModelSettings(await getModelSettings());
-      return true;
-    } catch (reason) {
-      setModelSettings(null);
-      setSettingsFeedback(
-        reason instanceof Error
-          ? reason.message
-          : "无法读取模型设置，请确认本地服务已经启动。"
-      );
-      return false;
-    } finally {
-      setSettingsLoading(false);
-    }
+    return await openSettings();
   }
 
-  async function openConnectionCreator() {
+  async function handleOpenConnectionCreator() {
     setModelMenuOpen(false);
-    if (await openSettings()) {
-      setConnectionDraft(emptyModelConnectionDraft());
-    }
+    setMoreMenuOpen(false);
+    setToolsOpen(false);
+    setHistoryOpen(false);
+    setSettingsOpen(true);
+    setApiKeyDraft("");
+    await openConnectionCreator();
   }
 
-  function selectModel(modelId: string) {
-    setSelectedModelId(modelId);
-    localStorage.setItem(MODEL_STORAGE_KEY, modelId);
+  function handleSelectModel(modelId: string) {
+    selectModel(modelId);
     setModelMenuOpen(false);
-  }
-
-  function dismissModelGuide() {
-    setModelGuideDismissed(true);
-  }
-
-  async function saveApiKey() {
-    const apiKey = apiKeyDraft.trim();
-    if (!apiKey) {
-      setSettingsFeedback("请输入新的 API Key。");
-      return;
-    }
-    setSettingsSaving(true);
-    setSettingsFeedback("");
-    try {
-      const saved = await updateModelSettings({ apiKey });
-      setModelSettings(saved);
-      setApiKeyDraft("");
-      setShowApiKey(false);
-      setSettingsFeedback("API Key 已保存并立即生效。");
-      const [health, catalog] = await Promise.all([
-        checkHealth(),
-        listModels()
-      ]);
-      setServiceHealth(health);
-      setServerOnline(health !== null);
-      setModelOptions(catalog.models);
-      setSelectedModelId((current) => {
-        const next = catalog.models.some(
-          (option) => option.id === current && option.available
-        )
-          ? current
-          : catalog.defaultModelId;
-        localStorage.setItem(MODEL_STORAGE_KEY, next);
-        return next;
-      });
-    } catch (reason) {
-      setSettingsFeedback(
-        reason instanceof Error ? reason.message : "API Key 保存失败。"
-      );
-    } finally {
-      setSettingsSaving(false);
-    }
-  }
-
-  function editModelConnection(connectionId: string) {
-    const connection = modelSettings?.connections.find(
-      (item) => item.id === connectionId
-    );
-    if (!connection) return;
-    setShowApiKey(false);
-    setConnectionDraft({
-      id: connection.id,
-      label: connection.label,
-      baseUrl: connection.baseUrl,
-      modelId: connection.modelId,
-      apiKey: "",
-      clearApiKey: false,
-      supportsVision: connection.supportsVision
-    });
-    setSettingsFeedback("");
-  }
-
-  async function refreshModelsAfterSettings(
-    saved: ModelSettings,
-    preferredModelId?: string
-  ) {
-    setModelSettings(saved);
-    const [health, catalog] = await Promise.all([
-      checkHealth(),
-      listModels()
-    ]);
-    setServiceHealth(health);
-    setServerOnline(health !== null);
-    setModelOptions(catalog.models);
-    setSelectedModelId((current) => {
-      const next = chooseAvailableModel(
-        catalog.models,
-        current,
-        catalog.defaultModelId,
-        preferredModelId
-      );
-      localStorage.setItem(MODEL_STORAGE_KEY, next);
-      return next;
-    });
-  }
-
-  function connectionRequest(): UpsertModelConnectionRequest | null {
-    if (!connectionDraft) return null;
-    const label = connectionDraft.label.trim();
-    const baseUrl = connectionDraft.baseUrl.trim();
-    const modelId = connectionDraft.modelId.trim();
-    if (!label || !baseUrl || !modelId) {
-      setSettingsFeedback("请填写连接名称、服务地址和模型 ID。");
-      return null;
-    }
-    return {
-      id: connectionDraft.id,
-      label,
-      baseUrl,
-      modelId,
-      apiKey: connectionDraft.apiKey.trim() || null,
-      clearApiKey: connectionDraft.clearApiKey,
-      supportsVision: connectionDraft.supportsVision
-    };
-  }
-
-  async function verifyConnection() {
-    const request = connectionRequest();
-    if (!request) return;
-    setSettingsTesting(true);
-    setSettingsFeedback("");
-    try {
-      const result = await testModelConnection(request);
-      setSettingsFeedback(result.message);
-    } catch (reason) {
-      setSettingsFeedback(
-        reason instanceof Error ? reason.message : "模型连接测试失败。"
-      );
-    } finally {
-      setSettingsTesting(false);
-    }
-  }
-
-  async function saveConnection() {
-    const request = connectionRequest();
-    if (!request || !connectionDraft) return;
-    const wasCreating = !connectionDraft.id;
-    const previousConnectionIds = new Set(
-      modelSettings?.connections.map((connection) => connection.id) ?? []
-    );
-    setSettingsSaving(true);
-    setSettingsFeedback("");
-    try {
-      const saved = await saveModelConnection(request);
-      const createdConnection = wasCreating
-        ? saved.connections.find(
-            (connection) => !previousConnectionIds.has(connection.id)
-          )
-        : null;
-      await refreshModelsAfterSettings(
-        saved,
-        createdConnection?.catalogModelId
-      );
-      setShowApiKey(false);
-      setConnectionDraft(null);
-      setSettingsFeedback(
-        wasCreating
-          ? "模型连接已添加，并已切换为当前模型。"
-          : "模型连接已更新。"
-      );
-    } catch (reason) {
-      setSettingsFeedback(
-        reason instanceof Error ? reason.message : "模型连接保存失败。"
-      );
-    } finally {
-      setSettingsSaving(false);
-    }
-  }
-
-  async function removeConnection(connectionId: string) {
-    setSettingsSaving(true);
-    setSettingsFeedback("");
-    try {
-      const saved = await deleteModelConnection(connectionId);
-      await refreshModelsAfterSettings(saved);
-      setPendingDeleteConnectionId(null);
-      setConnectionDraft((current) =>
-        current?.id === connectionId ? null : current
-      );
-      setSettingsFeedback("模型连接已删除。");
-    } catch (reason) {
-      setSettingsFeedback(
-        reason instanceof Error ? reason.message : "模型连接删除失败。"
-      );
-    } finally {
-      setSettingsSaving(false);
-    }
-  }
-
-  async function saveFormulaModel(modelId: string) {
-    setSettingsSaving(true);
-    setSettingsFeedback("");
-    try {
-      const saved = await setFormulaModel({ modelId });
-      await refreshModelsAfterSettings(saved);
-      setSettingsFeedback(
-        modelId
-          ? "/function 公式模型已更新。"
-          : "/function 公式模型已恢复为跟随全局选择。"
-      );
-    } catch (reason) {
-      setSettingsFeedback(
-        reason instanceof Error ? reason.message : "公式模型保存失败。"
-      );
-    } finally {
-      setSettingsSaving(false);
-    }
   }
 
   async function previewTool(tool: SavedTool) {
@@ -4182,7 +3421,7 @@ export default function App() {
       sourceIds,
       message.resultContext?.headers ?? []
     );
-    setQueryTools(saveQueryTool(tool));
+    saveQueryTool(tool);
     appendMessage({
       role: "system",
       text: `已保存固化查询「${tool.name}」。重复运行将直接使用本地执行器。`
@@ -4243,30 +3482,6 @@ export default function App() {
     }
   }
 
-  function requestToolDeletion(
-    kind: PendingToolDeletion["kind"],
-    tool: Pick<SavedTool | SavedQueryTool, "id" | "name">
-  ) {
-    setPendingToolDeletion({ kind, id: tool.id, name: tool.name });
-  }
-
-  function confirmToolDeletion() {
-    if (!pendingToolDeletion) return;
-    if (pendingToolDeletion.kind === "workflow") {
-      setTools(deleteTool(pendingToolDeletion.id));
-      setSelectedToolId((current) =>
-        current === pendingToolDeletion.id ? null : current
-      );
-    } else {
-      setQueryTools(deleteQueryTool(pendingToolDeletion.id));
-      setSelectedQueryToolId((current) =>
-        current === pendingToolDeletion.id ? null : current
-      );
-    }
-    setPendingToolDeletion(null);
-    setToolDrawerView("library");
-  }
-
   // 当输入内容变化时检测斜杠命令：仅当整段以 "/" 开头且尚未含空格时展开候选。
   function handleComposerChange(event: React.ChangeEvent<HTMLTextAreaElement>) {
     const value = event.target.value;
@@ -4295,7 +3510,7 @@ export default function App() {
   function handleSlashCommandSelect(value: string) {
     if (slashMode === "model") {
       // 模型选择：直接切换，清空输入框，关闭补全。
-      selectModel(value);
+      handleSelectModel(value);
       setPrompt("");
       setShowSlashAutocomplete(false);
     } else {
@@ -4456,7 +3671,7 @@ export default function App() {
                   aria-checked={option.id === (selectedModelId || "local")}
                   key={option.id}
                   disabled={!option.available}
-                  onClick={() => selectModel(option.id)}
+                  onClick={() => handleSelectModel(option.id)}
                 >
                   <i />
                   <span>{option.label}</span>
@@ -4467,14 +3682,14 @@ export default function App() {
                 <button
                   type="button"
                   role="menuitem"
-                  onClick={() => void openConnectionCreator()}
+                  onClick={() => void handleOpenConnectionCreator()}
                 >
                   ＋ 添加模型连接
                 </button>
                 <button
                   type="button"
                   role="menuitem"
-                  onClick={() => void openSettings()}
+                  onClick={() => void handleOpenSettings()}
                 >
                   管理模型连接
                 </button>
@@ -4505,7 +3720,7 @@ export default function App() {
                 <button
                   type="button"
                   className="primary"
-                  onClick={() => void openConnectionCreator()}
+                  onClick={() => void handleOpenConnectionCreator()}
                 >
                   现在添加
                 </button>
@@ -4516,7 +3731,7 @@ export default function App() {
         <div className="header-actions">
           <button
             className="header-button labeled-header-button new-chat-entry"
-            onClick={newChat}
+            onClick={handleNewChat}
             disabled={busy}
             title="新对话"
             aria-label="新对话"
@@ -4776,10 +3991,7 @@ export default function App() {
                   <button
                     type="button"
                     disabled={settingsSaving || !serverOnline}
-                    onClick={() => {
-                      setShowApiKey(false);
-                      setConnectionDraft(emptyModelConnectionDraft())
-                    }}
+                    onClick={() => void handleOpenConnectionCreator()}
                   >
                     ＋ 添加
                   </button>
@@ -5610,7 +4822,7 @@ export default function App() {
                   >
                     <button
                       className="history-open-button"
-                      onClick={() => openConversation(conversation.id)}
+                      onClick={() => handleOpenConversation(conversation.id)}
                       disabled={busy}
                     >
                       <span className="history-title-row">
@@ -5626,7 +4838,7 @@ export default function App() {
                     </button>
                     <button
                       className="history-delete-button"
-                      onClick={() => deleteConversation(conversation.id)}
+                      onClick={() => handleDeleteConversation(conversation.id)}
                       disabled={busy}
                       title={`删除「${conversation.title}」`}
                       aria-label={`删除「${conversation.title}」`}
@@ -5639,7 +4851,7 @@ export default function App() {
           </div>
           <button
             className="history-new-button"
-            onClick={newChat}
+            onClick={handleNewChat}
             disabled={busy}
           >
             ＋ 新建对话
@@ -5647,11 +4859,11 @@ export default function App() {
         </aside>
       )}
 
-      {pendingDeleteConversationId &&
+      {pendingDeleteConvId &&
         chatHistory.conversations
           .filter(
             (conversation) =>
-              conversation.id === pendingDeleteConversationId
+              conversation.id === pendingDeleteConvId
           )
           .map((conversation) => (
             <div
@@ -5671,7 +4883,7 @@ export default function App() {
                     <span>此操作无法撤销</span>
                   </div>
                   <button
-                    onClick={() => setPendingDeleteConversationId(null)}
+                    onClick={cancelDeleteConversation}
                     aria-label="关闭"
                   >
                     ×
@@ -5683,7 +4895,7 @@ export default function App() {
                 <div className="tool-dialog-actions">
                   <button
                     className="secondary-button"
-                    onClick={() => setPendingDeleteConversationId(null)}
+                    onClick={cancelDeleteConversation}
                   >
                     取消
                   </button>
@@ -6270,7 +5482,17 @@ export default function App() {
                           <button
                             className="secondary-button"
                             disabled={busy}
-                            onClick={() => void copyFunctionFormula(message)}
+                            onClick={() => {
+                              const preview = message.functionPreview;
+                              if (!preview) return;
+                              const formula =
+                                preview.version === "modern"
+                                  ? preview.modernFormula
+                                  : preview.compatFormula;
+                              if (formula) {
+                                void copyFunctionFormula(message.id, formula);
+                              }
+                            }}
                           >
                             {copiedFunctionPreviewId === message.id
                               ? "已复制"
@@ -6384,7 +5606,9 @@ export default function App() {
                         ? "消息已复制"
                         : "复制这条消息"
                     }
-                    onClick={() => void copyMessage(message)}
+                    onClick={() =>
+                      void copyMessageText(message.id, message.text?.trim() ?? "")
+                    }
                   >
                     {copiedMessageId === message.id ? (
                       <>
@@ -6513,7 +5737,7 @@ export default function App() {
                     ? "selected"
                     : ""
                 }
-                onClick={chooseAutomaticScope}
+                onClick={() => chooseAutomaticScope(workbook)}
               >
                 <i>◎</i>
                 <span>
@@ -6527,7 +5751,7 @@ export default function App() {
                     ? "selected"
                     : ""
                 }
-                onClick={chooseManualScope}
+                onClick={() => chooseManualScope(workbook)}
               >
                 <i>☷</i>
                 <span>
@@ -6537,7 +5761,7 @@ export default function App() {
               </button>
               <button
                 className={sourceMode === "folder" ? "selected" : ""}
-                onClick={chooseFolderScope}
+                onClick={() => chooseFolderScope()}
               >
                 <i>⌑</i>
                 <span>
@@ -6563,22 +5787,15 @@ export default function App() {
                 <div className="sheet-picker-toolbar">
                   <button
                     onClick={() => {
-                      setSelectedSheetNames((current) => [
-                        ...new Set([
-                          ...current,
-                          ...filteredWorksheets.map((sheet) => sheet.name)
-                        ])
-                      ]);
-                      setSelectionConfirmed(false);
+                      selectAllSheets(
+                        filteredWorksheets.map((sheet) => sheet.name)
+                      );
                     }}
                   >
                     全选搜索结果
                   </button>
                   <button
-                    onClick={() => {
-                      setSelectedSheetNames([]);
-                      setSelectionConfirmed(false);
-                    }}
+                    onClick={clearSelectedSheets}
                   >
                     清空
                   </button>
