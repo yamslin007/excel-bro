@@ -686,6 +686,17 @@ def _write_matrix(sheet, address: str, values: list[list[object]]) -> None:
             )
 
 
+def _force_text_if_formula(value: object) -> object:
+    """防公式注入：openpyxl 会把 "=..." 字符串当公式写入（data_type='f'）。
+
+    LLM 或外部数据可能把用户输入原样填进"值"单元格；对以 = 开头的字符串
+    加前导撇号强制按文本存储，避免值路径被注入可执行公式。
+    """
+    if isinstance(value, str) and value.startswith("="):
+        return "'" + value
+    return value
+
+
 def _folder_mode_unsupported(action_type: str) -> None:
     raise ValueError(
         f"文件夹模式暂不支持 {action_type}；请打开工作簿后在 Excel 内执行该动作"
@@ -1126,7 +1137,14 @@ def _verify_folder_plan(
                 passed = len(actual) == len(criterion.expected) and all(
                     len(actual_row) == len(expected_row)
                     and all(
-                        _values_equal(actual_value, expected_value)
+                        _values_equal(
+                            actual_value,
+                            (
+                                _force_text_if_formula(expected_value)
+                                if criterion.type == "rangeEquals"
+                                else expected_value
+                            ),
+                        )
                         for actual_value, expected_value in zip(
                             actual_row, expected_row
                         )
@@ -1806,10 +1824,17 @@ def _execute_folder_plan(request: FolderExecuteRequest) -> FolderExecuteResponse
                     sheet.cell(
                         row=start_row + row_offset,
                         column=start_column + column_offset,
-                        value=value,
+                        value=_force_text_if_formula(value),
                     )
         elif action.type == "writeValues":
-            _write_matrix(sheet, action.range, action.values)
+            _write_matrix(
+                sheet,
+                action.range,
+                [
+                    [_force_text_if_formula(v) for v in row]
+                    for row in action.values
+                ],
+            )
         elif action.type == "writeFormulas":
             _write_matrix(sheet, action.range, action.formulas)
         elif action.type == "clearRange":

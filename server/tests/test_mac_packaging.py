@@ -97,11 +97,11 @@ def test_runtime_uses_application_support_on_macos() -> None:
     assert 'Path.home() / "Library" / "Application Support" / "Excel Bro"' in script
 
 
-def test_workflow_builds_both_mac_architectures() -> None:
+def test_workflow_builds_arm64_mac_installer() -> None:
     workflow = _read(WORKFLOW_PATH)
 
-    assert "macos-13" in workflow
     assert "macos-14" in workflow
+    assert "arm64" in workflow
     assert "workflow_dispatch" in workflow
     assert "bash packaging/build_mac.sh" in workflow
     assert "dist/Excel-Bro-Setup-*.pkg" in workflow

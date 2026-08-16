@@ -33,6 +33,9 @@ INTENT_SYSTEM_PROMPT = """
 - 删除、覆盖、清空等高风险动作的目标是否明确。
 
 用户手动选中的工作表是默认且不可扩大的数据边界。不要建议读取未选中的工作表。
+数据范围摘要中的 worksheetNames 列出全部数据工作表名（不含系统表），仅供规划
+结构操作（删除、重命名等用户明确要求的工作表）；读取数据仍以 sheets 中的已选
+工作表为限。
 query_table 同时支持 sourceMode=workbook 和 sourceMode=folder；文件夹模式由受控
 pandas 工具读取用户已选择的文件和工作表。
 query_table 的 combine.deduplicate / combine.join 仅用于文件夹模式的多表去重或关联；

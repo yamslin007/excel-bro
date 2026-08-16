@@ -364,6 +364,7 @@ def _intent_payload(prompt: str, sheet_count: int = 2) -> dict[str, object]:
             "activeWorksheet": "恐怖游轮",
             "selectedRange": "恐怖游轮!A1:E19",
             "totalWorksheetCount": sheet_count,
+            "worksheetNames": [f"影片{index + 1}" for index in range(sheet_count)],
             "sheets": [
                 {
                     "name": f"影片{index + 1}",

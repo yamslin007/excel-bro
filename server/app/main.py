@@ -9,10 +9,10 @@ from datetime import datetime
 from typing import Any, AsyncIterator
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from .capabilities import capabilities
 from .intent import check_intent
@@ -78,18 +78,46 @@ app = FastAPI(
     description="Local planning and analysis service for the Excel Bro add-in.",
 )
 
+ALLOWED_ORIGINS = [
+    "https://localhost:3000",
+    "https://127.0.0.1:3000",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://localhost:3000",
-        "https://127.0.0.1:3000",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
     allow_methods=["DELETE", "GET", "POST", "PUT"],
     allow_headers=["Content-Type"],
 )
+
+
+@app.middleware("http")
+async def guard_state_changing_origins(request: Request, call_next):
+    """拦截跨站静默调用。
+
+    本地 API 无鉴权，任何本机进程都能直接调用；CORS 只限制浏览器「读取」
+    响应，并不阻止「发出」请求。恶意网页可用简单请求让服务改配置、删连接、
+    弹文件夹对话框等。浏览器发起的跨源请求必定带 Origin，这里对状态变更
+    方法校验 Origin 白名单；不带 Origin 的（curl、本机脚本、安装器健康检查）
+    放行——它们不是浏览器跨站攻击面。
+    """
+    if request.method in {"POST", "PUT", "DELETE"}:
+        origin = request.headers.get("origin")
+        if origin is not None and origin not in ALLOWED_ORIGINS:
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "detail": {
+                        "code": "FORBIDDEN_ORIGIN",
+                        "message": "请求来源不被允许",
+                        "retryable": False,
+                    }
+                },
+            )
+    return await call_next(request)
 
 _diagnostic_events: deque[dict[str, object]] = deque(maxlen=500)
 

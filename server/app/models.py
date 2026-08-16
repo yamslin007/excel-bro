@@ -8,6 +8,12 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, Field, StringConstraints, field_validator, model_validator
 
 from .capabilities import capability_int
+from .safety import (
+    base64_within_image_limit,
+    dangerous_formula,
+    dangerous_hyperlink_address,
+    max_image_bytes,
+)
 
 CellValue = str | int | float | bool | None
 SheetName = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=500)]
@@ -185,6 +191,14 @@ class WriteFormulasAction(BaseModel):
         width = len(self.formulas[0])
         if width == 0 or any(len(row) != width for row in self.formulas):
             raise ValueError("writeFormulas 必须是规则二维数组")
+        for row_index, row in enumerate(self.formulas):
+            for column_index, formula in enumerate(row):
+                matched = dangerous_formula(formula)
+                if matched is not None:
+                    raise ValueError(
+                        f"writeFormulas 第 {row_index + 1} 行第 {column_index + 1}"
+                        f" 列的公式包含被禁用的函数：{matched}"
+                    )
         return self
 
 
@@ -353,6 +367,13 @@ class SetHyperlinkAction(BaseModel):
     text: str | None = Field(default=None, max_length=500)
     screenTip: str | None = Field(default=None, max_length=500)
 
+    @model_validator(mode="after")
+    def validate_address(self) -> "SetHyperlinkAction":
+        matched = dangerous_hyperlink_address(self.address)
+        if matched is not None:
+            raise ValueError(f"超链接地址包含被禁用的注入载体：{matched}")
+        return self
+
 
 class AddCommentAction(BaseModel):
     type: Literal["addComment"]
@@ -468,6 +489,14 @@ class AddImageAction(BaseModel):
     base64: str = Field(min_length=1, max_length=8_000_000)
     targetRange: RangeAddress
     name: str | None = Field(default=None, max_length=255)
+
+    @model_validator(mode="after")
+    def validate_image_size(self) -> "AddImageAction":
+        if not base64_within_image_limit(self.base64):
+            raise ValueError(
+                f"内嵌图片超过 {max_image_bytes() // (1024 * 1024)} MB 上限"
+            )
+        return self
 
 
 class AddShapeAction(BaseModel):
@@ -1263,6 +1292,9 @@ class IntentScopeContext(BaseModel):
     activeWorksheet: str = Field(min_length=1, max_length=500)
     selectedRange: RangeAddress | None = None
     totalWorksheetCount: int = Field(ge=1, le=1000)
+    # 全部数据工作表名（不含 #EB_* 系统表）。sheets 只含已选表的数据，
+    # 结构操作（删除/重命名等）需引用 worksheetNames 才能规划。
+    worksheetNames: list[SheetName] = Field(min_length=1, max_length=1000)
     sheets: list[IntentSheetContext] = Field(min_length=1, max_length=100)
 
 

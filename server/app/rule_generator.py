@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from .llm import formula_model_config, selected_model_config
 from .llm.client import OpenAICompatibleClient
 from .capabilities import capability_float, capability_int
+from .safety import dangerous_formula
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +225,17 @@ async def generate_formula(request: GenerateFormulaRequest) -> GenerateFormulaRe
         modern_formula = "=" + modern_formula
     if not compat_formula.startswith("="):
         compat_formula = "=" + compat_formula
+
+    for label, formula in (
+        ("现代版", modern_formula),
+        ("兼容版", compat_formula),
+    ):
+        matched = dangerous_formula(formula)
+        if matched is not None:
+            raise ValueError(
+                f"{label}公式包含被禁用的函数：{matched}，已拒绝写入。"
+                "请重新描述需求，或手动输入该公式。"
+            )
 
     return GenerateFormulaResponse(
         modernFormula=modern_formula,

@@ -41,6 +41,16 @@ def capability_text(section: str, key: str) -> str:
     return value
 
 
+def capability_bool(section: str, key: str, default: bool = False) -> bool:
+    """读取布尔开关。缺失时用默认值（安全默认=False），存在但非 bool 时报错。"""
+    value = capabilities().get(section, {}).get(key)
+    if value is None:
+        return default
+    if not isinstance(value, bool):
+        raise RuntimeError(f"能力配置 {section}.{key} 必须是布尔值")
+    return value
+
+
 def model_timeout_seconds() -> float:
     """模型请求超时。环境变量 AI_TIMEOUT_SECONDS 优先，否则用 llm.timeoutSeconds。
 
