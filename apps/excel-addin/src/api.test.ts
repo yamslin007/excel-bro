@@ -303,6 +303,7 @@ describe("service discovery", () => {
           activeWorksheet: "Sheet1",
           selectedRange: "Sheet1!A1:C4",
           totalWorksheetCount: 1,
+          worksheetNames: ["Sheet1"],
           sheets: [
             {
               name: "Sheet1",
@@ -366,6 +367,7 @@ describe("service discovery", () => {
         selectionMode: "auto",
         activeWorksheet: "Sheet1",
         totalWorksheetCount: 1,
+        worksheetNames: ["Sheet1"],
         sheets: [
           {
             name: "Sheet1",

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { normalizeIntentKey, normalizePrompt } from "./App";
+import { normalizeIntentKey, normalizePrompt } from "./conversation";
 import type { IntentScopeContext, QueryTableArguments } from "./contracts";
 
 function scope(sheets: string[]): IntentScopeContext {
@@ -9,6 +9,7 @@ function scope(sheets: string[]): IntentScopeContext {
     selectionMode: "auto",
     activeWorksheet: sheets[0] ?? "Sheet1",
     totalWorksheetCount: sheets.length,
+    worksheetNames: sheets,
     sheets: sheets.map((name) => ({
       name,
       usedRange: `${name}!A1:B2`,

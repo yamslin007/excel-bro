@@ -3,7 +3,7 @@ import {
   deleteConversationFromHistory,
   normalizePetVisibility,
   normalizeStoredVerification
-} from "./App";
+} from "./conversation";
 
 function conversation(id: string, updatedAt: string) {
   return {

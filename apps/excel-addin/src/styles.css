@@ -3265,6 +3265,18 @@ textarea:focus-visible {
   cursor: default;
 }
 
+.undo-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+.undo-row-hint {
+  color: #8a948e;
+  font-size: var(--font-size-caption);
+}
+
 .activity-log-card summary {
   cursor: pointer;
   color: #6f7b73;
@@ -4146,6 +4158,44 @@ textarea:focus-visible {
   margin: 0 2px 2px;
   color: #a44534;
   font-size: var(--font-size-caption);
+}
+
+.composer-reply-chip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 1px 1px 2px;
+  padding: 5px 6px 5px 10px;
+  border: 1px solid #cfe3d4;
+  border-radius: 999px;
+  background: #eef6f0;
+  color: #2f4d39;
+  font-size: var(--font-size-caption);
+}
+
+.composer-reply-chip span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-reply-chip button {
+  display: grid;
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  place-items: center;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: #5f7567;
+  font-size: var(--font-size-caption);
+  cursor: pointer;
+}
+
+.composer-reply-chip button:hover {
+  background: #d9eadf;
+  color: #243a2c;
 }
 
 .composer-toolbar {

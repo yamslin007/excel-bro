@@ -32,20 +32,13 @@ async function loadRules(): Promise<Map<string, EBRule>> {
  * 执行规则
  */
 function executeRuleLogic(rule: EBRule, args: any[]): any {
-  // 预制规则直接执行
+  // 仅执行内置预制规则。曾经存在"用户自定义规则"分支（用 new Function 求值
+  // rule.compiled），已成为不可达死代码并构成任意代码执行隐患，已移除。
   const builtinFn = getBuiltinFunction(rule.name);
   if (builtinFn) {
     return builtinFn(...args);
   }
-
-  // 用户自定义规则：安全执行编译后的函数
-  try {
-    // 从 compiled 字符串创建函数
-    const fn = new Function('return ' + rule.compiled)();
-    return fn(...args);
-  } catch (error) {
-    throw new Error(`执行规则 "${rule.name}" 失败: ${error}`);
-  }
+  throw new Error(`规则 "${rule.name}" 不是内置预制规则，无法执行`);
 }
 
 /**

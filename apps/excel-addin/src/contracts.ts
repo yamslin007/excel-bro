@@ -447,6 +447,9 @@ export interface IntentScopeContext {
   activeWorksheet: string;
   selectedRange?: string | null;
   totalWorksheetCount: number;
+  // 全部数据工作表名（不含 #EB_* 系统表）。sheets 只含已选表的数据，结构操作
+  // （删除/重命名等用户明确要求的跨表改动）需引用 worksheetNames 才能规划。
+  worksheetNames: string[];
   sheets: IntentSheetContext[];
 }
 

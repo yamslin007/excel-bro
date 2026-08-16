@@ -25,6 +25,7 @@ import {
   displayCellValue,
   normalizeCellValue
 } from "./cellNormalization";
+import { assertSafeFormula, assertSafeHyperlink } from "./formulaSafety";
 import { resolveFilteredRowIndices } from "./dataTools";
 
 const DATA_ROW_LIMIT = capabilities.snapshot.dataRows;
@@ -38,7 +39,7 @@ const FINGERPRINT_CHUNK_CELLS =
   capabilities.queryTable.chunkRows * capabilities.queryTable.maxColumns;
 const SPLIT_AGGREGATE_BATCH_SHEETS =
   capabilities.excelExecution.splitAggregateBatchSheets;
-// EB 规则系统早期把规则存进这两张隐藏工作表（见 docs/EB_FUNCTIONS.md）。
+// EB 规则系统早期把规则存进这两张隐藏工作表（见 README「EB 函数」）。
 // 现已改为纯内置规则，代码不再读写它们，但用户的旧文件里可能残留。
 // 用精确名单过滤，避免误伤用户自己以 # 开头命名的正常表。
 const EB_SYSTEM_SHEETS = new Set(["#EB_RULES", "#EB_RULES_BACKUP"]);
@@ -492,6 +493,7 @@ export async function previewFormulaFirstCell(
 
     const original = cell.formulas as unknown[][];
 
+    assertSafeFormula(formula, `${firstCell} 的公式`);
     cell.formulas = [[formula]];
     await context.sync();
 
@@ -2829,6 +2831,18 @@ export async function executeAction(
       return;
     }
     case "writeFormulas": {
+      if (action.formulaR1C1) {
+        assertSafeFormula(action.formulaR1C1, `${action.range} 的公式`);
+      } else {
+        action.formulas.forEach((row, rowIndex) =>
+          row.forEach((formula, columnIndex) =>
+            assertSafeFormula(
+              formula,
+              `${action.range} 第 ${rowIndex + 1} 行第 ${columnIndex + 1} 列`
+            )
+          )
+        );
+      }
       const target = sheet.getRange(action.range);
       if (action.formulaR1C1) {
         // R1C1 与锚点无关：同一字符串铺满整个区域，相对引用逐格自动平移
@@ -3121,6 +3135,7 @@ export async function executeAction(
       if (action.columns > 0) sheet.freezePanes.freezeColumns(action.columns);
       return;
     case "setHyperlink":
+      assertSafeHyperlink(action.address, `${action.range} 的超链接`);
       sheet.getRange(action.range).hyperlink = {
         address: action.address,
         ...(action.text ? { textToDisplay: action.text } : {}),
