@@ -80,12 +80,23 @@ export function useImageAttachments() {
         return;
       }
 
-      // 按顺序添加图片（受数量限制）
-      for (const file of imageFiles) {
-        if (pendingImages.length >= MAX_IMAGE_ATTACHMENTS) {
-          setImageError(`最多只能上传 ${MAX_IMAGE_ATTACHMENTS} 张图片`);
-          break;
-        }
+      const remaining = Math.max(
+        0,
+        MAX_IMAGE_ATTACHMENTS - pendingImages.length
+      );
+      const acceptedFiles = imageFiles.slice(0, remaining);
+
+      if (acceptedFiles.length === 0) {
+        setImageError(`最多只能上传 ${MAX_IMAGE_ATTACHMENTS} 张图片`);
+        return;
+      }
+
+      if (acceptedFiles.length < imageFiles.length) {
+        setImageError(`最多只能上传 ${MAX_IMAGE_ATTACHMENTS} 张图片`);
+      }
+
+      // 按顺序添加图片（在拖入时已按当前状态截断，避免异步循环中状态过期）
+      for (const file of acceptedFiles) {
         await addImage(file);
       }
     },

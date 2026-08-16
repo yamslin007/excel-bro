@@ -238,25 +238,39 @@ export function useWorkbookContext() {
       return;
     }
 
+    let disposed = false;
     let dispose: (() => void) | undefined;
 
     Office.onReady(async () => {
+      if (disposed) return;
       try {
         await scan();
       } catch {
         // scan 内部已处理错误
       }
 
+      if (disposed) return;
+
       if (isRunningInExcel()) {
-        dispose = await watchWorkbookStructureChanges(() => {
+        const watcherDispose = await watchWorkbookStructureChanges(() => {
           setSelectionConfirmed(false);
           // 通知父组件：结构变化，需要清除撤销快照
           // 这部分逻辑由父组件通过监听 workbook 变化来处理
         });
+
+        if (disposed) {
+          watcherDispose?.();
+          return;
+        }
+
+        dispose = watcherDispose;
       }
     });
 
-    return () => dispose?.();
+    return () => {
+      disposed = true;
+      dispose?.();
+    };
   }, []); // 只在挂载时运行
 
   return {

@@ -127,21 +127,25 @@ export function useConversation() {
    * 只保存最近的 PERSISTED_MESSAGES_PER_CONVERSATION 条消息
    */
   useEffect(() => {
-    if (chatHistory.conversations.length === 0) {
-      localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(chatHistory));
-    } else {
-      const compact: ChatHistoryState = {
-        activeConversationId: chatHistory.activeConversationId,
-        conversations: chatHistory.conversations
-          .slice(0, MAX_STORED_CONVERSATIONS)
-          .map((conversation) => ({
-            ...conversation,
-            messages: conversation.messages.slice(
-              -PERSISTED_MESSAGES_PER_CONVERSATION
-            )
-          }))
-      };
-      localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(compact));
+    try {
+      if (chatHistory.conversations.length === 0) {
+        localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(chatHistory));
+      } else {
+        const compact: ChatHistoryState = {
+          activeConversationId: chatHistory.activeConversationId,
+          conversations: chatHistory.conversations
+            .slice(0, MAX_STORED_CONVERSATIONS)
+            .map((conversation) => ({
+              ...conversation,
+              messages: conversation.messages.slice(
+                -PERSISTED_MESSAGES_PER_CONVERSATION
+              )
+            }))
+        };
+        localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(compact));
+      }
+    } catch {
+      // 存储被浏览器阻止时，仅保持当前会话内存状态。
     }
   }, [chatHistory]);
 
