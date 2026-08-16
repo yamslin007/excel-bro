@@ -91,13 +91,13 @@ export function useImageAttachments() {
         return;
       }
 
-      if (acceptedFiles.length < imageFiles.length) {
-        setImageError(`最多只能上传 ${MAX_IMAGE_ATTACHMENTS} 张图片`);
-      }
-
       // 按顺序添加图片（在拖入时已按当前状态截断，避免异步循环中状态过期）
       for (const file of acceptedFiles) {
         await addImage(file);
+      }
+
+      if (acceptedFiles.length < imageFiles.length) {
+        setImageError(`最多只能上传 ${MAX_IMAGE_ATTACHMENTS} 张图片`);
       }
     },
     [pendingImages.length, addImage]
