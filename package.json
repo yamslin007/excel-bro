@@ -9,11 +9,17 @@
     "dev:addin": "npm run dev --workspace @excel-bro/addin",
     "build:addin": "npm run build --workspace @excel-bro/addin",
     "build:installer": "powershell -NoProfile -ExecutionPolicy Bypass -File packaging/build_installer.ps1",
+    "lint": "eslint apps/excel-addin/src --ext .ts,.tsx",
     "test:addin": "npm run test --workspace @excel-bro/addin",
     "start:excel": "npm run start:desktop --workspace @excel-bro/addin",
     "stop:excel": "npm run stop:desktop --workspace @excel-bro/addin",
     "dev:server": "python -m uvicorn server.app.main:app --host 127.0.0.1 --port 8765 --reload",
     "test:server": "python -m pytest server/tests",
     "test": "npm run test:addin && npm run test:server"
+  },
+  "devDependencies": {
+    "@typescript-eslint/parser": "^8.67.0",
+    "eslint": "^8.57.1",
+    "eslint-plugin-react-hooks": "^4.6.2"
   }
 }
