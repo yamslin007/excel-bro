@@ -32,7 +32,7 @@ npm run lint
 
 ### warning 清单
 
-1. `apps/excel-addin/src/App.tsx:1302`
+1. `apps/excel-addin/src/App.tsx:1235`
    - 规则：`react-hooks/exhaustive-deps`
    - 缺失依赖：`clearUndoSnapshot`, `scan`, `setSelectedSheetNames`,
      `setSelectionConfirmed`
