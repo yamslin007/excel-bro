@@ -12,6 +12,7 @@ import {
   type ToolParameter
 } from "../storage";
 import { renderToolDsl } from "../toolDsl";
+import { copyTextToClipboard } from "../utils";
 
 export type ToolDrawerView = "library" | "detail" | "run";
 export type ToolDetailMode = "standard" | "expert";
@@ -270,20 +271,9 @@ export function useToolManagement({
     async (tool: SavedTool) => {
       const text = renderToolDsl(tool.planTemplate);
       try {
-        if (navigator.clipboard?.writeText) {
-          await navigator.clipboard.writeText(text);
-        } else {
-          const textarea = document.createElement("textarea");
-          textarea.value = text;
-          textarea.setAttribute("readonly", "");
-          textarea.style.position = "fixed";
-          textarea.style.opacity = "0";
-          document.body.appendChild(textarea);
-          textarea.select();
-          const copied = document.execCommand("copy");
-          textarea.remove();
-          if (!copied) throw new Error("copy failed");
-        }
+        const copied = await copyTextToClipboard(text);
+        if (!copied) throw new Error("copy failed");
+
         setCopiedToolDslId(tool.id);
         if (toolDslCopyTimerRef.current !== null) {
           window.clearTimeout(toolDslCopyTimerRef.current);
