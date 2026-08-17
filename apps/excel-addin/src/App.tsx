@@ -5235,6 +5235,22 @@ export default function App() {
                   )}
                 </div>
               )}
+              {message.executedPlanId &&
+                lastUndoSnapshot?.planId === message.executedPlanId && (
+                  <div className="undo-row">
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      disabled={busy}
+                      onClick={() => void undoLastExecution()}
+                    >
+                      ↶ 撤销本次执行
+                    </button>
+                    <span className="undo-row-hint">
+                      只保留最近一次执行的撤销数据
+                    </span>
+                  </div>
+                )}
               {message.functionPreview &&
                 message.functionPreview.phase === "target" && (
                   <div className="inline-plan">
