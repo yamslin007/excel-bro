@@ -6,6 +6,7 @@ import type {
 } from "../contracts";
 import type { SourceMode, WorkbookScopeMode } from "../types/workbook";
 import { folderSheetKey } from "../utils";
+import { isEBSystemSheet } from "../excel";
 
 /**
  * 数据范围与工具保存字段 Hook
@@ -59,6 +60,27 @@ export function useScopeSelection() {
       current.includes(key)
         ? current.filter((item) => item !== key)
         : [...current, key]
+    );
+    setSelectionConfirmed(false);
+  }, []);
+
+  const selectAllSheetsInFile = useCallback((fileId: string) => {
+    if (!folderCatalog) return;
+    const file = folderCatalog.files.find(
+      (candidate) => candidate.id === fileId
+    );
+    if (!file) return;
+    const keys = file.worksheets
+      .filter((sheet) => !isEBSystemSheet(sheet.name))
+      .map((sheet) => folderSheetKey(fileId, sheet.name));
+    setFolderSheetKeys((current) => [...new Set([...current, ...keys])]);
+    setSelectionConfirmed(false);
+  }, [folderCatalog]);
+
+  const clearSheetsInFile = useCallback((fileId: string) => {
+    const prefix = folderSheetKey(fileId, "");
+    setFolderSheetKeys((current) =>
+      current.filter((key) => !key.startsWith(prefix))
     );
     setSelectionConfirmed(false);
   }, []);
@@ -165,6 +187,8 @@ export function useScopeSelection() {
     applyWorkbookSnapshotSelection,
     toggleSheet,
     toggleFolderSheet,
+    selectAllSheetsInFile,
+    clearSheetsInFile,
     applyFolderCatalog,
     chooseAutomaticScope,
     chooseManualScope,

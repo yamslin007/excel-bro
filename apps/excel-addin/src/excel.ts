@@ -44,7 +44,7 @@ const SPLIT_AGGREGATE_BATCH_SHEETS =
 // 用精确名单过滤，避免误伤用户自己以 # 开头命名的正常表。
 const EB_SYSTEM_SHEETS = new Set(["#EB_RULES", "#EB_RULES_BACKUP"]);
 
-function isEBSystemSheet(name: string): boolean {
+export function isEBSystemSheet(name: string): boolean {
   return EB_SYSTEM_SHEETS.has(name);
 }
 

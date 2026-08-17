@@ -7,6 +7,7 @@ import type {
   WorksheetSnapshot
 } from "./contracts";
 import { folderSheetKey } from "./utils";
+import { isEBSystemSheet } from "./excel";
 import type { Status } from "./types/chat";
 import type { SourceMode, WorkbookScopeMode } from "./types/workbook";
 
@@ -32,6 +33,8 @@ interface ScopePopoverProps {
   folderCatalog: FolderCatalog | null;
   folderSheetKeys: string[];
   toggleFolderSheet: (fileId: string, sheetName: string) => void;
+  selectAllSheetsInFile: (fileId: string) => void;
+  clearSheetsInFile: (fileId: string) => void;
   scan: (options?: { announce?: boolean }) => Promise<void>;
   status: Status;
   confirmSheetSelection: () => Promise<void>;
@@ -59,6 +62,8 @@ export default function ScopePopover({
   folderCatalog,
   folderSheetKeys,
   toggleFolderSheet,
+  selectAllSheetsInFile,
+  clearSheetsInFile,
   scan,
   status,
   confirmSheetSelection
@@ -218,37 +223,59 @@ export default function ScopePopover({
 
               {folderCatalog && (
                 <div className="folder-file-list">
-                  {folderCatalog.files.map((file) => (
-                    <div className="folder-file" key={file.id}>
-                      <strong>{file.relativePath}</strong>
-                      {file.error ? (
-                        <small className="file-error">{file.error}</small>
-                      ) : (
-                        <div className="sheet-picker-options">
-                          {file.worksheets.map((sheet) => {
-                            const selected = folderSheetKeys.includes(
-                              folderSheetKey(file.id, sheet.name)
-                            );
-                            return (
+                  {folderCatalog.files.map((file) => {
+                    const selectableSheets = file.worksheets.filter(
+                      (sheet) => !isEBSystemSheet(sheet.name)
+                    );
+                    return (
+                      <div className="folder-file" key={file.id}>
+                        <strong>{file.relativePath}</strong>
+                        {file.error ? (
+                          <small className="file-error">{file.error}</small>
+                        ) : (
+                          <>
+                            <div className="sheet-picker-toolbar">
                               <button
-                                key={sheet.name}
-                                className={selected ? "selected" : ""}
-                                onClick={() =>
-                                  toggleFolderSheet(file.id, sheet.name)
-                                }
-                                aria-pressed={selected}
+                                onClick={() => selectAllSheetsInFile(file.id)}
                               >
-                                <span>{sheet.name}</span>
-                                <small>
-                                  {sheet.rowCount} 行 · {sheet.columnCount} 列
-                                </small>
+                                全选本文件
                               </button>
-                            );
-                          })}
-                        </div>
-                      )}
-                    </div>
-                  ))}
+                              <button
+                                onClick={() => clearSheetsInFile(file.id)}
+                              >
+                                清空本文件
+                              </button>
+                            </div>
+                            <div className="sheet-picker-options">
+                              {selectableSheets.map((sheet) => {
+                                const selected = folderSheetKeys.includes(
+                                  folderSheetKey(file.id, sheet.name)
+                                );
+                                return (
+                                  <button
+                                    key={sheet.name}
+                                    className={selected ? "selected" : ""}
+                                    onClick={() =>
+                                      toggleFolderSheet(file.id, sheet.name)
+                                    }
+                                    aria-pressed={selected}
+                                  >
+                                    <span>{sheet.name}</span>
+                                    <small>
+                                      {sheet.rowCount} 行 · {sheet.columnCount} 列
+                                    </small>
+                                  </button>
+                                );
+                              })}
+                              {selectableSheets.length === 0 && (
+                                <p>没有可选工作表</p>
+                              )}
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
               )}
             </div>
