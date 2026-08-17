@@ -14,9 +14,7 @@ import { folderSheetKey } from "../utils";
 import { demoWorkbook } from "../demo";
 import { extractWorkbookDataPeriod } from "../workbookIdentity";
 import type { DiagnosticEvent } from "../diagnostics";
-
-export type SourceMode = "workbook" | "folder";
-export type WorkbookScopeMode = "auto" | "manual";
+import type { SourceMode, WorkbookScopeMode } from "../types/workbook";
 
 /**
  * 工作簿上下文管理 Hook

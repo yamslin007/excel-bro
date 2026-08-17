@@ -1,5 +1,5 @@
 // 意图 / 需求确认相关的纯函数（从 App.tsx 抽出）。
-import type { ChatMessage } from "./App";
+import type { ChatMessage } from "./types/chat";
 import type {
   FormulaDictionarySheet,
   IntentCheckResponse,

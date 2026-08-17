@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect } from "react";
-import type { ChatMessage } from "../App";
+import type { ChatMessage, ChatHistoryState } from "../types/chat";
 import {
   loadChatHistory,
   createConversation,
@@ -9,7 +9,6 @@ import {
   MAX_MESSAGES_PER_CONVERSATION,
   MAX_STORED_CONVERSATIONS,
   PERSISTED_MESSAGES_PER_CONVERSATION,
-  type ChatHistoryState
 } from "../conversation";
 
 /**

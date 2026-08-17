@@ -7,7 +7,8 @@ import type {
   WorksheetSnapshot
 } from "./contracts";
 import { folderSheetKey } from "./utils";
-import type { SourceMode, Status, WorkbookScopeMode } from "./App";
+import type { Status } from "./types/chat";
+import type { SourceMode, WorkbookScopeMode } from "./types/workbook";
 
 interface ScopePopoverProps {
   contextOpen: boolean;

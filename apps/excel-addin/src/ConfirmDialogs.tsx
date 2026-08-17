@@ -3,7 +3,7 @@
 import type { Dispatch, SetStateAction } from "react";
 import type { AnalysisPlan } from "./contracts";
 import type { ToolEligibility } from "./storage";
-import type { ChatHistoryState } from "./conversation";
+import type { ChatHistoryState } from "./types/chat";
 import type { PendingToolDeletion } from "./hooks/useToolManagement";
 
 interface ConfirmDialogsProps {

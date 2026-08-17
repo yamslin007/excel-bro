@@ -1,24 +1,15 @@
 // 对话 / 历史相关的纯函数与常量（从 App.tsx 抽出，避免单文件过大的维护负担）。
-import type { ChatMessage } from "./App";
+import type {
+  ChatConversation,
+  ChatHistoryState,
+  ChatMessage
+} from "./types/chat";
 import type {
   QueryTableArguments,
   IntentScopeContext,
   VerificationReport
 } from "./contracts";
 import capabilities from "../../../config/capabilities.json";
-
-export interface ChatConversation {
-  id: string;
-  title: string;
-  messages: ChatMessage[];
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface ChatHistoryState {
-  activeConversationId: string;
-  conversations: ChatConversation[];
-}
 
 export const CHAT_STORAGE_KEY = "excel-bro.chat.v4";
 export const LEGACY_CHAT_STORAGE_KEY = "excel-bro.chat.v3";

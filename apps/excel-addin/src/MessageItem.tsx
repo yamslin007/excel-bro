@@ -7,12 +7,12 @@ import type {
   IntentOption
 } from "./contracts";
 import { actionLabel, formatGenerateMs, formatStepElapsed } from "./format";
+import type { ActivityProgress } from "./hooks/useActivityProgress";
 import type {
-  ActivityProgress,
   ChatMessage,
   FunctionPreview,
   Status
-} from "./App";
+} from "./types/chat";
 
 interface MessageItemProps {
   messages: ChatMessage[];

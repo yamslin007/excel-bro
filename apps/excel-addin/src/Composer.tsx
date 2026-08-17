@@ -20,7 +20,7 @@ import type {
   FolderCatalog,
   WorkbookSnapshot
 } from "./contracts";
-import type { SourceMode, WorkbookScopeMode } from "./App";
+import type { SourceMode, WorkbookScopeMode } from "./types/workbook";
 
 interface ComposerProps {
   contextOpen: boolean;

@@ -4,7 +4,7 @@ import type {
   FolderSelection,
   WorkbookSnapshot
 } from "../contracts";
-import type { SourceMode, WorkbookScopeMode } from "../App";
+import type { SourceMode, WorkbookScopeMode } from "../types/workbook";
 import { folderSheetKey } from "../utils";
 
 /**

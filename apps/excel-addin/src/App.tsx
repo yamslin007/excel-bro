@@ -33,6 +33,14 @@ import type {
   VerificationReport,
   WorkbookSnapshot
 } from "./contracts";
+import type {
+  ChatConversation,
+  ChatHistoryState,
+  ChatMessage,
+  FunctionPreview,
+  Status
+} from "./types/chat";
+import type { SourceMode, WorkbookScopeMode } from "./types/workbook";
 import { demoWorkbook } from "./demo";
 import {
   captureSelectionContext,
@@ -99,86 +107,11 @@ import { useUndoSnapshot } from "./hooks/useUndoSnapshot";
 import { folderSheetKey } from "./utils";
 
 export type { ActivityLog, ActivityProgress } from "./hooks/useActivityProgress";
-export type Status = "idle" | "scanning" | "planning" | "tooling" | "executing";
-type MessageRole = "assistant" | "user" | "system";
-export type SourceMode = "workbook" | "folder";
-export type WorkbookScopeMode = "auto" | "manual";
-
-interface MessageClarification extends IntentClarification {
-  turnId?: string;
-  originalPrompt: string;
-  scopeFingerprint: string;
-  hadImages?: boolean;
-  round: number;
-  status: "pending" | "resolving" | "resolved" | "cancelled" | "invalidated";
-  resolvedLabel?: string;
-}
-
-export interface ChatMessage {
-  id: string;
-  role: MessageRole;
-  text?: string;
-  attachmentNames?: string[];
-  plan?: AnalysisPlan;
-  resultContext?: ResultContext;
-  intentMemory?: IntentMemory;
-  verification?: VerificationReport;
-  clarification?: MessageClarification;
-  activityLog?: ActivityLog;
-  reused?: boolean;
-  provider?: "model" | "local";
-  querySourceMode?: SourceMode;
-  querySourceSheetNames?: string[];
-  querySourceSheetIds?: string[];
-  functionPreview?: FunctionPreview;
-  executedPlanId?: string;
-  createdAt: string;
-}
-
-// /function 短链预览卡：两阶段。
-// phase=target：先确定写入单元格（预填智能建议，可改/可拾取），此时未生成公式。
-// phase=preview：已按目标首格生成，展示两版公式，可切换、确认写入。
-export interface FunctionPreview {
-  phase: "target" | "preview";
-  // 用户描述，target 阶段确认后据此调模型生成
-  description: string;
-  sheet: string;
-  // 写入目标：裸 A1 地址（E2 / E2:E20），生成/试算/写入统一锚在其首格
-  writeTarget: string;
-  pickingTarget?: boolean;
-  targetError?: string;
-  // 以下 preview 阶段才有值
-  version: "modern" | "compat";
-  modernFormula: string;
-  modernExplanation: string;
-  modernResult: string;
-  compatFormula: string;
-  compatExplanation: string;
-  compatResult: string;
-  appliedTarget?: string;
-  applied?: boolean;
-  cancelled?: boolean;
-  // 生成耗时（毫秒）：从调模型到两版公式试算完成，preview 阶段才有值
-  generateMs?: number;
-}
 
 // 生成耗时格式化：<1s 显示毫秒，否则显示秒（保留一位小数）。
 function formatGenerateMs(ms: number): string {
   if (ms < 1000) return `${ms} 毫秒`;
   return `${(ms / 1000).toFixed(1)} 秒`;
-}
-
-interface ChatConversation {
-  id: string;
-  title: string;
-  messages: ChatMessage[];
-  createdAt: string;
-  updatedAt: string;
-}
-
-interface ChatHistoryState {
-  activeConversationId: string;
-  conversations: ChatConversation[];
 }
 
 const CHAT_STORAGE_KEY = "excel-bro.chat.v4";

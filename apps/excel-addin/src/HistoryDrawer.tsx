@@ -1,7 +1,7 @@
 // 历史对话抽屉：按更新时间排序展示会话，可打开 / 新建 / 删除。
 // 纯展示组件，JSX 与 formatConversationTime 从 App.tsx 逐字搬移。
 import type { Dispatch, SetStateAction } from "react";
-import type { ChatHistoryState } from "./conversation";
+import type { ChatHistoryState } from "./types/chat";
 
 interface HistoryDrawerProps {
   historyOpen: boolean;
