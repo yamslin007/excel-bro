@@ -2739,7 +2739,8 @@ export default function App() {
             ? `已记录 ${result.undoSnapshot.ranges.length} 项本次执行撤销数据。`
             : ""
         }原始工作表没有被删除或清空。`,
-        verification: result.verification
+        verification: result.verification,
+        executedPlanId: plan.id
       });
       setLastUndoSnapshot(result.undoSnapshot ?? null);
       if (result.verification.status === "verified") {
@@ -5995,16 +5996,6 @@ export default function App() {
                   </svg>
                   <span>图片</span>
                 </button>
-                {lastUndoSnapshot && (
-                  <button
-                    className="attach-image-button"
-                    disabled={busy}
-                    onClick={() => void undoLastExecution()}
-                    title="撤销上一次 Excel Bro 执行"
-                  >
-                    ↶ <span>撤销</span>
-                  </button>
-                )}
               </div>
               {busy ? (
                 // 运行中：有字=转向（带话打断重跑），无字=纯停止。
