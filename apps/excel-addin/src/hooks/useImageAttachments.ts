@@ -123,9 +123,11 @@ export function useImageAttachments() {
     e.preventDefault();
     e.stopPropagation();
 
-    // 只有真正离开 textarea 时才取消高亮
-    // relatedTarget 为 null 表示离开了文档
-    if (!e.currentTarget.contains(e.relatedTarget as Node)) {
+    // 只有真正离开 textarea 时才取消高亮。
+    // relatedTarget 为 null 表示离开了文档；非 Node 类型不参与 contains 判断。
+    const relatedTarget =
+      e.relatedTarget instanceof Node ? e.relatedTarget : null;
+    if (!e.currentTarget.contains(relatedTarget)) {
       setDraggingImage(false);
     }
   }, []);
