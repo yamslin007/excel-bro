@@ -22,11 +22,13 @@ export function useCopyFeedback({
   const [copiedFunctionPreviewId, setCopiedFunctionPreviewId] = useState<
     string | null
   >(null);
+  const mountedRef = useRef(true);
   const copyFeedbackTimerRef = useRef<number | null>(null);
   const functionCopyTimerRef = useRef<number | null>(null);
 
   useEffect(
     () => () => {
+      mountedRef.current = false;
       if (copyFeedbackTimerRef.current !== null) {
         window.clearTimeout(copyFeedbackTimerRef.current);
       }
@@ -41,6 +43,7 @@ export function useCopyFeedback({
     async (messageId: string, text: string) => {
       if (!text.trim()) return;
       const copied = await copyTextToClipboard(text);
+      if (!mountedRef.current) return;
       if (!copied) {
         onMessageCopyError?.();
         return;
@@ -63,6 +66,7 @@ export function useCopyFeedback({
   const copyFunctionFormula = useCallback(
     async (messageId: string, formula: string) => {
       const copied = await copyTextToClipboard(formula);
+      if (!mountedRef.current) return;
       if (!copied) {
         onFormulaCopyError?.(messageId);
         return;
