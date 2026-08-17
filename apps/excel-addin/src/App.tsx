@@ -2453,7 +2453,7 @@ export default function App() {
       (pendingImages.length > 0
         ? "请结合附件图片分析当前工作簿，并说明发现的问题。"
         : "");
-    if (!workbook || !text || busy) return;
+    if (!workbook || !text || text.length < 2 || busy) return;
     // /function 短链：绕开 planner（checkIntent/streamAssistantResponse），
     // 命中式单发生成原生公式 + 首格真实试算 + 预览卡。
     if (enteredText.startsWith("/function ")) {
