@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import type {
   WorkbookSnapshot,
   FolderCatalog,
@@ -124,6 +124,14 @@ export function useWorkbookContext() {
     }
   }, [sourceMode, workbookScopeMode, selectedSheetNames]);
 
+  // scan 会随 sourceMode/workbookScopeMode/selectedSheetNames 重建。
+  // 初始化 effect 只需要执行一次，因此这里通过 ref 读取最新 scan，
+  // 既保持“只初始化一次”的语义，也避免静态检查提示缺失依赖。
+  const scanRef = useRef(scan);
+  useEffect(() => {
+    scanRef.current = scan;
+  }, [scan]);
+
   /**
    * 切换工作表选择（workbook 模式）
    */
@@ -244,7 +252,7 @@ export function useWorkbookContext() {
     Office.onReady(async () => {
       if (disposed) return;
       try {
-        await scan();
+        await scanRef.current();
       } catch {
         // scan 内部已处理错误
       }
