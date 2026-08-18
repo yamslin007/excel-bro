@@ -128,11 +128,14 @@ const PET_ANIMATIONS = [
 
 function animatePet(className: string, duration = 800): void {
   const pet = document.querySelector<HTMLElement>(".pet-avatar");
+  console.log("[Pet] animatePet called:", className, pet);
   if (!pet) return;
   pet.classList.remove(...PET_ANIMATIONS, "turtle-sleepy", "turtle-encourage");
   pet.classList.add(className);
+  console.log("[Pet] Animation class added:", pet.className);
   window.setTimeout(() => {
     pet.classList.remove(className);
+    console.log("[Pet] Animation class removed:", className);
   }, duration);
 }
 
@@ -1027,9 +1030,11 @@ export default function App() {
 
     const handlePetClick = (event: MouseEvent) => {
       const target = event.target as HTMLElement | null;
+      console.log("[Pet] Click detected:", target);
       if (!target?.closest(".pet-avatar")) return;
       const animation =
         PET_ANIMATIONS[Math.floor(Math.random() * PET_ANIMATIONS.length)];
+      console.log("[Pet] Animating with:", animation);
       animatePet(animation);
     };
 

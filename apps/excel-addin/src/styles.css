@@ -2513,6 +2513,7 @@ textarea:focus-visible {
   width: 58px;
   height: 58px;
   place-items: center;
+  z-index: 100;
   border: 0;
   border-radius: var(--radius-full);
   background:
@@ -2520,6 +2521,7 @@ textarea:focus-visible {
     #eef7f1;
   padding: 0;
   cursor: pointer;
+  pointer-events: auto;
   box-shadow: 0 6px 18px rgba(39, 83, 51, 0.22);
   transition: transform 0.16s ease;
 }
@@ -4997,19 +4999,21 @@ textarea:focus-visible {
 }
 
 .chat-shell::before {
-  z-index: -1;
+  z-index: 0;
   background-color: var(--color-background);
   background-image: var(--theme-pattern, none);
   background-position: center;
   background-repeat: repeat;
   background-size: 60px 60px;
+  transition: opacity 0.3s ease;
 }
 
 .chat-shell::after {
-  z-index: 0;
-  display: none;
+  z-index: 1;
+  display: block;
   background: var(--color-background);
-  opacity: 0.6;
+  opacity: 0;
+  transition: opacity 0.3s ease;
 }
 
 .chat-shell[data-has-background="true"]::before {
@@ -5022,8 +5026,7 @@ textarea:focus-visible {
 }
 
 .chat-shell[data-has-background="true"][data-auto-mask="true"]::after {
-  display: block;
-  z-index: 1;
+  opacity: 0.6;
 }
 
 .chat-shell > * {
