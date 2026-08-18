@@ -667,6 +667,7 @@ export async function captureWorkbookStructure(
   const cacheKey = JSON.stringify([...(dataSheetNames ?? [])].sort());
   if (structureCacheEnabled && structureCache?.key === cacheKey) {
     const cached = structuredClone(structureCache.snapshot);
+    cached.name = workbookNameFromDocumentUrl(Office.context.document.url);
     // 结构缓存只在工作表数据/集合变化时失效，切换活动工作表不会失效。
     // 命中缓存时用一次轻量选区读取刷新活动表与选区，避免拿过期值构建
     // 指纹，导致确认期与运行期不一致的误判。
