@@ -5029,7 +5029,10 @@ textarea:focus-visible {
   display: block;
 }
 
-.chat-shell > * {
+/* 确保对话内容在背景图和遮罩之上 */
+.chat-shell .conversation-wrapper,
+.chat-shell .composer-box,
+.chat-shell .chat-header {
   position: relative;
   z-index: 2;
 }
