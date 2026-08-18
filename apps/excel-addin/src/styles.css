@@ -4942,3 +4942,74 @@ textarea:focus-visible {
     transform: none;
   }
 }
+
+/* Notion 风格细节打磨：图标、间距、圆角和阴影统一。 */
+.model-picker-trigger svg,
+.labeled-header-button svg,
+.header-button:not(.labeled-header-button) svg,
+.attach-image-button svg,
+.message-copy-button svg {
+  width: 16px;
+  height: 16px;
+  stroke-width: 1.5;
+}
+
+.base-mode-icon {
+  stroke-width: 1.5;
+}
+
+.base-mode-help-button svg {
+  width: 16px;
+  height: 16px;
+}
+
+.tool-card {
+  padding: var(--spacing-lg) var(--spacing-lg) var(--spacing-sm);
+}
+
+.composer-box {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-background);
+  padding: var(--spacing-sm) var(--spacing-sm) 7px;
+}
+
+.composer-box:focus-within {
+  border-color: var(--color-brand-text);
+  box-shadow: 0 0 0 2px var(--color-brand-bg);
+}
+
+.system .message-text {
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-hover);
+  color: var(--color-text-secondary);
+  padding: 6px var(--spacing-md);
+}
+
+.message-copy-button {
+  border-radius: var(--radius-sm);
+}
+
+.message-copy-button:hover,
+.message-copy-button:focus-visible {
+  background: var(--color-surface-hover);
+  color: var(--color-brand-text);
+}
+
+.message-copy-button.copied {
+  background: var(--color-brand-bg);
+  color: var(--color-brand-text);
+}
+
+.tool-drawer {
+  border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+  box-shadow: 0 -4px 12px rgba(0, 0, 0, 0.08);
+}
+
+.scope-popover {
+  box-shadow: var(--shadow-md);
+}
+
+.pet-avatar {
+  border-radius: var(--radius-full);
+}
