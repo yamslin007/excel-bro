@@ -143,11 +143,21 @@ export async function watchWorkbookStructureChanges(
     bumpSheetDataEpoch(sheetName);
     onInvalidated?.();
   };
+  const nameChangedHandler = async (
+    event: Excel.WorksheetNameChangedEventArgs
+  ) => {
+    idToName.set(event.worksheetId, event.nameAfter);
+    invalidateWorkbookStructureCache();
+    bumpSheetDataEpoch(event.nameAfter);
+    onInvalidated?.();
+  };
   const supportsCollectionChanges =
     Office.context.requirements.isSetSupported("ExcelApi", "1.9");
   structureCacheEnabled = supportsCollectionChanges;
   const supportsCollectionLifecycle =
     Office.context.requirements.isSetSupported("ExcelApi", "1.7");
+  const supportsNameChanged =
+    Office.context.requirements.isSetSupported("ExcelApi", "1.17");
   const watched = await Excel.run(async (context) => {
     const worksheets = context.workbook.worksheets;
     if (supportsCollectionChanges) {
@@ -156,6 +166,9 @@ export async function watchWorkbookStructureChanges(
     if (supportsCollectionLifecycle) {
       worksheets.onAdded.add(handler);
       worksheets.onDeleted.add(handler);
+    }
+    if (supportsNameChanged) {
+      worksheets.onNameChanged.add(nameChangedHandler);
     }
     worksheets.load("items/name,items/id");
     await context.sync();
@@ -187,6 +200,9 @@ export async function watchWorkbookStructureChanges(
       if (supportsCollectionLifecycle) {
         worksheets.onAdded.remove(handler);
         worksheets.onDeleted.remove(handler);
+      }
+      if (supportsNameChanged) {
+        worksheets.onNameChanged.remove(nameChangedHandler);
       }
       await context.sync();
     });
