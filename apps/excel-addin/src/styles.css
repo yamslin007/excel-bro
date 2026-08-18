@@ -1199,6 +1199,54 @@ textarea:focus-visible {
   background: #a7aea9;
 }
 
+.base-mode-icon {
+  width: 12px;
+  height: 12px;
+  flex: 0 0 12px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.3;
+}
+
+.brand-copy span.base-mode {
+  color: #77837b;
+}
+
+.brand-copy span.model-online {
+  color: #216f3d;
+}
+
+.base-mode-help-button {
+  display: grid;
+  width: 16px;
+  height: 16px;
+  min-height: 16px;
+  flex: 0 0 16px;
+  place-items: center;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: #77837b;
+  padding: 0;
+}
+
+.base-mode-help-button:hover {
+  background: #edf3ef;
+  color: #216f3d;
+}
+
+.base-mode-help-button svg {
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.35;
+}
+
 .model-picker {
   position: relative;
   min-width: 0;
@@ -1273,7 +1321,7 @@ textarea:focus-visible {
 
 .model-menu > button {
   display: grid;
-  grid-template-columns: 8px minmax(0, 1fr) auto;
+  grid-template-columns: 12px minmax(0, 1fr) auto;
   align-items: center;
   gap: 7px;
   min-height: 31px;
@@ -1295,6 +1343,29 @@ textarea:focus-visible {
   height: 7px;
   border-radius: 50%;
   background: #8b958e;
+}
+
+.model-menu > button .base-mode-icon {
+  color: #77837b;
+}
+
+.model-menu > button .model-option-copy {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
+.model-menu > button .model-option-copy > span,
+.model-menu > button .model-option-copy small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-menu > button .model-option-copy small {
+  color: #77837b;
+  font-size: var(--font-size-caption);
+  line-height: var(--line-height-caption);
 }
 
 .model-menu > button[aria-checked="true"] i {

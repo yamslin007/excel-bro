@@ -1,7 +1,14 @@
 import { describe, it, expect } from "vitest";
-import { BASE_MODE_HELP_TEXT } from "./helpCommand";
+import {
+  BASE_MODE_DESCRIPTION,
+  BASE_MODE_HELP_TEXT
+} from "./helpCommand";
 
 describe("BASE_MODE_HELP_TEXT", () => {
+  it("describes the base mode in model menus", () => {
+    expect(BASE_MODE_DESCRIPTION).toBe("离线 · 地址操作 · 零延迟");
+  });
+
   it("covers the base-mode command documentation", () => {
     expect(BASE_MODE_HELP_TEXT).toContain("📘 基础模式功能说明");
     expect(BASE_MODE_HELP_TEXT).toContain("1️⃣ 清空区域");

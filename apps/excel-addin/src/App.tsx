@@ -95,7 +95,7 @@ import {
 import PetCompanion from "./PetCompanion";
 import { RuleManager } from "./RuleManager";
 import { SlashCommandAutocomplete, type SlashCommand } from "./SlashCommandAutocomplete";
-import { BASE_MODE_HELP_TEXT } from "./helpCommand";
+import { BASE_MODE_DESCRIPTION, BASE_MODE_HELP_TEXT } from "./helpCommand";
 import { useActivityProgress, type ActivityLog, type ActivityProgress } from "./hooks/useActivityProgress";
 import { useConversation } from "./hooks/useConversation";
 import { useCopyFeedback } from "./hooks/useCopyFeedback";
@@ -118,6 +118,7 @@ function formatGenerateMs(ms: number): string {
 
 const CHAT_STORAGE_KEY = "excel-bro.chat.v4";
 const LEGACY_CHAT_STORAGE_KEY = "excel-bro.chat.v3";
+const BASE_MODE_HELP_SHOWN_KEY = "ebBasicModeHelpShown";
 const MAX_STORED_CONVERSATIONS =
   capabilities.conversation.maxStoredConversations;
 const MAX_MESSAGES_PER_CONVERSATION =
@@ -995,6 +996,7 @@ export default function App() {
   );
 
   const busy = status !== "idle";
+  const isBaseMode = (selectedModelId || serviceHealth?.model || "local") === "local";
   // 撤销快照管理（自定义 Hook）
   const {
     lastUndoSnapshot,
@@ -1020,6 +1022,18 @@ export default function App() {
     [modelOptions, selectedModelId]
   );
   const supportsVision = selectedModel?.supportsVision === true;
+  const headerStatusClassName = !serverOnline
+    ? ""
+    : isBaseMode
+      ? "online base-mode"
+      : serviceHealth?.configured
+        ? "online model-online"
+        : "online";
+  const headerStatusText = !serverOnline
+    ? "本地服务未连接"
+    : isBaseMode
+      ? "本地服务已连接 · 基础模式"
+      : `模型：${selectedModel?.label ?? serviceHealth?.model}`;
   const hasConfiguredModel = modelOptions.some(
     (option) => option.provider === "model" && option.available
   );
@@ -3289,6 +3303,19 @@ export default function App() {
   function handleSelectModel(modelId: string) {
     selectModel(modelId);
     setModelMenuOpen(false);
+    if (modelId === "local") {
+      try {
+        if (localStorage.getItem(BASE_MODE_HELP_SHOWN_KEY) !== "1") {
+          localStorage.setItem(BASE_MODE_HELP_SHOWN_KEY, "1");
+          appendMessage({
+            role: "assistant",
+            text: BASE_MODE_HELP_TEXT
+          });
+        }
+      } catch {
+        // localStorage 不可用时跳过持久化，避免阻塞模型切换。
+      }
+    }
   }
 
   async function previewTool(tool: SavedTool) {
@@ -3577,21 +3604,35 @@ export default function App() {
         <div className="brand-mark">EB</div>
         <div className="brand-copy">
           <strong>Excel Bro</strong>
-          <span
-            className={
-              serverOnline
-                ? serviceHealth?.configured
-                  ? "online model-online"
-                  : "online"
-                : ""
-            }
-          >
+          <span className={headerStatusClassName}>
             <i />
-            {!serverOnline
-              ? "本地服务未连接"
-              : (selectedModelId || serviceHealth?.model || "local") === "local"
-                ? "本地服务已连接 · 基础模式"
-                : `模型：${selectedModel?.label ?? serviceHealth?.model}`}
+            {serverOnline && isBaseMode && (
+              <svg
+                className="base-mode-icon"
+                viewBox="0 0 16 16"
+                aria-hidden="true"
+                focusable="false"
+              >
+                <circle cx="8" cy="8" r="6.25" />
+                <path d="M5.5 8h5" />
+              </svg>
+            )}
+            {headerStatusText}
+            {serverOnline && isBaseMode && (
+              <button
+                type="button"
+                className="base-mode-help-button"
+                title="查看基础模式帮助"
+                aria-label="查看基础模式帮助"
+                onClick={() => handleSlashCommandSelect("help")}
+              >
+                <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+                  <circle cx="8" cy="8" r="6.25" />
+                  <path d="M6.15 6.15c.14-1.05 1.08-1.78 2.12-1.62 1.02.16 1.72 1.02 1.67 2.02-.04.83-.54 1.42-1.36 1.86-.38.2-.47.38-.43.78" />
+                  <path d="M8 11.2h.01" />
+                </svg>
+              </button>
+            )}
           </span>
         </div>
         <div
@@ -3629,8 +3670,25 @@ export default function App() {
                   disabled={!option.available}
                   onClick={() => handleSelectModel(option.id)}
                 >
-                  <i />
-                  <span>{option.label}</span>
+                  {option.id === "local" ? (
+                    <svg
+                      className="base-mode-icon model-option-icon"
+                      viewBox="0 0 16 16"
+                      aria-hidden="true"
+                      focusable="false"
+                    >
+                      <circle cx="8" cy="8" r="6.25" />
+                      <path d="M5.5 8h5" />
+                    </svg>
+                  ) : (
+                    <i />
+                  )}
+                  <span className="model-option-copy">
+                    <span>{option.label}</span>
+                    {option.id === "local" && (
+                      <small>{BASE_MODE_DESCRIPTION}</small>
+                    )}
+                  </span>
                   {option.id === (selectedModelId || "local") && <b>✓</b>}
                 </button>
               ))}

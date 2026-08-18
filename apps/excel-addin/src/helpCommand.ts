@@ -1,3 +1,5 @@
+export const BASE_MODE_DESCRIPTION = "离线 · 地址操作 · 零延迟";
+
 export const BASE_MODE_HELP_TEXT = `📘 基础模式功能说明
 
 基础模式是离线、零延迟的确定性操作模式，适合快速的地址操作。

@@ -2,6 +2,7 @@
 // 纯展示组件，JSX 从 App.tsx 逐字搬移；所有状态与回调都由 props 传入。
 import type { Dispatch, SetStateAction } from "react";
 import type { ModelOption, ServiceHealth } from "./api";
+import { BASE_MODE_DESCRIPTION } from "./helpCommand";
 
 interface ChatHeaderProps {
   serverOnline: boolean;
@@ -21,6 +22,7 @@ interface ChatHeaderProps {
   setToolsOpen: Dispatch<SetStateAction<boolean>>;
   focusOpening: boolean;
   selectModel: (modelId: string) => void;
+  onShowBaseModeHelp: () => void;
   openConnectionCreator: () => void;
   openSettings: () => void;
   dismissModelGuide: () => void;
@@ -51,6 +53,7 @@ export default function ChatHeader({
   setToolsOpen,
   focusOpening,
   selectModel,
+  onShowBaseModeHelp,
   openConnectionCreator,
   openSettings,
   dismissModelGuide,
@@ -62,26 +65,55 @@ export default function ChatHeader({
   closeSettings,
   openFocusWindow
 }: ChatHeaderProps) {
+  const activeModelId = selectedModelId || serviceHealth?.model || "local";
+  const isBaseMode = activeModelId === "local";
+  const statusClassName = !serverOnline
+    ? ""
+    : isBaseMode
+      ? "online base-mode"
+      : serviceHealth?.configured
+        ? "online model-online"
+        : "online";
+  const statusText = !serverOnline
+    ? "本地服务未连接"
+    : isBaseMode
+      ? "本地服务已连接 · 基础模式"
+      : `模型：${selectedModel?.label ?? serviceHealth?.model}`;
+
   return (
     <header className="chat-header">
       <div className="brand-mark">EB</div>
       <div className="brand-copy">
         <strong>Excel Bro</strong>
-        <span
-          className={
-            serverOnline
-              ? serviceHealth?.configured
-                ? "online model-online"
-                : "online"
-              : ""
-          }
-        >
+        <span className={statusClassName}>
           <i />
-          {!serverOnline
-            ? "本地服务未连接"
-            : (selectedModelId || serviceHealth?.model || "local") === "local"
-              ? "本地服务已连接 · 基础模式"
-              : `模型：${selectedModel?.label ?? serviceHealth?.model}`}
+          {serverOnline && isBaseMode && (
+            <svg
+              className="base-mode-icon"
+              viewBox="0 0 16 16"
+              aria-hidden="true"
+              focusable="false"
+            >
+              <circle cx="8" cy="8" r="6.25" />
+              <path d="M5.5 8h5" />
+            </svg>
+          )}
+          {statusText}
+          {serverOnline && isBaseMode && (
+            <button
+              type="button"
+              className="base-mode-help-button"
+              title="查看基础模式帮助"
+              aria-label="查看基础模式帮助"
+              onClick={onShowBaseModeHelp}
+            >
+              <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+                <circle cx="8" cy="8" r="6.25" />
+                <path d="M6.15 6.15c.14-1.05 1.08-1.78 2.12-1.62 1.02.16 1.72 1.02 1.67 2.02-.04.83-.54 1.42-1.36 1.86-.38.2-.47.38-.43.78" />
+                <path d="M8 11.2h.01" />
+              </svg>
+            </button>
+          )}
         </span>
       </div>
       <div
@@ -119,8 +151,25 @@ export default function ChatHeader({
                 disabled={!option.available}
                 onClick={() => selectModel(option.id)}
               >
-                <i />
-                <span>{option.label}</span>
+                {option.id === "local" ? (
+                  <svg
+                    className="base-mode-icon model-option-icon"
+                    viewBox="0 0 16 16"
+                    aria-hidden="true"
+                    focusable="false"
+                  >
+                    <circle cx="8" cy="8" r="6.25" />
+                    <path d="M5.5 8h5" />
+                  </svg>
+                ) : (
+                  <i />
+                )}
+                <span className="model-option-copy">
+                  <span>{option.label}</span>
+                  {option.id === "local" && (
+                    <small>{BASE_MODE_DESCRIPTION}</small>
+                  )}
+                </span>
                 {option.id === (selectedModelId || "local") && <b>✓</b>}
               </button>
             ))}
