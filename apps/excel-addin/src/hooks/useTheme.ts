@@ -34,7 +34,7 @@ interface PresetPalette {
 const PRESETS: Record<ThemePreset, PresetPalette> = {
   default: {
     background: "#ffffff",
-    backgroundSubtle: "#f7f6f3",
+    backgroundSubtle: "#ffffff",
     surface: "#fafaf9",
     surfaceHover: "#f1f0ee",
     textPrimary: "#37352f",
