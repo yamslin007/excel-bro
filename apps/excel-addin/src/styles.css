@@ -727,7 +727,7 @@ textarea:focus-visible {
 .tool-field-mapping select:focus,
 .tool-field-mapping input:focus {
   border-color: #5f9f74;
-  outline: 2px solid rgba(65, 143, 89, 0.11);
+  outline: none;
 }
 
 .tool-layout {
@@ -922,7 +922,7 @@ textarea:focus-visible {
 .tool-dialog input:focus,
 .tool-dialog textarea:focus {
   border-color: #5f9f74;
-  outline: 2px solid rgba(65, 143, 89, 0.11);
+  outline: none;
 }
 
 .tool-fixed-note {
@@ -1956,7 +1956,7 @@ textarea:focus-visible {
 
 .api-key-input-row input:focus {
   border-color: #5f9f74;
-  outline: 2px solid rgba(65, 143, 89, 0.11);
+  outline: none;
 }
 
 .api-key-input-row > button {
@@ -2176,7 +2176,7 @@ textarea:focus-visible {
 
 .connection-editor input:not([type="checkbox"]):focus {
   border-color: #5f9f74;
-  outline: 2px solid rgba(65, 143, 89, 0.11);
+  outline: none;
 }
 
 .connection-key-toggle {
@@ -2213,7 +2213,7 @@ textarea:focus-visible {
 
 .connection-formula-select:focus {
   border-color: #5f9f74;
-  outline: 2px solid rgba(65, 143, 89, 0.11);
+  outline: none;
 }
 
 .connection-formula-select:disabled {
@@ -3103,7 +3103,7 @@ textarea:focus-visible {
 }
 
 .clarification-custom-input textarea:focus {
-  outline: 2px solid rgba(32, 121, 72, 0.14);
+  outline: none;
   border-color: #2f8a55;
 }
 
@@ -3530,7 +3530,7 @@ textarea:focus-visible {
 .function-write-target-input:focus {
   outline: none;
   border-color: #6aa67f;
-  box-shadow: 0 0 0 2px rgba(106, 166, 127, 0.18);
+  box-shadow: none;
 }
 
 .function-write-target-input:disabled {
@@ -4000,7 +4000,7 @@ textarea:focus-visible {
 
 .sheet-search-row input:focus {
   border-color: var(--color-brand-text);
-  outline: 2px solid var(--color-brand-bg);
+  outline: none;
 }
 
 .sheet-search-row span {
@@ -4308,7 +4308,7 @@ textarea:focus-visible {
 
 .composer-box:focus-within {
   border-color: #63a579;
-  box-shadow: 0 0 0 3px rgba(74, 151, 97, 0.1);
+  box-shadow: none;
 }
 
 /* 斜杠命令自动补全：贴在输入框正上方，左右与输入框对齐 */
@@ -4908,7 +4908,7 @@ textarea:focus-visible {
 .composer textarea:focus {
   outline: none;
   border-color: var(--color-brand-text);
-  box-shadow: 0 0 0 2px var(--color-brand-bg);
+  box-shadow: none;
 }
 
 .composer textarea {
@@ -4976,7 +4976,7 @@ textarea:focus-visible {
 
 .composer-box:focus-within {
   border-color: var(--color-brand-text);
-  box-shadow: 0 0 0 2px var(--color-brand-bg);
+  box-shadow: none;
 }
 
 .system .message-text {
