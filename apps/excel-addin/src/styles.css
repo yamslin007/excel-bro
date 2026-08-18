@@ -4858,3 +4858,87 @@ textarea:focus-visible {
     animation: none;
   }
 }
+
+/* Notion 风格交互动效：统一列表项与按钮的悬停、聚焦反馈。 */
+.model-menu > button,
+.model-menu-actions button,
+.scope-mode-list > button,
+.workbook-sheet-list > button,
+.sheet-picker-options button,
+.source-switch button,
+.scope-popover-actions > button,
+.tool-card-wrap,
+.header-button,
+.model-picker-trigger,
+.attach-image-button,
+.scope-trigger,
+.composer-reply-chip button {
+  transition:
+    background 150ms ease,
+    border-color 150ms ease,
+    box-shadow 150ms ease,
+    transform 150ms ease;
+}
+
+.model-picker-trigger:not(:disabled):hover,
+.header-button:not(:disabled):hover,
+.attach-image-button:not(:disabled):hover,
+.scope-popover-actions > button:not(:disabled):hover,
+.primary-button:not(:disabled):hover,
+.secondary-button:not(:disabled):hover,
+.send-button:not(:disabled):hover {
+  transform: translateY(-1px);
+}
+
+.model-menu > button:hover,
+.model-menu-actions button:hover,
+.scope-mode-list > button:not(.selected):hover,
+.workbook-sheet-list > button:not(.selected):hover,
+.sheet-picker-options button:not(.selected):hover {
+  background: rgba(0, 0, 0, 0.03);
+}
+
+.scope-mode-list > button.selected:hover,
+.workbook-sheet-list > button.selected:hover,
+.sheet-picker-options button.selected:hover {
+  background: var(--color-brand-hover);
+}
+
+.sheet-search-row input:focus,
+.composer textarea:focus {
+  outline: none;
+  border-color: var(--color-brand-text);
+  box-shadow: 0 0 0 2px var(--color-brand-bg);
+}
+
+.composer textarea {
+  border: 1px solid transparent;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .model-menu > button,
+  .model-menu-actions button,
+  .scope-mode-list > button,
+  .workbook-sheet-list > button,
+  .sheet-picker-options button,
+  .source-switch button,
+  .scope-popover-actions > button,
+  .tool-card-wrap,
+  .header-button,
+  .model-picker-trigger,
+  .attach-image-button,
+  .scope-trigger,
+  .composer-reply-chip button {
+    transition: none;
+  }
+
+  .model-picker-trigger:not(:disabled):hover,
+  .header-button:not(:disabled):hover,
+  .attach-image-button:not(:disabled):hover,
+  .scope-popover-actions > button:not(:disabled):hover,
+  .primary-button:not(:disabled):hover,
+  .secondary-button:not(:disabled):hover,
+  .send-button:not(:disabled):hover {
+    transform: none;
+  }
+}
