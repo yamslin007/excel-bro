@@ -16,44 +16,84 @@ import {
 interface PresetPalette {
   background: string;
   backgroundSubtle: string;
+  surface: string;
+  surfaceHover: string;
   textPrimary: string;
+  textSecondary: string;
+  textTertiary: string;
   brandBg: string;
   brandText: string;
   brandHover: string;
+  border: string;
+  borderStrong: string;
+  shadowSm: string;
+  shadowMd: string;
 }
 
 const PRESETS: Record<ThemePreset, PresetPalette> = {
   default: {
     background: "#ffffff",
     backgroundSubtle: "#f7f6f3",
+    surface: "#fafaf9",
+    surfaceHover: "#f1f0ee",
     textPrimary: "#37352f",
+    textSecondary: "#787774",
+    textTertiary: "#9b9a97",
     brandBg: "#edf3ec",
     brandText: "#2f6b47",
-    brandHover: "#e3ebe2"
+    brandHover: "#e3ebe2",
+    border: "#e9e9e7",
+    borderStrong: "#d3d2cf",
+    shadowSm: "0 1px 2px rgba(0, 0, 0, 0.04)",
+    shadowMd: "0 2px 4px rgba(0, 0, 0, 0.06)"
   },
   "warm-orange": {
-    background: "#fffbf5",
-    backgroundSubtle: "#fff4e6",
-    textPrimary: "#4a3520",
-    brandBg: "#ffe8cc",
-    brandText: "#c87a3a",
-    brandHover: "#ffdbb0"
+    background: "#faf9f7",
+    backgroundSubtle: "#f5f3f0",
+    surface: "#f0ede9",
+    surfaceHover: "#ebe7e2",
+    textPrimary: "#3d3730",
+    textSecondary: "#6b6358",
+    textTertiary: "#9a9186",
+    brandBg: "#f0ebe5",
+    brandText: "#7d6854",
+    brandHover: "#e8e2db",
+    border: "#e5e0db",
+    borderStrong: "#d6cfc8",
+    shadowSm: "0 1px 2px rgba(61, 55, 48, 0.04)",
+    shadowMd: "0 2px 4px rgba(61, 55, 48, 0.06)"
   },
   "calm-blue": {
-    background: "#f8fbff",
-    backgroundSubtle: "#eff6ff",
-    textPrimary: "#1e3a5f",
-    brandBg: "#dbeafe",
-    brandText: "#3b82f6",
-    brandHover: "#c7defe"
+    background: "#f8f9fb",
+    backgroundSubtle: "#f1f3f6",
+    surface: "#ebeef2",
+    surfaceHover: "#e3e7ec",
+    textPrimary: "#2f3d4f",
+    textSecondary: "#5a6678",
+    textTertiary: "#8a95a5",
+    brandBg: "#e8ecf1",
+    brandText: "#5a6b7d",
+    brandHover: "#dfe4ea",
+    border: "#e3e8ed",
+    borderStrong: "#d1d9e2",
+    shadowSm: "0 1px 2px rgba(47, 61, 79, 0.04)",
+    shadowMd: "0 2px 4px rgba(47, 61, 79, 0.06)"
   },
   "vivid-green": {
-    background: "#f7fff7",
-    backgroundSubtle: "#ecfdf5",
-    textPrimary: "#1a4d2e",
-    brandBg: "#d1fae5",
-    brandText: "#059669",
-    brandHover: "#a7f3d0"
+    background: "#f8faf9",
+    backgroundSubtle: "#f2f5f3",
+    surface: "#ecf0ed",
+    surfaceHover: "#e4e9e6",
+    textPrimary: "#2f3d35",
+    textSecondary: "#5a6a60",
+    textTertiary: "#8a9890",
+    brandBg: "#e9efec",
+    brandText: "#5a7065",
+    brandHover: "#dfe6e2",
+    border: "#e4ebe7",
+    borderStrong: "#d3ddd7",
+    shadowSm: "0 1px 2px rgba(47, 61, 53, 0.04)",
+    shadowMd: "0 2px 4px rgba(47, 61, 53, 0.06)"
   }
 };
 
@@ -73,10 +113,18 @@ function applyPalette(preset: ThemePreset): void {
   const style = rootStyle();
   style.setProperty("--color-background", palette.background);
   style.setProperty("--color-background-subtle", palette.backgroundSubtle);
+  style.setProperty("--color-surface", palette.surface);
+  style.setProperty("--color-surface-hover", palette.surfaceHover);
   style.setProperty("--color-text-primary", palette.textPrimary);
+  style.setProperty("--color-text-secondary", palette.textSecondary);
+  style.setProperty("--color-text-tertiary", palette.textTertiary);
   style.setProperty("--color-brand-bg", palette.brandBg);
   style.setProperty("--color-brand-text", palette.brandText);
   style.setProperty("--color-brand-hover", palette.brandHover);
+  style.setProperty("--color-border", palette.border);
+  style.setProperty("--color-border-strong", palette.borderStrong);
+  style.setProperty("--shadow-sm", palette.shadowSm);
+  style.setProperty("--shadow-md", palette.shadowMd);
 }
 
 function applyBackground(url: string | null, opacity: number): void {
@@ -167,6 +215,7 @@ export function useTheme() {
     async (file: File) => {
       setError("");
       try {
+        console.log("[Theme] 上传开始:", file.name, file.size, file.type);
         validateImageFile(file);
         setUploading(true);
         const blob = await convertToJPEG(file, 0.9);

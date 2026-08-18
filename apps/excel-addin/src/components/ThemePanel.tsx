@@ -15,9 +15,9 @@ const PRESET_OPTIONS: Array<{
   description: string;
 }> = [
   { id: "default", label: "默认 Notion", description: "暖灰、浅绿、克制" },
-  { id: "warm-orange", label: "温暖橙", description: "柔和橙色背景" },
-  { id: "calm-blue", label: "宁静蓝", description: "清爽蓝色背景" },
-  { id: "vivid-green", label: "活力绿", description: "品牌绿色增强" }
+  { id: "warm-orange", label: "温暖米色", description: "纸张般的柔和米色" },
+  { id: "calm-blue", label: "石板灰蓝", description: "平静低饱和蓝灰" },
+  { id: "vivid-green", label: "鼠尾草绿", description: "自然的灰调绿色" }
 ];
 
 export default function ThemePanel({
