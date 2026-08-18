@@ -28,6 +28,7 @@ interface PresetPalette {
   borderStrong: string;
   shadowSm: string;
   shadowMd: string;
+  pattern: string;
 }
 
 const PRESETS: Record<ThemePreset, PresetPalette> = {
@@ -45,55 +46,59 @@ const PRESETS: Record<ThemePreset, PresetPalette> = {
     border: "#e9e9e7",
     borderStrong: "#d3d2cf",
     shadowSm: "0 1px 2px rgba(0, 0, 0, 0.04)",
-    shadowMd: "0 2px 4px rgba(0, 0, 0, 0.06)"
+    shadowMd: "0 2px 4px rgba(0, 0, 0, 0.06)",
+    pattern: "none"
   },
   "warm-orange": {
-    background: "#faf9f7",
-    backgroundSubtle: "#f5f3f0",
-    surface: "#f0ede9",
-    surfaceHover: "#ebe7e2",
-    textPrimary: "#3d3730",
-    textSecondary: "#6b6358",
-    textTertiary: "#9a9186",
-    brandBg: "#f0ebe5",
-    brandText: "#7d6854",
-    brandHover: "#e8e2db",
-    border: "#e5e0db",
-    borderStrong: "#d6cfc8",
-    shadowSm: "0 1px 2px rgba(61, 55, 48, 0.04)",
-    shadowMd: "0 2px 4px rgba(61, 55, 48, 0.06)"
+    background: "#fffcf7",
+    backgroundSubtle: "#fff5e8",
+    surface: "#ffefd9",
+    surfaceHover: "#ffe6c7",
+    textPrimary: "#5c3d2e",
+    textSecondary: "#8b6f5c",
+    textTertiary: "#b39a87",
+    brandBg: "#ffe4c4",
+    brandText: "#d97739",
+    brandHover: "#ffd9b0",
+    border: "#f5d9b8",
+    borderStrong: "#e8c89f",
+    shadowSm: "0 1px 2px rgba(217, 119, 57, 0.08)",
+    shadowMd: "0 2px 4px rgba(217, 119, 57, 0.12)",
+    pattern: `url("data:image/svg+xml,%3Csvg width='60' height='60' xmlns='http://www.w3.org/2000/svg'%3E%3Ccircle cx='10' cy='10' r='3' fill='%23d97739' opacity='0.04'/%3E%3Cpath d='M10 5 L10 6 M10 14 L10 15 M5 10 L6 10 M14 10 L15 10 M7 7 L7.7 7.7 M12.3 12.3 L13 13 M13 7 L12.3 7.7 M7.7 12.3 L7 13' stroke='%23d97739' opacity='0.04' stroke-width='0.5'/%3E%3Ccircle cx='50' cy='50' r='3' fill='%23d97739' opacity='0.03'/%3E%3C/svg%3E")`
   },
   "calm-blue": {
-    background: "#f8f9fb",
-    backgroundSubtle: "#f1f3f6",
-    surface: "#ebeef2",
-    surfaceHover: "#e3e7ec",
-    textPrimary: "#2f3d4f",
-    textSecondary: "#5a6678",
-    textTertiary: "#8a95a5",
-    brandBg: "#e8ecf1",
-    brandText: "#5a6b7d",
-    brandHover: "#dfe4ea",
-    border: "#e3e8ed",
-    borderStrong: "#d1d9e2",
-    shadowSm: "0 1px 2px rgba(47, 61, 79, 0.04)",
-    shadowMd: "0 2px 4px rgba(47, 61, 79, 0.06)"
+    background: "#f9fbff",
+    backgroundSubtle: "#f0f6ff",
+    surface: "#e3f0ff",
+    surfaceHover: "#d4e8ff",
+    textPrimary: "#2c3e5c",
+    textSecondary: "#5a6b8a",
+    textTertiary: "#8a9bb5",
+    brandBg: "#d4e8ff",
+    brandText: "#3b7dd6",
+    brandHover: "#c2deff",
+    border: "#c7dff7",
+    borderStrong: "#aecef0",
+    shadowSm: "0 1px 2px rgba(59, 125, 214, 0.08)",
+    shadowMd: "0 2px 4px rgba(59, 125, 214, 0.12)",
+    pattern: `url("data:image/svg+xml,%3Csvg width='80' height='60' xmlns='http://www.w3.org/2000/svg'%3E%3Cellipse cx='15' cy='20' rx='8' ry='5' fill='%233b7dd6' opacity='0.04'/%3E%3Cellipse cx='20' cy='18' rx='6' ry='4' fill='%233b7dd6' opacity='0.04'/%3E%3Cellipse cx='10' cy='21' rx='5' ry='3' fill='%233b7dd6' opacity='0.04'/%3E%3Cellipse cx='55' cy='45' rx='7' ry='4' fill='%233b7dd6' opacity='0.03'/%3E%3C/svg%3E")`
   },
   "vivid-green": {
-    background: "#f8faf9",
-    backgroundSubtle: "#f2f5f3",
-    surface: "#ecf0ed",
-    surfaceHover: "#e4e9e6",
-    textPrimary: "#2f3d35",
-    textSecondary: "#5a6a60",
-    textTertiary: "#8a9890",
-    brandBg: "#e9efec",
-    brandText: "#5a7065",
-    brandHover: "#dfe6e2",
-    border: "#e4ebe7",
-    borderStrong: "#d3ddd7",
-    shadowSm: "0 1px 2px rgba(47, 61, 53, 0.04)",
-    shadowMd: "0 2px 4px rgba(47, 61, 53, 0.06)"
+    background: "#f7fffb",
+    backgroundSubtle: "#edfff4",
+    surface: "#dfffea",
+    surfaceHover: "#ceffd9",
+    textPrimary: "#1e4d3b",
+    textSecondary: "#4a7562",
+    textTertiary: "#7a9f8e",
+    brandBg: "#c8f5d9",
+    brandText: "#2d9b63",
+    brandHover: "#b5f0ca",
+    border: "#b8e8ca",
+    borderStrong: "#9ddab3",
+    shadowSm: "0 1px 2px rgba(45, 155, 99, 0.08)",
+    shadowMd: "0 2px 4px rgba(45, 155, 99, 0.12)",
+    pattern: `url("data:image/svg+xml,%3Csvg width='60' height='60' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M12 18 Q15 12, 18 18 Q15 15, 12 18' fill='%232d9b63' opacity='0.04'/%3E%3Cpath d='M8 10 Q10 6, 12 10 Q10 8, 8 10' fill='%232d9b63' opacity='0.04'/%3E%3Cpath d='M48 48 Q50 44, 52 48 Q50 46, 48 48' fill='%232d9b63' opacity='0.03'/%3E%3C/svg%3E")`
   }
 };
 
@@ -125,6 +130,7 @@ function applyPalette(preset: ThemePreset): void {
   style.setProperty("--color-border-strong", palette.borderStrong);
   style.setProperty("--shadow-sm", palette.shadowSm);
   style.setProperty("--shadow-md", palette.shadowMd);
+  style.setProperty("--theme-pattern", palette.pattern);
 }
 
 function applyBackground(url: string | null, opacity: number): void {

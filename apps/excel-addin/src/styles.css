@@ -4984,6 +4984,7 @@ textarea:focus-visible {
 }
 
 .chat-shell {
+  position: relative;
   overflow: hidden;
 }
 
@@ -4996,12 +4997,12 @@ textarea:focus-visible {
 }
 
 .chat-shell::before {
-  z-index: 0;
-  background-image: var(--custom-background-image);
+  z-index: -1;
+  background-color: var(--color-background);
+  background-image: var(--theme-pattern, none);
   background-position: center;
-  background-repeat: no-repeat;
-  background-size: cover;
-  opacity: var(--custom-background-opacity);
+  background-repeat: repeat;
+  background-size: 60px 60px;
 }
 
 .chat-shell::after {
@@ -5011,8 +5012,23 @@ textarea:focus-visible {
   opacity: 0.6;
 }
 
+.chat-shell[data-has-background="true"]::before {
+  background-image: var(--custom-background-image);
+  background-position: center;
+  background-repeat: no-repeat;
+  background-size: cover;
+  opacity: var(--custom-background-opacity);
+  z-index: 0;
+}
+
 .chat-shell[data-has-background="true"][data-auto-mask="true"]::after {
   display: block;
+  z-index: 1;
+}
+
+.chat-shell > * {
+  position: relative;
+  z-index: 2;
 }
 
 .theme-panel-backdrop {
@@ -5151,15 +5167,15 @@ textarea:focus-visible {
 }
 
 .preset-warm-orange {
-  background: #f5f3f0;
+  background: #fff5e8;
 }
 
 .preset-calm-blue {
-  background: #f1f3f6;
+  background: #f0f6ff;
 }
 
 .preset-vivid-green {
-  background: #f2f5f3;
+  background: #edfff4;
 }
 
 .preset-button > span:last-child {
@@ -5452,4 +5468,82 @@ textarea:focus-visible {
 
 .pet-avatar {
   border-radius: var(--radius-full);
+}
+
+/* 工具抽屉配色配套：让抽屉和内部控件随主题变量一起变化。 */
+.tool-drawer {
+  background: var(--color-background);
+  border: 1px solid var(--color-border);
+}
+
+.tool-drawer-header {
+  background: var(--color-surface);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.tool-card-wrap {
+  background: var(--color-surface);
+  border-color: var(--color-border);
+}
+
+.tool-card:hover {
+  background: var(--color-surface-hover);
+}
+
+.tool-guide-fields select,
+.tool-guide-fields input,
+.tool-field-mapping select,
+.tool-field-mapping input,
+.tool-parameters select,
+.tool-parameters input,
+.tool-dialog input,
+.tool-dialog textarea {
+  background: var(--color-surface);
+  border-color: var(--color-border);
+  color: var(--color-text-primary);
+}
+
+.tool-guide-fields select:focus,
+.tool-guide-fields input:focus,
+.tool-field-mapping select:focus,
+.tool-field-mapping input:focus,
+.tool-parameters select:focus,
+.tool-parameters input:focus,
+.tool-dialog input:focus,
+.tool-dialog textarea:focus {
+  border-color: var(--color-brand-text);
+}
+
+.tool-drawer .secondary-button {
+  background: var(--color-surface);
+  border-color: var(--color-border);
+  color: var(--color-text-primary);
+}
+
+.tool-drawer .secondary-button:hover {
+  background: var(--color-surface-hover);
+}
+
+.tool-drawer .primary-button {
+  background: var(--color-brand-text);
+  color: #ffffff;
+}
+
+.tool-drawer .primary-button:hover {
+  opacity: 0.9;
+}
+
+.tool-drawer h3,
+.tool-card h4 {
+  color: var(--color-text-primary);
+}
+
+.tool-description,
+.tool-field-label {
+  color: var(--color-text-secondary);
+}
+
+.tool-hint,
+.tool-placeholder {
+  color: var(--color-text-tertiary);
 }
