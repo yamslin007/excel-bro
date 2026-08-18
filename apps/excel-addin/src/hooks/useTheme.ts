@@ -104,8 +104,8 @@ const PRESETS: Record<ThemePreset, PresetPalette> = {
 
 const DEFAULT_SETTINGS: ThemeSettings = {
   preset: "default",
-  opacity: 40,
-  autoMask: true,
+  opacity: 100,
+  autoMask: false,
   hasCustomBackground: false
 };
 

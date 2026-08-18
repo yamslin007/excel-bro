@@ -5037,6 +5037,33 @@ textarea:focus-visible {
   z-index: 2;
 }
 
+/* 有背景图片时，给内容卡片加半透明白色背景 */
+.chat-shell[data-has-background="true"] .message-row .sheet-picker,
+.chat-shell[data-has-background="true"] .composer-box,
+.chat-shell[data-has-background="true"] .intent-clarification,
+.chat-shell[data-has-background="true"] .message-content,
+.chat-shell[data-has-background="true"] .function-preview,
+.chat-shell[data-has-background="true"] .tool-result,
+.chat-shell[data-has-background="true"] .user-confirm-button,
+.chat-shell[data-has-background="true"] .clarification-option,
+.chat-shell[data-has-background="true"] .intent-option-button {
+  background: rgba(255, 255, 255, 0.92);
+  backdrop-filter: blur(8px);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+}
+
+/* 头部和底部区域也需要半透明背景 */
+.chat-shell[data-has-background="true"] .chat-header {
+  background: rgba(255, 255, 255, 0.95);
+  backdrop-filter: blur(12px);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.06);
+}
+
+.chat-shell[data-has-background="true"] .conversation-controls {
+  background: rgba(255, 255, 255, 0.92);
+  backdrop-filter: blur(8px);
+}
+
 .theme-panel-backdrop {
   position: fixed;
   inset: 0;
