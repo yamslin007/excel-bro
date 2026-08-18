@@ -4943,6 +4943,440 @@ textarea:focus-visible {
   }
 }
 
+/* 主题定制彩蛋 */
+:root {
+  --custom-background-image: none;
+  --custom-background-opacity: 0;
+}
+
+.app-logo {
+  transition:
+    filter 200ms ease,
+    transform 200ms ease,
+    opacity 200ms ease;
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.app-logo.glow {
+  filter: drop-shadow(0 0 8px rgba(47, 107, 71, 0.5));
+  transform: scale(1.04);
+}
+
+.app-logo.trigger-success {
+  animation: logo-flash 0.4s ease;
+}
+
+@keyframes logo-flash {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.chat-shell {
+  overflow: hidden;
+}
+
+.chat-shell::before,
+.chat-shell::after {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.chat-shell::before {
+  z-index: 0;
+  background-image: var(--custom-background-image);
+  background-position: center;
+  background-repeat: no-repeat;
+  background-size: cover;
+  opacity: var(--custom-background-opacity);
+}
+
+.chat-shell::after {
+  z-index: 0;
+  display: none;
+  background: var(--color-background);
+  opacity: 0.6;
+}
+
+.chat-shell[data-has-background="true"][data-auto-mask="true"]::after {
+  display: block;
+}
+
+.theme-panel-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 180;
+  border: 0;
+  background: rgba(0, 0, 0, 0.16);
+  padding: 0;
+}
+
+.theme-panel {
+  position: fixed;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 190;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  height: min(70vh, 600px);
+  border-top: 1px solid rgba(255, 255, 255, 0.35);
+  border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+  background: rgba(255, 255, 255, 0.85);
+  box-shadow: 0 -8px 32px rgba(0, 0, 0, 0.1);
+  padding: var(--spacing-md);
+  transform: translateY(100%);
+  transition: transform 300ms cubic-bezier(0.4, 0, 0.2, 1);
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+}
+
+.theme-panel.open {
+  transform: translateY(0);
+}
+
+@supports not (backdrop-filter: blur(20px)) {
+  .theme-panel {
+    background: rgba(255, 255, 255, 0.96);
+  }
+}
+
+.theme-panel-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--spacing-md);
+  border-bottom: 1px solid var(--color-border);
+  padding-bottom: var(--spacing-md);
+}
+
+.theme-panel-header > div {
+  display: grid;
+  gap: 2px;
+}
+
+.theme-panel-eyebrow {
+  color: var(--color-brand-text);
+  font-size: var(--font-size-caption);
+  font-weight: 800;
+}
+
+.theme-panel-header strong {
+  color: var(--color-text-primary);
+  font-size: var(--font-size-title);
+  line-height: var(--line-height-title);
+}
+
+.theme-panel-header > button {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-subtitle);
+}
+
+.theme-panel-body {
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--spacing-md) 2px var(--spacing-lg);
+}
+
+.theme-section {
+  display: grid;
+  gap: var(--spacing-sm);
+  margin-bottom: var(--spacing-lg);
+}
+
+.theme-section h3 {
+  margin: 0;
+  color: var(--color-text-primary);
+  font-size: var(--font-size-body);
+  line-height: var(--line-height-body);
+}
+
+.preset-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--spacing-sm);
+}
+
+.preset-button {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: var(--spacing-sm);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  color: var(--color-text-primary);
+  padding: var(--spacing-sm);
+  text-align: left;
+  transition:
+    border-color 150ms ease,
+    background 150ms ease;
+}
+
+.preset-button.selected {
+  border-color: var(--color-brand-text);
+  background: var(--color-brand-bg);
+}
+
+.preset-swatch {
+  width: 28px;
+  height: 28px;
+  flex: 0 0 28px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-border);
+}
+
+.preset-default {
+  background: #f7f6f3;
+}
+
+.preset-warm-orange {
+  background: #fff4e6;
+}
+
+.preset-calm-blue {
+  background: #eff6ff;
+}
+
+.preset-vivid-green {
+  background: #ecfdf5;
+}
+
+.preset-button > span:last-child {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
+.preset-button strong {
+  overflow: hidden;
+  color: inherit;
+  font-size: var(--font-size-caption);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.preset-button small {
+  overflow: hidden;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-caption);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.theme-upload-row {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+}
+
+.theme-upload-row > span {
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-caption);
+}
+
+.theme-file-input {
+  display: none;
+}
+
+.opacity-control {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 34px;
+  align-items: center;
+  gap: var(--spacing-sm);
+  color: var(--color-text-primary);
+  font-size: var(--font-size-caption);
+}
+
+.opacity-control input[type="range"] {
+  grid-column: 1 / -1;
+  width: 100%;
+  accent-color: var(--color-brand-text);
+}
+
+.opacity-control b {
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-caption);
+  text-align: right;
+}
+
+.theme-mask-toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  color: var(--color-text-primary);
+  font-size: var(--font-size-caption);
+}
+
+.theme-mask-toggle input {
+  width: 15px;
+  height: 15px;
+  accent-color: var(--color-brand-text);
+}
+
+.theme-error {
+  margin: 0 0 var(--spacing-md);
+  border-radius: var(--radius-sm);
+  background: #fff1ef;
+  color: #9c4338;
+  padding: var(--spacing-sm);
+  font-size: var(--font-size-caption);
+}
+
+.theme-preview {
+  display: grid;
+  gap: var(--spacing-sm);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-background-subtle);
+  padding: var(--spacing-md);
+}
+
+.theme-preview-bubble {
+  width: fit-content;
+  border-radius: var(--radius-md);
+  background: var(--color-brand-text);
+  color: #fff;
+  padding: var(--spacing-sm) var(--spacing-md);
+  font-size: var(--font-size-body);
+}
+
+.theme-preview-button {
+  width: fit-content;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: var(--color-brand-text);
+  color: #fff;
+  padding: 6px 12px;
+  font-size: var(--font-size-caption);
+  font-weight: 800;
+}
+
+.theme-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--spacing-sm);
+  border-top: 1px solid var(--color-border);
+  padding-top: var(--spacing-md);
+}
+
+@media (max-width: 420px) {
+  .preset-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* 格仔互动动画，独立于主题面板。 */
+.turtle-spin {
+  animation: turtle-spin 0.8s ease;
+}
+
+.turtle-blink {
+  animation: turtle-blink 0.4s ease;
+}
+
+.turtle-nod,
+.turtle-encourage {
+  animation: turtle-nod 0.6s ease;
+}
+
+.turtle-wave {
+  animation: turtle-wave 0.6s ease;
+}
+
+.turtle-sleepy {
+  animation: turtle-sleepy 2s ease infinite;
+}
+
+@keyframes turtle-spin {
+  0%,
+  100% {
+    transform: rotateY(0deg);
+  }
+  50% {
+    transform: rotateY(180deg);
+  }
+}
+
+@keyframes turtle-blink {
+  0%,
+  90%,
+  100% {
+    opacity: 1;
+  }
+  95% {
+    opacity: 0.3;
+  }
+}
+
+@keyframes turtle-nod {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  25%,
+  75% {
+    transform: translateY(-4px);
+  }
+  50% {
+    transform: translateY(0);
+  }
+}
+
+@keyframes turtle-wave {
+  0%,
+  100% {
+    transform: rotate(0deg);
+  }
+  25% {
+    transform: rotate(-15deg);
+  }
+  75% {
+    transform: rotate(15deg);
+  }
+}
+
+@keyframes turtle-sleepy {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+  50% {
+    transform: scale(0.95);
+    opacity: 0.7;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .theme-panel,
+  .app-logo,
+  .preset-button,
+  .turtle-spin,
+  .turtle-blink,
+  .turtle-nod,
+  .turtle-wave,
+  .turtle-sleepy,
+  .turtle-encourage {
+    animation: none;
+    transition: none;
+  }
+}
+
 /* Notion 风格细节打磨：图标、间距、圆角和阴影统一。 */
 .model-picker-trigger svg,
 .labeled-header-button svg,

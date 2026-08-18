@@ -95,6 +95,7 @@ import {
 import PetCompanion from "./PetCompanion";
 import { RuleManager } from "./RuleManager";
 import { SlashCommandAutocomplete, type SlashCommand } from "./SlashCommandAutocomplete";
+import ThemePanel from "./components/ThemePanel";
 import { BASE_MODE_DESCRIPTION, BASE_MODE_HELP_TEXT } from "./helpCommand";
 import { useActivityProgress, type ActivityLog, type ActivityProgress } from "./hooks/useActivityProgress";
 import { useConversation } from "./hooks/useConversation";
@@ -102,10 +103,12 @@ import { useCopyFeedback } from "./hooks/useCopyFeedback";
 import { useExecutionApproval } from "./hooks/useExecutionApproval";
 import { useModelManagement } from "./hooks/useModelManagement";
 import { useServiceHealth } from "./hooks/useServiceHealth";
+import { useTheme } from "./hooks/useTheme";
 import { useToolManagement } from "./hooks/useToolManagement";
 import { useUIState } from "./hooks/useUIState";
 import { useScopeSelection } from "./hooks/useScopeSelection";
 import { useUndoSnapshot } from "./hooks/useUndoSnapshot";
+import { useLongPress } from "./hooks/useLongPress";
 import { folderSheetKey } from "./utils";
 
 export type { ActivityLog, ActivityProgress } from "./hooks/useActivityProgress";
@@ -114,6 +117,23 @@ export type { ActivityLog, ActivityProgress } from "./hooks/useActivityProgress"
 function formatGenerateMs(ms: number): string {
   if (ms < 1000) return `${ms} 毫秒`;
   return `${(ms / 1000).toFixed(1)} 秒`;
+}
+
+const PET_ANIMATIONS = [
+  "turtle-spin",
+  "turtle-blink",
+  "turtle-nod",
+  "turtle-wave"
+];
+
+function animatePet(className: string, duration = 800): void {
+  const pet = document.querySelector<HTMLElement>(".pet-avatar");
+  if (!pet) return;
+  pet.classList.remove(...PET_ANIMATIONS, "turtle-sleepy", "turtle-encourage");
+  pet.classList.add(className);
+  window.setTimeout(() => {
+    pet.classList.remove(className);
+  }, duration);
 }
 
 const CHAT_STORAGE_KEY = "excel-bro.chat.v4";
@@ -841,6 +861,7 @@ export default function App() {
 
   const [contextOpen, setContextOpen] = useState(false);
   const [sheetSearch, setSheetSearch] = useState("");
+  const [themePanelOpen, setThemePanelOpen] = useState(false);
 
   // 斜杠命令自动补全状态
   const [showSlashAutocomplete, setShowSlashAutocomplete] = useState(false);
@@ -865,6 +886,9 @@ export default function App() {
     composerHeight, setComposerHeight,
     togglePetVisibility
   } = useUIState();
+
+  const themeApi = useTheme();
+  const logoLongPress = useLongPress(() => setThemePanelOpen(true));
 
   // 执行验收与工具固化批准状态（自定义 Hook）
   const {
@@ -997,6 +1021,41 @@ export default function App() {
 
   const busy = status !== "idle";
   const isBaseMode = (selectedModelId || serviceHealth?.model || "local") === "local";
+
+  useEffect(() => {
+    if (!petVisible) return;
+
+    const handlePetClick = (event: MouseEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (!target?.closest(".pet-avatar")) return;
+      const animation =
+        PET_ANIMATIONS[Math.floor(Math.random() * PET_ANIMATIONS.length)];
+      animatePet(animation);
+    };
+
+    let idleTimer: ReturnType<typeof setTimeout> | null = null;
+    const resetIdleTimer = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      const pet = document.querySelector<HTMLElement>(".pet-avatar");
+      pet?.classList.remove("turtle-sleepy");
+      idleTimer = setTimeout(() => {
+        pet?.classList.add("turtle-sleepy");
+      }, 60000);
+    };
+
+    document.addEventListener("click", handlePetClick);
+    document.addEventListener("keydown", resetIdleTimer);
+    document.addEventListener("scroll", resetIdleTimer, true);
+    resetIdleTimer();
+
+    return () => {
+      document.removeEventListener("click", handlePetClick);
+      document.removeEventListener("keydown", resetIdleTimer);
+      document.removeEventListener("scroll", resetIdleTimer, true);
+      if (idleTimer) clearTimeout(idleTimer);
+    };
+  }, [petVisible]);
+
   // 撤销快照管理（自定义 Hook）
   const {
     lastUndoSnapshot,
@@ -2576,6 +2635,7 @@ export default function App() {
       text: enteredText || "请结合附件图片分析当前工作簿。",
       attachmentNames: sentImages.map((image) => image.name)
     });
+    animatePet("turtle-encourage", 1000);
     setPrompt("");
     setPendingImages([]);
     setImageError("");
@@ -3603,7 +3663,9 @@ export default function App() {
       <header className="chat-header">
         <div className="brand-mark">EB</div>
         <div className="brand-copy">
-          <strong>Excel Bro</strong>
+          <strong className="app-logo" {...logoLongPress}>
+            Excel Bro
+          </strong>
           <span className={headerStatusClassName}>
             <i />
             {serverOnline && isBaseMode && (
@@ -6157,6 +6219,11 @@ export default function App() {
         </span>
       </footer>
       {petVisible && <PetCompanion busy={busy} />}
+      <ThemePanel
+        open={themePanelOpen}
+        onClose={() => setThemePanelOpen(false)}
+        {...themeApi}
+      />
       <RuleManager
         isOpen={isRuleManagerOpen}
         onClose={() => setIsRuleManagerOpen(false)}
