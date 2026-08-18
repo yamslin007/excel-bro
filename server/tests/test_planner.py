@@ -158,7 +158,9 @@ def test_semantic_requests_decline_without_a_model(prompt: str) -> None:
 
     assert response.kind == "answer"
     assert response.provider == "local"
-    assert "请配置" in response.message
+    assert "基础模式不支持此操作" in response.message
+    assert "/help" in response.message
+    assert "配置 AI 模型" in response.message
 
 
 def test_keyless_local_gateway_can_be_used(

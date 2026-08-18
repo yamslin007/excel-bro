@@ -242,12 +242,9 @@ def _local_analysis(request: PlanRequest) -> AssistantResponse:
     return AnswerResponse(
         provider="local",
         message=(
-            "基础模式只支持明确的地址/范围操作，例如：\n"
-            "· 清空 A1:B10\n"
-            "· 把 A1 填入 100\n"
-            "· 把 A1 设为 =SUM(B2:B10)\n\n"
-            "其他需要理解表格字段或数据含义的需求（查找、汇总、去重、比较等），"
-            "请配置 AI 模型后使用。"
+            "基础模式不支持此操作。\n\n"
+            "💡 输入 /help 查看支持的命令\n"
+            "或配置 AI 模型解锁完整能力。"
         ),
     )
 

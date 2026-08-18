@@ -95,6 +95,7 @@ import {
 import PetCompanion from "./PetCompanion";
 import { RuleManager } from "./RuleManager";
 import { SlashCommandAutocomplete, type SlashCommand } from "./SlashCommandAutocomplete";
+import { BASE_MODE_HELP_TEXT } from "./helpCommand";
 import { useActivityProgress, type ActivityLog, type ActivityProgress } from "./hooks/useActivityProgress";
 import { useConversation } from "./hooks/useConversation";
 import { useCopyFeedback } from "./hooks/useCopyFeedback";
@@ -959,6 +960,10 @@ export default function App() {
   // 一级斜杠命令定义
   const slashCommands: SlashCommand[] = useMemo(
     () => [
+      {
+        value: "help",
+        description: "查看基础模式支持的命令（离线功能说明）"
+      },
       {
         value: "function",
         description: "AI 生成原生 Excel 公式（快捷输入，智能补全）"
@@ -3451,6 +3456,20 @@ export default function App() {
       setPrompt("");
       setShowSlashAutocomplete(false);
     } else {
+      if (value === "help") {
+        appendMessage({
+          role: "assistant",
+          text: BASE_MODE_HELP_TEXT
+        });
+        setPrompt("");
+        setShowSlashAutocomplete(false);
+        const input = composerInputRef.current;
+        if (input) {
+          input.focus();
+        }
+        return;
+      }
+
       // 一级命令：/function 填入等继续输入描述；/model 进二级菜单。
       if (value === "model") {
         setPrompt("/model ");
