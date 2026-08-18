@@ -5010,9 +5010,9 @@ textarea:focus-visible {
 
 .chat-shell::after {
   z-index: 1;
-  display: block;
+  display: none;
   background: var(--color-background);
-  opacity: 0;
+  opacity: 0.6;
   transition: opacity 0.3s ease;
 }
 
@@ -5026,7 +5026,7 @@ textarea:focus-visible {
 }
 
 .chat-shell[data-has-background="true"][data-auto-mask="true"]::after {
-  opacity: 0.6;
+  display: block;
 }
 
 .chat-shell > * {
@@ -5471,6 +5471,9 @@ textarea:focus-visible {
 
 .pet-avatar {
   border-radius: var(--radius-full);
+  z-index: 100;
+  cursor: pointer;
+  pointer-events: auto;
 }
 
 /* 工具抽屉配色配套：让抽屉和内部控件随主题变量一起变化。 */
