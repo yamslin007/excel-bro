@@ -52,12 +52,17 @@ def hyperlink_allowed() -> bool:
 
 
 def dangerous_formula(
-    formula: str, *, allow_hyperlink: bool | None = None
+    formula: str,
+    *,
+    allow_hyperlink: bool | None = None,
+    allowed_external: set[str] | None = None,
 ) -> str | None:
     """公式含危险函数/注入载体时返回命中名称，否则返回 None。
 
     对整段公式做搜索（不只开头），能覆盖 IF(WEBSERVICE(...)) 这类嵌套。
     allow_hyperlink=None 时按配置决定；显式传 True/False 可覆盖（供测试）。
+    allowed_external 为本次会话已勾选的外部工作簿文件名集合：方括号内文件名
+    全部 ∈ allowed_external 才放行外部引用，否则仍返回 EXTERNAL_REF。
     """
     if not formula:
         return None
@@ -73,6 +78,12 @@ def dangerous_formula(
     if _UNC_PREFIX_PATTERN.search(formula):
         return "UNC"
     if _EXTERNAL_WORKBOOK_REF_PATTERN.search(formula):
+        refs = [
+            match[1:-1]
+            for match in _EXTERNAL_WORKBOOK_REF_PATTERN.findall(formula)
+        ]
+        if allowed_external and all(name in allowed_external for name in refs):
+            return None
         return "EXTERNAL_REF"
     return None
 

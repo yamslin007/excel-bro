@@ -39,6 +39,8 @@ export interface FunctionPreview {
   applied?: boolean;
   cancelled?: boolean;
   generateMs?: number;
+  /** 本次公式生成时勾选的外部工作簿文件名（白名单，用于试算与写入放行）。 */
+  externalFiles?: string[];
 }
 
 export interface ChatMessage {

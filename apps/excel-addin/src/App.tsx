@@ -23,6 +23,7 @@ import type {
   FolderSelection,
   DataToolResult,
   FormulaDictionarySheet,
+  FormulaExtraSheet,
   IntentCheckResponse,
   IntentClarification,
   IntentMemory,
@@ -2422,6 +2423,60 @@ export default function App() {
     }
   }
 
+  // /function 多工作簿：从 folder 勾选解析每张外部表的文件信息与样本上下文。
+  // 优先复用 workbook 里已缓存的 folder snapshot（confirmSheetSelection 存的，
+  // sheet 带 sourceFile/sourceFileId）；勾选集未被缓存完整覆盖时现取。
+  async function resolveFormulaExtraSheets(): Promise<FormulaExtraSheet[]> {
+    if (
+      sourceMode !== "folder" ||
+      !folderCatalog ||
+      folderSheetKeys.length === 0
+    ) {
+      return [];
+    }
+    const selectedKeys = new Set(folderSheetKeys);
+    const snapshotKeys = new Set(
+      workbook?.worksheets
+        .filter((sheet) => sheet.sourceFileId || sheet.sourceFile)
+        .map((sheet) => folderSheetKey(sheet.sourceFileId ?? "", sheet.name)) ??
+        []
+    );
+    const snapshot =
+      workbook !== null &&
+      snapshotKeys.size > 0 &&
+      [...selectedKeys].every((key) => snapshotKeys.has(key))
+        ? workbook
+        : await createFolderSnapshot(
+            folderCatalog.sessionId,
+            folderSelections()
+          );
+    const extraSheets: FormulaExtraSheet[] = [];
+    for (const sheet of snapshot.worksheets) {
+      const fileId = sheet.sourceFileId ?? "";
+      if (!selectedKeys.has(folderSheetKey(fileId, sheet.name))) continue;
+      const sourcePath = sheet.sourceFile ?? "";
+      const sourceFile = sourcePath.split(/[\\/]/).pop() ?? sourcePath;
+      if (!sourceFile) continue;
+      const startCol = startColumnOfRange(sheet.usedRange);
+      const startIndex = startCol ? columnIndexFromLetter(startCol) : 0;
+      const headers = sheet.headers.map((cell) => String(cell ?? ""));
+      const columns = headers.map((_, index) =>
+        columnLetterFromIndex(startIndex + index)
+      );
+      extraSheets.push({
+        sourceFile,
+        sourcePath,
+        sheetName: sheet.name,
+        headers,
+        columns,
+        sampleRows: sheet.dataRows
+          .slice(0, 5)
+          .map((row) => row.map((cell) => String(cell ?? "")))
+      });
+    }
+    return extraSheets;
+  }
+
   // /function 阶段二：用户确认写入单元格后，以目标首格作 activeCell 生成两版公式，
   // 就地试算，翻到 preview 阶段。生成/试算/写入三者同锚，R1C1 错位不再发生。
   async function confirmFunctionTarget(message: ChatMessage) {
@@ -2464,6 +2519,10 @@ export default function App() {
         .slice(0, 5)
         .map((row) => row.map((cell) => String(cell ?? "")));
       const dictionary = await loadDictionaryForFormula(sheetName);
+      const extraSheets = await resolveFormulaExtraSheets();
+      const allowedExternal = new Set(
+        extraSheets.map((sheet) => sheet.sourceFile)
+      );
 
       // 计时起点：从此刻(调模型)到两版公式试算完成，作为"生成耗时"展示。
       const generateStart = performance.now();
@@ -2478,6 +2537,7 @@ export default function App() {
         columns,
         sampleRows,
         dictionary,
+        extraSheets,
         modelId: selectedModelId || null
       });
 
@@ -2488,7 +2548,8 @@ export default function App() {
           const trial = await previewFormulaFirstCell(
             sheetName,
             firstCell,
-            formula
+            formula,
+            allowedExternal
           );
           return trial.sampleResult;
         } catch (previewError) {
@@ -2514,6 +2575,7 @@ export default function App() {
         modernFormula: result.modernFormula,
         modernExplanation: result.modernExplanation,
         modernResult,
+        externalFiles: extraSheets.map((sheet) => sheet.sourceFile),
         compatFormula: result.compatFormula,
         compatExplanation: result.compatExplanation,
         compatResult,
@@ -2747,7 +2809,10 @@ export default function App() {
     }
   }
 
-  async function runPlan(plan: AnalysisPlan) {
+  async function runPlan(
+    plan: AnalysisPlan,
+    allowedExternalFiles?: ReadonlySet<string>
+  ) {
     if (sourceMode === "folder") {
       if (!folderCatalog) return;
       setStatus("executing");
@@ -2803,7 +2868,7 @@ export default function App() {
 
     setStatus("executing");
     try {
-      const result = await executePlan(plan);
+      const result = await executePlan(plan, { allowedExternalFiles });
       recordDiagnosticEvent({
         timestamp: new Date().toISOString(),
         phase: "execution",
@@ -2987,7 +3052,10 @@ export default function App() {
           const trial = await previewFormulaFirstCell(
             preview.sheet,
             firstCell,
-            formula
+            formula,
+            preview.externalFiles
+              ? new Set(preview.externalFiles)
+              : undefined
           );
           formulaR1C1 = trial.formulaR1C1;
         } catch {
@@ -3035,7 +3103,10 @@ export default function App() {
       targetError: undefined,
       pickingTarget: false
     });
-    await runPlan(plan);
+    await runPlan(
+      plan,
+      preview.externalFiles ? new Set(preview.externalFiles) : undefined
+    );
   }
 
   function cancelFunctionPreview(message: ChatMessage) {

@@ -75,6 +75,48 @@ describe("formulaSafety", () => {
     expect(dangerousFormula("=SUM(A1:A10)")).toBeNull();
   });
 
+  it("allowlists external workbook refs only for selected files", () => {
+    const allowed = new Set(["B.xlsx"]);
+    expect(
+      dangerousFormula("='[B.xlsx]Sheet2'!A1", undefined, allowed)
+    ).toBeNull();
+    expect(
+      dangerousFormula("=SUM('[B.xlsx]Sheet2'!$A$2:$B$7)", undefined, allowed)
+    ).toBeNull();
+    // 未勾选的文件仍拒绝
+    expect(
+      dangerousFormula("='[C.xlsx]Sheet1'!A1", undefined, allowed)
+    ).toBe("EXTERNAL_REF");
+    // 不传白名单时维持原行为
+    expect(dangerousFormula("='[B.xlsx]Sheet2'!A1")).toBe("EXTERNAL_REF");
+    // 多个引用中任一不在白名单即拒绝
+    expect(
+      dangerousFormula(
+        "=SUM('[B.xlsx]Sheet2'!A1)+SUM('[C.xlsx]Sheet3'!A1)",
+        undefined,
+        allowed
+      )
+    ).toBe("EXTERNAL_REF");
+    // UNC 不受白名单影响
+    expect(
+      dangerousFormula(
+        "='\\\\evil.com\\share\\[data.xlsx]Sheet1'!A1",
+        undefined,
+        allowed
+      )
+    ).toBe("UNC");
+  });
+
+  it("assertSafeFormula respects the external file whitelist", () => {
+    const allowed = new Set(["B.xlsx"]);
+    expect(() =>
+      assertSafeFormula("='[B.xlsx]Sheet2'!A1", "A1 的公式", allowed)
+    ).not.toThrow();
+    expect(() =>
+      assertSafeFormula("='[C.xlsx]Sheet1'!A1", "A1 的公式", allowed)
+    ).toThrow(/EXTERNAL_REF/);
+  });
+
   it("detects UNC and file hyperlink addresses", () => {
     expect(dangerousHyperlinkAddress("\\\\evil.com\\share\\report.xlsx")).toBe(
       "UNC"

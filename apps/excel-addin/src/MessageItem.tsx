@@ -53,6 +53,61 @@ interface MessageItemProps {
   replyToMessage: (message: ChatMessage) => void;
 }
 
+interface ExternalWorkbookRef {
+  file: string;
+  sheet: string;
+}
+
+// 解析公式中的外部工作簿引用（如 '[B.xlsx]Sheet2'!A1），去重后返回。
+function externalWorkbookRefs(formula: string): ExternalWorkbookRef[] {
+  const refs: ExternalWorkbookRef[] = [];
+  const pattern =
+    /\[([^\]\s]+\.(?:xlsx|xlsm|xlsb|xls|csv|xlw)\])'?([^'!]+)'?!/gi;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(formula)) !== null) {
+    const file = match[1].slice(1, -1);
+    const sheet = match[2].trim();
+    if (!file || !sheet) continue;
+    const key = `${file}\u0000${sheet}`;
+    if (!refs.some((ref) => `${ref.file}\u0000${ref.sheet}` === key)) {
+      refs.push({ file, sheet });
+    }
+  }
+  return refs;
+}
+
+// 预览卡外部工作簿提示块：列出公式引用的外部工作簿；试算报错时提示先打开。
+function FunctionExternalRefs({ preview }: { preview: FunctionPreview }) {
+  const formula =
+    preview.version === "modern"
+      ? preview.modernFormula
+      : preview.compatFormula;
+  const trial =
+    preview.version === "modern"
+      ? preview.modernResult
+      : preview.compatResult;
+  const refs = externalWorkbookRefs(formula);
+  if (refs.length === 0) return null;
+  const unavailable = /#(?:REF|NAME|VALUE)/.test(trial);
+  return (
+    <>
+      <div className="function-external-refs">
+        <span>本公式引用外部工作簿：</span>
+        {refs.map((ref) => (
+          <em key={`${ref.file}\u0000${ref.sheet}`}>
+            {ref.file} › {ref.sheet}
+          </em>
+        ))}
+      </div>
+      {unavailable && (
+        <p className="function-external-hint">
+          外部工作簿未在 Excel 中打开，打开后会自动重算。
+        </p>
+      )}
+    </>
+  );
+}
+
 export default function MessageItem({
   messages,
   messageEndRef,
@@ -514,6 +569,8 @@ export default function MessageItem({
                         : message.functionPreview.compatResult}
                     </strong>
                   </div>
+
+                  <FunctionExternalRefs preview={message.functionPreview} />
 
                   {(message.functionPreview.version === "modern"
                     ? message.functionPreview.modernExplanation

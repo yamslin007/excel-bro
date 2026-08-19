@@ -145,6 +145,7 @@ server/app/
 - `PUT /api/settings/model`：更新模型配置
 - `POST /api/settings/model/connections`：新增连接
 - `DELETE /api/settings/model/connections`：删除连接
+- `POST /api/formulas/generate`：/function 短链生成原生公式（可携带文件夹模式勾选的外部工作簿工作表上下文 `extraSheets`）
 - `GET /api/diagnostics`：诊断信息
 
 前端协议定义在 `apps/excel-addin/src/contracts.ts`，后端协议镜像在 `server/app/models.py`。

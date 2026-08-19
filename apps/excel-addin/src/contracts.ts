@@ -6,6 +6,16 @@ export interface FormulaDictionarySheet {
   rows: string[][];
 }
 
+// /function 多工作簿：用户勾选的外部工作簿工作表上下文（供生成跨文件公式）。
+export interface FormulaExtraSheet {
+  sourceFile: string;
+  sourcePath: string;
+  sheetName: string;
+  headers: string[];
+  columns: string[];
+  sampleRows: string[][];
+}
+
 export interface GenerateFormulaRequest {
   description: string;
   activeCell: string;
@@ -13,6 +23,7 @@ export interface GenerateFormulaRequest {
   columns?: string[];
   sampleRows?: string[][];
   dictionary?: FormulaDictionarySheet | null;
+  extraSheets?: FormulaExtraSheet[];
   modelId?: string | null;
 }
 

@@ -499,7 +499,8 @@ export async function captureSelectionContext(): Promise<{
 export async function previewFormulaFirstCell(
   sheetName: string,
   firstCell: string,
-  formula: string
+  formula: string,
+  allowedExternal?: ReadonlySet<string>
 ): Promise<{ sampleResult: string; sampleInput: string; formulaR1C1: string }> {
   return Excel.run(async (context) => {
     const sheet = context.workbook.worksheets.getItem(sheetName);
@@ -509,7 +510,7 @@ export async function previewFormulaFirstCell(
 
     const original = cell.formulas as unknown[][];
 
-    assertSafeFormula(formula, `${firstCell} 的公式`);
+    assertSafeFormula(formula, `${firstCell} 的公式`, allowedExternal);
     cell.formulas = [[formula]];
     await context.sync();
 
@@ -2546,7 +2547,8 @@ export async function executeAction(
   context: Excel.RequestContext,
   action: ExcelAction,
   actionIndex: number,
-  collector: ActionUndoCollector
+  collector: ActionUndoCollector,
+  allowedExternalFiles?: ReadonlySet<string>
 ): Promise<VerificationCriterion[] | void> {
   if (action.type === "deleteWorksheet") {
     const existing = context.workbook.worksheets.getItemOrNullObject(action.sheet);
@@ -2849,13 +2851,18 @@ export async function executeAction(
     }
     case "writeFormulas": {
       if (action.formulaR1C1) {
-        assertSafeFormula(action.formulaR1C1, `${action.range} 的公式`);
+        assertSafeFormula(
+          action.formulaR1C1,
+          `${action.range} 的公式`,
+          allowedExternalFiles
+        );
       } else {
         action.formulas.forEach((row, rowIndex) =>
           row.forEach((formula, columnIndex) =>
             assertSafeFormula(
               formula,
-              `${action.range} 第 ${rowIndex + 1} 行第 ${columnIndex + 1} 列`
+              `${action.range} 第 ${rowIndex + 1} 行第 ${columnIndex + 1} 列`,
+              allowedExternalFiles
             )
           )
         );
@@ -3417,7 +3424,15 @@ export async function undoExecution(
   });
 }
 
-export async function executePlan(plan: AnalysisPlan): Promise<PlanExecutionResult> {
+export interface ExecutePlanOptions {
+  /** 本次会话已勾选的外部工作簿文件名集合，用于放行跨文件公式引用。 */
+  allowedExternalFiles?: ReadonlySet<string>;
+}
+
+export async function executePlan(
+  plan: AnalysisPlan,
+  options: ExecutePlanOptions = {}
+): Promise<PlanExecutionResult> {
   if (plan.sourceFingerprint && plan.sourceFingerprintSheets?.length) {
     const current = isToolSchemaFingerprint(plan.sourceFingerprint)
       ? toolSchemaFingerprintForSnapshot(
@@ -3523,7 +3538,8 @@ export async function executePlan(plan: AnalysisPlan): Promise<PlanExecutionResu
           context,
           action,
           index,
-          actionUndo
+          actionUndo,
+          options.allowedExternalFiles
         );
         if (actionCriteria) dynamicCriteria.push(...actionCriteria);
         await context.sync();

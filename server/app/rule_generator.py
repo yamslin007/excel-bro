@@ -23,6 +23,16 @@ class DictionarySheet(BaseModel):
     rows: list[list[str]] = Field(default_factory=list, max_length=200)
 
 
+class ExtraSheet(BaseModel):
+    """外部工作簿工作表上下文：文件名 + 表头/样本行（供生成跨文件公式）"""
+    sourceFile: str = Field(min_length=1, max_length=200, description="文件名，如 B.xlsx（用于外部引用语法）")
+    sourcePath: str = Field(default="", max_length=500, description="相对路径（展示用，区分同名文件）")
+    sheetName: str = Field(min_length=1, max_length=100, description="工作表名")
+    headers: list[str] = Field(default_factory=list, max_length=100, description="列头")
+    columns: list[str] = Field(default_factory=list, max_length=100, description="列字母，与 headers 一一对应")
+    sampleRows: list[list[str]] = Field(default_factory=list, max_length=10, description="前几行样本")
+
+
 class GenerateFormulaRequest(BaseModel):
     """生成原生公式请求"""
     description: str = Field(min_length=1, max_length=500, description="用户对公式的自然语言描述")
@@ -31,6 +41,11 @@ class GenerateFormulaRequest(BaseModel):
     columns: list[str] = Field(default_factory=list, max_length=100, description="列字母，与 headers 一一对应，如 [A,B,C]")
     sampleRows: list[list[str]] = Field(default_factory=list, max_length=10, description="选区样本行")
     dictionary: DictionarySheet | None = Field(default=None, description="数据字典表内容（若存在）")
+    extraSheets: list[ExtraSheet] = Field(
+        default_factory=list,
+        max_length=20,
+        description="用户勾选的外部工作簿工作表上下文（跨文件公式）",
+    )
     modelId: str | None = Field(default=None, description="模型 ID")
 
 
@@ -64,7 +79,8 @@ def _build_formula_generation_prompt(request: GenerateFormulaRequest) -> list[di
 8. 【回退·严格受限】仅当需求恰好是这两个已存在的预制规则能解决的复杂文本场景时，才回退用它们：清理隐形/零宽/控制字符 → =EB("隐形字符清理", 引用)；检测伪空白单元格 → =EB("空白检测", 引用)。这是仅有的两个预制规则，**绝不可编造任何其它规则名**。
 9. 【做不了就明说】若原生公式和上述两个预制规则都无法表达该需求，请把 modernFormula 和 compatFormula 都返回空字符串 ""，并在 explanation 里写明「原生公式无法表达此需求，建议直接在对话中描述需求，走常规处理流程」。不要硬凑公式、不要编造规则。
 10. 不要编造上下文里不存在的列或表名。
-11. 只返回 JSON：{{"modernFormula": "=...", "modernExplanation": "现代版怎么工作", "compatFormula": "=...", "compatExplanation": "兼容版怎么工作"}}"""
+11. 若涉及外部工作簿（见下方「外部工作簿」段落），必须用完整外部引用语法 [文件名]表名!区域，例如 [B.xlsx]Sheet2!$A$2:$B$7；文件名必须严格使用注入的名字，禁止编造未提供的文件或工作表；外部区域一律用绝对引用（$A$2:$B$7 风格），与字典表规则一致。
+12. 只返回 JSON：{{"modernFormula": "=...", "modernExplanation": "现代版怎么工作", "compatFormula": "=...", "compatExplanation": "兼容版怎么工作"}}"""
 
     lines: list[str] = [
         f"目标单元格：{request.activeCell}（引用范围不得圈入此格本身；但若是对该列数据做汇总/统计，可正常引用同列其它单元格区域）",
@@ -92,6 +108,27 @@ def _build_formula_generation_prompt(request: GenerateFormulaRequest) -> list[di
         lines.append(f"数据字典表「{request.dictionary.name}」内容（可在公式中引用此表）：")
         for row in request.dictionary.rows:
             lines.append(f"  {json.dumps(row, ensure_ascii=False)}")
+
+    for extra in request.extraSheets:
+        lines.append("")
+        lines.append(
+            f"外部工作簿「{extra.sourceFile}」工作表「{extra.sheetName}」"
+            f"（可在公式中用 [{extra.sourceFile}]{extra.sheetName}! 引用）："
+        )
+        if extra.columns and len(extra.columns) == len(extra.headers):
+            mapping = "、".join(
+                f"{col}列={header}"
+                for col, header in zip(extra.columns, extra.headers)
+            )
+            lines.append(f"列头→列字母映射：{mapping}")
+        else:
+            lines.append(
+                f"列头：{json.dumps(extra.headers, ensure_ascii=False)}"
+            )
+        if extra.sampleRows:
+            lines.append("样本行（前几行数据）：")
+            for row in extra.sampleRows:
+                lines.append(f"  {json.dumps(row, ensure_ascii=False)}")
 
     lines.append("")
     lines.append('请只返回 JSON：{"modernFormula": "=...", "modernExplanation": "...", "compatFormula": "=...", "compatExplanation": "..."}')
@@ -226,11 +263,13 @@ async def generate_formula(request: GenerateFormulaRequest) -> GenerateFormulaRe
     if not compat_formula.startswith("="):
         compat_formula = "=" + compat_formula
 
+    allowed_external = {extra.sourceFile for extra in request.extraSheets} or None
+
     for label, formula in (
         ("现代版", modern_formula),
         ("兼容版", compat_formula),
     ):
-        matched = dangerous_formula(formula)
+        matched = dangerous_formula(formula, allowed_external=allowed_external)
         if matched is not None:
             raise ValueError(
                 f"{label}公式包含被禁用的函数：{matched}，已拒绝写入。"

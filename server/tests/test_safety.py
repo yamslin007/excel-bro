@@ -80,6 +80,41 @@ def test_dangerous_formula_detects_unc_and_external_workbook_refs() -> None:
     assert dangerous_formula("=SUM(A1:A10)") is None
 
 
+def test_dangerous_formula_allowlists_external_workbook_refs_for_selected_files() -> None:
+    allowed = {"B.xlsx"}
+    # 勾选文件的外部引用放行
+    assert dangerous_formula("='[B.xlsx]Sheet2'!A1", allowed_external=allowed) is None
+    assert (
+        dangerous_formula(
+            "=SUM('[B.xlsx]Sheet2'!$A$2:$B$7)", allowed_external=allowed
+        )
+        is None
+    )
+    # 未勾选的文件仍拒绝
+    assert (
+        dangerous_formula("='[C.xlsx]Sheet1'!A1", allowed_external=allowed)
+        == "EXTERNAL_REF"
+    )
+    # 不传白名单时维持原行为
+    assert dangerous_formula("='[B.xlsx]Sheet2'!A1") == "EXTERNAL_REF"
+    # 多个引用中任一不在白名单即拒绝
+    assert (
+        dangerous_formula(
+            "=SUM('[B.xlsx]Sheet2'!A1)+SUM('[C.xlsx]Sheet3'!A1)",
+            allowed_external=allowed,
+        )
+        == "EXTERNAL_REF"
+    )
+    # UNC 不受白名单影响
+    assert (
+        dangerous_formula(
+            r"='\\evil.com\share\[data.xlsx]Sheet1'!A1",
+            allowed_external=allowed,
+        )
+        == "UNC"
+    )
+
+
 def test_dangerous_hyperlink_address_detects_unc_and_file() -> None:
     # Windows 把 \\ 与 // 都解析为 UNC；点击超链接即触发 SMB 连接。
     assert dangerous_hyperlink_address(r"\\evil.com\share\report.xlsx") == "UNC"

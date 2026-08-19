@@ -36,13 +36,24 @@ function hyperlinkEnabled(): boolean {
   return safety?.allowHyperlink === true;
 }
 
+/** 提取公式中所有外部工作簿引用（方括号内的文件名）。 */
+function externalWorkbookFileNames(formula: string): string[] {
+  const pattern = new RegExp(EXTERNAL_WORKBOOK_REF_PATTERN.source, "gi");
+  const matches = formula.match(pattern);
+  if (!matches) return [];
+  return matches.map((ref) => ref.slice(1, -1));
+}
+
 /**
  * 公式含危险函数/注入载体时返回命中名称，否则返回 null。
  * allowHyperlink 不传时按配置决定；显式传值可覆盖（供测试）。
+ * allowedExternal 为本次会话已勾选的外部工作簿文件名集合：方括号内文件名
+ * 全部 ∈ allowedExternal 才放行外部引用，否则仍返回 "EXTERNAL_REF"。
  */
 export function dangerousFormula(
   formula: string,
-  allowHyperlink = hyperlinkEnabled()
+  allowHyperlink = hyperlinkEnabled(),
+  allowedExternal?: ReadonlySet<string>
 ): string | null {
   if (!formula) return null;
   for (const { name, pattern } of DANGEROUS_FORMULA_FUNCTIONS) {
@@ -51,7 +62,13 @@ export function dangerousFormula(
   }
   if (DDE_PATTERN.test(formula)) return "DDE";
   if (UNC_PREFIX_PATTERN.test(formula)) return "UNC";
-  if (EXTERNAL_WORKBOOK_REF_PATTERN.test(formula)) return "EXTERNAL_REF";
+  if (EXTERNAL_WORKBOOK_REF_PATTERN.test(formula)) {
+    const refs = externalWorkbookFileNames(formula);
+    const allAllowed =
+      refs.length > 0 &&
+      refs.every((fileName) => allowedExternal?.has(fileName) ?? false);
+    if (!allAllowed) return "EXTERNAL_REF";
+  }
   return null;
 }
 
@@ -67,8 +84,12 @@ export function dangerousHyperlinkAddress(address: string): string | null {
 }
 
 /** 校验单个公式，危险则抛错。label 用于错误提示定位。 */
-export function assertSafeFormula(formula: string, label: string): void {
-  const matched = dangerousFormula(formula);
+export function assertSafeFormula(
+  formula: string,
+  label: string,
+  allowedExternal?: ReadonlySet<string>
+): void {
+  const matched = dangerousFormula(formula, hyperlinkEnabled(), allowedExternal);
   if (matched !== null) {
     throw new Error(`${label}包含被禁用的函数：${matched}，已拒绝写入`);
   }
