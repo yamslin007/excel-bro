@@ -63,15 +63,11 @@ App.tsx (5946 行) - 业务协调层
 │       ├── useSlashCommands
 │       ├── useCopyFeedback
 │       └── useServiceHealth
-├── UI 组件 (8 个)
-│   ├── ChatHeader
-│   ├── Composer
-│   ├── ConfirmDialogs
-│   ├── HistoryDrawer
-│   ├── MessageItem
-│   ├── ScopePopover
-│   ├── SettingsDrawer
-│   └── ToolDrawer
+├── UI 组件（实际接线）
+│   ├── PetCompanion / RuleManager / SlashCommandAutocomplete / ThemePanel
+│   └── 其余界面（消息流、范围浮层、设置/工具/历史抽屉、输入区等）
+│       内联渲染在 App.tsx
+│   （曾把上述界面抽成独立展示组件文件，但从未被引入，已作为死代码删除）
 └── 工具模块
     ├── conversation.ts
     ├── format.ts
