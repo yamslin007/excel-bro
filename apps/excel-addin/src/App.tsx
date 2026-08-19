@@ -5907,7 +5907,12 @@ export default function App() {
                         onClick={() => toggleSheet(sheet.name)}
                         aria-pressed={selected}
                       >
-                        <i aria-hidden="true">{selected ? "✓" : ""}</i>
+                        <i
+                          className="sheet-checkbox"
+                          aria-hidden="true"
+                        >
+                          {selected ? "✓" : ""}
+                        </i>
                         <span>
                           <strong>{sheet.name}</strong>
                           <small>
@@ -5978,6 +5983,12 @@ export default function App() {
                                       }
                                       aria-pressed={selected}
                                     >
+                                      <i
+                                        className="sheet-checkbox"
+                                        aria-hidden="true"
+                                      >
+                                        {selected ? "✓" : ""}
+                                      </i>
                                       <span>{sheet.name}</span>
                                       <small>
                                         {sheet.rowCount} 行 · {sheet.columnCount} 列

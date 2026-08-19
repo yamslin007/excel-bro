@@ -2774,7 +2774,7 @@ textarea:focus-visible {
 .sheet-picker-options button {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-start;
   gap: 8px;
   border: 1px solid var(--color-border);
   border-radius: var(--radius-md);
@@ -2800,6 +2800,7 @@ textarea:focus-visible {
 
 .sheet-picker-options small {
   flex: 0 0 auto;
+  margin-left: auto;
   color: var(--color-text-secondary);
   font-size: var(--font-size-caption);
 }
@@ -4060,21 +4061,26 @@ textarea:focus-visible {
   background: var(--color-brand-bg);
 }
 
-.workbook-sheet-list > button > i {
+.sheet-checkbox {
   display: grid;
-  width: 17px;
-  height: 17px;
-  flex: 0 0 17px;
+  width: 18px;
+  height: 18px;
+  flex: 0 0 18px;
   place-items: center;
-  border: 1px solid var(--color-border-strong);
+  border: 1.5px solid var(--color-border-strong);
   border-radius: var(--radius-sm);
-  background: var(--color-background);
+  background: var(--color-surface);
   color: white;
-  font-size: var(--font-size-caption);
+  font-size: 13px;
+  font-weight: 800;
   font-style: normal;
+  line-height: 1;
+  transition:
+    background-color 120ms ease,
+    border-color 120ms ease;
 }
 
-.workbook-sheet-list > button.selected > i {
+button.selected > .sheet-checkbox {
   border-color: var(--color-brand-text);
   background: var(--color-brand-text);
 }
