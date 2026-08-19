@@ -31,6 +31,7 @@ class ExtraSheet(BaseModel):
     headers: list[str] = Field(default_factory=list, max_length=100, description="列头")
     columns: list[str] = Field(default_factory=list, max_length=100, description="列字母，与 headers 一一对应")
     sampleRows: list[list[str]] = Field(default_factory=list, max_length=10, description="前几行样本")
+    rowCount: int = Field(default=0, ge=0, description="外部表总行数（含表头行）")
 
 
 class GenerateFormulaRequest(BaseModel):
@@ -80,7 +81,8 @@ def _build_formula_generation_prompt(request: GenerateFormulaRequest) -> list[di
 9. 【做不了就明说】若原生公式和上述两个预制规则都无法表达该需求，请把 modernFormula 和 compatFormula 都返回空字符串 ""，并在 explanation 里写明「原生公式无法表达此需求，建议直接在对话中描述需求，走常规处理流程」。不要硬凑公式、不要编造规则。
 10. 不要编造上下文里不存在的列或表名。
 11. 若涉及外部工作簿（见下方「外部工作簿」段落），必须用完整外部引用语法 [文件名]表名!区域，例如 [B.xlsx]Sheet2!$A$2:$B$7；文件名必须严格使用注入的名字，禁止编造未提供的文件或工作表；外部区域一律用绝对引用（$A$2:$B$7 风格），与字典表规则一致。
-12. 只返回 JSON：{{"modernFormula": "=...", "modernExplanation": "现代版怎么工作", "compatFormula": "=...", "compatExplanation": "兼容版怎么工作"}}"""
+12. 【字面值·必须遵守】字典或上下文中的「/」「－」「—」等符号是**字面值**：公式输出时必须原样保留（要填入 / 就写 "/"，要填入 － 就写 "－"），绝不能把这些符号当作空值/缺失值替换成 ""。用户明确要某个标记，就输出那个标记本身。
+13. 只返回 JSON：{{"modernFormula": "=...", "modernExplanation": "现代版怎么工作", "compatFormula": "=...", "compatExplanation": "兼容版怎么工作"}}"""
 
     lines: list[str] = [
         f"目标单元格：{request.activeCell}（引用范围不得圈入此格本身；但若是对该列数据做汇总/统计，可正常引用同列其它单元格区域）",

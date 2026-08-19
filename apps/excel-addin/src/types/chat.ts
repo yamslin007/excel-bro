@@ -5,6 +5,7 @@ import type {
   ResultContext,
   VerificationReport
 } from "../contracts";
+import type { CrossTableMatchProposal } from "../crossTableFormula";
 import type { ActivityLog } from "../hooks/useActivityProgress";
 import type { SourceMode } from "./workbook";
 
@@ -39,6 +40,10 @@ export interface FunctionPreview {
   applied?: boolean;
   cancelled?: boolean;
   generateMs?: number;
+  /** 公式来源：deterministic=本地确定性拼公式；model=模型生成（默认）。 */
+  mode?: "deterministic" | "model";
+  /** 跨表匹配提案（目标阶段预填，可改匹配键/取值列；换 AI 生成时清空）。 */
+  match?: CrossTableMatchProposal;
   /** 本次公式生成时勾选的外部工作簿文件名（白名单，用于试算与写入放行）。 */
   externalFiles?: string[];
 }

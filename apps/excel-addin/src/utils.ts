@@ -92,3 +92,13 @@ export function isAbortError(reason: unknown): boolean {
 export function folderSheetKey(fileId: string, sheetName: string): string {
   return `${fileId}\u0000${sheetName}`;
 }
+
+// /function 试算结果是否算"验算不通过"：Excel 错误值（#REF! 等）或试算异常。
+export function formulaTrialFailed(result: string): boolean {
+  const trimmed = result.trim();
+  return (
+    trimmed.startsWith("#") ||
+    trimmed.startsWith("（试算失败") ||
+    trimmed.startsWith("(试算失败")
+  );
+}

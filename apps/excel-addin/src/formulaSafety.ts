@@ -44,6 +44,11 @@ function externalWorkbookFileNames(formula: string): string[] {
   return matches.map((ref) => ref.slice(1, -1));
 }
 
+/** 公式引用的外部工作簿文件名列表（供验算拦截判断是否外部引用导致报错）。 */
+export function formulaExternalFileNames(formula: string): string[] {
+  return externalWorkbookFileNames(formula);
+}
+
 /**
  * 公式含危险函数/注入载体时返回命中名称，否则返回 null。
  * allowHyperlink 不传时按配置决定；显式传值可覆盖（供测试）。

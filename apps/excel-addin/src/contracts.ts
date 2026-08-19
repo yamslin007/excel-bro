@@ -14,6 +14,8 @@ export interface FormulaExtraSheet {
   headers: string[];
   columns: string[];
   sampleRows: string[][];
+  /** 外部表总行数（含表头行），本地拼跨表公式时用于确定引用区域末行。 */
+  rowCount: number;
 }
 
 export interface GenerateFormulaRequest {

@@ -85,6 +85,14 @@ import {
 import { extractWorkbookDataPeriod } from "./workbookIdentity";
 import capabilities from "../../../config/capabilities.json";
 import {
+  buildCrossTableFormulas,
+  buildCrossTableProposal,
+  columnsFromRange,
+  type CrossTableMatchProposal,
+  type GeneratedFormulaPair
+} from "./crossTableFormula";
+import { formulaExternalFileNames } from "./formulaSafety";
+import {
   currentModelCallCount,
   exportDiagnosticReport,
   recordDiagnosticEvent
@@ -110,7 +118,7 @@ import { useUIState } from "./hooks/useUIState";
 import { useScopeSelection } from "./hooks/useScopeSelection";
 import { useUndoSnapshot } from "./hooks/useUndoSnapshot";
 import { useLongPress } from "./hooks/useLongPress";
-import { folderSheetKey } from "./utils";
+import { folderSheetKey, formulaTrialFailed } from "./utils";
 
 export type { ActivityLog, ActivityProgress } from "./hooks/useActivityProgress";
 
@@ -366,6 +374,52 @@ function suggestWriteTarget(usedRange: string | null): string {
   const endColLetter = (match[3] ?? match[1]).toUpperCase();
   const nextCol = columnLetterFromIndex(columnIndexFromLetter(endColLetter) + 1);
   return `${nextCol}${startRow + 1}`;
+}
+
+interface ExternalWorkbookRef {
+  file: string;
+  sheet: string;
+}
+
+// 解析公式中的外部工作簿引用（如 '[B.xlsx]Sheet2'!A1），去重后返回。
+function externalWorkbookRefs(formula: string): ExternalWorkbookRef[] {
+  const refs: ExternalWorkbookRef[] = [];
+  const pattern =
+    /\[([^\]\s]+\.(?:xlsx|xlsm|xlsb|xls|csv|xlw)\])'?([^'!]+)'?!/gi;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(formula)) !== null) {
+    const file = match[1].slice(1, -1);
+    const sheet = match[2].trim();
+    if (!file || !sheet) continue;
+    const key = `${file}\u0000${sheet}`;
+    if (!refs.some((ref) => `${ref.file}\u0000${ref.sheet}` === key)) {
+      refs.push({ file, sheet });
+    }
+  }
+  return refs;
+}
+
+// 验算拦截文案：返回 null 表示可写入；否则返回原因（不能算就不算，不硬写）。
+function functionWriteBlockReason(preview: FunctionPreview): string | null {
+  const noFormula = !preview.modernFormula && !preview.compatFormula;
+  if (noFormula) {
+    return "无法生成可靠公式：未能得到可用公式。为避免硬写错误结果，已拦截写入；请手动填写，或调整描述后重试。";
+  }
+  const formula =
+    preview.version === "modern"
+      ? preview.modernFormula
+      : preview.compatFormula;
+  const trial =
+    preview.version === "modern"
+      ? preview.modernResult
+      : preview.compatResult;
+  if (
+    formulaTrialFailed(trial) &&
+    formulaExternalFileNames(formula).length === 0
+  ) {
+    return `试算未通过（${trial}）：为避免写入错误结果，已拦截写入；请检查公式或手动填写。`;
+  }
+  return null;
 }
 
 // /function 上下文：扫描名字含"字典"/"映射"的表，读其内容注入生成提示。
@@ -2395,6 +2449,22 @@ export default function App() {
         (sheet) => sheet.name === sheetName
       );
       const suggested = suggestWriteTarget(activeSheet?.usedRange ?? null);
+      // 跨表匹配确定性提案：仅凭表头结构 + 描述关键词本地判断，不调模型。
+      // 快照读取失败不阻断流程：退回模型生成路径。
+      let match: CrossTableMatchProposal | null = null;
+      try {
+        const extraSheets = await resolveFormulaExtraSheets();
+        match = buildCrossTableProposal(
+          description,
+          columnsFromRange(
+            activeSheet?.headers ?? [],
+            activeSheet?.usedRange ?? null
+          ),
+          extraSheets
+        );
+      } catch {
+        match = null;
+      }
 
       appendMessage({
         role: "assistant",
@@ -2403,6 +2473,8 @@ export default function App() {
           description,
           sheet: sheetName,
           writeTarget: suggested,
+          mode: match ? "deterministic" : "model",
+          match: match ?? undefined,
           version: "compat",
           modernFormula: "",
           modernExplanation: "",
@@ -2471,7 +2543,8 @@ export default function App() {
         columns,
         sampleRows: sheet.dataRows
           .slice(0, 5)
-          .map((row) => row.map((cell) => String(cell ?? "")))
+          .map((row) => row.map((cell) => String(cell ?? ""))),
+        rowCount: sheet.rowCount
       });
     }
     return extraSheets;
@@ -2479,7 +2552,11 @@ export default function App() {
 
   // /function 阶段二：用户确认写入单元格后，以目标首格作 activeCell 生成两版公式，
   // 就地试算，翻到 preview 阶段。生成/试算/写入三者同锚，R1C1 错位不再发生。
-  async function confirmFunctionTarget(message: ChatMessage) {
+  // 优先本地确定性路径（mode=deterministic），否则走模型兜底（mode=model）。
+  async function confirmFunctionTarget(
+    message: ChatMessage,
+    options?: { forceModel?: boolean }
+  ) {
     const preview = message.functionPreview;
     if (!preview || preview.phase !== "target" || busy) return;
 
@@ -2496,50 +2573,73 @@ export default function App() {
       return;
     }
 
+    const useModel =
+      options?.forceModel === true ||
+      preview.mode !== "deterministic" ||
+      !preview.match;
+
     setStatus("planning");
     // 建 activity 让实时计时器起步：不建的话计时 effect 因 activity 为空提前返回，
     // 生成公式的多秒模型调用期间会一直显示"0 秒"。
-    beginActivity("正在生成公式", `目标 ${resolved.address}，正在结合表结构生成两版公式。`);
+    beginActivity(
+      useModel ? "正在生成公式" : "正在生成本地公式",
+      useModel
+        ? `目标 ${resolved.address}，正在结合表结构生成两版公式。`
+        : `目标 ${resolved.address}，正在按跨表匹配参数拼公式并试算。`
+    );
     try {
       const sheetName = preview.sheet;
-      // 抓活动表列头/样本行喂模型；扫描"字典/映射"表注入其内容。
-      const snapshot = await captureWorkbook([sheetName]);
-      const activeSheet = snapshot.worksheets.find(
-        (sheet) => sheet.name === sheetName
-      );
-      const headers = activeSheet?.headers.map((cell) => String(cell ?? "")) ?? [];
-      // 列头对应的列字母：从 usedRange 起始列往右枚举，喂给模型建立"列头→列"映射，
-      // 避免模型猜错列（如把输出列当输入列导致循环引用）。
-      const startCol = startColumnOfRange(activeSheet?.usedRange ?? null);
-      const startIndex = startCol ? columnIndexFromLetter(startCol) : 0;
-      const columns = headers.map((_, i) =>
-        columnLetterFromIndex(startIndex + i)
-      );
-      const sampleRows = (activeSheet?.dataRows ?? [])
-        .slice(0, 5)
-        .map((row) => row.map((cell) => String(cell ?? "")));
-      const dictionary = await loadDictionaryForFormula(sheetName);
-      const extraSheets = await resolveFormulaExtraSheets();
-      const allowedExternal = new Set(
-        extraSheets.map((sheet) => sheet.sourceFile)
-      );
-
       // 计时起点：从此刻(调模型)到两版公式试算完成，作为"生成耗时"展示。
       const generateStart = performance.now();
 
-      // 后端优先用「/function 公式模型」（模型配置里单独选的那个），忽略 modelId。
-      // modelId 仅作回退：若公式模型设为「跟随全局」，才用全局选择。这让 /function
-      // 与聊天窗口全局选择脱钩，避免有人切推理模型时公式生成被 reasoning 卡住。
-      const result = await generateFormula({
-        description: preview.description,
-        activeCell: firstCell,
-        headers,
-        columns,
-        sampleRows,
-        dictionary,
-        extraSheets,
-        modelId: selectedModelId || null
-      });
+      let generated: GeneratedFormulaPair;
+      let externalFiles: string[];
+      if (useModel) {
+        // 模型兜底：抓活动表列头/样本行喂模型；扫描"字典/映射"表注入其内容。
+        const snapshot = await captureWorkbook([sheetName]);
+        const activeSheet = snapshot.worksheets.find(
+          (sheet) => sheet.name === sheetName
+        );
+        const headers =
+          activeSheet?.headers.map((cell) => String(cell ?? "")) ?? [];
+        // 列头对应的列字母：从 usedRange 起始列往右枚举，喂给模型建立"列头→列"映射，
+        // 避免模型猜错列（如把输出列当输入列导致循环引用）。
+        const columns = columnsFromRange(
+          activeSheet?.headers ?? [],
+          activeSheet?.usedRange ?? null
+        ).map((column) => column.letter);
+        const sampleRows = (activeSheet?.dataRows ?? [])
+          .slice(0, 5)
+          .map((row) => row.map((cell) => String(cell ?? "")));
+        const dictionary = await loadDictionaryForFormula(sheetName);
+        const extraSheets = await resolveFormulaExtraSheets();
+        externalFiles = extraSheets.map((sheet) => sheet.sourceFile);
+
+        // 后端优先用「/function 公式模型」（模型配置里单独选的那个），忽略 modelId。
+        // modelId 仅作回退：若公式模型设为「跟随全局」，才用全局选择。这让 /function
+        // 与聊天窗口全局选择脱钩，避免有人切推理模型时公式生成被 reasoning 卡住。
+        generated = await generateFormula({
+          description: preview.description,
+          activeCell: firstCell,
+          headers,
+          columns,
+          sampleRows,
+          dictionary,
+          extraSheets,
+          modelId: selectedModelId || null
+        });
+      } else if (preview.match) {
+        // 本地确定性路径：不调模型、不发数据，直接拼两版公式。
+        externalFiles = [preview.match.externalFile];
+        generated = buildCrossTableFormulas(preview.match, firstCell);
+      } else {
+        markFunctionPreview(message.id, {
+          targetError: "缺少跨表匹配参数，请重试或换 AI 生成。"
+        });
+        return;
+      }
+
+      const allowedExternal = new Set(externalFiles);
 
       // 两版公式各在目标首格真实试算（试算失败不阻断预览，让用户自行判断）。
       const trialCalc = async (formula: string): Promise<string> => {
@@ -2561,8 +2661,8 @@ export default function App() {
         }
       };
 
-      const modernResult = await trialCalc(result.modernFormula);
-      const compatResult = await trialCalc(result.compatFormula);
+      const modernResult = await trialCalc(generated.modernFormula);
+      const compatResult = await trialCalc(generated.compatFormula);
 
       const generateMs = Math.round(performance.now() - generateStart);
 
@@ -2572,12 +2672,12 @@ export default function App() {
         targetError: undefined,
         pickingTarget: false,
         version: "compat",
-        modernFormula: result.modernFormula,
-        modernExplanation: result.modernExplanation,
+        modernFormula: generated.modernFormula,
+        modernExplanation: generated.modernExplanation,
         modernResult,
-        externalFiles: extraSheets.map((sheet) => sheet.sourceFile),
-        compatFormula: result.compatFormula,
-        compatExplanation: result.compatExplanation,
+        externalFiles,
+        compatFormula: generated.compatFormula,
+        compatExplanation: generated.compatExplanation,
         compatResult,
         generateMs
       });
@@ -2589,6 +2689,17 @@ export default function App() {
       finishActivity();
       setStatus("idle");
     }
+  }
+
+  // 用户觉得预填的跨表匹配不对：切到模型兜底，用原描述直接生成。
+  async function switchToModelFunction(message: ChatMessage) {
+    if (!message.functionPreview || busy) return;
+    markFunctionPreview(message.id, {
+      mode: "model",
+      match: undefined,
+      targetError: undefined
+    });
+    await confirmFunctionTarget(message, { forceModel: true });
   }
 
   async function sendMessage(options?: {
@@ -3042,6 +3153,29 @@ export default function App() {
       preview.version === "modern"
         ? preview.modernExplanation
         : preview.compatExplanation;
+
+    // 验算不通过拦截：拿不到公式，或试算报错且不是"外部工作簿未打开"导致——不硬写。
+    const noFormula = !preview.modernFormula && !preview.compatFormula;
+    if (noFormula) {
+      markFunctionPreview(message.id, {
+        targetError:
+          "无法生成可靠公式：未能得到可用公式。为避免硬写错误结果，已拦截写入；请手动填写，或调整描述后重试。"
+      });
+      return;
+    }
+    const activeTrial =
+      preview.version === "modern"
+        ? preview.modernResult
+        : preview.compatResult;
+    if (
+      formulaTrialFailed(activeTrial) &&
+      formulaExternalFileNames(formula).length === 0
+    ) {
+      markFunctionPreview(message.id, {
+        targetError: `试算未通过（${activeTrial}）：为避免写入错误结果，已拦截写入；请检查公式或手动填写。`
+      });
+      return;
+    }
 
     // 多格区域才需 R1C1 铺满；单格直写字面公式。R1C1 从目标首格现取。
     let formulaR1C1 = "";
@@ -5509,6 +5643,89 @@ export default function App() {
                     <div className="inline-notes function-pick-hint">
                       拾取方式：先在工作表里点一下（或框选）目标单元格，再点上面的「拾取当前选区」，会自动填入那一刻选中的位置。
                     </div>
+                    {message.functionPreview.match && (
+                      <div className="function-match-proposal">
+                        <strong>
+                          跨表匹配 · 本地生成公式（不调用 AI，数据不出本机）
+                        </strong>
+                        <div className="function-match-row">
+                          <span>外部表</span>
+                          <em>
+                            {message.functionPreview.match.externalFile} ›{" "}
+                            {message.functionPreview.match.externalSheet}
+                          </em>
+                        </div>
+                        <div className="function-match-row">
+                          <label>
+                            匹配键列
+                            <select
+                              value={
+                                message.functionPreview.match.selectedKey
+                              }
+                              disabled={busy}
+                              onChange={(event) => {
+                                const match = message.functionPreview?.match;
+                                if (!match) return;
+                                markFunctionPreview(message.id, {
+                                  match: {
+                                    ...match,
+                                    selectedKey: event.target.value
+                                  }
+                                });
+                              }}
+                            >
+                              {message.functionPreview.match.keyCandidates.map(
+                                (candidate) => (
+                                  <option
+                                    key={candidate.name}
+                                    value={candidate.name}
+                                  >
+                                    {candidate.name}
+                                  </option>
+                                )
+                              )}
+                            </select>
+                          </label>
+                          <label>
+                            取值列
+                            <select
+                              value={
+                                message.functionPreview.match.selectedValue
+                              }
+                              disabled={busy}
+                              onChange={(event) => {
+                                const match = message.functionPreview?.match;
+                                if (!match) return;
+                                markFunctionPreview(message.id, {
+                                  match: {
+                                    ...match,
+                                    selectedValue: event.target.value
+                                  }
+                                });
+                              }}
+                            >
+                              {message.functionPreview.match.valueCandidates.map(
+                                (candidate) => (
+                                  <option
+                                    key={candidate.name}
+                                    value={candidate.name}
+                                  >
+                                    {candidate.name}
+                                  </option>
+                                )
+                              )}
+                            </select>
+                          </label>
+                        </div>
+                        <button
+                          className="secondary-button"
+                          disabled={busy}
+                          onClick={() => void switchToModelFunction(message)}
+                        >
+                          这个不对，换 AI 生成
+                        </button>
+                      </div>
+                    )}
                     {message.functionPreview.targetError && (
                       <div className="function-write-target-error">
                         {message.functionPreview.targetError}
@@ -5539,6 +5756,11 @@ export default function App() {
                       <div>
                         <span>公式预览</span>
                         <strong>{message.functionPreview.writeTarget}</strong>
+                        {message.functionPreview.mode === "deterministic" && (
+                          <em className="function-local-badge">
+                            本地生成 · 未调用 AI
+                          </em>
+                        )}
                       </div>
                       {message.functionPreview.generateMs !== undefined && (
                         <span className="function-preview-timing">
@@ -5595,6 +5817,52 @@ export default function App() {
                           : message.functionPreview.compatResult}
                       </strong>
                     </div>
+
+                    {(() => {
+                      const preview = message.functionPreview;
+                      if (!preview) return null;
+                      const formula =
+                        preview.version === "modern"
+                          ? preview.modernFormula
+                          : preview.compatFormula;
+                      const trial =
+                        preview.version === "modern"
+                          ? preview.modernResult
+                          : preview.compatResult;
+                      const refs = externalWorkbookRefs(formula);
+                      if (refs.length === 0) return null;
+                      const unavailable = /#(?:REF|NAME|VALUE)/.test(trial);
+                      return (
+                        <>
+                          <div className="function-external-refs">
+                            <span>本公式引用外部工作簿：</span>
+                            {refs.map((ref) => (
+                              <em
+                                key={`${ref.file}\u0000${ref.sheet}`}
+                              >
+                                {ref.file} › {ref.sheet}
+                              </em>
+                            ))}
+                          </div>
+                          {unavailable && (
+                            <p className="function-external-hint">
+                              外部工作簿未在 Excel 中打开，打开后会自动重算。
+                            </p>
+                          )}
+                        </>
+                      );
+                    })()}
+
+                    {(() => {
+                      const reason = functionWriteBlockReason(
+                        message.functionPreview
+                      );
+                      return reason ? (
+                        <p className="function-verification-block">
+                          {reason}
+                        </p>
+                      ) : null;
+                    })()}
 
                     {(message.functionPreview.version === "modern"
                       ? message.functionPreview.modernExplanation
@@ -5675,7 +5943,12 @@ export default function App() {
                           </button>
                           <button
                             className="primary-button"
-                            disabled={busy}
+                            disabled={
+                              busy ||
+                              functionWriteBlockReason(
+                                message.functionPreview
+                              ) !== null
+                            }
                             onClick={() => void applyFunctionPreview(message)}
                           >
                             {status === "executing" ? "正在写入…" : "确认写入"}

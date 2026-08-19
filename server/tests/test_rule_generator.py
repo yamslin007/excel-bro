@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from server.app.rule_generator import (
+    DictionarySheet,
     ExtraSheet,
     GenerateFormulaRequest,
     _build_formula_generation_prompt,
@@ -46,6 +47,24 @@ def test_formula_prompt_injects_external_sheets() -> None:
     system_content = messages[0]["content"]
     assert "[文件名]表名!区域" in system_content
     assert "禁止编造未提供的文件或工作表" in system_content
+
+
+def test_formula_prompt_keeps_literal_markers() -> None:
+    """提示词必须要求把字典里的 / 等符号当字面值原样输出，不得当空值。"""
+    request = GenerateFormulaRequest(
+        description="无问题填入/",
+        activeCell="E2",
+        dictionary=DictionarySheet(
+            name="数据字典", rows=[["问题", "结果"], ["无问题", "/"]]
+        ),
+    )
+    messages = _build_formula_generation_prompt(request)
+    system_content = messages[0]["content"]
+    assert "「/」「－」「—」等符号是**字面值**" in system_content
+    assert "绝不能把这些符号当作空值" in system_content
+    assert "要填入 / 就写 \"/\"" in system_content
+    user_content = messages[1]["content"]
+    assert '["无问题", "/"]' in user_content
 
 
 def test_generate_formula_whitelist_passes_selected_external_refs() -> None:
