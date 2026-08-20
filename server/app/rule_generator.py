@@ -3,6 +3,7 @@
 """
 
 import json
+import logging
 import re
 from pydantic import BaseModel, Field
 
@@ -10,6 +11,9 @@ from .llm import formula_model_config, selected_model_config
 from .llm.client import OpenAICompatibleClient
 from .capabilities import capability_float, capability_int
 from .safety import dangerous_formula
+
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -76,13 +80,14 @@ def _build_formula_generation_prompt(request: GenerateFormulaRequest) -> list[di
 4. 【兼容版】面向 Excel 2016/2019，只用这些老版本通用函数：IF、AND、OR、NOT、VLOOKUP、HLOOKUP、INDEX、MATCH、SUMPRODUCT、SUMIF(S)、COUNTIF(S)、SEARCH、FIND、ISNUMBER、IFERROR、LEFT、RIGHT、MID、LEN、TRIM、SUBSTITUTE、& 拼接、数组常量；不要用 LET/XLOOKUP/TEXTSPLIT/TEXTJOIN/CONCAT/IFS/SWITCH/FILTER/SORT/UNIQUE/LAMBDA 等新函数或动态数组溢出。多值判断改用 SUMPRODUCT+ISNUMBER+SEARCH 或嵌套 IF/COUNTIF 实现。
 5. 若涉及跨表查表，直接在公式里引用那张表的区域（如 数据字典!$A$2:$B$7）。
 6. 【易错点·必须遵守】COUNTIF/COUNTIFS/SUMIF/SUMIFS 的区域参数必须是真实的工作表单元格区域，绝不能传入 TEXTSPLIT/XLOOKUP/FILTER 等算出来的内存数组或 LET 变量（会 #VALUE! 报错）。要在内存数组里按条件计数，请改用 SUMPRODUCT((条件)*(条件))。
-7. 【常见模式·首选】判断"某单元格是否含关键词清单中的任一项、并按其归类取值"时，两版都优先用 SUMPRODUCT(ISNUMBER(SEARCH(关键词区域, 目标格))*(级别区域=某值))>0 这种整块区域运算，不要先 TEXTSPLIT 切分再逐个查表（切分+数组查表最容易踩函数组合坑）。
+7. 【查表 vs 关键词匹配】根据数据特征选择合适的方案：(a) 若是精确匹配场景（如「根据分类/编号查对应值」），用查表函数（现代版 XLOOKUP，兼容版 VLOOKUP 或 INDEX+MATCH）或 IFS/SWITCH/嵌套 IF；(b) 若是模糊匹配场景（如「单元格包含某关键词则归为某类」），用 ISNUMBER+SEARCH 或 SUMPRODUCT(ISNUMBER(SEARCH(关键词区域, 目标格))*(返回值区域)) 这种整块区域运算（不要 TEXTSPLIT 切分后查表，易踩函数组合坑）。
 8. 【回退·严格受限】仅当需求恰好是这两个已存在的预制规则能解决的复杂文本场景时，才回退用它们：清理隐形/零宽/控制字符 → =EB("隐形字符清理", 引用)；检测伪空白单元格 → =EB("空白检测", 引用)。这是仅有的两个预制规则，**绝不可编造任何其它规则名**。
 9. 【做不了就明说】若原生公式和上述两个预制规则都无法表达该需求，请把 modernFormula 和 compatFormula 都返回空字符串 ""，并在 explanation 里写明「原生公式无法表达此需求，建议直接在对话中描述需求，走常规处理流程」。不要硬凑公式、不要编造规则。
 10. 不要编造上下文里不存在的列或表名。
 11. 若涉及外部工作簿（见下方「外部工作簿」段落），必须用完整外部引用语法 [文件名]表名!区域，例如 [B.xlsx]Sheet2!$A$2:$B$7；文件名必须严格使用注入的名字，禁止编造未提供的文件或工作表；外部区域一律用绝对引用（$A$2:$B$7 风格），与字典表规则一致。
 12. 【字面值·必须遵守】字典或上下文中的「/」「－」「—」等符号是**字面值**：公式输出时必须原样保留（要填入 / 就写 "/"，要填入 － 就写 "－"），绝不能把这些符号当作空值/缺失值替换成 ""。用户明确要某个标记，就输出那个标记本身。
-13. 只返回 JSON：{{"modernFormula": "=...", "modernExplanation": "现代版怎么工作", "compatFormula": "=...", "compatExplanation": "兼容版怎么工作"}}"""
+13. 【精确匹配·必须遵守】所有查表/匹配必须用精确匹配，**禁止任何近似/模糊匹配**：VLOOKUP/HLOOKUP 第四参数必须写 FALSE（禁止 TRUE、1 或省略——省略默认近似）；MATCH 第三参数必须写 0（禁止 1、-1 或省略——省略默认 1）；XLOOKUP 保持默认精确（match_mode=0，不要写 1/-1/2）；不要使用 LOOKUP。编号、名称等键值一旦近似匹配会静默返回错误数据，这是绝对不能接受的。
+14. 只返回 JSON：{{"modernFormula": "=...", "modernExplanation": "现代版怎么工作", "compatFormula": "=...", "compatExplanation": "兼容版怎么工作"}}"""
 
     lines: list[str] = [
         f"目标单元格：{request.activeCell}（引用范围不得圈入此格本身；但若是对该列数据做汇总/统计，可正常引用同列其它单元格区域）",
@@ -142,7 +147,31 @@ def _build_formula_generation_prompt(request: GenerateFormulaRequest) -> list[di
 
 
 async def generate_formula(request: GenerateFormulaRequest) -> GenerateFormulaResponse:
-    """短链生成原生 Excel 公式：单发调用模型，不经过 planner"""
+    """短链生成原生 Excel 公式：优先工具调用架构，失败回退到端到端生成。"""
+
+    # 第一步：尝试工具调用架构（模型返回结构化函数调用 → 代码编译公式）。
+    # 语法正确性与字面量保留由编译器保证；任何失败都回退，不让用户感知。
+    logger.info("=== [/function] 开始生成公式，优先走工具调用路径 ===")
+    try:
+        from .formula_tools_integration import generate_formula_with_tool_call
+
+        result = await generate_formula_with_tool_call(
+            active_cell=request.activeCell,
+            description=request.description,
+            headers=request.headers,
+            columns=request.columns,
+            dictionary=request.dictionary.model_dump() if request.dictionary else None,
+            extra_sheets=[s.model_dump() for s in request.extraSheets]
+            if request.extraSheets
+            else None,
+            model_id=request.modelId,
+        )
+        logger.info("=== [/function] 工具调用路径成功 ===")
+        return GenerateFormulaResponse(**result)
+    except Exception as e:
+        logger.warning("=== [/function] 工具调用架构失败，回退到端到端模型生成: %s ===", e)
+
+    # 第二步：回退到现有的端到端模型生成（保留原有逻辑）。
 
     # 优先用「公式专用」连接（在模型配置里勾选），与聊天窗口全局选择脱钩，
     # 避免有人把全局切成推理模型时 /function 被 reasoning 拖到 length 截断。

@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import type {
   FolderCatalog,
   FolderSelection,
@@ -8,6 +8,9 @@ import type { SourceMode, WorkbookScopeMode } from "../types/workbook";
 import { folderSheetKey } from "../utils";
 import { isEBSystemSheet } from "../excel";
 
+const FOLDER_CATALOG_KEY = "excelBro.folderCatalog";
+const FOLDER_SHEET_KEYS_KEY = "excelBro.folderSheetKeys";
+
 /**
  * 数据范围与工具保存字段 Hook
  *
@@ -16,6 +19,7 @@ import { isEBSystemSheet } from "../excel";
  * - 管理工作簿/文件夹中的工作表选择状态
  * - 管理工具保存对话框中的名称与用途说明
  * - 提供范围切换、工作表勾选和文件夹选择等操作
+ * - 持久化文件夹会话到 localStorage（30分钟内刷新页面不丢失）
  */
 export function useScopeSelection() {
   const [toolName, setToolName] = useState("");
@@ -25,8 +29,48 @@ export function useScopeSelection() {
   const [sourceMode, setSourceMode] = useState<SourceMode>("workbook");
   const [workbookScopeMode, setWorkbookScopeMode] =
     useState<WorkbookScopeMode>("auto");
-  const [folderCatalog, setFolderCatalog] = useState<FolderCatalog | null>(null);
-  const [folderSheetKeys, setFolderSheetKeys] = useState<string[]>([]);
+  const [folderCatalog, setFolderCatalog] = useState<FolderCatalog | null>(() => {
+    try {
+      const stored = localStorage.getItem(FOLDER_CATALOG_KEY);
+      return stored ? JSON.parse(stored) : null;
+    } catch {
+      return null;
+    }
+  });
+  const [folderSheetKeys, setFolderSheetKeys] = useState<string[]>(() => {
+    try {
+      const stored = localStorage.getItem(FOLDER_SHEET_KEYS_KEY);
+      return stored ? JSON.parse(stored) : [];
+    } catch {
+      return [];
+    }
+  });
+
+  // 持久化 folderCatalog 到 localStorage
+  useEffect(() => {
+    try {
+      if (folderCatalog) {
+        localStorage.setItem(FOLDER_CATALOG_KEY, JSON.stringify(folderCatalog));
+      } else {
+        localStorage.removeItem(FOLDER_CATALOG_KEY);
+      }
+    } catch {
+      // localStorage 写入失败（隐私模式/配额满）：静默忽略
+    }
+  }, [folderCatalog]);
+
+  // 持久化 folderSheetKeys 到 localStorage
+  useEffect(() => {
+    try {
+      if (folderSheetKeys.length > 0) {
+        localStorage.setItem(FOLDER_SHEET_KEYS_KEY, JSON.stringify(folderSheetKeys));
+      } else {
+        localStorage.removeItem(FOLDER_SHEET_KEYS_KEY);
+      }
+    } catch {
+      // localStorage 写入失败：静默忽略
+    }
+  }, [folderSheetKeys]);
 
   const applyWorkbookSnapshotSelection = useCallback(
     (snapshot: WorkbookSnapshot) => {
@@ -87,7 +131,16 @@ export function useScopeSelection() {
 
   const applyFolderCatalog = useCallback((catalog: FolderCatalog) => {
     setFolderCatalog(catalog);
-    setFolderSheetKeys([]);
+    // 保留仍然有效的勾选（文件 ID 和表名都能在新 catalog 中找到）
+    const validFileSheets = new Set<string>();
+    for (const file of catalog.files) {
+      for (const sheet of file.worksheets) {
+        validFileSheets.add(folderSheetKey(file.id, sheet.name));
+      }
+    }
+    setFolderSheetKeys((current) =>
+      current.filter((key) => validFileSheets.has(key))
+    );
     setSelectionConfirmed(false);
   }, []);
 

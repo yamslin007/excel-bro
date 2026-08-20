@@ -49,6 +49,89 @@ export function formulaExternalFileNames(formula: string): string[] {
   return externalWorkbookFileNames(formula);
 }
 
+/** 提取公式中 name( ... ) 的顶层参数（支持嵌套括号与字符串引号）。 */
+function extractFunctionArgs(formula: string, name: string): string[][] {
+  const regex = new RegExp(`\\b${name}\\s*\\(`, "gi");
+  const results: string[][] = [];
+  let match: RegExpExecArray | null;
+  while ((match = regex.exec(formula)) !== null) {
+    const args: string[] = [];
+    let index = match.index + match[0].length;
+    let depth = 1;
+    let inString = false;
+    let current = "";
+    while (index < formula.length && depth > 0) {
+      const ch = formula[index];
+      if (inString) {
+        if (ch === '"' && formula[index - 1] !== "\\") inString = false;
+        current += ch;
+      } else if (ch === '"') {
+        inString = true;
+        current += ch;
+      } else if (ch === "(") {
+        depth += 1;
+        current += ch;
+      } else if (ch === ")") {
+        depth -= 1;
+        if (depth === 0) {
+          args.push(current.trim());
+          break;
+        }
+        current += ch;
+      } else if (ch === "," && depth === 1) {
+        args.push(current.trim());
+        current = "";
+      } else {
+        current += ch;
+      }
+      index += 1;
+    }
+    results.push(args);
+  }
+  return results;
+}
+
+function isExactMatchFlag(value: string | undefined): boolean {
+  if (value === undefined) return false;
+  const trimmed = value.trim();
+  return trimmed === "FALSE" || trimmed === "0" || trimmed === "false";
+}
+
+/**
+ * 检测公式中的近似/模糊匹配用法，返回命中的函数名；全部精确匹配则返回 null。
+ * VLOOKUP/HLOOKUP 省略第四参数默认近似（TRUE）；MATCH 省略第三参数默认 1；
+ * LOOKUP 本身只有近似语义；XLOOKUP 的 match_mode 为 1/-1/2 都是非精确。
+ */
+export function fuzzyLookupMatch(formula: string): string | null {
+  if (!formula) return null;
+  for (const name of ["VLOOKUP", "HLOOKUP", "LOOKUP", "MATCH", "XLOOKUP"]) {
+    const calls = extractFunctionArgs(formula, name);
+    for (const args of calls) {
+      if (args.length < 2) continue;
+      if (name === "VLOOKUP" || name === "HLOOKUP") {
+        if (!isExactMatchFlag(args[3])) return name;
+      } else if (name === "MATCH") {
+        if (!isExactMatchFlag(args[2])) return name;
+      } else if (name === "LOOKUP") {
+        return name;
+      } else if (name === "XLOOKUP") {
+        if (args[4] !== undefined && !isExactMatchFlag(args[4])) return name;
+      }
+    }
+  }
+  return null;
+}
+
+/** 校验公式必须精确匹配，命中模糊匹配则抛错。label 用于错误提示定位。 */
+export function assertExactLookup(formula: string, label: string): void {
+  const matched = fuzzyLookupMatch(formula);
+  if (matched !== null) {
+    throw new Error(
+      `${label}包含模糊匹配（${matched}）：近似匹配会静默返回错误数据，已拒绝；请改用精确匹配。`
+    );
+  }
+}
+
 /**
  * 公式含危险函数/注入载体时返回命中名称，否则返回 null。
  * allowHyperlink 不传时按配置决定；显式传值可覆盖（供测试）。

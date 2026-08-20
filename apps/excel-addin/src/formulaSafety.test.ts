@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
+  assertExactLookup,
   assertSafeFormula,
   assertSafeHyperlink,
   dangerousFormula,
-  dangerousHyperlinkAddress
+  dangerousHyperlinkAddress,
+  fuzzyLookupMatch
 } from "./formulaSafety";
 
 describe("formulaSafety", () => {
@@ -115,6 +117,52 @@ describe("formulaSafety", () => {
     expect(() =>
       assertSafeFormula("='[C.xlsx]Sheet1'!A1", "A1 的公式", allowed)
     ).toThrow(/EXTERNAL_REF/);
+  });
+
+  it("detects approximate/fuzzy lookup matches", () => {
+    // VLOOKUP 显式 TRUE / 1 / 省略第四参数（默认近似）都应拦截
+    expect(fuzzyLookupMatch("=VLOOKUP(A2,B2:C9,2,TRUE)")).toBe("VLOOKUP");
+    expect(fuzzyLookupMatch("=VLOOKUP(A2,B2:C9,2,1)")).toBe("VLOOKUP");
+    expect(fuzzyLookupMatch("=VLOOKUP(A2,B2:C9,2)")).toBe("VLOOKUP");
+    expect(fuzzyLookupMatch("=IF(A1=1,VLOOKUP(A2,B2:C9,2,TRUE))")).toBe(
+      "VLOOKUP"
+    );
+    // HLOOKUP 同规则
+    expect(fuzzyLookupMatch("=HLOOKUP(A1,B1:D2,2)")).toBe("HLOOKUP");
+    // MATCH 省略第三参数默认 1；1 / -1 都是近似
+    expect(fuzzyLookupMatch("=MATCH(A1,B:B)")).toBe("MATCH");
+    expect(fuzzyLookupMatch("=MATCH(A1,B:B,1)")).toBe("MATCH");
+    expect(fuzzyLookupMatch("=MATCH(A1,B:B,-1)")).toBe("MATCH");
+    // LOOKUP 只有近似语义
+    expect(fuzzyLookupMatch("=LOOKUP(A1,B:B,C:C)")).toBe("LOOKUP");
+    // XLOOKUP match_mode 非 0
+    expect(
+      fuzzyLookupMatch("=XLOOKUP(A1,B:B,C:C,\"\",2)")
+    ).toBe("XLOOKUP");
+  });
+
+  it("passes exact-match lookups", () => {
+    expect(fuzzyLookupMatch("=VLOOKUP(A2,B2:C9,2,FALSE)")).toBeNull();
+    expect(fuzzyLookupMatch("=VLOOKUP(A2,B2:C9,2,0)")).toBeNull();
+    expect(fuzzyLookupMatch("=MATCH(A1,B:B,0)")).toBeNull();
+    expect(fuzzyLookupMatch("=XLOOKUP(A1,B:B,C:C)")).toBeNull();
+    expect(fuzzyLookupMatch("=XLOOKUP(A1,B:B,C:C,\"\",0)")).toBeNull();
+    expect(fuzzyLookupMatch("=SUM(A1:A10)")).toBeNull();
+    expect(fuzzyLookupMatch("")).toBeNull();
+    expect(
+      fuzzyLookupMatch(
+        "=IF(ISNUMBER(SEARCH(\"无问题\",D2)),\"/\",\"\")"
+      )
+    ).toBeNull();
+  });
+
+  it("assertExactLookup throws with label context", () => {
+    expect(() =>
+      assertExactLookup("=VLOOKUP(A1,B:B,2)", "A1 的公式")
+    ).toThrow(/模糊匹配/);
+    expect(() =>
+      assertExactLookup("=VLOOKUP(A1,B:B,2,FALSE)", "A1 的公式")
+    ).not.toThrow();
   });
 
   it("detects UNC and file hyperlink addresses", () => {

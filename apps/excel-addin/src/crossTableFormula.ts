@@ -169,9 +169,11 @@ export function buildCrossTableProposal(
   return best?.proposal ?? null;
 }
 
-/** 外部工作表引用串：统一带引号（'[B.xlsx]Sheet2'），兼容空格等特殊字符。 */
+/** 外部工作表引用串：[file.xlsx]sheet 或 [file.xlsx]'sheet name'（表名含特殊字符时加引号）。 */
 function externalSheetRef(file: string, sheet: string): string {
-  return `'[${file}]${sheet}'`;
+  // 工作表名含空格或特殊字符时需要单引号包裹
+  const needsQuote = /[ ']/.test(sheet);
+  return needsQuote ? `[${file}]'${sheet.replace(/'/g, "''")}'` : `[${file}]${sheet}`;
 }
 
 /** 本地拼两版跨表公式：兼容版 VLOOKUP / INDEX+MATCH，现代版 XLOOKUP。 */

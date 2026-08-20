@@ -15,6 +15,7 @@ import {
   executeFolderQuery,
   generateFormula,
   isLocalServiceConnectionError,
+  refreshFolder,
   selectFolder,
 } from "./api";
 import type {
@@ -91,7 +92,7 @@ import {
   type CrossTableMatchProposal,
   type GeneratedFormulaPair
 } from "./crossTableFormula";
-import { formulaExternalFileNames } from "./formulaSafety";
+import { formulaExternalFileNames, fuzzyLookupMatch } from "./formulaSafety";
 import {
   currentModelCallCount,
   exportDiagnosticReport,
@@ -418,6 +419,10 @@ function functionWriteBlockReason(preview: FunctionPreview): string | null {
     formulaExternalFileNames(formula).length === 0
   ) {
     return `试算未通过（${trial}）：为避免写入错误结果，已拦截写入；请检查公式或手动填写。`;
+  }
+  const fuzzy = fuzzyLookupMatch(formula);
+  if (fuzzy !== null) {
+    return `公式包含模糊匹配（${fuzzy}）：近似匹配会静默返回错误数据，已拦截写入；请手动改成精确匹配（VLOOKUP 用 FALSE、MATCH 用 0），或调整描述重试。`;
   }
   return null;
 }
@@ -994,7 +999,9 @@ export default function App() {
     sourceMode,
     workbookScopeMode,
     folderCatalog,
+    setFolderCatalog,
     folderSheetKeys,
+    setFolderSheetKeys,
     applyWorkbookSnapshotSelection,
     toggleSheet,
     toggleFolderSheet,
@@ -1507,6 +1514,60 @@ export default function App() {
     }
   }
 
+  async function refreshCurrentFolder() {
+    if (!folderCatalog || busy) return;
+    setStatus("scanning");
+    try {
+      const refreshed = await refreshFolder(folderCatalog.sessionId);
+      applyFolderCatalog(refreshed);
+      markServerOnline();
+    } catch (reason) {
+      const message = reason instanceof Error ? reason.message : String(reason);
+      if (
+        message.includes("已失效") ||
+        message.includes("已过期") ||
+        message.includes("不存在")
+      ) {
+        setFolderCatalog(null);
+        setFolderSheetKeys([]);
+        appendMessage({
+          role: "system",
+          text: "文件夹会话已过期，请重新选择文件夹"
+        });
+      } else {
+        appendMessage({
+          role: "system",
+          text: `刷新文件夹失败：${message}`
+        });
+      }
+    } finally {
+      setStatus("idle");
+    }
+  }
+
+  async function refreshWorkbook() {
+    if (busy) return;
+    setStatus("scanning");
+    try {
+      const refreshed = isRunningInExcel()
+        ? await captureWorkbook()
+        : demoWorkbook;
+      setWorkbook(refreshed);
+      if (sourceMode === "workbook") {
+        applyWorkbookSnapshotSelection(refreshed);
+      }
+    } catch (reason) {
+      appendMessage({
+        role: "system",
+        text: `刷新工作簿失败：${
+          reason instanceof Error ? reason.message : String(reason)
+        }`
+      });
+    } finally {
+      setStatus("idle");
+    }
+  }
+
   async function confirmSheetSelection() {
     if (sourceMode === "folder") {
       if (!folderCatalog || folderSheetKeys.length === 0) return;
@@ -1521,10 +1582,19 @@ export default function App() {
         setSelectionConfirmed(true);
         setContextOpen(false);
       } catch (reason) {
-        appendMessage({
-          role: "system",
-          text: reason instanceof Error ? reason.message : "读取所选工作表失败"
-        });
+        const message = reason instanceof Error ? reason.message : "读取所选工作表失败";
+        if (message.includes("会话已失效") || message.includes("不存在或已过期")) {
+          setFolderCatalog(null);
+          appendMessage({
+            role: "system",
+            text: "文件夹会话已过期，请重新选择文件夹"
+          });
+        } else {
+          appendMessage({
+            role: "system",
+            text: message
+          });
+        }
       } finally {
         setStatus("idle");
       }
@@ -2510,7 +2580,7 @@ export default function App() {
     const snapshotKeys = new Set(
       workbook?.worksheets
         .filter((sheet) => sheet.sourceFileId || sheet.sourceFile)
-        .map((sheet) => folderSheetKey(sheet.sourceFileId ?? "", sheet.name)) ??
+        .map((sheet) => folderSheetKey(sheet.sourceFileId ?? "", sheet.sourceSheet ?? sheet.name)) ??
         []
     );
     const snapshot =
@@ -2525,7 +2595,8 @@ export default function App() {
     const extraSheets: FormulaExtraSheet[] = [];
     for (const sheet of snapshot.worksheets) {
       const fileId = sheet.sourceFileId ?? "";
-      if (!selectedKeys.has(folderSheetKey(fileId, sheet.name))) continue;
+      const originalSheetName = sheet.sourceSheet ?? sheet.name;
+      if (!selectedKeys.has(folderSheetKey(fileId, originalSheetName))) continue;
       const sourcePath = sheet.sourceFile ?? "";
       const sourceFile = sourcePath.split(/[\\/]/).pop() ?? sourcePath;
       if (!sourceFile) continue;
@@ -2538,7 +2609,7 @@ export default function App() {
       extraSheets.push({
         sourceFile,
         sourcePath,
-        sheetName: sheet.name,
+        sheetName: originalSheetName,
         headers,
         columns,
         sampleRows: sheet.dataRows
@@ -2682,9 +2753,17 @@ export default function App() {
         generateMs
       });
     } catch (reason) {
-      markFunctionPreview(message.id, {
-        targetError: reason instanceof Error ? reason.message : "生成公式失败"
-      });
+      const message = reason instanceof Error ? reason.message : "生成公式失败";
+      if (message.includes("会话已失效") || message.includes("不存在或已过期")) {
+        setFolderCatalog(null);
+        markFunctionPreview(message.id, {
+          targetError: "文件夹会话已过期，请重新选择文件夹"
+        });
+      } else {
+        markFunctionPreview(message.id, {
+          targetError: message
+        });
+      }
     } finally {
       finishActivity();
       setStatus("idle");
@@ -2694,10 +2773,22 @@ export default function App() {
   // 用户觉得预填的跨表匹配不对：切到模型兜底，用原描述直接生成。
   async function switchToModelFunction(message: ChatMessage) {
     if (!message.functionPreview || busy) return;
+
+    // 清除之前的验证消息：避免重新生成时出现重复的"已执行 N 步并通过独立验证"
+    const planId = `function-${message.id}`;
+    setMessages((current) =>
+      current.filter(
+        (msg) => msg.executedPlanId !== planId
+      )
+    );
+
     markFunctionPreview(message.id, {
+      phase: "target",
       mode: "model",
       match: undefined,
-      targetError: undefined
+      targetError: undefined,
+      applied: false,
+      cancelled: false
     });
     await confirmFunctionTarget(message, { forceModel: true });
   }
@@ -2922,10 +3013,11 @@ export default function App() {
 
   async function runPlan(
     plan: AnalysisPlan,
-    allowedExternalFiles?: ReadonlySet<string>
-  ) {
-    if (sourceMode === "folder") {
-      if (!folderCatalog) return;
+    allowedExternalFiles?: ReadonlySet<string>,
+    forceLocal?: boolean
+  ): Promise<boolean> {
+    if (sourceMode === "folder" && !forceLocal) {
+      if (!folderCatalog) return false;
       setStatus("executing");
       try {
         const result = await executeFolderPlan(folderCatalog.sessionId, plan);
@@ -2958,15 +3050,16 @@ export default function App() {
         if (result.verification.status === "verified") {
           markPlanVerified(plan.id);
         }
+        return true;
       } catch (reason) {
         appendMessage({
           role: "system",
           text: reason instanceof Error ? reason.message : "执行文件夹计划失败"
         });
+        return false;
       } finally {
         setStatus("idle");
       }
-      return;
     }
 
     if (!isRunningInExcel()) {
@@ -2974,7 +3067,7 @@ export default function App() {
         role: "system",
         text: "当前是浏览器演示模式，不会写入文件。请在 Excel 中打开任务窗格。"
       });
-      return;
+      return false;
     }
 
     setStatus("executing");
@@ -3010,6 +3103,7 @@ export default function App() {
         markPlanVerified(plan.id);
       }
       await scan();
+      return true;
     } catch (reason) {
       if (reason instanceof PlanExecutionError) {
         const succeeded = reason.actionResults.filter(
@@ -3031,12 +3125,13 @@ export default function App() {
             notRun > 0 ? `其余 ${notRun} 步未执行。` : ""
           }`
         });
-        return;
+        return false;
       }
       appendMessage({
         role: "system",
         text: reason instanceof Error ? reason.message : "执行计划失败"
       });
+      return false;
     } finally {
       setStatus("idle");
     }
@@ -3138,8 +3233,9 @@ export default function App() {
       preview.applied ||
       preview.cancelled ||
       busy
-    )
+    ) {
       return;
+    }
     const resolved = resolveWriteTarget(preview);
     if (!resolved.address) {
       markFunctionPreview(message.id, { targetError: resolved.error });
@@ -3173,6 +3269,13 @@ export default function App() {
     ) {
       markFunctionPreview(message.id, {
         targetError: `试算未通过（${activeTrial}）：为避免写入错误结果，已拦截写入；请检查公式或手动填写。`
+      });
+      return;
+    }
+    const fuzzy = fuzzyLookupMatch(formula);
+    if (fuzzy !== null) {
+      markFunctionPreview(message.id, {
+        targetError: `公式包含模糊匹配（${fuzzy}）：近似匹配会静默返回错误数据，已拦截写入；请手动改成精确匹配（VLOOKUP 用 FALSE、MATCH 用 0），或调整描述重试。`
       });
       return;
     }
@@ -3231,16 +3334,23 @@ export default function App() {
             }
       ]
     };
+    // /function 预览锚定在当前实时工作簿（captureWorkbook、previewFormulaFirstCell
+    // 都通过 Excel.run 与打开文档交互），写入必须直接操作实时工作簿，不能路由到
+    // folder 后端写磁盘文件——否则用户看不到结果。
+    // 注意：/function 只写单个公式单元格，无需源数据指纹校验（与多表分析不同）。
+
+    // 强制走本地 Excel 路径：/function 预览基于实时工作簿，必须写入实时工作簿。
+    const planSucceeded = await runPlan(
+      plan,
+      preview.externalFiles ? new Set(preview.externalFiles) : undefined,
+      true  // forceLocal: 强制本地路径
+    );
     markFunctionPreview(message.id, {
-      applied: true,
-      appliedTarget: resolved.address,
+      applied: planSucceeded,
+      appliedTarget: planSucceeded ? resolved.address : undefined,
       targetError: undefined,
       pickingTarget: false
     });
-    await runPlan(
-      plan,
-      preview.externalFiles ? new Set(preview.externalFiles) : undefined
-    );
   }
 
   function cancelFunctionPreview(message: ChatMessage) {
@@ -5717,13 +5827,6 @@ export default function App() {
                             </select>
                           </label>
                         </div>
-                        <button
-                          className="secondary-button"
-                          disabled={busy}
-                          onClick={() => void switchToModelFunction(message)}
-                        >
-                          这个不对，换 AI 生成
-                        </button>
                       </div>
                     )}
                     {message.functionPreview.targetError && (
@@ -5875,9 +5978,21 @@ export default function App() {
                     )}
 
                     {message.functionPreview.applied ? (
-                      <div className="inline-notes">
-                        已写入 {message.functionPreview.appliedTarget}。
-                      </div>
+                      <>
+                        <div className="inline-notes">
+                          已写入 {message.functionPreview.appliedTarget}。
+                          下拉填充后若发现公式不对，可用下面的按钮重新生成。
+                        </div>
+                        <div className="inline-plan-buttons">
+                          <button
+                            className="secondary-button"
+                            disabled={busy}
+                            onClick={() => void switchToModelFunction(message)}
+                          >
+                            换 AI 重新生成
+                          </button>
+                        </div>
+                      </>
                     ) : message.functionPreview.cancelled ? (
                       <div className="inline-notes">已取消。</div>
                     ) : (
@@ -5934,6 +6049,15 @@ export default function App() {
                               ? "已复制"
                               : "复制公式"}
                           </button>
+                          {message.functionPreview.mode === "deterministic" && (
+                            <button
+                              className="secondary-button"
+                              disabled={busy}
+                              onClick={() => void switchToModelFunction(message)}
+                            >
+                              换 AI 生成
+                            </button>
+                          )}
                           <button
                             className="secondary-button"
                             disabled={busy}
@@ -6171,44 +6295,55 @@ export default function App() {
               </div>
             )}
 
-            <div className="scope-mode-list">
+            <div className="scope-controls">
+              <div className="scope-mode-list">
+                <button
+                  className={
+                    sourceMode === "workbook" && workbookScopeMode === "auto"
+                      ? "selected"
+                      : ""
+                  }
+                  onClick={() => chooseAutomaticScope(workbook)}
+                >
+                  <i>◎</i>
+                  <span>
+                    <strong>跟随当前工作表</strong>
+                    <small>发送时自动使用正在查看的工作表</small>
+                  </span>
+                </button>
+                <button
+                  className={
+                    sourceMode === "workbook" && workbookScopeMode === "manual"
+                      ? "selected"
+                      : ""
+                  }
+                  onClick={() => chooseManualScope(workbook)}
+                >
+                  <i>☷</i>
+                  <span>
+                    <strong>选择多个工作表</strong>
+                    <small>用于跨表查询、比较或汇总</small>
+                  </span>
+                </button>
+                <button
+                  className={sourceMode === "folder" ? "selected" : ""}
+                  onClick={() => chooseFolderScope()}
+                >
+                  <i>⌑</i>
+                  <span>
+                    <strong>选择文件夹</strong>
+                    <small>批量处理多个本地工作簿</small>
+                  </span>
+                </button>
+              </div>
               <button
-                className={
-                  sourceMode === "workbook" && workbookScopeMode === "auto"
-                    ? "selected"
-                    : ""
-                }
-                onClick={() => chooseAutomaticScope(workbook)}
+                className="icon-button"
+                disabled={busy || !workbook}
+                onClick={() => void refreshWorkbook()}
+                title="刷新工作簿（更新工作簿名和工作表列表）"
+                aria-label="刷新工作簿"
               >
-                <i>◎</i>
-                <span>
-                  <strong>跟随当前工作表</strong>
-                  <small>发送时自动使用正在查看的工作表</small>
-                </span>
-              </button>
-              <button
-                className={
-                  sourceMode === "workbook" && workbookScopeMode === "manual"
-                    ? "selected"
-                    : ""
-                }
-                onClick={() => chooseManualScope(workbook)}
-              >
-                <i>☷</i>
-                <span>
-                  <strong>选择多个工作表</strong>
-                  <small>用于跨表查询、比较或汇总</small>
-                </span>
-              </button>
-              <button
-                className={sourceMode === "folder" ? "selected" : ""}
-                onClick={() => chooseFolderScope()}
-              >
-                <i>⌑</i>
-                <span>
-                  <strong>选择文件夹</strong>
-                  <small>批量处理多个本地工作簿</small>
-                </span>
+                🔄
               </button>
             </div>
 
@@ -6278,15 +6413,28 @@ export default function App() {
 
             {sourceMode === "folder" && (
               <div className="folder-scope-picker">
-                <button
-                  className="browse-folder-button"
-                  disabled={busy}
-                  onClick={() => void browseFolder()}
-                >
-                  {folderCatalog
-                    ? `更换文件夹 · ${folderCatalog.folderName}`
-                    : "选择文件夹"}
-                </button>
+                <div className="folder-toolbar">
+                  <button
+                    className="browse-folder-button"
+                    disabled={busy}
+                    onClick={() => void browseFolder()}
+                  >
+                    {folderCatalog
+                      ? `更换文件夹 · ${folderCatalog.folderName}`
+                      : "选择文件夹"}
+                  </button>
+                  {folderCatalog && (
+                    <button
+                      className="icon-button"
+                      disabled={busy}
+                      onClick={() => void refreshCurrentFolder()}
+                      title="刷新文件夹（更新文件列表）"
+                      aria-label="刷新文件夹"
+                    >
+                      🔄
+                    </button>
+                  )}
+                </div>
 
                 {folderCatalog && (
                   <div className="folder-file-list">
