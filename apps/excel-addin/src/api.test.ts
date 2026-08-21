@@ -8,6 +8,7 @@ import {
   executeFolderQuery,
   getModelSettings,
   listModels,
+  refreshFolder,
   saveModelConnection,
   streamAssistantResponse,
   testModelConnection,
@@ -322,6 +323,68 @@ describe("service discovery", () => {
       expect.stringContaining("/api/turn"),
       expect.objectContaining({ method: "POST" })
     );
+  });
+
+  it("refreshes a folder catalog while keeping the session id", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          sessionId: "session-1",
+          folderName: "reports",
+          folderPath: "C:\\reports",
+          files: [
+            {
+              id: "file-1",
+              name: "renamed.xlsx",
+              relativePath: "renamed.xlsx",
+              worksheets: [{ name: "得分", rowCount: 3, columnCount: 2 }],
+              error: null
+            }
+          ],
+          totalFiles: 1,
+          truncated: false,
+          expiresAt: "2026-08-20T00:00:00.000Z"
+        }),
+        { status: 200 }
+      )
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const catalog = await refreshFolder("session-1");
+
+    expect(catalog.sessionId).toBe("session-1");
+    expect(catalog.files[0].name).toBe("renamed.xlsx");
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining("/api/folders/refresh"),
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ sessionId: "session-1" })
+      })
+    );
+  });
+
+  it("surfaces folder refresh session errors", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            detail: {
+              code: "FOLDER_DATA_ERROR",
+              message: "文件夹会话已失效，请重新选择文件夹",
+              retryable: true
+            }
+          }),
+          { status: 422 }
+        )
+      )
+    );
+
+    await expect(refreshFolder("missing-session")).rejects.toMatchObject({
+      status: 422,
+      code: "FOLDER_DATA_ERROR",
+      message: "文件夹会话已失效，请重新选择文件夹"
+    });
   });
 
   it("rejects an invalid folder query response at runtime", async () => {

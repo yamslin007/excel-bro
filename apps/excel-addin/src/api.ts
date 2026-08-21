@@ -409,6 +409,15 @@ export async function selectFolder(): Promise<FolderCatalog | null> {
   return responseJson<FolderCatalog | null>(response);
 }
 
+export async function refreshFolder(sessionId: string): Promise<FolderCatalog> {
+  const response = await fetch(`${API_BASE_URL}/api/folders/refresh`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sessionId })
+  });
+  return responseJson<FolderCatalog>(response);
+}
+
 export async function createFolderSnapshot(
   sessionId: string,
   selections: FolderSelection[]
