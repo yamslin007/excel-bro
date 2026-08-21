@@ -1,0 +1,71 @@
+<svg width="800" height="900" xmlns="http://www.w3.org/2000/svg">
+  <!-- 背景图层 -->
+  <rect x="50" y="50" width="700" height="800" fill="#87CEEB" opacity="0.3"/>
+  <text x="400" y="90" text-anchor="middle" font-size="14" font-weight="bold">1. 背景图层 (用户上传的图片)</text>
+
+  <!-- 头部 -->
+  <rect x="80" y="120" width="640" height="60" fill="white" opacity="0.95" rx="8"/>
+  <text x="400" y="155" text-anchor="middle" font-size="12">7. 头部 .chat-header (95% 白色半透明)</text>
+
+  <!-- 消息区域 -->
+  <g>
+    <!-- 助手消息 1 -->
+    <rect x="100" y="200" width="600" height="150" fill="none" stroke="#999" stroke-dasharray="5,5"/>
+    <text x="110" y="220" font-size="11" fill="#666">2. 消息容器 .message-content (透明)</text>
+
+    <text x="110" y="245" font-size="10" fill="#2f6b47" font-weight="bold">Excel Bro</text>
+    <rect x="190" y="235" width="60" height="18" fill="#edf3ec" rx="4"/>
+    <text x="220" y="247" font-size="9" fill="#2f6b47" text-anchor="middle">需求确认</text>
+    <text x="110" y="230" font-size="11" fill="#999">3. 消息标题 .message-author (透明)</text>
+
+    <text x="110" y="280" font-size="12" fill="#37352f">用户仅发送了问候语，尚未提出具体的查询、分析或修改需求。</text>
+    <text x="110" y="300" font-size="12" fill="#37352f" font-weight="bold">请问您希望对当前选中的工作表（Sheet3）或其数据执行什么操作？</text>
+    <text x="110" y="265" font-size="11" fill="#999">4. 消息文字 .message-text (透明)</text>
+  </g>
+
+  <g>
+    <!-- 用户消息 -->
+    <rect x="400" y="370" width="300" height="80" fill="none" stroke="#999" stroke-dasharray="5,5"/>
+    <text x="410" y="390" font-size="11" fill="#666">2. 消息容器 .message-content (透明)</text>
+
+    <rect x="530" y="410" width="150" height="30" fill="#2f6b47" rx="16"/>
+    <text x="605" y="430" font-size="12" fill="white" text-anchor="middle">你好</text>
+    <text x="410" y="405" font-size="11" fill="#999">5. 用户气泡 .user .message-text (透明)</text>
+  </g>
+
+  <g>
+    <!-- 助手消息 2 -->
+    <rect x="100" y="470" width="600" height="150" fill="none" stroke="#999" stroke-dasharray="5,5"/>
+    <text x="110" y="490" font-size="11" fill="#666">2. 消息容器 .message-content (透明)</text>
+
+    <text x="110" y="515" font-size="10" fill="#2f6b47" font-weight="bold">Excel Bro</text>
+    <rect x="190" y="505" width="60" height="18" fill="#edf3ec" rx="4"/>
+    <text x="220" y="517" font-size="9" fill="#2f6b47" text-anchor="middle">需求确认</text>
+
+    <text x="110" y="550" font-size="12" fill="#37352f">执行前确认</text>
+    <text x="110" y="570" font-size="12" fill="#37352f">需求已确认</text>
+    <text x="110" y="595" font-size="11" fill="#5a7065">已选择：你好</text>
+  </g>
+
+  <!-- 输入框 -->
+  <rect x="80" y="650" width="640" height="100" fill="white" opacity="0.92" rx="8"/>
+  <text x="400" y="705" text-anchor="middle" font-size="12">6. 输入框 .composer-box (92% 白色半透明)</text>
+
+  <!-- 图例 -->
+  <g transform="translate(80, 780)">
+    <text x="0" y="0" font-size="14" font-weight="bold">图例：</text>
+    <rect x="0" y="10" width="30" height="20" fill="white" opacity="0.95" rx="4"/>
+    <text x="40" y="25" font-size="11">= 半透明白色背景</text>
+
+    <rect x="200" y="10" width="30" height="20" fill="none" stroke="#999" stroke-dasharray="3,3" rx="4"/>
+    <text x="240" y="25" font-size="11">= 透明容器（虚线框）</text>
+
+    <rect x="450" y="10" width="30" height="20" fill="#37352f" rx="4"/>
+    <text x="490" y="25" font-size="11">= 实际文字（不透明）</text>
+  </g>
+
+  <!-- 说明 -->
+  <text x="400" y="860" text-anchor="middle" font-size="13" fill="#666" font-weight="bold">
+    当前：只有头部和输入框有半透明白色背景，所有消息内容透明
+  </text>
+</svg>

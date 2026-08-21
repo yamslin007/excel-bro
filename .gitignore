@@ -9,6 +9,7 @@ dist/
 __pycache__/
 .pytest_cache/
 server/.pytest_tmp/
+.pytest-tmp/
 *.py[cod]
 .venv/
 server/data/

@@ -125,8 +125,30 @@ server/app/
 ├── folder_data.py          # 文件夹确定性查询
 ├── capabilities.py         # 共享能力配置
 ├── safety.py               # 安全与协议校验
+├── rule_generator.py       # /function 公式生成主流程
+├── formula_tools/          # /function 工具调用架构（schema/编译器/注册表/Prompt）
+├── formula_tools_integration.py  # 工具调用路径与主流程的衔接
 └── llm/                    # 模型调用、错误和重试
 ```
+
+### /function 公式生成链路
+
+`/function` 短链优先走「本地确定性跨表公式」（前端 `crossTableFormula.ts`，
+不调用 AI）。覆盖不了时后端按两级架构生成：
+
+1. **工具调用路径**（`formula_tools/` + `formula_tools_integration.py`）：
+   模型只返回结构化函数调用 JSON（`FormulaToolCallResponse`），由代码编译器
+   递归编译成公式文本，保证语法正确、字面量不丢失；编译结果与主流程一样经过
+   `dangerous_formula` 安全检查。
+2. **端到端兜底**（`rule_generator.py` 原有逻辑）：工具调用路径任何一步失败
+   （模型未配置、JSON 无效、编译失败、安全检查拦截）都自动回退到原有
+   「模型直接生成公式文本」方式，用户无感知。
+
+协议不变：请求仍为 `GenerateFormulaRequest`，响应仍为
+`GenerateFormulaResponse`（现代版 + 兼容版两条公式）。工具调用路径只生成一版
+公式：`compatFormula` 与 `modernFormula` 相同，但 `compatExplanation` 会附加
+「⚠️ 此公式使用了 Excel 365+ 函数，可能不兼容旧版本」警示，避免承诺虚假兼容；
+真正的兼容版转换（XLOOKUP → VLOOKUP 等）留待后续实现。
 
 ### 通信协议
 
@@ -142,6 +164,8 @@ server/app/
 - `POST /api/settings/model/connections`：新增连接
 - `DELETE /api/settings/model/connections`：删除连接
 - `POST /api/formulas/generate`：/function 短链生成原生公式（可携带文件夹模式勾选的外部工作簿工作表上下文 `extraSheets`）
+- `POST /api/folders/select`：选择并扫描文件夹
+- `POST /api/folders/refresh`：刷新文件夹文件列表（保持 sessionId 不变）
 - `GET /api/diagnostics`：诊断信息
 
 前端协议定义在 `apps/excel-addin/src/contracts.ts`，后端协议镜像在 `server/app/models.py`。
