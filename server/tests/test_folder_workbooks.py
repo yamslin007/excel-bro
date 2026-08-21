@@ -12,6 +12,7 @@ from server.app.folder_workbooks import (
     FolderSnapshotRequest,
     create_folder_snapshot,
     execute_folder_plan,
+    refresh_folder,
     scan_folder,
 )
 from server.app.models import AnalysisPlan
@@ -72,6 +73,56 @@ def test_folder_catalog_reports_scan_truncation(
     assert catalog.totalFiles == 3
     assert catalog.truncated is True
     assert catalog.expiresAt
+
+
+def test_refresh_folder_keeps_session_and_updates_file_list(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "scores.xlsx"
+    _create_source(source)
+    catalog = scan_folder(tmp_path)
+
+    renamed = tmp_path / "renamed.xlsx"
+    source.rename(renamed)
+    (tmp_path / "added.xlsx").write_bytes(b"not an excel file")
+
+    refreshed = refresh_folder(catalog.sessionId)
+
+    assert refreshed.sessionId == catalog.sessionId
+    assert refreshed.folderName == catalog.folderName
+    names = {file.name for file in refreshed.files}
+    assert "renamed.xlsx" in names
+    assert "scores.xlsx" not in names
+    # 无法读取的文件保留错误信息而不是丢失条目
+    added = next(file for file in refreshed.files if file.name == "added.xlsx")
+    assert added.error is not None
+
+
+def test_refresh_folder_reflects_new_worksheets_in_existing_file(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "scores.xlsx"
+    _create_source(source)
+    catalog = scan_folder(tmp_path)
+
+    workbook = load_workbook(source)
+    workbook.create_sheet("新增")
+    workbook.save(source)
+    workbook.close()
+
+    refreshed = refresh_folder(catalog.sessionId)
+
+    assert refreshed.files[0].relativePath == "scores.xlsx"
+    assert {sheet.name for sheet in refreshed.files[0].worksheets} == {
+        "得分",
+        "说明",
+        "新增",
+    }
+
+
+def test_refresh_folder_rejects_unknown_session() -> None:
+    with pytest.raises(ValueError, match="会话已失效"):
+        refresh_folder("missing-session")
 
 
 def test_folder_snapshot_normalizes_dates_codes_and_display_values(

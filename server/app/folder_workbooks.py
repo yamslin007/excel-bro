@@ -84,6 +84,10 @@ class FolderSnapshotRequest(BaseModel):
     selections: list[FolderSelection] = Field(min_length=1)
 
 
+class FolderRefreshRequest(BaseModel):
+    sessionId: str
+
+
 class FolderExecuteRequest(BaseModel):
     sessionId: str
     plan: AnalysisPlan
@@ -117,15 +121,7 @@ _sessions: dict[str, _FolderSession] = {}
 
 
 def _prune_sessions(*, reserve_slot: bool = False) -> None:
-    ttl = capability_int("folder", "sessionTtlSeconds")
-    cutoff = time.monotonic() - ttl
-    expired = [
-        session_id
-        for session_id, session in _sessions.items()
-        if session.last_access < cutoff
-    ]
-    for session_id in expired:
-        _sessions.pop(session_id, None)
+    """淘汰会话：仅按容量限制（maxSessions），不设时间过期——远程办公场景可能长时间挂起。"""
     capacity = capability_int("folder", "maxSessions")
     target_size = capacity - 1 if reserve_slot else capacity
     while len(_sessions) > target_size:
@@ -156,13 +152,52 @@ def _is_supported_file(path: Path) -> bool:
     )
 
 
-def scan_folder(root: Path) -> FolderCatalog:
-    root = root.resolve()
+def _candidate_files(root: Path) -> tuple[list[Path], list[Path]]:
+    """返回排序后的全部候选文件与受 FILE_LIMIT 限制的候选文件。"""
     all_candidates = sorted(
         (path for path in root.rglob("*") if _is_supported_file(path)),
         key=lambda path: str(path.relative_to(root)).casefold(),
     )
-    candidates = all_candidates[:FILE_LIMIT]
+    return all_candidates, all_candidates[:FILE_LIMIT]
+
+
+def _file_info(root: Path, file_id: str, path: Path) -> FolderFileInfo:
+    """读取单个文件的工作表结构；读取失败时返回带错误信息的条目。"""
+    relative_path = str(path.relative_to(root))
+    try:
+        workbook = load_workbook(
+            path,
+            read_only=True,
+            data_only=True,
+            keep_vba=path.suffix.lower() == ".xlsm",
+        )
+        worksheets = [
+            FolderWorksheetInfo(
+                name=sheet.title,
+                rowCount=sheet.max_row,
+                columnCount=sheet.max_column,
+            )
+            for sheet in workbook.worksheets
+        ]
+        workbook.close()
+        return FolderFileInfo(
+            id=file_id,
+            name=path.name,
+            relativePath=relative_path,
+            worksheets=worksheets,
+        )
+    except Exception as error:
+        return FolderFileInfo(
+            id=file_id,
+            name=path.name,
+            relativePath=relative_path,
+            error=f"无法读取：{error}",
+        )
+
+
+def scan_folder(root: Path) -> FolderCatalog:
+    root = root.resolve()
+    all_candidates, candidates = _candidate_files(root)
     _prune_sessions(reserve_slot=True)
     session_id = uuid.uuid4().hex
     session_files: dict[str, Path] = {}
@@ -174,40 +209,7 @@ def scan_folder(root: Path) -> FolderCatalog:
             str(path.relative_to(root)).replace("\\", "/").casefold(),
         ).hex
         session_files[file_id] = path
-        relative_path = str(path.relative_to(root))
-        try:
-            workbook = load_workbook(
-                path,
-                read_only=True,
-                data_only=True,
-                keep_vba=path.suffix.lower() == ".xlsm",
-            )
-            worksheets = [
-                FolderWorksheetInfo(
-                    name=sheet.title,
-                    rowCount=sheet.max_row,
-                    columnCount=sheet.max_column,
-                )
-                for sheet in workbook.worksheets
-            ]
-            workbook.close()
-            files.append(
-                FolderFileInfo(
-                    id=file_id,
-                    name=path.name,
-                    relativePath=relative_path,
-                    worksheets=worksheets,
-                )
-            )
-        except Exception as error:
-            files.append(
-                FolderFileInfo(
-                    id=file_id,
-                    name=path.name,
-                    relativePath=relative_path,
-                    error=f"无法读取：{error}",
-                )
-            )
+        files.append(_file_info(root, file_id, path))
 
     _sessions[session_id] = _FolderSession(root, session_files)
     return FolderCatalog(
@@ -218,8 +220,38 @@ def scan_folder(root: Path) -> FolderCatalog:
         totalFiles=len(all_candidates),
         truncated=len(all_candidates) > FILE_LIMIT,
         expiresAt=datetime.fromtimestamp(
-            datetime.now().timestamp()
-            + capability_int("folder", "sessionTtlSeconds")
+            datetime.now().timestamp() + 86400 * 30  # 30天后（容量淘汰优先，无固定过期）
+        ).astimezone().isoformat(),
+    )
+
+
+def refresh_folder(session_id: str) -> FolderCatalog:
+    """刷新文件夹会话：重新扫描文件列表，保持 sessionId 不变。"""
+    session = _session(session_id)
+    root = session.root
+    all_candidates, candidates = _candidate_files(root)
+    session_files: dict[str, Path] = {}
+    files: list[FolderFileInfo] = []
+
+    for path in candidates:
+        file_id = uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            str(path.relative_to(root)).replace("\\", "/").casefold(),
+        ).hex
+        session_files[file_id] = path
+        files.append(_file_info(root, file_id, path))
+
+    session.files = session_files
+    session.last_access = time.monotonic()
+    return FolderCatalog(
+        sessionId=session_id,
+        folderName=root.name,
+        folderPath=str(root),
+        files=files,
+        totalFiles=len(all_candidates),
+        truncated=len(all_candidates) > FILE_LIMIT,
+        expiresAt=datetime.fromtimestamp(
+            datetime.now().timestamp() + 86400 * 30  # 30天后（容量淘汰优先，无固定过期）
         ).astimezone().isoformat(),
     )
 
