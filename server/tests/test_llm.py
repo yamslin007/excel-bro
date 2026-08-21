@@ -126,6 +126,44 @@ def test_openai_compatible_client_owns_auth_and_request_shape(
     }
 
 
+def test_openai_compatible_client_sends_temperature_when_provided(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """可选 temperature 参数应进入请求体；不传时保持向后兼容（不出现该字段）。"""
+    captured: dict[str, object] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={"choices": [{"message": {"content": "ok"}}]},
+        )
+
+    transport = httpx.MockTransport(handler)
+    original_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: original_client(transport=transport, **kwargs),
+    )
+    connection = ModelConnection(
+        base_url="https://api.example.test/v1",
+        model="test-model",
+        api_key="",
+        supports_vision=False,
+    )
+
+    async def run() -> None:
+        async with OpenAICompatibleClient(connection, timeout=12) as client:
+            await client.chat_completions(
+                messages=[{"role": "user", "content": "hello"}],
+                temperature=0.1,
+            )
+
+    asyncio.run(run())
+    assert captured["body"]["temperature"] == 0.1
+
+
 def test_adapter_normalizes_http_status_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

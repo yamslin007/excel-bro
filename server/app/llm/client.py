@@ -93,6 +93,7 @@ class OpenAICompatibleClient:
         *,
         messages: list[dict[str, Any]],
         max_tokens: int | None = None,
+        temperature: float | None = None,
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | None = None,
     ) -> dict[str, Any]:
@@ -104,6 +105,8 @@ class OpenAICompatibleClient:
         }
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
+        if temperature is not None:
+            payload["temperature"] = temperature
         if tools is not None:
             payload["tools"] = tools
         if tool_choice is not None:
