@@ -2740,6 +2740,16 @@ textarea:focus-visible {
   font-weight: 800;
 }
 
+.folder-toolbar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.folder-toolbar .browse-folder-button {
+  flex: 1;
+}
+
 .folder-file-list {
   display: grid;
   gap: 8px;
@@ -4021,6 +4031,70 @@ textarea:focus-visible {
   white-space: nowrap;
 }
 
+.scope-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.scope-controls .scope-mode-list {
+  flex: 1;
+  min-width: 0;
+}
+
+.scope-action-buttons {
+  display: flex;
+  gap: 7px;
+  justify-content: flex-end;
+}
+
+.scope-refresh {
+  min-height: 32px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  color: var(--color-brand-text);
+  padding: 6px 12px;
+  font-size: var(--font-size-caption);
+  font-weight: 500;
+  transition: background 150ms ease, border-color 150ms ease, transform 150ms ease;
+}
+
+.scope-refresh:hover:not(:disabled) {
+  background: var(--color-brand-bg);
+  border-color: var(--color-brand-hover);
+  transform: translateY(-1px);
+}
+
+.scope-refresh:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.scope-confirm {
+  min-width: 64px;
+  min-height: 32px;
+  border: 1px solid var(--color-brand-text);
+  border-radius: var(--radius-md);
+  background: var(--color-brand-text);
+  color: white;
+  padding: 6px 16px;
+  font-size: var(--font-size-caption);
+  font-weight: 750;
+  transition: background 150ms ease, border-color 150ms ease, transform 150ms ease;
+}
+
+.scope-confirm:hover:not(:disabled) {
+  background: var(--color-brand-text);
+  filter: brightness(0.85);
+  transform: translateY(-1px);
+}
+
+.scope-confirm:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .scope-mode-list {
   display: grid;
   gap: 6px;
@@ -4076,6 +4150,27 @@ textarea:focus-visible {
 .scope-mode-list small {
   color: var(--color-text-secondary);
   font-size: var(--font-size-caption);
+}
+
+.icon-button {
+  flex: 0 0 auto;
+  padding: 6px 10px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  color: var(--color-text-primary);
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+}
+
+.icon-button:hover:not(:disabled) {
+  background: var(--color-surface-hover);
+}
+
+.icon-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .workbook-sheet-picker,
@@ -4204,39 +4299,6 @@ button.selected > .sheet-checkbox {
   color: var(--color-text-tertiary);
   font-size: var(--font-size-caption);
   text-align: center;
-}
-
-.scope-popover-actions {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 7px;
-  border-top: 1px solid #edf0ed;
-  padding-top: 9px;
-}
-
-.scope-popover-actions > span {
-  margin-right: auto;
-  color: #7e8881;
-  font-size: var(--font-size-caption);
-}
-
-.scope-popover-actions > button {
-  min-height: 28px;
-  border: 1px solid #d5ded7;
-  border-radius: 8px;
-  background: white;
-  color: #4e6255;
-  padding: 5px 10px;
-  font-size: var(--font-size-caption);
-  font-weight: 750;
-}
-
-.scope-popover-actions > .scope-confirm {
-  min-width: 64px;
-  border-color: #216f3d;
-  background: #216f3d;
-  color: white;
 }
 
 .composer-input-region {
@@ -4978,7 +5040,7 @@ button.selected > .sheet-checkbox {
 .workbook-sheet-list > button,
 .sheet-picker-options button,
 .source-switch button,
-.scope-popover-actions > button,
+.icon-button,
 .tool-card-wrap,
 .header-button,
 .model-picker-trigger,
@@ -4995,7 +5057,6 @@ button.selected > .sheet-checkbox {
 .model-picker-trigger:not(:disabled):hover,
 .header-button:not(:disabled):hover,
 .attach-image-button:not(:disabled):hover,
-.scope-popover-actions > button:not(:disabled):hover,
 .primary-button:not(:disabled):hover,
 .secondary-button:not(:disabled):hover,
 .send-button:not(:disabled):hover {
@@ -5039,7 +5100,7 @@ button.selected > .sheet-checkbox {
   .workbook-sheet-list > button,
   .sheet-picker-options button,
   .source-switch button,
-  .scope-popover-actions > button,
+  .icon-button,
   .tool-card-wrap,
   .header-button,
   .model-picker-trigger,
@@ -5052,7 +5113,6 @@ button.selected > .sheet-checkbox {
   .model-picker-trigger:not(:disabled):hover,
   .header-button:not(:disabled):hover,
   .attach-image-button:not(:disabled):hover,
-  .scope-popover-actions > button:not(:disabled):hover,
   .primary-button:not(:disabled):hover,
   .secondary-button:not(:disabled):hover,
   .send-button:not(:disabled):hover {

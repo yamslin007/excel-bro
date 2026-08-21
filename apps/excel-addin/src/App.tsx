@@ -6307,7 +6307,7 @@ export default function App() {
                 >
                   <i>◎</i>
                   <span>
-                    <strong>跟随当前工作表</strong>
+                    <strong>跟随当前</strong>
                     <small>发送时自动使用正在查看的工作表</small>
                   </span>
                 </button>
@@ -6321,7 +6321,7 @@ export default function App() {
                 >
                   <i>☷</i>
                   <span>
-                    <strong>选择多个工作表</strong>
+                    <strong>选择多个</strong>
                     <small>用于跨表查询、比较或汇总</small>
                   </span>
                 </button>
@@ -6331,20 +6331,41 @@ export default function App() {
                 >
                   <i>⌑</i>
                   <span>
-                    <strong>选择文件夹</strong>
+                    <strong>文件夹</strong>
                     <small>批量处理多个本地工作簿</small>
                   </span>
                 </button>
               </div>
-              <button
-                className="icon-button"
-                disabled={busy || !workbook}
-                onClick={() => void refreshWorkbook()}
-                title="刷新工作簿（更新工作簿名和工作表列表）"
-                aria-label="刷新工作簿"
-              >
-                🔄
-              </button>
+              <div className="scope-action-buttons">
+                <button
+                  className="scope-refresh"
+                  disabled={busy || (sourceMode === "folder" && !folderCatalog)}
+                  onClick={() =>
+                    void (sourceMode === "folder"
+                      ? refreshCurrentFolder()
+                      : refreshWorkbook())
+                  }
+                  title={
+                    sourceMode === "folder"
+                      ? "刷新文件夹（更新文件列表）"
+                      : "刷新工作簿（更新工作簿名和工作表列表）"
+                  }
+                >
+                  ↻ 刷新
+                </button>
+                <button
+                  className="scope-confirm"
+                  disabled={
+                    sourceMode === "workbook"
+                      ? workbookScopeMode === "manual" &&
+                        selectedSheetNames.length === 0
+                      : folderSheetKeys.length === 0
+                  }
+                  onClick={() => void confirmSheetSelection()}
+                >
+                  {status === "scanning" ? "读取中…" : "完成"}
+                </button>
+              </div>
             </div>
 
             {sourceMode === "workbook" && workbookScopeMode === "manual" && (
@@ -6423,17 +6444,6 @@ export default function App() {
                       ? `更换文件夹 · ${folderCatalog.folderName}`
                       : "选择文件夹"}
                   </button>
-                  {folderCatalog && (
-                    <button
-                      className="icon-button"
-                      disabled={busy}
-                      onClick={() => void refreshCurrentFolder()}
-                      title="刷新文件夹（更新文件列表）"
-                      aria-label="刷新文件夹"
-                    >
-                      🔄
-                    </button>
-                  )}
                 </div>
 
                 {folderCatalog && (
@@ -6502,30 +6512,6 @@ export default function App() {
               </div>
             )}
 
-            <div className="scope-popover-actions">
-              {sourceMode === "workbook" ? (
-                <button
-                  disabled={busy}
-                  onClick={() => void scan({ announce: true })}
-                >
-                  {status === "scanning" ? "读取中…" : "刷新工作簿"}
-                </button>
-              ) : (
-                <span>已选 {folderSheetKeys.length} 个工作表</span>
-              )}
-              <button
-                className="scope-confirm"
-                disabled={
-                  sourceMode === "workbook"
-                    ? workbookScopeMode === "manual" &&
-                      selectedSheetNames.length === 0
-                    : folderSheetKeys.length === 0
-                }
-                onClick={() => void confirmSheetSelection()}
-              >
-                {status === "scanning" ? "读取中…" : "完成"}
-              </button>
-            </div>
           </section>
         )}
 
