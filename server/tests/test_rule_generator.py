@@ -67,6 +67,21 @@ def test_formula_prompt_keeps_literal_markers() -> None:
     assert '["无问题", "/"]' in user_content
 
 
+def test_formula_prompt_forbids_fuzzy_matching() -> None:
+    """提示词必须强制精确匹配，禁止 VLOOKUP TRUE / MATCH 1 / 省略参数等近似匹配。"""
+    request = GenerateFormulaRequest(
+        description="把B表的单价按编号匹配过来",
+        activeCell="E2",
+    )
+    messages = _build_formula_generation_prompt(request)
+    system_content = messages[0]["content"]
+    assert "禁止任何近似/模糊匹配" in system_content
+    assert "VLOOKUP/HLOOKUP 第四参数必须写 FALSE" in system_content
+    assert "MATCH 第三参数必须写 0" in system_content
+    assert "省略默认近似" in system_content
+    assert "不要使用 LOOKUP" in system_content
+
+
 def test_generate_formula_whitelist_passes_selected_external_refs() -> None:
     """勾选文件名集合作为 allowed_external 时，对应外部引用放行。"""
     allowed = {"B.xlsx"}

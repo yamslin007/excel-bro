@@ -21,10 +21,12 @@ from .folder_workbooks import (
     FolderExecuteRequest,
     FolderExecuteResponse,
     FolderQueryRequest,
+    FolderRefreshRequest,
     FolderSnapshotRequest,
     create_folder_snapshot,
     execute_folder_plan,
     query_folder_data,
+    refresh_folder,
     select_and_scan_folder,
 )
 from .models import (
@@ -594,6 +596,18 @@ async def turn_stream(request: TurnRequest) -> StreamingResponse:
 @app.post("/api/folders/select", response_model=FolderCatalog | None)
 async def select_folder() -> FolderCatalog | None:
     return await run_in_threadpool(select_and_scan_folder)
+
+
+@app.post("/api/folders/refresh", response_model=FolderCatalog)
+async def refresh_folder_endpoint(
+    request: FolderRefreshRequest,
+) -> FolderCatalog:
+    try:
+        return await run_in_threadpool(refresh_folder, request.sessionId)
+    except ValueError as error:
+        raise service_error(
+            422, "FOLDER_DATA_ERROR", str(error), retryable=True
+        ) from error
 
 
 @app.post("/api/folders/snapshot", response_model=WorkbookSnapshot)

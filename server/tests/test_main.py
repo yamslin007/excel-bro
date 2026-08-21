@@ -8,9 +8,11 @@ from pathlib import Path
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from openpyxl import Workbook
 
 import server.app.main as main_module
 import server.app.llm.config as llm_config
+import server.app.folder_workbooks as folder_workbooks_module
 from server.app.main import app
 from server.app.llm import selected_model_config
 from server.app.models import AnswerResponse
@@ -352,6 +354,40 @@ def test_model_vision_capability_requires_explicit_configuration(
     monkeypatch.setenv("AI_VISION_MODELS", "vision-looking-name")
     configured = TestClient(app).get("/api/models").json()
     assert configured["models"][1]["supportsVision"] is True
+
+
+def test_folder_refresh_endpoint_keeps_session_id(tmp_path: Path) -> None:
+    source = tmp_path / "scores.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "得分"
+    sheet.append(["人员", "得分"])
+    sheet.append(["嘟嘟嘟", 33])
+    workbook.save(source)
+    workbook.close()
+
+    catalog = folder_workbooks_module.scan_folder(tmp_path)
+    source.rename(tmp_path / "renamed.xlsx")
+
+    response = TestClient(app).post(
+        "/api/folders/refresh",
+        json={"sessionId": catalog.sessionId},
+    )
+
+    assert response.status_code == 200
+    value = response.json()
+    assert value["sessionId"] == catalog.sessionId
+    assert [file["name"] for file in value["files"]] == ["renamed.xlsx"]
+
+
+def test_folder_refresh_endpoint_rejects_unknown_session() -> None:
+    response = TestClient(app).post(
+        "/api/folders/refresh",
+        json={"sessionId": "missing-session"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "FOLDER_DATA_ERROR"
 
 
 def _intent_payload(prompt: str, sheet_count: int = 2) -> dict[str, object]:
