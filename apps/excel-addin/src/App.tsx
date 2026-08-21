@@ -2753,15 +2753,15 @@ export default function App() {
         generateMs
       });
     } catch (reason) {
-      const message = reason instanceof Error ? reason.message : "生成公式失败";
-      if (message.includes("会话已失效") || message.includes("不存在或已过期")) {
+      const errorMsg = reason instanceof Error ? reason.message : "生成公式失败";
+      if (errorMsg.includes("会话已失效") || errorMsg.includes("不存在或已过期")) {
         setFolderCatalog(null);
         markFunctionPreview(message.id, {
           targetError: "文件夹会话已过期，请重新选择文件夹"
         });
       } else {
         markFunctionPreview(message.id, {
-          targetError: message
+          targetError: errorMsg
         });
       }
     } finally {
