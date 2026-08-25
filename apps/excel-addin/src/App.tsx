@@ -57,6 +57,7 @@ import {
   readSelectedRange,
   previewFormulaFirstCell,
   PlanExecutionError,
+  StaleSourceError,
   snapshotDataEpochs,
   toolSchemaFingerprintForSnapshot,
   watchWorkbookStructureChanges
@@ -78,6 +79,7 @@ import {
   SavedQueryToolFallbackError
 } from "./deterministicTools";
 import { renderToolDsl } from "./toolDsl";
+import type { PlanEditorTarget } from "./hooks/usePlanEditor";
 import {
   MAX_IMAGE_ATTACHMENTS,
   prepareImageFile,
@@ -98,6 +100,7 @@ import {
   exportDiagnosticReport,
   recordDiagnosticEvent
 } from "./diagnostics";
+import { probeWorkerSupport } from "./sandbox/workerProbe";
 import {
   FOCUS_PAYLOAD_STORAGE_KEY,
   type FocusPayload
@@ -778,6 +781,8 @@ function actionLabel(action: AnalysisPlan["actions"][number]): string {
       return `按「${action.splitBy}」拆分「${action.sheet}」，并按 ${action.groupBy.join(
         "、"
       )} 汇总`;
+    case "computeValues":
+      return `从「${action.sourceSheet}」计算并写入「${action.sheet}」${action.destinationCell}`;
     case "addNamedRange":
       return `为「${action.sheet}」${action.range} 创建名称「${action.name}」`;
     case "addImage":
@@ -919,7 +924,8 @@ export default function App() {
     copyToolDsl,
     setToolDrawerView,
     setToolDetailMode,
-    setPendingToolDeletion
+    setPendingToolDeletion,
+    setTools
   } = toolManagementHook;
 
   const [contextOpen, setContextOpen] = useState(false);
@@ -967,6 +973,7 @@ export default function App() {
     beginSaveCandidate,
     closeSaveCandidate
   } = useExecutionApproval();
+
   // 复制反馈状态与定时器（自定义 Hook）
   const {
     copiedMessageId,
@@ -1028,6 +1035,7 @@ export default function App() {
     startHeight: number;
   } | null>(null);
   const focusDialogRef = useRef<Office.Dialog | null>(null);
+  const planEditorDialogRef = useRef<Office.Dialog | null>(null);
   const queryAbortRef = useRef<AbortController | null>(null);
   // turnAbortRef：整个 turn（需求确认→本地取数→生成方案）共用的打断句柄。
   // 每个 turn 开始时新建；用户中途插话/停止时 abort，串在链上的模型请求会一起 reject。
@@ -1123,12 +1131,14 @@ export default function App() {
     };
   }, [petVisible]);
 
-  // 撤销快照管理（自定义 Hook）
+  // 撤销栈管理（自定义 Hook）
   const {
+    undoStack,
     lastUndoSnapshot,
-    setLastUndoSnapshot,
+    pushUndoSnapshot,
     clearUndoSnapshot,
-    undoLastExecution
+    undoLastExecution,
+    undoExecutionTo
   } = useUndoSnapshot({
     isBusy: busy,
     onStatusChange: setStatus,
@@ -1229,6 +1239,8 @@ export default function App() {
     () => () => {
       focusDialogRef.current?.close();
       focusDialogRef.current = null;
+      planEditorDialogRef.current?.close();
+      planEditorDialogRef.current = null;
     },
     []
   );
@@ -3014,7 +3026,9 @@ export default function App() {
   async function runPlan(
     plan: AnalysisPlan,
     allowedExternalFiles?: ReadonlySet<string>,
-    forceLocal?: boolean
+    forceLocal?: boolean,
+    /** 用户在「数据已变」二次确认里点了「仍要执行」。 */
+    acknowledgeStaleSource?: boolean
   ): Promise<boolean> {
     if (sourceMode === "folder" && !forceLocal) {
       if (!folderCatalog) return false;
@@ -3072,7 +3086,10 @@ export default function App() {
 
     setStatus("executing");
     try {
-      const result = await executePlan(plan, { allowedExternalFiles });
+      const result = await executePlan(plan, {
+        allowedExternalFiles,
+        acknowledgeStaleSource
+      });
       recordDiagnosticEvent({
         timestamp: new Date().toISOString(),
         phase: "execution",
@@ -3098,13 +3115,25 @@ export default function App() {
         verification: result.verification,
         executedPlanId: plan.id
       });
-      setLastUndoSnapshot(result.undoSnapshot ?? null);
+      pushUndoSnapshot(result.undoSnapshot ?? null);
       if (result.verification.status === "verified") {
         markPlanVerified(plan.id);
       }
       await scan();
       return true;
     } catch (reason) {
+      if (reason instanceof StaleSourceError) {
+        // 数据变了但计划本身仍可执行：给出二次确认，而不是像字段缺失那样堵死。
+        appendMessage({
+          role: "system",
+          text: reason.message,
+          staleSourceConfirm: {
+            plan,
+            bakedActionCount: reason.bakedActionCount
+          }
+        });
+        return false;
+      }
       if (reason instanceof PlanExecutionError) {
         const succeeded = reason.actionResults.filter(
           (result) => result.status === "succeeded"
@@ -3560,7 +3589,7 @@ export default function App() {
     const url = new URL("focus.html", window.location.href).toString();
     Office.context.ui.displayDialogAsync(
       url,
-      { height: 90, width: 90, displayInIframe: false },
+      { height: 93, width: 100, displayInIframe: false },
       (result) => {
         if (result.status !== Office.AsyncResultStatus.Succeeded) {
           setFocusOpening(false);
@@ -3598,6 +3627,116 @@ export default function App() {
         dialog.addEventHandler(Office.EventType.DialogEventReceived, () => {
           focusDialogRef.current = null;
           setFocusOpening(false);
+        });
+      }
+    );
+  }
+
+  function openPlanEditorDialog(plan: AnalysisPlan, target: PlanEditorTarget) {
+    if (!isRunningInExcel()) {
+      appendMessage({
+        role: "system",
+        text: "计划编辑器需要从 Excel 任务窗格打开。"
+      });
+      return;
+    }
+
+    const payload = {
+      type: "plan-editor-init" as const,
+      payload: {
+        plan,
+        target,
+        workbook: workbook!
+      }
+    };
+
+    try {
+      localStorage.setItem("EB_PLAN_EDITOR_PAYLOAD", JSON.stringify(payload));
+    } catch {
+      // DialogApi 1.2 messaging remains the primary synchronization path.
+    }
+
+    const canMessageChild = Office.context.requirements.isSetSupported(
+      "DialogApi",
+      "1.2"
+    );
+
+    if (planEditorDialogRef.current) {
+      if (canMessageChild) {
+        planEditorDialogRef.current.messageChild(JSON.stringify(payload));
+      }
+      return;
+    }
+
+    const url = new URL("plan-editor.html", window.location.href).toString();
+    Office.context.ui.displayDialogAsync(
+      url,
+      { height: 93, width: 100, displayInIframe: false },
+      (result) => {
+        if (result.status !== Office.AsyncResultStatus.Succeeded) {
+          appendMessage({
+            role: "system",
+            text: `无法打开编辑器：${result.error.message}`
+          });
+          return;
+        }
+
+        const dialog = result.value;
+        planEditorDialogRef.current = dialog;
+
+        dialog.addEventHandler(
+          Office.EventType.DialogMessageReceived,
+          (event) => {
+            if (!("message" in event)) return;
+            try {
+              const message = JSON.parse(event.message) as { type?: string; payload?: any };
+
+              if (message.type === "plan-editor-ready" && canMessageChild) {
+                dialog.messageChild(JSON.stringify(payload));
+              }
+
+              if (message.type === "plan-editor-save" && message.payload) {
+                const { plan: updatedPlan, target: saveTarget, updatedTools } = message.payload;
+
+                if (saveTarget.kind === "message") {
+                  setMessages((prev) =>
+                    prev.map((msg) =>
+                      msg.id === saveTarget.messageId
+                        ? { ...msg, plan: updatedPlan }
+                        : msg
+                    )
+                  );
+                  appendMessage({
+                    role: "system",
+                    text: "已更新计划脚本。"
+                  });
+                }
+
+                if (saveTarget.kind === "savedTool" && updatedTools) {
+                  // updateToolPlanTemplate 返回的是 SavedTool[]（workflow 工具）
+                  setTools(updatedTools);
+                  appendMessage({
+                    role: "system",
+                    text: "已更新工具脚本。"
+                  });
+                }
+
+                dialog.close();
+                planEditorDialogRef.current = null;
+              }
+
+              if (message.type === "plan-editor-close") {
+                dialog.close();
+                planEditorDialogRef.current = null;
+              }
+            } catch {
+              // Ignore malformed messages
+            }
+          }
+        );
+
+        dialog.addEventHandler(Office.EventType.DialogEventReceived, () => {
+          planEditorDialogRef.current = null;
         });
       }
     );
@@ -3647,6 +3786,30 @@ export default function App() {
     setToolsOpen(false);
     closeSettings();
     setHistoryOpen(true);
+  }
+
+  // P0 探针：验证沙箱方案能否在真实 Excel 宿主里落地，结果复用设置面板的反馈区。
+  async function runWorkerProbe() {
+    setSettingsFeedback("正在探测 Worker 可用性…");
+    try {
+      const result = await probeWorkerSupport();
+      const parts = [
+        result.supported ? "Worker 可用" : "Worker 不可用",
+        `往返 ${result.echoOk ? "通过" : "失败"}`,
+        `中断 ${result.terminateOk ? "通过" : "失败"}`
+      ];
+      if (result.presentGlobals.length) {
+        parts.push(`意外存在：${result.presentGlobals.join("、")}`);
+      } else {
+        parts.push(`危险入口全部缺席（${result.absentGlobals.length} 项）`);
+      }
+      if (result.failure) parts.push(result.failure);
+      setSettingsFeedback(parts.join("；"));
+    } catch (error) {
+      setSettingsFeedback(
+        `探测失败：${error instanceof Error ? error.message : String(error)}`
+      );
+    }
   }
 
   function closeSettings() {
@@ -4262,6 +4425,14 @@ export default function App() {
               <strong>模型设置</strong>
               <span>密钥仅保存在这台电脑的本地服务中</span>
             </div>
+            <button
+              type="button"
+              className="drawer-text-action"
+              onClick={() => void runWorkerProbe()}
+              title="探测本机 Excel 是否支持 Worker 沙箱"
+            >
+              探测沙箱
+            </button>
             <button
               type="button"
               className="drawer-text-action"
@@ -4920,15 +5091,30 @@ export default function App() {
                           </button>
                         </div>
                         <div className="tool-expert-badges">
-                          <span>只读展示</span>
+                          <span>可编辑 JSON</span>
                           <span>运行前预览</span>
                           <span>禁止任意代码</span>
                         </div>
                         <pre className="tool-dsl" tabIndex={0}>
                           <code>{renderToolDsl(tool.planTemplate)}</code>
                         </pre>
+                        <div className="inline-plan-buttons">
+                          <button
+                            className="secondary-button"
+                            disabled={busy}
+                            onClick={() =>
+                              openPlanEditorDialog(tool.planTemplate, {
+                                kind: "savedTool",
+                                toolId: tool.id
+                              })
+                            }
+                          >
+                            编辑脚本（JSON）
+                          </button>
+                        </div>
                         <p className="tool-expert-note">
-                          这里和普通视图是同一份工具。复制脚本不会执行；实际运行仍使用受控
+                          这里和普通视图是同一份工具。上面的脚本文本是只读展示；要改内容请用
+                          「编辑脚本（JSON）」，保存时会经过服务端校验。实际运行仍使用受控
                           AnalysisPlan，并在写入前让你确认预览。
                         </p>
                       </div>
@@ -5698,21 +5884,57 @@ export default function App() {
                 </div>
               )}
               {message.executedPlanId &&
-                lastUndoSnapshot?.planId === message.executedPlanId && (
-                  <div className="undo-row">
-                    <button
-                      type="button"
-                      className="secondary-button"
-                      disabled={busy}
-                      onClick={() => void undoLastExecution()}
-                    >
-                      ↶ 撤销本次执行
-                    </button>
-                    <span className="undo-row-hint">
-                      只保留最近一次执行的撤销数据
-                    </span>
-                  </div>
-                )}
+                (() => {
+                  const stackIndex = undoStack.findIndex(
+                    (entry) => entry.planId === message.executedPlanId
+                  );
+                  if (stackIndex < 0) return null;
+                  // 栈顶之后还有多少次执行会被连带撤销。
+                  const alsoUndone = undoStack.length - 1 - stackIndex;
+                  return (
+                    <div className="undo-row">
+                      <button
+                        type="button"
+                        className="secondary-button"
+                        disabled={busy}
+                        onClick={() =>
+                          void undoExecutionTo(message.executedPlanId)
+                        }
+                      >
+                        {alsoUndone > 0
+                          ? `↶ 撤销本次执行（含之后 ${alsoUndone} 次）`
+                          : "↶ 撤销本次执行"}
+                      </button>
+                      <span className="undo-row-hint">
+                        {alsoUndone > 0
+                          ? "多次执行的区域可能重叠，只能从最近一次往前逐级撤销"
+                          : `保留最近 ${undoStack.length} 次执行的撤销数据`}
+                      </span>
+                    </div>
+                  );
+                })()}
+              {message.staleSourceConfirm && (
+                <div className="undo-row">
+                  <button
+                    type="button"
+                    className="secondary-button"
+                    disabled={busy}
+                    onClick={() =>
+                      void runPlan(
+                        message.staleSourceConfirm!.plan,
+                        undefined,
+                        undefined,
+                        true
+                      )
+                    }
+                  >
+                    仍要执行（写入预览时的结果）
+                  </button>
+                  <span className="undo-row-hint">
+                    重新提问可以按当前数据重新生成一份预览
+                  </span>
+                </div>
+              )}
               {message.functionPreview &&
                 message.functionPreview.phase === "target" && (
                   <div className="inline-plan">
@@ -6151,6 +6373,23 @@ export default function App() {
                         </li>
                       ))}
                     </ol>
+
+                    <div className="inline-plan-buttons">
+                      <button
+                        className="secondary-button"
+                        disabled={busy}
+                        onClick={() => {
+                          const plan = message.plan;
+                          if (!plan) return;
+                          openPlanEditorDialog(plan, {
+                            kind: "message",
+                            messageId: message.id
+                          });
+                        }}
+                      >
+                        编辑脚本
+                      </button>
+                    </div>
                   </details>
                 </div>
               )}
