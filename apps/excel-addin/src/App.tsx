@@ -78,7 +78,7 @@ import {
   executeSavedQueryTool,
   SavedQueryToolFallbackError
 } from "./deterministicTools";
-import { renderToolDsl } from "./toolDsl";
+import { highlightToolDsl, renderToolDsl } from "./toolDsl";
 import type { PlanEditorTarget } from "./hooks/usePlanEditor";
 import {
   MAX_IMAGE_ATTACHMENTS,
@@ -927,6 +927,10 @@ export default function App() {
     setPendingToolDeletion,
     setTools
   } = toolManagementHook;
+
+  const [toolActionBusy, setToolActionBusy] = useState<
+    "prepare" | "query" | null
+  >(null);
 
   const [contextOpen, setContextOpen] = useState(false);
   const [sheetSearch, setSheetSearch] = useState("");
@@ -3696,7 +3700,12 @@ export default function App() {
               }
 
               if (message.type === "plan-editor-save" && message.payload) {
-                const { plan: updatedPlan, target: saveTarget, updatedTools } = message.payload;
+                const {
+                  plan: updatedPlan,
+                  target: saveTarget,
+                  updatedTools,
+                  closeAfterSave
+                } = message.payload;
 
                 if (saveTarget.kind === "message") {
                   setMessages((prev) =>
@@ -3721,8 +3730,11 @@ export default function App() {
                   });
                 }
 
-                dialog.close();
-                planEditorDialogRef.current = null;
+                // 「保存」按钮触发的保存由父窗口关闭对话框；Ctrl+S 快捷保存则留在窗口
+                if (closeAfterSave) {
+                  dialog.close();
+                  planEditorDialogRef.current = null;
+                }
               }
 
               if (message.type === "plan-editor-close") {
@@ -3752,31 +3764,36 @@ export default function App() {
   }
 
   async function prepareToolRun(tool: SavedTool) {
-    if (!isRunningInExcel() || !workbook) {
-      selectTool(tool);
-      setToolDrawerView("run");
-      return;
-    }
-    setStatus("scanning");
+    setToolActionBusy("prepare");
     try {
-      const snapshot = await captureWorkbookStructure(
-        workbookScopeMode === "manual" ? selectedSheetNames : undefined
-      );
-      setWorkbook(snapshot);
-      selectTool(tool, snapshot);
-      setToolDrawerView("run");
-    } catch (reason) {
-      appendMessage({
-        role: "system",
-        text:
-          reason instanceof Error
-            ? `读取工具所需字段失败：${reason.message}`
-            : "读取工具所需字段失败"
-      });
-      selectTool(tool);
-      setToolDrawerView("run");
+      if (!isRunningInExcel() || !workbook) {
+        selectTool(tool);
+        setToolDrawerView("run");
+        return;
+      }
+      setStatus("scanning");
+      try {
+        const snapshot = await captureWorkbookStructure(
+          workbookScopeMode === "manual" ? selectedSheetNames : undefined
+        );
+        setWorkbook(snapshot);
+        selectTool(tool, snapshot);
+        setToolDrawerView("run");
+      } catch (reason) {
+        appendMessage({
+          role: "system",
+          text:
+            reason instanceof Error
+              ? `读取工具所需字段失败：${reason.message}`
+              : "读取工具所需字段失败"
+        });
+        selectTool(tool);
+        setToolDrawerView("run");
+      } finally {
+        setStatus("idle");
+      }
     } finally {
-      setStatus("idle");
+      setToolActionBusy(null);
     }
   }
 
@@ -3942,6 +3959,7 @@ export default function App() {
 
   async function runQueryTool(tool: SavedQueryTool) {
     if (!workbook) return;
+    setToolActionBusy("query");
     setStatus("tooling");
     beginActivity("正在运行固化查询", "直接调用本地确定性执行器。");
     try {
@@ -3990,6 +4008,7 @@ export default function App() {
       });
     } finally {
       setStatus("idle");
+      setToolActionBusy(null);
       finishActivity();
     }
   }
@@ -4924,7 +4943,9 @@ export default function App() {
                             <span className="tool-card-copy">
                               <small>{presentation.label}</small>
                               <strong>{tool.name}</strong>
-                              <span>{tool.description}</span>
+                              <span title={tool.description}>
+                                {tool.description}
+                              </span>
                             </span>
                           </button>
                           <div className="tool-card-footer">
@@ -4958,12 +4979,14 @@ export default function App() {
                           <span className="tool-card-copy">
                             <small>本地查询</small>
                             <strong>{tool.name}</strong>
-                            <span>{tool.description}</span>
+                            <span title={tool.description}>
+                              {tool.description}
+                            </span>
                           </span>
                         </button>
                         <div className="tool-card-footer">
                           <span className="tool-card-meta">
-                            模型调用 0 次
+                            本地确定性执行
                             {formatToolDate(tool.updatedAt)
                               ? ` · ${formatToolDate(tool.updatedAt)} 更新`
                               : ""}
@@ -5074,6 +5097,16 @@ export default function App() {
                             ))}
                           </ol>
                         </details>
+                        <p className="tool-expert-hint">
+                          需要调整处理规则？{" "}
+                          <button
+                            type="button"
+                            onClick={() => setToolDetailMode("expert")}
+                          >
+                            切换到专家视图
+                          </button>
+                          后可以编辑脚本。
+                        </p>
                       </>
                     ) : (
                       <div className="tool-expert-view">
@@ -5083,12 +5116,28 @@ export default function App() {
                             <strong>专家脚本</strong>
                             <span>由保存的白名单计划确定性生成</span>
                           </div>
-                          <button
-                            className="tool-copy-dsl"
-                            onClick={() => void copyToolDsl(tool)}
-                          >
-                            {copiedToolDslId === tool.id ? "已复制" : "复制脚本"}
-                          </button>
+                          <div className="tool-expert-actions">
+                            <button
+                              className="secondary-button"
+                              disabled={busy}
+                              onClick={() =>
+                                openPlanEditorDialog(tool.planTemplate, {
+                                  kind: "savedTool",
+                                  toolId: tool.id
+                                })
+                              }
+                            >
+                              编辑脚本
+                            </button>
+                            <button
+                              className="tool-copy-dsl"
+                              onClick={() => void copyToolDsl(tool)}
+                            >
+                              {copiedToolDslId === tool.id
+                                ? "已复制"
+                                : "复制脚本"}
+                            </button>
+                          </div>
                         </div>
                         <div className="tool-expert-badges">
                           <span>可编辑 JSON</span>
@@ -5096,25 +5145,17 @@ export default function App() {
                           <span>禁止任意代码</span>
                         </div>
                         <pre className="tool-dsl" tabIndex={0}>
-                          <code>{renderToolDsl(tool.planTemplate)}</code>
+                          <code
+                            dangerouslySetInnerHTML={{
+                              __html: highlightToolDsl(
+                                renderToolDsl(tool.planTemplate)
+                              )
+                            }}
+                          />
                         </pre>
-                        <div className="inline-plan-buttons">
-                          <button
-                            className="secondary-button"
-                            disabled={busy}
-                            onClick={() =>
-                              openPlanEditorDialog(tool.planTemplate, {
-                                kind: "savedTool",
-                                toolId: tool.id
-                              })
-                            }
-                          >
-                            编辑脚本（JSON）
-                          </button>
-                        </div>
                         <p className="tool-expert-note">
                           这里和普通视图是同一份工具。上面的脚本文本是只读展示；要改内容请用
-                          「编辑脚本（JSON）」，保存时会经过服务端校验。实际运行仍使用受控
+                          「编辑脚本」，保存时会检查 JSON 格式与白名单结构。实际运行仍使用受控
                           AnalysisPlan，并在写入前让你确认预览。
                         </p>
                       </div>
@@ -5122,10 +5163,20 @@ export default function App() {
                     <div className="tool-run-actions">
                       <button
                         className="tool-preview-button"
-                        disabled={busy || !workbook}
+                        disabled={busy || !workbook || toolActionBusy !== null}
                         onClick={() => void prepareToolRun(tool)}
                       >
-                        使用这个工具
+                        {toolActionBusy === "prepare" ? (
+                          <>
+                            <span
+                              className="tool-button-spinner"
+                              aria-hidden="true"
+                            />
+                            正在读取工作簿…
+                          </>
+                        ) : (
+                          "使用这个工具"
+                        )}
                       </button>
                       <span>下一步先确认本次数据来源，不会立即修改工作簿</span>
                     </div>
@@ -5179,10 +5230,20 @@ export default function App() {
                   <div className="tool-run-actions">
                     <button
                       className="tool-preview-button"
-                      disabled={busy || !workbook}
+                      disabled={busy || !workbook || toolActionBusy !== null}
                       onClick={() => void runQueryTool(tool)}
                     >
-                      运行这个查询
+                      {toolActionBusy === "query" ? (
+                        <>
+                          <span
+                            className="tool-button-spinner"
+                            aria-hidden="true"
+                          />
+                          正在运行…
+                        </>
+                      ) : (
+                        "运行这个查询"
+                      )}
                     </button>
                     <span>查询结果会回到当前对话，不会写入工作簿</span>
                   </div>
@@ -5210,6 +5271,12 @@ export default function App() {
                   (parameter) =>
                     !(toolParameterValues[parameter.id] ?? "").trim()
                 ).length;
+                const primaryReady =
+                  primaryParameters.length === 0 ||
+                  primaryParameters.every(
+                    (parameter) =>
+                      (toolParameterValues[parameter.id] ?? "").trim()
+                  );
                 return (
                   <section className="tool-page tool-run-page" key={tool.id}>
                     <button
@@ -5226,7 +5293,13 @@ export default function App() {
                       </span>
                     </div>
                     <div className="tool-run-guide">
-                      <section className="tool-guide-step">
+                      <section
+                        className={`tool-guide-step${
+                          primaryParameters.length > 0 && !primaryReady
+                            ? " needs-attention"
+                            : ""
+                        }`}
+                      >
                         <span className="tool-guide-number">1</span>
                         <div className="tool-guide-content">
                           <div className="tool-guide-title">
@@ -5234,7 +5307,13 @@ export default function App() {
                               <strong>选择数据来源</strong>
                               <span>这次要处理哪张工作表？</span>
                             </div>
-                            <small>需要确认</small>
+                            <small>
+                              {primaryParameters.length === 0
+                                ? "固定来源"
+                                : primaryReady
+                                  ? "已完成"
+                                  : "待处理"}
+                            </small>
                           </div>
                           <div className="tool-guide-fields">
                             {primaryParameters.length > 0 ? (
@@ -5311,7 +5390,9 @@ export default function App() {
                                 下一步只展示将要执行的内容，不会立即修改工作簿。
                               </span>
                             </div>
-                            <small>最后确认</small>
+                            <small>
+                              {missingFieldCount > 0 ? "待处理" : "准备就绪"}
+                            </small>
                           </div>
                         </div>
                       </section>
