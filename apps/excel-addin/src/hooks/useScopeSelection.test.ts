@@ -139,7 +139,7 @@ describe("useScopeSelection", () => {
     expect(result.current.selectionConfirmed).toBe(true);
   });
 
-  it("should reset folder selection when applying a new catalog", () => {
+  it("should keep still-valid folder selection when applying a new catalog", () => {
     const { result } = renderHook(() => useScopeSelection());
 
     act(() => result.current.setFolderCatalog(folderCatalog));
@@ -147,7 +147,25 @@ describe("useScopeSelection", () => {
     act(() => result.current.applyFolderCatalog(folderCatalog));
 
     expect(result.current.folderCatalog).toBe(folderCatalog);
-    expect(result.current.folderSheetKeys).toEqual([]);
+    // 勾选在新 catalog 中依然存在，保留 —— 支撑刷新页面后的会话恢复。
+    expect(result.current.folderSheetKeys).toEqual(["file-1\0Data"]);
+    expect(result.current.selectionConfirmed).toBe(false);
+  });
+
+  it("should drop folder selection that no longer exists in the new catalog", () => {
+    const { result } = renderHook(() => useScopeSelection());
+
+    act(() => result.current.setFolderCatalog(folderCatalog));
+    act(() =>
+      result.current.setFolderSheetKeys([
+        "file-1\0Data",
+        "file-1\0Gone",
+        "file-404\0Data"
+      ])
+    );
+    act(() => result.current.applyFolderCatalog(folderCatalog));
+
+    expect(result.current.folderSheetKeys).toEqual(["file-1\0Data"]);
     expect(result.current.selectionConfirmed).toBe(false);
   });
 

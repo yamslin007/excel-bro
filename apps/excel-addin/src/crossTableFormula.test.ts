@@ -152,4 +152,38 @@ describe("buildCrossTableFormulas", () => {
       )
     ).toThrow(/参数不完整/);
   });
+
+  // 引号必须包裹「[文件]表名」整体：`[B.xlsx]'Sheet Name'` 是无效语法。
+  it("quotes the whole workbook-and-sheet reference for names with spaces", () => {
+    const spaced: FormulaExtraSheet = { ...sheetB, sheetName: "Sheet 2" };
+    const spacedProposal = buildCrossTableProposal(
+      "把B表的单价按编号匹配过来",
+      [
+        { name: "编号", letter: "A" },
+        { name: "名称", letter: "B" }
+      ],
+      [spaced]
+    )!;
+    const pair = buildCrossTableFormulas(spacedProposal, "E2");
+    expect(pair.compatFormula).toBe(
+      "=VLOOKUP(A2,'[B.xlsx]Sheet 2'!$A$2:$C$7,3,FALSE)"
+    );
+    expect(pair.compatFormula).not.toContain("]'Sheet 2'");
+  });
+
+  it("escapes single quotes inside the sheet name", () => {
+    const quoted: FormulaExtraSheet = { ...sheetB, sheetName: "Bob's" };
+    const quotedProposal = buildCrossTableProposal(
+      "把B表的单价按编号匹配过来",
+      [
+        { name: "编号", letter: "A" },
+        { name: "名称", letter: "B" }
+      ],
+      [quoted]
+    )!;
+    const pair = buildCrossTableFormulas(quotedProposal, "E2");
+    expect(pair.compatFormula).toBe(
+      "=VLOOKUP(A2,'[B.xlsx]Bob''s'!$A$2:$C$7,3,FALSE)"
+    );
+  });
 });

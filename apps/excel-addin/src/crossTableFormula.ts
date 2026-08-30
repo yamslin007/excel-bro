@@ -169,11 +169,16 @@ export function buildCrossTableProposal(
   return best?.proposal ?? null;
 }
 
-/** 外部工作表引用串：[file.xlsx]sheet 或 [file.xlsx]'sheet name'（表名含特殊字符时加引号）。 */
+/**
+ * 外部工作表引用串：'[file.xlsx]sheet'。
+ *
+ * 引号必须包裹「[文件]表名」整体 —— `[file.xlsx]'sheet name'` 是无效语法，
+ * Excel 只认 `'[file.xlsx]sheet name'`。简单表名加引号同样合法（Excel 自己
+ * 写外部引用就是这个形式），所以统一加引号，不做条件分支。
+ * 表名内的单引号按 Excel 规则双写转义。
+ */
 function externalSheetRef(file: string, sheet: string): string {
-  // 工作表名含空格或特殊字符时需要单引号包裹
-  const needsQuote = /[ ']/.test(sheet);
-  return needsQuote ? `[${file}]'${sheet.replace(/'/g, "''")}'` : `[${file}]${sheet}`;
+  return `'[${file}]${sheet.replace(/'/g, "''")}'`;
 }
 
 /** 本地拼两版跨表公式：兼容版 VLOOKUP / INDEX+MATCH，现代版 XLOOKUP。 */
