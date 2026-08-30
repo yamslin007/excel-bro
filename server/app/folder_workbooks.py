@@ -765,6 +765,7 @@ def _preflight_folder_plan(
     unsupported = {
         "insertRange",
         "deleteRange",
+        "removeDuplicates",
         "createPivotTable",
         "addShape",
         # computeValues 靠 Excel 端在执行时读实时数据求值，文件夹模式没有那条通路。
@@ -2195,6 +2196,8 @@ def _execute_folder_plan(request: FolderExecuteRequest) -> FolderExecuteResponse
                     default=8,
                 )
                 sheet.column_dimensions[letter].width = min(width + 2, 60)
+        else:
+            raise ValueError(f"文件夹模式未实现动作：{action.type}")
         action_results.append(
             ActionExecutionResult(
                 index=index,

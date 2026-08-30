@@ -540,6 +540,92 @@ def test_folder_preflight_rejects_filtered_write_actions(
     assert not list(tmp_path.glob("*.excel-bro-backup-*"))
 
 
+def test_folder_preflight_rejects_remove_duplicates(tmp_path: Path) -> None:
+    source = tmp_path / "scores.xlsx"
+    _create_source(source)
+    catalog = scan_folder(tmp_path)
+    snapshot = create_folder_snapshot(
+        FolderSnapshotRequest(
+            sessionId=catalog.sessionId,
+            selections=[
+                FolderSelection(fileId=catalog.files[0].id, sheets=["得分"])
+            ],
+        )
+    )
+    target = snapshot.worksheets[0].name
+    plan = AnalysisPlan.model_validate(
+        {
+            "id": "reject-remove-duplicates",
+            "title": "拒绝文件夹去重",
+            "summary": "不允许未实现动作被记录为成功",
+            "actions": [
+                {
+                    "type": "removeDuplicates",
+                    "sheet": target,
+                    "range": "A1:B3",
+                    "columns": [1],
+                    "hasHeaders": True,
+                }
+            ],
+        }
+    )
+
+    with pytest.raises(ValueError, match="文件夹模式暂不支持 removeDuplicates"):
+        execute_folder_plan(
+            FolderExecuteRequest(
+                sessionId=catalog.sessionId, plan=_stamp_plan(plan, snapshot)
+            )
+        )
+
+    unchanged = load_workbook(source, data_only=True)
+    assert unchanged["得分"].max_row == 3
+    unchanged.close()
+    assert not list(tmp_path.glob("*.excel-bro-backup-*"))
+
+
+def test_folder_dispatch_rejects_unmatched_action(tmp_path: Path) -> None:
+    source = tmp_path / "scores.xlsx"
+    _create_source(source)
+    catalog = scan_folder(tmp_path)
+    snapshot = create_folder_snapshot(
+        FolderSnapshotRequest(
+            sessionId=catalog.sessionId,
+            selections=[
+                FolderSelection(fileId=catalog.files[0].id, sheets=["得分"])
+            ],
+        )
+    )
+    target = snapshot.worksheets[0].name
+    plan = AnalysisPlan.model_validate(
+        {
+            "id": "reject-unmatched-action",
+            "title": "拒绝未匹配动作",
+            "summary": "动作分发必须穷尽",
+            "actions": [
+                {
+                    "type": "writeValues",
+                    "sheet": target,
+                    "range": "B2",
+                    "values": [[99]],
+                }
+            ],
+        }
+    )
+    plan.actions[0].type = "futureAction"  # type: ignore[assignment]
+
+    with pytest.raises(ValueError, match="文件夹模式未实现动作：futureAction"):
+        execute_folder_plan(
+            FolderExecuteRequest(
+                sessionId=catalog.sessionId, plan=_stamp_plan(plan, snapshot)
+            )
+        )
+
+    unchanged = load_workbook(source, data_only=True)
+    assert unchanged["得分"]["B2"].value == 33
+    unchanged.close()
+    assert not list(tmp_path.glob("*.excel-bro-backup-*"))
+
+
 def test_folder_preflight_prevents_earlier_writes_when_later_source_is_missing(
     tmp_path: Path,
 ) -> None:
