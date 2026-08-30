@@ -462,6 +462,84 @@ def test_plan_cannot_modify_an_unselected_sheet(tmp_path: Path) -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("action_type", "action"),
+    [
+        (
+            "clearRange",
+            {
+                "type": "clearRange",
+                "sheet": "TARGET",
+                "range": "A1:B3",
+                "applyTo": "contents",
+                "filters": [
+                    {"field": "得分", "operator": "greaterThan", "value": 40}
+                ],
+            },
+        ),
+        (
+            "copyRange",
+            {
+                "type": "copyRange",
+                "sheet": "TARGET",
+                "sourceSheet": "TARGET",
+                "sourceRange": "A1:B3",
+                "targetRange": "D1:E3",
+                "copyType": "values",
+                "filters": [
+                    {"field": "得分", "operator": "greaterThan", "value": 40}
+                ],
+            },
+        ),
+    ],
+)
+def test_folder_preflight_rejects_filtered_write_actions(
+    tmp_path: Path, action_type: str, action: dict[str, object]
+) -> None:
+    source = tmp_path / "scores.xlsx"
+    _create_source(source)
+    catalog = scan_folder(tmp_path)
+    snapshot = create_folder_snapshot(
+        FolderSnapshotRequest(
+            sessionId=catalog.sessionId,
+            selections=[
+                FolderSelection(fileId=catalog.files[0].id, sheets=["得分"])
+            ],
+        )
+    )
+    target = snapshot.worksheets[0].name
+    action["sheet"] = target
+    if action_type == "copyRange":
+        action["sourceSheet"] = target
+    plan = AnalysisPlan.model_validate(
+        {
+            "id": f"reject-filtered-{action_type}",
+            "title": "拒绝带筛选条件的文件夹写入",
+            "summary": "防止文件夹模式忽略筛选条件后误改整块区域",
+            "actions": [action],
+        }
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            rf"文件夹模式暂不支持 {action_type} 动作的筛选条件（filters）。"
+            r"请在 Excel 中手动筛选后再操作，或使用当前工作簿模式。"
+        ),
+    ):
+        execute_folder_plan(
+            FolderExecuteRequest(
+                sessionId=catalog.sessionId, plan=_stamp_plan(plan, snapshot)
+            )
+        )
+
+    unchanged = load_workbook(source, data_only=True)
+    assert unchanged["得分"]["B2"].value == 33
+    assert unchanged["得分"]["D1"].value is None
+    unchanged.close()
+    assert not list(tmp_path.glob("*.excel-bro-backup-*"))
+
+
 def test_folder_preflight_prevents_earlier_writes_when_later_source_is_missing(
     tmp_path: Path,
 ) -> None:

@@ -822,6 +822,12 @@ def _preflight_folder_plan(
 
     issues: list[str] = []
     for index, action in enumerate(plan.actions):
+        if getattr(action, "filters", []):
+            issues.append(
+                f"第 {index + 1} 步：文件夹模式暂不支持 {action.type} 动作的筛选条件"
+                "（filters）。请在 Excel 中手动筛选后再操作，或使用当前工作簿模式。"
+            )
+            continue
         if action.type in unsupported:
             issues.append(
                 f"第 {index + 1} 步：文件夹模式暂不支持 {action.type}"
