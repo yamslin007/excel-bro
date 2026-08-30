@@ -48,7 +48,8 @@ export default defineConfig(async ({ command }) => {
           taskpane: path.resolve(__dirname, "index.html"),
           focus: path.resolve(__dirname, "focus.html"),
           commands: path.resolve(__dirname, "commands.html"),
-          functions: path.resolve(__dirname, "functions.html")
+          functions: path.resolve(__dirname, "functions.html"),
+          planEditor: path.resolve(__dirname, "plan-editor.html")
         }
       }
     }

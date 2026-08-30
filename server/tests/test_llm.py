@@ -87,7 +87,14 @@ def test_openai_compatible_client_owns_auth_and_request_shape(
         captured["body"] = json.loads(request.content)
         return httpx.Response(
             200,
-            json={"choices": [{"message": {"content": "ok"}}]},
+            json={
+                "choices": [{"message": {"content": "ok"}}],
+                "usage": {
+                    "prompt_tokens": 7,
+                    "completion_tokens": 2,
+                    "total_tokens": 9,
+                },
+            },
         )
 
     transport = httpx.MockTransport(handler)
@@ -104,7 +111,7 @@ def test_openai_compatible_client_owns_auth_and_request_shape(
         supports_vision=False,
     )
 
-    async def run() -> dict[str, object]:
+    async def run() -> tuple[dict[str, object], dict[str, int]]:
         async with OpenAICompatibleClient(
             connection,
             timeout=12,
@@ -114,9 +121,14 @@ def test_openai_compatible_client_owns_auth_and_request_shape(
                 max_tokens=100,
             )
 
-    response = asyncio.run(run())
+    response, usage = asyncio.run(run())
 
     assert response["choices"][0]["message"]["content"] == "ok"
+    assert usage == {
+        "prompt_tokens": 7,
+        "completion_tokens": 2,
+        "total_tokens": 9,
+    }
     assert captured["url"] == "https://api.example.test/v1/chat/completions"
     assert captured["authorization"] == "Bearer secret"
     assert captured["body"] == {
@@ -136,7 +148,14 @@ def test_openai_compatible_client_sends_temperature_when_provided(
         captured["body"] = json.loads(request.content)
         return httpx.Response(
             200,
-            json={"choices": [{"message": {"content": "ok"}}]},
+            json={
+                "choices": [{"message": {"content": "ok"}}],
+                "usage": {
+                    "prompt_tokens": 7,
+                    "completion_tokens": 2,
+                    "total_tokens": 9,
+                },
+            },
         )
 
     transport = httpx.MockTransport(handler)
@@ -275,7 +294,7 @@ def test_retries_overloaded_then_succeeds(
 
     monkeypatch.setattr("server.app.llm.client.asyncio.sleep", fake_sleep)
 
-    async def run() -> dict[str, object]:
+    async def run() -> tuple[dict[str, object], dict[str, int]]:
         async with OpenAICompatibleClient(
             _retry_connection(),
             timeout=12,
@@ -285,9 +304,14 @@ def test_retries_overloaded_then_succeeds(
         ) as client:
             return await client.chat_completions(messages=[])
 
-    response = asyncio.run(run())
+    response, usage = asyncio.run(run())
 
     assert response["choices"][0]["message"]["content"] == "ok"
+    assert usage == {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+    }
     assert calls["count"] == 3
     assert len(sleeps) == 2
 
@@ -377,7 +401,7 @@ def test_retry_after_header_controls_delay(
 
     monkeypatch.setattr("server.app.llm.client.asyncio.sleep", fake_sleep)
 
-    async def run() -> dict[str, object]:
+    async def run() -> tuple[dict[str, object], dict[str, int]]:
         async with OpenAICompatibleClient(
             _retry_connection(),
             timeout=12,

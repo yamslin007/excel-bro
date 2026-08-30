@@ -3,6 +3,8 @@ import {
   dataEpochsChanged,
   executeAction,
   incompleteActionResults,
+  missingSchemaRequirements,
+  planLiveness,
   preflightPlanActions,
   snapshotDataEpochs,
   sourceFingerprintForSnapshot,
@@ -146,6 +148,99 @@ describe("saved tool schema fingerprint", () => {
     expect(toolSchemaFingerprintForSnapshot(plan, { worksheets: [] })).not.toBe(
       toolSchemaFingerprintForSnapshot(plan, snapshot)
     );
+  });
+});
+
+describe("plan liveness tiering", () => {
+  const computeAction: ExcelAction = {
+    type: "computeValues",
+    sheet: "结果",
+    sourceSheet: "数据",
+    hasHeaders: true,
+    includeHeaders: true,
+    destinationCell: "A1",
+    query: {
+      mode: "aggregate",
+      groupBy: ["分类"],
+      metrics: [{ operation: "sum", field: "金额", outputName: "合计" }]
+    }
+  };
+
+  function planWith(actions: ExcelAction[]): AnalysisPlan {
+    return {
+      id: "liveness-plan",
+      title: "汇总",
+      summary: "按分类汇总金额",
+      sourceFingerprintSheets: ["数据"],
+      assumptions: [],
+      warnings: [],
+      actions
+    };
+  }
+
+  it("treats execute-time evaluation as live and baked matrices as mixed", () => {
+    expect(planLiveness(planWith([computeAction]))).toBe("live");
+    expect(
+      planLiveness(
+        planWith([
+          {
+            type: "writeFormulas",
+            sheet: "结果",
+            range: "B2",
+            formulas: [["=SUM(数据!B:B)"]]
+          }
+        ])
+      )
+    ).toBe("live");
+    expect(
+      planLiveness(
+        planWith([
+          computeAction,
+          { type: "writeValues", sheet: "结果", range: "D1", values: [[1]] }
+        ])
+      )
+    ).toBe("mixed");
+  });
+
+  it("passes live plans whose source sheets and fields still exist", () => {
+    // 值改了、行数变了、无关列增删 —— live 计划照样能执行，这正是它存在的理由。
+    expect(
+      missingSchemaRequirements(planWith([computeAction]), {
+        worksheets: [
+          {
+            name: "数据",
+            usedRange: "数据!A1:C9",
+            rowCount: 9,
+            columnCount: 3,
+            headers: ["分类", "金额", "新增备注"],
+            dataRows: [["甲", 999]],
+            truncated: false
+          }
+        ]
+      })
+    ).toEqual([]);
+  });
+
+  it("names the missing sheet or field so live plans still reject real breakage", () => {
+    expect(
+      missingSchemaRequirements(planWith([computeAction]), {
+        worksheets: [
+          {
+            name: "数据",
+            usedRange: "数据!A1:B9",
+            rowCount: 9,
+            columnCount: 2,
+            headers: ["分类", "已改名的金额"],
+            dataRows: [["甲", 1]],
+            truncated: false
+          }
+        ]
+      })
+    ).toEqual(["「数据」的字段「金额」"]);
+
+    expect(
+      missingSchemaRequirements(planWith([computeAction]), { worksheets: [] })
+    ).toEqual(["工作表「数据」"]);
   });
 });
 

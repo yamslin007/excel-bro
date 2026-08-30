@@ -96,7 +96,13 @@ class OpenAICompatibleClient:
         temperature: float | None = None,
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], dict[str, int]]:
+        """调用聊天补全接口并返回响应载荷与标准化 token 用量。
+
+        Returns:
+            (payload, usage)，其中 usage 始终包含 prompt_tokens、
+            completion_tokens 和 total_tokens 三个非负整数。
+        """
         if self._client is None:
             raise RuntimeError("OpenAICompatibleClient 必须在 async with 中使用")
         payload: dict[str, Any] = {
@@ -115,7 +121,8 @@ class OpenAICompatibleClient:
         attempt = 0
         while True:
             try:
-                return await self._request_once(payload)
+                response_payload = await self._request_once(payload)
+                return response_payload, self._normalized_usage(response_payload)
             except LLMError as error:
                 retryable = self._is_retryable(error)
                 if not retryable or attempt >= self.max_retries:
@@ -123,6 +130,25 @@ class OpenAICompatibleClient:
                 delay = self._retry_delay(attempt, error)
                 attempt += 1
                 await asyncio.sleep(delay)
+
+    @staticmethod
+    def _normalized_usage(payload: dict[str, Any]) -> dict[str, int]:
+        """从兼容接口响应中提取稳定的 token 用量结构。"""
+        raw_usage = payload.get("usage")
+        if not isinstance(raw_usage, dict):
+            raw_usage = {}
+
+        def token_count(key: str) -> int:
+            value = raw_usage.get(key, 0)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                return 0
+            return value
+
+        return {
+            "prompt_tokens": token_count("prompt_tokens"),
+            "completion_tokens": token_count("completion_tokens"),
+            "total_tokens": token_count("total_tokens"),
+        }
 
     async def _request_once(self, payload: dict[str, Any]) -> dict[str, Any]:
         assert self._client is not None

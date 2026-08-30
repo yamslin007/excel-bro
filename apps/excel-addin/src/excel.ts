@@ -2,9 +2,11 @@ import type {
   AnalysisPlan,
   ActionExecutionResult,
   CellValue,
+  DataToolRequest,
   ExecutionUndoSnapshot,
   ExcelAction,
   PlanExecutionResult,
+  UndoRangeFormat,
   UndoWorksheetSnapshot,
   VerificationCheck,
   VerificationCriterion,
@@ -26,7 +28,12 @@ import {
   normalizeCellValue
 } from "./cellNormalization";
 import { assertSafeFormula, assertSafeHyperlink } from "./formulaSafety";
-import { resolveFilteredRowIndices } from "./dataTools";
+import {
+  resolveFilteredRowIndices,
+  createQueryTableAccumulator,
+  readSheetIntoAccumulator,
+  DataToolExecutionError
+} from "./dataTools";
 
 const DATA_ROW_LIMIT = capabilities.snapshot.dataRows;
 const DATA_COLUMN_LIMIT = capabilities.snapshot.dataColumns;
@@ -39,6 +46,9 @@ const FINGERPRINT_CHUNK_CELLS =
   capabilities.queryTable.chunkRows * capabilities.queryTable.maxColumns;
 const SPLIT_AGGREGATE_BATCH_SHEETS =
   capabilities.excelExecution.splitAggregateBatchSheets;
+// 超过此规模的区域跳过完整格式捕获：逐格读边框会让整表操作的执行耗时显著上升。
+const UNDO_FORMAT_CAPTURE_MAX_CELLS =
+  capabilities.undo.formatCaptureMaxCells;
 // EB 规则系统早期把规则存进这两张隐藏工作表（见 README「EB 函数」）。
 // 现已改为纯内置规则，代码不再读写它们，但用户的旧文件里可能残留。
 // 用精确名单过滤，避免误伤用户自己以 # 开头命名的正常表。
@@ -219,6 +229,25 @@ export class PlanExecutionError extends Error {
   }
 }
 
+/**
+ * 计划里含烘焙矩阵、且预览之后源数据变了。
+ *
+ * 这不是硬错误 —— 计划本身依然可执行，只是其中的固定值来自旧数据。所以单独
+ * 分一个错误类型，让 UI 能出「仍要执行」的二次确认，而不是像字段缺失那样
+ * 直接堵死。
+ */
+export class StaleSourceError extends PlanExecutionError {
+  constructor(
+    message: string,
+    actionResults: ActionExecutionResult[],
+    /** 计划里携带烘焙矩阵的动作数量，用于文案里说清影响范围。 */
+    public readonly bakedActionCount: number
+  ) {
+    super(message, actionResults);
+    this.name = "StaleSourceError";
+  }
+}
+
 export interface PlanPreflightIssue {
   index: number;
   message: string;
@@ -286,6 +315,16 @@ function requiredToolFieldsBySheet(
         ...action.metrics.map((metric) => metric.field)
       ]);
     }
+    if (action.type === "computeValues") {
+      add(action.sourceSheet, [
+        ...(action.query.fields ?? []),
+        ...(action.query.groupBy ?? []),
+        ...(action.query.filters ?? []).map((filter) => filter.field),
+        ...(action.query.metrics ?? []).map((metric) => metric.field),
+        action.query.profileField,
+        action.query.sortBy
+      ]);
+    }
     if (action.type === "createPivotTable") {
       add(action.sourceSheet, [
         ...action.rowFields,
@@ -346,8 +385,71 @@ export function toolSchemaFingerprintForSnapshot(
     .padStart(8, "0")}`;
 }
 
-function isToolSchemaFingerprint(value: string): boolean {
+export function isToolSchemaFingerprint(value: string): boolean {
   return value.startsWith(TOOL_SCHEMA_FINGERPRINT_PREFIX);
+}
+
+/**
+ * 直接体检：计划点名的来源工作表、以及执行时求值动作引用的字段，现在还在不在。
+ *
+ * 为什么不复用 schema 指纹比对：指纹只能拿「计划生成时存下的那串哈希」当基线，
+ * 而 live 计划存的往往是值指纹（旧规则），没有 schema 基线可比。拿现算的哈希跟
+ * 自己比是恒等式，什么都挡不住 —— 所以这里改成逐项查在不在，并把缺了什么直接
+ * 报出来。
+ */
+export function missingSchemaRequirements(
+  plan: AnalysisPlan,
+  snapshot: Pick<WorkbookSnapshot, "worksheets">
+): string[] {
+  const requiredBySheet = requiredToolFieldsBySheet(plan);
+  const available = new Map(
+    snapshot.worksheets.map((sheet) => [
+      normalizeSchemaName(sheet.name),
+      new Set(
+        sheet.headers
+          .map((header) => normalizeSchemaName(String(header ?? "")))
+          .filter(Boolean)
+      )
+    ])
+  );
+  const missing: string[] = [];
+  for (const name of new Set(plan.sourceFingerprintSheets ?? [])) {
+    const key = normalizeSchemaName(name);
+    const headers = available.get(key);
+    if (!headers) {
+      missing.push(`工作表「${name}」`);
+      continue;
+    }
+    for (const field of requiredBySheet.get(key) ?? []) {
+      if (!headers.has(field)) missing.push(`「${name}」的字段「${field}」`);
+    }
+  }
+  return missing;
+}
+
+/**
+ * 烘焙动作：动作体里携带「从源数据算出来的」矩阵。源数据一变，这些矩阵就是
+ * 过期结果，照原样执行会把旧数字写进表里。
+ *
+ * writeFormulas 不在此列 —— 公式引用的是单元格，Excel 自己会重算。
+ * filterRange.values / setDataValidation.values 是用户点名的取值而非算出的
+ * 结果，同样不算烘焙。
+ */
+const BAKED_ACTION_TYPES = new Set<ExcelAction["type"]>([
+  "writeValues",
+  "writeTable"
+]);
+
+export type PlanLiveness = "live" | "mixed";
+
+/**
+ * live = 所有写入都在执行那一刻求值，源数据改了照样成立；
+ * mixed = 至少有一处烘焙矩阵，源数据改了这部分结果就过期。
+ */
+export function planLiveness(plan: AnalysisPlan): PlanLiveness {
+  return plan.actions.some((action) => BAKED_ACTION_TYPES.has(action.type))
+    ? "mixed"
+    : "live";
 }
 
 function updateFingerprint(seed: number, text: string): number {
@@ -1194,6 +1296,9 @@ export function verificationGaps(
         );
         break;
       case "splitGroupAggregate":
+        verified = dynamicCriteria.length > 0;
+        break;
+      case "computeValues":
         verified = dynamicCriteria.length > 0;
         break;
       case "sortRange":
@@ -2393,6 +2498,36 @@ export function preflightPlanActions(
       });
       return;
     }
+    if (action.type === "computeValues") {
+      if (!hasSheet(action.sourceSheet)) {
+        issues.push({
+          index,
+          message: `未找到计算源工作表「${action.sourceSheet}」`
+        });
+        return;
+      }
+      const destination = explicitA1RangeShape(action.destinationCell);
+      if (!destination || destination.rows !== 1 || destination.columns !== 1) {
+        issues.push({
+          index,
+          message: `计算结果的起始单元格「${action.destinationCell}」必须是单个单元格`
+        });
+        return;
+      }
+      const referenced = [
+        ...action.query.fields ?? [],
+        ...action.query.groupBy ?? [],
+        ...(action.query.filters ?? []).map((filter) => filter.field),
+        ...(action.query.metrics ?? []).map((metric) => metric.field)
+      ];
+      if (referenced.some((field) => !String(field ?? "").trim())) {
+        issues.push({
+          index,
+          message: "计算动作引用了空字段名"
+        });
+        return;
+      }
+    }
 
     for (const { label, address } of actionRangeAddresses(action)) {
       if (
@@ -2548,7 +2683,8 @@ export async function executeAction(
   action: ExcelAction,
   actionIndex: number,
   collector: ActionUndoCollector,
-  allowedExternalFiles?: ReadonlySet<string>
+  allowedExternalFiles?: ReadonlySet<string>,
+  signal?: AbortSignal
 ): Promise<VerificationCriterion[] | void> {
   if (action.type === "deleteWorksheet") {
     const existing = context.workbook.worksheets.getItemOrNullObject(action.sheet);
@@ -2823,6 +2959,122 @@ export async function executeAction(
       }
     }
     return criteria;
+  }
+
+  if (action.type === "computeValues") {
+    const worksheets = context.workbook.worksheets;
+    const sourceSheet = worksheets.getItemOrNullObject(action.sourceSheet);
+    sourceSheet.load("isNullObject,name");
+    try {
+      await context.sync();
+    } catch (reason) {
+      throw new Error(`定位源工作表失败：${excelErrorDetail(reason)}`);
+    }
+    if (sourceSheet.isNullObject) {
+      throw new Error(`未找到源工作表「${action.sourceSheet}」`);
+    }
+
+    const sourceRange = action.sourceRange
+      ? sourceSheet.getRange(action.sourceRange)
+      : sourceSheet.getUsedRangeOrNullObject(true);
+    sourceRange.load("isNullObject,rowCount,columnCount,rowIndex,columnIndex");
+    try {
+      await context.sync();
+    } catch (reason) {
+      throw new Error(`读取源数据范围失败：${excelErrorDetail(reason)}`);
+    }
+    if (sourceRange.isNullObject) {
+      throw new Error(`源工作表「${action.sourceSheet}」没有可读取的数据`);
+    }
+
+    const request: DataToolRequest = {
+      id: "computeValues",
+      tool: "query_table",
+      arguments: action.query
+    };
+    const accumulator = createQueryTableAccumulator(request);
+    try {
+      await readSheetIntoAccumulator(
+        context,
+        {
+          name: action.sourceSheet,
+          worksheet: sourceSheet,
+          rowIndex: sourceRange.rowIndex,
+          columnIndex: sourceRange.columnIndex,
+          rowCount: sourceRange.rowCount,
+          columnCount: sourceRange.columnCount
+        },
+        accumulator,
+        {
+          queryArguments: action.query,
+          headerMode: action.hasHeaders ? "detect" : "synthesize"
+        }
+      );
+    } catch (reason) {
+      if (reason instanceof DataToolExecutionError) throw reason;
+      throw new Error(`计算数据失败：${excelErrorDetail(reason)}`);
+    }
+
+    const result = accumulator.finish();
+    const outputRows: typeof result.rows = action.includeHeaders
+      ? [result.headers as typeof result.rows[number], ...result.rows]
+      : result.rows;
+
+    if (outputRows.length === 0) {
+      return [{ type: "worksheetExists", sheet: action.sheet }];
+    }
+
+    // 检查目标工作表是否已存在（决定撤销行为）。
+    const existingDestSheet = worksheets.getItemOrNullObject(action.sheet);
+    existingDestSheet.load("isNullObject");
+    await context.sync();
+    const destSheet = existingDestSheet.isNullObject
+      ? worksheets.add(action.sheet)
+      : existingDestSheet;
+    if (existingDestSheet.isNullObject) {
+      collector.createdWorksheets.push(action.sheet);
+    }
+
+    const destStart = destSheet.getRange(action.destinationCell);
+    const destRange = destStart.getResizedRange(
+      outputRows.length - 1,
+      (outputRows[0]?.length ?? 1) - 1
+    );
+    // 输出形状要算完才知道，所以撤销快照不能走 recoverableActionRange（那里
+    // 只认动作体里写死的 range），必须在这里、写入之前手动拍一张。
+    if (!existingDestSheet.isNullObject) {
+      destRange.load(
+        "address,formulas,numberFormat,format/fill/color,format/font/bold,format/font/color"
+      );
+      try {
+        await context.sync();
+        collector.overwrittenRanges.push({
+          actionIndex,
+          sheet: action.sheet,
+          range: destRange.address.split("!").pop() ?? destRange.address,
+          formulas: destRange.formulas.map((row) => row.map(normalizeValue)),
+          numberFormat: destRange.numberFormat,
+          fillColor: destRange.format.fill.color,
+          fontBold: destRange.format.font.bold,
+          fontColor: destRange.format.font.color
+        });
+      } catch {
+        // 拍照失败不阻塞写入，只是这一步失去撤销能力。
+      }
+    }
+    destRange.values = outputRows;
+    if (action.includeHeaders && result.headers.length > 0) {
+      const headerRange = destStart.getResizedRange(0, result.headers.length - 1);
+      headerRange.format.font.bold = true;
+      headerRange.format.fill.color = "#DFF3E4";
+    }
+    destRange.format.autofitColumns();
+    try {
+      await context.sync();
+    } catch (reason) {
+      throw new Error(`写入计算结果失败：${excelErrorDetail(reason)}`);
+    }
+    return [{ type: "worksheetExists", sheet: action.sheet }];
   }
 
   const sheet = await getOrCreateWorksheet(context, action.sheet);
@@ -3298,6 +3550,11 @@ function recoverableActionRange(action: ExcelAction): string | null {
     case "writeFormulas":
     case "setFill":
     case "setFont":
+    // 以下动作只改格式，但格式现在也会被捕获与恢复。
+    case "setBorders":
+    case "setAlignment":
+    case "setNumberFormat":
+    case "resizeRange":
       return action.range;
     case "clearRange":
       return action.applyTo === "contents" ? action.range : null;
@@ -3310,6 +3567,60 @@ function recoverableActionRange(action: ExcelAction): string | null {
     default:
       return null;
   }
+}
+
+// Excel.BorderIndex 是运行时枚举，模块加载期取值会在非 Excel 环境（测试、
+// 文件夹模式）里抛 ReferenceError，因此推迟到实际捕获格式时才求值。
+function undoBorderSides(): Excel.BorderIndex[] {
+  return [
+    Excel.BorderIndex.edgeTop,
+    Excel.BorderIndex.edgeBottom,
+    Excel.BorderIndex.edgeLeft,
+    Excel.BorderIndex.edgeRight,
+    Excel.BorderIndex.insideHorizontal,
+    Excel.BorderIndex.insideVertical
+  ];
+}
+
+/**
+ * 捕获超出常用格式之外的属性。区域过大时返回 null，撤销退化为只恢复
+ * 值/公式/数字格式/填充色/加粗/字色。
+ */
+async function captureRangeFormat(
+  context: Excel.RequestContext,
+  range: Excel.Range,
+  cellCount: number
+): Promise<UndoRangeFormat | null> {
+  if (cellCount > UNDO_FORMAT_CAPTURE_MAX_CELLS) return null;
+  const format = range.format;
+  format.load(
+    "horizontalAlignment,verticalAlignment,wrapText,rowHeight,columnWidth,indentLevel"
+  );
+  format.font.load("name,size,italic,underline");
+  const borders = undoBorderSides().map((sideIndex) => {
+    const border = format.borders.getItem(sideIndex);
+    border.load("style,color,weight");
+    return { sideIndex, border };
+  });
+  await context.sync();
+  return {
+    horizontalAlignment: String(format.horizontalAlignment),
+    verticalAlignment: String(format.verticalAlignment),
+    wrapText: format.wrapText,
+    rowHeight: format.rowHeight,
+    columnWidth: format.columnWidth,
+    indentLevel: format.indentLevel,
+    fontName: format.font.name,
+    fontSize: format.font.size,
+    fontItalic: format.font.italic,
+    fontUnderline: String(format.font.underline),
+    borders: borders.map(({ sideIndex, border }) => ({
+      sideIndex,
+      style: String(border.style),
+      color: border.color,
+      weight: String(border.weight)
+    }))
+  };
 }
 
 async function captureUndoRange(
@@ -3328,6 +3639,8 @@ async function captureUndoRange(
     "formulas,numberFormat,format/fill/color,format/font/bold,format/font/color"
   );
   await context.sync();
+  const cellCount = range.formulas.length * (range.formulas[0]?.length ?? 0);
+  const format = await captureRangeFormat(context, range, cellCount);
   return {
     actionIndex,
     sheet: action.sheet,
@@ -3336,7 +3649,8 @@ async function captureUndoRange(
     numberFormat: range.numberFormat,
     fillColor: range.format.fill.color,
     fontBold: range.format.font.bold,
-    fontColor: range.format.font.color
+    fontColor: range.format.font.color,
+    format
   };
 }
 
@@ -3383,6 +3697,33 @@ async function captureDeletedWorksheet(
   };
 }
 
+/** 恢复完整格式；捕获时因区域过大而降级的（null）直接跳过。 */
+function restoreRangeFormat(
+  range: Excel.Range,
+  saved: UndoRangeFormat | null | undefined
+): void {
+  if (!saved) return;
+  const format = range.format;
+  format.horizontalAlignment =
+    saved.horizontalAlignment as Excel.HorizontalAlignment;
+  format.verticalAlignment =
+    saved.verticalAlignment as Excel.VerticalAlignment;
+  if (saved.wrapText !== null) format.wrapText = saved.wrapText;
+  format.rowHeight = saved.rowHeight;
+  format.columnWidth = saved.columnWidth;
+  format.indentLevel = saved.indentLevel;
+  format.font.name = saved.fontName;
+  format.font.size = saved.fontSize;
+  format.font.italic = saved.fontItalic;
+  format.font.underline = saved.fontUnderline as Excel.RangeUnderlineStyle;
+  for (const border of saved.borders) {
+    const target = format.borders.getItem(border.sideIndex);
+    target.style = border.style as Excel.BorderLineStyle;
+    target.color = border.color;
+    target.weight = border.weight as Excel.BorderWeight;
+  }
+}
+
 export async function undoExecution(
   snapshot: ExecutionUndoSnapshot
 ): Promise<void> {
@@ -3412,6 +3753,7 @@ export async function undoExecution(
       range.format.fill.color = saved.fillColor;
       range.format.font.bold = saved.fontBold;
       range.format.font.color = saved.fontColor;
+      restoreRangeFormat(range, saved.format);
     }
     // 最后移除本次执行新建的工作表。
     for (const name of snapshot.createdWorksheets) {
@@ -3427,6 +3769,13 @@ export async function undoExecution(
 export interface ExecutePlanOptions {
   /** 本次会话已勾选的外部工作簿文件名集合，用于放行跨文件公式引用。 */
   allowedExternalFiles?: ReadonlySet<string>;
+  /**
+   * 当计划含烘焙矩阵且源数据已变时，UI 二次确认后带上此标志重试。
+   * 不带此标志时，数据已变的 mixed 计划会抛 StaleSourceError 而非直接执行。
+   */
+  acknowledgeStaleSource?: boolean;
+  /** 取消信号，透传给沙箱脚本执行。 */
+  signal?: AbortSignal;
 }
 
 export async function executePlan(
@@ -3434,19 +3783,47 @@ export async function executePlan(
   options: ExecutePlanOptions = {}
 ): Promise<PlanExecutionResult> {
   if (plan.sourceFingerprint && plan.sourceFingerprintSheets?.length) {
-    const current = isToolSchemaFingerprint(plan.sourceFingerprint)
-      ? toolSchemaFingerprintForSnapshot(
-          plan,
-          await captureWorkbookStructure(plan.sourceFingerprintSheets)
-        )
-      : await captureWorkbookSourceFingerprint(plan.sourceFingerprintSheets);
-    if (current !== plan.sourceFingerprint) {
-      throw new PlanExecutionError(
-        isToolSchemaFingerprint(plan.sourceFingerprint)
-          ? "工具所需的来源工作表或字段已发生变化，请重新选择后再执行"
-          : "预览后数据来源已发生变化，请重新生成预览后再执行",
-        incompleteActionResults(plan, new Map())
+    if (isToolSchemaFingerprint(plan.sourceFingerprint)) {
+      // 固化工具：基线本身就是 schema 指纹，照原样比。
+      const current = toolSchemaFingerprintForSnapshot(
+        plan,
+        await captureWorkbookStructure(plan.sourceFingerprintSheets)
       );
+      if (current !== plan.sourceFingerprint) {
+        throw new PlanExecutionError(
+          "工具所需的来源工作表或字段已发生变化，请重新选择后再执行",
+          incompleteActionResults(plan, new Map())
+        );
+      }
+    } else if (planLiveness(plan) === "live") {
+      // 写入全在执行时求值：源数据变了正是它该重算的场景，只要表和字段还在
+      // 就放行。
+      const missing = missingSchemaRequirements(
+        plan,
+        await captureWorkbookStructure(plan.sourceFingerprintSheets)
+      );
+      if (missing.length > 0) {
+        throw new PlanExecutionError(
+          `计划所需的来源已发生变化，缺少：${missing.join("、")}，请重新选择后再执行`,
+          incompleteActionResults(plan, new Map())
+        );
+      }
+    } else {
+      // 含烘焙矩阵：这些值是预览时算出来的，源数据一变就过期。不直接堵死，
+      // 交给用户判断是重新生成预览还是坚持写入旧结果。
+      const current = await captureWorkbookSourceFingerprint(
+        plan.sourceFingerprintSheets
+      );
+      if (current !== plan.sourceFingerprint && !options.acknowledgeStaleSource) {
+        const bakedActionCount = plan.actions.filter((action) =>
+          BAKED_ACTION_TYPES.has(action.type)
+        ).length;
+        throw new StaleSourceError(
+          `数据来源在预览后发生了变化，这份计划里有 ${bakedActionCount} 处写入的是预览时算出的固定值，执行会写入旧结果。建议重新生成预览；也可以坚持执行。`,
+          incompleteActionResults(plan, new Map()),
+          bakedActionCount
+        );
+      }
     }
   }
   return Excel.run(async (context) => {
@@ -3539,7 +3916,8 @@ export async function executePlan(
           action,
           index,
           actionUndo,
-          options.allowedExternalFiles
+          options.allowedExternalFiles,
+          options.signal
         );
         if (actionCriteria) dynamicCriteria.push(...actionCriteria);
         await context.sync();

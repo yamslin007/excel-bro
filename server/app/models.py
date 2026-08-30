@@ -475,6 +475,115 @@ class SplitGroupAggregateAction(BaseModel):
         return self
 
 
+class DataMetric(BaseModel):
+    operation: Literal[
+        "countRows",
+        "countDistinct",
+        "sum",
+        "average",
+        "min",
+        "max",
+    ]
+    field: str | None = Field(default=None, max_length=200)
+    outputName: str = Field(min_length=1, max_length=200)
+    ratioOutputName: str | None = Field(default=None, max_length=200)
+
+
+class DataCombine(BaseModel):
+    mode: Literal["union", "deduplicate", "join"] = "union"
+    deduplicateBy: list[str] = Field(default_factory=list, max_length=30)
+    leftSourceSheetId: str | None = Field(default=None, max_length=100)
+    rightSourceSheetId: str | None = Field(default=None, max_length=100)
+    leftKey: str | None = Field(default=None, max_length=200)
+    rightKey: str | None = Field(default=None, max_length=200)
+    joinHow: Literal["inner", "left", "right", "outer"] = "inner"
+
+    @model_validator(mode="after")
+    def validate_combine(self) -> "DataCombine":
+        if self.mode == "deduplicate" and not self.deduplicateBy:
+            raise ValueError("deduplicate 合并需要 deduplicateBy")
+        if self.mode == "join" and not all(
+            (
+                self.leftSourceSheetId,
+                self.rightSourceSheetId,
+                self.leftKey,
+                self.rightKey,
+            )
+        ):
+            raise ValueError("join 合并需要左右工作表 ID 和关联键")
+        return self
+
+
+class QueryTableArguments(BaseModel):
+    mode: Literal["rows", "aggregate", "profile"]
+    scope: Literal["selected", "active"] = "selected"
+    fields: list[str] = Field(default_factory=list, max_length=30)
+    filters: list[DataFilter] = Field(default_factory=list, max_length=20)
+    groupBy: list[str] = Field(default_factory=list, max_length=10)
+    metrics: list[DataMetric] = Field(default_factory=list, max_length=10)
+    combine: DataCombine | None = None
+    profileField: str | None = Field(default=None, max_length=200)
+    sortBy: str | None = Field(default=None, max_length=200)
+    sortDirection: Literal["asc", "desc"] = "desc"
+    limit: int = Field(default=20, ge=1, le=200)
+
+    @model_validator(mode="after")
+    def validate_mode_requirements(self) -> "QueryTableArguments":
+        if self.mode == "aggregate" and not self.metrics:
+            raise ValueError("aggregate 查询至少需要一个指标")
+        if self.mode == "profile" and not self.profileField:
+            raise ValueError("profile 查询需要 profileField")
+        for metric in self.metrics:
+            if metric.operation != "countRows" and not metric.field:
+                raise ValueError(f"{metric.operation} 指标需要 field")
+            if (
+                metric.ratioOutputName
+                and metric.operation not in ("countRows", "sum")
+            ):
+                raise ValueError("占比只支持 countRows 或 sum 指标")
+        return self
+
+
+class ComputeValuesAction(BaseModel):
+    """执行时求值的查询动作。
+
+    与 writeValues / writeTable 的根本区别：动作体里**只带查询配置，不带结果**。
+    结果由 Excel 端在执行那一刻读取源工作表的实时数据算出来，所以源数据改了之后
+    这份计划依然成立、并且会按新数据重算 —— 这正是它存在的理由。
+
+    因此输出的行数在生成计划时**无法确定**，绝不能给它自动补 rangeEquals 验收条件
+    （RangeEqualsCriterion 会校验 range 尺寸必须等于 expected 尺寸，见其
+    validate_matrix），只补 worksheetExists。参见
+    add_deterministic_acceptance_criteria 里的对应分支。
+    """
+
+    type: Literal["computeValues"]
+    sheet: SheetName
+    sourceSheet: SheetName
+    sourceRange: RangeAddress | None = None
+    hasHeaders: bool = True
+    query: QueryTableArguments
+    destinationCell: RangeAddress
+    includeHeaders: bool = True
+
+    @model_validator(mode="after")
+    def validate_configuration(self) -> "ComputeValuesAction":
+        if _range_dimensions(self.destinationCell) != (1, 1):
+            raise ValueError("computeValues.destinationCell 必须是单个单元格")
+        if self.query.combine is not None:
+            raise ValueError("computeValues 暂不支持多表合并，请改用文件夹模式")
+        referenced = [
+            *self.query.fields,
+            *self.query.groupBy,
+            *[filter_.field for filter_ in self.query.filters],
+            *[metric.field for metric in self.query.metrics if metric.field],
+        ]
+        if any(not str(field).strip() for field in referenced):
+            raise ValueError("computeValues 引用的字段名不能为空")
+        return self
+
+
+
 class AddNamedRangeAction(BaseModel):
     type: Literal["addNamedRange"]
     sheet: SheetName
@@ -544,6 +653,7 @@ ExcelAction = Annotated[
     | CreateChartAction
     | CreatePivotTableAction
     | SplitGroupAggregateAction
+    | ComputeValuesAction
     | AddNamedRangeAction
     | AddImageAction
     | AddShapeAction,
@@ -1161,6 +1271,13 @@ class AnalysisPlan(BaseModel):
                         columns=action.columns,
                     )
                 )
+            elif action.type in ("computeValues", "computeScript"):
+                # 故意只保留上面那条无条件补的 worksheetExists，不补任何值类条件。
+                # 这两个动作的结果都在执行那一刻才算出来，行数未知 —— 补
+                # rangeEquals 既填不出 range，也会被 RangeEqualsCriterion 的
+                # 「range 尺寸必须等于 expected 尺寸」校验直接拒掉。
+                # 运行时的验收由 Excel 端自建（见 excel.ts 的 splitGroupAggregate 做法）。
+                pass
             elif action.type == "createPivotTable":
                 add_criterion(
                     PivotTableExistsCriterion(
@@ -1185,11 +1302,14 @@ class AnalysisPlan(BaseModel):
             if warning not in self.warnings:
                 self.warnings = [*self.warnings[:19], warning]
         for action in self.actions:
-            if action.type != "splitGroupAggregate":
+            if action.type not in ("splitGroupAggregate", "computeValues"):
                 continue
             warning = (
                 f"将按「{action.splitBy}」创建多个结果工作表，"
                 f"同名工作表处理方式为 {action.existingSheetPolicy}。"
+            ) if action.type == "splitGroupAggregate" else (
+                f"计划将在执行时从「{action.sourceSheet}」读取实时数据进行计算，"
+                f"结果行数由实际数据决定，预览时未固定。"
             )
             if warning not in self.warnings:
                 self.warnings = [*self.warnings[:19], warning]
@@ -1357,75 +1477,6 @@ class IntentOption(BaseModel):
     description: str = Field(min_length=1, max_length=240)
     resolution: str = Field(min_length=1, max_length=500)
     action: Literal["resolve", "editScope"] = "resolve"
-
-
-class DataMetric(BaseModel):
-    operation: Literal[
-        "countRows",
-        "countDistinct",
-        "sum",
-        "average",
-        "min",
-        "max",
-    ]
-    field: str | None = Field(default=None, max_length=200)
-    outputName: str = Field(min_length=1, max_length=200)
-    ratioOutputName: str | None = Field(default=None, max_length=200)
-
-
-class DataCombine(BaseModel):
-    mode: Literal["union", "deduplicate", "join"] = "union"
-    deduplicateBy: list[str] = Field(default_factory=list, max_length=30)
-    leftSourceSheetId: str | None = Field(default=None, max_length=100)
-    rightSourceSheetId: str | None = Field(default=None, max_length=100)
-    leftKey: str | None = Field(default=None, max_length=200)
-    rightKey: str | None = Field(default=None, max_length=200)
-    joinHow: Literal["inner", "left", "right", "outer"] = "inner"
-
-    @model_validator(mode="after")
-    def validate_combine(self) -> "DataCombine":
-        if self.mode == "deduplicate" and not self.deduplicateBy:
-            raise ValueError("deduplicate 合并需要 deduplicateBy")
-        if self.mode == "join" and not all(
-            (
-                self.leftSourceSheetId,
-                self.rightSourceSheetId,
-                self.leftKey,
-                self.rightKey,
-            )
-        ):
-            raise ValueError("join 合并需要左右工作表 ID 和关联键")
-        return self
-
-
-class QueryTableArguments(BaseModel):
-    mode: Literal["rows", "aggregate", "profile"]
-    scope: Literal["selected", "active"] = "selected"
-    fields: list[str] = Field(default_factory=list, max_length=30)
-    filters: list[DataFilter] = Field(default_factory=list, max_length=20)
-    groupBy: list[str] = Field(default_factory=list, max_length=10)
-    metrics: list[DataMetric] = Field(default_factory=list, max_length=10)
-    combine: DataCombine | None = None
-    profileField: str | None = Field(default=None, max_length=200)
-    sortBy: str | None = Field(default=None, max_length=200)
-    sortDirection: Literal["asc", "desc"] = "desc"
-    limit: int = Field(default=20, ge=1, le=200)
-
-    @model_validator(mode="after")
-    def validate_mode_requirements(self) -> "QueryTableArguments":
-        if self.mode == "aggregate" and not self.metrics:
-            raise ValueError("aggregate 查询至少需要一个指标")
-        if self.mode == "profile" and not self.profileField:
-            raise ValueError("profile 查询需要 profileField")
-        for metric in self.metrics:
-            if metric.operation != "countRows" and not metric.field:
-                raise ValueError(f"{metric.operation} 指标需要 field")
-            if (
-                metric.ratioOutputName
-                and metric.operation not in ("countRows", "sum")
-            ):
-                raise ValueError("占比只支持 countRows 或 sum 指标")
-        return self
 
 
 class DataToolRequest(BaseModel):
@@ -1609,7 +1660,7 @@ class PlanResponse(BaseModel):
 class AnswerResponse(BaseModel):
     kind: Literal["answer"] = "answer"
     message: str = Field(min_length=1, max_length=4000)
-    provider: Literal["model", "local"]
+    provider: Literal["model", "local", "system"]
     resultContext: ResultContext | None = None
     turnId: TurnId | None = None
 

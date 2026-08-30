@@ -13,7 +13,8 @@ import {
   deleteTool,
   instantiateTool,
   saveQueryTool,
-  saveTool
+  saveTool,
+  updateToolPlanTemplate
 } from "./storage";
 
 const splitPlan: AnalysisPlan = {
@@ -320,6 +321,58 @@ describe("saved tools", () => {
       expect(
         JSON.parse(values.get("excel-bro.query-tools.v1") ?? "[]")
       ).toEqual([]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("recomputes parameters and approvals when the plan template is edited", () => {
+    const values = new Map<string, string>();
+    vi.stubGlobal("localStorage", {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, value),
+      removeItem: (key: string) => values.delete(key),
+      clear: () => values.clear(),
+      key: (index: number) => [...values.keys()][index] ?? null,
+      get length() {
+        return values.size;
+      }
+    });
+    try {
+      const tool = createTool(splitPlan, "拆分", "生成子表", ["旧数据"]);
+      saveTool(tool);
+      expect(tool.approvals).toEqual([]);
+
+      // 换成一份引用别的字段、且新增了固定内容写入的计划。
+      const edited: AnalysisPlan = {
+        ...splitPlan,
+        actions: [
+          {
+            ...splitPlan.actions[0],
+            splitBy: "场次",
+            groupBy: ["门店"]
+          } as AnalysisPlan["actions"][number],
+          {
+            type: "writeValues",
+            sheet: "汇总",
+            range: "A1",
+            values: [["固定值"]]
+          }
+        ]
+      };
+
+      const [updated] = updateToolPlanTemplate(tool.id, edited);
+
+      expect(updated.id).toBe(tool.id);
+      // 参数是从 planTemplate 反推的，换了计划必须跟着重算 —— 否则运行工具时
+      // 会拿旧参数去绑不存在的动作下标。
+      expect(
+        updated.parameters
+          .filter((parameter) => parameter.type === "field")
+          .map((parameter) => parameter.defaultValue)
+      ).toEqual(["场次", "门店"]);
+      // 新引入的 writeValues 是固定内容，必须重新要求审批。
+      expect(updated.approvals).toContain("fixedContent");
     } finally {
       vi.unstubAllGlobals();
     }

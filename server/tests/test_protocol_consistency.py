@@ -289,6 +289,26 @@ VALID_ACTION_SAMPLES = {
         "existingSheetPolicy": "rename",
         "maxOutputSheets": 50,
     },
+    "computeValues": {
+        "type": "computeValues",
+        "sheet": "结果",
+        "sourceSheet": "Sheet1",
+        "sourceRange": "A1:D100",
+        "hasHeaders": True,
+        "query": {
+            "mode": "aggregate",
+            "scope": "selected",
+            "groupBy": ["部门"],
+            "metrics": [
+                {"operation": "sum", "field": "金额", "outputName": "总金额"}
+            ],
+            "sortBy": "总金额",
+            "sortDirection": "desc",
+            "limit": 50,
+        },
+        "destinationCell": "A1",
+        "includeHeaders": True,
+    },
     "addNamedRange": {
         "type": "addNamedRange",
         "sheet": "Sheet1",
@@ -320,7 +340,9 @@ VALID_ACTION_SAMPLES = {
 
 
 @pytest.mark.parametrize("action_type", list(VALID_ACTION_SAMPLES.keys()))
-def test_backend_can_parse_frontend_action(action_type: str) -> None:
+def test_backend_can_parse_frontend_action(
+    action_type: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """验证后端 Pydantic 能正确解析前端发送的每种 ExcelAction 类型"""
     action_data = VALID_ACTION_SAMPLES[action_type]
 

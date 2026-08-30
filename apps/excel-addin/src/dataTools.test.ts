@@ -3,9 +3,11 @@ import {
   createQueryTableAccumulator,
   DataToolExecutionError,
   executeQueryTableData,
+  readSheetIntoAccumulator,
   resolveFilteredRowIndices
 } from "./dataTools";
-import type { DataToolRequest } from "./contracts";
+import type { CellValue, DataToolRequest } from "./contracts";
+import capabilities from "../../../config/capabilities.json";
 
 describe("executeQueryTableData", () => {
   it("detects a title row and aggregates complete selected-sheet data", () => {
@@ -388,5 +390,209 @@ describe("resolveFilteredRowIndices", () => {
       { field: "人员", operator: "equals", value: "阿里" }
     ]);
     expect(indices).toEqual([]);
+  });
+});
+
+describe("readSheetIntoAccumulator", () => {
+  const CHUNK_ROWS = capabilities.queryTable.chunkRows;
+
+  /**
+   * 造一张跨分块的表：表头 + N 行数据，前一半属于「甲」组、后一半属于「乙」组。
+   * 分界点故意落在第二块里，这样若后续块丢了表头（第一行数据被当成表头吞掉），
+   * 分组计数就会少算。
+   */
+  function makeSheet(dataRows: number): CellValue[][] {
+    const rows: CellValue[][] = [["人员", "得分"]];
+    for (let index = 0; index < dataRows; index += 1) {
+      rows.push([index < dataRows / 2 ? "甲" : "乙", 1]);
+    }
+    return rows;
+  }
+
+  /** 只实现 readSheetIntoAccumulator 用到的那点 Office.js 表面。 */
+  function fakeContext(sheet: CellValue[][]) {
+    const pendingLoads: { start: number; count: number; box: FakeRange }[] = [];
+    interface FakeRange {
+      values: CellValue[][];
+      text: string[][];
+      numberFormat: string[][];
+      load(properties: string): void;
+    }
+    const worksheet = {
+      getRangeByIndexes(
+        rowIndex: number,
+        _columnIndex: number,
+        rowCount: number
+      ) {
+        const box: FakeRange = {
+          values: [],
+          text: [],
+          numberFormat: [],
+          load() {
+            pendingLoads.push({ start: rowIndex, count: rowCount, box });
+          }
+        };
+        return box;
+      }
+    };
+    let syncCount = 0;
+    const context = {
+      sync: async () => {
+        syncCount += 1;
+        for (const { start, count, box } of pendingLoads.splice(0)) {
+          box.values = sheet.slice(start, start + count);
+          box.text = box.values.map((row) => row.map(() => ""));
+          box.numberFormat = box.values.map((row) => row.map(() => "General"));
+        }
+      }
+    };
+    return {
+      context: context as unknown as Excel.RequestContext,
+      worksheet: worksheet as unknown as Excel.Worksheet,
+      syncCount: () => syncCount
+    };
+  }
+
+  function countingRequest(): DataToolRequest {
+    return {
+      id: "cross-chunk",
+      tool: "query_table",
+      arguments: {
+        mode: "aggregate",
+        scope: "selected",
+        groupBy: ["人员"],
+        metrics: [{ operation: "countRows", outputName: "笔数" }],
+        limit: 10
+      }
+    };
+  }
+
+  it("re-injects the header so groups stay correct across chunks", async () => {
+    const dataRows = CHUNK_ROWS * 2 + 37;
+    const sheet = makeSheet(dataRows);
+    const fake = fakeContext(sheet);
+    const request = countingRequest();
+    const accumulator = createQueryTableAccumulator(request);
+
+    const rowsRead = await readSheetIntoAccumulator(
+      fake.context,
+      {
+        name: "数据",
+        worksheet: fake.worksheet,
+        rowIndex: 0,
+        columnIndex: 0,
+        rowCount: sheet.length,
+        columnCount: 2
+      },
+      accumulator,
+      { queryArguments: request.arguments }
+    );
+
+    expect(rowsRead).toBe(sheet.length);
+    // 三块（含表头共 10037 行 → 5000 + 5000 + 37），每块一次 sync。
+    expect(fake.syncCount()).toBe(3);
+
+    const result = accumulator.finish();
+    const total = result.rows.reduce(
+      (sum, row) => sum + Number(row[row.length - 1] ?? 0),
+      0
+    );
+    // 一行都不能丢：跨块时若表头没拼回去，后续块的首行会被吞掉。
+    expect(total).toBe(dataRows);
+    expect(result.rows).toHaveLength(2);
+    expect(result.scannedRows).toBe(dataRows);
+  });
+
+  it("reports an empty sheet without reading anything", async () => {
+    const fake = fakeContext([]);
+    const request = countingRequest();
+    const accumulator = createQueryTableAccumulator(request);
+
+    const rowsRead = await readSheetIntoAccumulator(
+      fake.context,
+      {
+        name: "空表",
+        worksheet: fake.worksheet,
+        rowIndex: 0,
+        columnIndex: 0,
+        rowCount: 0,
+        columnCount: 0
+      },
+      accumulator,
+      { queryArguments: request.arguments }
+    );
+
+    expect(rowsRead).toBe(0);
+    expect(fake.syncCount()).toBe(0);
+  });
+
+  it("aborts between chunks when the signal is already aborted", async () => {
+    const sheet = makeSheet(CHUNK_ROWS + 10);
+    const fake = fakeContext(sheet);
+    const request = countingRequest();
+    const accumulator = createQueryTableAccumulator(request);
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(
+      readSheetIntoAccumulator(
+        fake.context,
+        {
+          name: "数据",
+          worksheet: fake.worksheet,
+          rowIndex: 0,
+          columnIndex: 0,
+          rowCount: sheet.length,
+          columnCount: 2
+        },
+        accumulator,
+        { queryArguments: request.arguments, signal: controller.signal }
+      )
+    ).rejects.toThrow(DataToolExecutionError);
+    expect(fake.syncCount()).toBe(0);
+  });
+
+  it("synthesizes a header row when the source has none", async () => {
+    // 无表头数据：第一行就是真实数据，不能被当成表头吞掉。
+    const sheet: CellValue[][] = [
+      ["甲", 1],
+      ["甲", 1],
+      ["乙", 1]
+    ];
+    const fake = fakeContext(sheet);
+    const request: DataToolRequest = {
+      id: "no-header",
+      tool: "query_table",
+      arguments: {
+        mode: "aggregate",
+        scope: "selected",
+        groupBy: ["列1"],
+        metrics: [{ operation: "countRows", outputName: "笔数" }],
+        limit: 10
+      }
+    };
+    const accumulator = createQueryTableAccumulator(request);
+
+    await readSheetIntoAccumulator(
+      fake.context,
+      {
+        name: "无表头",
+        worksheet: fake.worksheet,
+        rowIndex: 0,
+        columnIndex: 0,
+        rowCount: sheet.length,
+        columnCount: 2
+      },
+      accumulator,
+      { queryArguments: request.arguments, headerMode: "synthesize" }
+    );
+
+    const result = accumulator.finish();
+    const total = result.rows.reduce(
+      (sum, row) => sum + Number(row[row.length - 1] ?? 0),
+      0
+    );
+    expect(total).toBe(3);
+    expect(result.rows).toHaveLength(2);
   });
 });

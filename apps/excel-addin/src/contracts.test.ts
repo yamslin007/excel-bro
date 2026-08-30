@@ -75,6 +75,16 @@ describe("assertAssistantResponse", () => {
     expect(() => assertAssistantResponse(response)).not.toThrow();
   });
 
+  it("accepts a system degradation answer", () => {
+    const response = {
+      kind: "answer",
+      provider: "system",
+      message: "规划达到预算上限，请简化需求后重试。"
+    };
+
+    expect(() => assertAssistantResponse(response)).not.toThrow();
+  });
+
   it("rejects an unknown action", () => {
     const response = {
       kind: "plan",

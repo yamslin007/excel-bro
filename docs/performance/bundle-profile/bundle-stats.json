@@ -1,0 +1,2989 @@
+{
+  "version": 2,
+  "tree": {
+    "name": "root",
+    "children": [
+      {
+        "name": "assets/commands-l0sNRNKZ.js",
+        "children": [
+          {
+            "name": "E:/codex/excel-bro/apps/excel-addin/commands.html",
+            "uid": "0bd3843f-1"
+          }
+        ]
+      },
+      {
+        "name": "assets/focus-B_sDg92A.js",
+        "children": [
+          {
+            "name": "E:/codex/excel-bro/apps/excel-addin",
+            "children": [
+              {
+                "name": "src",
+                "children": [
+                  {
+                    "uid": "0bd3843f-3",
+                    "name": "FocusWorkspace.tsx"
+                  },
+                  {
+                    "uid": "0bd3843f-5",
+                    "name": "focus.css"
+                  },
+                  {
+                    "uid": "0bd3843f-7",
+                    "name": "focus.tsx"
+                  }
+                ]
+              },
+              {
+                "uid": "0bd3843f-9",
+                "name": "focus.html"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "assets/functions-CTqYbpWc.js",
+        "children": [
+          {
+            "name": "E:/codex/excel-bro/apps/excel-addin/functions.html",
+            "uid": "0bd3843f-11"
+          }
+        ]
+      },
+      {
+        "name": "assets/taskpane-DMRQNRvo.js",
+        "children": [
+          {
+            "name": "E:/codex/excel-bro/apps/excel-addin",
+            "children": [
+              {
+                "name": "src",
+                "children": [
+                  {
+                    "uid": "0bd3843f-13",
+                    "name": "demo.ts"
+                  },
+                  {
+                    "uid": "0bd3843f-15",
+                    "name": "deterministicTools.ts"
+                  },
+                  {
+                    "uid": "0bd3843f-17",
+                    "name": "toolDsl.ts"
+                  },
+                  {
+                    "uid": "0bd3843f-19",
+                    "name": "imageAttachments.ts"
+                  },
+                  {
+                    "uid": "0bd3843f-21",
+                    "name": "crossTableFormula.ts"
+                  },
+                  {
+                    "name": "sandbox/workerProbe.ts",
+                    "uid": "0bd3843f-23"
+                  },
+                  {
+                    "uid": "0bd3843f-25",
+                    "name": "petTips.ts"
+                  },
+                  {
+                    "uid": "0bd3843f-27",
+                    "name": "PetCompanion.tsx"
+                  },
+                  {
+                    "uid": "0bd3843f-29",
+                    "name": "RuleManager.tsx"
+                  },
+                  {
+                    "uid": "0bd3843f-31",
+                    "name": "SlashCommandAutocomplete.tsx"
+                  },
+                  {
+                    "name": "components/ThemePanel.tsx",
+                    "uid": "0bd3843f-33"
+                  },
+                  {
+                    "uid": "0bd3843f-35",
+                    "name": "helpCommand.ts"
+                  },
+                  {
+                    "name": "hooks",
+                    "children": [
+                      {
+                        "uid": "0bd3843f-37",
+                        "name": "useActivityProgress.ts"
+                      },
+                      {
+                        "uid": "0bd3843f-41",
+                        "name": "useConversation.ts"
+                      },
+                      {
+                        "uid": "0bd3843f-45",
+                        "name": "useCopyFeedback.ts"
+                      },
+                      {
+                        "uid": "0bd3843f-47",
+                        "name": "useExecutionApproval.ts"
+                      },
+                      {
+                        "uid": "0bd3843f-51",
+                        "name": "useModelManagement.ts"
+                      },
+                      {
+                        "uid": "0bd3843f-53",
+                        "name": "useServiceHealth.ts"
+                      },
+                      {
+                        "uid": "0bd3843f-55",
+                        "name": "useToolManagement.ts"
+                      },
+                      {
+                        "uid": "0bd3843f-57",
+                        "name": "useUIState.ts"
+                      },
+                      {
+                        "uid": "0bd3843f-59",
+                        "name": "useScopeSelection.ts"
+                      },
+                      {
+                        "uid": "0bd3843f-61",
+                        "name": "useUndoSnapshot.ts"
+                      },
+                      {
+                        "uid": "0bd3843f-63",
+                        "name": "useLongPress.ts"
+                      }
+                    ]
+                  },
+                  {
+                    "uid": "0bd3843f-39",
+                    "name": "conversation.ts"
+                  },
+                  {
+                    "uid": "0bd3843f-43",
+                    "name": "utils.ts"
+                  },
+                  {
+                    "uid": "0bd3843f-49",
+                    "name": "modelSelection.ts"
+                  },
+                  {
+                    "uid": "0bd3843f-65",
+                    "name": "App.tsx"
+                  },
+                  {
+                    "uid": "0bd3843f-67",
+                    "name": "main.tsx"
+                  }
+                ]
+              },
+              {
+                "uid": "0bd3843f-69",
+                "name": "index.html"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "assets/focusState-B0WnU0Z0.js",
+        "children": [
+          {
+            "name": "E:/codex/excel-bro/apps/excel-addin/src/focusState.ts",
+            "uid": "0bd3843f-71"
+          }
+        ]
+      },
+      {
+        "name": "assets/functions-T_tY4VyS.js",
+        "children": [
+          {
+            "name": "E:/codex/excel-bro/apps/excel-addin/src",
+            "children": [
+              {
+                "uid": "0bd3843f-73",
+                "name": "ebRules.ts"
+              },
+              {
+                "uid": "0bd3843f-75",
+                "name": "ebStorage.ts"
+              },
+              {
+                "name": "functions/functions.ts",
+                "uid": "0bd3843f-77"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "assets/planEditor-CHdDRyzC.js",
+        "children": [
+          {
+            "name": "E:/codex/excel-bro/apps/excel-addin",
+            "children": [
+              {
+                "name": "src",
+                "children": [
+                  {
+                    "name": "components",
+                    "children": [
+                      {
+                        "uid": "0bd3843f-79",
+                        "name": "JsonCodeEditor.tsx"
+                      },
+                      {
+                        "uid": "0bd3843f-81",
+                        "name": "PlanEditorDialog.tsx"
+                      }
+                    ]
+                  },
+                  {
+                    "uid": "0bd3843f-83",
+                    "name": "plan-editor-entry.tsx"
+                  }
+                ]
+              },
+              {
+                "uid": "0bd3843f-85",
+                "name": "plan-editor.html"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "assets/useTheme-7rHUCDM0.js",
+        "children": [
+          {
+            "name": "E:/codex/excel-bro",
+            "children": [
+              {
+                "name": "apps/excel-addin/src",
+                "children": [
+                  {
+                    "uid": "0bd3843f-87",
+                    "name": "contracts.ts"
+                  },
+                  {
+                    "uid": "0bd3843f-89",
+                    "name": "diagnostics.ts"
+                  },
+                  {
+                    "uid": "0bd3843f-91",
+                    "name": "api.ts"
+                  },
+                  {
+                    "uid": "0bd3843f-95",
+                    "name": "tableSchema.ts"
+                  },
+                  {
+                    "uid": "0bd3843f-97",
+                    "name": "splitAggregate.ts"
+                  },
+                  {
+                    "uid": "0bd3843f-99",
+                    "name": "workbookIdentity.ts"
+                  },
+                  {
+                    "uid": "0bd3843f-101",
+                    "name": "cellNormalization.ts"
+                  },
+                  {
+                    "uid": "0bd3843f-103",
+                    "name": "formulaSafety.ts"
+                  },
+                  {
+                    "name": "sandbox",
+                    "children": [
+                      {
+                        "uid": "0bd3843f-105",
+                        "name": "sandboxSafety.ts"
+                      },
+                      {
+                        "uid": "0bd3843f-107",
+                        "name": "protocol.ts"
+                      },
+                      {
+                        "uid": "0bd3843f-109",
+                        "name": "runComputeScript.ts"
+                      }
+                    ]
+                  },
+                  {
+                    "uid": "0bd3843f-111",
+                    "name": "dataTools.ts"
+                  },
+                  {
+                    "uid": "0bd3843f-113",
+                    "name": "excel.ts"
+                  },
+                  {
+                    "uid": "0bd3843f-115",
+                    "name": "storage.ts"
+                  },
+                  {
+                    "name": "utils",
+                    "children": [
+                      {
+                        "uid": "0bd3843f-117",
+                        "name": "imageStorage.ts"
+                      },
+                      {
+                        "uid": "0bd3843f-119",
+                        "name": "imageProcessing.ts"
+                      }
+                    ]
+                  },
+                  {
+                    "name": "hooks/useTheme.ts",
+                    "uid": "0bd3843f-121"
+                  }
+                ]
+              },
+              {
+                "name": "config/capabilities.json",
+                "uid": "0bd3843f-93"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "assets/styles-DEyUvZMw.js",
+        "children": [
+          {
+            "uid": "0bd3843f-123",
+            "name": "\u0000commonjsHelpers.js"
+          },
+          {
+            "name": "\u0000E:/codex/excel-bro/node_modules",
+            "children": [
+              {
+                "name": "react",
+                "children": [
+                  {
+                    "uid": "0bd3843f-125",
+                    "name": "jsx-runtime.js?commonjs-module"
+                  },
+                  {
+                    "name": "cjs",
+                    "children": [
+                      {
+                        "uid": "0bd3843f-127",
+                        "name": "react-jsx-runtime.production.js?commonjs-exports"
+                      },
+                      {
+                        "uid": "0bd3843f-137",
+                        "name": "react.production.js?commonjs-exports"
+                      }
+                    ]
+                  },
+                  {
+                    "uid": "0bd3843f-133",
+                    "name": "jsx-runtime.js?commonjs-es-import"
+                  },
+                  {
+                    "uid": "0bd3843f-135",
+                    "name": "index.js?commonjs-module"
+                  },
+                  {
+                    "uid": "0bd3843f-143",
+                    "name": "index.js?commonjs-es-import"
+                  }
+                ]
+              },
+              {
+                "name": "react-dom",
+                "children": [
+                  {
+                    "uid": "0bd3843f-145",
+                    "name": "client.js?commonjs-module"
+                  },
+                  {
+                    "name": "cjs",
+                    "children": [
+                      {
+                        "uid": "0bd3843f-147",
+                        "name": "react-dom-client.production.js?commonjs-exports"
+                      },
+                      {
+                        "uid": "0bd3843f-159",
+                        "name": "react-dom.production.js?commonjs-exports"
+                      }
+                    ]
+                  },
+                  {
+                    "uid": "0bd3843f-157",
+                    "name": "index.js?commonjs-module"
+                  },
+                  {
+                    "uid": "0bd3843f-169",
+                    "name": "client.js?commonjs-es-import"
+                  }
+                ]
+              },
+              {
+                "name": "scheduler",
+                "children": [
+                  {
+                    "uid": "0bd3843f-149",
+                    "name": "index.js?commonjs-module"
+                  },
+                  {
+                    "name": "cjs/scheduler.production.js?commonjs-exports",
+                    "uid": "0bd3843f-151"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "name": "E:/codex/excel-bro",
+            "children": [
+              {
+                "name": "node_modules",
+                "children": [
+                  {
+                    "name": "react",
+                    "children": [
+                      {
+                        "name": "cjs",
+                        "children": [
+                          {
+                            "uid": "0bd3843f-129",
+                            "name": "react-jsx-runtime.production.js"
+                          },
+                          {
+                            "uid": "0bd3843f-139",
+                            "name": "react.production.js"
+                          }
+                        ]
+                      },
+                      {
+                        "uid": "0bd3843f-131",
+                        "name": "jsx-runtime.js"
+                      },
+                      {
+                        "uid": "0bd3843f-141",
+                        "name": "index.js"
+                      }
+                    ]
+                  },
+                  {
+                    "name": "scheduler",
+                    "children": [
+                      {
+                        "name": "cjs/scheduler.production.js",
+                        "uid": "0bd3843f-153"
+                      },
+                      {
+                        "uid": "0bd3843f-155",
+                        "name": "index.js"
+                      }
+                    ]
+                  },
+                  {
+                    "name": "react-dom",
+                    "children": [
+                      {
+                        "name": "cjs",
+                        "children": [
+                          {
+                            "uid": "0bd3843f-161",
+                            "name": "react-dom.production.js"
+                          },
+                          {
+                            "uid": "0bd3843f-165",
+                            "name": "react-dom-client.production.js"
+                          }
+                        ]
+                      },
+                      {
+                        "uid": "0bd3843f-163",
+                        "name": "index.js"
+                      },
+                      {
+                        "uid": "0bd3843f-167",
+                        "name": "client.js"
+                      }
+                    ]
+                  }
+                ]
+              },
+              {
+                "name": "apps/excel-addin/src/styles.css",
+                "uid": "0bd3843f-171"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "name": "assets/modulepreload-polyfill-B5Qt9EMX.js",
+        "children": [
+          {
+            "name": "\u0000vite/modulepreload-polyfill.js",
+            "uid": "0bd3843f-173"
+          }
+        ]
+      }
+    ],
+    "isRoot": true
+  },
+  "nodeParts": {
+    "0bd3843f-1": {
+      "renderedLength": 0,
+      "gzipLength": 0,
+      "brotliLength": 0,
+      "metaUid": "0bd3843f-0"
+    },
+    "0bd3843f-3": {
+      "renderedLength": 12070,
+      "gzipLength": 2367,
+      "brotliLength": 1905,
+      "metaUid": "0bd3843f-2"
+    },
+    "0bd3843f-5": {
+      "renderedLength": 0,
+      "gzipLength": 0,
+      "brotliLength": 0,
+      "metaUid": "0bd3843f-4"
+    },
+    "0bd3843f-7": {
+      "renderedLength": 194,
+      "gzipLength": 162,
+      "brotliLength": 127,
+      "metaUid": "0bd3843f-6"
+    },
+    "0bd3843f-9": {
+      "renderedLength": 0,
+      "gzipLength": 0,
+      "brotliLength": 0,
+      "metaUid": "0bd3843f-8"
+    },
+    "0bd3843f-11": {
+      "renderedLength": 0,
+      "gzipLength": 0,
+      "brotliLength": 0,
+      "metaUid": "0bd3843f-10"
+    },
+    "0bd3843f-13": {
+      "renderedLength": 949,
+      "gzipLength": 441,
+      "brotliLength": 359,
+      "metaUid": "0bd3843f-12"
+    },
+    "0bd3843f-15": {
+      "renderedLength": 1673,
+      "gzipLength": 762,
+      "brotliLength": 585,
+      "metaUid": "0bd3843f-14"
+    },
+    "0bd3843f-17": {
+      "renderedLength": 4464,
+      "gzipLength": 1734,
+      "brotliLength": 1458,
+      "metaUid": "0bd3843f-16"
+    },
+    "0bd3843f-19": {
+      "renderedLength": 2982,
+      "gzipLength": 1276,
+      "brotliLength": 1031,
+      "metaUid": "0bd3843f-18"
+    },
+    "0bd3843f-21": {
+      "renderedLength": 5234,
+      "gzipLength": 1705,
+      "brotliLength": 1449,
+      "metaUid": "0bd3843f-20"
+    },
+    "0bd3843f-23": {
+      "renderedLength": 2608,
+      "gzipLength": 1036,
+      "brotliLength": 857,
+      "metaUid": "0bd3843f-22"
+    },
+    "0bd3843f-25": {
+      "renderedLength": 8906,
+      "gzipLength": 3113,
+      "brotliLength": 2547,
+      "metaUid": "0bd3843f-24"
+    },
+    "0bd3843f-27": {
+      "renderedLength": 5410,
+      "gzipLength": 1349,
+      "brotliLength": 1177,
+      "metaUid": "0bd3843f-26"
+    },
+    "0bd3843f-29": {
+      "renderedLength": 4123,
+      "gzipLength": 1242,
+      "brotliLength": 996,
+      "metaUid": "0bd3843f-28"
+    },
+    "0bd3843f-31": {
+      "renderedLength": 3065,
+      "gzipLength": 997,
+      "brotliLength": 835,
+      "metaUid": "0bd3843f-30"
+    },
+    "0bd3843f-33": {
+      "renderedLength": 6354,
+      "gzipLength": 1624,
+      "brotliLength": 1307,
+      "metaUid": "0bd3843f-32"
+    },
+    "0bd3843f-35": {
+      "renderedLength": 1185,
+      "gzipLength": 811,
+      "brotliLength": 636,
+      "metaUid": "0bd3843f-34"
+    },
+    "0bd3843f-37": {
+      "renderedLength": 2246,
+      "gzipLength": 687,
+      "brotliLength": 591,
+      "metaUid": "0bd3843f-36"
+    },
+    "0bd3843f-39": {
+      "renderedLength": 4811,
+      "gzipLength": 1557,
+      "brotliLength": 1275,
+      "metaUid": "0bd3843f-38"
+    },
+    "0bd3843f-41": {
+      "renderedLength": 3501,
+      "gzipLength": 991,
+      "brotliLength": 847,
+      "metaUid": "0bd3843f-40"
+    },
+    "0bd3843f-43": {
+      "renderedLength": 1075,
+      "gzipLength": 559,
+      "brotliLength": 431,
+      "metaUid": "0bd3843f-42"
+    },
+    "0bd3843f-45": {
+      "renderedLength": 2265,
+      "gzipLength": 533,
+      "brotliLength": 453,
+      "metaUid": "0bd3843f-44"
+    },
+    "0bd3843f-47": {
+      "renderedLength": 1379,
+      "gzipLength": 431,
+      "brotliLength": 375,
+      "metaUid": "0bd3843f-46"
+    },
+    "0bd3843f-49": {
+      "renderedLength": 378,
+      "gzipLength": 171,
+      "brotliLength": 129,
+      "metaUid": "0bd3843f-48"
+    },
+    "0bd3843f-51": {
+      "renderedLength": 8309,
+      "gzipLength": 1931,
+      "brotliLength": 1568,
+      "metaUid": "0bd3843f-50"
+    },
+    "0bd3843f-53": {
+      "renderedLength": 2311,
+      "gzipLength": 746,
+      "brotliLength": 581,
+      "metaUid": "0bd3843f-52"
+    },
+    "0bd3843f-55": {
+      "renderedLength": 8485,
+      "gzipLength": 1948,
+      "brotliLength": 1676,
+      "metaUid": "0bd3843f-54"
+    },
+    "0bd3843f-57": {
+      "renderedLength": 2602,
+      "gzipLength": 810,
+      "brotliLength": 669,
+      "metaUid": "0bd3843f-56"
+    },
+    "0bd3843f-59": {
+      "renderedLength": 6937,
+      "gzipLength": 1559,
+      "brotliLength": 1319,
+      "metaUid": "0bd3843f-58"
+    },
+    "0bd3843f-61": {
+      "renderedLength": 2583,
+      "gzipLength": 1007,
+      "brotliLength": 859,
+      "metaUid": "0bd3843f-60"
+    },
+    "0bd3843f-63": {
+      "renderedLength": 1305,
+      "gzipLength": 438,
+      "brotliLength": 392,
+      "metaUid": "0bd3843f-62"
+    },
+    "0bd3843f-65": {
+      "renderedLength": 242719,
+      "gzipLength": 44374,
+      "brotliLength": 34717,
+      "metaUid": "0bd3843f-64"
+    },
+    "0bd3843f-67": {
+      "renderedLength": 183,
+      "gzipLength": 155,
+      "brotliLength": 157,
+      "metaUid": "0bd3843f-66"
+    },
+    "0bd3843f-69": {
+      "renderedLength": 0,
+      "gzipLength": 0,
+      "brotliLength": 0,
+      "metaUid": "0bd3843f-68"
+    },
+    "0bd3843f-71": {
+      "renderedLength": 55,
+      "gzipLength": 75,
+      "brotliLength": 59,
+      "metaUid": "0bd3843f-70"
+    },
+    "0bd3843f-73": {
+      "renderedLength": 2339,
+      "gzipLength": 995,
+      "brotliLength": 836,
+      "metaUid": "0bd3843f-72"
+    },
+    "0bd3843f-75": {
+      "renderedLength": 172,
+      "gzipLength": 154,
+      "brotliLength": 125,
+      "metaUid": "0bd3843f-74"
+    },
+    "0bd3843f-77": {
+      "renderedLength": 1446,
+      "gzipLength": 681,
+      "brotliLength": 561,
+      "metaUid": "0bd3843f-76"
+    },
+    "0bd3843f-79": {
+      "renderedLength": 8974,
+      "gzipLength": 2446,
+      "brotliLength": 2035,
+      "metaUid": "0bd3843f-78"
+    },
+    "0bd3843f-81": {
+      "renderedLength": 20179,
+      "gzipLength": 4408,
+      "brotliLength": 3690,
+      "metaUid": "0bd3843f-80"
+    },
+    "0bd3843f-83": {
+      "renderedLength": 247,
+      "gzipLength": 191,
+      "brotliLength": 167,
+      "metaUid": "0bd3843f-82"
+    },
+    "0bd3843f-85": {
+      "renderedLength": 0,
+      "gzipLength": 0,
+      "brotliLength": 0,
+      "metaUid": "0bd3843f-84"
+    },
+    "0bd3843f-87": {
+      "renderedLength": 11992,
+      "gzipLength": 3145,
+      "brotliLength": 2612,
+      "metaUid": "0bd3843f-86"
+    },
+    "0bd3843f-89": {
+      "renderedLength": 876,
+      "gzipLength": 454,
+      "brotliLength": 372,
+      "metaUid": "0bd3843f-88"
+    },
+    "0bd3843f-91": {
+      "renderedLength": 10230,
+      "gzipLength": 2239,
+      "brotliLength": 1863,
+      "metaUid": "0bd3843f-90"
+    },
+    "0bd3843f-93": {
+      "renderedLength": 1056,
+      "gzipLength": 527,
+      "brotliLength": 425,
+      "metaUid": "0bd3843f-92"
+    },
+    "0bd3843f-95": {
+      "renderedLength": 1439,
+      "gzipLength": 634,
+      "brotliLength": 562,
+      "metaUid": "0bd3843f-94"
+    },
+    "0bd3843f-97": {
+      "renderedLength": 5667,
+      "gzipLength": 1959,
+      "brotliLength": 1668,
+      "metaUid": "0bd3843f-96"
+    },
+    "0bd3843f-99": {
+      "renderedLength": 957,
+      "gzipLength": 518,
+      "brotliLength": 432,
+      "metaUid": "0bd3843f-98"
+    },
+    "0bd3843f-101": {
+      "renderedLength": 1101,
+      "gzipLength": 502,
+      "brotliLength": 423,
+      "metaUid": "0bd3843f-100"
+    },
+    "0bd3843f-103": {
+      "renderedLength": 4646,
+      "gzipLength": 1534,
+      "brotliLength": 1294,
+      "metaUid": "0bd3843f-102"
+    },
+    "0bd3843f-105": {
+      "renderedLength": 1740,
+      "gzipLength": 704,
+      "brotliLength": 551,
+      "metaUid": "0bd3843f-104"
+    },
+    "0bd3843f-107": {
+      "renderedLength": 2168,
+      "gzipLength": 964,
+      "brotliLength": 754,
+      "metaUid": "0bd3843f-106"
+    },
+    "0bd3843f-109": {
+      "renderedLength": 2717,
+      "gzipLength": 1159,
+      "brotliLength": 906,
+      "metaUid": "0bd3843f-108"
+    },
+    "0bd3843f-111": {
+      "renderedLength": 18555,
+      "gzipLength": 5190,
+      "brotliLength": 4445,
+      "metaUid": "0bd3843f-110"
+    },
+    "0bd3843f-113": {
+      "renderedLength": 118552,
+      "gzipLength": 23839,
+      "brotliLength": 19636,
+      "metaUid": "0bd3843f-112"
+    },
+    "0bd3843f-115": {
+      "renderedLength": 22651,
+      "gzipLength": 5513,
+      "brotliLength": 4636,
+      "metaUid": "0bd3843f-114"
+    },
+    "0bd3843f-117": {
+      "renderedLength": 1953,
+      "gzipLength": 673,
+      "brotliLength": 518,
+      "metaUid": "0bd3843f-116"
+    },
+    "0bd3843f-119": {
+      "renderedLength": 1426,
+      "gzipLength": 681,
+      "brotliLength": 519,
+      "metaUid": "0bd3843f-118"
+    },
+    "0bd3843f-121": {
+      "renderedLength": 9106,
+      "gzipLength": 2470,
+      "brotliLength": 2095,
+      "metaUid": "0bd3843f-120"
+    },
+    "0bd3843f-123": {
+      "renderedLength": 140,
+      "gzipLength": 142,
+      "brotliLength": 102,
+      "metaUid": "0bd3843f-122"
+    },
+    "0bd3843f-125": {
+      "renderedLength": 31,
+      "gzipLength": 51,
+      "brotliLength": 35,
+      "metaUid": "0bd3843f-124"
+    },
+    "0bd3843f-127": {
+      "renderedLength": 36,
+      "gzipLength": 56,
+      "brotliLength": 40,
+      "metaUid": "0bd3843f-126"
+    },
+    "0bd3843f-129": {
+      "renderedLength": 1294,
+      "gzipLength": 555,
+      "brotliLength": 454,
+      "metaUid": "0bd3843f-128"
+    },
+    "0bd3843f-131": {
+      "renderedLength": 239,
+      "gzipLength": 141,
+      "brotliLength": 122,
+      "metaUid": "0bd3843f-130"
+    },
+    "0bd3843f-133": {
+      "renderedLength": 44,
+      "gzipLength": 57,
+      "brotliLength": 48,
+      "metaUid": "0bd3843f-132"
+    },
+    "0bd3843f-135": {
+      "renderedLength": 26,
+      "gzipLength": 46,
+      "brotliLength": 30,
+      "metaUid": "0bd3843f-134"
+    },
+    "0bd3843f-137": {
+      "renderedLength": 26,
+      "gzipLength": 46,
+      "brotliLength": 29,
+      "metaUid": "0bd3843f-136"
+    },
+    "0bd3843f-139": {
+      "renderedLength": 18321,
+      "gzipLength": 4503,
+      "brotliLength": 3936,
+      "metaUid": "0bd3843f-138"
+    },
+    "0bd3843f-141": {
+      "renderedLength": 194,
+      "gzipLength": 129,
+      "brotliLength": 110,
+      "metaUid": "0bd3843f-140"
+    },
+    "0bd3843f-143": {
+      "renderedLength": 100,
+      "gzipLength": 100,
+      "brotliLength": 92,
+      "metaUid": "0bd3843f-142"
+    },
+    "0bd3843f-145": {
+      "renderedLength": 27,
+      "gzipLength": 47,
+      "brotliLength": 31,
+      "metaUid": "0bd3843f-144"
+    },
+    "0bd3843f-147": {
+      "renderedLength": 35,
+      "gzipLength": 55,
+      "brotliLength": 34,
+      "metaUid": "0bd3843f-146"
+    },
+    "0bd3843f-149": {
+      "renderedLength": 30,
+      "gzipLength": 50,
+      "brotliLength": 34,
+      "metaUid": "0bd3843f-148"
+    },
+    "0bd3843f-151": {
+      "renderedLength": 30,
+      "gzipLength": 50,
+      "brotliLength": 27,
+      "metaUid": "0bd3843f-150"
+    },
+    "0bd3843f-153": {
+      "renderedLength": 11134,
+      "gzipLength": 2610,
+      "brotliLength": 2260,
+      "metaUid": "0bd3843f-152"
+    },
+    "0bd3843f-155": {
+      "renderedLength": 226,
+      "gzipLength": 133,
+      "brotliLength": 104,
+      "metaUid": "0bd3843f-154"
+    },
+    "0bd3843f-157": {
+      "renderedLength": 29,
+      "gzipLength": 49,
+      "brotliLength": 33,
+      "metaUid": "0bd3843f-156"
+    },
+    "0bd3843f-159": {
+      "renderedLength": 29,
+      "gzipLength": 49,
+      "brotliLength": 33,
+      "metaUid": "0bd3843f-158"
+    },
+    "0bd3843f-161": {
+      "renderedLength": 7216,
+      "gzipLength": 1858,
+      "brotliLength": 1588,
+      "metaUid": "0bd3843f-160"
+    },
+    "0bd3843f-163": {
+      "renderedLength": 520,
+      "gzipLength": 259,
+      "brotliLength": 199,
+      "metaUid": "0bd3843f-162"
+    },
+    "0bd3843f-165": {
+      "renderedLength": 552879,
+      "gzipLength": 95428,
+      "brotliLength": 77779,
+      "metaUid": "0bd3843f-164"
+    },
+    "0bd3843f-167": {
+      "renderedLength": 512,
+      "gzipLength": 263,
+      "brotliLength": 205,
+      "metaUid": "0bd3843f-166"
+    },
+    "0bd3843f-169": {
+      "renderedLength": 106,
+      "gzipLength": 107,
+      "brotliLength": 94,
+      "metaUid": "0bd3843f-168"
+    },
+    "0bd3843f-171": {
+      "renderedLength": 0,
+      "gzipLength": 0,
+      "brotliLength": 0,
+      "metaUid": "0bd3843f-170"
+    },
+    "0bd3843f-173": {
+      "renderedLength": 1168,
+      "gzipLength": 525,
+      "brotliLength": 446,
+      "metaUid": "0bd3843f-172"
+    }
+  },
+  "nodeMetas": {
+    "0bd3843f-0": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/commands.html",
+      "moduleParts": {
+        "assets/commands-l0sNRNKZ.js": "0bd3843f-1"
+      },
+      "imported": [],
+      "importedBy": [],
+      "isEntry": true
+    },
+    "0bd3843f-2": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/FocusWorkspace.tsx",
+      "moduleParts": {
+        "assets/focus-B_sDg92A.js": "0bd3843f-3"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-132"
+        },
+        {
+          "uid": "0bd3843f-142"
+        },
+        {
+          "uid": "0bd3843f-70"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-6"
+        }
+      ]
+    },
+    "0bd3843f-4": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/focus.css",
+      "moduleParts": {
+        "assets/focus-B_sDg92A.js": "0bd3843f-5"
+      },
+      "imported": [],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-6"
+        }
+      ]
+    },
+    "0bd3843f-6": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/focus.tsx",
+      "moduleParts": {
+        "assets/focus-B_sDg92A.js": "0bd3843f-7"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-132"
+        },
+        {
+          "uid": "0bd3843f-142"
+        },
+        {
+          "uid": "0bd3843f-168"
+        },
+        {
+          "uid": "0bd3843f-2"
+        },
+        {
+          "uid": "0bd3843f-170"
+        },
+        {
+          "uid": "0bd3843f-4"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-8"
+        }
+      ]
+    },
+    "0bd3843f-8": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/focus.html",
+      "moduleParts": {
+        "assets/focus-B_sDg92A.js": "0bd3843f-9"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-172"
+        },
+        {
+          "uid": "0bd3843f-6"
+        }
+      ],
+      "importedBy": [],
+      "isEntry": true
+    },
+    "0bd3843f-10": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/functions.html",
+      "moduleParts": {
+        "assets/functions-CTqYbpWc.js": "0bd3843f-11"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-172"
+        },
+        {
+          "uid": "0bd3843f-76"
+        }
+      ],
+      "importedBy": [],
+      "isEntry": true
+    },
+    "0bd3843f-12": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/demo.ts",
+      "moduleParts": {
+        "assets/taskpane-DMRQNRvo.js": "0bd3843f-13"
+      },
+      "imported": [],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-64"
+        }
+      ]
+    },
+    "0bd3843f-14": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/deterministicTools.ts",
+      "moduleParts": {
+        "assets/taskpane-DMRQNRvo.js": "0bd3843f-15"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-114"
+        },
+        {
+          "uid": "0bd3843f-88"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-64"
+        }
+      ]
+    },
+    "0bd3843f-16": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/toolDsl.ts",
+      "moduleParts": {
+        "assets/taskpane-DMRQNRvo.js": "0bd3843f-17"
+      },
+      "imported": [],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-64"
+        },
+        {
+          "uid": "0bd3843f-54"
+        }
+      ]
+    },
+    "0bd3843f-18": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/imageAttachments.ts",
+      "moduleParts": {
+        "assets/taskpane-DMRQNRvo.js": "0bd3843f-19"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-92"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-64"
+        }
+      ]
+    },
+    "0bd3843f-20": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/crossTableFormula.ts",
+      "moduleParts": {
+        "assets/taskpane-DMRQNRvo.js": "0bd3843f-21"
+      },
+      "imported": [],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-64"
+        }
+      ]
+    },
+    "0bd3843f-22": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/sandbox/workerProbe.ts",
+      "moduleParts": {
+        "assets/taskpane-DMRQNRvo.js": "0bd3843f-23"
+      },
+      "imported": [],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-64"
+        }
+      ]
+    },
+    "0bd3843f-24": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/petTips.ts",
+      "moduleParts": {
+        "assets/taskpane-DMRQNRvo.js": "0bd3843f-25"
+      },
+      "imported": [],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-26"
+        }
+      ]
+    },
+    "0bd3843f-26": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/PetCompanion.tsx",
+      "moduleParts": {
+        "assets/taskpane-DMRQNRvo.js": "0bd3843f-27"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-132"
+        },
+        {
+          "uid": "0bd3843f-142"
+        },
+        {
+          "uid": "0bd3843f-24"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-64"
+        }
+      ]
+    },
+    "0bd3843f-28": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/RuleManager.tsx",
+      "moduleParts": {
+        "assets/taskpane-DMRQNRvo.js": "0bd3843f-29"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-132"
+        },
+        {
+          "uid": "0bd3843f-142"
+        },
+        {
+          "uid": "0bd3843f-74"
+        },
+        {
+          "uid": "0bd3843f-72"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-64"
+        }
+      ]
+    },
+    "0bd3843f-30": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/SlashCommandAutocomplete.tsx",
+      "moduleParts": {
+        "assets/taskpane-DMRQNRvo.js": "0bd3843f-31"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-132"
+        },
+        {
+          "uid": "0bd3843f-142"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-64"
+        }
+      ]
+    },
+    "0bd3843f-32": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/components/ThemePanel.tsx",
+      "moduleParts": {
+        "assets/taskpane-DMRQNRvo.js": "0bd3843f-33"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-132"
+        },
+        {
+          "uid": "0bd3843f-142"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-64"
+        }
+      ]
+    },
+    "0bd3843f-34": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/helpCommand.ts",
+      "moduleParts": {
+        "assets/taskpane-DMRQNRvo.js": "0bd3843f-35"
+      },
+      "imported": [],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-64"
+        }
+      ]
+    },
+    "0bd3843f-36": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/hooks/useActivityProgress.ts",
+      "moduleParts": {
+        "assets/taskpane-DMRQNRvo.js": "0bd3843f-37"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-142"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-64"
+        }
+      ]
+    },
+    "0bd3843f-38": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/conversation.ts",
+      "moduleParts": {
+        "assets/taskpane-DMRQNRvo.js": "0bd3843f-39"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-92"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-40"
+        },
+        {
+          "uid": "0bd3843f-50"
+        },
+        {
+          "uid": "0bd3843f-56"
+        }
+      ]
+    },
+    "0bd3843f-40": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/hooks/useConversation.ts",
+      "moduleParts": {
+        "assets/taskpane-DMRQNRvo.js": "0bd3843f-41"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-142"
+        },
+        {
+          "uid": "0bd3843f-38"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-64"
+        }
+      ]
+    },
+    "0bd3843f-42": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/utils.ts",
+      "moduleParts": {
+        "assets/taskpane-DMRQNRvo.js": "0bd3843f-43"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-110"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-64"
+        },
+        {
+          "uid": "0bd3843f-44"
+        },
+        {
+          "uid": "0bd3843f-50"
+        },
+        {
+          "uid": "0bd3843f-54"
+        },
+        {
+          "uid": "0bd3843f-58"
+        }
+      ]
+    },
+    "0bd3843f-44": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/hooks/useCopyFeedback.ts",
+      "moduleParts": {
+        "assets/taskpane-DMRQNRvo.js": "0bd3843f-45"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-142"
+        },
+        {
+          "uid": "0bd3843f-42"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-64"
+        }
+      ]
+    },
+    "0bd3843f-46": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/hooks/useExecutionApproval.ts",
+      "moduleParts": {
+        "assets/taskpane-DMRQNRvo.js": "0bd3843f-47"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-142"
+        },
+        {
+          "uid": "0bd3843f-114"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-64"
+        }
+      ]
+    },
+    "0bd3843f-48": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/modelSelection.ts",
+      "moduleParts": {
+        "assets/taskpane-DMRQNRvo.js": "0bd3843f-49"
+      },
+      "imported": [],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-50"
+        }
+      ]
+    },
+    "0bd3843f-50": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/hooks/useModelManagement.ts",
+      "moduleParts": {
+        "assets/taskpane-DMRQNRvo.js": "0bd3843f-51"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-142"
+        },
+        {
+          "uid": "0bd3843f-90"
+        },
+        {
+          "uid": "0bd3843f-42"
+        },
+        {
+          "uid": "0bd3843f-38"
+        },
+        {
+          "uid": "0bd3843f-48"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-64"
+        }
+      ]
+    },
+    "0bd3843f-52": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/hooks/useServiceHealth.ts",
+      "moduleParts": {
+        "assets/taskpane-DMRQNRvo.js": "0bd3843f-53"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-142"
+        },
+        {
+          "uid": "0bd3843f-90"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-64"
+        }
+      ]
+    },
+    "0bd3843f-54": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/hooks/useToolManagement.ts",
+      "moduleParts": {
+        "assets/taskpane-DMRQNRvo.js": "0bd3843f-55"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-142"
+        },
+        {
+          "uid": "0bd3843f-114"
+        },
+        {
+          "uid": "0bd3843f-16"
+        },
+        {
+          "uid": "0bd3843f-42"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-64"
+        }
+      ]
+    },
+    "0bd3843f-56": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/hooks/useUIState.ts",
+      "moduleParts": {
+        "assets/taskpane-DMRQNRvo.js": "0bd3843f-57"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-142"
+        },
+        {
+          "uid": "0bd3843f-38"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-64"
+        }
+      ]
+    },
+    "0bd3843f-58": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/hooks/useScopeSelection.ts",
+      "moduleParts": {
+        "assets/taskpane-DMRQNRvo.js": "0bd3843f-59"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-142"
+        },
+        {
+          "uid": "0bd3843f-42"
+        },
+        {
+          "uid": "0bd3843f-112"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-64"
+        }
+      ]
+    },
+    "0bd3843f-60": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/hooks/useUndoSnapshot.ts",
+      "moduleParts": {
+        "assets/taskpane-DMRQNRvo.js": "0bd3843f-61"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-142"
+        },
+        {
+          "uid": "0bd3843f-92"
+        },
+        {
+          "uid": "0bd3843f-112"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-64"
+        }
+      ]
+    },
+    "0bd3843f-62": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/hooks/useLongPress.ts",
+      "moduleParts": {
+        "assets/taskpane-DMRQNRvo.js": "0bd3843f-63"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-142"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-64"
+        }
+      ]
+    },
+    "0bd3843f-64": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/App.tsx",
+      "moduleParts": {
+        "assets/taskpane-DMRQNRvo.js": "0bd3843f-65"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-132"
+        },
+        {
+          "uid": "0bd3843f-142"
+        },
+        {
+          "uid": "0bd3843f-90"
+        },
+        {
+          "uid": "0bd3843f-12"
+        },
+        {
+          "uid": "0bd3843f-112"
+        },
+        {
+          "uid": "0bd3843f-110"
+        },
+        {
+          "uid": "0bd3843f-114"
+        },
+        {
+          "uid": "0bd3843f-14"
+        },
+        {
+          "uid": "0bd3843f-16"
+        },
+        {
+          "uid": "0bd3843f-18"
+        },
+        {
+          "uid": "0bd3843f-98"
+        },
+        {
+          "uid": "0bd3843f-92"
+        },
+        {
+          "uid": "0bd3843f-20"
+        },
+        {
+          "uid": "0bd3843f-102"
+        },
+        {
+          "uid": "0bd3843f-88"
+        },
+        {
+          "uid": "0bd3843f-22"
+        },
+        {
+          "uid": "0bd3843f-70"
+        },
+        {
+          "uid": "0bd3843f-26"
+        },
+        {
+          "uid": "0bd3843f-28"
+        },
+        {
+          "uid": "0bd3843f-30"
+        },
+        {
+          "uid": "0bd3843f-32"
+        },
+        {
+          "uid": "0bd3843f-34"
+        },
+        {
+          "uid": "0bd3843f-36"
+        },
+        {
+          "uid": "0bd3843f-40"
+        },
+        {
+          "uid": "0bd3843f-44"
+        },
+        {
+          "uid": "0bd3843f-46"
+        },
+        {
+          "uid": "0bd3843f-50"
+        },
+        {
+          "uid": "0bd3843f-52"
+        },
+        {
+          "uid": "0bd3843f-120"
+        },
+        {
+          "uid": "0bd3843f-54"
+        },
+        {
+          "uid": "0bd3843f-56"
+        },
+        {
+          "uid": "0bd3843f-58"
+        },
+        {
+          "uid": "0bd3843f-60"
+        },
+        {
+          "uid": "0bd3843f-62"
+        },
+        {
+          "uid": "0bd3843f-42"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-66"
+        }
+      ]
+    },
+    "0bd3843f-66": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/main.tsx",
+      "moduleParts": {
+        "assets/taskpane-DMRQNRvo.js": "0bd3843f-67"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-132"
+        },
+        {
+          "uid": "0bd3843f-142"
+        },
+        {
+          "uid": "0bd3843f-168"
+        },
+        {
+          "uid": "0bd3843f-64"
+        },
+        {
+          "uid": "0bd3843f-170"
+        },
+        {
+          "uid": "0bd3843f-76"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-68"
+        }
+      ]
+    },
+    "0bd3843f-68": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/index.html",
+      "moduleParts": {
+        "assets/taskpane-DMRQNRvo.js": "0bd3843f-69"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-172"
+        },
+        {
+          "uid": "0bd3843f-66"
+        }
+      ],
+      "importedBy": [],
+      "isEntry": true
+    },
+    "0bd3843f-70": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/focusState.ts",
+      "moduleParts": {
+        "assets/focusState-B0WnU0Z0.js": "0bd3843f-71"
+      },
+      "imported": [],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-2"
+        },
+        {
+          "uid": "0bd3843f-64"
+        }
+      ]
+    },
+    "0bd3843f-72": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/ebRules.ts",
+      "moduleParts": {
+        "assets/functions-T_tY4VyS.js": "0bd3843f-73"
+      },
+      "imported": [],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-76"
+        },
+        {
+          "uid": "0bd3843f-74"
+        },
+        {
+          "uid": "0bd3843f-28"
+        }
+      ]
+    },
+    "0bd3843f-74": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/ebStorage.ts",
+      "moduleParts": {
+        "assets/functions-T_tY4VyS.js": "0bd3843f-75"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-72"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-76"
+        },
+        {
+          "uid": "0bd3843f-28"
+        }
+      ]
+    },
+    "0bd3843f-76": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/functions/functions.ts",
+      "moduleParts": {
+        "assets/functions-T_tY4VyS.js": "0bd3843f-77"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-74"
+        },
+        {
+          "uid": "0bd3843f-72"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-10"
+        },
+        {
+          "uid": "0bd3843f-66"
+        }
+      ]
+    },
+    "0bd3843f-78": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/components/JsonCodeEditor.tsx",
+      "moduleParts": {
+        "assets/planEditor-CHdDRyzC.js": "0bd3843f-79"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-132"
+        },
+        {
+          "uid": "0bd3843f-142"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-80"
+        }
+      ]
+    },
+    "0bd3843f-80": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/components/PlanEditorDialog.tsx",
+      "moduleParts": {
+        "assets/planEditor-CHdDRyzC.js": "0bd3843f-81"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-132"
+        },
+        {
+          "uid": "0bd3843f-142"
+        },
+        {
+          "uid": "0bd3843f-86"
+        },
+        {
+          "uid": "0bd3843f-90"
+        },
+        {
+          "uid": "0bd3843f-114"
+        },
+        {
+          "uid": "0bd3843f-112"
+        },
+        {
+          "uid": "0bd3843f-120"
+        },
+        {
+          "uid": "0bd3843f-116"
+        },
+        {
+          "uid": "0bd3843f-78"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-82"
+        }
+      ]
+    },
+    "0bd3843f-82": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/plan-editor-entry.tsx",
+      "moduleParts": {
+        "assets/planEditor-CHdDRyzC.js": "0bd3843f-83"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-132"
+        },
+        {
+          "uid": "0bd3843f-142"
+        },
+        {
+          "uid": "0bd3843f-168"
+        },
+        {
+          "uid": "0bd3843f-80"
+        },
+        {
+          "uid": "0bd3843f-170"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-84"
+        }
+      ]
+    },
+    "0bd3843f-84": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/plan-editor.html",
+      "moduleParts": {
+        "assets/planEditor-CHdDRyzC.js": "0bd3843f-85"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-172"
+        },
+        {
+          "uid": "0bd3843f-82"
+        }
+      ],
+      "importedBy": [],
+      "isEntry": true
+    },
+    "0bd3843f-86": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/contracts.ts",
+      "moduleParts": {
+        "assets/useTheme-7rHUCDM0.js": "0bd3843f-87"
+      },
+      "imported": [],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-90"
+        },
+        {
+          "uid": "0bd3843f-114"
+        },
+        {
+          "uid": "0bd3843f-80"
+        }
+      ]
+    },
+    "0bd3843f-88": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/diagnostics.ts",
+      "moduleParts": {
+        "assets/useTheme-7rHUCDM0.js": "0bd3843f-89"
+      },
+      "imported": [],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-64"
+        },
+        {
+          "uid": "0bd3843f-90"
+        },
+        {
+          "uid": "0bd3843f-14"
+        }
+      ]
+    },
+    "0bd3843f-90": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/api.ts",
+      "moduleParts": {
+        "assets/useTheme-7rHUCDM0.js": "0bd3843f-91"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-86"
+        },
+        {
+          "uid": "0bd3843f-88"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-64"
+        },
+        {
+          "uid": "0bd3843f-50"
+        },
+        {
+          "uid": "0bd3843f-52"
+        },
+        {
+          "uid": "0bd3843f-80"
+        }
+      ]
+    },
+    "0bd3843f-92": {
+      "id": "E:/codex/excel-bro/config/capabilities.json",
+      "moduleParts": {
+        "assets/useTheme-7rHUCDM0.js": "0bd3843f-93"
+      },
+      "imported": [],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-64"
+        },
+        {
+          "uid": "0bd3843f-112"
+        },
+        {
+          "uid": "0bd3843f-110"
+        },
+        {
+          "uid": "0bd3843f-114"
+        },
+        {
+          "uid": "0bd3843f-18"
+        },
+        {
+          "uid": "0bd3843f-102"
+        },
+        {
+          "uid": "0bd3843f-60"
+        },
+        {
+          "uid": "0bd3843f-94"
+        },
+        {
+          "uid": "0bd3843f-104"
+        },
+        {
+          "uid": "0bd3843f-106"
+        },
+        {
+          "uid": "0bd3843f-38"
+        }
+      ]
+    },
+    "0bd3843f-94": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/tableSchema.ts",
+      "moduleParts": {
+        "assets/useTheme-7rHUCDM0.js": "0bd3843f-95"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-92"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-112"
+        },
+        {
+          "uid": "0bd3843f-110"
+        }
+      ]
+    },
+    "0bd3843f-96": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/splitAggregate.ts",
+      "moduleParts": {
+        "assets/useTheme-7rHUCDM0.js": "0bd3843f-97"
+      },
+      "imported": [],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-112"
+        }
+      ]
+    },
+    "0bd3843f-98": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/workbookIdentity.ts",
+      "moduleParts": {
+        "assets/useTheme-7rHUCDM0.js": "0bd3843f-99"
+      },
+      "imported": [],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-64"
+        },
+        {
+          "uid": "0bd3843f-112"
+        }
+      ]
+    },
+    "0bd3843f-100": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/cellNormalization.ts",
+      "moduleParts": {
+        "assets/useTheme-7rHUCDM0.js": "0bd3843f-101"
+      },
+      "imported": [],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-112"
+        },
+        {
+          "uid": "0bd3843f-110"
+        }
+      ]
+    },
+    "0bd3843f-102": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/formulaSafety.ts",
+      "moduleParts": {
+        "assets/useTheme-7rHUCDM0.js": "0bd3843f-103"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-92"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-64"
+        },
+        {
+          "uid": "0bd3843f-112"
+        }
+      ]
+    },
+    "0bd3843f-104": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/sandbox/sandboxSafety.ts",
+      "moduleParts": {
+        "assets/useTheme-7rHUCDM0.js": "0bd3843f-105"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-92"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-112"
+        }
+      ]
+    },
+    "0bd3843f-106": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/sandbox/protocol.ts",
+      "moduleParts": {
+        "assets/useTheme-7rHUCDM0.js": "0bd3843f-107"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-92"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-112"
+        },
+        {
+          "uid": "0bd3843f-108"
+        }
+      ]
+    },
+    "0bd3843f-108": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/sandbox/runComputeScript.ts",
+      "moduleParts": {
+        "assets/useTheme-7rHUCDM0.js": "0bd3843f-109"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-106"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-112"
+        }
+      ]
+    },
+    "0bd3843f-110": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/dataTools.ts",
+      "moduleParts": {
+        "assets/useTheme-7rHUCDM0.js": "0bd3843f-111"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-92"
+        },
+        {
+          "uid": "0bd3843f-94"
+        },
+        {
+          "uid": "0bd3843f-100"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-64"
+        },
+        {
+          "uid": "0bd3843f-112"
+        },
+        {
+          "uid": "0bd3843f-42"
+        }
+      ]
+    },
+    "0bd3843f-112": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/excel.ts",
+      "moduleParts": {
+        "assets/useTheme-7rHUCDM0.js": "0bd3843f-113"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-92"
+        },
+        {
+          "uid": "0bd3843f-94"
+        },
+        {
+          "uid": "0bd3843f-96"
+        },
+        {
+          "uid": "0bd3843f-98"
+        },
+        {
+          "uid": "0bd3843f-100"
+        },
+        {
+          "uid": "0bd3843f-102"
+        },
+        {
+          "uid": "0bd3843f-104"
+        },
+        {
+          "uid": "0bd3843f-108"
+        },
+        {
+          "uid": "0bd3843f-106"
+        },
+        {
+          "uid": "0bd3843f-110"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-64"
+        },
+        {
+          "uid": "0bd3843f-58"
+        },
+        {
+          "uid": "0bd3843f-60"
+        },
+        {
+          "uid": "0bd3843f-80"
+        }
+      ]
+    },
+    "0bd3843f-114": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/storage.ts",
+      "moduleParts": {
+        "assets/useTheme-7rHUCDM0.js": "0bd3843f-115"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-86"
+        },
+        {
+          "uid": "0bd3843f-92"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-64"
+        },
+        {
+          "uid": "0bd3843f-14"
+        },
+        {
+          "uid": "0bd3843f-46"
+        },
+        {
+          "uid": "0bd3843f-54"
+        },
+        {
+          "uid": "0bd3843f-80"
+        }
+      ]
+    },
+    "0bd3843f-116": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/utils/imageStorage.ts",
+      "moduleParts": {
+        "assets/useTheme-7rHUCDM0.js": "0bd3843f-117"
+      },
+      "imported": [],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-120"
+        },
+        {
+          "uid": "0bd3843f-80"
+        }
+      ]
+    },
+    "0bd3843f-118": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/utils/imageProcessing.ts",
+      "moduleParts": {
+        "assets/useTheme-7rHUCDM0.js": "0bd3843f-119"
+      },
+      "imported": [],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-120"
+        }
+      ]
+    },
+    "0bd3843f-120": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/hooks/useTheme.ts",
+      "moduleParts": {
+        "assets/useTheme-7rHUCDM0.js": "0bd3843f-121"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-142"
+        },
+        {
+          "uid": "0bd3843f-116"
+        },
+        {
+          "uid": "0bd3843f-118"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-64"
+        },
+        {
+          "uid": "0bd3843f-80"
+        }
+      ]
+    },
+    "0bd3843f-122": {
+      "id": "\u0000commonjsHelpers.js",
+      "moduleParts": {
+        "assets/styles-DEyUvZMw.js": "0bd3843f-123"
+      },
+      "imported": [],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-132"
+        },
+        {
+          "uid": "0bd3843f-142"
+        },
+        {
+          "uid": "0bd3843f-168"
+        },
+        {
+          "uid": "0bd3843f-130"
+        },
+        {
+          "uid": "0bd3843f-140"
+        },
+        {
+          "uid": "0bd3843f-166"
+        },
+        {
+          "uid": "0bd3843f-128"
+        },
+        {
+          "uid": "0bd3843f-138"
+        },
+        {
+          "uid": "0bd3843f-164"
+        },
+        {
+          "uid": "0bd3843f-154"
+        },
+        {
+          "uid": "0bd3843f-162"
+        },
+        {
+          "uid": "0bd3843f-152"
+        },
+        {
+          "uid": "0bd3843f-160"
+        }
+      ]
+    },
+    "0bd3843f-124": {
+      "id": "\u0000E:/codex/excel-bro/node_modules/react/jsx-runtime.js?commonjs-module",
+      "moduleParts": {
+        "assets/styles-DEyUvZMw.js": "0bd3843f-125"
+      },
+      "imported": [],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-130"
+        }
+      ]
+    },
+    "0bd3843f-126": {
+      "id": "\u0000E:/codex/excel-bro/node_modules/react/cjs/react-jsx-runtime.production.js?commonjs-exports",
+      "moduleParts": {
+        "assets/styles-DEyUvZMw.js": "0bd3843f-127"
+      },
+      "imported": [],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-128"
+        }
+      ]
+    },
+    "0bd3843f-128": {
+      "id": "E:/codex/excel-bro/node_modules/react/cjs/react-jsx-runtime.production.js",
+      "moduleParts": {
+        "assets/styles-DEyUvZMw.js": "0bd3843f-129"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-122"
+        },
+        {
+          "uid": "0bd3843f-126"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-130"
+        }
+      ]
+    },
+    "0bd3843f-130": {
+      "id": "E:/codex/excel-bro/node_modules/react/jsx-runtime.js",
+      "moduleParts": {
+        "assets/styles-DEyUvZMw.js": "0bd3843f-131"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-122"
+        },
+        {
+          "uid": "0bd3843f-124"
+        },
+        {
+          "uid": "0bd3843f-128"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-132"
+        }
+      ]
+    },
+    "0bd3843f-132": {
+      "id": "\u0000E:/codex/excel-bro/node_modules/react/jsx-runtime.js?commonjs-es-import",
+      "moduleParts": {
+        "assets/styles-DEyUvZMw.js": "0bd3843f-133"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-122"
+        },
+        {
+          "uid": "0bd3843f-130"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-6"
+        },
+        {
+          "uid": "0bd3843f-2"
+        },
+        {
+          "uid": "0bd3843f-66"
+        },
+        {
+          "uid": "0bd3843f-64"
+        },
+        {
+          "uid": "0bd3843f-26"
+        },
+        {
+          "uid": "0bd3843f-28"
+        },
+        {
+          "uid": "0bd3843f-30"
+        },
+        {
+          "uid": "0bd3843f-32"
+        },
+        {
+          "uid": "0bd3843f-82"
+        },
+        {
+          "uid": "0bd3843f-80"
+        },
+        {
+          "uid": "0bd3843f-78"
+        }
+      ]
+    },
+    "0bd3843f-134": {
+      "id": "\u0000E:/codex/excel-bro/node_modules/react/index.js?commonjs-module",
+      "moduleParts": {
+        "assets/styles-DEyUvZMw.js": "0bd3843f-135"
+      },
+      "imported": [],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-140"
+        }
+      ]
+    },
+    "0bd3843f-136": {
+      "id": "\u0000E:/codex/excel-bro/node_modules/react/cjs/react.production.js?commonjs-exports",
+      "moduleParts": {
+        "assets/styles-DEyUvZMw.js": "0bd3843f-137"
+      },
+      "imported": [],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-138"
+        }
+      ]
+    },
+    "0bd3843f-138": {
+      "id": "E:/codex/excel-bro/node_modules/react/cjs/react.production.js",
+      "moduleParts": {
+        "assets/styles-DEyUvZMw.js": "0bd3843f-139"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-122"
+        },
+        {
+          "uid": "0bd3843f-136"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-140"
+        }
+      ]
+    },
+    "0bd3843f-140": {
+      "id": "E:/codex/excel-bro/node_modules/react/index.js",
+      "moduleParts": {
+        "assets/styles-DEyUvZMw.js": "0bd3843f-141"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-122"
+        },
+        {
+          "uid": "0bd3843f-134"
+        },
+        {
+          "uid": "0bd3843f-138"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-142"
+        },
+        {
+          "uid": "0bd3843f-164"
+        },
+        {
+          "uid": "0bd3843f-160"
+        }
+      ]
+    },
+    "0bd3843f-142": {
+      "id": "\u0000E:/codex/excel-bro/node_modules/react/index.js?commonjs-es-import",
+      "moduleParts": {
+        "assets/styles-DEyUvZMw.js": "0bd3843f-143"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-122"
+        },
+        {
+          "uid": "0bd3843f-140"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-6"
+        },
+        {
+          "uid": "0bd3843f-2"
+        },
+        {
+          "uid": "0bd3843f-66"
+        },
+        {
+          "uid": "0bd3843f-64"
+        },
+        {
+          "uid": "0bd3843f-26"
+        },
+        {
+          "uid": "0bd3843f-28"
+        },
+        {
+          "uid": "0bd3843f-30"
+        },
+        {
+          "uid": "0bd3843f-32"
+        },
+        {
+          "uid": "0bd3843f-36"
+        },
+        {
+          "uid": "0bd3843f-40"
+        },
+        {
+          "uid": "0bd3843f-44"
+        },
+        {
+          "uid": "0bd3843f-46"
+        },
+        {
+          "uid": "0bd3843f-50"
+        },
+        {
+          "uid": "0bd3843f-52"
+        },
+        {
+          "uid": "0bd3843f-120"
+        },
+        {
+          "uid": "0bd3843f-54"
+        },
+        {
+          "uid": "0bd3843f-56"
+        },
+        {
+          "uid": "0bd3843f-58"
+        },
+        {
+          "uid": "0bd3843f-60"
+        },
+        {
+          "uid": "0bd3843f-62"
+        },
+        {
+          "uid": "0bd3843f-82"
+        },
+        {
+          "uid": "0bd3843f-80"
+        },
+        {
+          "uid": "0bd3843f-78"
+        }
+      ]
+    },
+    "0bd3843f-144": {
+      "id": "\u0000E:/codex/excel-bro/node_modules/react-dom/client.js?commonjs-module",
+      "moduleParts": {
+        "assets/styles-DEyUvZMw.js": "0bd3843f-145"
+      },
+      "imported": [],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-166"
+        }
+      ]
+    },
+    "0bd3843f-146": {
+      "id": "\u0000E:/codex/excel-bro/node_modules/react-dom/cjs/react-dom-client.production.js?commonjs-exports",
+      "moduleParts": {
+        "assets/styles-DEyUvZMw.js": "0bd3843f-147"
+      },
+      "imported": [],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-164"
+        }
+      ]
+    },
+    "0bd3843f-148": {
+      "id": "\u0000E:/codex/excel-bro/node_modules/scheduler/index.js?commonjs-module",
+      "moduleParts": {
+        "assets/styles-DEyUvZMw.js": "0bd3843f-149"
+      },
+      "imported": [],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-154"
+        }
+      ]
+    },
+    "0bd3843f-150": {
+      "id": "\u0000E:/codex/excel-bro/node_modules/scheduler/cjs/scheduler.production.js?commonjs-exports",
+      "moduleParts": {
+        "assets/styles-DEyUvZMw.js": "0bd3843f-151"
+      },
+      "imported": [],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-152"
+        }
+      ]
+    },
+    "0bd3843f-152": {
+      "id": "E:/codex/excel-bro/node_modules/scheduler/cjs/scheduler.production.js",
+      "moduleParts": {
+        "assets/styles-DEyUvZMw.js": "0bd3843f-153"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-122"
+        },
+        {
+          "uid": "0bd3843f-150"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-154"
+        }
+      ]
+    },
+    "0bd3843f-154": {
+      "id": "E:/codex/excel-bro/node_modules/scheduler/index.js",
+      "moduleParts": {
+        "assets/styles-DEyUvZMw.js": "0bd3843f-155"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-122"
+        },
+        {
+          "uid": "0bd3843f-148"
+        },
+        {
+          "uid": "0bd3843f-152"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-164"
+        }
+      ]
+    },
+    "0bd3843f-156": {
+      "id": "\u0000E:/codex/excel-bro/node_modules/react-dom/index.js?commonjs-module",
+      "moduleParts": {
+        "assets/styles-DEyUvZMw.js": "0bd3843f-157"
+      },
+      "imported": [],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-162"
+        }
+      ]
+    },
+    "0bd3843f-158": {
+      "id": "\u0000E:/codex/excel-bro/node_modules/react-dom/cjs/react-dom.production.js?commonjs-exports",
+      "moduleParts": {
+        "assets/styles-DEyUvZMw.js": "0bd3843f-159"
+      },
+      "imported": [],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-160"
+        }
+      ]
+    },
+    "0bd3843f-160": {
+      "id": "E:/codex/excel-bro/node_modules/react-dom/cjs/react-dom.production.js",
+      "moduleParts": {
+        "assets/styles-DEyUvZMw.js": "0bd3843f-161"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-122"
+        },
+        {
+          "uid": "0bd3843f-158"
+        },
+        {
+          "uid": "0bd3843f-140"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-162"
+        }
+      ]
+    },
+    "0bd3843f-162": {
+      "id": "E:/codex/excel-bro/node_modules/react-dom/index.js",
+      "moduleParts": {
+        "assets/styles-DEyUvZMw.js": "0bd3843f-163"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-122"
+        },
+        {
+          "uid": "0bd3843f-156"
+        },
+        {
+          "uid": "0bd3843f-160"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-164"
+        }
+      ]
+    },
+    "0bd3843f-164": {
+      "id": "E:/codex/excel-bro/node_modules/react-dom/cjs/react-dom-client.production.js",
+      "moduleParts": {
+        "assets/styles-DEyUvZMw.js": "0bd3843f-165"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-122"
+        },
+        {
+          "uid": "0bd3843f-146"
+        },
+        {
+          "uid": "0bd3843f-154"
+        },
+        {
+          "uid": "0bd3843f-140"
+        },
+        {
+          "uid": "0bd3843f-162"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-166"
+        }
+      ]
+    },
+    "0bd3843f-166": {
+      "id": "E:/codex/excel-bro/node_modules/react-dom/client.js",
+      "moduleParts": {
+        "assets/styles-DEyUvZMw.js": "0bd3843f-167"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-122"
+        },
+        {
+          "uid": "0bd3843f-144"
+        },
+        {
+          "uid": "0bd3843f-164"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-168"
+        }
+      ]
+    },
+    "0bd3843f-168": {
+      "id": "\u0000E:/codex/excel-bro/node_modules/react-dom/client.js?commonjs-es-import",
+      "moduleParts": {
+        "assets/styles-DEyUvZMw.js": "0bd3843f-169"
+      },
+      "imported": [
+        {
+          "uid": "0bd3843f-122"
+        },
+        {
+          "uid": "0bd3843f-166"
+        }
+      ],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-6"
+        },
+        {
+          "uid": "0bd3843f-66"
+        },
+        {
+          "uid": "0bd3843f-82"
+        }
+      ]
+    },
+    "0bd3843f-170": {
+      "id": "E:/codex/excel-bro/apps/excel-addin/src/styles.css",
+      "moduleParts": {
+        "assets/styles-DEyUvZMw.js": "0bd3843f-171"
+      },
+      "imported": [],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-6"
+        },
+        {
+          "uid": "0bd3843f-66"
+        },
+        {
+          "uid": "0bd3843f-82"
+        }
+      ]
+    },
+    "0bd3843f-172": {
+      "id": "\u0000vite/modulepreload-polyfill.js",
+      "moduleParts": {
+        "assets/modulepreload-polyfill-B5Qt9EMX.js": "0bd3843f-173"
+      },
+      "imported": [],
+      "importedBy": [
+        {
+          "uid": "0bd3843f-8"
+        },
+        {
+          "uid": "0bd3843f-10"
+        },
+        {
+          "uid": "0bd3843f-68"
+        },
+        {
+          "uid": "0bd3843f-84"
+        }
+      ]
+    }
+  },
+  "env": {
+    "rollup": "4.63.1"
+  },
+  "options": {
+    "gzip": true,
+    "brotli": true,
+    "sourcemap": false
+  }
+}

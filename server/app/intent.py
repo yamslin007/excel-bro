@@ -166,7 +166,7 @@ async def check_intent(
     async with OpenAICompatibleClient(config, timeout=timeout) as client:
         repair_note = ""
         for _attempt in range(2):
-            payload = await client.chat_completions(
+            payload, _ = await client.chat_completions(
                 messages=[
                     {"role": "system", "content": INTENT_SYSTEM_PROMPT},
                     {

@@ -1,0 +1,642 @@
+{
+  "generatedAt": "2026-08-30T13:40:08.934Z",
+  "runtime": {
+    "node": "v24.12.0",
+    "react": "19.2.8",
+    "samplesPerScenario": 12,
+    "thresholdMs": 16,
+    "harness": "React Profiler + jsdom; source production component tree"
+  },
+  "scenarios": [
+    {
+      "id": "initial-render",
+      "label": "打开插件：初始渲染",
+      "scale": "100 条消息 + 50 个已保存工具（工具箱关闭）",
+      "runs": [
+        {
+          "wallMs": 94.55690000000004,
+          "commitCount": 3,
+          "totalActualMs": 67.25670000001128,
+          "maxCommitMs": 29.621300000004567,
+          "totalBaseMs": 55.1215000000052
+        },
+        {
+          "wallMs": 85.97219999999993,
+          "commitCount": 3,
+          "totalActualMs": 65.77359999999953,
+          "maxCommitMs": 33.14699999999675,
+          "totalBaseMs": 46.73000000000843
+        },
+        {
+          "wallMs": 60.08669999999984,
+          "commitCount": 3,
+          "totalActualMs": 49.01699999999505,
+          "maxCommitMs": 38.906599999996615,
+          "totalBaseMs": 39.102799999989884
+        },
+        {
+          "wallMs": 40.05439999999999,
+          "commitCount": 3,
+          "totalActualMs": 21.370900000008533,
+          "maxCommitMs": 14.176700000001347,
+          "totalBaseMs": 10.326100000009774
+        },
+        {
+          "wallMs": 29.311999999999898,
+          "commitCount": 3,
+          "totalActualMs": 16.543200000004163,
+          "maxCommitMs": 10.874699999993936,
+          "totalBaseMs": 7.66100000000597
+        },
+        {
+          "wallMs": 43.31889999999976,
+          "commitCount": 3,
+          "totalActualMs": 16.604899999987538,
+          "maxCommitMs": 10.876899999995658,
+          "totalBaseMs": 7.960699999997814
+        },
+        {
+          "wallMs": 37.24759999999969,
+          "commitCount": 3,
+          "totalActualMs": 20.015499999995882,
+          "maxCommitMs": 14.150300000002517,
+          "totalBaseMs": 8.627299999996012
+        },
+        {
+          "wallMs": 45.348199999999906,
+          "commitCount": 3,
+          "totalActualMs": 21.158199999991666,
+          "maxCommitMs": 12.146799999997711,
+          "totalBaseMs": 11.176799999989726
+        },
+        {
+          "wallMs": 32.05799999999999,
+          "commitCount": 3,
+          "totalActualMs": 18.238100000003215,
+          "maxCommitMs": 12.789999999999509,
+          "totalBaseMs": 8.558799999997063
+        },
+        {
+          "wallMs": 29.38670000000002,
+          "commitCount": 3,
+          "totalActualMs": 14.751900000006572,
+          "maxCommitMs": 9.800100000001748,
+          "totalBaseMs": 6.985300000005282
+        },
+        {
+          "wallMs": 29.653999999999996,
+          "commitCount": 3,
+          "totalActualMs": 15.145599999988917,
+          "maxCommitMs": 9.712199999991299,
+          "totalBaseMs": 7.5089000000102715
+        },
+        {
+          "wallMs": 38.18070000000034,
+          "commitCount": 3,
+          "totalActualMs": 18.41019999999071,
+          "maxCommitMs": 11.541499999999814,
+          "totalBaseMs": 9.379199999995762
+        }
+      ],
+      "median": {
+        "wallMs": 38.18070000000034,
+        "commitCount": 3,
+        "totalActualMs": 18.41019999999071,
+        "maxCommitMs": 12.146799999997711,
+        "totalBaseMs": 8.627299999996012
+      },
+      "p95": {
+        "wallMs": 94.55690000000004,
+        "commitCount": 3,
+        "totalActualMs": 67.25670000001128,
+        "maxCommitMs": 38.906599999996615,
+        "totalBaseMs": 55.1215000000052
+      }
+    },
+    {
+      "id": "typing-burst",
+      "label": "连续输入：重渲染频率诊断",
+      "scale": "100 条历史消息，连续输入 7 个字符",
+      "runs": [
+        {
+          "wallMs": 39.83789999999999,
+          "commitCount": 7,
+          "totalActualMs": 21.577899999967485,
+          "maxCommitMs": 5.448099999996884,
+          "totalBaseMs": 19.998900000004596
+        },
+        {
+          "wallMs": 32.25649999999996,
+          "commitCount": 7,
+          "totalActualMs": 16.01769999999715,
+          "maxCommitMs": 2.973000000000866,
+          "totalBaseMs": 14.622699999991255
+        },
+        {
+          "wallMs": 249.1564999999996,
+          "commitCount": 7,
+          "totalActualMs": 233.43049999999084,
+          "maxCommitMs": 35.48829999999907,
+          "totalBaseMs": 231.8466999999946
+        },
+        {
+          "wallMs": 30.119300000000294,
+          "commitCount": 7,
+          "totalActualMs": 16.28310000000147,
+          "maxCommitMs": 2.7486999999941872,
+          "totalBaseMs": 14.913999999990665
+        },
+        {
+          "wallMs": 35.18100000000004,
+          "commitCount": 7,
+          "totalActualMs": 15.446699999956309,
+          "maxCommitMs": 2.6494000000061533,
+          "totalBaseMs": 14.069299999975556
+        },
+        {
+          "wallMs": 29.040600000000268,
+          "commitCount": 7,
+          "totalActualMs": 15.097500000005766,
+          "maxCommitMs": 2.405099999999493,
+          "totalBaseMs": 13.691699999988487
+        },
+        {
+          "wallMs": 30.257100000000264,
+          "commitCount": 7,
+          "totalActualMs": 16.387700000011137,
+          "maxCommitMs": 2.9810999999976957,
+          "totalBaseMs": 14.961800000000949
+        },
+        {
+          "wallMs": 34.78690000000006,
+          "commitCount": 7,
+          "totalActualMs": 15.47760000002836,
+          "maxCommitMs": 2.583399999997255,
+          "totalBaseMs": 14.086500000025353
+        },
+        {
+          "wallMs": 28.259000000000015,
+          "commitCount": 7,
+          "totalActualMs": 15.218199999991157,
+          "maxCommitMs": 2.6963999999979933,
+          "totalBaseMs": 13.747199999985696
+        },
+        {
+          "wallMs": 42.65560000000005,
+          "commitCount": 7,
+          "totalActualMs": 18.041399999999157,
+          "maxCommitMs": 3.5774000000087653,
+          "totalBaseMs": 16.59950000001345
+        },
+        {
+          "wallMs": 29.178300000000036,
+          "commitCount": 7,
+          "totalActualMs": 15.8744000000097,
+          "maxCommitMs": 3.0002000000058615,
+          "totalBaseMs": 14.47890000001098
+        },
+        {
+          "wallMs": 29.37400000000025,
+          "commitCount": 7,
+          "totalActualMs": 16.219399999992675,
+          "maxCommitMs": 2.683700000009594,
+          "totalBaseMs": 14.811800000003586
+        }
+      ],
+      "median": {
+        "wallMs": 30.257100000000264,
+        "commitCount": 7,
+        "totalActualMs": 16.01769999999715,
+        "maxCommitMs": 2.7486999999941872,
+        "totalBaseMs": 14.622699999991255
+      },
+      "p95": {
+        "wallMs": 249.1564999999996,
+        "commitCount": 7,
+        "totalActualMs": 233.43049999999084,
+        "maxCommitMs": 35.48829999999907,
+        "totalBaseMs": 231.8466999999946
+      }
+    },
+    {
+      "id": "send-message",
+      "label": "发送消息：对话列表更新",
+      "scale": "100 条历史消息，新增第 101 条后按上限裁剪",
+      "runs": [
+        {
+          "wallMs": 76.11459999999988,
+          "commitCount": 2,
+          "totalActualMs": 36.3227000000129,
+          "maxCommitMs": 36.31830000001264,
+          "totalBaseMs": 71.22300000001815
+        },
+        {
+          "wallMs": 39.22109999999975,
+          "commitCount": 2,
+          "totalActualMs": 32.12650000000258,
+          "maxCommitMs": 32.12490000000298,
+          "totalBaseMs": 62.90180000001874
+        },
+        {
+          "wallMs": 16.19749999999931,
+          "commitCount": 2,
+          "totalActualMs": 2.887099999999009,
+          "maxCommitMs": 2.885399999998299,
+          "totalBaseMs": 4.546399999971982
+        },
+        {
+          "wallMs": 10.146700000000237,
+          "commitCount": 2,
+          "totalActualMs": 3.319600000038008,
+          "maxCommitMs": 3.3184000000374,
+          "totalBaseMs": 5.2316000000555505
+        },
+        {
+          "wallMs": 9.809699999999793,
+          "commitCount": 2,
+          "totalActualMs": 3.1996999999992113,
+          "maxCommitMs": 3.198099999999613,
+          "totalBaseMs": 5.130000000001019
+        },
+        {
+          "wallMs": 8.9333000000006,
+          "commitCount": 2,
+          "totalActualMs": 2.710899999998219,
+          "maxCommitMs": 2.7089999999980137,
+          "totalBaseMs": 4.247799999979179
+        },
+        {
+          "wallMs": 8.627400000000307,
+          "commitCount": 2,
+          "totalActualMs": 2.7551999999923282,
+          "maxCommitMs": 2.7534999999925276,
+          "totalBaseMs": 4.295599999972183
+        },
+        {
+          "wallMs": 9.145899999999529,
+          "commitCount": 2,
+          "totalActualMs": 2.839799999997922,
+          "maxCommitMs": 2.8380999999981213,
+          "totalBaseMs": 4.421600000006947
+        },
+        {
+          "wallMs": 9.301800000000185,
+          "commitCount": 2,
+          "totalActualMs": 2.887699999993856,
+          "maxCommitMs": 2.886299999993753,
+          "totalBaseMs": 4.535999999974592
+        },
+        {
+          "wallMs": 14.61619999999948,
+          "commitCount": 2,
+          "totalActualMs": 3.207799999998315,
+          "maxCommitMs": 3.2057999999979074,
+          "totalBaseMs": 5.098999999998341
+        },
+        {
+          "wallMs": 11.955500000000029,
+          "commitCount": 2,
+          "totalActualMs": 4.784699999978329,
+          "maxCommitMs": 4.782299999978022,
+          "totalBaseMs": 6.820999999998094
+        },
+        {
+          "wallMs": 83.3090000000002,
+          "commitCount": 2,
+          "totalActualMs": 39.23959999998351,
+          "maxCommitMs": 39.2345999999834,
+          "totalBaseMs": 76.71800000001167
+        }
+      ],
+      "median": {
+        "wallMs": 10.146700000000237,
+        "commitCount": 2,
+        "totalActualMs": 3.1996999999992113,
+        "maxCommitMs": 3.198099999999613,
+        "totalBaseMs": 5.098999999998341
+      },
+      "p95": {
+        "wallMs": 83.3090000000002,
+        "commitCount": 2,
+        "totalActualMs": 39.23959999998351,
+        "maxCommitMs": 39.2345999999834,
+        "totalBaseMs": 76.71800000001167
+      }
+    },
+    {
+      "id": "switch-worksheet",
+      "label": "切换工作表：范围选择器更新",
+      "scale": "100 条消息 + 演示工作簿 2 张表",
+      "runs": [
+        {
+          "wallMs": 5.09020000000055,
+          "commitCount": 1,
+          "totalActualMs": 2.854899999995723,
+          "maxCommitMs": 2.854899999995723,
+          "totalBaseMs": 2.589999999990141
+        },
+        {
+          "wallMs": 7.593899999999849,
+          "commitCount": 1,
+          "totalActualMs": 4.059300000000803,
+          "maxCommitMs": 4.059300000000803,
+          "totalBaseMs": 3.551299999980074
+        },
+        {
+          "wallMs": 5.054699999999684,
+          "commitCount": 1,
+          "totalActualMs": 2.6797999999998865,
+          "maxCommitMs": 2.6797999999998865,
+          "totalBaseMs": 2.4092000000000553
+        },
+        {
+          "wallMs": 4.5473000000001775,
+          "commitCount": 1,
+          "totalActualMs": 2.3450000000075306,
+          "maxCommitMs": 2.3450000000075306,
+          "totalBaseMs": 2.089500000010048
+        },
+        {
+          "wallMs": 3.895300000000134,
+          "commitCount": 1,
+          "totalActualMs": 2.157999999984895,
+          "maxCommitMs": 2.157999999984895,
+          "totalBaseMs": 1.9269000000049346
+        },
+        {
+          "wallMs": 4.583599999999933,
+          "commitCount": 1,
+          "totalActualMs": 2.337700000013683,
+          "maxCommitMs": 2.337700000013683,
+          "totalBaseMs": 2.1342999999933454
+        },
+        {
+          "wallMs": 4.496900000000096,
+          "commitCount": 1,
+          "totalActualMs": 2.4537999999984095,
+          "maxCommitMs": 2.4537999999984095,
+          "totalBaseMs": 2.249600000015562
+        },
+        {
+          "wallMs": 3.786300000000665,
+          "commitCount": 1,
+          "totalActualMs": 2.1055000000014843,
+          "maxCommitMs": 2.1055000000014843,
+          "totalBaseMs": 1.9021999999895343
+        },
+        {
+          "wallMs": 4.471999999999753,
+          "commitCount": 1,
+          "totalActualMs": 2.3645000000060463,
+          "maxCommitMs": 2.3645000000060463,
+          "totalBaseMs": 2.163700000013705
+        },
+        {
+          "wallMs": 4.63970000000063,
+          "commitCount": 1,
+          "totalActualMs": 2.4050999999853957,
+          "maxCommitMs": 2.4050999999853957,
+          "totalBaseMs": 2.2070999999996275
+        },
+        {
+          "wallMs": 39.757400000000416,
+          "commitCount": 1,
+          "totalActualMs": 37.02710000002298,
+          "maxCommitMs": 37.02710000002298,
+          "totalBaseMs": 36.77370000002702
+        },
+        {
+          "wallMs": 5.54989999999998,
+          "commitCount": 1,
+          "totalActualMs": 2.806199999978162,
+          "maxCommitMs": 2.806199999978162,
+          "totalBaseMs": 2.5724999999747524
+        }
+      ],
+      "median": {
+        "wallMs": 4.583599999999933,
+        "commitCount": 1,
+        "totalActualMs": 2.4050999999853957,
+        "maxCommitMs": 2.4050999999853957,
+        "totalBaseMs": 2.2070999999996275
+      },
+      "p95": {
+        "wallMs": 39.757400000000416,
+        "commitCount": 1,
+        "totalActualMs": 37.02710000002298,
+        "maxCommitMs": 37.02710000002298,
+        "totalBaseMs": 36.77370000002702
+      }
+    },
+    {
+      "id": "open-tools",
+      "label": "打开“我的工具”",
+      "scale": "50 个工具（配置上限）",
+      "runs": [
+        {
+          "wallMs": 15.957899999999427,
+          "commitCount": 1,
+          "totalActualMs": 12.933400000030815,
+          "maxCommitMs": 12.933400000030815,
+          "totalBaseMs": 8.976200000010977
+        },
+        {
+          "wallMs": 15.746799999999894,
+          "commitCount": 1,
+          "totalActualMs": 12.55700000001525,
+          "maxCommitMs": 12.55700000001525,
+          "totalBaseMs": 9.240699999992103
+        },
+        {
+          "wallMs": 34.7520999999997,
+          "commitCount": 1,
+          "totalActualMs": 16.99220000000514,
+          "maxCommitMs": 16.99220000000514,
+          "totalBaseMs": 11.608700000007047
+        },
+        {
+          "wallMs": 14.2458000000006,
+          "commitCount": 1,
+          "totalActualMs": 11.359199999997145,
+          "maxCommitMs": 11.359199999997145,
+          "totalBaseMs": 8.043999999989865
+        },
+        {
+          "wallMs": 19.33890000000065,
+          "commitCount": 1,
+          "totalActualMs": 12.139599999990423,
+          "maxCommitMs": 12.139599999990423,
+          "totalBaseMs": 8.88910000001124
+        },
+        {
+          "wallMs": 14.626599999999598,
+          "commitCount": 1,
+          "totalActualMs": 11.209299999994073,
+          "maxCommitMs": 11.209299999994073,
+          "totalBaseMs": 7.979699999996228
+        },
+        {
+          "wallMs": 15.782999999999447,
+          "commitCount": 1,
+          "totalActualMs": 12.990900000008878,
+          "maxCommitMs": 12.990900000008878,
+          "totalBaseMs": 9.623399999989488
+        },
+        {
+          "wallMs": 15.727100000000064,
+          "commitCount": 1,
+          "totalActualMs": 12.612499999977445,
+          "maxCommitMs": 12.612499999977445,
+          "totalBaseMs": 9.458899999985078
+        },
+        {
+          "wallMs": 14.766899999999623,
+          "commitCount": 1,
+          "totalActualMs": 12.093199999976605,
+          "maxCommitMs": 12.093199999976605,
+          "totalBaseMs": 8.948299999979099
+        },
+        {
+          "wallMs": 64.18159999999989,
+          "commitCount": 1,
+          "totalActualMs": 61.25620000002891,
+          "maxCommitMs": 61.25620000002891,
+          "totalBaseMs": 57.92239999998492
+        },
+        {
+          "wallMs": 70.18910000000051,
+          "commitCount": 1,
+          "totalActualMs": 60.82999999999993,
+          "maxCommitMs": 60.82999999999993,
+          "totalBaseMs": 57.56679999998596
+        },
+        {
+          "wallMs": 42.143200000000434,
+          "commitCount": 1,
+          "totalActualMs": 38.80869999998231,
+          "maxCommitMs": 38.80869999998231,
+          "totalBaseMs": 35.53129999998873
+        }
+      ],
+      "median": {
+        "wallMs": 15.782999999999447,
+        "commitCount": 1,
+        "totalActualMs": 12.612499999977445,
+        "maxCommitMs": 12.612499999977445,
+        "totalBaseMs": 9.240699999992103
+      },
+      "p95": {
+        "wallMs": 70.18910000000051,
+        "commitCount": 1,
+        "totalActualMs": 61.25620000002891,
+        "maxCommitMs": 61.25620000002891,
+        "totalBaseMs": 57.92239999998492
+      }
+    },
+    {
+      "id": "open-plan-editor",
+      "label": "打开计划编辑器",
+      "scale": "50 个白名单动作的格式化 JSON",
+      "runs": [
+        {
+          "wallMs": 12.680299999999988,
+          "commitCount": 2,
+          "totalActualMs": 9.932299999998577,
+          "maxCommitMs": 9.740600000000086,
+          "totalBaseMs": 0.6674000000029991
+        },
+        {
+          "wallMs": 14.519100000000435,
+          "commitCount": 2,
+          "totalActualMs": 6.636700000002747,
+          "maxCommitMs": 6.506900000001224,
+          "totalBaseMs": 0.526199999999335
+        },
+        {
+          "wallMs": 13.64640000000054,
+          "commitCount": 2,
+          "totalActualMs": 6.889100000002145,
+          "maxCommitMs": 6.713800000002266,
+          "totalBaseMs": 0.6289000000006126
+        },
+        {
+          "wallMs": 27.23950000000059,
+          "commitCount": 2,
+          "totalActualMs": 6.109200000000783,
+          "maxCommitMs": 5.965400000001864,
+          "totalBaseMs": 0.5118000000020402
+        },
+        {
+          "wallMs": 14.077100000000428,
+          "commitCount": 2,
+          "totalActualMs": 6.6734999999926,
+          "maxCommitMs": 6.499999999992724,
+          "totalBaseMs": 0.5500999999958367
+        },
+        {
+          "wallMs": 14.02520000000004,
+          "commitCount": 2,
+          "totalActualMs": 5.56170000000111,
+          "maxCommitMs": 5.383800000001429,
+          "totalBaseMs": 0.4988000000021202
+        },
+        {
+          "wallMs": 14.070999999999913,
+          "commitCount": 2,
+          "totalActualMs": 5.917799999996532,
+          "maxCommitMs": 5.758299999997689,
+          "totalBaseMs": 0.47369999999773427
+        },
+        {
+          "wallMs": 14.193500000000313,
+          "commitCount": 2,
+          "totalActualMs": 5.629199999994853,
+          "maxCommitMs": 5.478099999994811,
+          "totalBaseMs": 0.4817000000002736
+        },
+        {
+          "wallMs": 14.050599999999577,
+          "commitCount": 2,
+          "totalActualMs": 5.824500000003354,
+          "maxCommitMs": 5.650200000004588,
+          "totalBaseMs": 0.46379999999862775
+        },
+        {
+          "wallMs": 28.376400000000103,
+          "commitCount": 2,
+          "totalActualMs": 5.4987000000010084,
+          "maxCommitMs": 5.321300000001429,
+          "totalBaseMs": 0.44500000000425644
+        },
+        {
+          "wallMs": 12.432699999999386,
+          "commitCount": 2,
+          "totalActualMs": 5.648300000002564,
+          "maxCommitMs": 5.353100000003906,
+          "totalBaseMs": 0.5117000000036569
+        },
+        {
+          "wallMs": 14.11449999999968,
+          "commitCount": 2,
+          "totalActualMs": 5.39560000000165,
+          "maxCommitMs": 5.250400000001719,
+          "totalBaseMs": 0.402299999999741
+        }
+      ],
+      "median": {
+        "wallMs": 14.070999999999913,
+        "commitCount": 2,
+        "totalActualMs": 5.824500000003354,
+        "maxCommitMs": 5.650200000004588,
+        "totalBaseMs": 0.4988000000021202
+      },
+      "p95": {
+        "wallMs": 28.376400000000103,
+        "commitCount": 2,
+        "totalActualMs": 9.932299999998577,
+        "maxCommitMs": 9.740600000000086,
+        "totalBaseMs": 0.6674000000029991
+      }
+    }
+  ]
+}

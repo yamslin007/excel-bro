@@ -289,6 +289,106 @@ export interface QueryTableAccumulator {
   finish(): DataToolResult;
 }
 
+/** 一块待读取的表格区域，用索引描述，便于分块取子区域。 */
+export interface SheetReadRegion {
+  name: string;
+  worksheet: Excel.Worksheet;
+  rowIndex: number;
+  columnIndex: number;
+  rowCount: number;
+  columnCount: number;
+}
+
+export interface SheetReadOptions {
+  /** 用于识别表头行：优先挑包含这些字段名的行。 */
+  queryArguments: QueryTableArguments;
+  /**
+   * detect（默认）= 按 queryArguments 的字段名在前几行里识别表头；
+   * synthesize = 源数据没有表头，用「列1、列2……」补一行，所有行都算数据。
+   */
+  headerMode?: "detect" | "synthesize";
+  signal?: AbortSignal;
+  /** 每读完一块回调一次，参数是这一块的行数。 */
+  onChunk?: (rowsRead: number) => void;
+}
+
+/**
+ * 把一张表分块读进累加器。
+ *
+ * 分块是为了避免一次 load 整表撑爆 Office.js 的请求负载。累加器的 `addSheet`
+ * 把每次调用都当成一张独立的表来解析，所以第二块起必须手动把首块识别出的表头
+ * 行拼回去 —— 否则后续块的第一行数据会被当成表头吞掉，分组统计会静默算错，
+ * 而且只在数据超过一个分块（chunkRows）时才暴露。
+ */
+export async function readSheetIntoAccumulator(
+  context: Excel.RequestContext,
+  region: SheetReadRegion,
+  accumulator: QueryTableAccumulator,
+  options: SheetReadOptions
+): Promise<number> {
+  if (region.rowCount <= 0 || region.columnCount <= 0) {
+    accumulator.addSheet({ name: region.name, values: [] });
+    return 0;
+  }
+
+  let header: CellValue[] | null = null;
+  let rowsRead = 0;
+  for (
+    let rowOffset = 0;
+    rowOffset < region.rowCount;
+    rowOffset += TOOL_CHUNK_ROWS
+  ) {
+    if (options.signal?.aborted) {
+      throw new DataToolExecutionError(
+        "CANCELLED",
+        "本地查询已取消，未生成或写入任何结果",
+        false
+      );
+    }
+    const rowCount = Math.min(TOOL_CHUNK_ROWS, region.rowCount - rowOffset);
+    const range = region.worksheet.getRangeByIndexes(
+      region.rowIndex + rowOffset,
+      region.columnIndex,
+      rowCount,
+      region.columnCount
+    );
+    range.load("values,text,numberFormat");
+    await context.sync();
+    const values = range.values.map((row, rowIndex) =>
+      row.map((value, columnIndex) =>
+        normalizeCellValue(
+          value,
+          range.text[rowIndex]?.[columnIndex] ?? "",
+          range.numberFormat[rowIndex]?.[columnIndex] ?? "General"
+        )
+      )
+    );
+    if (header === null) {
+      if (options.headerMode === "synthesize") {
+        // 源数据没有表头：造一行「列1、列2……」，这样所有真实行都算数据，
+        // 且查询里的字段名可以用这套合成名引用。
+        header = Array.from(
+          { length: region.columnCount },
+          (_, index) => `列${index + 1}`
+        );
+        accumulator.addSheet({ name: region.name, values: [header, ...values] });
+      } else {
+        const headerIndex = detectHeaderIndex(
+          values,
+          requiredFields(options.queryArguments)
+        );
+        header = values[headerIndex] ?? [];
+        accumulator.addSheet({ name: region.name, values });
+      }
+    } else {
+      accumulator.addSheet({ name: region.name, values: [header, ...values] });
+    }
+    rowsRead += rowCount;
+    options.onChunk?.(rowCount);
+  }
+  return rowsRead;
+}
+
 export function createQueryTableAccumulator(
   request: DataToolRequest
 ): QueryTableAccumulator {
@@ -843,57 +943,30 @@ export async function executeQueryTableTool(
     const accumulator = createQueryTableAccumulator(request);
     let scannedRows = 0;
     for (const { name, worksheet, usedRange } of pending) {
-      let header: CellValue[] | null = null;
-      if (!usedRange.isNullObject) {
-        for (
-          let rowOffset = 0;
-          rowOffset < usedRange.rowCount;
-          rowOffset += TOOL_CHUNK_ROWS
-        ) {
-          if (options.signal?.aborted) {
-            throw new DataToolExecutionError(
-              "CANCELLED",
-              "本地查询已取消，未生成或写入任何结果",
-              false
-            );
-          }
-          const rowCount = Math.min(
-            TOOL_CHUNK_ROWS,
-            usedRange.rowCount - rowOffset
-          );
-          const range = worksheet.getRangeByIndexes(
-            usedRange.rowIndex + rowOffset,
-            usedRange.columnIndex,
-            rowCount,
-            usedRange.columnCount
-          );
-          range.load("values,text,numberFormat");
-          await context.sync();
-          const values = range.values.map((row, rowIndex) =>
-            row.map((value, columnIndex) =>
-                normalizeCellValue(
-                  value,
-                  range.text[rowIndex]?.[columnIndex] ?? "",
-                  range.numberFormat[rowIndex]?.[columnIndex] ?? "General"
-                )
-              )
-          );
-          if (header === null) {
-            const headerIndex = detectHeaderIndex(
-              values,
-              requiredFields(request.arguments)
-            );
-            header = values[headerIndex] ?? [];
-            accumulator.addSheet({ name, values });
-          } else {
-            accumulator.addSheet({ name, values: [header, ...values] });
-          }
-          scannedRows += rowCount;
-          options.onProgress?.({ scannedRows, totalRows, sheet: name });
-        }
-      } else {
+      if (usedRange.isNullObject) {
         accumulator.addSheet({ name, values: [] });
+        continue;
       }
+      await readSheetIntoAccumulator(
+        context,
+        {
+          name,
+          worksheet,
+          rowIndex: usedRange.rowIndex,
+          columnIndex: usedRange.columnIndex,
+          rowCount: usedRange.rowCount,
+          columnCount: usedRange.columnCount
+        },
+        accumulator,
+        {
+          queryArguments: request.arguments,
+          signal: options.signal,
+          onChunk: (rowsRead) => {
+            scannedRows += rowsRead;
+            options.onProgress?.({ scannedRows, totalRows, sheet: name });
+          }
+        }
+      );
     }
     return accumulator.finish();
   });

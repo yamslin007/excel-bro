@@ -68,7 +68,7 @@ async def generate_formula_with_tool_call(
 
     try:
         async with OpenAICompatibleClient(config, timeout=timeout) as client:
-            response = await client.chat_completions(
+            response, _ = await client.chat_completions(
                 messages=messages,
                 max_tokens=max_tokens,
                 temperature=0.1,  # 低温度保证结构输出稳定

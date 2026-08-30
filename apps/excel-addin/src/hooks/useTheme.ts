@@ -113,7 +113,8 @@ function rootStyle(): CSSStyleDeclaration {
   return document.documentElement.style;
 }
 
-function applyPalette(preset: ThemePreset): void {
+/** 把主题预设的调色板应用到当前 documentElement（独立窗口复用）。 */
+export function applyThemePalette(preset: ThemePreset): void {
   const palette = PRESETS[preset];
   const style = rootStyle();
   style.setProperty("--color-background", palette.background);
@@ -180,7 +181,7 @@ export function useTheme() {
       try {
         const stored = await loadThemeSettings();
         const next = stored ?? DEFAULT_SETTINGS;
-        applyPalette(next.preset);
+        applyThemePalette(next.preset);
         applyMask(next.autoMask);
         setSettings(next);
 
@@ -211,7 +212,7 @@ export function useTheme() {
 
   const applyPreset = useCallback(
     async (preset: ThemePreset) => {
-      applyPalette(preset);
+      applyThemePalette(preset);
       await persist({ ...settings, preset });
     },
     [persist, settings]
@@ -289,7 +290,7 @@ export function useTheme() {
   );
 
   const resetTheme = useCallback(async () => {
-    applyPalette("default");
+    applyThemePalette("default");
     await removeBackground();
     await persist({ ...DEFAULT_SETTINGS });
   }, [persist, removeBackground]);

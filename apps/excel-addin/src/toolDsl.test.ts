@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AnalysisPlan } from "./contracts";
-import { renderToolDsl } from "./toolDsl";
+import { highlightToolDsl, renderToolDsl } from "./toolDsl";
 
 describe("renderToolDsl", () => {
   it("renders a split aggregate tool as a deterministic controlled plan", () => {
@@ -70,5 +70,33 @@ describe("renderToolDsl", () => {
     expect(dsl).toContain('SUMMARY "第一行\\n第二行"');
     expect(dsl).toContain("VALUES = <MATRIX ROWS=2 COLUMNS=2>");
     expect(dsl).not.toContain("[1, 2]");
+  });
+});
+
+describe("highlightToolDsl", () => {
+  it("wraps keywords, keys, strings and numbers in token spans", () => {
+    const html = highlightToolDsl(
+      'TOOL "按影片拆分"\n  MAX_OUTPUT_SHEETS = 200'
+    );
+    expect(html).toContain('<span class="tk-kw">TOOL</span>');
+    expect(html).toContain('<span class="tk-str">"按影片拆分"</span>');
+    expect(html).toContain('<span class="tk-key">MAX_OUTPUT_SHEETS</span>');
+    expect(html).toContain('<span class="tk-num">200</span>');
+  });
+
+  it("highlights matrix tags and boolean/null values", () => {
+    const html = highlightToolDsl(
+      "  VALUES = <MATRIX ROWS=2 COLUMNS=2>\n  ARBITRARY_CODE = DISABLED\n  FLAG = TRUE\n  X = NULL"
+    );
+    expect(html).toContain('<span class="tk-tag">&lt;MATRIX ROWS=2 COLUMNS=2&gt;</span>');
+    expect(html).toContain('<span class="tk-bool">TRUE</span>');
+    expect(html).toContain('<span class="tk-null">NULL</span>');
+    expect(html).toContain('<span class="tk-key">ARBITRARY_CODE</span>');
+  });
+
+  it("escapes HTML inside string values", () => {
+    const html = highlightToolDsl('SUMMARY "a <b>&</b>"');
+    expect(html).not.toContain("<b>");
+    expect(html).toContain("&lt;b&gt;&amp;&lt;/b&gt;");
   });
 });

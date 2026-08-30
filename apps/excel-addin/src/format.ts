@@ -130,6 +130,8 @@ export function actionLabel(
       return `按「${action.splitBy}」拆分「${action.sheet}」，并按 ${action.groupBy.join(
         "、"
       )} 汇总`;
+    case "computeValues":
+      return `从「${action.sourceSheet}」计算并写入「${action.sheet}」${action.destinationCell}`;
     case "addNamedRange":
       return `为「${action.sheet}」${action.range} 创建名称「${action.name}」`;
     case "addImage":

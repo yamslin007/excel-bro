@@ -13,8 +13,10 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel
 
 from .capabilities import capabilities
+from .capabilities import model_timeout_seconds
 from .intent import check_intent
 from .folder_workbooks import (
     FolderCatalog,
@@ -30,6 +32,7 @@ from .folder_workbooks import (
     select_and_scan_folder,
 )
 from .models import (
+    AnalysisPlan,
     AssistantResponse,
     DataToolResult,
     IntentCheckRequest,
@@ -65,6 +68,7 @@ from .llm import (
     update_model_api_key,
 )
 from .planner import create_plan
+from .plan_chat import chat_modify_plan
 from .rule_generator import (
     GenerateFormulaRequest,
     GenerateFormulaResponse,
@@ -681,6 +685,65 @@ async def plan(request: PlanRequest) -> AssistantResponse:
     except ValueError as error:
         raise service_error(
             422, "INVALID_REQUEST", str(error), retryable=False
+        ) from error
+
+
+@app.post("/api/plans/validate", response_model=AnalysisPlan)
+async def validate_plan(plan: AnalysisPlan) -> AnalysisPlan:
+    """校验并规范化一份手工编辑过的计划。
+
+    保存编辑后的计划必须过这一关，返回的是**规范化之后**的计划（验收条件、
+    去重后的 warnings 等都由 AnalysisPlan 的校验器重算）。前端不允许自己拼
+    acceptanceCriteria —— 计划内容、liveness、指纹、验收条件这四样只要有两样
+    对不上，就会出现「保存成功但执行时验证失败」这种最难查的沉默错。
+
+    FastAPI 会在请求体不合法时直接返回 422 + Pydantic 的逐字段报错，正好是
+    编辑器需要的反馈，所以这里不额外包装。
+    """
+    return plan
+
+
+class PlanChatRequest(BaseModel):
+    plan: AnalysisPlan
+    message: str
+    modelId: str | None = None
+
+
+class PlanChatResponse(BaseModel):
+    explanation: str
+    modifiedPlan: AnalysisPlan
+
+
+@app.post("/api/plans/chat-modify", response_model=PlanChatResponse)
+async def plan_chat_modify(request: PlanChatRequest) -> PlanChatResponse:
+    """AI 辅助修改计划。
+
+    用户提供当前计划和自然语言描述，AI 返回修改建议和完整的新计划。
+    """
+    try:
+        config = selected_model_config(request.modelId)
+        explanation, modified_plan = await chat_modify_plan(
+            current_plan=request.plan,
+            user_message=request.message,
+            connection=config,
+            timeout=model_timeout_seconds(),
+        )
+        return PlanChatResponse(
+            explanation=explanation,
+            modifiedPlan=modified_plan
+        )
+    except (
+        LLMTimeoutError,
+        LLMConnectError,
+        LLMHTTPStatusError,
+        LLMTransportError,
+        LLMResponseError,
+    ) as error:
+        status, code, message, retryable = _map_turn_error(error)
+        raise service_error(status, code, message, retryable=retryable) from error
+    except ValueError as error:
+        raise service_error(
+            422, "INVALID_PLAN_MODIFICATION", str(error), retryable=False
         ) from error
 
 

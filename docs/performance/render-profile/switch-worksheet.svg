@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="430" viewBox="0 0 900 430">
+  <rect width="100%" height="100%" fill="#0f172a"/>
+  <text x="48" y="42" fill="#f8fafc" font-size="24" font-family="Segoe UI, sans-serif" font-weight="700">切换工作表：范围选择器更新</text>
+  <text x="48" y="68" fill="#94a3b8" font-size="14" font-family="Segoe UI, sans-serif">React Profiler actualDuration · 100 条消息 + 演示工作簿 2 张表 · 12 次</text>
+  <line x1="72" y1="233.9710158236125" x2="852" y2="233.9710158236125" stroke="#f59e0b" stroke-width="2" stroke-dasharray="7 6"/>
+  <text x="762" y="225.9710158236125" fill="#fbbf24" font-size="13" font-family="Segoe UI, sans-serif">16ms 阈值</text>
+  <line x1="72" y1="342" x2="852" y2="342" stroke="#475569"/>
+  <line x1="72" y1="92" x2="72" y2="342" stroke="#475569"/>
+  <polyline points="72,322.7242533172058 142.9090909090909,314.59237153329394 213.8181818181818,323.90649551275806 284.72727272727275,326.1670020065974 355.6363636363636,327.42959075931174 426.5454545454545,326.2162902305863 497.45454545454544,325.4324049142595 568.3636363636364,327.7840608635285 639.2727272727273,326.0353416821424 710.1818181818181,325.76121813493427 781.090909090909,92 852,323.05306653791126" fill="none" stroke="#38bdf8" stroke-width="3"/>
+  <circle cx="72" cy="322.7242533172058" r="4" fill="#7dd3fc"/>
+  <circle cx="142.9090909090909" cy="314.59237153329394" r="4" fill="#7dd3fc"/>
+  <circle cx="213.8181818181818" cy="323.90649551275806" r="4" fill="#7dd3fc"/>
+  <circle cx="284.72727272727275" cy="326.1670020065974" r="4" fill="#7dd3fc"/>
+  <circle cx="355.6363636363636" cy="327.42959075931174" r="4" fill="#7dd3fc"/>
+  <circle cx="426.5454545454545" cy="326.2162902305863" r="4" fill="#7dd3fc"/>
+  <circle cx="497.45454545454544" cy="325.4324049142595" r="4" fill="#7dd3fc"/>
+  <circle cx="568.3636363636364" cy="327.7840608635285" r="4" fill="#7dd3fc"/>
+  <circle cx="639.2727272727273" cy="326.0353416821424" r="4" fill="#7dd3fc"/>
+  <circle cx="710.1818181818181" cy="325.76121813493427" r="4" fill="#7dd3fc"/>
+  <circle cx="781.090909090909" cy="92" r="4" fill="#7dd3fc"/>
+  <circle cx="852" cy="323.05306653791126" r="4" fill="#7dd3fc"/>
+  <text x="48" y="382" fill="#e2e8f0" font-size="15" font-family="Segoe UI, sans-serif">中位最大 commit：2.41ms</text>
+  <text x="310" y="382" fill="#e2e8f0" font-size="15" font-family="Segoe UI, sans-serif">P95 最大 commit：37.03ms</text>
+  <text x="560" y="382" fill="#e2e8f0" font-size="15" font-family="Segoe UI, sans-serif">P95 交互墙钟：39.76ms</text>
+  <text x="48" y="410" fill="#64748b" font-size="12" font-family="Segoe UI, sans-serif">CPU/DOM 渲染采样；不包含网络、Excel COM 与真实浏览器布局绘制。</text>
+</svg>

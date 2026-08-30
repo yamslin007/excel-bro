@@ -767,6 +767,8 @@ def _preflight_folder_plan(
         "deleteRange",
         "createPivotTable",
         "addShape",
+        # computeValues 靠 Excel 端在执行时读实时数据求值，文件夹模式没有那条通路。
+        "computeValues",
     }
     sheet_names: dict[Path, set[str]] = {}
     object_names: dict[Path, set[str]] = {}

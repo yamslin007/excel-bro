@@ -803,6 +803,31 @@ export function deleteTool(toolId: string): SavedTool[] {
   return persistTools(loadTools().filter((tool) => tool.id !== toolId));
 }
 
+/**
+ * 把编辑过的计划写回固化工具。
+ *
+ * 参数是从 planTemplate 反推出来的（哪个动作的哪个属性该暴露成工作表/字段选项），
+ * 所以换了计划就必须重算参数 —— 否则运行工具时会拿旧参数去绑不存在的动作下标。
+ * 审批项同理：编辑后可能新引入了固定内容或破坏性动作。
+ */
+export function updateToolPlanTemplate(
+  toolId: string,
+  plan: AnalysisPlan
+): SavedTool[] {
+  const current = loadTools();
+  const target = current.find((tool) => tool.id === toolId);
+  if (!target) {
+    throw new Error("未找到要更新的工具");
+  }
+  return saveTool(
+    refreshToolParameters({
+      ...target,
+      planTemplate: structuredClone(plan),
+      approvals: analyzeToolEligibility(plan).requiredApprovals
+    })
+  );
+}
+
 function assertCompileContext(
   parameter: ToolParameter,
   value: string,

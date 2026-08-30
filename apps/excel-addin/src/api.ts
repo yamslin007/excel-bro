@@ -27,6 +27,17 @@ import {
 } from "./contracts";
 import { recordModelCall } from "./diagnostics";
 
+export interface PlanChatRequest {
+  plan: AnalysisPlan;
+  message: string;
+  modelId?: string;
+}
+
+export interface PlanChatResponse {
+  explanation: string;
+  modifiedPlan: AnalysisPlan;
+}
+
 const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8765";
 
@@ -402,6 +413,24 @@ export async function deleteModelConnection(
   return value;
 }
 
+/**
+ * 把手工编辑过的计划送去服务端校验，拿回**规范化之后**的计划。
+ *
+ * 验收条件由服务端的 AnalysisPlan 校验器重算 —— 前端绝不自己拼，否则计划内容
+ * 和验收条件会各说各话，执行时才暴露。
+ */
+export async function validatePlan(plan: AnalysisPlan): Promise<AnalysisPlan> {
+  const response = await fetch(`${API_BASE_URL}/api/plans/validate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(plan)
+  });
+  if (!response.ok) {
+    throw await requestError(response, "计划校验失败");
+  }
+  return (await response.json()) as AnalysisPlan;
+}
+
 export async function selectFolder(): Promise<FolderCatalog | null> {
   const response = await fetch(`${API_BASE_URL}/api/folders/select`, {
     method: "POST"
@@ -468,4 +497,20 @@ export async function generateFormula(
     body: JSON.stringify(request)
   });
   return responseJson<GenerateFormulaResponse>(response);
+}
+
+export async function chatModifyPlan(
+  request: PlanChatRequest,
+  signal?: AbortSignal
+): Promise<PlanChatResponse> {
+  const response = await fetch(`${API_BASE_URL}/api/plans/chat-modify`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(request),
+    signal
+  });
+  if (!response.ok) {
+    throw await requestError(response, "AI 辅助修改计划失败");
+  }
+  return responseJson<PlanChatResponse>(response);
 }

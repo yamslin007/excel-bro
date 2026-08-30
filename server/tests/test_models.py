@@ -490,3 +490,69 @@ def test_split_aggregate_rejects_duplicate_output_names() -> None:
                 ],
             }
         )
+
+
+def _compute_values_plan(**overrides: object) -> dict[str, object]:
+    query: dict[str, object] = {
+        "mode": "aggregate",
+        "scope": "selected",
+        "groupBy": ["部门"],
+        "metrics": [
+            {"operation": "sum", "field": "金额", "outputName": "总金额"}
+        ],
+        "sortBy": "总金额",
+        "sortDirection": "desc",
+        "limit": 20,
+    }
+    query.update(overrides.pop("query", {}))  # type: ignore[arg-type]
+    action: dict[str, object] = {
+        "type": "computeValues",
+        "sheet": "结果",
+        "sourceSheet": "原始数据",
+        "sourceRange": "A1:D500",
+        "hasHeaders": True,
+        "query": query,
+        "destinationCell": "A1",
+        "includeHeaders": True,
+    }
+    action.update(overrides)
+    return {
+        "id": "compute-1",
+        "title": "按部门汇总",
+        "summary": "执行时读取实时数据求和",
+        "actions": [action],
+    }
+
+
+def test_compute_values_never_gets_a_range_equals_criterion() -> None:
+    """执行时求值的动作行数未知，补 rangeEquals 会被尺寸校验直接拒掉。"""
+
+    plan = AnalysisPlan.model_validate(_compute_values_plan())
+
+    assert [item.type for item in plan.acceptanceCriteria] == ["worksheetExists"]
+    assert plan.acceptanceCriteria[0].sheet == "结果"
+    assert any("执行时" in warning for warning in plan.warnings)
+
+
+def test_compute_values_carries_no_baked_result() -> None:
+    """动作体里只有查询配置，没有任何算好的矩阵字段。"""
+
+    plan = AnalysisPlan.model_validate(_compute_values_plan())
+    action = plan.actions[0]
+
+    assert action.type == "computeValues"
+    assert not hasattr(action, "values")
+    assert not hasattr(action, "rows")
+    assert action.query.groupBy == ["部门"]
+
+
+def test_compute_values_requires_a_single_destination_cell() -> None:
+    with pytest.raises(ValidationError, match="必须是单个单元格"):
+        AnalysisPlan.model_validate(_compute_values_plan(destinationCell="A1:C9"))
+
+
+def test_compute_values_rejects_blank_field_names() -> None:
+    with pytest.raises(ValidationError, match="字段名不能为空"):
+        AnalysisPlan.model_validate(
+            _compute_values_plan(query={"groupBy": ["部门", "  "]})
+        )

@@ -479,11 +479,18 @@ class _FakeClient:
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
-        return {
-            "choices": [
-                {"message": {"content": self.content}, "finish_reason": "stop"}
-            ]
-        }
+        return (
+            {
+                "choices": [
+                    {"message": {"content": self.content}, "finish_reason": "stop"}
+                ]
+            },
+            {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+            },
+        )
 
 
 def _run(coro):

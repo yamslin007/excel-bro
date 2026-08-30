@@ -318,6 +318,8 @@ ExcelApi 1.15 的数据源字符串读取。修改最低版本时必须同步预
 - `test_main.py`：API 和错误协议
 - `test_models.py`：Pydantic 模型
 - `test_planner.py`：基础模式和规划
+- `test_agent_loop_protection.py`：Agent 预算、循环检测、降级与收尾提示
+- `test_agent_integration.py`：Agent 主循环熔断和警告注入
 - `test_folder_workbooks.py`：文件夹执行
 - `test_folder_data.py`：pandas 完整数据、跨文件 ID、权限边界、合并和关联
 - `test_no_business_hardcoding.py`：防止行业字段重新硬编码

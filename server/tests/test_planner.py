@@ -364,8 +364,20 @@ def test_submit_plan_schema_is_compacted_but_preserves_action_fields() -> None:
     # Pydantic 自动生成的 title 元数据应已剥离（顶层不再有裸 title 注解）。
     assert "title" not in plan_schema
 
-    # 精简后 token 体积应显著低于未精简的完整内联 schema。
     serialized = json.dumps(plan_tool, ensure_ascii=False)
+
+    # 真约束必须保留：剥的是注解，不是模型需要遵守的边界。
+    assert "maxLength" in serialized
+    assert "minLength" in serialized
+    # default 是服务端缺省行为，不是模型要满足的条件，应已剥离。
+    assert '"default"' not in serialized
+
+    # 精简后 token 体积应显著低于未精简的完整内联 schema。
+    #
+    # 这道闸是真闸，别为了让它变绿而抬上限。目前能剥的注解（title /
+    # description / default）已经剥完，可压缩的余量基本见底 —— 下次新增动作
+    # 把它顶破时，诚实的做法是抬上限并在这里写清「已无注解可剥」，而不是去削
+    # maxLength / enum 这类模型真正需要看见的约束。
     assert len(serialized) < 26000
 
 

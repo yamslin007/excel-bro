@@ -120,6 +120,7 @@ server/app/
 ├── intent.py               # 意图判断和澄清
 ├── planner.py              # 基础模式与最终规划
 ├── excel_agent.py          # 模型工具循环
+├── agent_loop_protection.py # Agent 预算、循环检测和安全降级
 ├── turn_state.py           # turnId 状态、TTL 和缓存
 ├── folder_workbooks.py     # 文件夹执行
 ├── folder_data.py          # 文件夹确定性查询
@@ -130,6 +131,20 @@ server/app/
 ├── formula_tools_integration.py  # 工具调用路径与主流程的衔接
 └── llm/                    # 模型调用、错误和重试
 ```
+
+### Agent 循环保护
+
+excel_agent.py 的每轮模型调用都由 LoopState 追踪工具路径、缓存命中、连续结构
+错误、累计 token、墙上时间和快照截断。循环开始前按固定顺序检查四层预算闸：
+最大轮次、累计 token、墙上时间、连续错误。检测层还会识别重复缓存查询以及
+2 至 4 步的重复工具路径，并把一次性警告附加到工具结果；接近预算尾部时，
+根据发散、收敛失败或循环状态向最后一条用户消息追加收尾提示。
+
+达到任一预算或耗尽轮次后不再抛出裸异常，而是返回 provider 为 system 的
+AnswerResponse，其中包含停止原因、压缩后的工具调用记录和针对截断、格式错误
+或循环的建议。限额集中在 config/capabilities.json 的 agent 段。
+OpenAI-compatible 适配器统一返回 payload 与 usage；缺失 usage 的服务会得到零值
+token 统计。
 
 ### /function 公式生成链路
 
@@ -169,6 +184,8 @@ server/app/
 - `GET /api/diagnostics`：诊断信息
 
 前端协议定义在 `apps/excel-addin/src/contracts.ts`，后端协议镜像在 `server/app/models.py`。
+AnswerResponse.provider 支持 model、local 和用于预算熔断降级的 system；
+PlanResponse.provider 仍只允许 model 或 local。
 
 ## 关键设计决策
 

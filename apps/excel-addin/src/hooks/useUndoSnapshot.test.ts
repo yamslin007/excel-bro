@@ -13,7 +13,18 @@ vi.mock("../excel", () => ({
 const isRunningInExcelMock = vi.mocked(isRunningInExcel);
 const undoExecutionMock = vi.mocked(undoExecution);
 
-const snapshot = { ranges: [] } as unknown as ExecutionUndoSnapshot;
+const snapshot = makeSnapshot("plan-1");
+
+function makeSnapshot(planId: string): ExecutionUndoSnapshot {
+  return {
+    planId,
+    capturedAt: "2026-08-22T00:00:00.000Z",
+    ranges: [],
+    createdWorksheets: [],
+    deletedWorksheets: [],
+    skippedWorksheets: []
+  };
+}
 
 describe("useUndoSnapshot", () => {
   beforeEach(() => {
@@ -43,7 +54,7 @@ describe("useUndoSnapshot", () => {
       })
     );
 
-    act(() => result.current.setLastUndoSnapshot(snapshot));
+    act(() => result.current.pushUndoSnapshot(snapshot));
     expect(result.current.lastUndoSnapshot).toBe(snapshot);
 
     act(() => result.current.clearUndoSnapshot());
@@ -80,7 +91,7 @@ describe("useUndoSnapshot", () => {
       })
     );
 
-    act(() => result.current.setLastUndoSnapshot(snapshot));
+    act(() => result.current.pushUndoSnapshot(snapshot));
     await act(async () => {
       await result.current.undoLastExecution();
     });
@@ -108,7 +119,7 @@ describe("useUndoSnapshot", () => {
       })
     );
 
-    act(() => result.current.setLastUndoSnapshot(snapshot));
+    act(() => result.current.pushUndoSnapshot(snapshot));
 
     await act(async () => {
       await result.current.undoLastExecution();
@@ -119,7 +130,7 @@ describe("useUndoSnapshot", () => {
     expect(onStatusChange).toHaveBeenNthCalledWith(1, "executing");
     expect(onStatusChange).toHaveBeenLastCalledWith("idle");
     expect(onMessage).toHaveBeenCalledWith(
-      "已撤销上一次执行中记录的单元格值、公式和常用格式。"
+      "已撤销上一次执行中记录的单元格值、公式和格式。"
     );
     expect(onAfterUndo).toHaveBeenCalledTimes(1);
   });
@@ -136,7 +147,7 @@ describe("useUndoSnapshot", () => {
       })
     );
 
-    act(() => result.current.setLastUndoSnapshot(snapshot));
+    act(() => result.current.pushUndoSnapshot(snapshot));
 
     await act(async () => {
       await result.current.undoLastExecution();
@@ -145,5 +156,78 @@ describe("useUndoSnapshot", () => {
     expect(onMessage).toHaveBeenCalledWith("undo failed");
     expect(onStatusChange).toHaveBeenLastCalledWith("idle");
     expect(result.current.lastUndoSnapshot).toBe(snapshot);
+  });
+
+  it("keeps multiple snapshots with the newest on top", () => {
+    const { result } = renderHook(() =>
+      useUndoSnapshot({
+        isBusy: false,
+        onStatusChange: vi.fn(),
+        onMessage: vi.fn()
+      })
+    );
+
+    const first = makeSnapshot("plan-1");
+    const second = makeSnapshot("plan-2");
+    act(() => result.current.pushUndoSnapshot(first));
+    act(() => result.current.pushUndoSnapshot(second));
+
+    expect(result.current.undoStack).toEqual([first, second]);
+    expect(result.current.lastUndoSnapshot).toBe(second);
+  });
+
+  it("cascades undo from the newest back to the requested plan", async () => {
+    const onMessage = vi.fn();
+    const { result } = renderHook(() =>
+      useUndoSnapshot({
+        isBusy: false,
+        onStatusChange: vi.fn(),
+        onMessage
+      })
+    );
+
+    const first = makeSnapshot("plan-1");
+    const second = makeSnapshot("plan-2");
+    const third = makeSnapshot("plan-3");
+    act(() => result.current.pushUndoSnapshot(first));
+    act(() => result.current.pushUndoSnapshot(second));
+    act(() => result.current.pushUndoSnapshot(third));
+
+    await act(async () => {
+      await result.current.undoExecutionTo("plan-2");
+    });
+
+    // 逆序撤销：先 plan-3 再 plan-2，plan-1 保留。
+    expect(undoExecutionMock.mock.calls.map((call) => call[0])).toEqual([
+      third,
+      second
+    ]);
+    expect(result.current.undoStack).toEqual([first]);
+    expect(onMessage).toHaveBeenCalledWith(
+      "已撤销最近 2 次执行中记录的单元格值、公式和格式。"
+    );
+  });
+
+  it("keeps the failing snapshot on the stack for retry", async () => {
+    undoExecutionMock.mockRejectedValueOnce(new Error("undo failed"));
+    const { result } = renderHook(() =>
+      useUndoSnapshot({
+        isBusy: false,
+        onStatusChange: vi.fn(),
+        onMessage: vi.fn()
+      })
+    );
+
+    const first = makeSnapshot("plan-1");
+    const second = makeSnapshot("plan-2");
+    act(() => result.current.pushUndoSnapshot(first));
+    act(() => result.current.pushUndoSnapshot(second));
+
+    await act(async () => {
+      await result.current.undoExecutionTo("plan-1");
+    });
+
+    // plan-2 撤销即失败，两条都留在栈上。
+    expect(result.current.undoStack).toEqual([first, second]);
   });
 });

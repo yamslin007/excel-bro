@@ -100,7 +100,6 @@ import {
   exportDiagnosticReport,
   recordDiagnosticEvent
 } from "./diagnostics";
-import { probeWorkerSupport } from "./sandbox/workerProbe";
 import {
   FOCUS_PAYLOAD_STORAGE_KEY,
   type FocusPayload
@@ -3805,29 +3804,6 @@ export default function App() {
     setHistoryOpen(true);
   }
 
-  // P0 探针：验证沙箱方案能否在真实 Excel 宿主里落地，结果复用设置面板的反馈区。
-  async function runWorkerProbe() {
-    setSettingsFeedback("正在探测 Worker 可用性…");
-    try {
-      const result = await probeWorkerSupport();
-      const parts = [
-        result.supported ? "Worker 可用" : "Worker 不可用",
-        `往返 ${result.echoOk ? "通过" : "失败"}`,
-        `中断 ${result.terminateOk ? "通过" : "失败"}`
-      ];
-      if (result.presentGlobals.length) {
-        parts.push(`意外存在：${result.presentGlobals.join("、")}`);
-      } else {
-        parts.push(`危险入口全部缺席（${result.absentGlobals.length} 项）`);
-      }
-      if (result.failure) parts.push(result.failure);
-      setSettingsFeedback(parts.join("；"));
-    } catch (error) {
-      setSettingsFeedback(
-        `探测失败：${error instanceof Error ? error.message : String(error)}`
-      );
-    }
-  }
 
   function closeSettings() {
     setSettingsOpen(false);
@@ -4444,14 +4420,6 @@ export default function App() {
               <strong>模型设置</strong>
               <span>密钥仅保存在这台电脑的本地服务中</span>
             </div>
-            <button
-              type="button"
-              className="drawer-text-action"
-              onClick={() => void runWorkerProbe()}
-              title="探测本机 Excel 是否支持 Worker 沙箱"
-            >
-              探测沙箱
-            </button>
             <button
               type="button"
               className="drawer-text-action"
@@ -5693,7 +5661,9 @@ export default function App() {
                         ? "需求确认"
                         : message.provider === "model"
                           ? "Agent"
-                          : "基础模式"}
+                          : message.provider === "system"
+                            ? "系统"
+                            : "基础模式"}
                     </em>
                   )}
                 </span>

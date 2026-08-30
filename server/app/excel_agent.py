@@ -1,13 +1,25 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 from pydantic import ValidationError
 
-from .capabilities import capability_int
+from .agent_loop_protection import (
+    LoopConfig,
+    LoopState,
+    detect_action_conflict,
+    detect_path_loop,
+    get_warning_prompt,
+    safe_degradation,
+    should_stop,
+    update_loop_state,
+)
+from .capabilities import capability_float, capability_int
 from .llm import ModelConnection, OpenAICompatibleClient
 from .models import (
     AnalysisPlan,
@@ -18,10 +30,32 @@ from .models import (
     ResultContext,
 )
 
-MAX_AGENT_TURNS = capability_int("agent", "maxTurns")
 MAX_READ_ROWS = capability_int("agent", "maxReadRows")
 MAX_READ_COLUMNS = capability_int("agent", "maxReadColumns")
 MAX_OUTPUT_TOKENS = capability_int("agent", "maxOutputTokens")
+
+logger = logging.getLogger(__name__)
+
+
+def _default_loop_config() -> LoopConfig:
+    """从共享能力配置构造生产环境 Agent 循环限额。"""
+    return LoopConfig(
+        max_turns=capability_int("agent", "maxTurns"),
+        max_total_tokens=capability_int("agent", "maxTotalTokens"),
+        max_wall_time_seconds=capability_float(
+            "agent", "maxWallTimeSeconds"
+        ),
+        max_consecutive_errors=capability_int(
+            "agent", "maxConsecutiveErrors"
+        ),
+        max_cache_hits_per_query=capability_int(
+            "agent", "maxCacheHitsPerQuery"
+        ),
+        max_tool_path_loop_length=capability_int(
+            "agent", "maxToolPathLoopLength"
+        ),
+        warning_turn=capability_int("agent", "warningTurn"),
+    )
 
 AGENT_SYSTEM_PROMPT = """
 你是 Excel Bro 的规划 Agent。你的工作是理解目标、按需查看工作簿，再提交一个
@@ -54,9 +88,24 @@ AGENT_SYSTEM_PROMPT = """
 - 源工作表可能在实际表头前有标题行；splitGroupAggregate 会自动识别同时包含
   所需字段的表头行。existingSheetPolicy 默认使用 rename，避免覆盖已有工作表。
 - 你只规划白名单 Excel 动作，不执行 VBA、宏、脚本或外部程序。
+
+写入方式的优先级（从高到低，只有前一档表达不了才降级）：
+1. writeFormulas —— 公式引用单元格，源数据一变 Excel 自己重算。表达得了就用它。
+2. computeValues / splitGroupAggregate —— 执行时求值的动作：动作体里**只带查询
+   配置，不带结果**，Excel 端在执行那一刻读取源工作表的实时数据算出来。需要
+   筛选、分组、聚合、排序、取前 N 这类查询时用 computeValues。
+3. writeValues / writeTable —— 只在写入的内容确实是**固定值**时使用：用户点名的
+   常量、表头文字、说明文字。
+
+不要把算出来的结果塞进 writeValues.values。那是一张一次性快照：源数据改一格
+结果就过期了，而计划本身无法重算，用户只能重新提问。同样的需求用
+computeValues 表达，改完数据直接重跑就是新结果。
+
 - 若请求包含“本地数据工具结果”，该结果由 Excel 端对用户授权范围进行确定性
-  计算。优先直接使用其 headers、rows、calculation 和完整性标记，不要再次调用
-  read_range 重复读取，也不要自行改变计算口径。
+  计算，可以直接引用它的 headers、rows、calculation 和完整性标记来**回答问题**
+  （submit_answer），不必再调 read_range 重复读取，也不要自行改变计算口径。
+  但要**写回工作表**时，不要把这些 rows 当静态值塞进 writeValues —— 改用
+  computeValues 复述同一套查询条件，让 Excel 在执行时重算。
 
 完成分析后优先调用 submit_plan 或 submit_answer。若模型不支持工具调用，也可以
 直接返回符合 AssistantResponse JSON Schema 的 JSON。
@@ -235,14 +284,19 @@ def _inline_json_schema(schema: dict[str, Any]) -> dict[str, Any]:
 
 
 def _strip_metadata(node: Any) -> Any:
-    """Remove Pydantic-generated title/description annotations that bloat schema.
+    """Remove Pydantic-generated title/description/default annotations.
 
     模型需要的是字段结构和取值约束，不是自动生成的字段名标题。剥离后可显著
     降低每轮 Agent 请求携带的 schema token，不改变任何字段或校验规则。
 
-    注意：只能剥离作为 JSON Schema 元数据的 title/description，不能误删
-    properties 内部同名的业务字段（例如 AnalysisPlan 自身就有 title 字段）。
-    因此进入 properties / $defs 等“键即字段名”的容器时不再当作元数据处理。
+    default 一并剥离：它描述的是**服务端在字段缺失时的行为**，不是模型必须
+    满足的条件。剥离后模型能生成的合法计划集合一个都没少 —— maxLength /
+    minLength / enum / anyOf 这些真约束全部保留。这条界线要守住：削注解可以，
+    削约束不行，后者会让模型看不见真实边界从而反复提交非法计划。
+
+    注意：只能剥离作为 JSON Schema 元数据的标量注解，不能误删 properties
+    内部同名的业务字段（例如 AnalysisPlan 自身就有 title 字段）。因此进入
+    properties / $defs 等“键即字段名”的容器时不再当作元数据处理。
     """
     if isinstance(node, list):
         return [_strip_metadata(item) for item in node]
@@ -250,8 +304,10 @@ def _strip_metadata(node: Any) -> Any:
         return node
     result: dict[str, Any] = {}
     for key, value in node.items():
-        if key in ("title", "description") and not isinstance(value, (dict, list)):
-            # 标量的 title/description 是 schema 注解，安全剥离。
+        if key in ("title", "description", "default") and not isinstance(
+            value, (dict, list)
+        ):
+            # 标量的 title/description/default 是 schema 注解，安全剥离。
             continue
         if key in ("properties", "$defs", "definitions") and isinstance(value, dict):
             # 这些容器的键是字段名，值继续递归但键本身保留。
@@ -342,7 +398,10 @@ def _terminal_tools() -> list[dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": "submit_plan",
-                "description": "提交需要用户预览并确认的 Excel 操作计划。",
+                "description": (
+                    "提交 Excel 操作计划。写入优先级：writeFormulas > "
+                    "computeValues（执行时按实时数据求值）> writeValues（仅固定值）。"
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {"plan": plan_schema},
@@ -448,6 +507,55 @@ def _tool_step(name: str, arguments: dict[str, Any]) -> str | None:
     return None
 
 
+def _append_warning_to_last_user_message(
+    messages: list[dict[str, Any]], warning: str
+) -> None:
+    """把收尾提示追加到最后一条用户消息，兼容文本和多模态内容。"""
+    for message in reversed(messages):
+        if message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            message["content"] = content + warning
+            return
+        if isinstance(content, list):
+            for item in reversed(content):
+                if isinstance(item, dict) and item.get("type") == "text":
+                    item["text"] = str(item.get("text", "")) + warning
+                    return
+            content.append({"type": "text", "text": warning})
+        return
+
+
+def _inject_tool_warning(tool_content: str, warning: str) -> str:
+    """向 JSON 工具结果附加警告，并保留同一结果中已有的警告。"""
+    try:
+        result = json.loads(tool_content)
+    except (TypeError, json.JSONDecodeError):
+        result = {"result": tool_content}
+    if not isinstance(result, dict):
+        result = {"result": result}
+
+    existing_warning = result.get("_warning")
+    if isinstance(existing_warning, str) and existing_warning:
+        if warning not in existing_warning:
+            result["_warning"] = f"{existing_warning}\n{warning}"
+    else:
+        result["_warning"] = warning
+    return json.dumps(result, ensure_ascii=False)
+
+
+def _contains_snapshot_truncation(value: Any) -> bool:
+    """递归识别工具结果中的快照截断标记。"""
+    if isinstance(value, dict):
+        if value.get("snapshotTruncated") is True or value.get("truncated") is True:
+            return True
+        return any(_contains_snapshot_truncation(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_snapshot_truncation(item) for item in value)
+    return False
+
+
 async def run_excel_agent(
     request: PlanRequest,
     *,
@@ -455,8 +563,13 @@ async def run_excel_agent(
     timeout: float,
     tool_cache: dict[str, Any] | None = None,
     on_event: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    config: LoopConfig | None = None,
 ) -> AssistantResponse:
+    """运行受预算和循环检测保护的 Excel 规划 Agent。"""
     cache = tool_cache
+    loop_config = config or _default_loop_config()
+    state = LoopState()
+    start_time = time.time()
 
     async def emit(
         title: str, detail: str | None = None, completed: str | None = None
@@ -505,19 +618,43 @@ async def run_excel_agent(
     # 前端已带回确定性查询结果时，去掉只读工具，直接进入提交。
     tools = AGENT_TOOLS_WITH_DATA if request.dataResults else AGENT_TOOLS
     async with OpenAICompatibleClient(connection, timeout=timeout) as client:
-        for turn_index in range(MAX_AGENT_TURNS):
+        for turn_index in range(loop_config.max_turns):
+            state.elapsed_time = time.time() - start_time
+            state.turn_index = turn_index
+            stop_flag, stop_reason = should_stop(state, loop_config)
+            if stop_flag:
+                assert stop_reason is not None
+                logger.warning(
+                    "Agent loop stopped: reason=%s, turns=%s, tokens=%s, "
+                    "errors=%s, loop=%s",
+                    stop_reason,
+                    state.turn_index,
+                    state.total_tokens,
+                    state.consecutive_errors,
+                    state.detected_path_loop,
+                )
+                return safe_degradation(state, stop_reason)
+
+            if turn_index == loop_config.warning_turn:
+                warning_prompt = get_warning_prompt(state)
+                if warning_prompt:
+                    _append_warning_to_last_user_message(
+                        messages, warning_prompt
+                    )
+
             await emit(
                 "正在规划操作"
                 if turn_index == 0
                 else f"正在规划操作（第 {turn_index + 1} 步）",
                 completed=last_step,
             )
-            payload = await client.chat_completions(
+            payload, usage = await client.chat_completions(
                 messages=messages,
                 tools=tools,
                 tool_choice="auto",
                 max_tokens=MAX_OUTPUT_TOKENS,
             )
+            state.total_tokens += usage.get("total_tokens", 0)
             message = payload["choices"][0]["message"]
             tool_calls = message.get("tool_calls") or []
             if not tool_calls:
@@ -525,6 +662,13 @@ async def run_excel_agent(
                 try:
                     return _parse_content(content)
                 except (ValueError, ValidationError, json.JSONDecodeError) as error:
+                    state.last_error_message = str(error)[:200]
+                    update_loop_state(
+                        state,
+                        None,
+                        None,
+                        error_occurred=True,
+                    )
                     messages.append({"role": "assistant", "content": content})
                     messages.append(
                         {
@@ -544,8 +688,14 @@ async def run_excel_agent(
             for tool_call in tool_calls:
                 function = tool_call.get("function") or {}
                 name = str(function.get("name", ""))
+                arguments: dict[str, Any] = {}
                 try:
-                    arguments = json.loads(function.get("arguments") or "{}")
+                    parsed_arguments = json.loads(
+                        function.get("arguments") or "{}"
+                    )
+                    if not isinstance(parsed_arguments, dict):
+                        raise ValueError("工具参数必须是 JSON 对象")
+                    arguments = parsed_arguments
                     step_text = _tool_step(name, arguments)
                     if step_text is not None:
                         await emit(step_text, completed=last_step)
@@ -554,15 +704,68 @@ async def run_excel_agent(
                     if cache is not None and name in READONLY_TOOLS:
                         cache_key = _tool_cache_key(name, arguments)
                     if cache_key is not None and cache_key in cache:
-                        tool_content = cache[cache_key]
+                        cached_value = cache[cache_key]
+                        if isinstance(cached_value, str):
+                            tool_content = cached_value
+                            try:
+                                truncation_value = json.loads(cached_value)
+                            except json.JSONDecodeError:
+                                truncation_value = cached_value
+                        else:
+                            truncation_value = cached_value
+                            tool_content = json.dumps(
+                                cached_value, ensure_ascii=False
+                            )
+                        if _contains_snapshot_truncation(truncation_value):
+                            state.encountered_truncation = True
+                        conflict_warning = detect_action_conflict(
+                            state,
+                            cache_key,
+                            loop_config.max_cache_hits_per_query,
+                        )
+                        if conflict_warning:
+                            tool_content = _inject_tool_warning(
+                                tool_content, conflict_warning
+                            )
                     else:
                         result = _execute_tool(request, name, arguments)
                         if isinstance(result, (PlanResponse, AnswerResponse)):
                             return result
+                        if _contains_snapshot_truncation(result):
+                            state.encountered_truncation = True
                         tool_content = json.dumps(result, ensure_ascii=False)
                         if cache_key is not None:
                             cache[cache_key] = tool_content
+
+                    update_loop_state(
+                        state,
+                        name,
+                        cache_key,
+                        error_occurred=False,
+                    )
+                    path_warning = detect_path_loop(
+                        state, loop_config.max_tool_path_loop_length
+                    )
+                    if path_warning:
+                        tool_content = _inject_tool_warning(
+                            tool_content, path_warning
+                        )
+                        state.last_warning = path_warning
                 except (ValueError, ValidationError, json.JSONDecodeError) as error:
+                    if name == "submit_plan":
+                        failed_plan = arguments.get("plan")
+                        state.last_failed_plan = (
+                            dict(failed_plan)
+                            if isinstance(failed_plan, dict)
+                            else None
+                        )
+                    state.last_error_message = str(error)[:200]
+                    update_loop_state(
+                        state,
+                        name,
+                        None,
+                        error_occurred=True,
+                    )
                     tool_content = json.dumps(
                         {"error": str(error)}, ensure_ascii=False
                     )
@@ -574,4 +777,13 @@ async def run_excel_agent(
                         "content": tool_content,
                     }
                 )
-    raise ValueError("Agent 在限定轮次内没有提交计划或回答")
+    state.turn_index = loop_config.max_turns
+    state.elapsed_time = time.time() - start_time
+    logger.warning(
+        "Agent loop exhausted: turns=%s, tokens=%s, errors=%s, loop=%s",
+        state.turn_index,
+        state.total_tokens,
+        state.consecutive_errors,
+        state.detected_path_loop,
+    )
+    return safe_degradation(state, "max_turns")

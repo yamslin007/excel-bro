@@ -8,7 +8,7 @@ from .errors import LLMResponseError
 async def test_model_connection(connection: ModelConnection) -> None:
     """Send a tiny request without persisting the draft connection."""
     async with OpenAICompatibleClient(connection, timeout=20) as client:
-        payload = await client.chat_completions(
+        payload, _ = await client.chat_completions(
             messages=[
                 {
                     "role": "user",

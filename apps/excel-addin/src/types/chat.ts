@@ -60,12 +60,20 @@ export interface ChatMessage {
   clarification?: MessageClarification;
   activityLog?: ActivityLog;
   reused?: boolean;
-  provider?: "model" | "local";
+  provider?: "model" | "local" | "system";
   querySourceMode?: SourceMode;
   querySourceSheetNames?: string[];
   querySourceSheetIds?: string[];
   functionPreview?: FunctionPreview;
   executedPlanId?: string;
+  /**
+   * 计划里含预览时算出的固定值、且源数据已变。带上原计划让用户能在确认后
+   * 坚持执行（executePlan 的 acknowledgeStaleSource）。
+   */
+  staleSourceConfirm?: {
+    plan: AnalysisPlan;
+    bakedActionCount: number;
+  };
   createdAt: string;
 }
 

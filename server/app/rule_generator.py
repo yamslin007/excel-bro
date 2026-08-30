@@ -189,7 +189,10 @@ async def generate_formula(request: GenerateFormulaRequest) -> GenerateFormulaRe
         # finish_reason=length 截断，真正的 JSON（content）根本没开始写。
         # 走 capabilities 配置，别硬编码。
         max_tokens = capability_int("formula", "maxOutputTokens")
-        response = await client.chat_completions(messages=messages, max_tokens=max_tokens)
+        response, _ = await client.chat_completions(
+            messages=messages,
+            max_tokens=max_tokens,
+        )
 
     choice = response["choices"][0]
     message = choice.get("message", {})

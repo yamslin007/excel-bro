@@ -277,6 +277,20 @@ export type ExcelAction =
       maxOutputSheets: number;
     }
   | {
+      /**
+       * 执行时求值：动作体只带查询配置，不带算好的结果。执行那一刻才读
+       * sourceSheet 的实时数据算出输出，所以源数据改了计划依然成立。
+       */
+      type: "computeValues";
+      sheet: string;
+      sourceSheet: string;
+      sourceRange?: string | null;
+      hasHeaders: boolean;
+      query: QueryTableArguments;
+      destinationCell: string;
+      includeHeaders: boolean;
+    }
+  | {
       type: "addNamedRange";
       sheet: string;
       name: string;
@@ -869,6 +883,13 @@ export interface PlanExecutionResult {
   verificationMs: number;
 }
 
+/**
+ * 单个区域的撤销快照。
+ *
+ * 格式分两层：value/formula 与常用格式总是记录；`format` 里的完整格式（边框、
+ * 对齐、合并）只在区域规模不超过 undo.formatCaptureMaxCells 时捕获 —— 整表操作
+ * 时逐格读边框会让执行明显变慢，超限则降级为只恢复常用格式。
+ */
 export interface UndoRangeSnapshot {
   actionIndex: number;
   sheet: string;
@@ -878,6 +899,30 @@ export interface UndoRangeSnapshot {
   fillColor: string;
   fontBold: boolean;
   fontColor: string;
+  /** 完整格式快照；区域过大而降级捕获时为 null。 */
+  format?: UndoRangeFormat | null;
+}
+
+/** 超出常用格式之外、逐格恢复的格式属性。 */
+export interface UndoRangeFormat {
+  horizontalAlignment: string;
+  verticalAlignment: string;
+  wrapText: boolean | null;
+  rowHeight: number;
+  columnWidth: number;
+  indentLevel: number;
+  fontName: string;
+  fontSize: number;
+  fontItalic: boolean;
+  fontUnderline: string;
+  borders: UndoBorderState[];
+}
+
+export interface UndoBorderState {
+  sideIndex: Excel.BorderIndex;
+  style: string;
+  color: string;
+  weight: string;
 }
 
 // 被删除工作表的撤销快照：删前把整张表内容拍下来，撤销时新建并原样恢复。
@@ -905,7 +950,7 @@ export type AssistantResponse =
   | {
       kind: "answer";
       message: string;
-      provider: "model" | "local";
+      provider: "model" | "local" | "system";
       resultContext?: ResultContext | null;
       turnId?: string | null;
     }
@@ -957,6 +1002,7 @@ const allowedActionTypes = new Set<ExcelAction["type"]>([
   "createChart",
   "createPivotTable",
   "splitGroupAggregate",
+  "computeValues",
   "addNamedRange",
   "addImage",
   "addShape"
@@ -1026,8 +1072,27 @@ export function assertAssistantResponse(
   if (response.kind !== "plan") {
     throw new Error("服务返回了未知响应类型");
   }
-  if (!response.plan || !Array.isArray(response.plan.actions)) {
-    throw new Error("服务返回的计划缺少 actions");
+  assertEditablePlan(response.plan);
+}
+
+/**
+ * 校验一份计划的动作白名单与验收条件结构。
+ *
+ * 模型返回的计划和用户手改的 JSON 走同一道门 —— 手改的不该比模型生成的宽松，
+ * 否则「能编辑」就变成了绕过白名单的后门。
+ *
+ * 这里只做结构与白名单校验，不查 title/summary 之类的必填字段：那些交给服务端
+ * Pydantic 规范化，前端多加一层只会和既有调用方打架。
+ */
+export function assertEditablePlan(
+  value: unknown
+): asserts value is AnalysisPlan {
+  if (!value || typeof value !== "object") {
+    throw new Error("计划不是有效对象");
+  }
+  const response = { plan: value as AnalysisPlan };
+  if (!Array.isArray(response.plan.actions)) {
+    throw new Error("计划缺少 actions");
   }
 
   for (const action of response.plan.actions as Array<{ type?: string }>) {
