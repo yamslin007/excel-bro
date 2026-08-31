@@ -13,6 +13,9 @@
 
 from __future__ import annotations
 
+import ast
+import inspect
+
 import pytest
 from pydantic import ValidationError
 
@@ -426,6 +429,152 @@ def test_action_type_list_consistency() -> None:
     assert len(backend_types) == len(frontend_types), (
         f"前后端动作类型数量不一致：后端 {len(backend_types)} 个，"
         f"前端 {len(frontend_types)} 个"
+    )
+
+
+# ============================================================================
+# 测试：文件夹执行器的动作覆盖穷尽性
+# ============================================================================
+# 背景：文件夹执行器曾经把没有实现的动作落进循环末尾的统一
+# status="succeeded"，用户看到成功但文件没变（removeDuplicates 假成功）。
+# 运行期兜底已经补在 folder_workbooks.py 的 else 分支，但那只在真的执行
+# 到那一步时才报错。这里把「协议动作集合」与「文件夹执行器覆盖集合」的
+# 一致性提到 CI：新增动作忘了在文件夹侧实现或声明不支持，测试直接失败。
+# ============================================================================
+
+
+def _protocol_action_types() -> set[str]:
+    """从 ExcelAction 判别联合中提取所有协议动作类型。"""
+    import typing
+
+    union_type = typing.get_args(ExcelAction)[0]
+    types: set[str] = set()
+    for model in typing.get_args(union_type):
+        type_field = model.model_fields.get("type")
+        if type_field:
+            literal_args = typing.get_args(type_field.annotation)
+            if literal_args:
+                types.add(literal_args[0])
+    return types
+
+
+def _dispatched_action_types(function) -> set[str]:
+    """静态提取函数体里所有与 action.type 比较过的字符串字面量。
+
+    覆盖三种写法：
+    - action.type == "x"
+    - action.type in {"x", "y"}
+    - action.type in unsupported（集合名，忽略，由调用方单独提供）
+    """
+    source = inspect.getsource(function)
+    tree = ast.parse(ast.unparse(ast.parse(source)))
+    found: set[str] = set()
+
+    def is_action_type(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Attribute)
+            and node.attr == "type"
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "action"
+        )
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Compare) or not is_action_type(node.left):
+            continue
+        for comparator in node.comparators:
+            if isinstance(comparator, ast.Constant) and isinstance(
+                comparator.value, str
+            ):
+                found.add(comparator.value)
+            elif isinstance(comparator, (ast.Set, ast.List, ast.Tuple)):
+                for element in comparator.elts:
+                    if isinstance(element, ast.Constant) and isinstance(
+                        element.value, str
+                    ):
+                        found.add(element.value)
+    return found
+
+
+def _folder_unsupported_action_types() -> set[str]:
+    """读取 validate_plan_for_folder 里声明的 unsupported 集合。"""
+    from server.app import folder_workbooks
+
+    source = inspect.getsource(folder_workbooks.validate_plan_for_folder)
+    tree = ast.parse(ast.unparse(ast.parse(source)))
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "unsupported"
+            and isinstance(node.value, ast.Set)
+        ):
+            return {
+                element.value
+                for element in node.value.elts
+                if isinstance(element, ast.Constant)
+                and isinstance(element.value, str)
+            }
+    pytest.fail(
+        "在 validate_plan_for_folder 中找不到 unsupported 集合字面量。"
+        "如果重构了拒绝清单的表达方式，请同步更新本测试的提取逻辑。"
+    )
+
+
+def test_folder_executor_covers_every_protocol_action() -> None:
+    """每个协议动作都必须在文件夹侧「有实现」或「明确声明不支持」。
+
+    两者都没有 = 运行到 folder_workbooks.py 的 else 分支抛
+    「文件夹模式未实现动作」，用户在计划已经写了一半的时候才看到失败。
+    """
+    from server.app import folder_workbooks
+
+    protocol_types = _protocol_action_types()
+    implemented = _dispatched_action_types(folder_workbooks._execute_folder_plan)
+    declared_unsupported = _folder_unsupported_action_types()
+
+    uncovered = protocol_types - implemented - declared_unsupported
+    assert not uncovered, (
+        f"以下 {len(uncovered)} 个动作在文件夹模式既没有实现也没有声明不支持：\n"
+        f"{sorted(uncovered)}\n"
+        "请二选一：\n"
+        "  A. 在 folder_workbooks.py 的 _execute_folder_plan 里加执行分支；\n"
+        "  B. 加入 validate_plan_for_folder 的 unsupported 集合，"
+        "让计划在任何写入之前就被拒绝。\n"
+        "不处理的话，动作会撞到末尾的 else 抛错——但那时前面的动作已经改过文件了。"
+    )
+
+
+def test_folder_unsupported_set_has_no_stale_entries() -> None:
+    """unsupported 集合里不能有协议里已经不存在的动作类型。
+
+    删除动作类型时忘了清理拒绝清单，会留下永远不会命中的死条目，
+    掩盖真实的覆盖情况。
+    """
+    stale = _folder_unsupported_action_types() - _protocol_action_types()
+    assert not stale, (
+        f"validate_plan_for_folder 的 unsupported 集合含 {len(stale)} 个"
+        f"协议中已不存在的动作类型：{sorted(stale)}\n"
+        "请从集合中删除这些死条目。"
+    )
+
+
+def test_folder_declared_unsupported_actions_are_rejected_before_execution() -> None:
+    """声明不支持的动作必须在校验阶段就被拦下，而不是执行到一半才报错。"""
+    from server.app import folder_workbooks
+
+    declared_unsupported = _folder_unsupported_action_types()
+    assert declared_unsupported, "unsupported 集合为空，说明提取逻辑失效了"
+
+    missing_samples = declared_unsupported - set(VALID_ACTION_SAMPLES)
+    assert not missing_samples, (
+        f"以下声明不支持的动作缺少测试样本：{sorted(missing_samples)}"
+    )
+
+    source = inspect.getsource(folder_workbooks.validate_plan_for_folder)
+    assert "if action.type in unsupported" in source, (
+        "validate_plan_for_folder 不再用 unsupported 集合拦截动作，"
+        "本测试的假设已失效，请同步更新。"
     )
 
 
