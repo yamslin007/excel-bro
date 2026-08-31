@@ -17,6 +17,7 @@ import {
   type IntentCheckResponse,
   type ModelSettings,
   type PlanRequest,
+  type PlanValidateRequest,
   type TestModelConnectionResponse,
   type UpdateModelSettingsRequest,
   type UpsertModelConnectionRequest,
@@ -419,11 +420,20 @@ export async function deleteModelConnection(
  * 验收条件由服务端的 AnalysisPlan 校验器重算 —— 前端绝不自己拼，否则计划内容
  * 和验收条件会各说各话，执行时才暴露。
  */
-export async function validatePlan(plan: AnalysisPlan): Promise<AnalysisPlan> {
+export async function validatePlan(
+  plan: AnalysisPlan,
+  authorizedSheets: string[],
+  existingSheets: string[] = authorizedSheets
+): Promise<AnalysisPlan> {
+  const request: PlanValidateRequest = {
+    plan,
+    authorized_sheets: authorizedSheets,
+    existing_sheets: existingSheets
+  };
   const response = await fetch(`${API_BASE_URL}/api/plans/validate`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(plan)
+    body: JSON.stringify(request)
   });
   if (!response.ok) {
     throw await requestError(response, "计划校验失败");

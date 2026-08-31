@@ -443,6 +443,12 @@ export interface AnalysisPlan {
   acceptanceCriteria?: VerificationCriterion[];
 }
 
+export interface PlanValidateRequest {
+  plan: AnalysisPlan;
+  authorized_sheets: string[];
+  existing_sheets: string[];
+}
+
 export interface ResultContext {
   kind: "table";
   title: string;

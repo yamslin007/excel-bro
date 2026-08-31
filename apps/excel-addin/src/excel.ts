@@ -2392,12 +2392,21 @@ export function preflightPlanActions(
   plan: AnalysisPlan,
   existingSheetNames: string[],
   isApiSupported: (version: string) => boolean = () => true,
-  catalog: PlanPreflightCatalog = {}
+  catalog: PlanPreflightCatalog = {},
+  authorizedSheetNames: readonly string[] = existingSheetNames
 ): PlanPreflightIssue[] {
   const issues: PlanPreflightIssue[] = [];
   const sheets = new Map(
     existingSheetNames.map((name) => [name.toLocaleLowerCase(), name])
   );
+  const existingSheets = new Set(sheets.keys());
+  const authorizedSheets = new Set(
+    authorizedSheetNames.map((name) => name.toLocaleLowerCase())
+  );
+  const isUnauthorizedExistingSheet = (name: string) => {
+    const normalized = name.toLocaleLowerCase();
+    return existingSheets.has(normalized) && !authorizedSheets.has(normalized);
+  };
   const hasSheet = (name: string) =>
     sheets.has(name.toLocaleLowerCase());
   const addSheet = (name: string) =>
@@ -2445,6 +2454,29 @@ export function preflightPlanActions(
       issues.push({
         index,
         message: `当前 Excel 不支持此操作（需要 ExcelApi ${requiredVersion} 或更高版本）`
+      });
+      return;
+    }
+
+    const sourceSheet =
+      action.type === "copyRange" ||
+      action.type === "createPivotTable" ||
+      action.type === "computeValues"
+        ? action.sourceSheet
+        : action.type === "splitGroupAggregate"
+          ? action.sheet
+          : null;
+    if (sourceSheet && isUnauthorizedExistingSheet(sourceSheet)) {
+      issues.push({
+        index,
+        message: `动作 ${action.type} 尝试读取未授权的工作表「${sourceSheet}」`
+      });
+      return;
+    }
+    if (isUnauthorizedExistingSheet(action.sheet)) {
+      issues.push({
+        index,
+        message: `动作 ${action.type} 尝试写入未授权的工作表「${action.sheet}」`
       });
       return;
     }
@@ -3767,6 +3799,8 @@ export async function undoExecution(
 }
 
 export interface ExecutePlanOptions {
+  /** 用户本次明确授权的现有工作表名称；新输出表可由计划创建。 */
+  authorizedSheetNames: readonly string[];
   /** 本次会话已勾选的外部工作簿文件名集合，用于放行跨文件公式引用。 */
   allowedExternalFiles?: ReadonlySet<string>;
   /**
@@ -3780,8 +3814,21 @@ export interface ExecutePlanOptions {
 
 export async function executePlan(
   plan: AnalysisPlan,
-  options: ExecutePlanOptions = {}
+  options: ExecutePlanOptions
 ): Promise<PlanExecutionResult> {
+  const authorizedSheetKeys = new Set(
+    options.authorizedSheetNames.map((name) => name.toLocaleLowerCase())
+  );
+  const unauthorizedFingerprintSheet = plan.sourceFingerprintSheets?.find(
+    (name) => !authorizedSheetKeys.has(name.toLocaleLowerCase())
+  );
+  if (unauthorizedFingerprintSheet) {
+    throw new PlanExecutionError(
+      `数据来源指纹尝试读取未授权的工作表「${unauthorizedFingerprintSheet}」`,
+      incompleteActionResults(plan, new Map())
+    );
+  }
+
   if (plan.sourceFingerprint && plan.sourceFingerprintSheets?.length) {
     if (isToolSchemaFingerprint(plan.sourceFingerprint)) {
       // 固化工具：基线本身就是 schema 指纹，照原样比。
@@ -3873,7 +3920,8 @@ export async function executePlan(
             shapes.items.map((shape) => shape.name)
           ])
         )
-      }
+      },
+      options.authorizedSheetNames
     );
     if (preflightIssues.length > 0) {
       const failed = new Map(

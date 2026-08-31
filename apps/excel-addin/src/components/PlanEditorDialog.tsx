@@ -25,6 +25,7 @@ interface PlanEditorInitMessage {
     plan: AnalysisPlan;
     target: PlanEditorTarget;
     workbook: WorkbookSnapshot;
+    authorizedSheets: string[];
   };
 }
 
@@ -286,7 +287,11 @@ export default function PlanEditorDialog() {
 
     let normalized: AnalysisPlan;
     try {
-      normalized = await validatePlan(parsed as AnalysisPlan);
+      normalized = await validatePlan(
+        parsed as AnalysisPlan,
+        payload.authorizedSheets,
+        payload.workbook.worksheets.map((sheet) => sheet.name)
+      );
     } catch (reason) {
       if (controller.signal.aborted) return;
       setPhase("error");

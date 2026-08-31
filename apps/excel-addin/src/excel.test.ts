@@ -324,6 +324,99 @@ describe("Excel plan preflight", () => {
     ]);
   });
 
+  it("rejects unauthorized existing sheets before any action runs", () => {
+    const authorizationPlan: AnalysisPlan = {
+      ...plan,
+      actions: [
+        {
+          type: "writeValues",
+          sheet: "秘密",
+          range: "A1",
+          values: [[1]]
+        },
+        { type: "deleteWorksheet", sheet: "秘密" },
+        {
+          type: "copyRange",
+          sheet: "复制结果",
+          sourceSheet: "秘密",
+          sourceRange: "A1",
+          targetRange: "A1",
+          copyType: "values",
+          skipBlanks: false,
+          transpose: false
+        },
+        {
+          type: "createPivotTable",
+          sheet: "透视结果",
+          sourceSheet: "秘密",
+          sourceRange: "A1:B3",
+          name: "UnauthorizedPivot",
+          destinationCell: "A1",
+          rowFields: [],
+          columnFields: [],
+          valueFields: []
+        },
+        { type: "createWorksheet", sheet: "秘密" }
+      ]
+    };
+
+    expect(
+      preflightPlanActions(
+        authorizationPlan,
+        ["授权", "秘密"],
+        () => true,
+        {},
+        ["授权"]
+      )
+    ).toEqual([
+      {
+        index: 0,
+        message: "动作 writeValues 尝试写入未授权的工作表「秘密」"
+      },
+      {
+        index: 1,
+        message: "动作 deleteWorksheet 尝试写入未授权的工作表「秘密」"
+      },
+      {
+        index: 2,
+        message: "动作 copyRange 尝试读取未授权的工作表「秘密」"
+      },
+      {
+        index: 3,
+        message: "动作 createPivotTable 尝试读取未授权的工作表「秘密」"
+      },
+      {
+        index: 4,
+        message: "动作 createWorksheet 尝试写入未授权的工作表「秘密」"
+      }
+    ]);
+  });
+
+  it("allows plans to create genuinely new output sheets", () => {
+    const outputPlan: AnalysisPlan = {
+      ...plan,
+      actions: [
+        { type: "createWorksheet", sheet: "新结果" },
+        {
+          type: "writeValues",
+          sheet: "新结果",
+          range: "A1",
+          values: [[1]]
+        }
+      ]
+    };
+
+    expect(
+      preflightPlanActions(
+        outputPlan,
+        ["授权", "秘密"],
+        () => true,
+        {},
+        ["授权"]
+      )
+    ).toEqual([]);
+  });
+
   it("reports unsupported Excel API requirements before execution", () => {
     const notePlan: AnalysisPlan = {
       ...plan,

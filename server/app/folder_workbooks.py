@@ -758,10 +758,12 @@ def _action_range_fields(action) -> list[tuple[str, str]]:
     return fields
 
 
-def _preflight_folder_plan(
-    session: _FolderSession,
+def validate_plan_for_folder(
     plan: AnalysisPlan,
+    folder_session: _FolderSession,
+    authorized_sheets: list[str] | None = None,
 ) -> None:
+    session = folder_session
     unsupported = {
         "insertRange",
         "deleteRange",
@@ -771,6 +773,15 @@ def _preflight_folder_plan(
         # computeValues 靠 Excel 端在执行时读实时数据求值，文件夹模式没有那条通路。
         "computeValues",
     }
+    authorized = {
+        name.casefold()
+        for name in (
+            authorized_sheets
+            if authorized_sheets is not None
+            else session.selected_targets.keys()
+        )
+    }
+    created_sheets: set[tuple[Path, str]] = set()
     sheet_names: dict[Path, set[str]] = {}
     object_names: dict[Path, set[str]] = {}
 
@@ -837,6 +848,20 @@ def _preflight_folder_plan(
 
         path, sheet_name, _ = _target(session, action.sheet)
         current_names = names_for(path)
+        sheet_key = (path, sheet_name.casefold())
+        existed_before_plan = (
+            path.exists()
+            and sheet_name in current_names
+            and sheet_key not in created_sheets
+        )
+        if existed_before_plan and action.sheet.casefold() not in authorized:
+            operation = "读取" if action.type == "splitGroupAggregate" else "写入"
+            issues.append(
+                f"第 {index + 1} 步：动作 {action.type} 尝试{operation}未授权的工作表"
+                f"「{action.sheet}」。"
+            )
+            continue
+        creates_sheet = not path.exists() or sheet_name not in current_names
         invalid_range = False
         shapes: dict[str, tuple[int, int]] = {}
         for label, address in _action_range_fields(action):
@@ -925,7 +950,23 @@ def _preflight_folder_plan(
             source_path, source_name, _ = _target(
                 session, action.sourceSheet
             )
-            if source_name not in names_for(source_path):
+            source_names = names_for(source_path)
+            source_key = (source_path, source_name.casefold())
+            source_existed_before_plan = (
+                source_path.exists()
+                and source_name in source_names
+                and source_key not in created_sheets
+            )
+            if (
+                source_existed_before_plan
+                and action.sourceSheet.casefold() not in authorized
+            ):
+                issues.append(
+                    f"第 {index + 1} 步：动作 {action.type} 尝试读取未授权的工作表"
+                    f"「{action.sourceSheet}」。"
+                )
+                continue
+            if source_name not in source_names:
                 issues.append(
                     f"第 {index + 1} 步：未找到复制源工作表"
                     f"「{action.sourceSheet}」"
@@ -933,6 +974,8 @@ def _preflight_folder_plan(
                 continue
 
         if action.type != "splitGroupAggregate":
+            if creates_sheet:
+                created_sheets.add(sheet_key)
             current_names.add(sheet_name)
 
     if issues:
@@ -1576,7 +1619,11 @@ def _execute_folder_plan(request: FolderExecuteRequest) -> FolderExecuteResponse
         )
         if current_fingerprint != session.source_fingerprint:
             raise ValueError("预览后所选文件已发生变化，请重新生成预览后再执行")
-    _preflight_folder_plan(session, request.plan)
+    validate_plan_for_folder(
+        request.plan,
+        session,
+        authorized_sheets=list(session.selected_targets),
+    )
     execution_started = time.perf_counter()
     workbooks: dict[Path, Workbook] = {}
     modified_paths: set[Path] = set()

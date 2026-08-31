@@ -39,6 +39,7 @@ from .models import (
     IntentCheckResponse,
     ModelSettingsResponse,
     PlanRequest,
+    PlanValidateRequest,
     TestModelConnectionResponse,
     SetFormulaModelRequest,
     TurnRequest,
@@ -689,7 +690,7 @@ async def plan(request: PlanRequest) -> AssistantResponse:
 
 
 @app.post("/api/plans/validate", response_model=AnalysisPlan)
-async def validate_plan(plan: AnalysisPlan) -> AnalysisPlan:
+async def validate_plan(request: PlanValidateRequest) -> AnalysisPlan:
     """校验并规范化一份手工编辑过的计划。
 
     保存编辑后的计划必须过这一关，返回的是**规范化之后**的计划（验收条件、
@@ -700,7 +701,7 @@ async def validate_plan(plan: AnalysisPlan) -> AnalysisPlan:
     FastAPI 会在请求体不合法时直接返回 422 + Pydantic 的逐字段报错，正好是
     编辑器需要的反馈，所以这里不额外包装。
     """
-    return plan
+    return request.plan
 
 
 class PlanChatRequest(BaseModel):

@@ -10,6 +10,7 @@ from server.app.folder_workbooks import (
     FolderExecuteRequest,
     FolderSelection,
     FolderSnapshotRequest,
+    OUTPUT_FILE_NAME,
     create_folder_snapshot,
     execute_folder_plan,
     refresh_folder,
@@ -626,6 +627,120 @@ def test_folder_dispatch_rejects_unmatched_action(tmp_path: Path) -> None:
     assert not list(tmp_path.glob("*.excel-bro-backup-*"))
 
 
+@pytest.mark.parametrize(
+    "action",
+    [
+        {
+            "type": "writeValues",
+            "sheet": "历史汇总",
+            "range": "A1",
+            "values": [["不允许"]],
+        },
+        {"type": "deleteWorksheet", "sheet": "历史汇总"},
+        {"type": "createWorksheet", "sheet": "历史汇总"},
+    ],
+)
+def test_folder_preflight_rejects_unauthorized_existing_output_sheets(
+    tmp_path: Path, action: dict[str, object]
+) -> None:
+    source = tmp_path / "scores.xlsx"
+    _create_source(source)
+    output = tmp_path / OUTPUT_FILE_NAME
+    output_book = Workbook()
+    output_book.active.title = "历史汇总"
+    output_book.active["A1"] = "保留"
+    output_book.save(output)
+    output_book.close()
+
+    catalog = scan_folder(tmp_path)
+    source_info = next(file for file in catalog.files if file.name == source.name)
+    snapshot = create_folder_snapshot(
+        FolderSnapshotRequest(
+            sessionId=catalog.sessionId,
+            selections=[FolderSelection(fileId=source_info.id, sheets=["得分"])],
+        )
+    )
+    plan = AnalysisPlan.model_validate(
+        {
+            "id": f"reject-unauthorized-{action['type']}",
+            "title": "拒绝未授权输出表",
+            "summary": "不能覆盖输出文件中的未授权现有工作表",
+            "actions": [action],
+        }
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=rf"动作 {action['type']} 尝试写入未授权的工作表「历史汇总」",
+    ):
+        execute_folder_plan(
+            FolderExecuteRequest(
+                sessionId=catalog.sessionId, plan=_stamp_plan(plan, snapshot)
+            )
+        )
+
+    unchanged = load_workbook(output, data_only=True)
+    assert unchanged.sheetnames == ["历史汇总"]
+    assert unchanged["历史汇总"]["A1"].value == "保留"
+    unchanged.close()
+    assert not list(tmp_path.glob("*.excel-bro-backup-*"))
+
+
+def test_folder_preflight_rejects_an_unauthorized_copy_source(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "scores.xlsx"
+    _create_source(source)
+    output = tmp_path / OUTPUT_FILE_NAME
+    output_book = Workbook()
+    output_book.active.title = "历史汇总"
+    output_book.active["A1"] = "保留"
+    output_book.save(output)
+    output_book.close()
+
+    catalog = scan_folder(tmp_path)
+    source_info = next(file for file in catalog.files if file.name == source.name)
+    snapshot = create_folder_snapshot(
+        FolderSnapshotRequest(
+            sessionId=catalog.sessionId,
+            selections=[FolderSelection(fileId=source_info.id, sheets=["得分"])],
+        )
+    )
+    plan = AnalysisPlan.model_validate(
+        {
+            "id": "reject-unauthorized-copy-source",
+            "title": "拒绝未授权复制源",
+            "summary": "不能从输出文件中的未授权现有工作表读取",
+            "actions": [
+                {
+                    "type": "copyRange",
+                    "sheet": "复制结果",
+                    "sourceSheet": "历史汇总",
+                    "sourceRange": "A1",
+                    "targetRange": "A1",
+                    "copyType": "values",
+                }
+            ],
+        }
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="动作 copyRange 尝试读取未授权的工作表「历史汇总」",
+    ):
+        execute_folder_plan(
+            FolderExecuteRequest(
+                sessionId=catalog.sessionId, plan=_stamp_plan(plan, snapshot)
+            )
+        )
+
+    unchanged = load_workbook(output, data_only=True)
+    assert unchanged.sheetnames == ["历史汇总"]
+    assert unchanged["历史汇总"]["A1"].value == "保留"
+    unchanged.close()
+    assert not list(tmp_path.glob("*.excel-bro-backup-*"))
+
+
 def test_folder_preflight_prevents_earlier_writes_when_later_source_is_missing(
     tmp_path: Path,
 ) -> None:
@@ -903,16 +1018,32 @@ def test_folder_verifies_sort_filter_table_and_cleared_filter(
     }
     assert all(check.passed for check in result.verification.checks)
 
+    refreshed = refresh_folder(catalog.sessionId)
+    output_info = next(
+        file for file in refreshed.files if file.name == OUTPUT_FILE_NAME
+    )
+    clear_snapshot = create_folder_snapshot(
+        FolderSnapshotRequest(
+            sessionId=catalog.sessionId,
+            selections=[
+                FolderSelection(fileId=output_info.id, sheets=["汇总"])
+            ],
+        )
+    )
+    clear_target = clear_snapshot.worksheets[0].name
     clear_plan = AnalysisPlan.model_validate(
         {
             "id": "verify-cleared-filter",
             "title": "清除筛选验收",
             "summary": "确认筛选条件已清除",
-            "actions": [{"type": "clearFilter", "sheet": "汇总"}],
+            "actions": [{"type": "clearFilter", "sheet": clear_target}],
         }
     )
     cleared = execute_folder_plan(
-        FolderExecuteRequest(sessionId=catalog.sessionId, plan=clear_plan)
+        FolderExecuteRequest(
+            sessionId=catalog.sessionId,
+            plan=_stamp_plan(clear_plan, clear_snapshot),
+        )
     )
     assert cleared.verification.status == "verified"
     assert cleared.verification.checks[-1].criterion.type == "filterCleared"

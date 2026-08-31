@@ -1319,6 +1319,62 @@ class AnalysisPlan(BaseModel):
         return self
 
 
+class PlanValidateRequest(BaseModel):
+    plan: AnalysisPlan
+    authorized_sheets: list[SheetName] = Field(
+        default_factory=list, max_length=100
+    )
+    existing_sheets: list[SheetName] = Field(default_factory=list, max_length=1000)
+
+    @model_validator(mode="after")
+    def enforce_authorized_sheet_boundary(self) -> "PlanValidateRequest":
+        authorized = {name.casefold() for name in self.authorized_sheets}
+        existing = {name.casefold() for name in self.existing_sheets}
+        created: set[str] = set()
+
+        for source_sheet in self.plan.sourceFingerprintSheets:
+            if source_sheet.casefold() not in authorized:
+                raise ValueError(
+                    f"数据来源指纹尝试读取未授权的工作表「{source_sheet}」。"
+                )
+
+        for action in self.plan.actions:
+            source_sheet = getattr(action, "sourceSheet", None)
+            if source_sheet:
+                source_key = source_sheet.casefold()
+                if source_key not in authorized and source_key not in created:
+                    raise ValueError(
+                        f"动作 {action.type} 尝试读取未授权的工作表"
+                        f"「{source_sheet}」。"
+                    )
+
+            sheet_key = action.sheet.casefold()
+            if action.type == "splitGroupAggregate":
+                if sheet_key not in authorized and sheet_key not in created:
+                    raise ValueError(
+                        f"动作 {action.type} 尝试读取未授权的工作表"
+                        f"「{action.sheet}」。"
+                    )
+                continue
+
+            if (
+                (
+                    sheet_key in existing
+                    or action.type == "deleteWorksheet"
+                )
+                and sheet_key not in authorized
+                and sheet_key not in created
+            ):
+                raise ValueError(
+                    f"动作 {action.type} 尝试写入未授权的工作表"
+                    f"「{action.sheet}」。"
+                )
+            if sheet_key not in existing:
+                created.add(sheet_key)
+
+        return self
+
+
 class ActionExecutionResult(BaseModel):
     index: int = Field(ge=0)
     type: str

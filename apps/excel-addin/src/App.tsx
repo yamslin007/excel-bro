@@ -3090,6 +3090,9 @@ export default function App() {
     setStatus("executing");
     try {
       const result = await executePlan(plan, {
+        authorizedSheetNames: forceLocal
+          ? [workbook!.activeWorksheet]
+          : selectedNamesFor(workbook!),
         allowedExternalFiles,
         acknowledgeStaleSource
       });
@@ -3649,7 +3652,8 @@ export default function App() {
       payload: {
         plan,
         target,
-        workbook: workbook!
+        workbook: workbook!,
+        authorizedSheets: selectedNamesFor(workbook!)
       }
     };
 
