@@ -1,9 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
+  canAcknowledgeStaleSource,
   deleteConversationFromHistory,
   normalizePetVisibility,
+  normalizeStoredMessage,
   normalizeStoredVerification
 } from "./conversation";
+import type { AnalysisPlan } from "./contracts";
 
 function conversation(id: string, updatedAt: string) {
   return {
@@ -78,6 +81,60 @@ describe("history verification migration", () => {
       passed: true,
       unverifiedActions: []
     });
+  });
+});
+
+describe("stale source plan preview", () => {
+  const plan = {
+    id: "stale-plan",
+    title: "写入汇总结果",
+    summary: "把预览时计算的汇总值写入结果表",
+    assumptions: [],
+    warnings: [],
+    actions: [
+      {
+        type: "writeValues",
+        sheet: "结果",
+        range: "A1",
+        values: [[42]]
+      }
+    ]
+  } as AnalysisPlan;
+
+  it("restores the stored plan as a visible preview before stale execution", () => {
+    const normalized = normalizeStoredMessage({
+      id: "message-1",
+      role: "system",
+      text: "数据来源已变化",
+      staleSourceConfirm: { plan, bakedActionCount: 1 },
+      createdAt: "2026-09-01T00:00:00.000Z"
+    });
+
+    expect(normalized.plan).toBe(plan);
+    expect(normalized.staleSourceConfirm?.status).toBe("pending");
+    expect(canAcknowledgeStaleSource(normalized)).toBe(true);
+  });
+
+  it("blocks stale execution without the matching visible preview or after completion", () => {
+    const message = normalizeStoredMessage({
+      id: "message-2",
+      role: "system",
+      staleSourceConfirm: { plan, bakedActionCount: 1 },
+      createdAt: "2026-09-01T00:00:00.000Z"
+    });
+
+    expect(canAcknowledgeStaleSource({ ...message, plan: undefined })).toBe(
+      false
+    );
+    expect(
+      canAcknowledgeStaleSource({
+        ...message,
+        staleSourceConfirm: {
+          ...message.staleSourceConfirm!,
+          status: "completed"
+        }
+      })
+    ).toBe(false);
   });
 });
 

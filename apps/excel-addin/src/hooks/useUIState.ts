@@ -5,6 +5,8 @@ import {
 } from "../conversation";
 
 const PANE_WIDEN_THRESHOLD = 380;
+export const WORK_DIRECTORY_GUIDE_STORAGE_KEY =
+  "excelBro.workDirectoryGuideDismissed.v1";
 
 /**
  * UI 状态管理 Hook
@@ -36,6 +38,11 @@ export function useUIState() {
       window.innerWidth < PANE_WIDEN_THRESHOLD
   );
   const [widenStepDone, setWidenStepDone] = useState(false);
+  const [workDirectoryGuideDismissed, setWorkDirectoryGuideDismissed] =
+    useState(
+      () =>
+        localStorage.getItem(WORK_DIRECTORY_GUIDE_STORAGE_KEY) === "dismissed"
+    );
   const [composerHeight, setComposerHeight] = useState<number | null>(null);
 
   // 宠物可见性持久化
@@ -83,6 +90,15 @@ export function useUIState() {
     setPetVisible((current) => !current);
   }, []);
 
+  const dismissWorkDirectoryGuide = useCallback(() => {
+    setWorkDirectoryGuideDismissed(true);
+    try {
+      localStorage.setItem(WORK_DIRECTORY_GUIDE_STORAGE_KEY, "dismissed");
+    } catch {
+      // 存储不可用时，本次会话仍保持已跳过状态。
+    }
+  }, []);
+
   return {
     // 抽屉状态
     toolsOpen,
@@ -107,11 +123,13 @@ export function useUIState() {
     focusOpening,
     isNarrowPane,
     widenStepDone,
+    workDirectoryGuideDismissed,
     composerHeight,
     togglePetVisibility,
     setFocusOpening,
     setIsNarrowPane,
     setWidenStepDone,
+    dismissWorkDirectoryGuide,
     setComposerHeight,
     setPetVisible
   };

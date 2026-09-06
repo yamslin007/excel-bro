@@ -59,6 +59,13 @@ export interface ChatMessage {
   verification?: VerificationReport;
   clarification?: MessageClarification;
   activityLog?: ActivityLog;
+  /** 批量工作表操作超出授权范围时，用结构化引导指向输入框上方的范围入口。 */
+  scopeSelectionGuidance?: {
+    keeperName: string;
+    missingSheetNames: string[];
+  };
+  /** 仅在本轮活动进行期间存在；刷新后未完成的空占位会被丢弃。 */
+  activityPending?: boolean;
   reused?: boolean;
   provider?: "model" | "local" | "system";
   querySourceMode?: SourceMode;
@@ -66,6 +73,10 @@ export interface ChatMessage {
   querySourceSheetIds?: string[];
   functionPreview?: FunctionPreview;
   executedPlanId?: string;
+  /** 当前工作簿模式下实际执行的唯一 ID，避免同一 plan 重复执行时选错撤销记录。 */
+  executedExecutionId?: string;
+  /** 文件夹模式下对应的恢复点 ID。 */
+  executedUndoId?: string;
   /**
    * 计划里含预览时算出的固定值、且源数据已变。带上原计划让用户能在确认后
    * 坚持执行（executePlan 的 acknowledgeStaleSource）。
@@ -73,6 +84,7 @@ export interface ChatMessage {
   staleSourceConfirm?: {
     plan: AnalysisPlan;
     bakedActionCount: number;
+    status?: "pending" | "completed";
   };
   createdAt: string;
 }

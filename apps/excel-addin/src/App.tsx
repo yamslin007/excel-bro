@@ -16,6 +16,7 @@ import {
   generateFormula,
   isLocalServiceConnectionError,
   refreshFolder,
+  scanFolderByPath,
   selectFolder,
 } from "./api";
 import type {
@@ -85,7 +86,15 @@ import {
   prepareImageFile,
   type PendingImage
 } from "./imageAttachments";
-import { extractWorkbookDataPeriod } from "./workbookIdentity";
+import { extractWorkbookDataPeriod, workbookFolderFromDocumentUrl } from "./workbookIdentity";
+import {
+  evaluateBulkWorksheetDeletion,
+  parseBulkWorksheetDeletion
+} from "./structuralIntent";
+import {
+  folderFileFullPath,
+  normalizeWorkbookPath
+} from "./workbookPathMatch";
 import capabilities from "../../../config/capabilities.json";
 import {
   buildCrossTableFormulas,
@@ -104,13 +113,31 @@ import {
   FOCUS_PAYLOAD_STORAGE_KEY,
   type FocusPayload
 } from "./focusState";
+import {
+  describeIntentDecision,
+  resolveConfirmedPrompt
+} from "./intent";
 import PetCompanion from "./PetCompanion";
 import { RuleManager } from "./RuleManager";
 import { SlashCommandAutocomplete, type SlashCommand } from "./SlashCommandAutocomplete";
 import ThemePanel from "./components/ThemePanel";
+import TaskProgressTimeline from "./components/TaskProgressTimeline";
+import { FolderBackupManager } from "./components/FolderBackupManager";
+import { ScopeSelectionGuidance } from "./components/ScopeSelectionGuidance";
+import {
+  shouldShowWorkDirectoryGuide,
+  WorkDirectoryGuide
+} from "./components/WorkDirectoryGuide";
+import type { FolderBackupTarget } from "./hooks/useFolderBackups";
 import { BASE_MODE_DESCRIPTION, BASE_MODE_HELP_TEXT } from "./helpCommand";
 import { useActivityProgress, type ActivityLog, type ActivityProgress } from "./hooks/useActivityProgress";
+import { useMessageAutoFollow } from "./hooks/useMessageAutoFollow";
 import { useConversation } from "./hooks/useConversation";
+import { canAcknowledgeStaleSource } from "./conversation";
+import {
+  insertChatMessage,
+  persistActivityMessage
+} from "./activityMessages";
 import { useCopyFeedback } from "./hooks/useCopyFeedback";
 import { useExecutionApproval } from "./hooks/useExecutionApproval";
 import { useModelManagement } from "./hooks/useModelManagement";
@@ -118,7 +145,12 @@ import { useServiceHealth } from "./hooks/useServiceHealth";
 import { useTheme } from "./hooks/useTheme";
 import { useToolManagement } from "./hooks/useToolManagement";
 import { useUIState } from "./hooks/useUIState";
-import { useScopeSelection } from "./hooks/useScopeSelection";
+import {
+  addedFolderSheetKeys,
+  resolveFolderViewAfterFileClear,
+  useScopeSelection
+} from "./hooks/useScopeSelection";
+import { useFolderUndo } from "./hooks/useFolderUndo";
 import { useUndoSnapshot } from "./hooks/useUndoSnapshot";
 import { useLongPress } from "./hooks/useLongPress";
 import { folderSheetKey, formulaTrialFailed } from "./utils";
@@ -195,11 +227,6 @@ export function normalizeStoredVerification(
   };
 }
 
-function formatStepElapsed(ms: number): string {
-  if (ms < 1000) return `${Math.max(0, Math.round(ms))}ms`;
-  return `${(ms / 1000).toFixed(1)}s`;
-}
-
 // isAbortError：区分「用户主动打断」和真正的错误。fetch 被 abort 时抛 AbortError，
 // 本地工具取消抛 DataToolExecutionError(code=CANCELLED)。这两种都不该弹错误提示。
 function isAbortError(reason: unknown): boolean {
@@ -213,83 +240,6 @@ function isAbortError(reason: unknown): boolean {
     return true;
   }
   return false;
-}
-
-// 把本地工具查询参数翻译成一句人能读懂的话，供「查看详情」里展示。
-function describeQueryArguments(args: QueryTableArguments): string {
-  const parts: string[] = [];
-  const modeLabel =
-    args.mode === "aggregate"
-      ? "分组汇总"
-      : args.mode === "profile"
-        ? "字段画像"
-        : "取明细行";
-  parts.push(`方式：${modeLabel}`);
-  if (args.fields?.length) parts.push(`字段：${args.fields.join("、")}`);
-  if (args.groupBy?.length) parts.push(`分组：${args.groupBy.join("、")}`);
-  if (args.metrics?.length) {
-    parts.push(
-      `指标：${args.metrics
-        .map((metric) => `${metric.operation}(${metric.field ?? "*"})`)
-        .join("、")}`
-    );
-  }
-  if (args.filters?.length) parts.push(`筛选：${args.filters.length} 个条件`);
-  if (args.combine?.mode) parts.push(`合并：${args.combine.mode}`);
-  if (typeof args.limit === "number") parts.push(`上限：${args.limit} 行`);
-  return parts.join("\n");
-}
-
-// describeIntentDecision：把需求确认的结构化结果翻译成「用户看得懂的判断」。
-// 返回 label（步骤标题）、note（模型的真实理解，第一层默认可见）、
-// detail（原始明细，第二层展开「查看详情」才显示），让用户判断模型是否偏离了轨迹。
-function describeIntentDecision(intent: IntentCheckResponse): {
-  label: string;
-  note?: string;
-  detail?: string;
-} {
-  const source = intent.provider === "model" ? "模型" : "本地规则";
-  if (intent.kind === "clarification") {
-    const clarification = intent.clarification;
-    const optionText = clarification.options
-      .map((option, index) => `${index + 1}. ${option.label}`)
-      .join("\n");
-    return {
-      label: `${source}判断需要先澄清需求`,
-      note: clarification.summary || clarification.question,
-      detail: [
-        `理解：${clarification.summary}`,
-        `追问：${clarification.question}`,
-        clarification.reason ? `原因：${clarification.reason}` : "",
-        clarification.options.length ? `可选项：\n${optionText}` : ""
-      ]
-        .filter(Boolean)
-        .join("\n\n")
-    };
-  }
-  if (intent.kind === "tool_request") {
-    return {
-      label: `${source}决定先用本地工具取数`,
-      note: intent.summary,
-      detail: [
-        `理解：${intent.summary}`,
-        `锁定执行：${intent.confirmedPrompt}`,
-        `本地查询：\n${describeQueryArguments(intent.request.arguments)}`
-      ]
-        .filter(Boolean)
-        .join("\n\n")
-    };
-  }
-  return {
-    label: `${source}确认可以直接分析`,
-    note: intent.summary,
-    detail: [
-      `理解：${intent.summary}`,
-      `锁定执行：${intent.confirmedPrompt}`
-    ]
-      .filter(Boolean)
-      .join("\n\n")
-  };
 }
 
 function intentScopeFingerprint(scope: IntentScopeContext): string {
@@ -570,7 +520,7 @@ function conversationTitle(messages: ChatMessage[]): string {
   )?.text;
   if (!firstUserMessage) return "新对话";
   const compact = firstUserMessage.replace(/\s+/g, " ").trim();
-  return compact.length > 34 ? `${compact.slice(0, 34)}…` : compact;
+  return compact.length > 34 ? `${compact.slice(0, 34)}...` : compact;
 }
 
 function createConversation(messages = [welcomeMessage()]): ChatConversation {
@@ -634,7 +584,13 @@ function loadChatHistory(): ChatHistoryState {
           const now = new Date().toISOString();
           return {
             ...conversation,
-            messages: conversation.messages.map((message) => {
+            messages: conversation.messages
+              .filter(
+                (message) =>
+                  !message.activityPending ||
+                  Boolean(message.activityLog?.steps.length)
+              )
+              .map((message) => {
               const normalizedMessage = {
                 ...message,
                 verification: normalizeStoredVerification(
@@ -657,7 +613,7 @@ function loadChatHistory(): ChatHistoryState {
                     }
                   }
                 : normalizedMessage;
-            }),
+              }),
             title:
               typeof conversation.title === "string"
                 ? conversation.title
@@ -821,27 +777,36 @@ export default function App() {
   } = conversationHook;
 
   const [status, setStatus] = useState<Status>("idle");
+  const [activePlanId, setActivePlanId] = useState<string | null>(null);
+  const activeActivityMessageIdRef = useRef<string | null>(null);
   // 活动进度管理（自定义 Hook）
   const activityHook = useActivityProgress({
-    onPersistLog: (log) => {
-      setMessages((messages) => {
-        const lastAssistantIndex = [...messages]
-          .reverse()
-          .findIndex((message) => message.role === "assistant");
-        if (lastAssistantIndex === -1) return messages;
-        const index = messages.length - 1 - lastAssistantIndex;
-        return messages.map((message, i) =>
-          i === index ? { ...message, activityLog: log } : message
-        );
-      });
+    onPersistLog: (log, persistenceKey) => {
+      const targetId = persistenceKey ?? activeActivityMessageIdRef.current;
+      setMessages((messages) =>
+        persistActivityMessage(messages, log, targetId, {
+          id: targetId ?? messageId(),
+          role: "assistant",
+          activityLog: log,
+          createdAt: new Date().toISOString()
+        })
+      );
+      if (activeActivityMessageIdRef.current === targetId) {
+        activeActivityMessageIdRef.current = null;
+      }
     }
   });
   const {
     activity,
     activitySeconds,
-    startActivity: beginActivity,
+    startActivity: startActivityProgress,
     advanceActivity,
+    completeCurrentStep,
+    applyProgressEvent,
     updateActivityDetail,
+    markActivityInterrupted,
+    markActivityReconnecting,
+    markActivityConnected,
     completeActivity: finishActivity
   } = activityHook;
 
@@ -933,7 +898,20 @@ export default function App() {
 
   const [contextOpen, setContextOpen] = useState(false);
   const [sheetSearch, setSheetSearch] = useState("");
+  const [folderSheetSearch, setFolderSheetSearch] = useState("");
+  const [activeFolderFileId, setActiveFolderFileId] = useState<string | null>(
+    null
+  );
+  const [folderPickerView, setFolderPickerView] = useState<"files" | "sheets">(
+    "files"
+  );
+  const [showSelectedFolderSheets, setShowSelectedFolderSheets] =
+    useState(false);
+  const [recentlyAddedFolderSheetKeys, setRecentlyAddedFolderSheetKeys] =
+    useState<string[]>([]);
+  const [folderRefreshNotice, setFolderRefreshNotice] = useState("");
   const [themePanelOpen, setThemePanelOpen] = useState(false);
+  const [folderBackupOpen, setFolderBackupOpen] = useState(false);
 
   // 斜杠命令自动补全状态
   const [showSlashAutocomplete, setShowSlashAutocomplete] = useState(false);
@@ -955,6 +933,7 @@ export default function App() {
     focusOpening, setFocusOpening,
     isNarrowPane, setIsNarrowPane,
     widenStepDone, setWidenStepDone,
+    workDirectoryGuideDismissed, dismissWorkDirectoryGuide,
     composerHeight, setComposerHeight,
     togglePetVisibility
   } = useUIState();
@@ -1020,18 +999,56 @@ export default function App() {
     applyFolderCatalog,
     chooseAutomaticScope,
     chooseManualScope,
+    adoptCurrentWorkbookScope,
     chooseFolderScope,
     folderSelections,
     selectedNamesFor,
     selectAllSheets,
     clearSelectedSheets
   } = useScopeSelection();
-  const messageEndRef = useRef<HTMLDivElement>(null);
+
+  // 备份管理目标：文件夹模式用 session，工作簿模式从文件路径推导
+  const folderBackupTarget = useMemo((): FolderBackupTarget => {
+    if (sourceMode === "folder" && folderCatalog) {
+      return {
+        kind: "session",
+        sessionId: folderCatalog.sessionId,
+        folderPath: folderCatalog.folderPath
+      };
+    }
+    if (isRunningInExcel()) {
+      const location = workbookFolderFromDocumentUrl(
+        (Office as any).context?.document?.url
+      );
+      if (location.kind === "local") {
+        return { kind: "path", folderPath: location.folderPath };
+      }
+      return { kind: "unavailable", reason: location.kind };
+    }
+    return { kind: "unavailable", reason: "unsaved" };
+  }, [folderCatalog, sourceMode]);
+
   const composerInputRef = useRef<HTMLTextAreaElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const clarificationImagesRef = useRef<Map<string, PendingImage[]>>(
     new Map()
   );
+  const activityScrollSignal = [
+    messages.length,
+    messages.length > 0 ? messages[messages.length - 1]?.id ?? "" : "",
+    activity?.operationId ?? "",
+    activity?.sequence ?? -1,
+    activity?.steps.length ?? 0,
+    activity?.current ?? "",
+    activity?.status ?? "",
+    activity?.connectionState ?? ""
+  ].join(":");
+  const {
+    containerRef: messageStreamRef,
+    hasUnseenProgress,
+    handleScroll: handleMessageStreamScroll,
+    scrollToLatest
+  } = useMessageAutoFollow(activityScrollSignal);
   const composerResizeRef = useRef<{
     pointerId: number;
     startY: number;
@@ -1099,6 +1116,18 @@ export default function App() {
   const isBaseMode = (selectedModelId || serviceHealth?.model || "local") === "local";
 
   useEffect(() => {
+    if (!folderCatalog || sourceMode !== "folder") {
+      setFolderBackupOpen(false);
+    }
+  }, [folderCatalog, sourceMode]);
+
+  useEffect(() => {
+    if (settingsOpen || toolsOpen || historyOpen || isRuleManagerOpen) {
+      setFolderBackupOpen(false);
+    }
+  }, [historyOpen, isRuleManagerOpen, settingsOpen, toolsOpen]);
+
+  useEffect(() => {
     if (!petVisible) return;
 
     const handlePetClick = (event: MouseEvent) => {
@@ -1153,6 +1182,25 @@ export default function App() {
     },
     onAfterUndo: () => scan()
   });
+  const {
+    folderUndoStack,
+    pushFolderUndo,
+    reconcileFolderUndoIds,
+    undoFolderExecutionTo
+  } = useFolderUndo({
+    isBusy: busy,
+    onStatusChange: setStatus,
+    onMessage: (text) => {
+      appendMessage({
+        role: "system",
+        text
+      });
+    },
+    onAfterUndo: async (entry) => {
+      const refreshed = await refreshFolder(entry.sessionId);
+      applyFolderRefreshResult(refreshed, true);
+    }
+  });
   const selectedModel = useMemo(
     () =>
       modelOptions.find(
@@ -1188,6 +1236,19 @@ export default function App() {
     showFirstModelGuide && isNarrowPane && !widenStepDone;
   const showModelGuide =
     showFirstModelGuide && (!isNarrowPane || widenStepDone);
+  const showWorkDirectoryGuide = shouldShowWorkDirectoryGuide({
+    ready: serverOnline && modelCatalogLoaded && workbook !== null,
+    previousStepComplete: hasConfiguredModel || modelGuideDismissed,
+    folderConfigured: folderCatalog !== null,
+    dismissed: workDirectoryGuideDismissed,
+    blocked:
+      settingsOpen ||
+      folderBackupOpen ||
+      contextOpen ||
+      busy ||
+      showWidenGuide ||
+      showModelGuide
+  });
   const hasEnvironmentModel =
     Boolean(modelSettings?.baseUrl) && Boolean(modelSettings?.defaultModel);
   const hasManagedModels = (modelSettings?.connections.length ?? 0) > 0;
@@ -1210,6 +1271,103 @@ export default function App() {
     },
     [sheetSearch, workbook]
   );
+  const folderSelectionCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const key of folderSheetKeys) {
+      const separator = key.indexOf("\0");
+      if (separator <= 0) continue;
+      const fileId = key.slice(0, separator);
+      counts.set(fileId, (counts.get(fileId) ?? 0) + 1);
+    }
+    return counts;
+  }, [folderSheetKeys]);
+  const visibleFolderFiles = useMemo(() => {
+    const files = folderCatalog?.files ?? [];
+    return showSelectedFolderSheets
+      ? files.filter((file) => (folderSelectionCounts.get(file.id) ?? 0) > 0)
+      : files;
+  }, [folderCatalog, folderSelectionCounts, showSelectedFolderSheets]);
+  const activeFolderFile = useMemo(
+    () =>
+      visibleFolderFiles.find((file) => file.id === activeFolderFileId) ??
+      visibleFolderFiles[0] ??
+      null,
+    [activeFolderFileId, visibleFolderFiles]
+  );
+  const activeFolderSheets = useMemo(
+    () =>
+      activeFolderFile?.worksheets.filter(
+        (sheet) => !isEBSystemSheet(sheet.name)
+      ) ?? [],
+    [activeFolderFile]
+  );
+  const filteredFolderSheets = useMemo(() => {
+    if (!activeFolderFile) return [];
+    const query = folderSheetSearch.trim().toLocaleLowerCase();
+    return activeFolderSheets.filter((sheet) => {
+      const key = folderSheetKey(activeFolderFile.id, sheet.name);
+      return (
+        sheet.name.toLocaleLowerCase().includes(query) &&
+        (!showSelectedFolderSheets || folderSheetKeys.includes(key))
+      );
+    });
+  }, [
+    activeFolderFile,
+    activeFolderSheets,
+    folderSheetKeys,
+    folderSheetSearch,
+    showSelectedFolderSheets
+  ]);
+  const selectedFolderFileCount = useMemo(
+    () =>
+      (folderCatalog?.files ?? []).filter(
+        (file) => (folderSelectionCounts.get(file.id) ?? 0) > 0
+      ).length,
+    [folderCatalog, folderSelectionCounts]
+  );
+  const totalSelectableFolderSheets = useMemo(
+    () =>
+      (folderCatalog?.files ?? []).reduce(
+        (total, file) =>
+          total +
+          file.worksheets.filter((sheet) => !isEBSystemSheet(sheet.name)).length,
+        0
+      ),
+    [folderCatalog]
+  );
+
+  function clearActiveFolderFileSelection(): void {
+    if (!activeFolderFile || !folderCatalog) return;
+    const transition = resolveFolderViewAfterFileClear(
+      folderSheetKeys,
+      activeFolderFile.id,
+      folderCatalog.files.map((file) => file.id),
+      showSelectedFolderSheets
+    );
+    clearSheetsInFile(activeFolderFile.id);
+    setShowSelectedFolderSheets(transition.showSelected);
+    setActiveFolderFileId(transition.activeFileId);
+    setFolderSheetSearch("");
+    if (showSelectedFolderSheets && !transition.showSelected) {
+      setFolderRefreshNotice(
+        "已清空本文件，当前没有已选工作表，已显示全部。"
+      );
+    }
+  }
+
+  useEffect(() => {
+    const files = folderCatalog?.files ?? [];
+    if (files.length === 0) {
+      setActiveFolderFileId(null);
+      setFolderPickerView("files");
+      return;
+    }
+    setActiveFolderFileId((current) =>
+      current && files.some((file) => file.id === current)
+        ? current
+        : (files.find((file) => !file.error) ?? files[0]).id
+    );
+  }, [folderCatalog]);
 
   useEffect(() => {
     try {
@@ -1233,10 +1391,6 @@ export default function App() {
       }
     }
   }, [chatHistory]);
-
-  useEffect(() => {
-    messageEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
 
   useEffect(
     () => () => {
@@ -1268,15 +1422,34 @@ export default function App() {
     message: Omit<ChatMessage, "id" | "createdAt">
   ): string {
     const id = messageId();
-    setMessages((current) => [
-      ...current,
-      {
-        ...message,
-        id,
-        createdAt: new Date().toISOString()
-      }
-    ]);
+    const nextMessage: ChatMessage = {
+      ...message,
+      id,
+      createdAt: new Date().toISOString()
+    };
+    setMessages((current) =>
+      insertChatMessage(
+        current,
+        nextMessage,
+        activeActivityMessageIdRef.current
+      )
+    );
     return id;
+  }
+
+  function beginActivity(
+    ...args: Parameters<typeof startActivityProgress>
+  ): void {
+    const [title, detail, options] = args;
+    const persistenceKey = appendMessage({
+      role: "assistant",
+      activityPending: true
+    });
+    activeActivityMessageIdRef.current = persistenceKey;
+    startActivityProgress(title, detail, {
+      ...(options ?? {}),
+      persistenceKey
+    });
   }
 
   // 命中判定：所有安全闸通过才返回缓存结论，否则 undefined（miss，静默重算）。
@@ -1512,43 +1685,197 @@ export default function App() {
     void addImageFiles(files);
   }
 
-  async function browseFolder() {
+  async function browseFolder(): Promise<FolderCatalog | null> {
     setStatus("scanning");
     try {
       const catalog = await selectFolder();
-      if (!catalog) return;
+      if (!catalog) return null;
+      if (
+        !folderCatalog ||
+        normalizeWorkbookPath(folderCatalog.folderPath) !==
+          normalizeWorkbookPath(catalog.folderPath)
+      ) {
+        // 初次设置或切换目录时不能沿用旧授权勾选。
+        setFolderSheetKeys([]);
+      }
       applyFolderCatalog(catalog);
+      setActiveFolderFileId(
+        (catalog.files.find((file) => !file.error) ?? catalog.files[0])?.id ??
+          null
+      );
+      setFolderPickerView("files");
+      setFolderSheetSearch("");
+      setShowSelectedFolderSheets(false);
+      setRecentlyAddedFolderSheetKeys([]);
+      setFolderRefreshNotice(
+        `已读取 ${catalog.files.length} 个文件、${catalog.files.reduce(
+          (total, file) =>
+            total +
+            file.worksheets.filter((sheet) => !isEBSystemSheet(sheet.name))
+              .length,
+          0
+        )} 张工作表`
+      );
       markServerOnline();
+      return catalog;
     } catch (reason) {
       appendMessage({
         role: "system",
         text: reason instanceof Error ? reason.message : "读取文件夹失败"
       });
+      return null;
     } finally {
       setStatus("idle");
     }
   }
 
-  async function refreshCurrentFolder() {
+  async function chooseWorkDirectoryFromGuide() {
+    const catalog = await browseFolder();
+    if (!catalog) return;
+    // 这里只登记候选目录；工作表仍需用户逐项勾选后才进入授权范围。
+    setFolderSheetKeys([]);
+    chooseFolderScope();
+    setSelectionConfirmed(false);
+    dismissWorkDirectoryGuide();
+    setContextOpen(true);
+  }
+
+  /** 会话失效的错误特征。后端只会说「已失效」，「已过期」是历史前端文案。 */
+  function isFolderSessionLost(message: string): boolean {
+    return (
+      message.includes("会话已失效") ||
+      message.includes("不存在或已过期") ||
+      message.includes("会话已过期")
+    );
+  }
+
+  /**
+   * 会话丢失后按本地记录重建：拿 folderPath 重新扫盘，再重放工作表勾选。
+   *
+   * 后端会话存在纯内存字典里，开发期 --reload 一重启就清空。前端本地已经存了
+   * folderPath 和勾选（都在 localStorage），所以不需要后端持久化——重建让授权集合
+   * 重新由 create_folder_snapshot 推导出来，边界校验路径保持完整。
+   *
+   * 重建**不掩盖数据变更**：新快照按当前文件状态重算 source_fingerprint，旧计划带的
+   * 是生成时的指纹，执行时比对不一致仍会被拒，照旧走「数据已变」二次确认。
+   */
+  async function rebuildFolderSession(): Promise<FolderCatalog | null> {
+    const folderPath = folderCatalog?.folderPath;
+    if (!folderPath) return null;
+    const wantedKeys = folderSheetKeys;
+    try {
+      const rebuilt = await scanFolderByPath(folderPath);
+      // fileId 是相对路径的 uuid5，跨会话稳定，所以旧 key 能直接在新 catalog 里匹配。
+      const selections = rebuilt.files
+        .map((file) => ({
+          fileId: file.id,
+          sheets: file.worksheets
+            .filter((sheet) => wantedKeys.includes(folderSheetKey(file.id, sheet.name)))
+            .map((sheet) => sheet.name)
+        }))
+        .filter((selection) => selection.sheets.length > 0);
+      const wantedSheetCount = wantedKeys.length;
+      const foundSheetCount = selections.reduce(
+        (total, selection) => total + selection.sheets.length,
+        0
+      );
+      if (wantedSheetCount > 0 && foundSheetCount < wantedSheetCount) {
+        // 有源文件或工作表在这期间被删/改名了，不静默丢弃勾选。
+        throw new Error("原先勾选的工作表已不存在");
+      }
+      applyFolderCatalog(rebuilt);
+      if (selections.length > 0) {
+        const snapshot = await createFolderSnapshot(rebuilt.sessionId, selections);
+        setWorkbook(snapshot);
+        setSelectedSheetNames(snapshot.worksheets.map((sheet) => sheet.name));
+        setSelectionConfirmed(true);
+      }
+      appendMessage({
+        role: "system",
+        text: `文件夹会话已重建：${rebuilt.folderName}`
+      });
+      return rebuilt;
+    } catch (reason) {
+      setFolderCatalog(null);
+      setFolderSheetKeys([]);
+      appendMessage({
+        role: "system",
+        text: `文件夹会话已失效且无法自动重建（${
+          reason instanceof Error ? reason.message : String(reason)
+        }），请重新选择文件夹`
+      });
+      return null;
+    }
+  }
+
+  /**
+   * 包装文件夹操作：遇到会话失效就重建后重试一次。
+   *
+   * operation 接收当前 sessionId 而非从闭包里读 folderCatalog，因为重建后的新
+   * sessionId 要到下一次渲染才进 state，闭包里拿到的还是旧值。
+   * 只重试一次，避免死循环。
+   */
+  async function withFolderSessionRecovery<T>(
+    sessionId: string,
+    operation: (sessionId: string) => Promise<T>
+  ): Promise<T> {
+    try {
+      return await operation(sessionId);
+    } catch (reason) {
+      const message = reason instanceof Error ? reason.message : String(reason);
+      if (!isFolderSessionLost(message)) throw reason;
+      const rebuilt = await rebuildFolderSession();
+      if (!rebuilt) throw reason;
+      return operation(rebuilt.sessionId);
+    }
+  }
+
+  function applyFolderRefreshResult(
+    refreshed: FolderCatalog,
+    quiet: boolean
+  ) {
+    const addedKeys = addedFolderSheetKeys(folderCatalog, refreshed);
+    applyFolderCatalog(refreshed);
+    setRecentlyAddedFolderSheetKeys(addedKeys);
+    if (addedKeys.length > 0) {
+      const separator = addedKeys[0].indexOf("\0");
+      if (separator > 0) {
+        setActiveFolderFileId(addedKeys[0].slice(0, separator));
+        setFolderPickerView("sheets");
+      }
+      setFolderRefreshNotice(`发现 ${addedKeys.length} 张新增工作表`);
+      return;
+    }
+    setFolderRefreshNotice(
+      quiet
+        ? ""
+        : `已刷新，共 ${refreshed.files.length} 个文件、${refreshed.files.reduce(
+            (total, file) =>
+              total +
+              file.worksheets.filter(
+                (sheet) => !isEBSystemSheet(sheet.name)
+              ).length,
+            0
+          )} 张工作表`
+    );
+  }
+
+  async function refreshCurrentFolder(options: { quiet?: boolean } = {}) {
     if (!folderCatalog || busy) return;
     setStatus("scanning");
     try {
       const refreshed = await refreshFolder(folderCatalog.sessionId);
-      applyFolderCatalog(refreshed);
+      applyFolderRefreshResult(refreshed, options.quiet ?? false);
       markServerOnline();
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : String(reason);
-      if (
-        message.includes("已失效") ||
-        message.includes("已过期") ||
-        message.includes("不存在")
-      ) {
-        setFolderCatalog(null);
-        setFolderSheetKeys([]);
-        appendMessage({
-          role: "system",
-          text: "文件夹会话已过期，请重新选择文件夹"
-        });
+      if (isFolderSessionLost(message) || message.includes("不存在")) {
+        // 会话没了但本地还记着 folderPath，直接重建等价于一次刷新。
+        const rebuilt = await rebuildFolderSession();
+        if (rebuilt) {
+          applyFolderRefreshResult(rebuilt, options.quiet ?? false);
+        }
+        markServerOnline();
       } else {
         appendMessage({
           role: "system",
@@ -1588,9 +1915,67 @@ export default function App() {
       if (!folderCatalog || folderSheetKeys.length === 0) return;
       setStatus("scanning");
       try {
-        const snapshot = await createFolderSnapshot(
+        const selections = folderSelections();
+        const selectedFile =
+          selections.length === 1
+            ? folderCatalog.files.find(
+                (file) => file.id === selections[0].fileId
+              )
+            : null;
+        const currentWorkbookPath = isRunningInExcel()
+          ? normalizeWorkbookPath(Office.context.document.url)
+          : null;
+        const selectedFilePath = selectedFile
+          ? folderFileFullPath(
+              folderCatalog.folderPath,
+              selectedFile.relativePath
+            )
+          : null;
+        if (
+          selectedFile &&
+          currentWorkbookPath &&
+          currentWorkbookPath === selectedFilePath
+        ) {
+          try {
+            const nameSnapshot = await captureWorkbook();
+            const actualNames = new Map(
+              nameSnapshot.worksheets.map((sheet) => [
+                sheet.name.toLocaleLowerCase(),
+                sheet.name
+              ])
+            );
+            const selectedNames = selections[0].sheets
+              .map((name) => actualNames.get(name.toLocaleLowerCase()))
+              .filter((name): name is string => name !== undefined);
+            if (selectedNames.length === selections[0].sheets.length) {
+              const snapshot = await captureWorkbook(selectedNames);
+              const snapshotNames = new Set(
+                snapshot.worksheets.map((sheet) =>
+                  sheet.name.toLocaleLowerCase()
+                )
+              );
+              if (
+                selectedNames.every((name) =>
+                  snapshotNames.has(name.toLocaleLowerCase())
+                )
+              ) {
+                setWorkbook(snapshot);
+                adoptCurrentWorkbookScope(snapshot, selectedNames);
+                setContextOpen(false);
+                appendMessage({
+                  role: "system",
+                  text: "所选文件就是当前工作簿，已改为直接在 Excel 中处理。"
+                });
+                return;
+              }
+            }
+          } catch {
+            // 无法从宿主实时确认时保留文件夹语义，由后端锁探测继续兜底。
+          }
+        }
+        const snapshot = await withFolderSessionRecovery(
           folderCatalog.sessionId,
-          folderSelections()
+          (sessionId) => createFolderSnapshot(sessionId, selections)
         );
         setWorkbook(snapshot);
         setSelectedSheetNames(snapshot.worksheets.map((sheet) => sheet.name));
@@ -1598,13 +1983,8 @@ export default function App() {
         setContextOpen(false);
       } catch (reason) {
         const message = reason instanceof Error ? reason.message : "读取所选工作表失败";
-        if (message.includes("会话已失效") || message.includes("不存在或已过期")) {
-          setFolderCatalog(null);
-          appendMessage({
-            role: "system",
-            text: "文件夹会话已过期，请重新选择文件夹"
-          });
-        } else {
+        // 会话失效的分支已由 withFolderSessionRecovery 处理（重建失败时它已提示重选）。
+        if (!isFolderSessionLost(message)) {
           appendMessage({
             role: "system",
             text: message
@@ -1676,7 +2056,8 @@ export default function App() {
     dataResults: DataToolResult[] = [],
     preparedWorkbook?: WorkbookSnapshot,
     intentMemory?: IntentMemory,
-    turnId?: string | null
+    turnId?: string | null,
+    planningReadPolicy: "ifNeeded" | "none" = "ifNeeded"
   ) {
     if (!workbook) return;
     setStatus("planning");
@@ -1781,16 +2162,12 @@ export default function App() {
             data
           })),
           dataResults,
+          planningReadPolicy,
           modelId: selectedModelId || null
         },
         {
           signal: turnAbortRef.current?.signal,
-          onStep: (step) =>
-            advanceActivity(
-              step.title,
-              step.detail ?? "",
-              step.completedStep ?? undefined
-            )
+          onProgress: applyProgressEvent
         }
       );
       markServerOnline();
@@ -1868,6 +2245,7 @@ export default function App() {
       setPendingImages(sentImages);
       if (isLocalServiceConnectionError(reason)) {
         markServerOffline();
+        markActivityInterrupted("连接中断，执行结果待确认。");
       } else {
         markServerOnline();
       }
@@ -2175,7 +2553,8 @@ export default function App() {
     scopeFingerprint: string,
     clarificationMessageId?: string,
     clarificationRound = 0,
-    correctionAttempt = 0
+    correctionAttempt = 0,
+    planningReadPolicy: "ifNeeded" | "none" = "ifNeeded"
   ) {
     if (intent.kind === "clarification") {
       clarificationImagesRef.current.set(
@@ -2217,14 +2596,17 @@ export default function App() {
       {
         confirmedPrompt: intent.confirmedPrompt
       },
-      intent.turnId
+      intent.turnId,
+      planningReadPolicy
     );
   }
 
   async function resolveClarification(
     message: ChatMessage,
     resolution: string,
-    label: string
+    label: string,
+    finalSelection = false,
+    resolutionMode: IntentOption["resolutionMode"] = "append"
   ) {
     const clarification = message.clarification;
     if (!clarification || clarification.status !== "pending" || busy) return;
@@ -2254,8 +2636,11 @@ export default function App() {
     );
     setPendingImages([]);
     setImageError("");
-    const confirmedPrompt =
-      `${clarification.originalPrompt}\n\n用户确认：${resolution}`;
+    const confirmedPrompt = resolveConfirmedPrompt(
+      clarification.originalPrompt,
+      resolution,
+      resolutionMode
+    );
     if (!workbook) return;
     const sheetNames = selectedNamesFor(workbook);
     const scope = buildIntentScope(workbook, sheetNames);
@@ -2292,34 +2677,45 @@ export default function App() {
       `正在核对 ${sheetNames.length} 张已选工作表的字段结构。`
     );
     try {
-      const intent = await checkIntent({
-        turnId: clarification.turnId,
-        prompt: confirmedPrompt,
-        scope,
-        imageCount: sentImages.length,
-        intentConfirmed: true,
-        clarificationRound: Math.min(
-          MAX_CLARIFICATION_ROUNDS,
-          clarification.round + 1
-        ),
-        conversation: messages
-          .filter(
-            (item) =>
-              (item.role === "user" || item.role === "assistant") &&
-              item.text?.trim()
-          )
-          .slice(-INTENT_HISTORY_MESSAGES)
-          .map((item) => ({
-            role: item.role as "user" | "assistant",
-            text: item.text!.slice(0, INTENT_MESSAGE_CHARACTERS)
-          })),
-        priorIntent:
-          [...messages]
-            .reverse()
-            .find((item) => item.intentMemory)?.intentMemory ?? null,
-        priorResult: latestResultContext(messages),
-        modelId: selectedModelId || null
-      }, turnController.signal);
+      const intent: IntentCheckResponse = finalSelection
+        ? {
+            kind: "proceed",
+            summary: `已按用户选择确认：${label}`,
+            confirmedPrompt,
+            provider: "local",
+            turnId: clarification.turnId
+          }
+        : await checkIntent(
+            {
+              turnId: clarification.turnId,
+              prompt: confirmedPrompt,
+              scope,
+              imageCount: sentImages.length,
+              intentConfirmed: true,
+              clarificationRound: Math.min(
+                MAX_CLARIFICATION_ROUNDS,
+                clarification.round + 1
+              ),
+              conversation: messages
+                .filter(
+                  (item) =>
+                    (item.role === "user" || item.role === "assistant") &&
+                    item.text?.trim()
+                )
+                .slice(-INTENT_HISTORY_MESSAGES)
+                .map((item) => ({
+                  role: item.role as "user" | "assistant",
+                  text: item.text!.slice(0, INTENT_MESSAGE_CHARACTERS)
+                })),
+              priorIntent:
+                [...messages]
+                  .reverse()
+                  .find((item) => item.intentMemory)?.intentMemory ?? null,
+              priorResult: latestResultContext(messages),
+              modelId: selectedModelId || null
+            },
+            turnController.signal
+          );
       advanceActivity(
         "需求确认完成",
         "正在根据确认结果选择本地工具或生成操作预览。",
@@ -2349,26 +2745,49 @@ export default function App() {
         return next;
       });
       clarificationImagesRef.current.delete(clarification.id);
-      setStatus("idle");
       const decision = describeIntentDecision(intent);
-      advanceActivity(
-        decision.label,
-        decision.note ?? "正在根据确认结果继续。",
-        decision.label,
-        { note: decision.note, detail: decision.detail }
-      );
-      await continueIntentDecision(
-        intent,
-        confirmedPrompt,
-        sentImages,
-        clarification.scopeFingerprint,
-        message.id,
-        Math.min(
-          MAX_CLARIFICATION_ROUNDS,
-          clarification.round + 1
-        )
-      );
-      finishActivity();
+      if (intent.kind === "clarification") {
+        completeCurrentStep(decision.label, {
+          note: decision.note,
+          detail: decision.detail
+        });
+        finishActivity("completed", undefined, "awaiting_input");
+        await continueIntentDecision(
+          intent,
+          confirmedPrompt,
+          sentImages,
+          clarification.scopeFingerprint,
+          message.id,
+          Math.min(
+            MAX_CLARIFICATION_ROUNDS,
+            clarification.round + 1
+          ),
+          0,
+          finalSelection ? "none" : "ifNeeded"
+        );
+      } else {
+        advanceActivity(
+          decision.label,
+          decision.note ?? "正在根据确认结果继续。",
+          decision.label,
+          { note: decision.note, detail: decision.detail }
+        );
+        await continueIntentDecision(
+          intent,
+          confirmedPrompt,
+          sentImages,
+          clarification.scopeFingerprint,
+          message.id,
+          Math.min(
+            MAX_CLARIFICATION_ROUNDS,
+            clarification.round + 1
+          ),
+          0,
+          finalSelection ? "none" : "ifNeeded"
+        );
+        finishActivity();
+      }
+      setStatus("idle");
     } catch (reason) {
       // 用户主动打断：把澄清状态复位为 pending，静默收尾。
       if (isAbortError(reason)) {
@@ -2385,8 +2804,8 @@ export default function App() {
               : item
           )
         );
+        finishActivity("cancelled", "用户已取消");
         setStatus("idle");
-        finishActivity();
         return;
       }
       setPendingImages(sentImages);
@@ -2477,6 +2896,7 @@ export default function App() {
   function stopTurn() {
     pendingSteerRef.current = null;
     steerBasePromptRef.current = null;
+    markActivityInterrupted("已停止接收进度，执行结果待确认。");
     turnAbortRef.current?.abort();
     queryAbortRef.current?.abort();
   }
@@ -2603,9 +3023,8 @@ export default function App() {
       snapshotKeys.size > 0 &&
       [...selectedKeys].every((key) => snapshotKeys.has(key))
         ? workbook
-        : await createFolderSnapshot(
-            folderCatalog.sessionId,
-            folderSelections()
+        : await withFolderSessionRecovery(folderCatalog.sessionId, (sessionId) =>
+            createFolderSnapshot(sessionId, folderSelections())
           );
     const extraSheets: FormulaExtraSheet[] = [];
     for (const sheet of snapshot.worksheets) {
@@ -2769,16 +3188,12 @@ export default function App() {
       });
     } catch (reason) {
       const errorMsg = reason instanceof Error ? reason.message : "生成公式失败";
-      if (errorMsg.includes("会话已失效") || errorMsg.includes("不存在或已过期")) {
-        setFolderCatalog(null);
-        markFunctionPreview(message.id, {
-          targetError: "文件夹会话已过期，请重新选择文件夹"
-        });
-      } else {
-        markFunctionPreview(message.id, {
-          targetError: errorMsg
-        });
-      }
+      // 会话失效已在上面尝试过重建；能走到这里说明重建也失败了，状态已被清空。
+      markFunctionPreview(message.id, {
+        targetError: isFolderSessionLost(errorMsg)
+          ? "文件夹会话已失效，请重新选择文件夹"
+          : errorMsg
+      });
     } finally {
       finishActivity();
       setStatus("idle");
@@ -2832,8 +3247,12 @@ export default function App() {
     // 仅影响送模型与缓存的意图文本（intentText），气泡仍只显示用户实际输入（text）。
     const steerBasePrompt = steerBasePromptRef.current;
     steerBasePromptRef.current = null;
+    const standaloneStructuralIntent =
+      sourceMode === "workbook"
+        ? parseBulkWorksheetDeletion(text)
+        : null;
     const intentText =
-      steerBasePrompt && steerBasePrompt !== text
+      !standaloneStructuralIntent && steerBasePrompt && steerBasePrompt !== text
         ? `${steerBasePrompt}；补充：${text}`
         : text;
     // "仍要重新计算"绕过整个命中判定，并在重算后覆写缓存。
@@ -2875,7 +3294,7 @@ export default function App() {
       setContextOpen(true);
       appendMessage({
         role: "system",
-        text: "请先在上方“数据范围”中选择文件夹和工作表。"
+        text: "请先在上方「数据范围」中选择文件夹和工作表。"
       });
       return;
     }
@@ -2908,6 +3327,71 @@ export default function App() {
     }
     const effectiveSheetNames = selectedNamesFor(intentWorkbook);
     setSelectedSheetNames(effectiveSheetNames);
+    const structuralDeletion =
+      sourceMode === "workbook"
+        ? evaluateBulkWorksheetDeletion(
+            intentText,
+            intentWorkbook.worksheets
+              .filter((sheet) => !isEBSystemSheet(sheet.name))
+              .map((sheet) => sheet.name),
+            effectiveSheetNames
+          )
+        : { kind: "notMatched" as const };
+    if (structuralDeletion.kind === "keeperMissing") {
+      appendMessage({ role: "user", text: enteredText });
+      appendMessage({
+        role: "system",
+        text:
+          `当前工作簿中未找到要保留的工作表"${structuralDeletion.requestedKeeperName}"。` +
+          "本次没有生成计划，也没有删除任何工作表。"
+      });
+      setPrompt(enteredText);
+      setStatus("idle");
+      finishActivity();
+      return;
+    }
+    if (structuralDeletion.kind === "selectionRequired") {
+      const missingPreview = structuralDeletion.missingSheetNames
+        .slice(0, 6)
+        .map((name) => `"${name}"`)
+        .join("、");
+      const missingSuffix =
+        structuralDeletion.missingSheetNames.length > 6
+          ? `等 ${structuralDeletion.missingSheetNames.length} 张工作表`
+          : "";
+      appendMessage({ role: "user", text: enteredText });
+      appendMessage({
+        role: "system",
+        text:
+          "当前授权范围不包含全部工作表，因此不能删除尚未授权的工作表。" +
+          `请点击输入框上方的「工作表范围」，勾选当前工作簿的全部工作表，然后再次发送这条指令。请同时勾选需要保留的「${structuralDeletion.keeperName}」。` +
+          `\n\n尚未授权：${missingPreview}${missingSuffix}。` +
+          "\n\n本次未生成执行计划，也未删除任何工作表。",
+        scopeSelectionGuidance: {
+          keeperName: structuralDeletion.keeperName,
+          missingSheetNames: structuralDeletion.missingSheetNames
+        }
+      });
+      chooseManualScope(intentWorkbook);
+      setSelectionConfirmed(false);
+      setPrompt(enteredText);
+      setStatus("idle");
+      finishActivity();
+      return;
+    }
+    if (structuralDeletion.kind === "nothingToDelete") {
+      appendMessage({ role: "user", text: enteredText });
+      appendMessage({
+        role: "assistant",
+        text: `当前工作簿只剩"${structuralDeletion.keeperName}"，没有其他工作表需要删除。`
+      });
+      setPrompt("");
+      setPendingImages([]);
+      setImageError("");
+      setStatus("idle");
+      finishActivity();
+      return;
+    }
     const intentScope = buildIntentScope(
       intentWorkbook,
       effectiveSheetNames
@@ -2981,31 +3465,46 @@ export default function App() {
         modelId: selectedModelId || null
       }, turnController.signal);
       markServerOnline();
-      setStatus("idle");
       const decision = describeIntentDecision(intent);
-      advanceActivity(
-        decision.label,
-        decision.note ?? "正在根据确认结果继续。",
-        decision.label,
-        { note: decision.note, detail: decision.detail }
-      );
-      await continueIntentDecision(
-        intent,
-        intentText,
-        sentImages,
-        scopeFingerprint
-      );
-      finishActivity();
+      if (intent.kind === "clarification") {
+        completeCurrentStep(decision.label, {
+          note: decision.note,
+          detail: decision.detail
+        });
+        finishActivity("completed", undefined, "awaiting_input");
+        await continueIntentDecision(
+          intent,
+          intentText,
+          sentImages,
+          scopeFingerprint
+        );
+      } else {
+        advanceActivity(
+          decision.label,
+          decision.note ?? "正在根据确认结果继续。",
+          decision.label,
+          { note: decision.note, detail: decision.detail }
+        );
+        await continueIntentDecision(
+          intent,
+          intentText,
+          sentImages,
+          scopeFingerprint
+        );
+        finishActivity();
+      }
+      setStatus("idle");
     } catch (reason) {
       // 用户主动打断：静默收尾，不弹错误。转向时新 turn 已在 steerTurn 里另起。
       if (isAbortError(reason)) {
+        finishActivity("cancelled", "用户已取消");
         setStatus("idle");
-        finishActivity();
         return;
       }
       setPendingImages(sentImages);
       if (isLocalServiceConnectionError(reason)) {
         markServerOffline();
+        markActivityInterrupted("连接中断，执行结果待确认。");
       } else {
         markServerOnline();
       }
@@ -3035,9 +3534,39 @@ export default function App() {
   ): Promise<boolean> {
     if (sourceMode === "folder" && !forceLocal) {
       if (!folderCatalog) return false;
+      const operationId = `execution-${messageId()}`;
+      setActivePlanId(plan.id);
+      beginActivity("正在执行文件夹操作计划", plan.summary, {
+        operationId,
+        phase: "preflight",
+        stepId: "execution.preflight"
+      });
       setStatus("executing");
+      let folderActivityStatus: "completed" | "warning" | "failed" =
+        "completed";
+      let folderActivitySummary: string | undefined;
       try {
-        const result = await executeFolderPlan(folderCatalog.sessionId, plan);
+        const result = await withFolderSessionRecovery(
+          folderCatalog.sessionId,
+          (sessionId) =>
+            executeFolderPlan(sessionId, plan, {
+              operationId,
+              onProgress: applyProgressEvent,
+              onConnectionState: (connectionState, message) => {
+                if (connectionState === "reconnecting") {
+                  markActivityReconnecting(
+                    message ?? "连接短暂中断，正在恢复进度。"
+                  );
+                } else if (connectionState === "interrupted") {
+                  markActivityInterrupted(
+                    message ?? "连接中断，执行结果待确认。"
+                  );
+                } else {
+                  markActivityConnected();
+                }
+              }
+            })
+        );
         recordDiagnosticEvent({
           timestamp: new Date().toISOString(),
           phase: "execution",
@@ -3057,25 +3586,54 @@ export default function App() {
           role: "assistant",
           text: `「${plan.title}」已执行 ${
             result.actionResults.length
-          } 步${verificationSummary(result.verification)}。已写入：${result.filesModified.join("、")}${
-            result.backups.length > 0
-              ? `；已备份：${result.backups.join("、")}`
+          } 步${verificationSummary(result.verification)}。${
+            result.filesModified.length > 0
+              ? `已写入：${result.filesModified.join("、")}`
+              : "目标状态已经符合要求，未写入文件，也未创建恢复点"
+          }${
+            result.backupDirectory
+              ? "；执行前副本已集中保存，可在「恢复点管理」中查看"
+              : ""
+          }${result.undo ? "；已记录本次恢复点" : ""}${
+            result.backupWarnings?.length
+              ? `。注意：${result.backupWarnings.join("；")}`
               : ""
           }`,
-          verification: result.verification
+          verification: result.verification,
+          executedPlanId: result.undo ? plan.id : undefined,
+          executedUndoId: result.undo?.undoId
         });
+        pushFolderUndo(
+          result.undo
+            ? {
+                planId: plan.id,
+                undoId: result.undo.undoId,
+                sessionId: result.undo.sessionId
+              }
+            : null
+        );
         if (result.verification.status === "verified") {
           markPlanVerified(plan.id);
         }
         return true;
       } catch (reason) {
+        folderActivitySummary =
+          reason instanceof Error ? reason.message : "执行文件夹计划失败";
+        if (isLocalServiceConnectionError(reason)) {
+          folderActivityStatus = "warning";
+          markActivityInterrupted("连接中断，执行结果待确认。");
+        } else {
+          folderActivityStatus = "failed";
+        }
         appendMessage({
           role: "system",
           text: reason instanceof Error ? reason.message : "执行文件夹计划失败"
         });
         return false;
       } finally {
+        setActivePlanId(null);
         setStatus("idle");
+        finishActivity(folderActivityStatus, folderActivitySummary);
       }
     }
 
@@ -3087,14 +3645,26 @@ export default function App() {
       return false;
     }
 
+    const operationId = `execution-${messageId()}`;
+    setActivePlanId(plan.id);
+    beginActivity("正在执行操作计划", plan.summary, {
+      operationId,
+      phase: "preflight",
+      stepId: "execution.preflight"
+    });
     setStatus("executing");
+    let workbookActivityStatus: "completed" | "warning" | "failed" =
+      "completed";
+    let workbookActivitySummary: string | undefined;
     try {
       const result = await executePlan(plan, {
         authorizedSheetNames: forceLocal
           ? [workbook!.activeWorksheet]
           : selectedNamesFor(workbook!),
         allowedExternalFiles,
-        acknowledgeStaleSource
+        acknowledgeStaleSource,
+        operationId,
+        onProgress: applyProgressEvent
       });
       recordDiagnosticEvent({
         timestamp: new Date().toISOString(),
@@ -3115,11 +3685,14 @@ export default function App() {
         role: "assistant",
         text: `「${plan.title}」已执行 ${result.actionResults.length} 步${verificationSummary(result.verification)}。${
           result.undoSnapshot
-            ? `已记录 ${result.undoSnapshot.ranges.length} 项本次执行撤销数据。`
+            ? result.undoSnapshot.postStateCoverage === "complete"
+              ? `已记录 ${result.undoSnapshot.ranges.length} 项本次执行撤销数据，并已核对执行后状态。`
+              : "已保留本次执行捕获的数据，但执行后状态未能完整核对，暂不能直接撤销。"
             : ""
         }原始工作表没有被删除或清空。`,
         verification: result.verification,
-        executedPlanId: plan.id
+        executedPlanId: plan.id,
+        executedExecutionId: result.undoSnapshot?.executionId
       });
       pushUndoSnapshot(result.undoSnapshot ?? null);
       if (result.verification.status === "verified") {
@@ -3129,18 +3702,24 @@ export default function App() {
       return true;
     } catch (reason) {
       if (reason instanceof StaleSourceError) {
+        workbookActivityStatus = "warning";
+        workbookActivitySummary = reason.message;
         // 数据变了但计划本身仍可执行：给出二次确认，而不是像字段缺失那样堵死。
         appendMessage({
           role: "system",
           text: reason.message,
+          plan,
           staleSourceConfirm: {
             plan,
-            bakedActionCount: reason.bakedActionCount
+            bakedActionCount: reason.bakedActionCount,
+            status: "pending"
           }
         });
         return false;
       }
       if (reason instanceof PlanExecutionError) {
+        workbookActivityStatus = "failed";
+        workbookActivitySummary = reason.message;
         const succeeded = reason.actionResults.filter(
           (result) => result.status === "succeeded"
         ).length;
@@ -3150,17 +3729,32 @@ export default function App() {
         const notRun = reason.actionResults.filter(
           (result) => result.status === "not_run"
         ).length;
+        pushUndoSnapshot(reason.undoSnapshot);
         appendMessage({
           role: "system",
           text: `${reason.message}。${
             succeeded > 0
               ? `已有 ${succeeded} 步成功写入当前工作簿；`
               : "本次没有步骤成功写入；"
+          }${
+            reason.undoSnapshot
+              ? `已保留本次执行捕获的数据（${reason.undoSnapshot.coverage === "partial" ? "部分覆盖" : "完整覆盖"}，${reason.undoSnapshot.postStateCoverage === "complete" ? "可在撤销前再次核对" : "执行后状态未完整核对，暂不能直接撤销"}）；`
+              : "没有可用的撤销快照；"
           }${failed ? `失败步骤：${failed.type}（${failed.sheet}）；` : ""}${
             notRun > 0 ? `其余 ${notRun} 步未执行。` : ""
-          }`
+          }`,
+          executedPlanId: reason.undoSnapshot ? plan.id : undefined,
+          executedExecutionId: reason.undoSnapshot?.executionId
         });
         return false;
+      }
+      workbookActivityStatus = isLocalServiceConnectionError(reason)
+        ? "warning"
+        : "failed";
+      workbookActivitySummary =
+        reason instanceof Error ? reason.message : "执行计划失败";
+      if (workbookActivityStatus === "warning") {
+        markActivityInterrupted("连接中断，执行结果待确认。");
       }
       appendMessage({
         role: "system",
@@ -3168,8 +3762,41 @@ export default function App() {
       });
       return false;
     } finally {
+      setActivePlanId(null);
       setStatus("idle");
+      finishActivity(workbookActivityStatus, workbookActivitySummary);
     }
+  }
+
+  async function acknowledgeStaleSource(message: ChatMessage) {
+    if (!canAcknowledgeStaleSource(message)) {
+      appendMessage({
+        role: "system",
+        text: "无法恢复这份计划的执行预览，已阻止写入。请按当前数据重新生成预览。"
+      });
+      return;
+    }
+    const confirmation = message.staleSourceConfirm!;
+    const succeeded = await runPlan(
+      confirmation.plan,
+      undefined,
+      undefined,
+      true
+    );
+    if (!succeeded) return;
+    setMessages((current) =>
+      current.map((item) =>
+        item.id === message.id && item.staleSourceConfirm
+          ? {
+              ...item,
+              staleSourceConfirm: {
+                ...item.staleSourceConfirm,
+                status: "completed"
+              }
+            }
+          : item
+      )
+    );
   }
 
   // 更新某条消息的 functionPreview（确认/取消后标记状态）。
@@ -3959,7 +4586,9 @@ export default function App() {
           if (!folderCatalog) {
             throw new Error("文件夹会话已失效，请重新选择文件夹");
           }
-          return executeFolderQuery(folderCatalog.sessionId, request);
+          return withFolderSessionRecovery(folderCatalog.sessionId, (sessionId) =>
+            executeFolderQuery(sessionId, request)
+          );
         }
       });
       appendMessage({
@@ -4312,6 +4941,27 @@ export default function App() {
             <span>工具</span>
           </button>
           <button
+            className="header-button labeled-header-button folder-backup-entry"
+            onClick={() => {
+              closeAllDrawers();
+              closeAllMenus();
+              setFolderBackupOpen(true);
+            }}
+            disabled={busy}
+            title={
+              folderBackupTarget.kind === "unavailable"
+                ? "恢复点与备份"
+                : `恢复点与备份：${folderBackupTarget.folderPath}`
+            }
+            aria-label="备份与恢复"
+          >
+            <span aria-hidden="true">↶</span>
+            <span>备份</span>
+            {undoStack.length + folderUndoStack.length > 0 && (
+              <b>{undoStack.length + folderUndoStack.length}</b>
+            )}
+          </button>
+          <button
             className={`header-button pet-toggle${petVisible ? " active" : ""}`}
             onClick={togglePetVisibility}
             title={petVisible ? "隐藏格仔" : "显示格仔"}
@@ -4385,7 +5035,7 @@ export default function App() {
                     }}
                     disabled={focusOpening}
                   >
-                    <strong>{focusOpening ? "正在打开…" : "专注窗口"}</strong>
+                    <strong>{focusOpening ? "正在打开..." : "专注窗口"}</strong>
                     <span>在独立窗口中打开对话</span>
                   </button>
                 </div>
@@ -4417,6 +5067,22 @@ export default function App() {
         </section>
       )}
 
+      {folderBackupOpen && (
+        <FolderBackupManager
+          target={folderBackupTarget}
+          onClose={() => setFolderBackupOpen(false)}
+          onUndo={async (planId, undoId, undoSessionId) => {
+            await undoFolderExecutionTo(undoId, {
+              sessionId: undoSessionId,
+              undoId
+            });
+          }}
+          onBackupDeleted={reconcileFolderUndoIds}
+          workbookUndoCount={undoStack.length}
+          folderUndoCount={folderUndoStack.length}
+        />
+      )}
+
       {settingsOpen && (
         <aside className="tool-drawer settings-drawer" aria-label="模型设置">
           <div className="tool-drawer-header">
@@ -4440,7 +5106,7 @@ export default function App() {
             {settingsLoading ? (
               <div className="settings-loading">
                 <i />
-                正在读取本地模型连接…
+                正在读取本地模型连接...
               </div>
             ) : (
               <>
@@ -4515,7 +5181,7 @@ export default function App() {
                         }
                         onClick={() => void saveApiKey()}
                       >
-                        {settingsSaving ? "正在保存…" : "保存并立即生效"}
+                        {settingsSaving ? "正在保存..." : "保存并立即生效"}
                       </button>
                     </section>
                   </>
@@ -4785,7 +5451,7 @@ export default function App() {
                       }
                       onClick={() => void verifyConnection()}
                     >
-                      {settingsTesting ? "正在测试…" : "测试连接"}
+                      {settingsTesting ? "正在测试..." : "测试连接"}
                     </button>
                     <button
                       type="button"
@@ -4796,7 +5462,7 @@ export default function App() {
                       onClick={() => void saveConnection()}
                     >
                       {settingsSaving
-                        ? "正在保存…"
+                        ? "正在保存..."
                         : connectionDraft.id
                           ? "保存修改"
                           : "添加并使用"}
@@ -5144,7 +5810,7 @@ export default function App() {
                               className="tool-button-spinner"
                               aria-hidden="true"
                             />
-                            正在读取工作簿…
+                            正在读取工作簿...
                           </>
                         ) : (
                           "使用这个工具"
@@ -5211,7 +5877,7 @@ export default function App() {
                             className="tool-button-spinner"
                             aria-hidden="true"
                           />
-                          正在运行…
+                          正在运行...
                         </>
                       ) : (
                         "运行这个查询"
@@ -5556,7 +6222,7 @@ export default function App() {
             <div className="tool-dialog-title">
               <div>
                 <strong>保存为工具</strong>
-                <span>验证后可从“我的工具”重复使用</span>
+                <span>验证后可从"我的工具"重复使用</span>
               </div>
               <button onClick={() => setSaveCandidate(null)}>×</button>
             </div>
@@ -5649,10 +6315,18 @@ export default function App() {
         </div>
       )}
 
-      <section className="message-stream" aria-live="polite">
+      <div className="message-stream-shell">
+      <section
+        ref={messageStreamRef}
+        className="message-stream"
+        aria-live="polite"
+        onScroll={handleMessageStreamScroll}
+      >
         {messages.map((message) => (
           <article
-            className={`message-row ${message.role}`}
+            className={`message-row ${message.role}${
+              message.staleSourceConfirm ? " stale-source-message" : ""
+            }`}
             key={message.id}
           >
             <div className="message-content">
@@ -5685,7 +6359,27 @@ export default function App() {
                   </button>
                 </div>
               )}
-              {message.text && <p className="message-text">{message.text}</p>}
+              {message.staleSourceConfirm ? (
+                <section
+                  className="stale-source-warning"
+                  aria-label="数据源变化提示"
+                >
+                  <span className="stale-source-warning-icon" aria-hidden="true">
+                    !
+                  </span>
+                  <div className="stale-source-warning-copy">
+                    <strong>数据源已发生变化</strong>
+                    <p>
+                      这份计划里有 {message.staleSourceConfirm.bakedActionCount} 处写入
+                      使用了预览时计算的固定值。继续执行会写入旧结果，请先检查下方计划预览。
+                    </p>
+                  </div>
+                </section>
+              ) : message.scopeSelectionGuidance ? (
+                <ScopeSelectionGuidance {...message.scopeSelectionGuidance} />
+              ) : (
+                message.text && <p className="message-text">{message.text}</p>
+              )}
               {message.intentMemory?.toolRequest && message.resultContext && (
                 <button
                   type="button"
@@ -5706,6 +6400,30 @@ export default function App() {
                     ))}
                   </div>
                 )}
+              {message.activityPending &&
+                activity?.persistenceKey === message.id &&
+                activity.steps.length > 0 && (
+                  <TaskProgressTimeline
+                    live
+                    log={{
+                      operationId: activity.operationId,
+                      steps: activity.steps,
+                      traces: activity.traces,
+                      totalMs: activitySeconds * 1000,
+                      connectionState: activity.connectionState,
+                      connectionMessage: activity.connectionMessage
+                    }}
+                    onStop={
+                      status === "planning" || status === "tooling"
+                        ? stopTurn
+                        : undefined
+                    }
+                  />
+                )}
+              {message.activityLog &&
+                message.activityLog.steps.length > 0 && (
+                  <TaskProgressTimeline log={message.activityLog} />
+                )}
               {message.clarification && (
                 <section
                   className={`clarification-card ${message.clarification.status}`}
@@ -5716,7 +6434,7 @@ export default function App() {
                       <span>执行前确认</span>
                       <strong>
                         {message.clarification.status === "pending"
-                          ? "我需要确认你的需求"
+                          ? "需要你确认需求"
                           : message.clarification.status === "resolving"
                             ? "正在理解你的补充"
                           : message.clarification.status === "resolved"
@@ -5753,9 +6471,11 @@ export default function App() {
                                 }
                                 void resolveClarification(
                                   message,
-                                  option.resolution,
-                                  option.label
-                                );
+                                   option.resolution,
+                                   option.label,
+                                   true,
+                                   option.resolutionMode
+                                 );
                               }}
                             >
                               <strong>{option.label}</strong>
@@ -5823,7 +6543,8 @@ export default function App() {
                             void resolveClarification(
                               message,
                               "按用户原始需求继续；若仍需自行判断，请在结果中明确列出采用的假设。",
-                              "按原话继续"
+                              "按原话继续",
+                              true
                             )
                           }
                         >
@@ -5850,46 +6571,6 @@ export default function App() {
                   )}
                 </section>
               )}
-              {message.activityLog &&
-                message.activityLog.steps.length > 0 && (
-                  <details className="activity-log-card">
-                    <summary>
-                      执行过程 · {message.activityLog.steps.length} 步 ·{" "}
-                      {formatStepElapsed(message.activityLog.totalMs)}
-                    </summary>
-                    <ul className="activity-steps">
-                      {message.activityLog.steps.map((step, index) => (
-                        <li key={`${step.label}-${index}`}>
-                          <span
-                            className="activity-step-check"
-                            aria-hidden="true"
-                          >
-                            ✓
-                          </span>
-                          <div className="activity-step-body">
-                            <span className="activity-step-label">
-                              {step.label}
-                            </span>
-                            {step.note && (
-                              <span className="activity-step-note">
-                                {step.note}
-                              </span>
-                            )}
-                            {step.detail && (
-                              <details className="activity-step-detail">
-                                <summary>查看详情</summary>
-                                <pre>{step.detail}</pre>
-                              </details>
-                            )}
-                          </div>
-                          <span className="activity-step-time">
-                            {formatStepElapsed(step.elapsedMs)}
-                          </span>
-                        </li>
-                      ))}
-                    </ul>
-                  </details>
-                )}
               {message.verification && (
                 <div
                   className={`verification-card ${message.verification.status}`}
@@ -5940,56 +6621,80 @@ export default function App() {
               )}
               {message.executedPlanId &&
                 (() => {
-                  const stackIndex = undoStack.findIndex(
-                    (entry) => entry.planId === message.executedPlanId
+                  const workbookIndex = undoStack.findIndex((entry) =>
+                    message.executedExecutionId
+                      ? entry.executionId === message.executedExecutionId
+                      : entry.planId === message.executedPlanId
                   );
-                  if (stackIndex < 0) return null;
+                  const folderIndex = folderUndoStack.findIndex((entry) =>
+                    message.executedUndoId
+                      ? entry.undoId === message.executedUndoId
+                      : entry.planId === message.executedPlanId
+                  );
+                  if (workbookIndex < 0 && folderIndex < 0) return null;
+                  const isFolderUndo = folderIndex >= 0;
+                  const workbookUndoEntry =
+                    workbookIndex >= 0 ? undoStack[workbookIndex] : null;
+                  const workbookUndoReady =
+                    isFolderUndo ||
+                    workbookUndoEntry?.postStateCoverage === "complete";
+                  const activeStackLength = isFolderUndo
+                    ? folderUndoStack.length
+                    : undoStack.length;
+                  const stackIndex = isFolderUndo
+                    ? folderIndex
+                    : workbookIndex;
                   // 栈顶之后还有多少次执行会被连带撤销。
-                  const alsoUndone = undoStack.length - 1 - stackIndex;
+                  const alsoUndone = activeStackLength - 1 - stackIndex;
                   return (
-                    <div className="undo-row">
+                    <div className="undo-row execution-undo-row">
                       <button
                         type="button"
                         className="secondary-button"
-                        disabled={busy}
+                        disabled={busy || !workbookUndoReady}
                         onClick={() =>
-                          void undoExecutionTo(message.executedPlanId)
+                          void (isFolderUndo
+                            ? undoFolderExecutionTo(
+                                message.executedUndoId ?? message.executedPlanId
+                              )
+                            : undoExecutionTo(
+                                message.executedExecutionId ??
+                                  message.executedPlanId
+                              ))
                         }
                       >
-                        {alsoUndone > 0
+                        {!workbookUndoReady
+                          ? "↶ 撤销需核对"
+                          : alsoUndone > 0
                           ? `↶ 撤销本次执行（含之后 ${alsoUndone} 次）`
                           : "↶ 撤销本次执行"}
                       </button>
+                      {isFolderUndo && (
+                        <button
+                          type="button"
+                          className="secondary-button"
+                          disabled={busy}
+                          onClick={() => {
+                            setContextOpen(false);
+                            closeAllDrawers();
+                            setFolderBackupOpen(true);
+                          }}
+                        >
+                          查看备份
+                        </button>
+                      )}
                       <span className="undo-row-hint">
-                        {alsoUndone > 0
-                          ? "多次执行的区域可能重叠，只能从最近一次往前逐级撤销"
-                          : `保留最近 ${undoStack.length} 次执行的撤销数据`}
+                        {!workbookUndoReady
+                          ? "执行后状态未能完整核对，已停止自动覆盖"
+                          : alsoUndone > 0
+                          ? "多次执行可能修改同一文件，只能从最近一次往前逐级撤销"
+                          : isFolderUndo
+                            ? "恢复到执行前状态；撤销前会检查文件是否又被修改"
+                            : `保留最近 ${undoStack.length} 次执行的撤销数据`}
                       </span>
                     </div>
                   );
                 })()}
-              {message.staleSourceConfirm && (
-                <div className="undo-row">
-                  <button
-                    type="button"
-                    className="secondary-button"
-                    disabled={busy}
-                    onClick={() =>
-                      void runPlan(
-                        message.staleSourceConfirm!.plan,
-                        undefined,
-                        undefined,
-                        true
-                      )
-                    }
-                  >
-                    仍要执行（写入预览时的结果）
-                  </button>
-                  <span className="undo-row-hint">
-                    重新提问可以按当前数据重新生成一份预览
-                  </span>
-                </div>
-              )}
               {message.functionPreview &&
                 message.functionPreview.phase === "target" && (
                   <div className="inline-plan">
@@ -6023,7 +6728,7 @@ export default function App() {
                         onClick={() => void pickFunctionTarget(message)}
                       >
                         {message.functionPreview.pickingTarget
-                          ? "读取中…"
+                          ? "读取中..."
                           : "拾取当前选区"}
                       </button>
                     </div>
@@ -6124,7 +6829,7 @@ export default function App() {
                         disabled={busy}
                         onClick={() => void confirmFunctionTarget(message)}
                       >
-                        {status === "planning" ? "正在生成…" : "确定并生成"}
+                        {status === "planning" ? "正在生成..." : "确定并生成"}
                       </button>
                     </div>
                   </div>
@@ -6297,7 +7002,7 @@ export default function App() {
                             onClick={() => void pickFunctionTarget(message)}
                           >
                             {message.functionPreview.pickingTarget
-                              ? "读取中…"
+                              ? "读取中..."
                               : "拾取当前选区"}
                           </button>
                         </div>
@@ -6352,7 +7057,7 @@ export default function App() {
                             }
                             onClick={() => void applyFunctionPreview(message)}
                           >
-                            {status === "executing" ? "正在写入…" : "确认写入"}
+                            {status === "executing" ? "正在写入..." : "确认写入"}
                           </button>
                         </div>
                       </>
@@ -6360,7 +7065,11 @@ export default function App() {
                   </div>
                 )}
               {message.plan && (
-                <div className="inline-plan">
+                <div
+                  className={`inline-plan${
+                    message.staleSourceConfirm ? " stale-source-plan" : ""
+                  }`}
+                >
                   <div className="inline-plan-title">
                     <div>
                       <span>准备就绪</span>
@@ -6383,16 +7092,23 @@ export default function App() {
                         ? "保存为工具"
                         : "验证后保存"}
                     </button>
-                    <button
-                      className="primary-button"
-                      disabled={busy}
-                      onClick={() => void runPlan(message.plan!)}
-                    >
-                      {status === "executing" ? "正在执行…" : "执行到 Excel"}
-                    </button>
+                    {!message.staleSourceConfirm && (
+                      <button
+                        className="primary-button"
+                        disabled={busy}
+                        onClick={() => void runPlan(message.plan!)}
+                      >
+                        {status === "executing" && activePlanId === message.plan.id
+                          ? "正在执行..."
+                          : "执行到 Excel"}
+                      </button>
+                    )}
                   </div>
 
-                  <details className="plan-details">
+                  <details
+                    className="plan-details"
+                    open={Boolean(message.staleSourceConfirm)}
+                  >
                     <summary>
                       查看执行细节
                       <span>{message.plan.actions.length} 步</span>
@@ -6448,7 +7164,38 @@ export default function App() {
                   </details>
                 </div>
               )}
-              {message.text && (
+              {message.staleSourceConfirm &&
+                message.staleSourceConfirm.status !== "completed" &&
+                (canAcknowledgeStaleSource(message) ? (
+                  <section
+                    className="stale-source-actions"
+                    aria-label="选择数据变化后的处理方式"
+                  >
+                    <div className="stale-source-action-copy">
+                      <strong>推荐：按当前数据重新生成预览</strong>
+                      <span>重新提问后会使用当前数据生成一份新计划。</span>
+                    </div>
+                    <button
+                      type="button"
+                      className="secondary-button stale-source-continue-button"
+                      disabled={busy}
+                      onClick={() => void acknowledgeStaleSource(message)}
+                    >
+                      仍要执行旧结果
+                    </button>
+                  </section>
+                ) : (
+                  <section
+                    className="stale-source-actions blocked"
+                    aria-label="计划预览不可用"
+                  >
+                    <div className="stale-source-action-copy">
+                      <strong>计划预览不可用，已阻止执行</strong>
+                      <span>请重新提问，按当前数据生成一份新计划预览。</span>
+                    </div>
+                  </section>
+                ))}
+              {message.text && !message.staleSourceConfirm && (
                 <div className="message-copy-row">
                   <button
                     className={`message-copy-button ${
@@ -6497,72 +7244,46 @@ export default function App() {
           </article>
         ))}
 
-        {(status === "planning" || status === "tooling") && (
-          <article className="message-row assistant">
-            <div className="activity-card" aria-live="polite">
-              <div className="activity-heading">
-                <span className="activity-pulse" aria-hidden="true">
-                  <i />
-                  <i />
-                  <i />
-                </span>
-                <strong>
-                  {activity?.title ??
-                    (status === "tooling"
-                      ? "正在本地读取并计算"
-                      : "正在理解工作簿")}
-                </strong>
-                <time>{activitySeconds} 秒</time>
-              </div>
-              {activity?.detail && <p>{activity.detail}</p>}
-              {busy && (
-                <button
-                  type="button"
-                  className="activity-stop-button"
-                  onClick={stopTurn}
-                >
-                  停止
-                </button>
-              )}
-              {activity && activity.completed.length > 0 && (
-                <ul className="activity-steps">
-                  {activity.completed.map((step, index) => (
-                    <li key={`${step.label}-${index}`}>
-                      <span className="activity-step-check" aria-hidden="true">
-                        ✓
-                      </span>
-                      <div className="activity-step-body">
-                        <span className="activity-step-label">{step.label}</span>
-                        {step.note && (
-                          <span className="activity-step-note">{step.note}</span>
-                        )}
-                        {step.detail && (
-                          <details className="activity-step-detail">
-                            <summary>查看详情</summary>
-                            <pre>{step.detail}</pre>
-                          </details>
-                        )}
-                      </div>
-                      <span className="activity-step-time">
-                        {formatStepElapsed(step.elapsedMs)}
-                      </span>
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </div>
-          </article>
-        )}
-        <div ref={messageEndRef} />
+        <div />
       </section>
+      {hasUnseenProgress && (
+        <button
+          type="button"
+          className="new-progress-button"
+          onClick={scrollToLatest}
+          aria-label="查看最新执行进度"
+        >
+          <svg
+            viewBox="0 0 20 20"
+            aria-hidden="true"
+            focusable="false"
+          >
+            <path d="M5.5 8 10 12.5 14.5 8" />
+          </svg>
+          <span>查看最新进度</span>
+        </button>
+      )}
+      </div>
 
       <footer className="composer">
+        {showWorkDirectoryGuide && (
+          <WorkDirectoryGuide
+            busy={busy}
+            onDismiss={dismissWorkDirectoryGuide}
+            onChoose={() => void chooseWorkDirectoryFromGuide()}
+          />
+        )}
         {contextOpen && workbook && (
           <section className="scope-popover" aria-label="选择数据范围">
-            <div className="scope-popover-header">
+            <div className="scope-popover-scroll">
+              <div className="scope-popover-header">
               <div>
                 <strong>这次对话使用哪些数据？</strong>
-                <span>默认跟随你当前正在查看的工作表</span>
+                <span>
+                  {sourceMode === "folder"
+                    ? "工作目录确定候选文件，只有勾选的工作表会被授权"
+                    : "默认跟随你当前正在查看的工作表"}
+                </span>
               </div>
               <button
                 onClick={() => setContextOpen(false)}
@@ -6621,45 +7342,44 @@ export default function App() {
                 </button>
                 <button
                   className={sourceMode === "folder" ? "selected" : ""}
-                  onClick={() => chooseFolderScope()}
+                  onClick={() => {
+                    chooseFolderScope();
+                    setFolderPickerView("files");
+                    setFolderSheetSearch("");
+                    if (folderCatalog && !busy) {
+                      void refreshCurrentFolder({ quiet: true });
+                    }
+                  }}
                 >
                   <i>⌑</i>
                   <span>
-                    <strong>文件夹</strong>
+                    <strong>工作目录</strong>
                     <small>批量处理多个本地工作簿</small>
                   </span>
                 </button>
               </div>
-              <div className="scope-action-buttons">
-                <button
-                  className="scope-refresh"
-                  disabled={busy || (sourceMode === "folder" && !folderCatalog)}
-                  onClick={() =>
-                    void (sourceMode === "folder"
-                      ? refreshCurrentFolder()
-                      : refreshWorkbook())
-                  }
-                  title={
-                    sourceMode === "folder"
-                      ? "刷新文件夹（更新文件列表）"
-                      : "刷新工作簿（更新工作簿名和工作表列表）"
-                  }
-                >
-                  ↻ 刷新
-                </button>
-                <button
-                  className="scope-confirm"
-                  disabled={
-                    sourceMode === "workbook"
-                      ? workbookScopeMode === "manual" &&
-                        selectedSheetNames.length === 0
-                      : folderSheetKeys.length === 0
-                  }
-                  onClick={() => void confirmSheetSelection()}
-                >
-                  {status === "scanning" ? "读取中…" : "完成"}
-                </button>
-              </div>
+              {sourceMode === "workbook" && (
+                <div className="scope-action-buttons">
+                  <button
+                    className="scope-refresh"
+                    disabled={busy}
+                    onClick={() => void refreshWorkbook()}
+                    title="刷新工作簿（更新工作簿名和工作表列表）"
+                  >
+                    ↻ 刷新
+                  </button>
+                  <button
+                    className="scope-confirm"
+                    disabled={
+                      workbookScopeMode === "manual" &&
+                      selectedSheetNames.length === 0
+                    }
+                    onClick={() => void confirmSheetSelection()}
+                  >
+                    {status === "scanning" ? "读取中..." : "完成"}
+                  </button>
+                </div>
+              )}
             </div>
 
             {sourceMode === "workbook" && workbookScopeMode === "manual" && (
@@ -6668,7 +7388,7 @@ export default function App() {
                   <input
                     value={sheetSearch}
                     onChange={(event) => setSheetSearch(event.target.value)}
-                    placeholder="搜索工作表…"
+                    placeholder="搜索工作表..."
                     aria-label="搜索工作表"
                   />
                   <span>
@@ -6728,54 +7448,220 @@ export default function App() {
 
             {sourceMode === "folder" && (
               <div className="folder-scope-picker">
-                <div className="folder-toolbar">
-                  <button
-                    className="browse-folder-button"
-                    disabled={busy}
-                    onClick={() => void browseFolder()}
+                {!folderCatalog ? (
+                  <section
+                    className="work-directory-empty"
+                    aria-label="设置工作目录"
                   >
-                    {folderCatalog
-                      ? `更换文件夹 · ${folderCatalog.folderName}`
-                      : "选择文件夹"}
-                  </button>
-                </div>
+                    <i aria-hidden="true">⌂</i>
+                    <div>
+                      <strong>设置工作目录</strong>
+                      <span>
+                        选择存放待处理 Excel 文件的文件夹。这里仅确定候选范围，稍后仍需勾选允许处理的工作表。
+                      </span>
+                      <small>
+                        恢复点只会在发生写入后创建，不会生成空的备份目录。
+                      </small>
+                    </div>
+                    <button
+                      type="button"
+                      className="browse-folder-button"
+                      disabled={busy}
+                      onClick={() => void browseFolder()}
+                    >
+                      {status === "scanning" ? "正在读取…" : "选择工作目录"}
+                    </button>
+                  </section>
+                ) : (
+                  <div className="folder-toolbar">
+                    <button
+                      type="button"
+                      className="browse-folder-button"
+                      disabled={busy}
+                      onClick={() => void browseFolder()}
+                    >
+                      {`更换工作目录 · ${folderCatalog.folderName}`}
+                    </button>
+                    <button
+                      type="button"
+                      className="folder-refresh-button"
+                      disabled={busy}
+                      onClick={() => void refreshCurrentFolder()}
+                      title="重新扫描文件和工作表"
+                    >
+                      ↻ {status === "scanning" ? "刷新中" : "刷新"}
+                    </button>
+                  </div>
+                )}
 
                 {folderCatalog && (
-                  <div className="folder-file-list">
-                    {folderCatalog.files.map((file) => {
-                      const selectableSheets = file.worksheets.filter(
-                        (sheet) => !isEBSystemSheet(sheet.name)
-                      );
-                      return (
-                        <div className="folder-file" key={file.id}>
-                          <strong>{file.relativePath}</strong>
-                          {file.error ? (
-                            <small className="file-error">{file.error}</small>
+                  <>
+                    <p className="folder-save-hint">
+                      在其他工作簿新增或改名后，请先保存文件再刷新。
+                    </p>
+                    {folderRefreshNotice && (
+                      <div
+                        className={`folder-refresh-notice${
+                          recentlyAddedFolderSheetKeys.length > 0
+                            ? " has-new"
+                            : ""
+                        }`}
+                        role="status"
+                      >
+                        {folderRefreshNotice}
+                      </div>
+                    )}
+                    <div className="folder-selection-filter">
+                      <span>
+                        {folderCatalog.files.length} 个文件 · {totalSelectableFolderSheets} 张表
+                      </span>
+                      <button
+                        type="button"
+                        className={showSelectedFolderSheets ? "selected" : ""}
+                        disabled={
+                          !showSelectedFolderSheets &&
+                          folderSheetKeys.length === 0
+                        }
+                        onClick={() =>
+                          setShowSelectedFolderSheets((current) => !current)
+                        }
+                        aria-pressed={showSelectedFolderSheets}
+                      >
+                        {showSelectedFolderSheets ? "显示全部" : "只看已选"}
+                      </button>
+                    </div>
+                    <div
+                      className={`folder-master-detail folder-picker-view-${folderPickerView}`}
+                    >
+                      <div
+                        className="folder-file-list"
+                        role="list"
+                        aria-label="工作簿列表"
+                      >
+                        {visibleFolderFiles.map((file) => {
+                          const selectableCount = file.worksheets.filter(
+                            (sheet) => !isEBSystemSheet(sheet.name)
+                          ).length;
+                          const selectedCount =
+                            folderSelectionCounts.get(file.id) ?? 0;
+                          const active = activeFolderFile?.id === file.id;
+                          return (
+                            <button
+                              type="button"
+                              className={`folder-file-option${
+                                active ? " active" : ""
+                              }${file.error ? " error" : ""}`}
+                              key={file.id}
+                              onClick={() => {
+                                setActiveFolderFileId(file.id);
+                                setFolderPickerView("sheets");
+                                setFolderSheetSearch("");
+                              }}
+                              aria-pressed={active}
+                              role="listitem"
+                            >
+                              <i aria-hidden="true">X</i>
+                              <span>
+                                <strong title={file.relativePath}>
+                                  {file.relativePath}
+                                </strong>
+                                <small>
+                                  {file.error
+                                    ? "文件暂时无法读取"
+                                    : `${selectableCount} 张工作表`}
+                                </small>
+                              </span>
+                              <b>
+                                {selectedCount}/{selectableCount}
+                              </b>
+                            </button>
+                          );
+                        })}
+                        {visibleFolderFiles.length === 0 && (
+                          <p className="folder-empty">
+                            {showSelectedFolderSheets
+                              ? "还没有勾选工作表"
+                              : "文件夹中没有可用工作簿"}
+                          </p>
+                        )}
+                      </div>
+
+                      {activeFolderFile && (
+                        <section
+                          className="folder-sheet-detail"
+                          aria-label={`选择 ${activeFolderFile.relativePath} 中的工作表`}
+                        >
+                          <div className="folder-sheet-header">
+                            <button
+                              type="button"
+                              className="folder-back-button"
+                              onClick={() => setFolderPickerView("files")}
+                            >
+                              ← 文件
+                            </button>
+                            <span>
+                              <strong title={activeFolderFile.relativePath}>
+                                {activeFolderFile.relativePath}
+                              </strong>
+                              <small>
+                                已选 {folderSelectionCounts.get(activeFolderFile.id) ?? 0}/
+                                {activeFolderSheets.length}
+                              </small>
+                            </span>
+                          </div>
+
+                          {activeFolderFile.error ? (
+                            <p className="file-error">
+                              {activeFolderFile.error}
+                            </p>
                           ) : (
                             <>
+                              <div className="sheet-search-row folder-sheet-search">
+                                <input
+                                  value={folderSheetSearch}
+                                  onChange={(event) =>
+                                    setFolderSheetSearch(event.target.value)
+                                  }
+                                  placeholder="搜索当前文件的工作表..."
+                                  aria-label="搜索当前文件的工作表"
+                                />
+                                <span>{filteredFolderSheets.length} 项</span>
+                              </div>
                               <div className="sheet-picker-toolbar">
                                 <button
-                                  onClick={() => selectAllSheetsInFile(file.id)}
+                                  type="button"
+                                  onClick={() =>
+                                    selectAllSheetsInFile(activeFolderFile.id)
+                                  }
                                 >
                                   全选本文件
                                 </button>
                                 <button
-                                  onClick={() => clearSheetsInFile(file.id)}
+                                  type="button"
+                                  onClick={clearActiveFolderFileSelection}
                                 >
                                   清空本文件
                                 </button>
                               </div>
-                              <div className="sheet-picker-options">
-                                {selectableSheets.map((sheet) => {
-                                  const selected = folderSheetKeys.includes(
-                                    folderSheetKey(file.id, sheet.name)
+                              <div className="folder-sheet-list">
+                                {filteredFolderSheets.map((sheet) => {
+                                  const key = folderSheetKey(
+                                    activeFolderFile.id,
+                                    sheet.name
                                   );
+                                  const selected = folderSheetKeys.includes(key);
+                                  const newlyAdded =
+                                    recentlyAddedFolderSheetKeys.includes(key);
                                   return (
                                     <button
+                                      type="button"
                                       key={sheet.name}
                                       className={selected ? "selected" : ""}
                                       onClick={() =>
-                                        toggleFolderSheet(file.id, sheet.name)
+                                        toggleFolderSheet(
+                                          activeFolderFile.id,
+                                          sheet.name
+                                        )
                                       }
                                       aria-pressed={selected}
                                     >
@@ -6785,35 +7671,85 @@ export default function App() {
                                       >
                                         {selected ? "✓" : ""}
                                       </i>
-                                      <span>{sheet.name}</span>
-                                      <small>
-                                        {sheet.rowCount} 行 · {sheet.columnCount} 列
-                                      </small>
+                                      <span>
+                                        <strong>{sheet.name}</strong>
+                                        <small>
+                                          {sheet.rowCount} 行 · {sheet.columnCount} 列
+                                        </small>
+                                      </span>
+                                      {newlyAdded && <em>新增</em>}
                                     </button>
                                   );
                                 })}
-                                {selectableSheets.length === 0 && (
-                                  <p>没有可选工作表</p>
+                                {filteredFolderSheets.length === 0 && (
+                                  <p className="folder-empty">
+                                    {showSelectedFolderSheets
+                                      ? "当前文件没有已选工作表"
+                                      : "没有匹配的工作表"}
+                                  </p>
                                 )}
                               </div>
                             </>
                           )}
-                        </div>
-                      );
-                    })}
-                  </div>
+                        </section>
+                      )}
+                    </div>
+
+                  </>
                 )}
+              </div>
+            )}
+            </div>
+
+            {sourceMode === "folder" && folderCatalog && (
+              <div className="folder-selection-footer">
+                <div className="folder-selection-summary">
+                  <strong>
+                    已选 {selectedFolderFileCount} 个文件 · {folderSheetKeys.length} 张表
+                  </strong>
+                  <details className="folder-selection-help">
+                    <summary
+                      aria-label="查看工作表选择保留说明"
+                      title="查看说明"
+                    >
+                      ⓘ
+                    </summary>
+                    <span role="note">
+                      切换文件不会丢失已勾选的工作表
+                    </span>
+                  </details>
+                </div>
+                <button
+                  type="button"
+                  className="scope-confirm"
+                  disabled={folderSheetKeys.length === 0 || busy}
+                  onClick={() => void confirmSheetSelection()}
+                >
+                  {status === "scanning" ? "读取中..." : "完成"}
+                </button>
               </div>
             )}
 
           </section>
         )}
 
+        <div className="scope-entry-row">
         <button
           className={`scope-trigger ${contextOpen ? "open" : ""}`}
           onClick={() => {
+            const nextOpen = !contextOpen;
+            setFolderBackupOpen(false);
             setSheetSearch("");
-            setContextOpen((value) => !value);
+            setFolderSheetSearch("");
+            setContextOpen(nextOpen);
+            if (
+              nextOpen &&
+              sourceMode === "folder" &&
+              folderCatalog &&
+              !busy
+            ) {
+              void refreshCurrentFolder({ quiet: true });
+            }
           }}
           aria-expanded={contextOpen}
         >
@@ -6832,8 +7768,8 @@ export default function App() {
                 ? "正在读取工作簿"
                 : sourceMode === "folder"
                   ? folderCatalog
-                    ? `文件夹 · 已选 ${folderSheetKeys.length} 个工作表`
-                    : "选择文件夹"
+                    ? `工作目录 ${folderCatalog.folderName} · 已选 ${folderSheetKeys.length} 张表`
+                    : "设置工作目录"
                   : workbookScopeMode === "auto"
                     ? `${
                         workbookDataPeriod
@@ -6849,6 +7785,7 @@ export default function App() {
           </span>
           <b>{contextOpen ? "⌄" : "⌃"}</b>
         </button>
+        </div>
 
         <div
           className={`composer-input-region ${
@@ -6900,7 +7837,7 @@ export default function App() {
               placeholder={
                 workbook
                   ? "描述你想查询、分析或修改的内容…"
-                  : "可以先输入需求，工作簿读取完成后即可发送…"
+                  : "可以先输入需求，工作簿读取完成后即可发送..."
               }
               rows={1}
             />
@@ -6965,6 +7902,18 @@ export default function App() {
                   <span>图片</span>
                 </button>
               </div>
+              <span
+                className="composer-shortcut-hint"
+                title={
+                  busy
+                    ? "运行中：输入新内容按 Enter 可打断并转向，留空点 ■ 停止"
+                    : "Enter 发送 · Shift + Enter 换行 · 可粘贴截图"
+                }
+              >
+                {busy
+                  ? "运行中：输入新内容按 Enter 可打断并转向，留空点 ■ 停止"
+                  : "Enter 发送 · Shift + Enter 换行 · 可粘贴截图"}
+              </span>
               {busy ? (
                 // 运行中：有字=转向（带话打断重跑），无字=纯停止。
                 <button
@@ -7000,11 +7949,6 @@ export default function App() {
             </div>
           </div>
         </div>
-        <span>
-          {busy
-            ? "运行中：输入新内容按 Enter 可打断并转向，留空点 ■ 停止"
-            : "Enter 发送 · Shift + Enter 换行 · 可粘贴截图 · 写入操作会先预览"}
-        </span>
       </footer>
       {petVisible && <PetCompanion busy={busy} />}
       <ThemePanel

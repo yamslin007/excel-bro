@@ -18,7 +18,28 @@ export interface DiagnosticEvent {
   errorCategory?: string;
 }
 
+export type ProgressDiagnosticDisposition =
+  | "inserted"
+  | "updated"
+  | "ignored-stale"
+  | "ignored-operation"
+  | "rejected-invalid";
+
+export interface ProgressDiagnosticEvent {
+  receivedAt: string;
+  operationId: string;
+  executionId?: string | null;
+  sequence: number;
+  stepId: string;
+  phase: string;
+  status: string;
+  toolName?: string | null;
+  actionType?: string | null;
+  disposition: ProgressDiagnosticDisposition;
+}
+
 const events: DiagnosticEvent[] = [];
+const progressEvents: ProgressDiagnosticEvent[] = [];
 let modelCalls = 0;
 
 export function recordModelCall(): void {
@@ -38,15 +59,51 @@ export function diagnosticEvents(): DiagnosticEvent[] {
   return events.map((event) => ({ ...event }));
 }
 
+export function recordProgressDiagnosticEvent(
+  event: {
+    operationId: string;
+    executionId?: string | null;
+    sequence: number;
+    stepId: string;
+    phase: string;
+    status: string;
+    toolName?: string | null;
+    actionType?: string | null;
+  },
+  disposition: ProgressDiagnosticDisposition
+): void {
+  progressEvents.push({
+    receivedAt: new Date().toISOString(),
+    operationId: event.operationId,
+    executionId: event.executionId,
+    sequence: event.sequence,
+    stepId: event.stepId,
+    phase: event.phase,
+    status: event.status,
+    toolName: event.toolName,
+    actionType: event.actionType,
+    disposition
+  });
+  if (progressEvents.length > 200) {
+    progressEvents.splice(0, progressEvents.length - 200);
+  }
+}
+
+export function progressDiagnosticEvents(): ProgressDiagnosticEvent[] {
+  return progressEvents.map((event) => ({ ...event }));
+}
+
 export function diagnosticReport(): {
   generatedAt: string;
   modelCalls: number;
   events: DiagnosticEvent[];
+  progressEvents: ProgressDiagnosticEvent[];
 } {
   return {
     generatedAt: new Date().toISOString(),
     modelCalls,
-    events: diagnosticEvents()
+    events: diagnosticEvents(),
+    progressEvents: progressDiagnosticEvents()
   };
 }
 

@@ -18,6 +18,7 @@ from .models import (
     PlanResponse,
     ResultContext,
 )
+from .structural_intent import parse_bulk_worksheet_deletion
 
 
 COMMAND_VARIANT_TRANSLATION = str.maketrans(
@@ -223,6 +224,108 @@ def _local_address_plan(request: PlanRequest) -> AssistantResponse | None:
     return PlanResponse(plan=plan, provider="local")
 
 
+def _local_bulk_worksheet_deletion_plan(
+    request: PlanRequest,
+) -> AssistantResponse | None:
+    deletion = parse_bulk_worksheet_deletion(request.prompt)
+    if deletion is None:
+        return None
+
+    keeper_key = _canonical_text(deletion.keeper_name).strip()
+    exact_candidates = [
+        sheet
+        for sheet in request.workbook.worksheets
+        if _canonical_text(sheet.name).strip() == keeper_key
+    ]
+    source_candidates = [
+        sheet
+        for sheet in request.workbook.worksheets
+        if sheet.sourceSheet
+        and _canonical_text(sheet.sourceSheet).strip() == keeper_key
+    ]
+    keeper_candidates = exact_candidates or source_candidates
+    if not keeper_candidates:
+        return AnswerResponse(
+            provider="local",
+            message=(
+                f"要保留的工作表「{deletion.keeper_name}」不在当前已授权范围内。"
+                "请先在“数据范围”中选择全部涉及的工作表，再重新提交。"
+            ),
+        )
+
+    if len(keeper_candidates) > 1:
+        candidate_names = "、".join(
+            f"「{sheet.name}」" for sheet in keeper_candidates[:5]
+        )
+        return AnswerResponse(
+            provider="local",
+            message=(
+                f"已选择的多个文件中都存在工作表「{deletion.keeper_name}」："
+                f"{candidate_names}。请只选择一个文件的工作表，或使用“文件 › 工作表”"
+                "的完整名称指定要保留的工作表。"
+            ),
+        )
+
+    keeper = keeper_candidates[0]
+    keeper_name = keeper.name
+    keeper_label = keeper.sourceSheet or keeper.name
+    keeper_source_key = keeper.sourceFileId or keeper.sourceFile
+    if keeper_source_key is not None:
+        foreign_sheets = [
+            sheet
+            for sheet in request.workbook.worksheets
+            if (sheet.sourceFileId or sheet.sourceFile) != keeper_source_key
+        ]
+        if foreign_sheets:
+            return AnswerResponse(
+                provider="local",
+                message=(
+                    "批量保留/删除工作表一次只能作用于一个文件。"
+                    "请在“数据范围”中只选择目标文件的工作表后重新提交。"
+                ),
+            )
+
+    targets = [
+        sheet
+        for sheet in request.workbook.worksheets
+        if sheet.name.casefold() != keeper_name.casefold()
+    ]
+    if not targets:
+        return AnswerResponse(
+            provider="local",
+            message=f"当前已授权范围中没有「{keeper_label}」之外的工作表可删除。",
+        )
+    if len(targets) > 50:
+        return AnswerResponse(
+            provider="local",
+            message=(
+                f"当前有 {len(targets)} 张工作表需要删除，超过单次计划最多 50 个动作的限制。"
+                "请分批选择并删除。"
+            ),
+        )
+
+    target_preview = "、".join(
+        f"「{sheet.sourceSheet or sheet.name}」" for sheet in targets[:8]
+    )
+    if len(targets) > 8:
+        target_preview += f"等 {len(targets)} 张工作表"
+    plan = AnalysisPlan.model_validate(
+        {
+            "id": f"local-delete-sheets-{uuid.uuid4().hex[:10]}",
+            "title": f"保留 {keeper_label} 并删除其他工作表",
+            "summary": (
+                f"保留「{keeper_label}」，删除当前已授权的其余 {len(targets)} 张工作表。"
+            ),
+            "warnings": [f"将永久删除：{target_preview}。"],
+            "actions": [
+                {"type": "deleteWorksheet", "sheet": sheet.name}
+                for sheet in targets
+            ],
+        }
+    )
+    return PlanResponse(plan=plan, provider="local")
+
+
 def _numeric_value(value: object) -> float | None:
     if isinstance(value, bool) or value in (None, ""):
         return None
@@ -290,6 +393,9 @@ async def create_plan(
     tool_cache: dict[str, Any] | None = None,
     on_event: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
 ) -> AssistantResponse:
+    structural_plan = _local_bulk_worksheet_deletion_plan(request)
+    if structural_plan is not None:
+        return structural_plan
     config = selected_model_config(request.modelId)
     if config is None:
         if request.images:

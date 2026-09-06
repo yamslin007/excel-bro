@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import logging
 import uuid
 import time
 from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, AsyncIterator
 
@@ -15,26 +18,51 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from .capabilities import capabilities
+from .capabilities import capabilities, capability_int
 from .capabilities import model_timeout_seconds
 from .intent import check_intent
 from .folder_workbooks import (
     FolderCatalog,
     FolderExecuteRequest,
-    FolderExecuteResponse,
     FolderQueryRequest,
     FolderRefreshRequest,
+    FolderScanRequest,
     FolderSnapshotRequest,
     create_folder_snapshot,
+    cleanup_folder_backups,
+    delete_folder_backup,
     execute_folder_plan,
+    export_folder_backup,
+    list_folder_backups,
+    open_folder_backup_directory,
+    set_folder_backup_pinned,
     query_folder_data,
     refresh_folder,
+    scan_folder_by_path,
     select_and_scan_folder,
+    collect_legacy_folder_backups,
+    undo_folder_execution,
 )
 from .models import (
     AnalysisPlan,
     AssistantResponse,
     DataToolResult,
+    FolderBackupCleanupRequest,
+    FolderBackupCleanupResponse,
+    FolderBackupDeleteRequest,
+    FolderBackupDeleteResponse,
+    FolderBackupExportRequest,
+    FolderBackupExportResponse,
+    FolderBackupOpenRequest,
+    FolderBackupOpenResponse,
+    FolderBackupPinRequest,
+    FolderBackupPinResponse,
+    FolderBackupsResponse,
+    FolderExecuteResponse,
+    FolderLegacyCollectRequest,
+    FolderLegacyCollectResponse,
+    FolderUndoRequest,
+    FolderUndoResponse,
     IntentCheckRequest,
     IntentCheckResponse,
     ModelSettingsResponse,
@@ -42,6 +70,7 @@ from .models import (
     PlanValidateRequest,
     TestModelConnectionResponse,
     SetFormulaModelRequest,
+    TaskProgressEvent,
     TurnRequest,
     TurnResponse,
     UpdateModelSettingsRequest,
@@ -78,6 +107,7 @@ from .rule_generator import (
 from .turn_state import TurnStateError, turn_registry
 
 load_dotenv("server/.env")
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Excel Bro Local Service",
@@ -126,13 +156,53 @@ async def guard_state_changing_origins(request: Request, call_next):
             )
     return await call_next(request)
 
+@app.middleware("http")
+async def allow_private_network_preflight(request: Request, call_next):
+    """回应 Private Network Access 预检。
+
+    任务窗格是 https://localhost:3000，本地服务是 http://127.0.0.1:8765，
+    属于「安全上下文访问私有网络」。新版 Chromium/WebView2 会在预检里带
+    Access-Control-Request-Private-Network，缺少对应的响应头就直接拦掉请求，
+    并把失败报成「No 'Access-Control-Allow-Origin' header」——极具误导性，
+    实际请求根本没发出去。
+
+    PNA 的目的正是阻止公网页面访问本机服务，所以这里只对 Origin 白名单回应，
+    不能无条件放开：不在白名单的来源拿不到这个头，保留原有防护。
+    """
+    response = await call_next(request)
+    if (
+        request.method == "OPTIONS"
+        and request.headers.get("access-control-request-private-network") == "true"
+        and request.headers.get("origin") in ALLOWED_ORIGINS
+    ):
+        response.headers["Access-Control-Allow-Private-Network"] = "true"
+    return response
+
+
 _diagnostic_events: deque[dict[str, object]] = deque(maxlen=500)
 
 
 @app.middleware("http")
 async def record_request_metrics(request, call_next):
     started = time.perf_counter()
-    response = await call_next(request)
+    try:
+        response = await call_next(request)
+    except Exception as error:
+        # 未捕获异常必须也进诊断日志。以前只在 call_next 正常返回后记录，500
+        # 请求因此对 /api/diagnostics 完全隐形；而未捕获异常的响应又不带 CORS
+        # 头，浏览器只会报「No Access-Control-Allow-Origin」+ Failed to fetch。
+        # 两者叠加的结果是真正的错误在前后端都看不见，只能去翻 uvicorn 终端。
+        _diagnostic_events.append(
+            {
+                "timestamp": datetime.now().astimezone().isoformat(),
+                "method": request.method,
+                "path": request.url.path,
+                "status": 500,
+                "durationMs": round((time.perf_counter() - started) * 1000, 2),
+                "error": f"{type(error).__name__}: {error}"[:300],
+            }
+        )
+        raise
     duration_ms = round((time.perf_counter() - started) * 1000, 2)
     response.headers["X-Excel-Bro-Duration-Ms"] = str(duration_ms)
     _diagnostic_events.append(
@@ -205,13 +275,8 @@ def _map_turn_error(error: Exception) -> tuple[int, str, str, bool]:
                 "模型服务暂时不可用（服务端错误），请稍候重试。",
                 True,
             )
-        body = error.body
-        return (
-            502,
-            "MODEL_HTTP_ERROR",
-            f"模型服务返回 HTTP {status}{f'：{body}' if body else ''}",
-            False,
-        )
+        # 401/402/403/404 等可行动的状态码由 LLMHTTPStatusError 自己给中文提示。
+        return (502, "MODEL_HTTP_ERROR", str(error), False)
     if isinstance(error, (LLMTransportError, LLMResponseError)):
         return (502, "MODEL_CONNECTION_ERROR", str(error), True)
     if isinstance(error, TurnStateError):
@@ -511,6 +576,161 @@ def _sse_frame(event: str, data: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+def _log_task_progress(event: TaskProgressEvent) -> None:
+    logger.info(
+        "task_progress operation_id=%s execution_id=%s sequence=%s "
+        "step_id=%s phase=%s status=%s tool=%s action=%s",
+        event.operationId,
+        event.executionId or "-",
+        event.sequence,
+        event.stepId,
+        event.phase,
+        event.status,
+        event.toolName or "-",
+        event.actionType or "-",
+    )
+
+
+@dataclass
+class _FolderOperationState:
+    request_fingerprint: str
+    created_at: float
+    condition: asyncio.Condition = field(default_factory=asyncio.Condition)
+    events: list[dict[str, Any]] = field(default_factory=list)
+    sequence: int = 0
+    status: str = "running"
+    result: dict[str, Any] | None = None
+    error: dict[str, Any] | None = None
+    task: asyncio.Task[None] | None = None
+
+
+_folder_operations: dict[str, _FolderOperationState] = {}
+_folder_operations_lock = asyncio.Lock()
+
+
+def _folder_request_fingerprint(request: FolderExecuteRequest) -> str:
+    payload = request.model_dump(
+        mode="json", exclude={"operationId", "afterSequence"}
+    )
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _folder_stream_error(error: Exception) -> dict[str, Any]:
+    return {
+        "status": 422,
+        "code": "FOLDER_EXECUTION_ERROR",
+        "message": str(error),
+        "retryable": True,
+    }
+
+
+async def _record_folder_progress(
+    operation_id: str,
+    state: _FolderOperationState,
+    event: dict[str, object],
+) -> None:
+    state.sequence += 1
+    payload = {
+        "schemaVersion": 1,
+        "operationId": operation_id,
+        "sequence": state.sequence,
+        "phase": event.get("phase", "executing"),
+        "stepId": event.get("stepId", f"folder-{state.sequence}"),
+        "status": event.get("status", "progress"),
+        "title": event.get("title", "正在执行文件夹操作"),
+        "summary": event.get("summary"),
+        "detail": event.get("detail"),
+        "current": event.get("current"),
+        "total": event.get("total"),
+        "unit": event.get("unit"),
+        "actionIndex": event.get("actionIndex"),
+        "actionCount": event.get("actionCount"),
+        "actionType": event.get("actionType"),
+        "toolName": event.get("toolName"),
+        "facts": event.get("facts"),
+        "target": event.get("target"),
+        "trace": event.get("trace"),
+        "executionId": event.get("executionId"),
+        "timestamp": datetime.now().astimezone().isoformat(),
+    }
+    validated_event = TaskProgressEvent.model_validate(payload)
+    _log_task_progress(validated_event)
+    validated = validated_event.model_dump(mode="json")
+    async with state.condition:
+        state.events.append(validated)
+        state.condition.notify_all()
+
+
+async def _run_folder_operation(
+    operation_id: str,
+    state: _FolderOperationState,
+    request: FolderExecuteRequest,
+) -> None:
+    loop = asyncio.get_running_loop()
+
+    def on_progress(event: dict[str, object]) -> None:
+        future = asyncio.run_coroutine_threadsafe(
+            _record_folder_progress(operation_id, state, event), loop
+        )
+        future.result(timeout=10)
+
+    try:
+        result = await run_in_threadpool(execute_folder_plan, request, on_progress)
+        async with state.condition:
+            state.result = result.model_dump(mode="json")
+            state.status = "completed"
+            state.condition.notify_all()
+    except Exception as error:
+        expected_error = isinstance(error, (OSError, ValueError, RuntimeError))
+        if not expected_error:
+            logger.exception(
+                "文件夹执行出现未预期异常 operation_id=%s", operation_id
+            )
+        public_message = (
+            str(error)
+            if expected_error
+            else "文件夹执行发生未预期错误，请查看诊断日志。"
+        )
+        await _record_folder_progress(
+            operation_id,
+            state,
+            {
+                "phase": "executing",
+                "stepId": "folder.failed",
+                "status": "failed",
+                "title": "文件夹操作执行失败",
+                "summary": public_message[:1000],
+            },
+        )
+        async with state.condition:
+            state.error = (
+                _folder_stream_error(error)
+                if expected_error
+                else {
+                    "status": 500,
+                    "code": "INTERNAL_ERROR",
+                    "message": public_message,
+                    "retryable": False,
+                }
+            )
+            state.status = "failed"
+            state.condition.notify_all()
+
+
+def _prune_folder_operations(now: float) -> None:
+    ttl = capability_int("progress", "folderOperationTtlSeconds")
+    expired = [
+        operation_id
+        for operation_id, state in _folder_operations.items()
+        if state.status != "running" and now - state.created_at > ttl
+    ]
+    for operation_id in expired:
+        _folder_operations.pop(operation_id, None)
+
+
 @app.post("/api/turn/stream")
 async def turn_stream(request: TurnRequest) -> StreamingResponse:
     """plan 分支的流式版本：实时推送分步进度，最后推送完整结果或错误事件。
@@ -539,9 +759,38 @@ async def turn_stream(request: TurnRequest) -> StreamingResponse:
                     return
 
                 queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+                event_sequence = 0
 
                 async def on_event(event: dict[str, Any]) -> None:
-                    await queue.put(event)
+                    nonlocal event_sequence
+                    event_sequence += 1
+                    payload = {
+                        "schemaVersion": 1,
+                        "operationId": turn_id,
+                        "sequence": event_sequence,
+                        "phase": event.get("phase", "planning"),
+                        "stepId": event.get(
+                            "stepId", f"planning-{event_sequence}"
+                        ),
+                        "status": event.get("status", "progress"),
+                        "title": event.get("title", "正在处理"),
+                        "summary": event.get("summary"),
+                        "detail": event.get("detail"),
+                        "current": event.get("current"),
+                        "total": event.get("total"),
+                        "unit": event.get("unit"),
+                        "actionIndex": event.get("actionIndex"),
+                        "actionCount": event.get("actionCount"),
+                        "actionType": event.get("actionType"),
+                        "toolName": event.get("toolName"),
+                        "facts": event.get("facts"),
+                        "target": event.get("target"),
+                        "trace": event.get("trace"),
+                        "timestamp": datetime.now().astimezone().isoformat(),
+                    }
+                    validated = TaskProgressEvent.model_validate(payload)
+                    _log_task_progress(validated)
+                    await queue.put(validated.model_dump(mode="json"))
 
                 task = asyncio.create_task(
                     create_plan(
@@ -603,6 +852,17 @@ async def select_folder() -> FolderCatalog | None:
     return await run_in_threadpool(select_and_scan_folder)
 
 
+@app.post("/api/folders/scan", response_model=FolderCatalog)
+async def scan_folder_endpoint(request: FolderScanRequest) -> FolderCatalog:
+    """按路径扫描文件夹（不弹对话框），供前端在会话丢失后静默重建。"""
+    try:
+        return await run_in_threadpool(scan_folder_by_path, request.folderPath)
+    except (OSError, ValueError) as error:
+        raise service_error(
+            422, "FOLDER_DATA_ERROR", str(error), retryable=True
+        ) from error
+
+
 @app.post("/api/folders/refresh", response_model=FolderCatalog)
 async def refresh_folder_endpoint(
     request: FolderRefreshRequest,
@@ -633,6 +893,251 @@ async def folder_execute(request: FolderExecuteRequest) -> FolderExecuteResponse
     except (OSError, ValueError) as error:
         raise service_error(
             422, "FOLDER_EXECUTION_ERROR", str(error), retryable=True
+        ) from error
+    except RuntimeError as error:
+        # 原子替换失败并已回滚。预检会拦掉「文件被占用」这个常见原因，但仍可能
+        # 输在竞态上（预检之后、替换之前文件被打开）。这类失败必须是明确的 4xx：
+        # 逃逸成 500 会丢掉 CORS 头，前端只能看到 Failed to fetch。
+        raise service_error(
+            422, "FOLDER_EXECUTION_ERROR", str(error), retryable=True
+        ) from error
+
+
+@app.post("/api/folders/execute/stream")
+async def folder_execute_stream(request: FolderExecuteRequest) -> StreamingResponse:
+    """流式执行文件夹计划；同一 operationId 只执行一次并可重连追赶事件。"""
+    operation_id = request.operationId
+    if operation_id is None:
+        raise service_error(
+            422,
+            "INVALID_REQUEST",
+            "文件夹流式执行缺少 operationId。",
+            retryable=False,
+        )
+    request_fingerprint = _folder_request_fingerprint(request)
+    async with _folder_operations_lock:
+        _prune_folder_operations(time.time())
+        state = _folder_operations.get(operation_id)
+        if state is not None and state.request_fingerprint != request_fingerprint:
+            raise service_error(
+                409,
+                "OPERATION_ID_CONFLICT",
+                "这个 operationId 已用于另一份执行请求，请重新生成操作标识。",
+                retryable=False,
+            )
+        if state is None:
+            max_operations = capability_int(
+                "progress", "folderMaxPendingOperations"
+            )
+            if len(_folder_operations) >= max_operations:
+                completed = sorted(
+                    (
+                        (key, value)
+                        for key, value in _folder_operations.items()
+                        if value.status != "running"
+                    ),
+                    key=lambda item: item[1].created_at,
+                )
+                for key, _value in completed:
+                    if len(_folder_operations) < max_operations:
+                        break
+                    _folder_operations.pop(key, None)
+            if len(_folder_operations) >= max_operations:
+                raise service_error(
+                    429,
+                    "TOO_MANY_OPERATIONS",
+                    "当前文件夹执行任务过多，请稍后重试。",
+                    retryable=True,
+                )
+            state = _FolderOperationState(
+                request_fingerprint=request_fingerprint,
+                created_at=time.time(),
+            )
+            _folder_operations[operation_id] = state
+            state.task = asyncio.create_task(
+                _run_folder_operation(operation_id, state, request)
+            )
+
+    async def generate() -> AsyncIterator[str]:
+        event_index = min(request.afterSequence, len(state.events))
+        heartbeat_seconds = capability_int("progress", "heartbeatSeconds")
+        while True:
+            heartbeat = False
+            async with state.condition:
+                if event_index >= len(state.events) and state.status == "running":
+                    try:
+                        await asyncio.wait_for(
+                            state.condition.wait(), timeout=heartbeat_seconds
+                        )
+                    except TimeoutError:
+                        heartbeat = True
+                pending = state.events[event_index:]
+                event_index = len(state.events)
+                status = state.status
+                result = state.result
+                error = state.error
+            for event in pending:
+                yield _sse_frame("progress", event)
+            if status == "completed" and result is not None:
+                yield _sse_frame("result", result)
+                return
+            if status == "failed" and error is not None:
+                yield _sse_frame("error", error)
+                return
+            if heartbeat and not pending:
+                yield ": heartbeat\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/api/folders/execute/status")
+async def folder_execute_status(operationId: str) -> dict[str, Any]:
+    """返回可恢复的文件夹操作状态；结果完成后在 TTL 内可查询。"""
+    async with _folder_operations_lock:
+        _prune_folder_operations(time.time())
+        state = _folder_operations.get(operationId)
+        if state is None:
+            raise service_error(
+                404,
+                "OPERATION_NOT_FOUND",
+                "未找到该文件夹执行任务，可能尚未开始或状态已过期。",
+                retryable=False,
+            )
+        return {
+            "operationId": operationId,
+            "status": state.status,
+            "lastSequence": state.sequence,
+            "result": state.result,
+            "error": state.error,
+        }
+
+
+@app.post("/api/folders/undo", response_model=FolderUndoResponse)
+async def folder_undo(request: FolderUndoRequest) -> FolderUndoResponse:
+    try:
+        return await run_in_threadpool(undo_folder_execution, request)
+    except (OSError, ValueError, RuntimeError) as error:
+        raise service_error(
+            422, "FOLDER_UNDO_ERROR", str(error), retryable=True
+        ) from error
+
+
+@app.get("/api/folders/backups", response_model=FolderBackupsResponse)
+async def folder_backups(
+    sessionId: str | None = None, folderPath: str | None = None
+) -> FolderBackupsResponse:
+    """列备份。sessionId 与 folderPath 二选一：前者带撤销能力，后者只读。"""
+    try:
+        return await run_in_threadpool(list_folder_backups, sessionId, folderPath)
+    except (OSError, ValueError) as error:
+        raise service_error(
+            422, "FOLDER_BACKUP_ERROR", str(error), retryable=True
+        ) from error
+
+
+@app.post("/api/folders/backups/open", response_model=FolderBackupOpenResponse)
+async def folder_backup_open(
+    request: FolderBackupOpenRequest,
+) -> FolderBackupOpenResponse:
+    try:
+        return await run_in_threadpool(
+            open_folder_backup_directory, request.directoryToken
+        )
+    except (OSError, ValueError) as error:
+        raise service_error(
+            422, "FOLDER_BACKUP_OPEN_ERROR", str(error), retryable=True
+        ) from error
+
+
+@app.post("/api/folders/backups/export", response_model=FolderBackupExportResponse)
+async def folder_backup_export(
+    request: FolderBackupExportRequest,
+) -> FolderBackupExportResponse:
+    try:
+        return await run_in_threadpool(
+            export_folder_backup,
+            request.sessionId,
+            request.undoId,
+            backup_management_token=request.backupManagementToken,
+            operation_id=request.operationId,
+        )
+    except (OSError, ValueError) as error:
+        raise service_error(
+            422, "FOLDER_BACKUP_ERROR", str(error), retryable=True
+        ) from error
+
+
+@app.post("/api/folders/backups/delete", response_model=FolderBackupDeleteResponse)
+async def folder_backup_delete(
+    request: FolderBackupDeleteRequest,
+) -> FolderBackupDeleteResponse:
+    try:
+        return await run_in_threadpool(
+            delete_folder_backup,
+            request.backupManagementToken,
+            request.undoId,
+            confirmed=request.confirmed,
+            expected_revision=request.expectedRevision,
+            expected_invalidated_undo_ids=request.expectedInvalidatedUndoIds,
+        )
+    except (OSError, ValueError) as error:
+        raise service_error(
+            422, "FOLDER_BACKUP_DELETE_ERROR", str(error), retryable=True
+        ) from error
+
+
+@app.post("/api/folders/backups/pin", response_model=FolderBackupPinResponse)
+async def folder_backup_pin(request: FolderBackupPinRequest) -> FolderBackupPinResponse:
+    try:
+        return await run_in_threadpool(
+            set_folder_backup_pinned,
+            request.backupManagementToken,
+            request.undoId,
+            pinned=request.pinned,
+        )
+    except (OSError, ValueError) as error:
+        raise service_error(
+            422, "FOLDER_BACKUP_PIN_ERROR", str(error), retryable=True
+        ) from error
+
+
+@app.post("/api/folders/backups/cleanup", response_model=FolderBackupCleanupResponse)
+async def folder_backup_cleanup(
+    request: FolderBackupCleanupRequest,
+) -> FolderBackupCleanupResponse:
+    try:
+        return await run_in_threadpool(
+            cleanup_folder_backups,
+            request.sessionId,
+            backup_management_token=request.backupManagementToken,
+        )
+    except (OSError, ValueError) as error:
+        raise service_error(
+            422, "FOLDER_BACKUP_ERROR", str(error), retryable=True
+        ) from error
+
+
+@app.post(
+    "/api/folders/backups/legacy/collect",
+    response_model=FolderLegacyCollectResponse,
+)
+async def folder_backup_collect_legacy(
+    request: FolderLegacyCollectRequest,
+) -> FolderLegacyCollectResponse:
+    try:
+        return await run_in_threadpool(
+            collect_legacy_folder_backups,
+            request.sessionId,
+            confirmed=request.confirmed,
+            backup_management_token=request.backupManagementToken,
+        )
+    except (OSError, ValueError) as error:
+        raise service_error(
+            422, "FOLDER_BACKUP_ERROR", str(error), retryable=True
         ) from error
 
 
@@ -787,11 +1292,7 @@ async def intent(request: IntentCheckRequest) -> IntentCheckResponse:
                 status_code=502,
                 detail="模型服务暂时不可用（服务端错误），请稍候重试。",
             ) from error
-        body = error.body
-        raise HTTPException(
-            status_code=502,
-            detail=f"模型服务返回 HTTP {status}{f'：{body}' if body else ''}",
-        ) from error
+        raise HTTPException(status_code=502, detail=str(error)) from error
     except (LLMTransportError, LLMResponseError) as error:
         raise HTTPException(
             status_code=502,

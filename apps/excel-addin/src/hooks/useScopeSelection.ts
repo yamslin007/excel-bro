@@ -11,6 +11,64 @@ import { isEBSystemSheet } from "../excel";
 const FOLDER_CATALOG_KEY = "excelBro.folderCatalog";
 const FOLDER_SHEET_KEYS_KEY = "excelBro.folderSheetKeys";
 
+/** 比较两次文件夹扫描，返回新出现且允许用户选择的工作表。 */
+export function addedFolderSheetKeys(
+  previous: FolderCatalog | null,
+  current: FolderCatalog
+): string[] {
+  if (!previous) return [];
+  const previousKeys = new Set(
+    previous.files.flatMap((file) =>
+      file.worksheets
+        .filter((sheet) => !isEBSystemSheet(sheet.name))
+        .map((sheet) => folderSheetKey(file.id, sheet.name))
+    )
+  );
+  return current.files.flatMap((file) =>
+    file.worksheets
+      .filter((sheet) => !isEBSystemSheet(sheet.name))
+      .map((sheet) => folderSheetKey(file.id, sheet.name))
+      .filter((key) => !previousKeys.has(key))
+  );
+}
+
+export interface FolderViewAfterFileClear {
+  remainingKeys: string[];
+  showSelected: boolean;
+  activeFileId: string;
+}
+
+/**
+ * 清空当前文件后修正文件夹选择视图，避免「只看已选」落入无法退出的空结果。
+ */
+export function resolveFolderViewAfterFileClear(
+  selectedKeys: string[],
+  clearedFileId: string,
+  orderedFileIds: string[],
+  showSelected: boolean
+): FolderViewAfterFileClear {
+  const clearedPrefix = folderSheetKey(clearedFileId, "");
+  const remainingKeys = selectedKeys.filter(
+    (key) => !key.startsWith(clearedPrefix)
+  );
+  if (!showSelected) {
+    return {
+      remainingKeys,
+      showSelected: false,
+      activeFileId: clearedFileId
+    };
+  }
+  const nextSelectedFileId = orderedFileIds.find((fileId) => {
+    const prefix = folderSheetKey(fileId, "");
+    return remainingKeys.some((key) => key.startsWith(prefix));
+  });
+  return {
+    remainingKeys,
+    showSelected: Boolean(nextSelectedFileId),
+    activeFileId: nextSelectedFileId ?? clearedFileId
+  };
+}
+
 /**
  * 数据范围与工具保存字段 Hook
  *
@@ -168,6 +226,16 @@ export function useScopeSelection() {
     [selectedSheetNames]
   );
 
+  const adoptCurrentWorkbookScope = useCallback(
+    (_snapshot: WorkbookSnapshot, sheetNames: string[]) => {
+      setSourceMode("workbook");
+      setWorkbookScopeMode("manual");
+      setSelectedSheetNames(sheetNames);
+      setSelectionConfirmed(true);
+    },
+    []
+  );
+
   const chooseFolderScope = useCallback(() => {
     setSourceMode("folder");
     setSelectionConfirmed(folderSheetKeys.length > 0);
@@ -245,6 +313,7 @@ export function useScopeSelection() {
     applyFolderCatalog,
     chooseAutomaticScope,
     chooseManualScope,
+    adoptCurrentWorkbookScope,
     chooseFolderScope,
     folderSelections,
     selectedNamesFor,

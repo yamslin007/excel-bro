@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   extractWorkbookDataPeriod,
-  workbookNameFromDocumentUrl
+  workbookNameFromDocumentUrl,
+  workbookFolderFromDocumentUrl
 } from "./workbookIdentity";
 
 describe("workbook identity", () => {
@@ -27,5 +28,40 @@ describe("workbook identity", () => {
       extractWorkbookDataPeriod("影院报表_2026年7月17日至2026年7月26日.xlsx")
     ).toBe("2026-07-17 至 2026-07-26");
     expect(extractWorkbookDataPeriod("普通工作簿.xlsx")).toBeNull();
+  });
+
+  it("derives local folder path from drive-letter file URLs", () => {
+    expect(
+      workbookFolderFromDocumentUrl("C:\\Users\\jia\\Desktop\\报表.xlsx")
+    ).toEqual({ kind: "local", folderPath: "C:\\Users\\jia\\Desktop" });
+    expect(
+      workbookFolderFromDocumentUrl("file:///C:/work/data/影院.xlsx")
+    ).toEqual({ kind: "local", folderPath: "C:/work/data" });
+  });
+
+  it("handles root directory paths correctly", () => {
+    expect(workbookFolderFromDocumentUrl("D:\\报表.xlsx")).toEqual({
+      kind: "local",
+      folderPath: "D:\\"
+    });
+  });
+
+  it("recognizes UNC paths as local", () => {
+    expect(
+      workbookFolderFromDocumentUrl("\\\\server\\share\\folder\\file.xlsx")
+    ).toEqual({ kind: "local", folderPath: "\\\\server\\share\\folder" });
+  });
+
+  it("classifies cloud URLs as remote", () => {
+    expect(
+      workbookFolderFromDocumentUrl(
+        "https://example.sharepoint.com/sites/team/documents/报表.xlsx"
+      )
+    ).toEqual({ kind: "remote" });
+  });
+
+  it("classifies empty or unsaved workbooks", () => {
+    expect(workbookFolderFromDocumentUrl("")).toEqual({ kind: "unsaved" });
+    expect(workbookFolderFromDocumentUrl(null)).toEqual({ kind: "unsaved" });
   });
 });

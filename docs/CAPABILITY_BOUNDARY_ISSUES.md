@@ -233,7 +233,7 @@ worksheets.items.map((worksheet) => worksheet.name)
 
 建议在文档中把该能力表述为“值矩阵排序”，或者实现整单元格记录搬移并增加对象级测试。
 
-### 4.2 文件夹模式只支持部分图表类型
+### 4.2 文件夹模式只支持部分图表类型（预检已补齐）
 
 协议允许：
 
@@ -248,9 +248,9 @@ worksheets.items.map((worksheet) => worksheet.name)
 - Waterfall
 - Funnel
 
-openpyxl 执行器当前只映射前七类，Histogram、Waterfall 和 Funnel 会在执行阶段报不支持，而不是在整份计划预检阶段报告。
+openpyxl 执行器当前只映射前七类。文件夹模式现已使用同一份显式能力表完成整份计划预检：Histogram、Waterfall 和 Funnel 会在任何文件写入及恢复点创建之前被拒绝，并提示改用当前工作簿模式或选择受支持的图表类型。
 
-建议建立显式执行通道能力矩阵，并在计划生成或预检阶段拒绝当前通道不支持的图表类型。
+后续如要在文件夹模式增加新图表类型，应先补齐 openpyxl 映射与正向执行测试，再扩展该能力表，避免协议范围与执行通道再次脱节。
 
 ### 4.3 openpyxl 不是无损 Excel 往返通道
 

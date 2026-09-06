@@ -140,6 +140,162 @@ def test_direct_formula_and_clear_commands_create_focused_plans() -> None:
     assert clearing.plan.actions[0].range == "B2:B4"
 
 
+def test_bulk_sheet_deletion_creates_only_authorized_delete_actions() -> None:
+    request = PlanRequest.model_validate(
+        {
+            "prompt": "清除sheet-dc1外的所有子表",
+            "workbook": {
+                "name": "movies.xlsx",
+                "capturedAt": "2026-09-01T00:00:00Z",
+                "activeWorksheet": "sheet-dc1",
+                "worksheets": [
+                    {
+                        "name": name,
+                        "usedRange": "A1:A1",
+                        "rowCount": 1,
+                        "columnCount": 1,
+                        "headers": ["字段"],
+                        "dataRows": [],
+                        "truncated": False,
+                    }
+                    for name in ("sheet-dc1", "恐怖游轮", "痴迷")
+                ],
+            },
+        }
+    )
+
+    response = asyncio.run(create_plan(request))
+
+    assert response.kind == "plan"
+    assert response.provider == "local"
+    assert [action.type for action in response.plan.actions] == [
+        "deleteWorksheet",
+        "deleteWorksheet",
+    ]
+    assert [action.sheet for action in response.plan.actions] == ["恐怖游轮", "痴迷"]
+    assert [criterion.type for criterion in response.plan.acceptanceCriteria] == [
+        "worksheetMissing",
+        "worksheetMissing",
+    ]
+
+
+def test_bulk_sheet_deletion_blocks_when_keeper_is_not_authorized() -> None:
+    request = PlanRequest.model_validate(
+        {
+            "prompt": "删除除 sheet-dc1 外的所有工作表",
+            "workbook": {
+                "name": "movies.xlsx",
+                "capturedAt": "2026-09-01T00:00:00Z",
+                "activeWorksheet": "恐怖游轮",
+                "worksheets": [
+                    {
+                        "name": "恐怖游轮",
+                        "usedRange": "A1:A1",
+                        "rowCount": 1,
+                        "columnCount": 1,
+                        "headers": ["字段"],
+                        "dataRows": [],
+                        "truncated": False,
+                    }
+                ],
+            },
+        }
+    )
+
+    response = asyncio.run(create_plan(request))
+
+    assert response.kind == "answer"
+    assert "不在当前已授权范围" in response.message
+    assert "选择全部涉及的工作表" in response.message
+
+
+def test_bulk_sheet_deletion_resolves_folder_display_names_by_source_sheet() -> None:
+    request = PlanRequest.model_validate(
+        {
+            "prompt": "清除sheet-dc1外的所有子表",
+            "workbook": {
+                "name": "文件夹：tst",
+                "capturedAt": "2026-09-01T00:00:00Z",
+                "activeWorksheet": "movies.xlsx › sheet-dc1",
+                "worksheets": [
+                    {
+                        "name": f"movies.xlsx › {name}",
+                        "sourceFileId": "movies-file",
+                        "sourceSheetId": f"sheet-{index}",
+                        "sourceFile": "movies.xlsx",
+                        "sourceSheet": name,
+                        "usedRange": "A1:A1",
+                        "rowCount": 1,
+                        "columnCount": 1,
+                        "headers": ["字段"],
+                        "dataRows": [],
+                        "truncated": False,
+                    }
+                    for index, name in enumerate(
+                        ("sheet-dc1", "恐怖游轮", "痴迷")
+                    )
+                ],
+            },
+        }
+    )
+
+    response = asyncio.run(create_plan(request))
+
+    assert response.kind == "plan"
+    assert response.provider == "local"
+    assert [action.sheet for action in response.plan.actions] == [
+        "movies.xlsx › 恐怖游轮",
+        "movies.xlsx › 痴迷",
+    ]
+    assert "保留「sheet-dc1」" in response.plan.summary
+
+
+def test_bulk_sheet_deletion_rejects_mixed_folder_files() -> None:
+    request = PlanRequest.model_validate(
+        {
+            "prompt": "删除除 sheet-dc1 外的所有工作表",
+            "workbook": {
+                "name": "文件夹：tst",
+                "capturedAt": "2026-09-01T00:00:00Z",
+                "activeWorksheet": "a.xlsx › sheet-dc1",
+                "worksheets": [
+                    {
+                        "name": "a.xlsx › sheet-dc1",
+                        "sourceFileId": "file-a",
+                        "sourceSheetId": "sheet-a",
+                        "sourceFile": "a.xlsx",
+                        "sourceSheet": "sheet-dc1",
+                        "usedRange": "A1:A1",
+                        "rowCount": 1,
+                        "columnCount": 1,
+                        "headers": ["字段"],
+                        "dataRows": [],
+                        "truncated": False,
+                    },
+                    {
+                        "name": "b.xlsx › 结果",
+                        "sourceFileId": "file-b",
+                        "sourceSheetId": "sheet-b",
+                        "sourceFile": "b.xlsx",
+                        "sourceSheet": "结果",
+                        "usedRange": "A1:A1",
+                        "rowCount": 1,
+                        "columnCount": 1,
+                        "headers": ["字段"],
+                        "dataRows": [],
+                        "truncated": False,
+                    },
+                ],
+            },
+        }
+    )
+
+    response = asyncio.run(create_plan(request))
+
+    assert response.kind == "answer"
+    assert "一次只能作用于一个文件" in response.message
+
+
 @pytest.mark.parametrize(
     "prompt",
     [
@@ -509,6 +665,7 @@ def test_model_agent_inspects_fields_before_submitting_formula_plan(
     assert response.provider == "model"
     assert response.plan.actions[0].type == "writeFormulas"
     assert len(requests) == 2
+    assert _tool_names(requests[1]) == {"submit_plan", "submit_answer"}
     second_messages = requests[1]["messages"]
     assert isinstance(second_messages, list)
     tool_message = next(
@@ -807,6 +964,113 @@ def test_agent_drops_readonly_tools_when_data_results_present(
     assert "find_fields" not in names
     assert "read_range" not in names
     assert {"submit_answer", "submit_plan"} <= names
+
+
+def test_confirmed_split_plan_submits_once_without_reading_snapshot_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    call_log: list[dict[str, object]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        call_log.append(body)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "split-submit",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "submit_plan",
+                                        "arguments": json.dumps(
+                                            {
+                                                "plan": {
+                                                    "id": "split-by-movie",
+                                                    "title": "按影片拆分并按影院汇总",
+                                                    "summary": "按影片建表，表内按影院统计记录数和占比",
+                                                    "actions": [
+                                                        {
+                                                            "type": "splitGroupAggregate",
+                                                            "sheet": "sheet-dc1",
+                                                            "splitBy": "影片名称",
+                                                            "groupBy": [
+                                                                "影院名称",
+                                                                "影院编码",
+                                                            ],
+                                                            "metrics": [
+                                                                {
+                                                                    "operation": "countRows",
+                                                                    "outputName": "计数项:影厅",
+                                                                    "ratioOutputName": "占比",
+                                                                }
+                                                            ],
+                                                            "existingSheetPolicy": "rename",
+                                                        }
+                                                    ],
+                                                }
+                                            },
+                                            ensure_ascii=False,
+                                        ),
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                ]
+            },
+        )
+
+    _install_mock_model(monkeypatch, handler)
+    request = PlanRequest.model_validate(
+        {
+            "prompt": (
+                "按影片名称建表，每张表内按影院名称和影院编码汇总；"
+                "计数项:影厅为该影片在该影院的记录数，占比为该记录数"
+                "除以该影院全部影片的记录总数。"
+            ),
+            "planningReadPolicy": "none",
+            "workbook": {
+                "name": "影院放映成绩实时报表.xlsx",
+                "capturedAt": "2026-09-01T00:00:00Z",
+                "activeWorksheet": "sheet-dc1",
+                "worksheets": [
+                    {
+                        "name": "sheet-dc1",
+                        "usedRange": "sheet-dc1!A1:W811",
+                        "rowCount": 811,
+                        "columnCount": 23,
+                        "headers": [
+                            "影院名称",
+                            "影院编码",
+                            "影片名称",
+                            "影厅",
+                        ],
+                        "dataRows": [],
+                        "truncated": True,
+                    }
+                ],
+            },
+        }
+    )
+
+    response = asyncio.run(create_plan(request))
+
+    assert response.kind == "plan"
+    assert response.plan.actions[0].type == "splitGroupAggregate"
+    assert response.plan.actions[0].splitBy == "影片名称"
+    assert response.plan.actions[0].groupBy == ["影院名称", "影院编码"]
+    assert response.plan.actions[0].metrics[0].ratioOutputName == "占比"
+    assert len(call_log) == 1
+    names = _tool_names(call_log[0])
+    assert names == {"submit_plan", "submit_answer"}
+    user_message = call_log[0]["messages"][1]
+    assert isinstance(user_message, dict)
+    assert "不得调用工作簿只读工具" in str(user_message["content"])
 
 
 def test_agent_keeps_readonly_tools_without_data_results(

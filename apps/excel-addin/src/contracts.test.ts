@@ -1,8 +1,137 @@
 import { describe, expect, it } from "vitest";
 import {
   assertAssistantResponse,
-  assertIntentCheckResponse
+  assertIntentCheckResponse,
+  parseTaskProgressEvent
 } from "./contracts";
+
+describe("parseTaskProgressEvent", () => {
+  it("accepts structured progress and keeps auditable trace metadata", () => {
+    const event = parseTaskProgressEvent({
+      schemaVersion: 1,
+      operationId: "execution-test-1",
+      executionId: "0123456789abcdef0123456789abcdef",
+      sequence: 3,
+      phase: "verifying",
+      stepId: "execution.verify",
+      status: "warning",
+      title: "验证发现不一致",
+      summary: "2 / 3 项符合预期",
+      current: 2,
+      total: 3,
+      unit: "checks",
+      trace: {
+        kind: "conflict",
+        summary: "1 项结果与预期不一致",
+        basis: "执行后重新读取"
+      },
+      timestamp: "2026-09-02T00:00:00Z"
+    });
+
+    expect(event).toMatchObject({
+      operationId: "execution-test-1",
+      sequence: 3,
+      status: "warning",
+      current: 2,
+      total: 3,
+      trace: { kind: "conflict" }
+    });
+  });
+
+  it("converts legacy planning steps without breaking older servers", () => {
+    expect(
+      parseTaskProgressEvent(
+        { phase: "planning", title: "正在查看工作簿结构" },
+        "turn-legacy-test",
+        7
+      )
+    ).toMatchObject({
+      schemaVersion: 1,
+      operationId: "turn-legacy-test",
+      sequence: 7,
+      phase: "planning"
+    });
+  });
+
+  it("rejects impossible counters", () => {
+    expect(
+      parseTaskProgressEvent({
+        schemaVersion: 1,
+        operationId: "execution-test-2",
+        sequence: 1,
+        phase: "executing",
+        stepId: "execution.action.1",
+        status: "progress",
+        title: "执行中",
+        current: 2,
+        total: 1,
+        unit: "actions",
+        timestamp: "2026-09-02T00:00:00Z"
+      })
+    ).toBeNull();
+  });
+
+  it("keeps safe tool facts and accepts the cancelled terminal status", () => {
+    const event = parseTaskProgressEvent({
+      schemaVersion: 1,
+      operationId: "execution-cancelled",
+      sequence: 4,
+      phase: "planning",
+      stepId: "planning.tool.1.1",
+      status: "cancelled",
+      title: "任务已取消",
+      toolName: "read_range",
+      facts: [
+        { label: "范围", value: "A1:B3", style: "code" },
+        { label: "结果", value: "3 行 × 2 列" }
+      ],
+      timestamp: "2026-09-02T00:00:00Z"
+    });
+
+    expect(event).toMatchObject({
+      status: "cancelled",
+      toolName: "read_range",
+      facts: [
+        { label: "范围", value: "A1:B3", style: "code" },
+        { label: "结果", value: "3 行 × 2 列", style: "text" }
+      ]
+    });
+  });
+
+  it("limits facts and redacts suspicious values before rendering", () => {
+    const event = parseTaskProgressEvent({
+      schemaVersion: 1,
+      operationId: "execution-safety",
+      sequence: 1,
+      phase: "planning",
+      stepId: "planning.tool.safe",
+      status: "completed",
+      title: "已完成",
+      facts: [
+        { label: "结果", value: "Bearer very-secret-token-value" },
+        { label: "apiKey", value: "plain-secret" },
+        { label: "未授权标签", value: "不应展示" },
+        ...Array.from({ length: 20 }, (_, index) => ({
+          label: "结果",
+          value: index === 0 ? "x".repeat(5000) : String(index)
+        }))
+      ],
+      target: {
+        file: "C:\\Users\\someone\\Desktop\\敏感目录\\报表.xlsx",
+        sheet: "Sheet1"
+      },
+      timestamp: "2026-09-02T00:00:00Z"
+    });
+
+    expect(event?.facts).toHaveLength(11);
+    expect(event?.facts?.[0].value).toBe("Bearer 已隐藏");
+    expect(event?.facts?.[1].value).toBe("已隐藏");
+    expect(event?.facts?.some((fact) => fact.value === "不应展示")).toBe(false);
+    expect(event?.facts?.[2].value.length).toBeLessThanOrEqual(500);
+    expect(event?.facts?.[2].value).toContain("内容过长，已截断");
+    expect(event?.target?.file).toBe("报表.xlsx");
+  });
+});
 
 describe("assertAssistantResponse", () => {
   it("accepts a safe plan", () => {
@@ -153,13 +282,45 @@ describe("assertIntentCheckResponse", () => {
             id: "aggregate",
             label: "重新汇总",
             description: "按电影重新计算",
-            resolution: "按电影重新汇总"
+            resolution: "按电影重新汇总",
+            resolutionMode: "replace"
           }
         ]
       }
     };
 
     expect(() => assertIntentCheckResponse(response)).not.toThrow();
+  });
+
+  it("rejects an unknown clarification resolution mode", () => {
+    const response = {
+      kind: "clarification",
+      provider: "model",
+      clarification: {
+        id: "intent-invalid-mode",
+        summary: "确认拆分方式",
+        question: "按什么建表？",
+        reason: "维度冲突",
+        scopeLabel: "当前工作表",
+        options: [
+          {
+            id: "one",
+            label: "按影院",
+            description: "改为按影院建表",
+            resolution: "按影院建表，表内按影片汇总",
+            resolutionMode: "overwrite"
+          },
+          {
+            id: "two",
+            label: "按影片",
+            description: "保留按影片建表",
+            resolution: "按影片建表，表内按影院汇总"
+          }
+        ]
+      }
+    };
+
+    expect(() => assertIntentCheckResponse(response)).toThrow("确认问题无效");
   });
 
   it("rejects a clarification with fewer than two options", () => {

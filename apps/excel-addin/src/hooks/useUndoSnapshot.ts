@@ -71,14 +71,18 @@ export function useUndoSnapshot({
     setUndoStack([]);
   }, []);
 
-  /** 撤销到指定 planId（含其之后的所有执行）。不传则撤销最近一次。 */
+  /** 撤销到指定 executionId；旧消息没有 executionId 时兼容 planId。 */
   const undoExecutionTo = useCallback(
-    async (planId?: string) => {
+    async (executionIdOrPlanId?: string) => {
       if (isBusy || !isRunningInExcel()) return;
       const index =
-        planId === undefined
+        executionIdOrPlanId === undefined
           ? undoStack.length - 1
-          : undoStack.findIndex((entry) => entry.planId === planId);
+          : undoStack.findIndex(
+              (entry) =>
+                entry.executionId === executionIdOrPlanId ||
+                entry.planId === executionIdOrPlanId
+            );
       if (index < 0) return;
       // 逆序撤销：先撤最近的，再往前退，保证每一步的上下文都是它执行完的状态。
       const targets = undoStack.slice(index).reverse();

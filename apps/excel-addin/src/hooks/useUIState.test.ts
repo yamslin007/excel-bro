@@ -5,7 +5,10 @@ import {
   PET_VISIBILITY_STORAGE_KEY,
   normalizePetVisibility
 } from "../conversation";
-import { useUIState } from "./useUIState";
+import {
+  useUIState,
+  WORK_DIRECTORY_GUIDE_STORAGE_KEY
+} from "./useUIState";
 
 describe("useUIState", () => {
   beforeEach(() => {
@@ -28,6 +31,26 @@ describe("useUIState", () => {
     expect(result.current.isRuleManagerOpen).toBe(false);
     expect(result.current.focusOpening).toBe(false);
     expect(result.current.widenStepDone).toBe(false);
+    expect(result.current.workDirectoryGuideDismissed).toBe(false);
+  });
+
+  it("should initialize the work directory guide from localStorage", () => {
+    localStorage.setItem(WORK_DIRECTORY_GUIDE_STORAGE_KEY, "dismissed");
+
+    const { result } = renderHook(() => useUIState());
+
+    expect(result.current.workDirectoryGuideDismissed).toBe(true);
+  });
+
+  it("should dismiss and persist the work directory guide", () => {
+    const { result } = renderHook(() => useUIState());
+
+    act(() => result.current.dismissWorkDirectoryGuide());
+
+    expect(result.current.workDirectoryGuideDismissed).toBe(true);
+    expect(localStorage.getItem(WORK_DIRECTORY_GUIDE_STORAGE_KEY)).toBe(
+      "dismissed"
+    );
   });
 
   it("should initialize pet visibility from localStorage", () => {

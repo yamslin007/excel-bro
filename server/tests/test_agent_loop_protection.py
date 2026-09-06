@@ -280,6 +280,14 @@ class TestBudgetControl:
             "consecutive_errors",
         )
 
+    def test_structure_error_is_reported_before_its_token_side_effect(self):
+        state = LoopState(consecutive_errors=3, total_tokens=20_000)
+
+        assert should_stop(state, LoopConfig()) == (
+            True,
+            "consecutive_errors",
+        )
+
     def test_should_not_stop_normal(self):
         state = LoopState(
             turn_index=7,
@@ -301,6 +309,9 @@ class TestSafeDegradation:
 
         assert response.provider == "system"
         assert "超过快照容量" in response.message
+        assert "不代表 Excel 无法处理完整数据" in response.message
+        assert "执行时读取完整数据" in response.message
+        assert "使用 Excel 内置的筛选功能先过滤数据" not in response.message
 
     def test_degradation_with_loop(self):
         state = LoopState(

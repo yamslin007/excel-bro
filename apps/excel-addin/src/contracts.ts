@@ -514,6 +514,7 @@ export interface IntentOption {
   label: string;
   description: string;
   resolution: string;
+  resolutionMode?: "append" | "replace";
   action?: "resolve" | "editScope";
 }
 
@@ -760,6 +761,7 @@ export interface PlanRequest {
   lastResult?: ResultContext | null;
   images?: ImageAttachment[];
   dataResults?: DataToolResult[];
+  planningReadPolicy?: "ifNeeded" | "none";
   modelId?: string | null;
 }
 
@@ -807,7 +809,10 @@ export function assertIntentCheckResponse(
         typeof option.id !== "string" ||
         typeof option.label !== "string" ||
         typeof option.description !== "string" ||
-        typeof option.resolution !== "string"
+        typeof option.resolution !== "string" ||
+        (option.resolutionMode !== undefined &&
+          option.resolutionMode !== "append" &&
+          option.resolutionMode !== "replace")
     )
   ) {
     throw new Error("服务返回的确认问题无效");
@@ -846,10 +851,138 @@ export interface FolderSelection {
 export interface FolderExecuteResult {
   filesModified: string[];
   backups: string[];
+  backupDirectory?: string | null;
+  backupWarnings?: string[];
   actionResults: ActionExecutionResult[];
   verification: VerificationReport;
+  undo?: FolderUndoReference | null;
   executionMs: number;
   verificationMs: number;
+}
+
+export interface FolderUndoReference {
+  undoId: string;
+  sessionId: string;
+}
+
+export interface FolderUndoResult {
+  filesRestored: string[];
+  executionsUndone: number;
+  remainingUndoCount: number;
+}
+
+export interface FolderBackupFileInfo {
+  originalRelativePath: string;
+  backupRelativePath?: string | null;
+  recoveryAction: "restore" | "remove";
+  sizeBytes: number;
+}
+
+export interface FolderBackupEntry {
+  revision?: number;
+  undoId: string;
+  undoSessionId?: string | null;
+  planId: string;
+  planTitle: string;
+  createdAt: string;
+  status:
+    | "creating"
+    | "preparing"
+    | "prepared"
+    | "applying"
+    | "ready"
+    | "recovering"
+    | "restored"
+    | "rolled_back"
+    | "needs_attention";
+  statusReason?: string | null;
+  undoAvailability: "eligible" | "blocked" | "view_only" | "busy";
+  undoUnavailableReason?: string | null;
+  deleteInvalidatesUndoIds: string[];
+  pinned: boolean;
+  protectedReasons: string[];
+  canUndo: boolean;
+  fileCount: number;
+  totalBytes: number;
+  expiresAt?: string | null;
+  files: FolderBackupFileInfo[];
+}
+
+export interface FolderLegacyBackupInfo {
+  relativePath: string;
+  sizeBytes: number;
+  modifiedAt: string;
+}
+
+export interface FolderBackupStorageSummary {
+  automaticBytes: number;
+  pinnedBytes: number;
+  abnormalBytes: number;
+  exportedBytes: number;
+  legacyBytes: number;
+  pendingCleanupBytes: number;
+  totalBytes: number;
+  softLimitBytes: number;
+  complete: boolean;
+  calculatedAt: string;
+}
+
+export interface FolderBackupsResult {
+  folderPath: string;
+  backupDirectory: string;
+  openDirectoryToken?: string | null;
+  backupManagementToken?: string | null;
+  backups: FolderBackupEntry[];
+  legacyCandidates: FolderLegacyBackupInfo[];
+  storageSummary?: FolderBackupStorageSummary | null;
+  warnings: string[];
+}
+
+export interface FolderBackupOpenResult {
+  opened: boolean;
+  directory: string;
+}
+
+export interface FolderBackupExportResult {
+  operationId: string;
+  exportDirectory: string;
+  files: string[];
+  complete?: boolean;
+  failures?: string[];
+}
+
+export interface FolderBackupDeleteResult {
+  deletedUndoId: string;
+  discardedUndo: boolean;
+  filesDeleted: number;
+  bytesFreed: number;
+  remainingUndoCount: number;
+  invalidatedUndoIds: string[];
+  remainingUndoIds: string[];
+  cleanupPending: boolean;
+  cleanupWarnings: string[];
+}
+
+export interface FolderBackupPinResult {
+  undoId: string;
+  pinned: boolean;
+}
+
+export interface FolderBackupCleanupResult {
+  deletedExecutions: number;
+  deletedFiles: number;
+  bytesFreed: number;
+  skippedActive: number;
+  protectedExecutions?: number;
+  retainedBytes?: number;
+  overLimitBytes?: number;
+  failures: string[];
+  legacyCandidateCount: number;
+}
+
+export interface FolderLegacyCollectResult {
+  collectedFiles: string[];
+  failures: string[];
 }
 
 export interface ActionExecutionResult {
@@ -858,6 +991,7 @@ export interface ActionExecutionResult {
   sheet: string;
   status: "succeeded" | "failed" | "not_run";
   message?: string | null;
+  changed?: boolean | null;
 }
 
 export interface VerificationCheck {
@@ -905,6 +1039,8 @@ export interface UndoRangeSnapshot {
   fillColor: string;
   fontBold: boolean;
   fontColor: string;
+  /** 本次执行完成后该范围的确定性指纹；撤销前用于阻止覆盖后续人工修改。 */
+  postFingerprint?: string;
   /** 完整格式快照；区域过大而降级捕获时为 null。 */
   format?: UndoRangeFormat | null;
 }
@@ -940,12 +1076,29 @@ export interface UndoWorksheetSnapshot {
   numberFormat: string[][];
 }
 
+export interface UndoCreatedWorksheetState {
+  sheet: string;
+  /** 新建表执行完成后的内容指纹；缺失时不能安全自动删除该表。 */
+  postFingerprint?: string;
+}
+
 export interface ExecutionUndoSnapshot {
   planId: string;
+  /** 同一计划重复执行时仍保持唯一的本次执行标识。 */
+  executionId?: string;
+  /** 工作簿本地标识；可取得时用于阻止把快照应用到另一个工作簿。 */
+  workbookIdentity?: string;
   capturedAt: string;
+  /** partial 表示失败前只捕获并执行了部分动作。 */
+  coverage?: "full" | "partial";
+  completedActionCount?: number;
+  uncertainActionIndexes?: number[];
+  /** complete 才允许直接撤销；partial 表示写后状态未能全部核对。 */
+  postStateCoverage?: "complete" | "partial";
   ranges: UndoRangeSnapshot[];
   // 本次执行新建的工作表名，撤销时移除。
   createdWorksheets: string[];
+  createdWorksheetStates?: UndoCreatedWorksheetState[];
   // 本次执行删除的工作表，撤销时恢复。
   deletedWorksheets: UndoWorksheetSnapshot[];
   // 删除但因过大未记录撤销快照的工作表名（无法恢复）。
@@ -972,6 +1125,76 @@ export interface TurnStepEvent {
   title: string;
   detail?: string | null;
   completedStep?: string | null;
+}
+
+export type TaskProgressPhase =
+  | "intent"
+  | "planning"
+  | "preflight"
+  | "backup"
+  | "executing"
+  | "saving"
+  | "verifying"
+  | "refreshing";
+
+export type TaskProgressStatus =
+  | "started"
+  | "progress"
+  | "completed"
+  | "warning"
+  | "failed"
+  | "cancelled";
+
+export type DecisionTraceKind =
+  | "understanding"
+  | "evidence"
+  | "assumption"
+  | "decision"
+  | "conflict"
+  | "correction";
+
+export interface TaskProgressTarget {
+  file?: string | null;
+  sheet?: string | null;
+  range?: string | null;
+}
+
+export interface TaskProgressFact {
+  label: string;
+  value: string;
+  style?: "text" | "code";
+}
+
+export interface TaskProgressTrace {
+  kind: DecisionTraceKind;
+  summary: string;
+  basis?: string | null;
+  changedFrom?: string | null;
+  requiresConfirmation?: boolean;
+}
+
+export interface TaskProgressEvent {
+  schemaVersion: 1;
+  operationId: string;
+  executionId?: string | null;
+  sequence: number;
+  phase: TaskProgressPhase;
+  stepId: string;
+  status: TaskProgressStatus;
+  title: string;
+  summary?: string | null;
+  detail?: string | null;
+  current?: number | null;
+  total?: number | null;
+  unit?: "rows" | "fields" | "actions" | "sheets" | "files" | "checks" | null;
+  actionIndex?: number | null;
+  actionCount?: number | null;
+  actionType?: string | null;
+  toolName?: string | null;
+  facts?: TaskProgressFact[] | null;
+  target?: TaskProgressTarget | null;
+  trace?: TaskProgressTrace | null;
+  timestamp: string;
 }
 
 const allowedActionTypes = new Set<ExcelAction["type"]>([
@@ -1291,5 +1514,248 @@ export function parseTurnStepEvent(value: unknown): TurnStepEvent | null {
     detail: typeof event.detail === "string" ? event.detail : null,
     completedStep:
       typeof event.completedStep === "string" ? event.completedStep : null
+  };
+}
+
+const taskProgressPhases = new Set<TaskProgressPhase>([
+  "intent",
+  "planning",
+  "preflight",
+  "backup",
+  "executing",
+  "saving",
+  "verifying",
+  "refreshing"
+]);
+
+const taskProgressStatuses = new Set<TaskProgressStatus>([
+  "started",
+  "progress",
+  "completed",
+  "warning",
+  "failed",
+  "cancelled"
+]);
+
+const decisionTraceKinds = new Set<DecisionTraceKind>([
+  "understanding",
+  "evidence",
+  "assumption",
+  "decision",
+  "conflict",
+  "correction"
+]);
+
+function optionalNonNegativeNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? value
+    : null;
+}
+
+const TASK_PROGRESS_FACT_LIMIT = 12;
+const TASK_PROGRESS_FACT_VALUE_LIMIT = 500;
+const TASK_PROGRESS_TRUNCATION_MARKER = "…（内容过长，已截断）";
+const SENSITIVE_PROGRESS_LABEL =
+  /token|authorization|cookie|api[ _-]?key|secret|password|credential|密钥|口令/i;
+const SAFE_PROGRESS_FACT_LABELS = new Set([
+  "工具",
+  "动作",
+  "动作数",
+  "参数",
+  "目标",
+  "结果",
+  "依据",
+  "查询",
+  "范围",
+  "工作表",
+  "工作表数",
+  "文件",
+  "字段数",
+  "匹配数",
+  "进度",
+  "授权范围",
+  "读取方式",
+  "快照"
+]);
+
+function truncateProgressText(value: string, limit: number): string {
+  if (value.length <= limit) return value;
+  const keep = Math.max(0, limit - TASK_PROGRESS_TRUNCATION_MARKER.length);
+  return value.slice(0, keep) + TASK_PROGRESS_TRUNCATION_MARKER;
+}
+
+function redactProgressValue(value: string): string {
+  return value
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, "Bearer 已隐藏")
+    .replace(
+      /([A-Za-z][A-Za-z0-9+.-]*:\/\/)([^/\s:@]+):([^@\s/]+)@/g,
+      "$1已隐藏@"
+    )
+    .replace(/\bsk-[A-Za-z0-9_-]{12,}\b/g, "已隐藏")
+    .replace(
+      /\b(api[ _-]?key|token|secret|password)\s*[:=]\s*[^\s,;]+/gi,
+      "$1=已隐藏"
+    );
+}
+
+function parseProgressFacts(value: unknown): TaskProgressFact[] | null {
+  if (!Array.isArray(value)) return null;
+  const parsed: TaskProgressFact[] = [];
+  for (const item of value.slice(0, TASK_PROGRESS_FACT_LIMIT)) {
+    if (!item || typeof item !== "object") continue;
+    const candidate = item as Record<string, unknown>;
+    if (
+      typeof candidate.label !== "string" ||
+      !candidate.label.trim() ||
+      typeof candidate.value !== "string" ||
+      !candidate.value.trim()
+    ) {
+      continue;
+    }
+    const label = truncateProgressText(candidate.label.trim(), 40);
+    if (
+      !SENSITIVE_PROGRESS_LABEL.test(label) &&
+      !SAFE_PROGRESS_FACT_LABELS.has(label)
+    ) {
+      continue;
+    }
+    const rawValue = candidate.value.trim();
+    const safeValue = SENSITIVE_PROGRESS_LABEL.test(label)
+      ? "已隐藏"
+      : redactProgressValue(rawValue);
+    parsed.push({
+      label,
+      value: truncateProgressText(
+        safeValue,
+        TASK_PROGRESS_FACT_VALUE_LIMIT
+      ),
+      style: candidate.style === "code" ? "code" : "text"
+    });
+  }
+  return parsed.length > 0 ? parsed : null;
+}
+
+function parseProgressTarget(value: unknown): TaskProgressTarget | null {
+  if (!value || typeof value !== "object") return null;
+  const candidate = value as Record<string, unknown>;
+  const rawFile =
+    typeof candidate.file === "string" ? candidate.file.trim() : "";
+  const file = rawFile
+    ? /^[A-Za-z]:[\\/]|^\\\\|^\//.test(rawFile)
+      ? (() => {
+          const parts = rawFile.split(/[\\/]/).filter(Boolean);
+          return parts.length > 0 ? parts[parts.length - 1] : null;
+        })()
+      : truncateProgressText(rawFile, 1000)
+    : null;
+  const sheet =
+    typeof candidate.sheet === "string" && candidate.sheet.trim()
+      ? truncateProgressText(candidate.sheet.trim(), 500)
+      : null;
+  const range =
+    typeof candidate.range === "string" && candidate.range.trim()
+      ? truncateProgressText(candidate.range.trim(), 80)
+      : null;
+  return file || sheet || range ? { file, sheet, range } : null;
+}
+
+export function parseTaskProgressEvent(
+  value: unknown,
+  legacyOperationId = "legacy-turn",
+  legacySequence = 0
+): TaskProgressEvent | null {
+  if (!value || typeof value !== "object") return null;
+  const candidate = value as Partial<TaskProgressEvent>;
+  if (candidate.schemaVersion !== 1) {
+    const legacy = parseTurnStepEvent(value);
+    if (!legacy) return null;
+    return {
+      schemaVersion: 1,
+      operationId: legacyOperationId,
+      sequence: legacySequence,
+      phase: "planning",
+      stepId: `legacy-${legacySequence}`,
+      status: "progress",
+      title: legacy.title,
+      detail: legacy.detail ?? null,
+      summary: null,
+      timestamp: new Date().toISOString()
+    };
+  }
+  if (
+    typeof candidate.operationId !== "string" ||
+    !candidate.operationId.trim() ||
+    typeof candidate.sequence !== "number" ||
+    !Number.isInteger(candidate.sequence) ||
+    candidate.sequence < 0 ||
+    !taskProgressPhases.has(candidate.phase as TaskProgressPhase) ||
+    !taskProgressStatuses.has(candidate.status as TaskProgressStatus) ||
+    typeof candidate.stepId !== "string" ||
+    !candidate.stepId.trim() ||
+    typeof candidate.title !== "string" ||
+    !candidate.title.trim() ||
+    typeof candidate.timestamp !== "string" ||
+    !candidate.timestamp.trim()
+  ) {
+    return null;
+  }
+  const current = optionalNonNegativeNumber(candidate.current);
+  const total = optionalNonNegativeNumber(candidate.total);
+  if (current !== null && total !== null && current > total) return null;
+  const traceValue = candidate.trace;
+  const trace =
+    traceValue &&
+    typeof traceValue === "object" &&
+    decisionTraceKinds.has(traceValue.kind as DecisionTraceKind) &&
+    typeof traceValue.summary === "string" &&
+    traceValue.summary.trim()
+      ? {
+          kind: traceValue.kind as DecisionTraceKind,
+          summary: traceValue.summary,
+          basis: typeof traceValue.basis === "string" ? traceValue.basis : null,
+          changedFrom:
+            typeof traceValue.changedFrom === "string"
+              ? traceValue.changedFrom
+              : null,
+          requiresConfirmation: Boolean(traceValue.requiresConfirmation)
+        }
+      : null;
+  return {
+    schemaVersion: 1,
+    operationId: candidate.operationId,
+    executionId:
+      typeof candidate.executionId === "string" ? candidate.executionId : null,
+    sequence: candidate.sequence,
+    phase: candidate.phase as TaskProgressPhase,
+    stepId: candidate.stepId,
+    status: candidate.status as TaskProgressStatus,
+    title: candidate.title,
+    summary:
+      typeof candidate.summary === "string"
+        ? truncateProgressText(candidate.summary, 1000)
+        : null,
+    detail:
+      typeof candidate.detail === "string"
+        ? truncateProgressText(candidate.detail, 2000)
+        : null,
+    current,
+    total,
+    unit: candidate.unit ?? null,
+    actionIndex: optionalNonNegativeNumber(candidate.actionIndex),
+    actionCount: optionalNonNegativeNumber(candidate.actionCount),
+    actionType:
+      typeof candidate.actionType === "string"
+        ? truncateProgressText(candidate.actionType, 100)
+        : null,
+    toolName:
+      typeof candidate.toolName === "string"
+        ? truncateProgressText(candidate.toolName, 100)
+        : null,
+    facts: parseProgressFacts(
+      (candidate as TaskProgressEvent & { facts?: unknown }).facts
+    ),
+    target: parseProgressTarget(candidate.target),
+    trace,
+    timestamp: candidate.timestamp
   };
 }

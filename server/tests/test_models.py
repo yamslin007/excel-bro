@@ -6,9 +6,98 @@ from pydantic import ValidationError
 from server.app.models import (
     ActionExecutionResult,
     AnalysisPlan,
+    IntentOption,
     IntentToolResponse,
+    TaskProgressEvent,
     VerificationReport,
 )
+
+
+def test_task_progress_event_supports_safe_facts_and_cancelled_status() -> None:
+    event = TaskProgressEvent.model_validate(
+        {
+            "operationId": "operation-progress-model",
+            "sequence": 2,
+            "phase": "planning",
+            "stepId": "planning.tool.1.1",
+            "status": "cancelled",
+            "title": "任务已取消",
+            "toolName": "read_range",
+            "facts": [
+                {"label": "范围", "value": "A1:B3", "style": "code"},
+                {"label": "结果", "value": "3 行 × 2 列"},
+            ],
+            "timestamp": "2026-09-03T00:00:00Z",
+        }
+    )
+
+    assert event.status == "cancelled"
+    assert event.toolName == "read_range"
+    assert event.facts is not None
+    assert event.facts[0].style == "code"
+
+
+def test_task_progress_event_rejects_oversized_fact_payloads() -> None:
+    base = {
+        "operationId": "operation-progress-invalid",
+        "sequence": 1,
+        "phase": "planning",
+        "stepId": "planning.tool.invalid",
+        "status": "completed",
+        "title": "已完成",
+        "timestamp": "2026-09-03T00:00:00Z",
+    }
+    with pytest.raises(ValidationError):
+        TaskProgressEvent.model_validate(
+            {
+                **base,
+                "facts": [
+                    {"label": "结果", "value": str(index)}
+                    for index in range(13)
+                ],
+            }
+        )
+    with pytest.raises(ValidationError):
+        TaskProgressEvent.model_validate(
+            {
+                **base,
+                "facts": [{"label": "结果", "value": "x" * 501}],
+            }
+        )
+
+
+def test_intent_option_supports_explicit_replacement_mode() -> None:
+    replacement = IntentOption.model_validate(
+        {
+            "id": "by-cinema",
+            "label": "改为按影院建表",
+            "description": "替换原拆分维度",
+            "resolution": "按影院名称和影院编码建表，表内按影片汇总",
+            "resolutionMode": "replace",
+        }
+    )
+    legacy = IntentOption.model_validate(
+        {
+            "id": "ratio",
+            "label": "补充分母",
+            "description": "只补充占比口径",
+            "resolution": "分母使用全表该影院记录数",
+        }
+    )
+
+    assert replacement.resolutionMode == "replace"
+    assert legacy.resolutionMode == "append"
+
+    with pytest.raises(ValidationError):
+        IntentOption.model_validate(
+            {
+                "id": "invalid",
+                "label": "无效",
+                "description": "无效模式",
+                "resolution": "继续",
+                "resolutionMode": "overwrite",
+            }
+        )
 
 
 def test_unknown_action_is_rejected() -> None:

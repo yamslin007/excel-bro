@@ -444,8 +444,16 @@ class SplitGroupAggregateAction(BaseModel):
     type: Literal["splitGroupAggregate"]
     sheet: SheetName
     sourceRange: RangeAddress | None = None
-    splitBy: str = Field(min_length=1, max_length=255)
-    groupBy: list[str] = Field(min_length=1, max_length=10)
+    splitBy: str = Field(
+        min_length=1,
+        max_length=255,
+        description="输出工作表的拆分字段；执行器会自动把它写入结果列。",
+    )
+    groupBy: list[str] = Field(
+        min_length=1,
+        max_length=10,
+        description="每张结果表内的分组字段；不得重复包含 splitBy。",
+    )
     metrics: list[SplitAggregateMetric] = Field(min_length=1, max_length=10)
     includeBlankSplitValues: bool = False
     existingSheetPolicy: Literal["rename", "replace", "skip"] = "rename"
@@ -1381,6 +1389,197 @@ class ActionExecutionResult(BaseModel):
     sheet: str
     status: Literal["succeeded", "failed", "not_run"]
     message: str | None = Field(default=None, max_length=1000)
+    changed: bool | None = None
+
+
+class FolderUndoReference(BaseModel):
+    undoId: str = Field(min_length=1, max_length=100)
+    sessionId: str = Field(min_length=1, max_length=100)
+
+
+class FolderUndoRequest(BaseModel):
+    sessionId: str = Field(min_length=1, max_length=100)
+    undoId: str = Field(min_length=1, max_length=100)
+
+
+class FolderUndoResponse(BaseModel):
+    filesRestored: list[str]
+    executionsUndone: int = Field(ge=1)
+    remainingUndoCount: int = Field(ge=0)
+
+
+class FolderBackupFileInfo(BaseModel):
+    originalRelativePath: str = Field(min_length=1, max_length=2000)
+    backupRelativePath: str | None = Field(default=None, max_length=2000)
+    recoveryAction: Literal["restore", "remove"]
+    sizeBytes: int = Field(ge=0)
+
+
+class FolderBackupEntry(BaseModel):
+    revision: int = Field(default=0, ge=0)
+    undoId: str = Field(min_length=1, max_length=100)
+    undoSessionId: str | None = Field(default=None, max_length=100)
+    planId: str = Field(min_length=1, max_length=100)
+    planTitle: str = Field(min_length=1, max_length=100)
+    createdAt: str = Field(min_length=1, max_length=100)
+    status: Literal[
+        "creating",
+        "preparing",
+        "prepared",
+        "applying",
+        "ready",
+        "recovering",
+        "restored",
+        "rolled_back",
+        "needs_attention",
+    ]
+    statusReason: str | None = Field(default=None, max_length=2000)
+    undoAvailability: Literal["eligible", "blocked", "view_only", "busy"]
+    undoUnavailableReason: str | None = Field(default=None, max_length=2000)
+    deleteInvalidatesUndoIds: list[str] = Field(default_factory=list)
+    pinned: bool = False
+    protectedReasons: list[str] = Field(default_factory=list)
+    canUndo: bool
+    fileCount: int = Field(ge=0)
+    totalBytes: int = Field(ge=0)
+    expiresAt: str | None = Field(default=None, max_length=100)
+    files: list[FolderBackupFileInfo] = Field(default_factory=list)
+
+
+class FolderLegacyBackupInfo(BaseModel):
+    relativePath: str = Field(min_length=1, max_length=2000)
+    sizeBytes: int = Field(ge=0)
+    modifiedAt: str = Field(min_length=1, max_length=100)
+
+
+class FolderBackupStorageSummary(BaseModel):
+    automaticBytes: int = Field(ge=0)
+    pinnedBytes: int = Field(ge=0)
+    abnormalBytes: int = Field(ge=0)
+    exportedBytes: int = Field(ge=0)
+    legacyBytes: int = Field(ge=0)
+    pendingCleanupBytes: int = Field(ge=0)
+    totalBytes: int = Field(ge=0)
+    softLimitBytes: int = Field(ge=0)
+    complete: bool
+    calculatedAt: str = Field(min_length=1, max_length=100)
+
+
+class FolderBackupsResponse(BaseModel):
+    folderPath: str = Field(min_length=1, max_length=2000)
+    backupDirectory: str = Field(min_length=1, max_length=2000)
+    openDirectoryToken: str | None = Field(default=None, min_length=1, max_length=100)
+    backupManagementToken: str | None = Field(default=None, min_length=1, max_length=100)
+    backups: list[FolderBackupEntry] = Field(default_factory=list)
+    legacyCandidates: list[FolderLegacyBackupInfo] = Field(default_factory=list)
+    storageSummary: FolderBackupStorageSummary | None = None
+    warnings: list[str] = Field(default_factory=list)
+
+
+class FolderBackupOpenRequest(BaseModel):
+    directoryToken: str = Field(min_length=1, max_length=100)
+
+
+class FolderBackupOpenResponse(BaseModel):
+    opened: bool
+    directory: str = Field(min_length=1, max_length=2000)
+
+
+class FolderBackupExportRequest(BaseModel):
+    sessionId: str | None = Field(default=None, min_length=1, max_length=100)
+    backupManagementToken: str | None = Field(default=None, min_length=1, max_length=100)
+    undoId: str = Field(min_length=1, max_length=100)
+    operationId: str | None = Field(
+        default=None,
+        min_length=8,
+        max_length=100,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]*$",
+    )
+
+    @model_validator(mode="after")
+    def validate_management_target(self) -> "FolderBackupExportRequest":
+        if not self.sessionId and not self.backupManagementToken:
+            raise ValueError("必须提供文件夹会话或备份管理凭证")
+        return self
+
+
+class FolderBackupExportResponse(BaseModel):
+    operationId: str = Field(min_length=8, max_length=100)
+    exportDirectory: str = Field(min_length=1, max_length=2000)
+    files: list[str] = Field(default_factory=list)
+    complete: bool = True
+    failures: list[str] = Field(default_factory=list)
+
+
+class FolderBackupDeleteRequest(BaseModel):
+    backupManagementToken: str = Field(min_length=1, max_length=100)
+    undoId: str = Field(min_length=1, max_length=100)
+    confirmed: bool
+    expectedRevision: int | None = Field(default=None, ge=0)
+    expectedInvalidatedUndoIds: list[str] | None = None
+
+
+class FolderBackupDeleteResponse(BaseModel):
+    deletedUndoId: str = Field(min_length=1, max_length=100)
+    discardedUndo: bool
+    filesDeleted: int = Field(ge=0)
+    bytesFreed: int = Field(ge=0)
+    remainingUndoCount: int = Field(ge=0)
+    invalidatedUndoIds: list[str] = Field(default_factory=list)
+    remainingUndoIds: list[str] = Field(default_factory=list)
+    cleanupPending: bool = False
+    cleanupWarnings: list[str] = Field(default_factory=list)
+
+
+class FolderBackupPinRequest(BaseModel):
+    backupManagementToken: str = Field(min_length=1, max_length=100)
+    undoId: str = Field(min_length=1, max_length=100)
+    pinned: bool
+
+
+class FolderBackupPinResponse(BaseModel):
+    undoId: str = Field(min_length=1, max_length=100)
+    pinned: bool
+
+
+class FolderBackupCleanupRequest(BaseModel):
+    sessionId: str | None = Field(default=None, min_length=1, max_length=100)
+    backupManagementToken: str | None = Field(default=None, min_length=1, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_management_target(self) -> "FolderBackupCleanupRequest":
+        if not self.sessionId and not self.backupManagementToken:
+            raise ValueError("必须提供文件夹会话或备份管理凭证")
+        return self
+
+
+class FolderBackupCleanupResponse(BaseModel):
+    deletedExecutions: int = Field(ge=0)
+    deletedFiles: int = Field(ge=0)
+    bytesFreed: int = Field(ge=0)
+    skippedActive: int = Field(ge=0)
+    protectedExecutions: int = Field(default=0, ge=0)
+    retainedBytes: int = Field(default=0, ge=0)
+    overLimitBytes: int = Field(default=0, ge=0)
+    failures: list[str] = Field(default_factory=list)
+    legacyCandidateCount: int = Field(ge=0)
+
+
+class FolderLegacyCollectRequest(BaseModel):
+    sessionId: str | None = Field(default=None, min_length=1, max_length=100)
+    backupManagementToken: str | None = Field(default=None, min_length=1, max_length=100)
+    confirmed: bool
+
+    @model_validator(mode="after")
+    def validate_management_target(self) -> "FolderLegacyCollectRequest":
+        if not self.sessionId and not self.backupManagementToken:
+            raise ValueError("必须提供文件夹会话或备份管理凭证")
+        return self
+
+
+class FolderLegacyCollectResponse(BaseModel):
+    collectedFiles: list[str] = Field(default_factory=list)
+    failures: list[str] = Field(default_factory=list)
 
 
 class VerificationCheck(BaseModel):
@@ -1412,6 +1611,18 @@ class VerificationReport(BaseModel):
         if self.status == "executed_unverified" and not self.unverifiedActions:
             raise ValueError("executed_unverified 必须说明未验证动作")
         return self
+
+
+class FolderExecuteResponse(BaseModel):
+    filesModified: list[str]
+    backups: list[str]
+    backupDirectory: str | None = None
+    backupWarnings: list[str] = Field(default_factory=list)
+    actionResults: list[ActionExecutionResult]
+    verification: VerificationReport
+    undo: FolderUndoReference | None = None
+    executionMs: float = Field(ge=0)
+    verificationMs: float = Field(ge=0)
 
 
 class ResultContext(BaseModel):
@@ -1532,6 +1743,7 @@ class IntentOption(BaseModel):
     label: str = Field(min_length=1, max_length=80)
     description: str = Field(min_length=1, max_length=240)
     resolution: str = Field(min_length=1, max_length=500)
+    resolutionMode: Literal["append", "replace"] = "append"
     action: Literal["resolve", "editScope"] = "resolve"
 
 
@@ -1700,6 +1912,7 @@ class PlanRequest(BaseModel):
     lastResult: ResultContext | None = None
     images: list[ImageAttachment] = Field(default_factory=list, max_length=3)
     dataResults: list[DataToolResult] = Field(default_factory=list, max_length=5)
+    planningReadPolicy: Literal["ifNeeded", "none"] = "ifNeeded"
     modelId: Annotated[
         str,
         StringConstraints(strip_whitespace=True, min_length=1, max_length=200),
@@ -1734,6 +1947,86 @@ class TurnStepEvent(BaseModel):
     title: str = Field(min_length=1, max_length=200)
     detail: str | None = Field(default=None, max_length=500)
     completedStep: str | None = Field(default=None, max_length=200)
+
+
+class TaskProgressTarget(BaseModel):
+    file: str | None = Field(default=None, max_length=1000)
+    sheet: str | None = Field(default=None, max_length=500)
+    range: str | None = Field(default=None, max_length=80)
+
+
+class TaskProgressFact(BaseModel):
+    label: str = Field(min_length=1, max_length=40)
+    value: str = Field(min_length=1, max_length=500)
+    style: Literal["text", "code"] = "text"
+
+
+class TaskProgressTrace(BaseModel):
+    kind: Literal[
+        "understanding",
+        "evidence",
+        "assumption",
+        "decision",
+        "conflict",
+        "correction",
+    ]
+    summary: str = Field(min_length=1, max_length=1000)
+    basis: str | None = Field(default=None, max_length=1000)
+    changedFrom: str | None = Field(default=None, max_length=1000)
+    requiresConfirmation: bool = False
+
+
+class TaskProgressEvent(BaseModel):
+    """由本地代码构造并校验的用户可见任务进度，不承载模型隐藏推理。"""
+
+    schemaVersion: Literal[1] = 1
+    operationId: TurnId
+    executionId: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{32}$"
+    )
+    sequence: int = Field(ge=0)
+    phase: Literal[
+        "intent",
+        "planning",
+        "preflight",
+        "backup",
+        "executing",
+        "saving",
+        "verifying",
+        "refreshing",
+    ]
+    stepId: str = Field(
+        min_length=1, max_length=100, pattern=r"^[A-Za-z0-9_.:-]+$"
+    )
+    status: Literal[
+        "started", "progress", "completed", "warning", "failed", "cancelled"
+    ]
+    title: str = Field(min_length=1, max_length=200)
+    summary: str | None = Field(default=None, max_length=1000)
+    detail: str | None = Field(default=None, max_length=2000)
+    current: int | None = Field(default=None, ge=0)
+    total: int | None = Field(default=None, ge=0)
+    unit: Literal[
+        "rows", "fields", "actions", "sheets", "files", "checks"
+    ] | None = None
+    actionIndex: int | None = Field(default=None, ge=0)
+    actionCount: int | None = Field(default=None, ge=0)
+    actionType: str | None = Field(default=None, max_length=100)
+    toolName: str | None = Field(default=None, max_length=100)
+    facts: list[TaskProgressFact] | None = Field(default=None, max_length=12)
+    target: TaskProgressTarget | None = None
+    trace: TaskProgressTrace | None = None
+    timestamp: str = Field(min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def validate_progress_numbers(self) -> "TaskProgressEvent":
+        if (
+            self.current is not None
+            and self.total is not None
+            and self.current > self.total
+        ):
+            raise ValueError("current 不能大于 total")
+        return self
 
 TurnRequest = IntentCheckRequest | PlanRequest
 TurnResponse = Annotated[

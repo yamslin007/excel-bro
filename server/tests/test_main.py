@@ -25,6 +25,7 @@ def clear_model_environment(
     tmp_path: Path,
 ) -> None:
     turn_registry.reset()
+    main_module._folder_operations.clear()
     for name in (
         "AI_API_KEY",
         "AI_BASE_URL",
@@ -55,6 +56,35 @@ def test_health_reports_local_mode_without_model_config() -> None:
     }
 
 
+def test_diagnostics_records_unhandled_exceptions() -> None:
+    """500 请求必须进诊断日志。
+
+    以前只在 call_next 正常返回后 append，未捕获异常的请求对 /api/diagnostics
+    完全隐形；而这类响应又不带 CORS 头，浏览器只报「No Access-Control-Allow-Origin」。
+    两者叠加导致真正的错误在前后端都看不见，只能去翻 uvicorn 终端。
+    """
+
+    @app.get("/api/_test_unhandled_error")
+    async def _boom() -> None:
+        raise RuntimeError("测试用未捕获异常")
+
+    main_module._diagnostic_events.clear()
+    response = TestClient(app, raise_server_exceptions=False).get(
+        "/api/_test_unhandled_error"
+    )
+
+    assert response.status_code == 500
+    events = [
+        event
+        for event in main_module._diagnostic_events
+        if event.get("path") == "/api/_test_unhandled_error"
+    ]
+    assert len(events) == 1
+    assert events[0]["status"] == 500
+    assert "RuntimeError" in str(events[0]["error"])
+    assert "测试用未捕获异常" in str(events[0]["error"])
+
+
 def test_capabilities_are_loaded_from_shared_project_config() -> None:
     response = TestClient(app).get("/api/capabilities")
 
@@ -69,6 +99,8 @@ def test_capabilities_are_loaded_from_shared_project_config() -> None:
         "maxPriorResultRows": 20,
     }
     assert value["savedTools"]["maxItems"] == 50
+    assert value["agent"]["maxConsecutiveErrors"] == 2
+    assert value["agent"]["repairMaxOutputTokens"] == 2000
 
 
 def test_health_reports_model_without_exposing_key(
@@ -390,6 +422,87 @@ def test_folder_refresh_endpoint_rejects_unknown_session() -> None:
     assert response.json()["detail"]["code"] == "FOLDER_DATA_ERROR"
 
 
+def test_folder_backup_management_endpoints_use_the_selected_work_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "scores.xlsx"
+    workbook = Workbook()
+    workbook.active.append(["人员", "得分"])
+    workbook.save(source)
+    workbook.close()
+    (tmp_path / ".excel-bro-backups").mkdir()
+    catalog = folder_workbooks_module.scan_folder(tmp_path)
+    client = TestClient(app)
+
+    listed = client.get(
+        "/api/folders/backups", params={"sessionId": catalog.sessionId}
+    )
+    cleaned = client.post(
+        "/api/folders/backups/cleanup", json={"sessionId": catalog.sessionId}
+    )
+    opened: list[str] = []
+    monkeypatch.setattr(
+        folder_workbooks_module.os,
+        "startfile",
+        lambda path: opened.append(path),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        folder_workbooks_module,
+        "_explorer_window_handles",
+        lambda: [],
+    )
+    monkeypatch.setattr(
+        folder_workbooks_module,
+        "_focus_opened_explorer_window",
+        lambda directory, handles: True,
+    )
+    opened_response = client.post(
+        "/api/folders/backups/open",
+        json={"directoryToken": listed.json()["openDirectoryToken"]},
+    )
+
+    assert listed.status_code == 200
+    assert listed.json()["folderPath"] == str(tmp_path)
+    assert listed.json()["backupDirectory"] == str(
+        tmp_path / ".excel-bro-backups"
+    )
+    assert cleaned.status_code == 200
+    assert cleaned.json()["deletedExecutions"] == 0
+    assert opened_response.status_code == 200
+    assert opened_response.json()["directory"] == str(
+        tmp_path / ".excel-bro-backups"
+    )
+    assert opened == [str(tmp_path / ".excel-bro-backups")]
+
+
+def test_folder_backup_management_rejects_unknown_session() -> None:
+    response = TestClient(app).get(
+        "/api/folders/backups", params={"sessionId": "missing-session"}
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "FOLDER_BACKUP_ERROR"
+
+    open_response = TestClient(app).post(
+        "/api/folders/backups/open",
+        json={"directoryToken": "missing-token"},
+    )
+    assert open_response.status_code == 422
+    assert open_response.json()["detail"]["code"] == "FOLDER_BACKUP_OPEN_ERROR"
+
+    delete_response = TestClient(app).post(
+        "/api/folders/backups/delete",
+        json={
+            "backupManagementToken": "missing-token",
+            "undoId": "a" * 32,
+            "confirmed": True,
+        },
+    )
+    assert delete_response.status_code == 422
+    assert delete_response.json()["detail"]["code"] == "FOLDER_BACKUP_DELETE_ERROR"
+
+
 def _intent_payload(prompt: str, sheet_count: int = 2) -> dict[str, object]:
     return {
         "prompt": prompt,
@@ -627,6 +740,95 @@ def test_turn_stream_emits_steps_then_result(
     assert len(result_events) == 1
     assert result_events[0]["kind"] == "answer"
     assert result_events[0]["turnId"] == "turn-stream-test"
+
+
+def test_folder_execute_stream_reuses_operation_without_writing_twice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def fake_execute(request, on_progress=None):
+        nonlocal calls
+        calls += 1
+        if on_progress is not None:
+            on_progress(
+                {
+                    "executionId": "0123456789abcdef0123456789abcdef",
+                    "phase": "executing",
+                    "stepId": "folder.action.1",
+                    "status": "completed",
+                    "title": "第 1 步已完成",
+                    "summary": "已创建结果表",
+                    "current": 1,
+                    "total": 1,
+                    "unit": "actions",
+                    "toolName": "submit_plan",
+                    "facts": [
+                        {"label": "动作", "value": "createWorksheet", "style": "code"}
+                    ],
+                }
+            )
+        return main_module.FolderExecuteResponse.model_validate(
+            {
+                "filesModified": ["数据.xlsx"],
+                "backups": [],
+                "actionResults": [
+                    {
+                        "index": 0,
+                        "type": "createWorksheet",
+                        "sheet": "结果",
+                        "status": "succeeded",
+                    }
+                ],
+                "verification": {
+                    "status": "verified",
+                    "passed": True,
+                    "checks": [],
+                    "unverifiedActions": [],
+                },
+                "executionMs": 1,
+                "verificationMs": 1,
+            }
+        )
+
+    monkeypatch.setattr(main_module, "execute_folder_plan", fake_execute)
+    payload = {
+        "sessionId": "session-stream-test",
+        "operationId": "folder-operation-test",
+        "plan": {
+            "id": "folder-plan-test",
+            "title": "创建结果表",
+            "summary": "创建一张结果表",
+            "assumptions": [],
+            "warnings": [],
+            "actions": [{"type": "createWorksheet", "sheet": "结果"}],
+        },
+    }
+    client = TestClient(app)
+
+    first = client.post("/api/folders/execute/stream", json=payload)
+    second = client.post(
+        "/api/folders/execute/stream",
+        json={**payload, "afterSequence": 1},
+    )
+    status = client.get(
+        "/api/folders/execute/status",
+        params={"operationId": "folder-operation-test"},
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert calls == 1
+    progress_events = [
+        payload for name, payload in _parse_sse(first.text) if name == "progress"
+    ]
+    assert progress_events
+    assert progress_events[0]["toolName"] == "submit_plan"
+    assert progress_events[0]["facts"][0]["value"] == "createWorksheet"
+    second_events = _parse_sse(second.text)
+    assert [name for name, _ in second_events] == ["result"]
+    assert status.json()["status"] == "completed"
+    assert status.json()["lastSequence"] == 1
 
 
 def test_turn_stream_serializes_model_error_as_event(

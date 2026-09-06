@@ -1,8 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   dataEpochsChanged,
   executeAction,
   incompleteActionResults,
+  matrixVerificationCriteria,
   missingSchemaRequirements,
   planLiveness,
   preflightPlanActions,
@@ -10,6 +11,7 @@ import {
   sourceFingerprintForSnapshot,
   sortedRangePasses,
   toolSchemaFingerprintForSnapshot,
+  undoExecution,
   verificationGaps,
   valuesEqual
 } from "./excel";
@@ -17,8 +19,81 @@ import type {
   AnalysisPlan,
   CellValue,
   DataFilter,
+  ExecutionUndoSnapshot,
   ExcelAction
 } from "./contracts";
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+describe("safe workbook undo", () => {
+  function snapshot(
+    overrides: Partial<ExecutionUndoSnapshot> = {}
+  ): ExecutionUndoSnapshot {
+    return {
+      planId: "plan-1",
+      executionId: "execution-1",
+      capturedAt: "2026-09-06T00:00:00.000Z",
+      coverage: "full",
+      postStateCoverage: "complete",
+      ranges: [],
+      createdWorksheets: [],
+      createdWorksheetStates: [],
+      deletedWorksheets: [],
+      skippedWorksheets: [],
+      ...overrides
+    };
+  }
+
+  it("refuses an undo snapshot whose write-after state is incomplete", async () => {
+    vi.stubGlobal("Excel", {
+      run: async (callback: (context: object) => Promise<void>) => callback({})
+    });
+
+    await expect(
+      undoExecution(snapshot({ postStateCoverage: "partial" }))
+    ).rejects.toThrow("缺少完整的执行后状态校验");
+  });
+
+  it("refuses to apply a snapshot to another workbook", async () => {
+    vi.stubGlobal("Office", {
+      context: { document: { url: "C:\\work\\other.xlsx" } }
+    });
+    vi.stubGlobal("Excel", {
+      run: async (callback: (context: object) => Promise<void>) => callback({})
+    });
+
+    await expect(
+      undoExecution(
+        snapshot({ workbookIdentity: "url:c:/work/source.xlsx" })
+      )
+    ).rejects.toThrow("当前已不是生成这份撤销数据的工作簿");
+  });
+});
+
+describe("runtime matrix verification", () => {
+  it("splits outputs larger than 500 rows into value-level checks", () => {
+    const matrix: CellValue[][] = Array.from({ length: 1001 }, (_, index) => [
+      `影院-${index}`,
+      index
+    ]);
+
+    const criteria = matrixVerificationCriteria("结果", matrix);
+
+    expect(criteria).toHaveLength(3);
+    expect(criteria.map((criterion) => "range" in criterion && criterion.range)).toEqual([
+      "A1:B500",
+      "A501:B1000",
+      "A1001:B1001"
+    ]);
+    expect(
+      criteria.map((criterion) =>
+        criterion.type === "rangeEquals" ? criterion.expected.length : 0
+      )
+    ).toEqual([500, 500, 1]);
+  });
+});
 
 describe("workbook source fingerprint", () => {
   const snapshot = {

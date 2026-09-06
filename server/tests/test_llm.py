@@ -349,6 +349,32 @@ def test_retries_exhausted_raises_last_error(
     assert calls["count"] == 3  # 首次 + 2 次重试
 
 
+def test_actionable_statuses_get_a_chinese_hint_instead_of_raw_body() -> None:
+    """402 之类只回英文 JSON 的状态码要给用户可行动的提示。"""
+    insufficient_balance = LLMHTTPStatusError(
+        402,
+        '{"error":{"message":"Insufficient Balance","code":"invalid_request_error"}}',
+    )
+
+    assert "余额不足" in str(insufficient_balance)
+    assert "切换" in str(insufficient_balance)
+    assert "HTTP 402" in str(insufficient_balance)
+    # 原始 body 仍保留在属性上供诊断，只是不再直接糊到用户面前。
+    assert "Insufficient Balance" in insufficient_balance.body
+    assert "Insufficient Balance" not in str(insufficient_balance)
+
+    assert "API Key" in str(LLMHTTPStatusError(401, "unauthorized"))
+    assert "baseUrl" in str(LLMHTTPStatusError(404, "not found"))
+
+
+def test_unmapped_status_still_passes_through_the_upstream_body() -> None:
+    """没映射的状态码不能吞掉原始信息，否则排查无从下手。"""
+    error = LLMHTTPStatusError(418, "i am a teapot")
+
+    assert "模型服务返回 HTTP 418" in str(error)
+    assert "i am a teapot" in str(error)
+
+
 def test_non_retryable_status_is_not_retried(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -15,9 +15,13 @@ const undoExecutionMock = vi.mocked(undoExecution);
 
 const snapshot = makeSnapshot("plan-1");
 
-function makeSnapshot(planId: string): ExecutionUndoSnapshot {
+function makeSnapshot(
+  planId: string,
+  executionId?: string
+): ExecutionUndoSnapshot {
   return {
     planId,
+    executionId,
     capturedAt: "2026-08-22T00:00:00.000Z",
     ranges: [],
     createdWorksheets: [],
@@ -229,5 +233,28 @@ describe("useUndoSnapshot", () => {
 
     // plan-2 撤销即失败，两条都留在栈上。
     expect(result.current.undoStack).toEqual([first, second]);
+  });
+
+  it("uses executionId to distinguish repeated executions of one plan", async () => {
+    const { result } = renderHook(() =>
+      useUndoSnapshot({
+        isBusy: false,
+        onStatusChange: vi.fn(),
+        onMessage: vi.fn()
+      })
+    );
+    const first = makeSnapshot("same-plan", "execution-1");
+    const second = makeSnapshot("same-plan", "execution-2");
+    act(() => {
+      result.current.pushUndoSnapshot(first);
+      result.current.pushUndoSnapshot(second);
+    });
+
+    await act(async () => {
+      await result.current.undoExecutionTo("execution-2");
+    });
+
+    expect(undoExecutionMock).toHaveBeenCalledWith(second);
+    expect(result.current.undoStack).toEqual([first]);
   });
 });

@@ -48,6 +48,48 @@ export function normalizeStoredVerification(
   };
 }
 
+export function normalizeStoredMessage(message: ChatMessage): ChatMessage {
+  const staleSourceConfirm = message.staleSourceConfirm
+    ? {
+        ...message.staleSourceConfirm,
+        status:
+          message.staleSourceConfirm.status === "completed"
+            ? ("completed" as const)
+            : ("pending" as const)
+      }
+    : undefined;
+  const normalizedMessage: ChatMessage = {
+    ...message,
+    plan: message.plan ?? staleSourceConfirm?.plan,
+    verification: normalizeStoredVerification(message.verification),
+    staleSourceConfirm
+  };
+  if (!message.clarification) return normalizedMessage;
+  return {
+    ...normalizedMessage,
+    clarification: {
+      ...message.clarification,
+      round:
+        typeof message.clarification.round === "number"
+          ? message.clarification.round
+          : 0,
+      status:
+        message.clarification.status === "resolving"
+          ? "pending"
+          : message.clarification.status
+    }
+  };
+}
+
+export function canAcknowledgeStaleSource(message: ChatMessage): boolean {
+  const confirmation = message.staleSourceConfirm;
+  return Boolean(
+    confirmation &&
+      confirmation.status !== "completed" &&
+      message.plan?.id === confirmation.plan.id
+  );
+}
+
 // 原样文本命中的一级 key：去首尾空白、内部空白折叠、小写。
 export function normalizePrompt(text: string): string {
   return text.trim().replace(/\s+/g, " ").toLowerCase();
@@ -184,30 +226,7 @@ export function loadChatHistory(): ChatHistoryState {
           const now = new Date().toISOString();
           return {
             ...conversation,
-            messages: conversation.messages.map((message) => {
-              const normalizedMessage = {
-                ...message,
-                verification: normalizeStoredVerification(
-                  message.verification
-                )
-              };
-              return message.clarification
-                ? {
-                    ...normalizedMessage,
-                    clarification: {
-                      ...message.clarification,
-                      round:
-                        typeof message.clarification.round === "number"
-                          ? message.clarification.round
-                          : 0,
-                      status:
-                        message.clarification.status === "resolving"
-                          ? "pending"
-                          : message.clarification.status
-                    }
-                  }
-                : normalizedMessage;
-            }),
+            messages: conversation.messages.map(normalizeStoredMessage),
             title:
               typeof conversation.title === "string"
                 ? conversation.title

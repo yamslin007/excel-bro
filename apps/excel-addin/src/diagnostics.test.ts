@@ -3,7 +3,8 @@ import {
   currentModelCallCount,
   diagnosticReport,
   recordDiagnosticEvent,
-  recordModelCall
+  recordModelCall,
+  recordProgressDiagnosticEvent
 } from "./diagnostics";
 
 describe("diagnostics", () => {
@@ -25,5 +26,37 @@ describe("diagnostics", () => {
       phase: "local_query",
       scannedRows: 200
     });
+  });
+
+  it("records progress correlation metadata without message contents", () => {
+    recordProgressDiagnosticEvent(
+      {
+        operationId: "operation-safe",
+        executionId: "execution-safe",
+        sequence: 3,
+        stepId: "planning.tool.1.1",
+        phase: "planning",
+        status: "completed",
+        toolName: "read_range",
+        actionType: null
+      },
+      "inserted"
+    );
+
+    const report = diagnosticReport();
+    expect(report.progressEvents.at(-1)).toEqual(
+      expect.objectContaining({
+        operationId: "operation-safe",
+        sequence: 3,
+        stepId: "planning.tool.1.1",
+        disposition: "inserted"
+      })
+    );
+    expect(JSON.stringify(report.progressEvents.at(-1))).not.toContain(
+      "summary"
+    );
+    expect(JSON.stringify(report.progressEvents.at(-1))).not.toContain(
+      "facts"
+    );
   });
 });

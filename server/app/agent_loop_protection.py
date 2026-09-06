@@ -109,7 +109,7 @@ def should_stop(
 ) -> tuple[bool, str | None]:
     """判断 Agent 循环是否应该触发预算熔断。
 
-    按步数、累计 token、墙上时间和连续错误的固定优先级检查，返回
+    按步数、连续错误、累计 token 和墙上时间的固定优先级检查，返回
     第一个达到配置阈值的原因。
 
     Args:
@@ -122,12 +122,13 @@ def should_stop(
     """
     if state.turn_index >= config.max_turns:
         return True, "max_turns"
+    # 当连续结构错误同时推高了 token，用根因而不是伴随结果向用户解释停止原因。
+    if state.consecutive_errors >= config.max_consecutive_errors:
+        return True, "consecutive_errors"
     if state.total_tokens >= config.max_total_tokens:
         return True, "max_tokens"
     if state.elapsed_time >= config.max_wall_time_seconds:
         return True, "timeout"
-    if state.consecutive_errors >= config.max_consecutive_errors:
-        return True, "consecutive_errors"
     return False, None
 
 
@@ -181,8 +182,9 @@ def _generate_suggestions(state: LoopState, stop_reason: str) -> str:
     """根据数据完整性和熔断原因生成可操作建议。"""
     if state.encountered_truncation:
         return (
-            "- 你的数据可能超过快照容量（200 行）\n"
-            "- 建议：缩小数据范围，或使用 Excel 内置的筛选功能先过滤数据"
+            "- 数据预览超过快照容量（200 行），但这不代表 Excel 无法处理完整数据\n"
+            "- 拆分、聚合或统计任务应使用执行时读取完整数据的计划；只有必须查看"
+            "具体明细时才需要缩小范围"
         )
 
     if stop_reason == "consecutive_errors":

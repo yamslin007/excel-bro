@@ -5,7 +5,11 @@ import type {
   FolderCatalog,
   WorkbookSnapshot
 } from "../contracts";
-import { useScopeSelection } from "./useScopeSelection";
+import {
+  addedFolderSheetKeys,
+  resolveFolderViewAfterFileClear,
+  useScopeSelection
+} from "./useScopeSelection";
 
 const workbook: WorkbookSnapshot = {
   name: "book.xlsx",
@@ -61,6 +65,74 @@ const folderCatalog: FolderCatalog = {
 };
 
 describe("useScopeSelection", () => {
+  it("should leave selected-only view when clearing the last selected file", () => {
+    expect(
+      resolveFolderViewAfterFileClear(
+        ["file-1\0Data"],
+        "file-1",
+        ["file-1", "file-2"],
+        true
+      )
+    ).toEqual({
+      remainingKeys: [],
+      showSelected: false,
+      activeFileId: "file-1"
+    });
+  });
+
+  it("should keep selected-only view and move to the next selected file", () => {
+    expect(
+      resolveFolderViewAfterFileClear(
+        ["file-1\0Data", "file-2\0Summary"],
+        "file-1",
+        ["file-1", "file-2"],
+        true
+      )
+    ).toEqual({
+      remainingKeys: ["file-2\0Summary"],
+      showSelected: true,
+      activeFileId: "file-2"
+    });
+  });
+
+  it("should preserve the all-files view when clearing one file", () => {
+    expect(
+      resolveFolderViewAfterFileClear(
+        ["file-1\0Data", "file-2\0Summary"],
+        "file-1",
+        ["file-1", "file-2"],
+        false
+      )
+    ).toEqual({
+      remainingKeys: ["file-2\0Summary"],
+      showSelected: false,
+      activeFileId: "file-1"
+    });
+  });
+
+  it("should identify worksheets added by a folder refresh", () => {
+    const refreshed: FolderCatalog = {
+      ...folderCatalog,
+      files: folderCatalog.files.map((file) =>
+        file.id === "file-1"
+          ? {
+              ...file,
+              worksheets: [
+                ...file.worksheets,
+                { name: "新增", rowCount: 1, columnCount: 1 },
+                { name: "#EB_RULES", rowCount: 1, columnCount: 1 }
+              ]
+            }
+          : file
+      )
+    };
+
+    expect(addedFolderSheetKeys(folderCatalog, refreshed)).toEqual([
+      "file-1\0新增"
+    ]);
+    expect(addedFolderSheetKeys(null, refreshed)).toEqual([]);
+  });
+
   it("should initialize scope and tool fields with defaults", () => {
     const { result } = renderHook(() => useScopeSelection());
 
@@ -124,6 +196,36 @@ describe("useScopeSelection", () => {
 
     expect(result.current.sourceMode).toBe("workbook");
     expect(result.current.workbookScopeMode).toBe("manual");
+    expect(result.current.selectedSheetNames).toEqual(["Sheet2"]);
+    expect(result.current.selectionConfirmed).toBe(true);
+  });
+
+  it("should atomically adopt selected sheets from the current workbook", () => {
+    const { result } = renderHook(() => useScopeSelection());
+
+    act(() => result.current.chooseFolderScope());
+    act(() =>
+      result.current.adoptCurrentWorkbookScope(workbook, ["Sheet1", "Sheet2"])
+    );
+
+    expect(result.current.sourceMode).toBe("workbook");
+    expect(result.current.workbookScopeMode).toBe("manual");
+    expect(result.current.selectedSheetNames).toEqual(["Sheet1", "Sheet2"]);
+    expect(result.current.selectionConfirmed).toBe(true);
+  });
+
+  it("should confirm the adopted scope regardless of the previous selection", () => {
+    // 这条锁住闭包旧值：若把 adoptCurrentWorkbookScope 退化成
+    // chooseManualScope() + setSelectedSheetNames() 的复合调用，
+    // chooseManualScope 会读到闭包里的空 selectedSheetNames，
+    // selectionConfirmed 就会按旧值算错。
+    const { result } = renderHook(() => useScopeSelection());
+
+    act(() => result.current.setSelectedSheetNames([]));
+    act(() =>
+      result.current.adoptCurrentWorkbookScope(workbook, ["Sheet2"])
+    );
+
     expect(result.current.selectedSheetNames).toEqual(["Sheet2"]);
     expect(result.current.selectionConfirmed).toBe(true);
   });

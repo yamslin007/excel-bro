@@ -21,7 +21,11 @@
   "undo": {
     "maxEntries": 5,
     "maxTotalCells": 400000,
-    "formatCaptureMaxCells": 20000
+    "formatCaptureMaxCells": 20000,
+    "folderBackupRetentionDays": 7,
+    "folderBackupMaxBytes": 1073741824,
+    "folderBackupMinFreeBytes": 67108864,
+    "folderBackupOpenTokenTtlSeconds": 300
   },
   "folder": {
     "maxFiles": 100,
@@ -54,13 +58,14 @@
     "maxTurns": 8,
     "maxTotalTokens": 20000,
     "maxWallTimeSeconds": 60.0,
-    "maxConsecutiveErrors": 3,
+    "maxConsecutiveErrors": 2,
     "maxCacheHitsPerQuery": 3,
     "maxToolPathLoopLength": 4,
     "warningTurn": 5,
     "maxReadRows": 200,
     "maxReadColumns": 30,
-    "maxOutputTokens": 4000
+    "maxOutputTokens": 4000,
+    "repairMaxOutputTokens": 2000
   },
   "formula": {
     "maxOutputTokens": 8000
@@ -77,5 +82,13 @@
   "turns": {
     "maxActive": 500,
     "ttlSeconds": 3600
+  },
+  "progress": {
+    "heartbeatSeconds": 10,
+    "minUpdateIntervalMs": 150,
+    "maxHistorySteps": 50,
+    "maxSummaryCharacters": 1000,
+    "folderOperationTtlSeconds": 3600,
+    "folderMaxPendingOperations": 100
   }
 }

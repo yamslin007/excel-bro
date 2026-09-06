@@ -172,6 +172,20 @@ bash packaging/build_mac.sh
 
 ## 5. 浏览器与 Excel 调试
 
+### 备份目录打开
+
+备份管理中的“打开文件夹”不使用 file://，因为 Excel WebView 会拦截该导航。前端先从备份列表响应取得短期 openDirectoryToken，再调用 POST /api/folders/backups/open。服务端只允许该令牌对应的当前工作目录下 .excel-bro-backups，不接收目标路径；过期令牌、路径越界、同名文件以及符号链接、junction 或 reparse point 都会被拒绝。备份目录尚不存在时列表不返回令牌，打开与复制路径按钮均禁用，打开接口不会创建空目录。此能力是项目“不启动外部程序”边界的窄例外，仅用于调用 Windows 文件资源管理器打开上述受管目录。
+
+逐份删除备份使用 `POST /api/folders/backups/delete`。备份列表在确认统一备份目录已经存在且通过安全检查后签发短期 `backupManagementToken`；当前工作簿入口和文件夹模式使用同一授权方式。请求只能包含令牌、32 位 `undoId`、明确确认、列表取得的 manifest revision 与级联失效 ID，不能提交磁盘路径。后端复核影响后先将完整目录原子移动到 `.trash/<operation_id>/`，再同步同根目录各会话的撤销资格并递归清理；递归清理失败必须返回 `cleanupPending`，且 `bytesFreed` 不能把仍在暂存中的资料算作已释放。自动清理必须复用同一事务，并安全重试合法的 `.trash` 残留。前端使用卡片内确认区，不使用 Excel WebView 可能拦截的 `window.confirm`。
+
+“取出副本”使用 `POST /api/folders/backups/export`，前端为一次用户动作生成稳定 `operationId`；结果不确定时重试必须复用该 ID。服务端固定写入 `exports/<operation_id>/` 并持久保存来源、清单、指纹和完成状态，同一操作重放只返回已核验结果。导出期间将源恢复点加入并发保护集合，删除、撤销和自动清理不能同时改变它。
+
+文件夹执行中的 `changed` 必须由本地确定性逻辑计算，不能交给模型判断。只有能够无歧义比较的动作才可以返回 `false`；新动作或复杂对象尚未实现比较时必须默认为 `true`。当本次计划没有任何实际变化时，执行器不得替换原工作簿，也不得创建 `.excel-bro-backups`。恢复点 manifest 的 `recoveryAction` 是向后兼容的新增字段，读取旧记录时仍需通过 `backupRelativePath` 推导 `restore` 或 `remove`。
+
+### Custom Functions 资源
+
+清单中的 Custom Functions `<Script>` 必须指向可直接执行的 JavaScript 文件，而不是 `functions.html`。`npm run dev:addin` 的 `predev` 钩子和 `npm run build:addin` 都会生成 `apps/excel-addin/dist/functions.js`；开发服务会通过 `/functions.js` 提供该 IIFE bundle，安装包则直接从前端静态目录提供它。修改清单后，需停止并重新旁加载 Excel 加载项。
+
 ### 浏览器模式
 
 打开 `https://localhost:3000`：
@@ -243,6 +257,7 @@ python -m compileall -q server/app
 | 单元格类型标准化 | `apps/excel-addin/src/cellNormalization.ts` |
 | 拆分工作表并聚合 | `apps/excel-addin/src/splitAggregate.ts` |
 | API 请求与错误显示 | `apps/excel-addin/src/api.ts`, `server/app/main.py` |
+| 任务进度、事件归并与审查轨迹 | `contracts.ts`, `models.py`, `useActivityProgress.ts`, `main.py` |
 | 需求确认机制 | `server/app/intent.py` |
 | 模型配置、鉴权和 HTTP 适配 | `server/app/llm/` |
 | 模型 Agent 工具 | `server/app/excel_agent.py` |
@@ -279,6 +294,23 @@ python -m compileall -q server/app
 9. 补前后端测试。
 10. 更新架构文档。
 
+文件夹模式的物理备份必须写入所选工作目录的 `.excel-bro-backups`，不得恢复为原文件旁散落备份。新增清理路径时必须复用统一事务删除，并同时验证 manifest、活跃撤销 ID、路径边界、符号链接和 Windows reparse point；不能直接递归删除 `executions/<undoId>`。manifest 使用同目录临时文件加 `os.replace()` 原子更新。`undo.maxEntries` 只限制快速撤销资格；历史磁盘副本按最短保留期、软上限、每文件最后完好副本、主动保留和异常状态分别判断。磁盘安全余量使用 `undo.folderBackupMinFreeBytes` 配置，不得在空间不足时降级成无备份写入。
+
+新增耗时操作时必须发送统一 `TaskProgressEvent`，并使用稳定 `operationId`、单调
+`sequence` 和可复用 `stepId`。用户可见 `trace` 只能由受控代码根据已授权元数据、
+工具安全摘要和验收结果构造；不得传递模型隐藏思维、提示词、API 凭据或原始数据行。
+文件夹写入必须优先使用 `/api/folders/execute/stream`，网络中断只能用同一
+`operationId` 和最后 `afterSequence` 重连，不得回退为可能重复写入的新执行请求。
+白名单工具事件必须填写真实 `toolName`；Excel 动作事件必须保留 `actionType` 和授权
+范围内的 `target`。可见参数和结果放入 `facts` 时只使用受控摘要标签，不得把工具原始
+返回值拼入事件。前端解析器仍会把 facts 限制为 12 项、单值 500 字符，并对疑似凭据、
+未知标签和越界绝对路径执行防御性隐藏。实时与历史过程统一由
+`TaskProgressTimeline` 渲染，默认展开且步骤内部不再增加折叠层。
+
+进度问题可通过“设置 → 导出诊断”获取脱敏事件元数据。诊断只包含
+`operationId`、`executionId`、`sequence`、`stepId`、阶段、状态、工具、动作和归并结果，
+不得记录 summary、detail、facts.value 或工作表数据。服务端日志使用同一组关联 ID。
+
 图表强验收依赖 ExcelApi 1.12 的系列维度读取；数据透视表强验收依赖
 ExcelApi 1.15 的数据源字符串读取。修改最低版本时必须同步预检测试和用户
 可读错误，不能在执行后才因缺少 API 失败。
@@ -296,6 +328,18 @@ ExcelApi 1.15 的数据源字符串读取。修改最低版本时必须同步预
 4. 有关键歧义时提供互斥选项，并保留“其他想法”。
 5. 写入仍然只返回计划，不直接执行。
 6. 为结构化输出失败设置有限修复次数，禁止无限重试。
+7. 澄清选项若改变拆分维度、输出结构、指标口径或目标，必须返回 replace 模式和
+   可独立执行的完整 resolution；只补充缺失参数时才使用 append。
+8. 计划格式修正轮不得继续携带完整失败参数，也不得重新开放只读工具；输出额度
+   使用 agent.repairMaxOutputTokens。
+9. splitGroupAggregate.splitBy 会自动写入输出列，提示词和工具 schema 都必须
+   明确禁止在 groupBy 中重复；模型仍重复提交时，服务端只允许确定性移除完全
+   同名项，并把修正写入计划 warnings，不得猜测或替换其他业务字段。
+10. 多个循环闸门同时命中时，连续结构错误优先于累计 token 展示为停止原因，避免
+    把格式错误造成的 token 增长误报成根因。
+11. 模型提交的 AnalysisPlan 顶层字段若由 default_factory 提供默认集合，null 可在
+    模型提交规范化阶段按省略处理；必填字段、普通可空字段及动作业务参数不得借此
+    放宽校验。
 
 ## 9. 测试组织
 

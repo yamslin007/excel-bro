@@ -20,7 +20,7 @@ export default defineConfig(async ({ command }) => {
           server.middlewares.use(
             (
               req: Connect.IncomingMessage,
-              _res: import("node:http").ServerResponse,
+              res: import("node:http").ServerResponse,
               next: Connect.NextFunction
             ) => {
             if (req.url && !req.url.includes("request-log")) {
@@ -28,6 +28,16 @@ export default defineConfig(async ({ command }) => {
                 path.resolve(__dirname, "request-log.txt"),
                 `${new Date().toISOString()} ${req.headers["user-agent"] ?? "?"} ${req.url}\n`
               );
+            }
+            // Excel 的 Custom Functions Script URL 必须返回 JavaScript，不能让 Vite 将 /functions.js 回退到 index.html。
+            if (req.url?.split("?", 1)[0] === "/functions.js") {
+              const bundlePath = path.resolve(__dirname, "dist/functions.js");
+              if (fs.existsSync(bundlePath)) {
+                res.statusCode = 200;
+                res.setHeader("Content-Type", "application/javascript; charset=utf-8");
+                res.end(fs.readFileSync(bundlePath));
+                return;
+              }
             }
             next();
           });

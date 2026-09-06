@@ -9,6 +9,22 @@ import type {
 } from "./contracts";
 import { INTENT_MAX_PRIOR_RESULT_ROWS } from "./conversation";
 
+export function resolveConfirmedPrompt(
+  originalPrompt: string,
+  resolution: string,
+  resolutionMode: "append" | "replace" = "append"
+): string {
+  const original = originalPrompt.trim();
+  const confirmed = resolution.trim();
+  if (resolutionMode === "replace") return confirmed;
+  return [
+    "用户最终确认（最高优先级；与背景冲突时以本确认为准）：" + confirmed,
+    "原始需求背景（仅保留未被最终确认修改的部分）：" + original
+  ]
+    .filter((part) => !part.endsWith("："))
+    .join("\n\n");
+}
+
 // 把本地工具查询参数翻译成一句人能读懂的话，供「查看详情」里展示。
 export function describeQueryArguments(args: QueryTableArguments): string {
   const parts: string[] = [];
@@ -45,20 +61,12 @@ export function describeIntentDecision(intent: IntentCheckResponse): {
   const source = intent.provider === "model" ? "模型" : "本地规则";
   if (intent.kind === "clarification") {
     const clarification = intent.clarification;
-    const optionText = clarification.options
-      .map((option, index) => `${index + 1}. ${option.label}`)
-      .join("\n");
     return {
       label: `${source}判断需要先澄清需求`,
       note: clarification.summary || clarification.question,
-      detail: [
-        `理解：${clarification.summary}`,
-        `追问：${clarification.question}`,
-        clarification.reason ? `原因：${clarification.reason}` : "",
-        clarification.options.length ? `可选项：\n${optionText}` : ""
-      ]
-        .filter(Boolean)
-        .join("\n\n")
+      detail: clarification.reason
+        ? `判断依据：${clarification.reason}`
+        : undefined
     };
   }
   if (intent.kind === "tool_request") {

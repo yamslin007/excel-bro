@@ -6,11 +6,13 @@ import type {
   ExecutionUndoSnapshot,
   ExcelAction,
   PlanExecutionResult,
+  UndoCreatedWorksheetState,
   UndoRangeFormat,
   UndoWorksheetSnapshot,
   VerificationCheck,
   VerificationCriterion,
   VerificationReport,
+  TaskProgressEvent,
   UnverifiedAction,
   WorkbookSnapshot,
   WorksheetSnapshot
@@ -222,7 +224,8 @@ export async function watchWorkbookStructureChanges(
 export class PlanExecutionError extends Error {
   constructor(
     message: string,
-    public readonly actionResults: ActionExecutionResult[]
+    public readonly actionResults: ActionExecutionResult[],
+    public readonly undoSnapshot: ExecutionUndoSnapshot | null = null
   ) {
     super(message);
     this.name = "PlanExecutionError";
@@ -924,6 +927,27 @@ function matrixRange(
   return `${match[1].toUpperCase()}${startRow}:${columnName(
     startColumn + columnCount - 1
   )}${startRow + rowCount - 1}`;
+}
+
+export function matrixVerificationCriteria(
+  sheet: string,
+  matrix: CellValue[][]
+): VerificationCriterion[] {
+  if (matrix.length === 0 || matrix[0].length === 0) {
+    return [{ type: "worksheetExists", sheet }];
+  }
+  const criteria: VerificationCriterion[] = [];
+  for (let offset = 0; offset < matrix.length; offset += 500) {
+    const expected = matrix.slice(offset, offset + 500);
+    const range = matrixRange(
+      `A${offset + 1}`,
+      expected.length,
+      matrix[0].length
+    );
+    if (!range) return [{ type: "worksheetExists", sheet }];
+    criteria.push({ type: "rangeEquals", sheet, range, expected });
+  }
+  return criteria;
 }
 
 function inferredCriteria(
@@ -2710,13 +2734,24 @@ interface ActionUndoCollector {
   overwrittenRanges: ExecutionUndoSnapshot["ranges"][number][];
 }
 
+interface ActionProgressUpdate {
+  stepId: string;
+  title: string;
+  summary?: string;
+  current?: number;
+  total?: number;
+  unit?: TaskProgressEvent["unit"];
+  target?: TaskProgressEvent["target"];
+}
+
 export async function executeAction(
   context: Excel.RequestContext,
   action: ExcelAction,
   actionIndex: number,
   collector: ActionUndoCollector,
   allowedExternalFiles?: ReadonlySet<string>,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onProgress?: (update: ActionProgressUpdate) => void
 ): Promise<VerificationCriterion[] | void> {
   if (action.type === "deleteWorksheet") {
     const existing = context.workbook.worksheets.getItemOrNullObject(action.sheet);
@@ -2761,6 +2796,15 @@ export async function executeAction(
         maxOutputSheets: action.maxOutputSheets ?? 200
       }
     );
+    onProgress?.({
+      stepId: `execution.action.${actionIndex + 1}.sheets`,
+      title: "正在生成拆分工作表",
+      summary: `已计算出 ${outputs.length} 张结果工作表，正在分批写入。`,
+      current: 0,
+      total: outputs.length,
+      unit: "sheets",
+      target: { sheet: action.sheet }
+    });
 
     worksheets.load("items/name");
     await context.sync();
@@ -2798,6 +2842,7 @@ export async function executeAction(
       await context.sync();
     };
 
+    let processedOutputCount = 0;
     for (const outputBatch of batchSplitAggregateOutputs(
       outputs,
       SPLIT_AGGREGATE_BATCH_SHEETS
@@ -2977,18 +3022,20 @@ export async function executeAction(
       }
 
       for (const { targetName, matrix } of jobs) {
-        const range = matrixRange("A1", matrix.length, matrix[0].length);
-        criteria.push(
-          range && matrix.length <= 500
-            ? {
-                type: "rangeEquals",
-                sheet: targetName,
-                range,
-                expected: matrix
-              }
-            : { type: "worksheetExists", sheet: targetName }
-        );
+        criteria.push(...matrixVerificationCriteria(targetName, matrix));
       }
+      processedOutputCount += outputBatch.length;
+      onProgress?.({
+        stepId: `execution.action.${actionIndex + 1}.sheets`,
+        title: "正在生成拆分工作表",
+        summary: `已处理 ${processedOutputCount} / ${outputs.length} 张结果工作表。`,
+        current: processedOutputCount,
+        total: outputs.length,
+        unit: "sheets",
+        target: {
+          sheet: jobs.length > 0 ? jobs[jobs.length - 1].targetName : action.sheet
+        }
+      });
     }
     return criteria;
   }
@@ -3729,6 +3776,244 @@ async function captureDeletedWorksheet(
   };
 }
 
+function localStateFingerprint(value: unknown): string {
+  const serialized = JSON.stringify(value);
+  return `fnv1a32:${updateFingerprint(0x811c9dc5, serialized)
+    .toString(16)
+    .padStart(8, "0")}`;
+}
+
+function loadedRangePostFingerprint(range: Excel.Range): string {
+  return localStateFingerprint({
+    formulas: range.formulas.map((row) => row.map(normalizeValue)),
+    numberFormat: range.numberFormat,
+    fillColor: range.format.fill.color,
+    fontBold: range.format.font.bold,
+    fontColor: range.format.font.color
+  });
+}
+
+function currentOfficeWorkbookIdentity(): string | undefined {
+  if (typeof Office === "undefined") return undefined;
+  const url = (Office as any).context?.document?.url;
+  if (typeof url !== "string" || !url.trim()) return undefined;
+  return `url:${url.trim().replace(/\\/g, "/").toLocaleLowerCase()}`;
+}
+
+async function readCreatedWorksheetState(
+  context: Excel.RequestContext,
+  sheetName: string
+): Promise<UndoCreatedWorksheetState | null> {
+  const sheet = context.workbook.worksheets.getItemOrNullObject(sheetName);
+  sheet.load("isNullObject");
+  await context.sync();
+  if (sheet.isNullObject) return null;
+  const used = sheet.getUsedRangeOrNullObject(true);
+  used.load("address,rowCount,columnCount,rowIndex,columnIndex,isNullObject");
+  await context.sync();
+  if (used.isNullObject) {
+    return { sheet: sheetName, postFingerprint: localStateFingerprint({ empty: true }) };
+  }
+  if (used.rowCount * used.columnCount > UNDO_WORKSHEET_MAX_CELLS) {
+    return { sheet: sheetName };
+  }
+  const range = sheet.getRangeByIndexes(
+    used.rowIndex,
+    used.columnIndex,
+    used.rowCount,
+    used.columnCount
+  );
+  range.load(
+    "formulas,numberFormat,format/fill/color,format/font/bold,format/font/color"
+  );
+  await context.sync();
+  return {
+    sheet: sheetName,
+    postFingerprint: localStateFingerprint({
+      address: used.address.split("!").pop() ?? used.address,
+      formulas: range.formulas.map((row) => row.map(normalizeValue)),
+      numberFormat: range.numberFormat,
+      fillColor: range.format.fill.color,
+      fontBold: range.format.font.bold,
+      fontColor: range.format.font.color
+    })
+  };
+}
+
+async function captureUndoPostState(
+  context: Excel.RequestContext,
+  ranges: ExecutionUndoSnapshot["ranges"],
+  createdWorksheetNames: string[],
+  deletedWorksheets: UndoWorksheetSnapshot[]
+): Promise<{
+  complete: boolean;
+  createdWorksheetStates: UndoCreatedWorksheetState[];
+  appliedDeletedWorksheets: UndoWorksheetSnapshot[];
+}> {
+  let complete = true;
+  for (const saved of ranges) {
+    const sheet = context.workbook.worksheets.getItemOrNullObject(saved.sheet);
+    sheet.load("isNullObject");
+    await context.sync();
+    if (sheet.isNullObject) {
+      complete = false;
+      continue;
+    }
+    const range = sheet.getRange(saved.range);
+    range.load(
+      "formulas,numberFormat,format/fill/color,format/font/bold,format/font/color"
+    );
+    await context.sync();
+    saved.postFingerprint = loadedRangePostFingerprint(range);
+  }
+
+  const createdWorksheetStates: UndoCreatedWorksheetState[] = [];
+  for (const sheetName of [...new Set(createdWorksheetNames)]) {
+    const state = await readCreatedWorksheetState(context, sheetName);
+    if (!state) continue;
+    if (!state.postFingerprint) complete = false;
+    createdWorksheetStates.push(state);
+  }
+
+  const appliedDeletedWorksheets: UndoWorksheetSnapshot[] = [];
+  for (const saved of deletedWorksheets) {
+    const sheet = context.workbook.worksheets.getItemOrNullObject(saved.sheet);
+    sheet.load("isNullObject");
+    await context.sync();
+    if (sheet.isNullObject) appliedDeletedWorksheets.push(saved);
+  }
+  return { complete, createdWorksheetStates, appliedDeletedWorksheets };
+}
+
+async function buildExecutionUndoSnapshot(
+  context: Excel.RequestContext,
+  input: {
+    planId: string;
+    executionId: string;
+    coverage: "full" | "partial";
+    completedActionCount: number;
+    uncertainActionIndexes: number[];
+    ranges: ExecutionUndoSnapshot["ranges"];
+    createdWorksheets: string[];
+    deletedWorksheets: UndoWorksheetSnapshot[];
+    skippedWorksheets: string[];
+  }
+): Promise<ExecutionUndoSnapshot | null> {
+  if (
+    input.ranges.length === 0 &&
+    input.createdWorksheets.length === 0 &&
+    input.deletedWorksheets.length === 0
+  ) {
+    return null;
+  }
+  let postState: Awaited<ReturnType<typeof captureUndoPostState>>;
+  try {
+    postState = await captureUndoPostState(
+      context,
+      input.ranges,
+      input.createdWorksheets,
+      input.deletedWorksheets
+    );
+  } catch {
+    postState = {
+      complete: false,
+      createdWorksheetStates: [],
+      appliedDeletedWorksheets: input.deletedWorksheets
+    };
+  }
+  const createdWorksheets = postState.createdWorksheetStates.map(
+    (state) => state.sheet
+  );
+  if (
+    input.ranges.length === 0 &&
+    createdWorksheets.length === 0 &&
+    postState.appliedDeletedWorksheets.length === 0
+  ) {
+    return null;
+  }
+  return {
+    planId: input.planId,
+    executionId: input.executionId,
+    workbookIdentity: currentOfficeWorkbookIdentity(),
+    capturedAt: new Date().toISOString(),
+    coverage: input.coverage,
+    completedActionCount: input.completedActionCount,
+    uncertainActionIndexes: input.uncertainActionIndexes,
+    postStateCoverage: postState.complete ? "complete" : "partial",
+    ranges: input.ranges,
+    createdWorksheets,
+    createdWorksheetStates: postState.createdWorksheetStates,
+    deletedWorksheets: postState.appliedDeletedWorksheets,
+    skippedWorksheets: [...new Set(input.skippedWorksheets)]
+  };
+}
+
+async function assertUndoPostState(
+  context: Excel.RequestContext,
+  snapshot: ExecutionUndoSnapshot
+): Promise<void> {
+  if (snapshot.postStateCoverage !== "complete") {
+    throw new Error(
+      "这份撤销数据缺少完整的执行后状态校验，已停止自动覆盖；请先人工核对当前工作簿。"
+    );
+  }
+  const currentIdentity = currentOfficeWorkbookIdentity();
+  if (
+    snapshot.workbookIdentity &&
+    currentIdentity &&
+    snapshot.workbookIdentity !== currentIdentity
+  ) {
+    throw new Error("当前已不是生成这份撤销数据的工作簿，已停止撤销。");
+  }
+  for (const saved of snapshot.ranges) {
+    if (!saved.postFingerprint) {
+      throw new Error("撤销数据缺少目标范围的执行后校验，已停止自动覆盖。");
+    }
+    const sheet = context.workbook.worksheets.getItemOrNullObject(saved.sheet);
+    sheet.load("isNullObject");
+    await context.sync();
+    if (sheet.isNullObject) {
+      throw new Error(`工作表「${saved.sheet}」已不存在，已停止撤销。`);
+    }
+    const range = sheet.getRange(saved.range);
+    range.load(
+      "formulas,numberFormat,format/fill/color,format/font/bold,format/font/color"
+    );
+    await context.sync();
+    if (loadedRangePostFingerprint(range) !== saved.postFingerprint) {
+      throw new Error(
+        `「${saved.sheet}」${saved.range} 在执行后又发生了变化，已停止撤销以免覆盖后续编辑。`
+      );
+    }
+  }
+
+  const createdStates = new Map(
+    (snapshot.createdWorksheetStates ?? []).map((state) => [state.sheet, state])
+  );
+  for (const sheetName of snapshot.createdWorksheets) {
+    const expected = createdStates.get(sheetName);
+    if (!expected?.postFingerprint) {
+      throw new Error(`新建工作表「${sheetName}」缺少执行后校验，已停止自动删除。`);
+    }
+    const current = await readCreatedWorksheetState(context, sheetName);
+    if (!current || current.postFingerprint !== expected.postFingerprint) {
+      throw new Error(
+        `新建工作表「${sheetName}」在执行后又发生了变化，已停止撤销以免删除后续编辑。`
+      );
+    }
+  }
+  for (const saved of snapshot.deletedWorksheets) {
+    const sheet = context.workbook.worksheets.getItemOrNullObject(saved.sheet);
+    sheet.load("isNullObject");
+    await context.sync();
+    if (!sheet.isNullObject) {
+      throw new Error(
+        `工作表「${saved.sheet}」已被重新创建，已停止撤销以免覆盖现有内容。`
+      );
+    }
+  }
+}
+
 /** 恢复完整格式；捕获时因区域过大而降级的（null）直接跳过。 */
 function restoreRangeFormat(
   range: Excel.Range,
@@ -3760,6 +4045,8 @@ export async function undoExecution(
   snapshot: ExecutionUndoSnapshot
 ): Promise<void> {
   await Excel.run(async (context) => {
+    // 所有检查均在首个写操作之前完成；不满足条件时整次撤销保持只读失败。
+    await assertUndoPostState(context, snapshot);
     // 先恢复被删除的工作表，让引用它们的单元格撤销能落回原表。
     const worksheets = context.workbook.worksheets;
     // 按原始位置升序逐个恢复：每个被删表原本位于其前面的工作表（无论
@@ -3810,12 +4097,45 @@ export interface ExecutePlanOptions {
   acknowledgeStaleSource?: boolean;
   /** 取消信号，透传给沙箱脚本执行。 */
   signal?: AbortSignal;
+  /** 前端生成的单次操作标识，用于归并、去重与恢复进度。 */
+  operationId?: string;
+  /** 由确定性执行器产生的结构化进度，不包含模型隐藏推理。 */
+  onProgress?: (event: TaskProgressEvent) => void;
 }
 
 export async function executePlan(
   plan: AnalysisPlan,
   options: ExecutePlanOptions
 ): Promise<PlanExecutionResult> {
+  const operationId =
+    options.operationId ?? `execution-${Date.now().toString(36)}`;
+  let progressSequence = 0;
+  const emitProgress = (
+    event: Omit<
+      TaskProgressEvent,
+      "schemaVersion" | "operationId" | "sequence" | "timestamp"
+    >
+  ): void => {
+    if (!options.onProgress) return;
+    progressSequence += 1;
+    options.onProgress({
+      schemaVersion: 1,
+      operationId,
+      sequence: progressSequence,
+      timestamp: new Date().toISOString(),
+      ...event
+    });
+  };
+  emitProgress({
+    phase: "preflight",
+    stepId: "execution.preflight",
+    status: "started",
+    title: "正在执行前检查",
+    summary: `正在核对 ${plan.actions.length} 步操作的授权范围、目标和来源结构。`,
+    current: 0,
+    total: plan.actions.length,
+    unit: "actions"
+  });
   const authorizedSheetKeys = new Set(
     options.authorizedSheetNames.map((name) => name.toLocaleLowerCase())
   );
@@ -3936,6 +4256,21 @@ export async function executePlan(
         incompleteActionResults(plan, failed)
       );
     }
+    emitProgress({
+      phase: "preflight",
+      stepId: "execution.preflight",
+      status: "completed",
+      title: "执行前检查已通过",
+      summary: `已确认 ${plan.actions.length} 步操作均在本次授权与白名单范围内。`,
+      current: plan.actions.length,
+      total: plan.actions.length,
+      unit: "actions",
+      trace: {
+        kind: "evidence",
+        summary: "执行前检查已通过。",
+        basis: "工作表授权、动作白名单、目标命名和运行环境能力检查"
+      }
+    });
 
     const actionResults: ActionExecutionResult[] = [];
     const dynamicCriteria: VerificationCriterion[] = [];
@@ -3945,9 +4280,25 @@ export async function executePlan(
     const skippedWorksheets: string[] = [];
     const executionStartedAt = performance.now();
     for (const [index, action] of plan.actions.entries()) {
+      let undoRange: ExecutionUndoSnapshot["ranges"][number] | null = null;
+      let deletedCapture: Awaited<ReturnType<typeof captureDeletedWorksheet>> | null = null;
+      const actionUndo: ActionUndoCollector = {
+        createdWorksheets: [],
+        overwrittenRanges: []
+      };
       try {
-        const undoRange = await captureUndoRange(context, action, index);
-        const deletedCapture =
+        emitProgress({
+          phase: "backup",
+          stepId: `execution.action.${index + 1}.undo`,
+          status: "started",
+          title: `正在保存第 ${index + 1} 步撤销数据`,
+          actionIndex: index + 1,
+          actionCount: plan.actions.length,
+          actionType: action.type,
+          target: { sheet: action.sheet }
+        });
+        undoRange = await captureUndoRange(context, action, index);
+        deletedCapture =
           action.type === "deleteWorksheet"
             ? await captureDeletedWorksheet(
                 context,
@@ -3955,17 +4306,56 @@ export async function executePlan(
                 positionByName.get(action.sheet)
               )
             : null;
-        const actionUndo: ActionUndoCollector = {
-          createdWorksheets: [],
-          overwrittenRanges: []
-        };
+        emitProgress({
+          phase: "backup",
+          stepId: `execution.action.${index + 1}.undo`,
+          status: "completed",
+          title: `第 ${index + 1} 步撤销数据已准备`,
+          summary:
+            undoRange || deletedCapture
+              ? "已保存本步执行前状态；结构化输出的覆盖快照会在写入时继续记录。"
+              : "本步没有可预先捕获的单元格范围；如创建新表，执行器会记录新表名称。",
+          actionIndex: index + 1,
+          actionCount: plan.actions.length,
+          actionType: action.type,
+          target: { sheet: action.sheet }
+        });
+        emitProgress({
+          phase: "executing",
+          stepId: `execution.action.${index + 1}`,
+          status: "started",
+          title: `正在执行第 ${index + 1} / ${plan.actions.length} 步`,
+          summary: `${action.type} · ${action.sheet}`,
+          current: index,
+          total: plan.actions.length,
+          unit: "actions",
+          actionIndex: index + 1,
+          actionCount: plan.actions.length,
+          actionType: action.type,
+          target: { sheet: action.sheet }
+        });
         const actionCriteria = await executeAction(
           context,
           action,
           index,
           actionUndo,
           options.allowedExternalFiles,
-          options.signal
+          options.signal,
+          (update) =>
+            emitProgress({
+              phase: "executing",
+              stepId: update.stepId,
+              status: "progress",
+              title: update.title,
+              summary: update.summary,
+              current: update.current,
+              total: update.total,
+              unit: update.unit,
+              actionIndex: index + 1,
+              actionCount: plan.actions.length,
+              actionType: action.type,
+              target: update.target
+            })
         );
         if (actionCriteria) dynamicCriteria.push(...actionCriteria);
         await context.sync();
@@ -3985,14 +4375,55 @@ export async function executePlan(
           skippedWorksheets.push(action.sheet);
         }
       } catch (reason) {
+        if (undoRange) undoRanges.push(undoRange);
+        if (actionUndo.overwrittenRanges.length > 0) {
+          undoRanges.push(...actionUndo.overwrittenRanges);
+        }
+        if (action.type === "createWorksheet") {
+          createdWorksheets.push(action.sheet);
+        }
+        if (actionUndo.createdWorksheets.length > 0) {
+          createdWorksheets.push(...actionUndo.createdWorksheets);
+        }
+        if (deletedCapture?.snapshot) {
+          deletedWorksheets.push(deletedCapture.snapshot);
+        } else if (deletedCapture?.skipped) {
+          skippedWorksheets.push(action.sheet);
+        }
         const detail = excelErrorDetail(reason);
+        emitProgress({
+          phase: "executing",
+          stepId: `execution.action.${index + 1}`,
+          status: "failed",
+          title: `第 ${index + 1} 步执行失败`,
+          summary: detail,
+          current: index,
+          total: plan.actions.length,
+          unit: "actions",
+          actionIndex: index + 1,
+          actionCount: plan.actions.length,
+          actionType: action.type,
+          target: { sheet: action.sheet }
+        });
+        const partialSnapshot = await buildExecutionUndoSnapshot(context, {
+          planId: plan.id,
+          executionId: operationId,
+          coverage: "partial",
+          completedActionCount: actionResults.length,
+          uncertainActionIndexes: [index],
+          ranges: undoRanges,
+          createdWorksheets,
+          deletedWorksheets,
+          skippedWorksheets
+        });
         throw new PlanExecutionError(
           `第 ${index + 1} 步执行失败：${detail}`,
           incompleteActionResults(
             plan,
             new Map([[index, detail]]),
             actionResults
-          )
+          ),
+          partialSnapshot
         );
       }
       actionResults.push({
@@ -4001,29 +4432,79 @@ export async function executePlan(
         sheet: action.sheet,
         status: "succeeded"
       });
+      emitProgress({
+        phase: "executing",
+        stepId: `execution.action.${index + 1}`,
+        status: "completed",
+        title: `第 ${index + 1} / ${plan.actions.length} 步已完成`,
+        summary: `${action.type} 已写入 ${action.sheet}`,
+        current: index + 1,
+        total: plan.actions.length,
+        unit: "actions",
+        actionIndex: index + 1,
+        actionCount: plan.actions.length,
+        actionType: action.type,
+        target: { sheet: action.sheet }
+      });
     }
+    const completedSnapshot = await buildExecutionUndoSnapshot(context, {
+      planId: plan.id,
+      executionId: operationId,
+      coverage: "full",
+      completedActionCount: actionResults.length,
+      uncertainActionIndexes: [],
+      ranges: undoRanges,
+      createdWorksheets,
+      deletedWorksheets,
+      skippedWorksheets
+    });
     const verificationStartedAt = performance.now();
     const executionMs = verificationStartedAt - executionStartedAt;
-    const verification = await verifyPlan(context, plan, dynamicCriteria);
+    emitProgress({
+      phase: "verifying",
+      stepId: "execution.verify",
+      status: "started",
+      title: "正在独立验证写入结果"
+    });
+    let verification: VerificationReport;
+    try {
+      verification = await verifyPlan(context, plan, dynamicCriteria);
+    } catch (reason) {
+      const detail = excelErrorDetail(reason);
+      throw new PlanExecutionError(
+        `写入已经完成，但独立验证失败：${detail}`,
+        actionResults,
+        completedSnapshot
+      );
+    }
     const verificationMs = performance.now() - verificationStartedAt;
+    const passedChecks = verification.checks.filter((check) => check.passed).length;
+    emitProgress({
+      phase: "verifying",
+      stepId: "execution.verify",
+      status: verification.status === "failed" ? "warning" : "completed",
+      title:
+        verification.status === "failed"
+          ? "执行已完成，但验证发现不一致"
+          : verification.status === "executed_unverified"
+            ? "执行已完成，部分结果暂无法独立验证"
+            : "写入结果验证通过",
+      summary: `${passedChecks} / ${verification.checks.length} 项检查符合预期。`,
+      current: passedChecks,
+      total: verification.checks.length,
+      unit: "checks",
+      trace: {
+        kind: verification.status === "failed" ? "conflict" : "evidence",
+        summary: `${passedChecks} / ${verification.checks.length} 项检查符合预期。`,
+        basis: "执行后重新读取工作簿并按计划验收条件比较"
+      }
+    });
     return {
       actionResults,
       verification,
       executionMs,
       verificationMs,
-      undoSnapshot:
-        undoRanges.length > 0 ||
-        createdWorksheets.length > 0 ||
-        deletedWorksheets.length > 0
-          ? {
-              planId: plan.id,
-              capturedAt: new Date().toISOString(),
-              ranges: undoRanges,
-              createdWorksheets,
-              deletedWorksheets,
-              skippedWorksheets
-            }
-          : null
+      undoSnapshot: completedSnapshot
     };
   });
 }

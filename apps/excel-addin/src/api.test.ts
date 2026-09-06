@@ -4,17 +4,31 @@ import {
   apiErrorCategory,
   checkHealth,
   checkIntent,
+  deleteFolderBackup,
   deleteModelConnection,
+  cleanupFolderBackups,
+  collectLegacyFolderBackups,
+  executeFolderPlan,
   executeFolderQuery,
+  exportFolderBackup,
   getModelSettings,
   listModels,
+  listFolderBackups,
+  openFolderBackupDirectory,
   refreshFolder,
   saveModelConnection,
+  scanFolderByPath,
   streamAssistantResponse,
+  setFolderBackupPinned,
   testModelConnection,
+  undoFolderExecution,
   updateModelSettings
 } from "./api";
-import type { PlanRequest, TurnStepEvent } from "./contracts";
+import type {
+  PlanRequest,
+  TaskProgressEvent,
+  TurnStepEvent
+} from "./contracts";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -325,6 +339,68 @@ describe("service discovery", () => {
     );
   });
 
+  it("scans a folder by path to rebuild a lost session", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          sessionId: "session-rebuilt",
+          folderName: "reports",
+          folderPath: "C:\\reports",
+          files: [
+            {
+              id: "file-1",
+              name: "scores.xlsx",
+              relativePath: "scores.xlsx",
+              worksheets: [{ name: "得分", rowCount: 3, columnCount: 2 }],
+              error: null
+            }
+          ],
+          totalFiles: 1,
+          truncated: false,
+          expiresAt: "2026-09-30T00:00:00.000Z"
+        }),
+        { status: 200 }
+      )
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const catalog = await scanFolderByPath("C:\\reports");
+
+    expect(catalog.sessionId).toBe("session-rebuilt");
+    expect(catalog.files[0].id).toBe("file-1");
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining("/api/folders/scan"),
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ folderPath: "C:\\reports" })
+      })
+    );
+  });
+
+  it("surfaces a missing folder path when rebuilding", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            detail: {
+              code: "FOLDER_DATA_ERROR",
+              message: "文件夹不存在：C:\\gone",
+              retryable: true
+            }
+          }),
+          { status: 422 }
+        )
+      )
+    );
+
+    await expect(scanFolderByPath("C:\\gone")).rejects.toMatchObject({
+      status: 422,
+      code: "FOLDER_DATA_ERROR",
+      message: "文件夹不存在：C:\\gone"
+    });
+  });
+
   it("refreshes a folder catalog while keeping the session id", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(
@@ -385,6 +461,176 @@ describe("service discovery", () => {
       code: "FOLDER_DATA_ERROR",
       message: "文件夹会话已失效，请重新选择文件夹"
     });
+  });
+
+  it("requests a folder undo with the server-issued recovery id", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          filesRestored: ["scores.xlsx"],
+          executionsUndone: 1,
+          remainingUndoCount: 0
+        }),
+        { status: 200 }
+      )
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      undoFolderExecution("session-1", "undo-1")
+    ).resolves.toEqual({
+      filesRestored: ["scores.xlsx"],
+      executionsUndone: 1,
+      remainingUndoCount: 0
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining("/api/folders/undo"),
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          sessionId: "session-1",
+          undoId: "undo-1"
+        })
+      })
+    );
+  });
+
+  it("lists backups for the selected folder session", async () => {
+    const payload = {
+      folderPath: "C:\\work",
+      backupDirectory: "C:\\work\\.excel-bro-backups",
+      openDirectoryToken: "open-token",
+      backups: [],
+      legacyCandidates: [],
+      warnings: []
+    };
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(payload), { status: 200 })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      listFolderBackups({ sessionId: "session 1" })
+    ).resolves.toEqual(payload);
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining("/api/folders/backups?sessionId=session+1")
+    );
+  });
+
+  it("opens only a backend-registered backup directory token", async () => {
+    const payload = {
+      opened: true,
+      directory: "C:\\work\\.excel-bro-backups"
+    };
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(payload), { status: 200 })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(openFolderBackupDirectory("open-token")).resolves.toEqual(payload);
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining("/api/folders/backups/open"),
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ directoryToken: "open-token" })
+      })
+    );
+  });
+
+  it("exports, deletes, cleans, collects and pins folder backups with scoped requests", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            deletedUndoId: "undo-1",
+            discardedUndo: true,
+            filesDeleted: 1,
+            bytesFreed: 20,
+            remainingUndoCount: 0
+          })
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ exportDirectory: "C:\\work\\exports", files: ["a.xlsx"] })
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            deletedExecutions: 1,
+            deletedFiles: 1,
+            bytesFreed: 20,
+            skippedActive: 0,
+            failures: [],
+            legacyCandidateCount: 0
+          })
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ collectedFiles: ["legacy/a.xlsx"], failures: [] }))
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ undoId: "undo-1", pinned: true }))
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await exportFolderBackup(
+      { sessionId: "session-1" },
+      "undo-1",
+      "export-operation-1"
+    );
+    await deleteFolderBackup("manage-token", "undo-1");
+    await cleanupFolderBackups({ sessionId: "session-1" });
+    await collectLegacyFolderBackups({ sessionId: "session-1" });
+    await setFolderBackupPinned("manage-token", "undo-1", true);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      expect.stringContaining("/api/folders/backups/export"),
+      expect.objectContaining({
+        body: JSON.stringify({
+          sessionId: "session-1",
+          undoId: "undo-1",
+          operationId: "export-operation-1"
+        })
+      })
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      expect.stringContaining("/api/folders/backups/delete"),
+      expect.objectContaining({
+        body: JSON.stringify({
+          backupManagementToken: "manage-token",
+          undoId: "undo-1",
+          confirmed: true
+        })
+      })
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      expect.stringContaining("/api/folders/backups/cleanup"),
+      expect.objectContaining({ body: JSON.stringify({ sessionId: "session-1" }) })
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      4,
+      expect.stringContaining("/api/folders/backups/legacy/collect"),
+      expect.objectContaining({
+        body: JSON.stringify({ sessionId: "session-1", confirmed: true })
+      })
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      5,
+      expect.stringContaining("/api/folders/backups/pin"),
+      expect.objectContaining({
+        body: JSON.stringify({
+          backupManagementToken: "manage-token",
+          undoId: "undo-1",
+          pinned: true
+        })
+      })
+    );
   });
 
   it("rejects an invalid folder query response at runtime", async () => {
@@ -570,5 +816,103 @@ describe("streaming assistant response", () => {
       expect.objectContaining({ method: "POST" })
     );
     expect(response).toMatchObject({ kind: "answer", message: "回退结果" });
+  });
+});
+
+describe("executeFolderPlan streaming", () => {
+  it("reconnects with the same operationId and forwards progress", async () => {
+    const resultFrame = `event: result\ndata: ${JSON.stringify({
+      filesModified: ["数据.xlsx"],
+      backups: [],
+      backupDirectory: null,
+      backupWarnings: [],
+      actionResults: [
+        {
+          index: 0,
+          type: "createWorksheet",
+          sheet: "结果",
+          status: "succeeded"
+        }
+      ],
+      verification: {
+        status: "verified",
+        passed: true,
+        checks: [],
+        unverifiedActions: []
+      },
+      undo: null,
+      executionMs: 1,
+      verificationMs: 1
+    })}\n\n`;
+    const progressFrame = `event: progress\ndata: ${JSON.stringify({
+      schemaVersion: 1,
+      operationId: "folder-operation-client-test",
+      executionId: "0123456789abcdef0123456789abcdef",
+      sequence: 1,
+      phase: "executing",
+      stepId: "folder.action.1",
+      status: "completed",
+      title: "第 1 步已完成",
+      current: 1,
+      total: 1,
+      unit: "actions",
+      timestamp: "2026-09-02T00:00:00Z"
+    })}\n\n`;
+    const fetchMock = vi
+      .fn()
+      .mockRejectedValueOnce(new TypeError("connection interrupted"))
+      .mockResolvedValueOnce(sseStreamResponse([progressFrame, resultFrame]));
+    vi.stubGlobal("fetch", fetchMock);
+    const progress: TaskProgressEvent[] = [];
+    const connectionStates: string[] = [];
+
+    const result = await executeFolderPlan(
+      "folder-session-test",
+      {
+        id: "folder-plan-test",
+        title: "创建结果表",
+        summary: "创建一张结果表",
+        assumptions: [],
+        warnings: [],
+        actions: [{ type: "createWorksheet", sheet: "结果" }]
+      },
+      {
+        operationId: "folder-operation-client-test",
+        onProgress: (event) => progress.push(event),
+        onConnectionState: (state) => connectionStates.push(state)
+      }
+    );
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const firstBody = JSON.parse(fetchMock.mock.calls[0][1].body);
+    const secondBody = JSON.parse(fetchMock.mock.calls[1][1].body);
+    expect(firstBody.operationId).toBe("folder-operation-client-test");
+    expect(secondBody.operationId).toBe(firstBody.operationId);
+    expect(firstBody.afterSequence).toBe(0);
+    expect(secondBody.afterSequence).toBe(0);
+    expect(progress).toHaveLength(1);
+    expect(connectionStates).toEqual(["reconnecting", "connected"]);
+    expect(result.filesModified).toEqual(["数据.xlsx"]);
+  });
+
+  it("does not fall back to the legacy write endpoint when a successful stream has no body", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      executeFolderPlan("folder-session-test", {
+        id: "folder-plan-test",
+        title: "创建结果表",
+        summary: "创建一张结果表",
+        assumptions: [],
+        warnings: [],
+        actions: [{ type: "createWorksheet", sheet: "结果" }]
+      })
+    ).rejects.toMatchObject({
+      status: 502,
+      code: "EMPTY_EXECUTION_STREAM",
+      retryable: false
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });

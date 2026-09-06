@@ -4,14 +4,24 @@ import {
   assertAssistantResponse,
   assertDataToolResult,
   assertModelSettings,
+  parseTaskProgressEvent,
   parseTurnStepEvent,
   type AssistantResponse,
+  type TaskProgressEvent,
   type TurnStepEvent,
   type AnalysisPlan,
   type DataToolRequest,
   type DataToolResult,
   type FolderCatalog,
+  type FolderBackupCleanupResult,
+  type FolderBackupDeleteResult,
+  type FolderBackupExportResult,
+  type FolderBackupOpenResult,
+  type FolderBackupPinResult,
+  type FolderBackupsResult,
   type FolderExecuteResult,
+  type FolderLegacyCollectResult,
+  type FolderUndoResult,
   type FolderSelection,
   type IntentCheckRequest,
   type IntentCheckResponse,
@@ -156,6 +166,7 @@ export async function createAssistantResponse(
 }
 
 interface StreamHooks {
+  onProgress?: (event: TaskProgressEvent) => void;
   onStep?: (event: TurnStepEvent) => void;
   // signal：打断/转向时掐掉流式请求。已吐出的 step 由调用方保留做上下文。
   signal?: AbortSignal;
@@ -212,6 +223,7 @@ export async function streamAssistantResponse(
   const decoder = new TextDecoder();
   let buffer = "";
   let result: AssistantResponse | null = null;
+  let legacySequence = 0;
 
   const handleFrame = (frame: string): void => {
     const parsed = parseSseFrame(frame);
@@ -219,7 +231,16 @@ export async function streamAssistantResponse(
       return;
     }
     const payload: unknown = JSON.parse(parsed.data);
-    if (parsed.event === "step") {
+    if (parsed.event === "step" || parsed.event === "progress") {
+      legacySequence += 1;
+      const progress = parseTaskProgressEvent(
+        payload,
+        request.turnId ?? "legacy-turn",
+        legacySequence
+      );
+      if (progress && hooks.onProgress) {
+        hooks.onProgress(progress);
+      }
       const step = parseTurnStepEvent(payload);
       if (step && hooks.onStep) {
         hooks.onStep(step);
@@ -448,6 +469,15 @@ export async function selectFolder(): Promise<FolderCatalog | null> {
   return responseJson<FolderCatalog | null>(response);
 }
 
+export async function scanFolderByPath(folderPath: string): Promise<FolderCatalog> {
+  const response = await fetch(`${API_BASE_URL}/api/folders/scan`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ folderPath })
+  });
+  return responseJson<FolderCatalog>(response);
+}
+
 export async function refreshFolder(sessionId: string): Promise<FolderCatalog> {
   const response = await fetch(`${API_BASE_URL}/api/folders/refresh`, {
     method: "POST",
@@ -469,16 +499,260 @@ export async function createFolderSnapshot(
   return responseJson<WorkbookSnapshot>(response);
 }
 
+interface FolderExecuteHooks {
+  operationId?: string;
+  onProgress?: (event: TaskProgressEvent) => void;
+  onConnectionState?: (
+    state: "connected" | "reconnecting" | "interrupted",
+    message?: string
+  ) => void;
+  signal?: AbortSignal;
+}
+
 export async function executeFolderPlan(
   sessionId: string,
-  plan: AnalysisPlan
+  plan: AnalysisPlan,
+  hooks: FolderExecuteHooks = {}
 ): Promise<FolderExecuteResult> {
-  const response = await fetch(`${API_BASE_URL}/api/folders/execute`, {
+  const operationId =
+    hooks.operationId ?? `folder-${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`;
+  let lastSequence = 0;
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/folders/execute/stream`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sessionId,
+          plan,
+          operationId,
+          afterSequence: lastSequence
+        }),
+        signal: hooks.signal
+      });
+      if (response.status === 404 || response.status === 405) {
+        const legacy = await fetch(`${API_BASE_URL}/api/folders/execute`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sessionId, plan }),
+          signal: hooks.signal
+        });
+        return responseJson<FolderExecuteResult>(legacy);
+      }
+      if (!response.ok) {
+        throw await requestError(response, "文件夹计划流式执行失败");
+      }
+      if (!response.body) {
+        throw new ApiRequestError(
+          502,
+          "EMPTY_EXECUTION_STREAM",
+          "文件夹执行进度流未返回响应体；为避免重复写入，已停止自动回退",
+          false
+        );
+      }
+      hooks.onConnectionState?.("connected");
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let result: FolderExecuteResult | null = null;
+      let legacySequence = 0;
+      const handleFrame = (frame: string): void => {
+        const parsed = parseSseFrame(frame);
+        if (!parsed) return;
+        const payload: unknown = JSON.parse(parsed.data);
+        if (parsed.event === "progress" || parsed.event === "step") {
+          legacySequence += 1;
+          const progress = parseTaskProgressEvent(
+            payload,
+            operationId,
+            legacySequence
+          );
+          if (progress) {
+            lastSequence = Math.max(lastSequence, progress.sequence);
+            hooks.onProgress?.(progress);
+          }
+          return;
+        }
+        if (parsed.event === "error") {
+          const detail = (payload ?? {}) as {
+            status?: unknown;
+            code?: unknown;
+            message?: unknown;
+            retryable?: unknown;
+          };
+          throw new ApiRequestError(
+            typeof detail.status === "number" ? detail.status : 502,
+            typeof detail.code === "string" ? detail.code : "SERVICE_ERROR",
+            typeof detail.message === "string"
+              ? detail.message
+              : "文件夹计划执行失败",
+            typeof detail.retryable === "boolean" ? detail.retryable : false
+          );
+        }
+        if (parsed.event === "result") {
+          if (!payload || typeof payload !== "object") {
+            throw new Error("文件夹执行结果格式无效");
+          }
+          result = payload as FolderExecuteResult;
+        }
+      };
+
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (value) buffer += decoder.decode(value, { stream: true });
+        let separator = buffer.indexOf("\n\n");
+        while (separator !== -1) {
+          const frame = buffer.slice(0, separator);
+          buffer = buffer.slice(separator + 2);
+          if (frame.trim()) handleFrame(frame);
+          separator = buffer.indexOf("\n\n");
+        }
+        if (done) break;
+      }
+      if (buffer.trim()) handleFrame(buffer.trim());
+      if (!result) {
+        throw new ApiRequestError(
+          502,
+          "SERVICE_ERROR",
+          "文件夹执行流已结束，但没有返回完整结果",
+          true
+        );
+      }
+      return result;
+    } catch (reason) {
+      if (
+        attempt === 0 &&
+        !(reason instanceof ApiRequestError) &&
+        !hooks.signal?.aborted
+      ) {
+        // 使用相同 operationId 重连；服务端会追赶历史事件而不会重复写文件。
+        hooks.onConnectionState?.(
+          "reconnecting",
+          "连接短暂中断，正在使用同一任务标识恢复进度。"
+        );
+        continue;
+      }
+      if (!hooks.signal?.aborted) {
+        hooks.onConnectionState?.(
+          "interrupted",
+          "连接中断，执行结果待确认。"
+        );
+      }
+      throw reason;
+    }
+  }
+  throw new Error("文件夹计划执行失败");
+}
+
+export async function undoFolderExecution(
+  sessionId: string,
+  undoId: string
+): Promise<FolderUndoResult> {
+  const response = await fetch(`${API_BASE_URL}/api/folders/undo`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ sessionId, plan })
+    body: JSON.stringify({ sessionId, undoId })
   });
-  return responseJson<FolderExecuteResult>(response);
+  return responseJson<FolderUndoResult>(response);
+}
+
+export async function listFolderBackups(
+  target: { sessionId: string } | { folderPath: string }
+): Promise<FolderBackupsResult> {
+  const params = new URLSearchParams();
+  if ("sessionId" in target) {
+    params.set("sessionId", target.sessionId);
+  } else {
+    params.set("folderPath", target.folderPath);
+  }
+  const response = await fetch(
+    `${API_BASE_URL}/api/folders/backups?${params.toString()}`
+  );
+  return responseJson<FolderBackupsResult>(response);
+}
+
+export async function openFolderBackupDirectory(
+  directoryToken: string
+): Promise<FolderBackupOpenResult> {
+  const response = await fetch(`${API_BASE_URL}/api/folders/backups/open`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ directoryToken })
+  });
+  return responseJson<FolderBackupOpenResult>(response);
+}
+
+export async function exportFolderBackup(
+  target: { sessionId: string } | { backupManagementToken: string },
+  undoId: string,
+  operationId?: string
+): Promise<FolderBackupExportResult> {
+  const response = await fetch(`${API_BASE_URL}/api/folders/backups/export`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...target, undoId, ...(operationId ? { operationId } : {}) })
+  });
+  return responseJson<FolderBackupExportResult>(response);
+}
+
+export async function deleteFolderBackup(
+  backupManagementToken: string,
+  undoId: string,
+  expectedRevision?: number,
+  expectedInvalidatedUndoIds?: string[]
+): Promise<FolderBackupDeleteResult> {
+  const response = await fetch(`${API_BASE_URL}/api/folders/backups/delete`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      backupManagementToken,
+      undoId,
+      confirmed: true,
+      ...(expectedRevision !== undefined ? { expectedRevision } : {}),
+      ...(expectedInvalidatedUndoIds ? { expectedInvalidatedUndoIds } : {})
+    })
+  });
+  return responseJson<FolderBackupDeleteResult>(response);
+}
+
+export async function setFolderBackupPinned(
+  backupManagementToken: string,
+  undoId: string,
+  pinned: boolean
+): Promise<FolderBackupPinResult> {
+  const response = await fetch(`${API_BASE_URL}/api/folders/backups/pin`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ backupManagementToken, undoId, pinned })
+  });
+  return responseJson<FolderBackupPinResult>(response);
+}
+
+export async function cleanupFolderBackups(
+  target: { sessionId: string } | { backupManagementToken: string }
+): Promise<FolderBackupCleanupResult> {
+  const response = await fetch(`${API_BASE_URL}/api/folders/backups/cleanup`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(target)
+  });
+  return responseJson<FolderBackupCleanupResult>(response);
+}
+
+export async function collectLegacyFolderBackups(
+  target: { sessionId: string } | { backupManagementToken: string }
+): Promise<FolderLegacyCollectResult> {
+  const response = await fetch(
+    `${API_BASE_URL}/api/folders/backups/legacy/collect`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...target, confirmed: true })
+    }
+  );
+  return responseJson<FolderLegacyCollectResult>(response);
 }
 
 export async function executeFolderQuery(
