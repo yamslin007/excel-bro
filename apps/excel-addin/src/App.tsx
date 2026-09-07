@@ -836,6 +836,7 @@ export default function App() {
     settingsTesting,
     settingsLoading,
     settingsFeedback,
+    connectionTestFeedback,
     modelGuideDismissed,
     selectModel,
     dismissModelGuide,
@@ -5468,6 +5469,29 @@ export default function App() {
                           : "添加并使用"}
                     </button>
                   </div>
+                  {connectionTestFeedback && (
+                    <div
+                      className={`connection-test-feedback ${connectionTestFeedback.kind}`}
+                      role={
+                        connectionTestFeedback.kind === "error"
+                          ? "alert"
+                          : "status"
+                      }
+                      aria-live={
+                        connectionTestFeedback.kind === "error"
+                          ? "assertive"
+                          : "polite"
+                      }
+                    >
+                      <span
+                        className="connection-test-feedback-icon"
+                        aria-hidden="true"
+                      >
+                        {connectionTestFeedback.kind === "success" ? "✓" : "!"}
+                      </span>
+                      <span>{connectionTestFeedback.message}</span>
+                    </div>
+                  )}
                 </div>
               )}
             </section>

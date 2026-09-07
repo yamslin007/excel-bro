@@ -1,4 +1,5 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useRef } from "react";
+import type { Dispatch, SetStateAction } from "react";
 import type { ModelOption } from "../api";
 import {
   getModelSettings,
@@ -26,6 +27,11 @@ export interface ModelConnectionDraft {
   apiKey: string;
   clearApiKey: boolean;
   supportsVision: boolean;
+}
+
+export interface ConnectionTestFeedback {
+  kind: "success" | "error";
+  message: string;
 }
 
 interface UseModelManagementOptions {
@@ -65,8 +71,11 @@ export function useModelManagement(options: UseModelManagementOptions) {
   const [showApiKey, setShowApiKey] = useState(false);
 
   // 连接编辑状态
-  const [connectionDraft, setConnectionDraft] = useState<ModelConnectionDraft | null>(null);
+  const [connectionDraft, setConnectionDraftState] = useState<ModelConnectionDraft | null>(null);
   const [pendingDeleteConnectionId, setPendingDeleteConnectionId] = useState<string | null>(null);
+  const [connectionTestFeedback, setConnectionTestFeedback] =
+    useState<ConnectionTestFeedback | null>(null);
+  const connectionDraftVersionRef = useRef(0);
 
   // UI 状态
   const [settingsSaving, setSettingsSaving] = useState(false);
@@ -74,6 +83,14 @@ export function useModelManagement(options: UseModelManagementOptions) {
   const [settingsLoading, setSettingsLoading] = useState(false);
   const [settingsFeedback, setSettingsFeedback] = useState("");
   const [modelGuideDismissed, setModelGuideDismissed] = useState(false);
+
+  const setConnectionDraft = useCallback<
+    Dispatch<SetStateAction<ModelConnectionDraft | null>>
+  >((nextDraft) => {
+    connectionDraftVersionRef.current += 1;
+    setConnectionTestFeedback(null);
+    setConnectionDraftState(nextDraft);
+  }, []);
 
   /**
    * 选择模型
@@ -206,7 +223,6 @@ export function useModelManagement(options: UseModelManagementOptions) {
     const baseUrl = connectionDraft.baseUrl.trim();
     const modelId = connectionDraft.modelId.trim();
     if (!label || !baseUrl || !modelId) {
-      setSettingsFeedback("请填写连接名称、服务地址和模型 ID。");
       return null;
     }
     return {
@@ -225,16 +241,31 @@ export function useModelManagement(options: UseModelManagementOptions) {
    */
   const verifyConnection = useCallback(async () => {
     const request = connectionRequest();
-    if (!request) return;
+    if (!request) {
+      setConnectionTestFeedback({
+        kind: "error",
+        message: "请先填写连接名称、服务地址和模型 ID。"
+      });
+      return;
+    }
+    const draftVersion = connectionDraftVersionRef.current;
     setSettingsTesting(true);
     setSettingsFeedback("");
+    setConnectionTestFeedback(null);
     try {
       const result = await testModelConnection(request);
-      setSettingsFeedback(result.message);
+      if (connectionDraftVersionRef.current !== draftVersion) return;
+      setConnectionTestFeedback({
+        kind: result.ok ? "success" : "error",
+        message: result.ok ? "连接成功，当前模型可用。" : result.message
+      });
     } catch (reason) {
-      setSettingsFeedback(
-        reason instanceof Error ? reason.message : "模型连接测试失败。"
-      );
+      if (connectionDraftVersionRef.current !== draftVersion) return;
+      setConnectionTestFeedback({
+        kind: "error",
+        message:
+          reason instanceof Error ? reason.message : "模型连接测试失败。"
+      });
     } finally {
       setSettingsTesting(false);
     }
@@ -245,13 +276,17 @@ export function useModelManagement(options: UseModelManagementOptions) {
    */
   const saveConnection = useCallback(async () => {
     const request = connectionRequest();
-    if (!request || !connectionDraft) return;
+    if (!request || !connectionDraft) {
+      setSettingsFeedback("请填写连接名称、服务地址和模型 ID。");
+      return;
+    }
     const wasCreating = !connectionDraft.id;
     const previousConnectionIds = new Set(
       modelSettings?.connections.map((connection) => connection.id) ?? []
     );
     setSettingsSaving(true);
     setSettingsFeedback("");
+    setConnectionTestFeedback(null);
     try {
       const saved = await saveModelConnection(request);
       const createdConnection = wasCreating
@@ -337,6 +372,7 @@ export function useModelManagement(options: UseModelManagementOptions) {
     settingsTesting,
     settingsLoading,
     settingsFeedback,
+    connectionTestFeedback,
     modelGuideDismissed,
 
     // 操作

@@ -76,7 +76,9 @@ describe("composer shortcut hint", () => {
     const source = css("./styles.css");
     const component = css("./App.tsx");
 
-    expect(component).toContain('<span\n                className="composer-shortcut-hint"');
+    expect(component).toMatch(
+      /<span\r?\n\s+className="composer-shortcut-hint"/
+    );
     expect(component).toContain(
       "Enter 发送 · Shift + Enter 换行 · 可粘贴截图"
     );
@@ -84,6 +86,43 @@ describe("composer shortcut hint", () => {
     expect(source).toContain(".composer-shortcut-hint {");
     expect(source).toContain("grid-template-columns: auto minmax(0, 1fr) auto");
     expect(source).not.toContain(".composer > span {");
+  });
+});
+
+describe("model connection feedback", () => {
+  it("keeps connection test feedback inside the editor before formula settings", () => {
+    const component = css("./App.tsx");
+    const actionsIndex = component.indexOf('className="connection-editor-actions"');
+    const feedbackIndex = component.indexOf("connection-test-feedback");
+    const formulaIndex = component.indexOf(
+      "<strong>/function 公式模型</strong>",
+      feedbackIndex
+    );
+
+    expect(actionsIndex).toBeGreaterThan(-1);
+    expect(feedbackIndex).toBeGreaterThan(actionsIndex);
+    expect(formulaIndex).toBeGreaterThan(feedbackIndex);
+    expect(component).toContain('aria-live={');
+  });
+
+  it("uses the active theme palette throughout model settings", () => {
+    const source = css("./styles.css");
+    const settingsStart = source.indexOf(".settings-loading {");
+    const settingsEnd = source.indexOf(".history-drawer {", settingsStart);
+    const settingsSection = source.slice(settingsStart, settingsEnd);
+
+    expect(settingsStart).toBeGreaterThan(-1);
+    expect(settingsEnd).toBeGreaterThan(settingsStart);
+    expect(settingsSection).toContain("var(--color-background)");
+    expect(settingsSection).toContain("var(--color-surface)");
+    expect(settingsSection).toContain("var(--color-text-primary)");
+    expect(settingsSection).toContain("var(--color-text-secondary)");
+    expect(settingsSection).toContain("var(--color-brand-bg)");
+    expect(settingsSection).toContain("var(--color-brand-text)");
+    expect(settingsSection).toContain("var(--color-border)");
+    expect(settingsSection).not.toMatch(
+      /#728077|#398557|#cfe0d3|#f2faf4|#dff1e4|#277246|#294a34|#6f7e74|#dce5de|#31483a|#2a4032|#78837c|#d4ded6|#5f9f74|#376448|#f4f8f5|#718078|#8dbb9b|#f2f9f4|#dcefe2|#2e4637|#367049|#66736a|#fff4e9|#9a6030/i
+    );
   });
 });
 

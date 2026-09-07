@@ -2039,15 +2039,15 @@ textarea:focus-visible {
   align-items: center;
   justify-content: center;
   gap: 8px;
-  color: #728077;
+  color: var(--color-text-secondary);
   font-size: var(--font-size-caption);
 }
 
 .settings-loading i {
   width: 14px;
   height: 14px;
-  border: 2px solid #d9e5dc;
-  border-top-color: #398557;
+  border: 2px solid var(--color-border-strong);
+  border-top-color: var(--color-brand-text);
   border-radius: 50%;
   animation: settings-spin 800ms linear infinite;
 }
@@ -2062,9 +2062,13 @@ textarea:focus-visible {
   display: flex;
   align-items: center;
   gap: 10px;
-  border: 1px solid #cfe0d3;
+  border: 1px solid var(--color-border-strong);
   border-radius: 11px;
-  background: linear-gradient(135deg, #f2faf4, #fbfdfb);
+  background: linear-gradient(
+    135deg,
+    var(--color-brand-bg),
+    var(--color-background)
+  );
   padding: 12px;
 }
 
@@ -2075,8 +2079,8 @@ textarea:focus-visible {
   flex: 0 0 34px;
   place-items: center;
   border-radius: 11px;
-  background: #dff1e4;
-  color: #277246;
+  background: var(--color-brand-hover);
+  color: var(--color-brand-text);
   font-size: var(--font-size-title);
   font-weight: 500;
 }
@@ -2087,12 +2091,12 @@ textarea:focus-visible {
 }
 
 .settings-first-run strong {
-  color: #294a34;
+  color: var(--color-text-primary);
   font-size: var(--font-size-caption);
 }
 
 .settings-first-run span {
-  color: #6f7e74;
+  color: var(--color-text-secondary);
   font-size: var(--font-size-caption);
   line-height: 1.5;
 }
@@ -2101,27 +2105,27 @@ textarea:focus-visible {
   display: grid;
   gap: 1px;
   overflow: hidden;
-  border: 1px solid #dce5de;
+  border: 1px solid var(--color-border);
   border-radius: 11px;
-  background: #dce5de;
+  background: var(--color-border);
 }
 
 .settings-summary > div {
   display: grid;
   gap: 3px;
-  background: white;
+  background: var(--color-background);
   padding: 10px 11px;
 }
 
 .settings-summary span,
 .api-key-settings label > span {
-  color: #7a867e;
+  color: var(--color-text-secondary);
   font-size: var(--font-size-caption);
 }
 
 .settings-summary strong {
   overflow-wrap: anywhere;
-  color: #31483a;
+  color: var(--color-text-primary);
   font-size: var(--font-size-caption);
 }
 
@@ -2129,9 +2133,9 @@ textarea:focus-visible {
   display: grid;
   gap: 11px;
   margin-top: 12px;
-  border: 1px solid #dce5de;
+  border: 1px solid var(--color-border);
   border-radius: 11px;
-  background: white;
+  background: var(--color-background);
   padding: 12px;
 }
 
@@ -2141,13 +2145,13 @@ textarea:focus-visible {
 }
 
 .api-key-settings > div:first-child strong {
-  color: #2a4032;
+  color: var(--color-text-primary);
   font-size: var(--font-size-caption);
 }
 
 .api-key-settings > div:first-child span,
 .api-key-settings > p {
-  color: #78837c;
+  color: var(--color-text-secondary);
   font-size: var(--font-size-caption);
   line-height: 1.5;
 }
@@ -2166,25 +2170,25 @@ textarea:focus-visible {
 .api-key-input-row input {
   min-width: 0;
   min-height: 34px;
-  border: 1px solid #d4ded6;
+  border: 1px solid var(--color-border-strong);
   border-radius: 8px;
-  background: #fbfcfb;
-  color: #26372c;
+  background: var(--color-surface);
+  color: var(--color-text-primary);
   padding: 6px 8px;
   font: inherit;
   font-size: var(--font-size-caption);
 }
 
 .api-key-input-row input:focus {
-  border-color: #5f9f74;
+  border-color: var(--color-brand-text);
   outline: none;
 }
 
 .api-key-input-row > button {
-  border: 1px solid #d4ded6;
+  border: 1px solid var(--color-border-strong);
   border-radius: 8px;
-  background: #f5f8f6;
-  color: #466250;
+  background: var(--color-surface);
+  color: var(--color-text-primary);
   padding: 0 9px;
   font-size: var(--font-size-caption);
 }
@@ -2195,8 +2199,8 @@ textarea:focus-visible {
 
 .settings-feedback {
   border-radius: 8px;
-  background: #fff4e9;
-  color: #9a6030;
+  background: var(--color-warning-bg);
+  color: var(--color-warning-text);
   padding: 8px 9px;
   font-size: var(--font-size-caption);
   line-height: 1.45;
@@ -2215,9 +2219,9 @@ textarea:focus-visible {
   display: grid;
   gap: 10px;
   margin-top: 12px;
-  border: 1px solid #dce5de;
+  border: 1px solid var(--color-border);
   border-radius: 11px;
-  background: white;
+  background: var(--color-background);
   padding: 12px;
 }
 
@@ -2235,12 +2239,12 @@ textarea:focus-visible {
 
 .connection-settings-header strong,
 .connection-editor > div strong {
-  color: #2a4032;
+  color: var(--color-text-primary);
   font-size: var(--font-size-caption);
 }
 
 .connection-settings-header span {
-  color: #78837c;
+  color: var(--color-text-secondary);
   font-size: var(--font-size-caption);
   line-height: 1.45;
 }
@@ -2250,10 +2254,10 @@ textarea:focus-visible {
 .connection-editor > div:first-child button,
 .connection-editor-actions > button,
 .connection-key-toggle {
-  border: 1px solid #d4ded6;
+  border: 1px solid var(--color-border-strong);
   border-radius: 7px;
-  background: #f5f8f6;
-  color: #376448;
+  background: var(--color-surface);
+  color: var(--color-text-primary);
   padding: 5px 8px;
   font-size: var(--font-size-caption);
   white-space: nowrap;
@@ -2261,8 +2265,8 @@ textarea:focus-visible {
 
 .connection-empty {
   border-radius: 8px;
-  background: #f4f8f5;
-  color: #718078;
+  background: var(--color-surface);
+  color: var(--color-text-secondary);
   padding: 9px;
   font-size: var(--font-size-caption);
   line-height: 1.5;
@@ -2278,15 +2282,15 @@ textarea:focus-visible {
   align-items: flex-start;
   justify-content: space-between;
   gap: 8px;
-  border: 1px solid #e0e7e2;
+  border: 1px solid var(--color-border);
   border-radius: 9px;
-  background: #fbfcfb;
+  background: var(--color-surface);
   padding: 9px;
 }
 
 .connection-card.current {
-  border-color: #8dbb9b;
-  background: #f2f9f4;
+  border-color: var(--color-brand-text);
+  background: var(--color-brand-bg);
 }
 
 .connection-card > div:first-child {
@@ -2303,27 +2307,27 @@ textarea:focus-visible {
 
 .connection-card-title b {
   border-radius: 999px;
-  background: #dcefe2;
-  color: #277046;
+  background: var(--color-brand-hover);
+  color: var(--color-brand-text);
   padding: 2px 5px;
   font-size: var(--font-size-caption);
   white-space: nowrap;
 }
 
 .connection-card strong {
-  color: #2e4637;
+  color: var(--color-text-primary);
   font-size: var(--font-size-caption);
 }
 
 .connection-card span {
-  color: #367049;
+  color: var(--color-brand-text);
   font-size: var(--font-size-caption);
   font-weight: 700;
 }
 
 .connection-card small {
   overflow-wrap: anywhere;
-  color: #7a867e;
+  color: var(--color-text-secondary);
   font-size: var(--font-size-caption);
   line-height: 1.4;
 }
@@ -2339,21 +2343,21 @@ textarea:focus-visible {
 }
 
 .connection-card-actions button.delete {
-  border-color: #ead0cc;
-  background: #fff6f4;
-  color: #9a4e47;
+  border-color: var(--color-danger-border);
+  background: var(--color-danger-bg);
+  color: var(--color-danger-text);
 }
 
 .connection-editor {
   display: grid;
   gap: 9px;
-  border-top: 1px solid #e1e7e2;
+  border-top: 1px solid var(--color-border);
   padding-top: 11px;
 }
 
 .connection-editor > p {
   margin: -3px 0 0;
-  color: #78837c;
+  color: var(--color-text-secondary);
   font-size: var(--font-size-caption);
   line-height: 1.45;
 }
@@ -2378,7 +2382,7 @@ textarea:focus-visible {
 }
 
 .connection-editor label > span {
-  color: #66736a;
+  color: var(--color-text-secondary);
   font-size: var(--font-size-caption);
   font-weight: 700;
 }
@@ -2386,17 +2390,17 @@ textarea:focus-visible {
 .connection-editor input:not([type="checkbox"]) {
   width: 100%;
   min-height: 32px;
-  border: 1px solid #d4ded6;
+  border: 1px solid var(--color-border-strong);
   border-radius: 8px;
-  background: #fbfcfb;
-  color: #26372c;
+  background: var(--color-surface);
+  color: var(--color-text-primary);
   padding: 6px 8px;
   font: inherit;
   font-size: var(--font-size-caption);
 }
 
 .connection-editor input:not([type="checkbox"]):focus {
-  border-color: #5f9f74;
+  border-color: var(--color-brand-text);
   outline: none;
 }
 
@@ -2410,7 +2414,7 @@ textarea:focus-visible {
 }
 
 .connection-formula-field > span {
-  color: #66736a;
+  color: var(--color-text-secondary);
   font-size: var(--font-size-caption);
   font-weight: 700;
 }
@@ -2418,10 +2422,10 @@ textarea:focus-visible {
 .connection-formula-select {
   width: 100%;
   min-height: 34px;
-  border: 1px solid #d4ded6;
+  border: 1px solid var(--color-border-strong);
   border-radius: 8px;
-  background: #fbfcfb;
-  color: #26372c;
+  background-color: var(--color-surface);
+  color: var(--color-text-primary);
   padding: 6px 30px 6px 10px;
   font: inherit;
   font-size: var(--font-size-caption);
@@ -2433,12 +2437,12 @@ textarea:focus-visible {
 }
 
 .connection-formula-select:focus {
-  border-color: #5f9f74;
+  border-color: var(--color-brand-text);
   outline: none;
 }
 
 .connection-formula-select:disabled {
-  color: #9aa69f;
+  color: var(--color-text-tertiary);
   cursor: not-allowed;
 }
 
@@ -2469,6 +2473,50 @@ textarea:focus-visible {
 
 .connection-editor-actions .tool-preview-button {
   margin-top: 0;
+  border-color: var(--color-brand-text);
+  background: var(--color-brand-text);
+  color: #fff;
+}
+
+.connection-test-feedback {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  border-radius: 8px;
+  padding: 8px 9px;
+  font-size: var(--font-size-caption);
+  line-height: 1.45;
+}
+
+.connection-test-feedback.success {
+  background: var(--color-brand-bg);
+  color: var(--color-brand-text);
+}
+
+.connection-test-feedback.error {
+  background: var(--color-warning-bg);
+  color: var(--color-warning-text);
+}
+
+.connection-test-feedback-icon {
+  display: grid;
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  place-items: center;
+  border-radius: 999px;
+  color: white;
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1;
+}
+
+.connection-test-feedback.success .connection-test-feedback-icon {
+  background: var(--color-brand-text);
+}
+
+.connection-test-feedback.error .connection-test-feedback-icon {
+  background: var(--color-warning-text);
 }
 
 .history-drawer {

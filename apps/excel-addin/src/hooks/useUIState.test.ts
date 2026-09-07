@@ -1,14 +1,35 @@
 // @vitest-environment jsdom
-import { describe, it, expect, beforeEach } from "vitest";
-import { renderHook, act } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { act, renderHook, waitFor } from "@testing-library/react";
 import {
   PET_VISIBILITY_STORAGE_KEY,
   normalizePetVisibility
 } from "../conversation";
 import {
+  normalizePreferredTaskPaneWidth,
+  TASK_PANE_WIDTH_STORAGE_KEY,
   useUIState,
   WORK_DIRECTORY_GUIDE_STORAGE_KEY
 } from "./useUIState";
+
+function stubTaskPaneApi(supported = true) {
+  const setWidth = vi.fn();
+  vi.stubGlobal("Office", {
+    onReady: (callback: () => void) => {
+      callback();
+      return Promise.resolve();
+    },
+    context: {
+      requirements: {
+        isSetSupported: vi.fn(() => supported)
+      }
+    },
+    extensionLifeCycle: {
+      taskpane: { setWidth }
+    }
+  });
+  return setWidth;
+}
 
 describe("useUIState", () => {
   beforeEach(() => {
@@ -18,6 +39,77 @@ describe("useUIState", () => {
       writable: true,
       value: 1200
     });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("should normalize only widened task pane widths", () => {
+    expect(normalizePreferredTaskPaneWidth(null)).toBeNull();
+    expect(normalizePreferredTaskPaneWidth("320")).toBeNull();
+    expect(normalizePreferredTaskPaneWidth("719.6")).toBe(720);
+    expect(normalizePreferredTaskPaneWidth("invalid")).toBeNull();
+  });
+
+  it("should restore the saved task pane width when TaskPaneApi is supported", async () => {
+    localStorage.setItem(TASK_PANE_WIDTH_STORAGE_KEY, "720");
+    Object.defineProperty(window, "innerWidth", {
+      configurable: true,
+      writable: true,
+      value: 320
+    });
+    const setWidth = stubTaskPaneApi();
+
+    const { result } = renderHook(() => useUIState());
+
+    await waitFor(() => expect(setWidth).toHaveBeenCalledWith(720));
+    expect(result.current.widenStepDone).toBe(true);
+  });
+
+  it("should remember the actual width after the user widens the pane", () => {
+    stubTaskPaneApi();
+    renderHook(() => useUIState());
+
+    Object.defineProperty(window, "innerWidth", {
+      configurable: true,
+      writable: true,
+      value: 684
+    });
+    act(() => window.dispatchEvent(new Event("resize")));
+
+    expect(localStorage.getItem(TASK_PANE_WIDTH_STORAGE_KEY)).toBe("684");
+  });
+
+  it("should reapply the saved width when the task pane becomes active again", () => {
+    localStorage.setItem(TASK_PANE_WIDTH_STORAGE_KEY, "720");
+    Object.defineProperty(window, "innerWidth", {
+      configurable: true,
+      writable: true,
+      value: 320
+    });
+    const setWidth = stubTaskPaneApi();
+    renderHook(() => useUIState());
+    setWidth.mockClear();
+
+    act(() => window.dispatchEvent(new Event("focus")));
+
+    expect(setWidth).toHaveBeenCalledWith(720);
+  });
+
+  it("should keep manual resizing as the fallback without TaskPaneApi", () => {
+    localStorage.setItem(TASK_PANE_WIDTH_STORAGE_KEY, "720");
+    Object.defineProperty(window, "innerWidth", {
+      configurable: true,
+      writable: true,
+      value: 320
+    });
+    const setWidth = stubTaskPaneApi(false);
+
+    const { result } = renderHook(() => useUIState());
+
+    expect(setWidth).not.toHaveBeenCalled();
+    expect(result.current.widenStepDone).toBe(false);
   });
 
   it("should initialize drawers, menus and guides as closed", () => {

@@ -203,7 +203,64 @@ describe("useModelManagement", () => {
     });
 
     expect(testModelConnectionMock).toHaveBeenCalled();
-    expect(result.current.settingsFeedback).toBe("连接成功");
+    expect(result.current.settingsFeedback).toBe("");
+    expect(result.current.connectionTestFeedback).toEqual({
+      kind: "success",
+      message: "连接成功，当前模型可用。"
+    });
+  });
+
+  it("should clear a stale connection test result after editing the draft", async () => {
+    const { result } = renderModelManagement();
+
+    act(() =>
+      result.current.setConnectionDraft({
+        id: null,
+        label: "New",
+        baseUrl: "https://api.example.com",
+        modelId: "gpt-4.1",
+        apiKey: "sk-test",
+        clearApiKey: false,
+        supportsVision: true
+      })
+    );
+    await act(async () => {
+      await result.current.verifyConnection();
+    });
+
+    act(() =>
+      result.current.setConnectionDraft((current) =>
+        current ? { ...current, modelId: "gpt-4.1-mini" } : current
+      )
+    );
+
+    expect(result.current.connectionTestFeedback).toBeNull();
+  });
+
+  it("should show connection test failures next to the editor actions", async () => {
+    testModelConnectionMock.mockRejectedValueOnce(new Error("API Key 无效。"));
+    const { result } = renderModelManagement();
+
+    act(() =>
+      result.current.setConnectionDraft({
+        id: null,
+        label: "New",
+        baseUrl: "https://api.example.com",
+        modelId: "gpt-4.1",
+        apiKey: "invalid",
+        clearApiKey: false,
+        supportsVision: false
+      })
+    );
+    await act(async () => {
+      await result.current.verifyConnection();
+    });
+
+    expect(result.current.connectionTestFeedback).toEqual({
+      kind: "error",
+      message: "API Key 无效。"
+    });
+    expect(result.current.settingsFeedback).toBe("");
   });
 
   it("should save an API key and refresh models", async () => {
