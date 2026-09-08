@@ -77,6 +77,8 @@ export interface ChatMessage {
   executedExecutionId?: string;
   /** 文件夹模式下对应的恢复点 ID。 */
   executedUndoId?: string;
+  /** 文件夹执行的持久操作 ID，用于刷新恢复结果去重。 */
+  folderOperationId?: string;
   /**
    * 计划里含预览时算出的固定值、且源数据已变。带上原计划让用户能在确认后
    * 坚持执行（executePlan 的 acknowledgeStaleSource）。

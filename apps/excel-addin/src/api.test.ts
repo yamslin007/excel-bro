@@ -11,11 +11,15 @@ import {
   executeFolderPlan,
   executeFolderQuery,
   exportFolderBackup,
+  getFolderExecutionStatus,
   getModelSettings,
   listModels,
   listFolderBackups,
+  listManagedFolderRecoveryDirectories,
   openFolderBackupDirectory,
+  removeManagedFolderRecoveryDirectory,
   refreshFolder,
+  restoreManagedFolderBackup,
   saveModelConnection,
   scanFolderByPath,
   streamAssistantResponse,
@@ -914,5 +918,84 @@ describe("executeFolderPlan streaming", () => {
       retryable: false
     });
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("folder recovery API", () => {
+  it("queries the existing operation without creating a new execution", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          operationId: "execution-existing",
+          status: "needs_reconciliation",
+          lastSequence: 7,
+          result: null,
+          error: { message: "需要核对" }
+        })
+      )
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const status = await getFolderExecutionStatus("execution-existing");
+
+    expect(status.status).toBe("needs_reconciliation");
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "/api/folders/execute/status?operationId=execution-existing"
+      )
+    );
+  });
+
+  it("lists, restores and removes only an explicitly identified managed directory", async () => {
+    const directoryId = "d".repeat(64);
+    const undoId = "a".repeat(32);
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ directories: [] })))
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            operationId: "recovery-operation-1",
+            undoId,
+            status: "completed",
+            filesRestored: ["scores.xlsx"],
+            alreadyRestored: false
+          })
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ directoryId, removed: true }))
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await listManagedFolderRecoveryDirectories();
+    await restoreManagedFolderBackup({
+      directoryId,
+      undoId,
+      expectedRevision: 3,
+      operationId: "recovery-operation-1",
+      confirmed: true
+    });
+    await removeManagedFolderRecoveryDirectory(directoryId);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      expect.stringContaining("/api/folders/recovery/restore"),
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          directoryId,
+          undoId,
+          expectedRevision: 3,
+          operationId: "recovery-operation-1",
+          confirmed: true
+        })
+      })
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      expect.stringContaining(`/api/folders/recovery/directories/${directoryId}`),
+      { method: "DELETE" }
+    );
   });
 });

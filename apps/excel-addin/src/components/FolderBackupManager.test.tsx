@@ -49,6 +49,15 @@ function backupsState(overrides: Partial<BackupsState> = {}): BackupsState {
       legacyCandidates: [],
       warnings: []
     },
+    managedDirectory: {
+      directoryId: "d".repeat(64),
+      folderName: "work",
+      folderPath: "C:\\work",
+      status: "active",
+      recoveryCount: 1,
+      attentionCount: 0,
+      operationCount: 1
+    },
     loading: false,
     working: false,
     error: "",
@@ -59,6 +68,13 @@ function backupsState(overrides: Partial<BackupsState> = {}): BackupsState {
       "C:\\work\\.excel-bro-backups"
     ),
     exportBackup: vi.fn().mockResolvedValue("C:\\work\\exports"),
+    recoverBackup: vi.fn().mockResolvedValue({
+      operationId: "recovery-test-operation",
+      undoId: "a".repeat(32),
+      status: "completed",
+      filesRestored: ["华南\\报表.xlsx"],
+      alreadyRestored: false
+    }),
     deleteBackup: vi.fn().mockResolvedValue({
       deletedUndoId: "a".repeat(32),
       discardedUndo: true,
@@ -271,6 +287,53 @@ describe("FolderBackupManager", () => {
       (screen.getByRole("button", { name: "删除备份" }) as HTMLButtonElement)
         .disabled
     ).toBe(true);
+    expect(
+      screen.getByRole("button", { name: "核对并恢复到执行前" })
+    ).toBeTruthy();
+  });
+
+  it("requires inline confirmation before restoring a restart-discovered backup", async () => {
+    const base = backupsState();
+    const backup = base.data!.backups[0];
+    const recoverBackup = vi.fn().mockResolvedValue({
+      operationId: "recovery-confirmed-operation",
+      undoId: backup.undoId,
+      status: "completed",
+      filesRestored: ["华南\\报表.xlsx"],
+      alreadyRestored: false
+    });
+    const state = backupsState({
+      recoverBackup,
+      data: {
+        ...base.data!,
+        backups: [
+          {
+            ...backup,
+            canUndo: false,
+            undoSessionId: null,
+            undoAvailability: "view_only"
+          }
+        ]
+      }
+    });
+    useFolderBackupsMock.mockReturnValue(state);
+
+    render(
+      <FolderBackupManager
+        target={{ kind: "path", folderPath: "C:\\work" }}
+        onClose={vi.fn()}
+        onUndo={vi.fn().mockResolvedValue(undefined)}
+      />
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "恢复到执行前" }));
+    expect(screen.getByText("恢复到本次执行前？")).toBeTruthy();
+    expect(recoverBackup).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "确认恢复" }));
+    await waitFor(() =>
+      expect(recoverBackup).toHaveBeenCalledWith(backup.undoId, 3)
+    );
   });
 
   it("can cancel an inline backup deletion confirmation", () => {

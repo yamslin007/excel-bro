@@ -64,6 +64,7 @@ from .models import (
     WorksheetSnapshot,
 )
 from .capabilities import capability_int, capability_text
+from .folder_mutex import folder_write_guard
 
 ROW_LIMIT = capability_int("snapshot", "dataRows")
 COLUMN_LIMIT = capability_int("snapshot", "dataColumns")
@@ -547,6 +548,19 @@ def _has_reparse_point(path: Path, boundary: Path) -> bool:
         current = current.parent
 
 
+def validate_managed_work_directory(root: Path) -> Path:
+    """Validate a user-selected work root without granting access to aliases."""
+
+    candidate = Path(os.path.abspath(root.expanduser()))
+    if not candidate.exists():
+        raise ValueError(f"文件夹不存在：{root}")
+    if not candidate.is_dir():
+        raise ValueError(f"路径不是文件夹：{root}")
+    if _has_reparse_point(candidate, candidate):
+        raise ValueError("工作目录不能是符号链接、junction 或 reparse point，请重新选择")
+    return candidate.resolve()
+
+
 def _tree_has_reparse_point(directory: Path) -> bool:
     marker = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
     for current, directory_names, file_names in os.walk(
@@ -931,7 +945,7 @@ def choose_folder() -> Path | None:
         selected = filedialog.askdirectory(title="选择包含 Excel 文件的文件夹")
     finally:
         root.destroy()
-    return Path(selected).resolve() if selected else None
+    return Path(selected) if selected else None
 
 
 def _is_supported_file(path: Path) -> bool:
@@ -989,7 +1003,7 @@ def _file_info(root: Path, file_id: str, path: Path) -> FolderFileInfo:
 
 
 def scan_folder(root: Path) -> FolderCatalog:
-    root = root.resolve()
+    root = validate_managed_work_directory(root)
     all_candidates, candidates = _candidate_files(root)
     _prune_sessions(reserve_slot=True)
     session_id = uuid.uuid4().hex
@@ -1032,11 +1046,7 @@ def scan_folder_by_path(folder_path: str) -> FolderCatalog:
     这里不做路径白名单——恶意网页跨站调用已被 main.py 的 Origin 守卫拦住，而本机
     恶意进程本来就能直接读这些文件，该端点不增加其能力（见威胁模型）。
     """
-    candidate = Path(folder_path)
-    if not candidate.exists():
-        raise ValueError(f"文件夹不存在：{folder_path}")
-    if not candidate.is_dir():
-        raise ValueError(f"路径不是文件夹：{folder_path}")
+    candidate = validate_managed_work_directory(Path(folder_path))
     return scan_folder(candidate)
 
 
@@ -1084,6 +1094,12 @@ def _session(session_id: str) -> _FolderSession:
         return session
     except KeyError as error:
         raise ValueError("文件夹会话已失效，请重新选择文件夹") from error
+
+
+def folder_session_root(session_id: str) -> Path:
+    """Return the exact root previously authorized by a folder session."""
+
+    return _session(session_id).root
 
 
 def _backup_entry(
@@ -1210,6 +1226,87 @@ def _backup_entry(
         expiresAt=(created_at + timedelta(days=retention_days)).isoformat(),
         files=files,
     )
+
+
+def inspect_managed_folder_recovery(root: Path) -> dict[str, object]:
+    """Inspect only managed recovery metadata; never read workbook data rows."""
+
+    root = validate_managed_work_directory(root)
+    backup_root = _backup_root(root)
+    if not backup_root.exists():
+        return {
+            "recoveryCount": 0,
+            "attentionCount": 0,
+            "operationCount": 0,
+            "warnings": [],
+        }
+    if not backup_root.is_dir() or _has_reparse_point(backup_root, backup_root):
+        raise ValueError("统一备份位置不是安全目录，请重新选择工作目录后核对")
+
+    recovery_count = 0
+    attention_count = 0
+    operation_count = 0
+    warnings: list[str] = []
+    executions = backup_root / "executions"
+    if executions.exists():
+        if not executions.is_dir() or _has_reparse_point(executions, backup_root):
+            raise ValueError("恢复资料目录包含不安全路径，已停止扫描")
+        for directory in executions.iterdir():
+            if not directory.is_dir():
+                continue
+            manifest, error = _validate_execution_directory(directory, backup_root)
+            if manifest is None:
+                attention_count += 1
+                warnings.append(f"{directory.name}：{error}")
+                continue
+            recovery_count += 1
+            try:
+                entry = _backup_entry(backup_root, directory, manifest)
+            except (TypeError, ValueError) as entry_error:
+                attention_count += 1
+                warnings.append(f"{directory.name}：{entry_error}")
+                continue
+            if entry.status == "needs_attention":
+                attention_count += 1
+
+    operations = backup_root / "operations"
+    terminal_operation_states = {"completed", "rolled_back", "aborted"}
+    if operations.exists():
+        if not operations.is_dir() or _has_reparse_point(operations, backup_root):
+            raise ValueError("恢复事务目录包含不安全路径，已停止扫描")
+        for directory in operations.iterdir():
+            if not directory.is_dir():
+                continue
+            operation_count += 1
+            if _has_reparse_point(directory, backup_root):
+                attention_count += 1
+                warnings.append(f"{directory.name}：恢复事务目录路径不安全")
+                continue
+            try:
+                payload = json.loads(
+                    (directory / "manifest.json").read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError) as operation_error:
+                attention_count += 1
+                warnings.append(f"{directory.name}：恢复事务记录不可读（{operation_error}）")
+                continue
+            if (
+                not isinstance(payload, dict)
+                or payload.get("operationId") != directory.name
+                or not isinstance(payload.get("status"), str)
+            ):
+                attention_count += 1
+                warnings.append(f"{directory.name}：恢复事务记录无效")
+                continue
+            if payload["status"] not in terminal_operation_states:
+                attention_count += 1
+
+    return {
+        "recoveryCount": recovery_count,
+        "attentionCount": attention_count,
+        "operationCount": operation_count,
+        "warnings": warnings[:50],
+    }
 
 
 def list_folder_backups(
@@ -3772,13 +3869,23 @@ def _restore_folder_undo_impl(request: FolderUndoRequest) -> FolderUndoResponse:
         raise ValueError("这次文件夹执行的撤销数据已失效或已使用")
 
     records = session.undo_stack[record_index:]
+    return _restore_folder_records(session, records)
+
+
+def _restore_folder_records(
+    session: _FolderSession,
+    records: list[_FolderUndoRecord],
+    *,
+    allowed_manifest_statuses: frozenset[str] = frozenset({"ready"}),
+    recovery_operation_id: str | None = None,
+) -> FolderUndoResponse:
     for record in records:
         manifest = _read_manifest(record.backup_directory)
         if manifest.get("version") != BACKUP_MANIFEST_VERSION:
             raise ValueError(
                 "这份旧版恢复点缺少可验证的直接撤销链，请从备份管理取出副本后人工核对"
             )
-        if manifest.get("status") != "ready":
+        if manifest.get("status") not in allowed_manifest_statuses:
             raise ValueError("恢复资料当前不处于可撤销状态，请刷新备份管理后核对")
     effective_fingerprints: dict[Path, str | None] = {}
     final_sources: dict[Path, Path | None] = {}
@@ -3792,6 +3899,9 @@ def _restore_folder_undo_impl(request: FolderUndoRequest) -> FolderUndoResponse:
                     if target.path.exists()
                     else None
                 )
+            if current_fingerprint == target.prior_fingerprint:
+                effective_fingerprints[target.path] = target.prior_fingerprint
+                continue
             if current_fingerprint != target.post_fingerprint:
                 raise ValueError(
                     f"无法撤销「{target.path.name}」：执行后文件又发生了变化。"
@@ -3813,6 +3923,30 @@ def _restore_folder_undo_impl(request: FolderUndoRequest) -> FolderUndoResponse:
             final_sources[target.path] = target.backup_path
 
     paths = sorted(final_sources, key=lambda path: str(path).casefold())
+    if not paths:
+        consumed_ids = {record.undo_id for record in records}
+        for record in records:
+            try:
+                manifest = _read_manifest(record.backup_directory)
+                if manifest.get("status") != "restored":
+                    _set_manifest_status(
+                        record.backup_directory, manifest, "restored", completed=True
+                    )
+            except (OSError, ValueError):
+                _logger.exception("无法持久记录已恢复状态：%s", record.undo_id)
+        backup_root = _backup_root(session.root)
+        for candidate_session in _sessions.values():
+            if _backup_root(candidate_session.root) == backup_root:
+                candidate_session.undo_stack = [
+                    record
+                    for record in candidate_session.undo_stack
+                    if record.undo_id not in consumed_ids
+                ]
+        return FolderUndoResponse(
+            filesRestored=[],
+            executionsUndone=len(records),
+            remainingUndoCount=len(session.undo_stack),
+        )
     locked = [path for path in paths if _is_locked_for_writing(path)]
     if locked:
         names = "、".join(path.name for path in locked)
@@ -3826,9 +3960,30 @@ def _restore_folder_undo_impl(request: FolderUndoRequest) -> FolderUndoResponse:
     existed_before_restore = {path: path.exists() for path in paths}
     operations_root = _ensure_safe_backup_storage(session.root, "operations")
     operations_root.mkdir(parents=True, exist_ok=True)
-    operation_id = uuid.uuid4().hex
+    operation_id = recovery_operation_id or uuid.uuid4().hex
     operation_directory = operations_root / operation_id
-    operation_directory.mkdir(parents=False, exist_ok=False)
+    if operation_directory.exists():
+        if (
+            not operation_directory.is_dir()
+            or _has_reparse_point(operation_directory, _backup_root(session.root))
+        ):
+            raise ValueError("恢复事务目录不安全，已停止恢复")
+        try:
+            previous_operation = json.loads(
+                (operation_directory / "manifest.json").read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError("已有恢复事务记录不可读，已停止恢复") from error
+        if (
+            not isinstance(previous_operation, dict)
+            or previous_operation.get("operationId") != operation_id
+            or previous_operation.get("operationType") != "undo"
+            or previous_operation.get("sourceUndoIds")
+            != [record.undo_id for record in records]
+        ):
+            raise ValueError("已有恢复事务与本次请求不一致，已停止恢复")
+    else:
+        operation_directory.mkdir(parents=False, exist_ok=False)
     operation_files: list[dict[str, object]] = []
     operation_file_by_path: dict[Path, dict[str, object]] = {}
     for path in paths:
@@ -4027,6 +4182,128 @@ def _restore_folder_undo_impl(request: FolderUndoRequest) -> FolderUndoResponse:
     )
 
 
+def restore_managed_folder_backup(
+    root: Path,
+    *,
+    undo_id: str,
+    expected_revision: int,
+    recovery_operation_id: str,
+) -> FolderUndoResponse:
+    """Restore one persisted recovery point without relying on an in-memory session."""
+
+    root = validate_managed_work_directory(root)
+    if _UNDO_ID_PATTERN.fullmatch(undo_id) is None:
+        raise ValueError("恢复点标识无效")
+    if _MANAGEMENT_OPERATION_ID_PATTERN.fullmatch(recovery_operation_id) is None:
+        raise ValueError("恢复操作标识无效")
+    backup_root = _backup_root(root)
+    backup_directory = backup_root / "executions" / undo_id
+    manifest, validation_error = _validate_execution_directory(
+        backup_directory, backup_root
+    )
+    if manifest is None:
+        raise ValueError(f"恢复资料无效：{validation_error}")
+    if manifest.get("version") != BACKUP_MANIFEST_VERSION:
+        raise ValueError("旧版恢复资料只能导出副本后人工核对")
+    revision = max(int(manifest.get("revision", 0) or 0), 0)
+    if revision != expected_revision:
+        raise ValueError("恢复资料状态已变化，请刷新后重新确认")
+    allowed_statuses = frozenset(
+        {
+            "preparing",
+            "prepared",
+            "applying",
+            "ready",
+            "recovering",
+            "needs_attention",
+            "restored",
+        }
+    )
+    if manifest.get("status") not in allowed_statuses:
+        raise ValueError("恢复资料当前状态不支持自动恢复，请先导出副本核对")
+
+    targets: list[_FolderUndoTarget] = []
+    raw_files = manifest.get("files")
+    if not isinstance(raw_files, list) or not raw_files:
+        raise ValueError("恢复资料没有可核对的文件清单")
+    root_absolute = Path(os.path.abspath(root))
+    for raw_item in raw_files:
+        if not isinstance(raw_item, dict):
+            raise ValueError("恢复资料包含无效文件项")
+        relative = _safe_manifest_relative_path(raw_item.get("originalRelativePath"))
+        if relative is None:
+            raise ValueError("恢复资料包含无效目标路径")
+        target = Path(os.path.abspath(root / relative))
+        if (
+            not _is_relative_to(target, root_absolute)
+            or _has_reparse_point(target, root)
+        ):
+            raise ValueError("恢复目标路径越界或包含 reparse point")
+        post_fingerprint = raw_item.get("postFingerprint")
+        prior_fingerprint = raw_item.get("priorFingerprint")
+        if (
+            not isinstance(post_fingerprint, str)
+            or re.fullmatch(r"[0-9a-f]{64}", post_fingerprint) is None
+        ):
+            raise ValueError("恢复资料缺少有效的执行后文件指纹")
+        if prior_fingerprint is not None and (
+            not isinstance(prior_fingerprint, str)
+            or re.fullmatch(r"[0-9a-f]{64}", prior_fingerprint) is None
+        ):
+            raise ValueError("恢复资料包含无效的执行前文件指纹")
+        recovery_action = raw_item.get("recoveryAction")
+        backup_relative = _safe_manifest_relative_path(
+            raw_item.get("backupRelativePath")
+        )
+        if recovery_action not in {"restore", "remove"}:
+            recovery_action = "restore" if backup_relative is not None else "remove"
+        backup_path: Path | None = None
+        if recovery_action == "restore":
+            if backup_relative is None or prior_fingerprint is None:
+                raise ValueError("恢复资料缺少执行前副本或指纹")
+            backup_path = Path(os.path.abspath(backup_directory / backup_relative))
+            if (
+                not _is_relative_to(backup_path, backup_directory)
+                or _has_reparse_point(backup_path, backup_directory)
+            ):
+                raise ValueError("执行前副本路径越界或包含 reparse point")
+        elif prior_fingerprint is not None:
+            raise ValueError("新建文件恢复项不应包含执行前文件指纹")
+        targets.append(
+            _FolderUndoTarget(
+                path=target,
+                backup_path=backup_path,
+                prior_fingerprint=prior_fingerprint,
+                post_fingerprint=post_fingerprint,
+            )
+        )
+
+    record = _FolderUndoRecord(
+        undo_id=undo_id,
+        plan_id=str(manifest.get("planId", undo_id)),
+        backup_directory=backup_directory,
+        targets=tuple(targets),
+    )
+    transient_session = _FolderSession(root, {})
+    with folder_write_guard(root):
+        with _backup_cleanup_lock:
+            if undo_id in _deleting_backup_ids:
+                raise ValueError("恢复资料正在删除，无法同时恢复")
+            if undo_id in _restoring_backup_ids:
+                raise ValueError("这份恢复资料正在处理，请勿重复操作")
+            _restoring_backup_ids.add(undo_id)
+        try:
+            return _restore_folder_records(
+                transient_session,
+                [record],
+                allowed_manifest_statuses=allowed_statuses,
+                recovery_operation_id=recovery_operation_id,
+            )
+        finally:
+            with _backup_cleanup_lock:
+                _restoring_backup_ids.discard(undo_id)
+
+
 def undo_folder_execution(request: FolderUndoRequest) -> FolderUndoResponse:
     session = _session(request.sessionId)
     record_index = next(
@@ -4042,17 +4319,18 @@ def undo_folder_execution(request: FolderUndoRequest) -> FolderUndoResponse:
     restore_ids = {
         record.undo_id for record in session.undo_stack[record_index:]
     }
-    with _backup_cleanup_lock:
-        if restore_ids & _deleting_backup_ids:
-            raise ValueError("所需备份正在删除，无法同时撤销")
-        if restore_ids & _restoring_backup_ids:
-            raise ValueError("这次文件夹执行正在撤销，请勿重复操作")
-        _restoring_backup_ids.update(restore_ids)
-    try:
-        return _restore_folder_undo_impl(request)
-    finally:
+    with folder_write_guard(session.root):
         with _backup_cleanup_lock:
-            _restoring_backup_ids.difference_update(restore_ids)
+            if restore_ids & _deleting_backup_ids:
+                raise ValueError("所需备份正在删除，无法同时撤销")
+            if restore_ids & _restoring_backup_ids:
+                raise ValueError("这次文件夹执行正在撤销，请勿重复操作")
+            _restoring_backup_ids.update(restore_ids)
+        try:
+            return _restore_folder_undo_impl(request)
+        finally:
+            with _backup_cleanup_lock:
+                _restoring_backup_ids.difference_update(restore_ids)
 
 
 def _execute_folder_plan(
@@ -5012,6 +5290,7 @@ def _execute_folder_plan(
             },
         )
         return FolderExecuteResponse(
+            executionId=execution_id,
             filesModified=modified,
             backups=backups,
             backupDirectory=(
@@ -5033,14 +5312,16 @@ def execute_folder_plan(
     request: FolderExecuteRequest,
     on_progress: FolderProgressCallback | None = None,
 ) -> FolderExecuteResponse:
-    opened: list[Workbook] = []
-    token = _OPEN_WRITE_WORKBOOKS.set(opened)
-    try:
-        return _execute_folder_plan(request, on_progress)
-    finally:
-        for workbook in opened:
-            try:
-                workbook.close()
-            except Exception:
-                pass
-        _OPEN_WRITE_WORKBOOKS.reset(token)
+    session = _session(request.sessionId)
+    with folder_write_guard(session.root):
+        opened: list[Workbook] = []
+        token = _OPEN_WRITE_WORKBOOKS.set(opened)
+        try:
+            return _execute_folder_plan(request, on_progress)
+        finally:
+            for workbook in opened:
+                try:
+                    workbook.close()
+                except Exception:
+                    pass
+            _OPEN_WRITE_WORKBOOKS.reset(token)

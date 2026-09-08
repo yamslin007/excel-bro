@@ -14,6 +14,7 @@ import {
   executeFolderPlan,
   executeFolderQuery,
   generateFormula,
+  getFolderExecutionStatus,
   isLocalServiceConnectionError,
   refreshFolder,
   scanFolderByPath,
@@ -22,6 +23,7 @@ import {
 import type {
   AnalysisPlan,
   FolderCatalog,
+  FolderExecuteResult,
   FolderSelection,
   DataToolResult,
   FormulaDictionarySheet,
@@ -154,6 +156,12 @@ import { useFolderUndo } from "./hooks/useFolderUndo";
 import { useUndoSnapshot } from "./hooks/useUndoSnapshot";
 import { useLongPress } from "./hooks/useLongPress";
 import { folderSheetKey, formulaTrialFailed } from "./utils";
+import {
+  clearPendingFolderOperation,
+  loadPendingFolderOperation,
+  savePendingFolderOperation,
+  type PendingFolderOperation
+} from "./folderOperationRecovery";
 
 export type { ActivityLog, ActivityProgress } from "./hooks/useActivityProgress";
 
@@ -210,6 +218,32 @@ function verificationSummary(report: VerificationReport): string {
     return "；写入已完成，但部分操作暂时无法独立验证";
   }
   return "，但结果验证未通过";
+}
+
+function folderExecutionOutcomeText(
+  plan: AnalysisPlan,
+  result: FolderExecuteResult,
+  recovered: boolean
+): string {
+  const writeStatus =
+    result.filesModified.length > 0
+      ? `已写入 ${result.filesModified.join("、")}`
+      : "目标状态原本已符合要求，没有写入文件，也没有创建恢复点";
+  const verificationStatus =
+    result.verification.status === "verified"
+      ? "已通过独立验证"
+      : result.verification.status === "executed_unverified"
+        ? "写入已完成，部分操作暂时无法独立验证"
+        : "写入已经结束，但结果验证未通过";
+  return `${recovered ? "已找回上次中断后的执行结果。" : ""}「${plan.title}」任务状态：执行已结束，共 ${result.actionResults.length} 步。写入状态：${writeStatus}。验收状态：${verificationStatus}。${
+    result.backupDirectory
+      ? "执行前副本已集中保存，可在「备份与恢复」中查看。"
+      : ""
+  }${result.undo ? "已记录本次恢复点。" : ""}${
+    result.backupWarnings?.length
+      ? `注意：${result.backupWarnings.join("；")}。`
+      : ""
+  }`;
 }
 
 export function normalizeStoredVerification(
@@ -1075,6 +1109,7 @@ export default function App() {
   const forceRecomputeRef = useRef(false);
   // sendMessage 起点记录的原始用户文本，写缓存时作为一级 prompt key。
   const rawPromptRef = useRef("");
+  const folderRecoveryAttachStartedRef = useRef(false);
 
   // 一级斜杠命令定义
   const slashCommands: SlashCommand[] = useMemo(
@@ -1419,6 +1454,192 @@ export default function App() {
       input.scrollHeight > COMPOSER_MAX_HEIGHT ? "auto" : "hidden";
   }, [prompt, composerHeight]);
 
+  useEffect(() => {
+    if (folderRecoveryAttachStartedRef.current) return;
+    folderRecoveryAttachStartedRef.current = true;
+    const pending = loadPendingFolderOperation();
+    if (!pending) return;
+    if (
+      chatHistory.conversations.some((conversation) =>
+        conversation.messages.some(
+          (message) => message.folderOperationId === pending.operationId
+        )
+      )
+    ) {
+      clearPendingFolderOperation(pending.operationId);
+      return;
+    }
+
+    const finishRecoveredResult = (
+      result: FolderExecuteResult,
+      activeSession: boolean
+    ) => {
+      appendFolderOperationOutcome(pending, result, true, activeSession);
+      if (activeSession && result.undo) {
+        pushFolderUndo({
+          planId: pending.plan.id,
+          undoId: result.undo.undoId,
+          sessionId: result.undo.sessionId
+        });
+      }
+      clearPendingFolderOperation(pending.operationId);
+    };
+
+    const attach = async () => {
+      let persisted;
+      try {
+        persisted = await getFolderExecutionStatus(pending.operationId);
+        markServerOnline();
+      } catch (reason) {
+        if (isLocalServiceConnectionError(reason)) {
+          markServerOffline();
+          return;
+        }
+        appendFolderOperationNotice(
+          pending,
+          `无法找回上次文件夹任务的状态：${
+            reason instanceof Error ? reason.message : String(reason)
+          }。没有创建新的执行，也没有重复写入；请在「备份与恢复」中核对文件。`
+        );
+        clearPendingFolderOperation(pending.operationId);
+        return;
+      }
+
+      if (persisted.status === "completed") {
+        if (persisted.result) {
+          finishRecoveredResult(persisted.result, false);
+        } else {
+          appendFolderOperationNotice(
+            pending,
+            "上次任务记录为已完成，但完整结果缺失。没有重新执行；请在「备份与恢复」中核对文件。"
+          );
+          clearPendingFolderOperation(pending.operationId);
+        }
+        return;
+      }
+
+      if (
+        persisted.status === "failed" ||
+        persisted.status === "needs_reconciliation"
+      ) {
+        appendFolderOperationNotice(
+          pending,
+          `上次文件夹任务已停止。任务状态：需要核对。写入状态：不能仅凭任务记录确定。验收状态：尚未完成。${
+            persisted.error?.message ? `原因：${persisted.error.message}。` : ""
+          }没有重新执行；请打开「备份与恢复」查看可恢复资料。`
+        );
+        clearPendingFolderOperation(pending.operationId);
+        return;
+      }
+
+      const now = new Date().toISOString();
+      setChatHistory((current) => {
+        const targetConversationId = current.conversations.some(
+          (conversation) => conversation.id === pending.conversationId
+        )
+          ? pending.conversationId
+          : current.activeConversationId;
+        return {
+          ...current,
+          activeConversationId: targetConversationId,
+          conversations: current.conversations.map((conversation) => {
+            if (conversation.id !== targetConversationId) return conversation;
+            const existingIndex = conversation.messages.findIndex(
+              (message) => message.id === pending.activityMessageId
+            );
+            const activityPlaceholder: ChatMessage = {
+              id: pending.activityMessageId,
+              role: "assistant",
+              activityPending: true,
+              createdAt: now
+            };
+            const nextMessages =
+              existingIndex >= 0
+                ? conversation.messages.map((message, index) =>
+                    index === existingIndex
+                      ? { ...message, activityPending: true }
+                      : message
+                  )
+                : [...conversation.messages, activityPlaceholder];
+            return { ...conversation, messages: nextMessages, updatedAt: now };
+          })
+        };
+      });
+      activeActivityMessageIdRef.current = pending.activityMessageId;
+      startActivityProgress(
+        "正在重新连接文件夹任务",
+        "正在追赶原任务的进度，不会创建新的执行。",
+        {
+          persistenceKey: pending.activityMessageId,
+          operationId: pending.operationId,
+          phase: "executing",
+          stepId: "execution.reattach"
+        }
+      );
+      setActivePlanId(pending.plan.id);
+      setStatus("executing");
+      try {
+        const result = await executeFolderPlan(pending.sessionId, pending.plan, {
+          operationId: pending.operationId,
+          onProgress: applyProgressEvent,
+          onConnectionState: (connectionState, message) => {
+            if (connectionState === "reconnecting") {
+              markActivityReconnecting(
+                message ?? "连接短暂中断，正在恢复原任务进度。"
+              );
+            } else if (connectionState === "interrupted") {
+              markActivityInterrupted(
+                message ?? "连接中断，执行结果待确认。"
+              );
+            } else {
+              markActivityConnected();
+            }
+          }
+        });
+        finishRecoveredResult(result, true);
+        finishActivity(
+          result.verification.status === "verified" ? "completed" : "warning",
+          result.verification.status === "verified"
+            ? "原任务已完成并通过验收"
+            : "原任务执行已结束，验收结果需要查看"
+        );
+      } catch (reason) {
+        let latest = null;
+        try {
+          latest = await getFolderExecutionStatus(pending.operationId);
+        } catch {
+          // 状态查询同样失败时保留本地任务标识，下一次刷新继续查询原任务。
+        }
+        if (latest?.status === "completed" && latest.result) {
+          finishRecoveredResult(latest.result, true);
+          finishActivity("completed", "已找回原任务的完成结果");
+        } else if (
+          latest?.status === "failed" ||
+          latest?.status === "needs_reconciliation"
+        ) {
+          appendFolderOperationNotice(
+            pending,
+            `原任务无法继续挂接：${
+              latest.error?.message ??
+              (reason instanceof Error ? reason.message : String(reason))
+            }。没有重新执行；请在「备份与恢复」中核对文件。`,
+            true
+          );
+          clearPendingFolderOperation(pending.operationId);
+          finishActivity("warning", "原任务需要核对");
+        } else {
+          markActivityInterrupted("连接中断，原任务标识已保留。刷新后可继续查询。");
+          finishActivity("warning", "连接中断，执行结果待确认");
+        }
+      } finally {
+        setActivePlanId(null);
+        setStatus("idle");
+      }
+    };
+
+    void attach();
+  }, []);
+
   function appendMessage(
     message: Omit<ChatMessage, "id" | "createdAt">
   ): string {
@@ -1436,6 +1657,125 @@ export default function App() {
       )
     );
     return id;
+  }
+
+  function appendFolderOperationOutcome(
+    pending: Pick<
+      PendingFolderOperation,
+      "conversationId" | "operationId" | "activityMessageId" | "plan"
+    >,
+    result: FolderExecuteResult,
+    recovered: boolean,
+    preserveActivity = false
+  ): void {
+    const createdAt = new Date().toISOString();
+    setChatHistory((current) => {
+      const requestedConversationExists = current.conversations.some(
+        (conversation) => conversation.id === pending.conversationId
+      );
+      const targetConversationId = requestedConversationExists
+        ? pending.conversationId
+        : current.activeConversationId;
+      return {
+        ...current,
+        conversations: current.conversations.map((conversation) => {
+          if (conversation.id !== targetConversationId) return conversation;
+          if (
+            conversation.messages.some(
+              (message) => message.folderOperationId === pending.operationId
+            )
+          ) {
+            return conversation;
+          }
+          const existingMessages = preserveActivity
+            ? conversation.messages
+            : conversation.messages.filter(
+                (message) =>
+                  message.id !== pending.activityMessageId ||
+                  !message.activityPending ||
+                  Boolean(message.activityLog)
+              );
+          const nextMessages = [
+            ...existingMessages,
+            {
+              id: messageId(),
+              role: "assistant" as const,
+              text: folderExecutionOutcomeText(pending.plan, result, recovered),
+              verification: result.verification,
+              executedPlanId: result.undo ? pending.plan.id : undefined,
+              executedUndoId: result.undo?.undoId,
+              folderOperationId: pending.operationId,
+              createdAt
+            }
+          ].slice(-MAX_MESSAGES_PER_CONVERSATION);
+          return {
+            ...conversation,
+            title: conversationTitle(nextMessages),
+            messages: nextMessages,
+            updatedAt: createdAt
+          };
+        })
+      };
+    });
+    if (result.verification.status === "verified") {
+      markPlanVerified(pending.plan.id);
+    }
+  }
+
+  function appendFolderOperationNotice(
+    pending: Pick<
+      PendingFolderOperation,
+      "conversationId" | "operationId" | "activityMessageId"
+    >,
+    text: string,
+    preserveActivity = false
+  ): void {
+    const createdAt = new Date().toISOString();
+    setChatHistory((current) => {
+      const requestedConversationExists = current.conversations.some(
+        (conversation) => conversation.id === pending.conversationId
+      );
+      const targetConversationId = requestedConversationExists
+        ? pending.conversationId
+        : current.activeConversationId;
+      return {
+        ...current,
+        conversations: current.conversations.map((conversation) => {
+          if (conversation.id !== targetConversationId) return conversation;
+          if (
+            conversation.messages.some(
+              (message) => message.folderOperationId === pending.operationId
+            )
+          ) {
+            return conversation;
+          }
+          const existingMessages = preserveActivity
+            ? conversation.messages
+            : conversation.messages.filter(
+                (message) =>
+                  message.id !== pending.activityMessageId ||
+                  !message.activityPending ||
+                  Boolean(message.activityLog)
+              );
+          const nextMessages = [
+            ...existingMessages,
+            {
+              id: messageId(),
+              role: "system" as const,
+              text,
+              folderOperationId: pending.operationId,
+              createdAt
+            }
+          ].slice(-MAX_MESSAGES_PER_CONVERSATION);
+          return {
+            ...conversation,
+            title: conversationTitle(nextMessages),
+            messages: nextMessages,
+            updatedAt: createdAt
+          };
+        })
+      };
+    });
   }
 
   function beginActivity(
@@ -3542,6 +3882,21 @@ export default function App() {
         phase: "preflight",
         stepId: "execution.preflight"
       });
+      const pendingFolderOperationBase = {
+        schemaVersion: 1 as const,
+        operationId,
+        folderPath: folderCatalog.folderPath,
+        conversationId:
+          activeConversation?.id ?? chatHistory.activeConversationId,
+        activityMessageId:
+          activeActivityMessageIdRef.current ?? `activity-${operationId}`,
+        plan,
+        createdAt: new Date().toISOString()
+      };
+      savePendingFolderOperation({
+        ...pendingFolderOperationBase,
+        sessionId: folderCatalog.sessionId
+      });
       setStatus("executing");
       let folderActivityStatus: "completed" | "warning" | "failed" =
         "completed";
@@ -3549,8 +3904,12 @@ export default function App() {
       try {
         const result = await withFolderSessionRecovery(
           folderCatalog.sessionId,
-          (sessionId) =>
-            executeFolderPlan(sessionId, plan, {
+          (sessionId) => {
+            savePendingFolderOperation({
+              ...pendingFolderOperationBase,
+              sessionId
+            });
+            return executeFolderPlan(sessionId, plan, {
               operationId,
               onProgress: applyProgressEvent,
               onConnectionState: (connectionState, message) => {
@@ -3566,7 +3925,8 @@ export default function App() {
                   markActivityConnected();
                 }
               }
-            })
+            });
+          }
         );
         recordDiagnosticEvent({
           timestamp: new Date().toISOString(),
@@ -3585,24 +3945,11 @@ export default function App() {
         });
         appendMessage({
           role: "assistant",
-          text: `「${plan.title}」已执行 ${
-            result.actionResults.length
-          } 步${verificationSummary(result.verification)}。${
-            result.filesModified.length > 0
-              ? `已写入：${result.filesModified.join("、")}`
-              : "目标状态已经符合要求，未写入文件，也未创建恢复点"
-          }${
-            result.backupDirectory
-              ? "；执行前副本已集中保存，可在「恢复点管理」中查看"
-              : ""
-          }${result.undo ? "；已记录本次恢复点" : ""}${
-            result.backupWarnings?.length
-              ? `。注意：${result.backupWarnings.join("；")}`
-              : ""
-          }`,
+          text: folderExecutionOutcomeText(plan, result, false),
           verification: result.verification,
           executedPlanId: result.undo ? plan.id : undefined,
-          executedUndoId: result.undo?.undoId
+          executedUndoId: result.undo?.undoId,
+          folderOperationId: operationId
         });
         pushFolderUndo(
           result.undo
@@ -3616,6 +3963,7 @@ export default function App() {
         if (result.verification.status === "verified") {
           markPlanVerified(plan.id);
         }
+        clearPendingFolderOperation(operationId);
         return true;
       } catch (reason) {
         folderActivitySummary =

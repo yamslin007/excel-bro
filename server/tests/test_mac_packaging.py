@@ -9,6 +9,7 @@ PREINSTALL_PATH = PROJECT_ROOT / "packaging" / "mac" / "pkg-scripts" / "preinsta
 POSTINSTALL_PATH = PROJECT_ROOT / "packaging" / "mac" / "pkg-scripts" / "postinstall"
 UNINSTALL_PATH = PROJECT_ROOT / "packaging" / "mac" / "uninstall.sh"
 RUNTIME_PATH = PROJECT_ROOT / "packaging" / "runtime.py"
+APP_DATA_PATH = PROJECT_ROOT / "server" / "app" / "app_data.py"
 WORKFLOW_PATH = PROJECT_ROOT / ".github" / "workflows" / "build-mac.yml"
 
 
@@ -90,11 +91,14 @@ def test_uninstall_removes_integration_but_preserves_user_configuration() -> Non
     assert 'rm -rf "$HOME/Library/Application Support' not in script
 
 
-def test_runtime_uses_application_support_on_macos() -> None:
-    script = _read(RUNTIME_PATH)
+def test_runtime_uses_shared_application_support_resolver_on_macos() -> None:
+    runtime = _read(RUNTIME_PATH)
+    resolver = _read(APP_DATA_PATH)
 
-    assert 'sys.platform == "darwin"' in script
-    assert 'Path.home() / "Library" / "Application Support" / "Excel Bro"' in script
+    assert "from server.app.app_data import application_data_root" in runtime
+    assert "data_root = application_data_root()" in runtime
+    assert 'sys.platform == "darwin"' in resolver
+    assert 'Path.home() / "Library" / "Application Support" / "Excel Bro"' in resolver
 
 
 def test_workflow_builds_arm64_mac_installer() -> None:

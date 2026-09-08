@@ -90,5 +90,9 @@
     "maxSummaryCharacters": 1000,
     "folderOperationTtlSeconds": 3600,
     "folderMaxPendingOperations": 100
+  },
+  "taskRecovery": {
+    "maxRegisteredDirectories": 50,
+    "operationRetentionDays": 30
   }
 }

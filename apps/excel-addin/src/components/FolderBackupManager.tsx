@@ -44,6 +44,17 @@ function canDeleteNormally(status: string): boolean {
   return ["ready", "restored", "rolled_back"].includes(status);
 }
 
+function canRecoverFromManagedRecord(status: string): boolean {
+  return [
+    "preparing",
+    "prepared",
+    "applying",
+    "ready",
+    "recovering",
+    "needs_attention"
+  ].includes(status);
+}
+
 export function FolderBackupManager({
   target,
   onClose,
@@ -54,6 +65,7 @@ export function FolderBackupManager({
 }: FolderBackupManagerProps) {
   const {
     data,
+    managedDirectory,
     loading,
     working,
     error,
@@ -62,12 +74,14 @@ export function FolderBackupManager({
     reload,
     openBackupDirectory,
     exportBackup,
+    recoverBackup,
     deleteBackup,
     setBackupPinned,
     cleanup,
     collectLegacy
   } = useFolderBackups(target);
   const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(null);
+  const [confirmingRecoveryId, setConfirmingRecoveryId] = useState<string | null>(null);
 
   const copyPath = async (path: string) => {
     try {
@@ -219,7 +233,8 @@ export function FolderBackupManager({
 
             {readOnly && data.backups.length > 0 && (
               <div className="folder-backup-feedback" role="status">
-                当前工作簿入口可以管理这个已登记目录内的备份，不会改变工作表数据范围。
+                当前工作簿入口可以管理这个已登记目录内的恢复点；恢复前会再次核对文件状态，
+                不会扩大工作表数据范围。
               </div>
             )}
 
@@ -244,6 +259,8 @@ export function FolderBackupManager({
               <div className="folder-backup-list">
                 {data.backups.map((backup) => {
                   const confirmingDelete = confirmingDeleteId === backup.undoId;
+                  const confirmingRecovery =
+                    confirmingRecoveryId === backup.undoId;
                   const restoreFileCount = backup.files.filter(
                     (file) => file.recoveryAction === "restore"
                   ).length;
@@ -252,6 +269,11 @@ export function FolderBackupManager({
                   ).length;
                   const backupBusy = isBackupBusy(backup.status);
                   const ordinaryDeleteAllowed = canDeleteNormally(backup.status);
+                  const managedRecoveryAllowed =
+                    !backup.canUndo &&
+                    managedDirectory?.status === "active" &&
+                    backup.revision !== undefined &&
+                    canRecoverFromManagedRecord(backup.status);
                   return (
                   <article className="folder-backup-card" key={backup.undoId}>
                     <header>
@@ -303,7 +325,47 @@ export function FolderBackupManager({
                         ))}
                       </ul>
                     </details>
-                    {confirmingDelete ? (
+                    {confirmingRecovery ? (
+                      <div
+                        className="folder-backup-delete-confirm folder-backup-recovery-confirm"
+                        role="alert"
+                      >
+                        <div>
+                          <strong>恢复到本次执行前？</strong>
+                          <span>
+                            将恢复 {restoreFileCount} 个原文件
+                            {createdFileCount > 0
+                              ? `，并移除本次执行新建的 ${createdFileCount} 个文件`
+                              : ""}
+                            。执行前会重新核对文件指纹；发现后续人工修改时会安全停止，不会覆盖。
+                          </span>
+                        </div>
+                        <div className="folder-backup-delete-confirm-actions">
+                          <button
+                            type="button"
+                            className="secondary-button"
+                            disabled={working}
+                            onClick={() => setConfirmingRecoveryId(null)}
+                          >
+                            取消
+                          </button>
+                          <button
+                            type="button"
+                            className="primary-button"
+                            disabled={working}
+                            onClick={async () => {
+                              const result = await recoverBackup(
+                                backup.undoId,
+                                backup.revision
+                              );
+                              if (result) setConfirmingRecoveryId(null);
+                            }}
+                          >
+                            确认恢复
+                          </button>
+                        </div>
+                      </div>
+                    ) : confirmingDelete ? (
                       <div className="folder-backup-delete-confirm" role="alert">
                         <div>
                           <strong>
@@ -365,6 +427,21 @@ export function FolderBackupManager({
                           }}
                         >
                           撤销本次执行
+                        </button>
+                      )}
+                      {managedRecoveryAllowed && (
+                        <button
+                          type="button"
+                          className="primary-button"
+                          disabled={working}
+                          onClick={() => {
+                            setConfirmingDeleteId(null);
+                            setConfirmingRecoveryId(backup.undoId);
+                          }}
+                        >
+                          {backup.status === "ready"
+                            ? "恢复到执行前"
+                            : "核对并恢复到执行前"}
                         </button>
                       )}
                       <button

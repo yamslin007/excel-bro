@@ -1408,6 +1408,46 @@ class FolderUndoResponse(BaseModel):
     remainingUndoCount: int = Field(ge=0)
 
 
+class ManagedFolderRecoveryDirectory(BaseModel):
+    directoryId: str = Field(min_length=1, max_length=100)
+    folderName: str = Field(min_length=1, max_length=255)
+    folderPath: str = Field(min_length=1, max_length=2000)
+    status: Literal["active", "unavailable", "unsafe"]
+    recoveryCount: int = Field(ge=0)
+    attentionCount: int = Field(ge=0)
+    operationCount: int = Field(ge=0)
+    lastScannedAt: str | None = Field(default=None, max_length=100)
+    statusReason: str | None = Field(default=None, max_length=2000)
+
+
+class ManagedFolderRecoveryDirectoriesResponse(BaseModel):
+    directories: list[ManagedFolderRecoveryDirectory] = Field(default_factory=list)
+
+
+class FolderManagedRecoveryRequest(BaseModel):
+    directoryId: str = Field(
+        min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
+    undoId: str = Field(
+        min_length=32, max_length=32, pattern=r"^[0-9a-f]{32}$"
+    )
+    expectedRevision: int = Field(ge=0)
+    operationId: str = Field(
+        min_length=8,
+        max_length=100,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{7,99}$",
+    )
+    confirmed: Literal[True]
+
+
+class FolderManagedRecoveryResponse(BaseModel):
+    operationId: str = Field(min_length=8, max_length=100)
+    undoId: str = Field(min_length=32, max_length=32)
+    status: Literal["completed"]
+    filesRestored: list[str]
+    alreadyRestored: bool
+
+
 class FolderBackupFileInfo(BaseModel):
     originalRelativePath: str = Field(min_length=1, max_length=2000)
     backupRelativePath: str | None = Field(default=None, max_length=2000)
@@ -1614,6 +1654,7 @@ class VerificationReport(BaseModel):
 
 
 class FolderExecuteResponse(BaseModel):
+    executionId: str | None = Field(default=None, min_length=8, max_length=100)
     filesModified: list[str]
     backups: list[str]
     backupDirectory: str | None = None

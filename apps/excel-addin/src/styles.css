@@ -5690,6 +5690,19 @@ textarea:focus-visible {
   font-size: var(--font-size-caption);
 }
 
+.folder-backup-recovery-confirm {
+  border-color: rgba(46, 125, 94, 0.32);
+  background: rgba(237, 249, 244, 0.94);
+}
+
+.folder-backup-recovery-confirm strong {
+  color: #245f49;
+}
+
+.folder-backup-recovery-confirm span {
+  color: #3f6557;
+}
+
 .folder-backup-delete-confirm-actions {
   display: flex;
   flex: 0 0 auto;

@@ -182,6 +182,30 @@ bash packaging/build_mac.sh
 
 文件夹执行中的 `changed` 必须由本地确定性逻辑计算，不能交给模型判断。只有能够无歧义比较的动作才可以返回 `false`；新动作或复杂对象尚未实现比较时必须默认为 `true`。当本次计划没有任何实际变化时，执行器不得替换原工作簿，也不得创建 `.excel-bro-backups`。恢复点 manifest 的 `recoveryAction` 是向后兼容的新增字段，读取旧记录时仍需通过 `backupRelativePath` 推导 `restore` 或 `remove`。
 
+### 文件夹任务中断与恢复调试
+
+开发和安装环境使用同一应用数据解析规则。设置 `EXCEL_BRO_CONFIG_DIR` 时以该目录为准；
+否则 Windows 使用 `%LOCALAPPDATA%\Excel Bro`，macOS 使用
+`~/Library/Application Support/Excel Bro`。文件夹任务账本位于 `tasks/state.sqlite3`，
+工作簿副本和恢复事务仍只放在用户已登记工作目录的 `.excel-bro-backups` 中，不复制到
+应用数据目录。
+
+- 前端发起文件夹写入前生成一次稳定 `operationId`，刷新、断线重连和状态查询必须复用；
+  不得因旧会话失效生成新标识。
+- `progress.folderOperationTtlSeconds` 只控制进程内热缓存；持久终态保留期由
+  `taskRecovery.operationRetentionDays` 控制。到期后只清除事件/结果载荷并保留幂等墓碑。
+- 服务重启后，已完成任务可重放结果；遗留 `running` 任务只能进入核对。阶段 A 不会从
+  DAG 节点继续，也没有预算追加入口。
+- `GET /api/folders/recovery/directories` 只返回后端登记目录。独立恢复必须携带目录 ID、
+  `undoId`、manifest revision、稳定恢复操作 ID 和明确确认。
+- `folder_write_guard` 对规范化工作目录提供进程内和跨进程排他。执行、撤销、恢复均须
+  经过它，测试不能用不同大小写或路径别名绕开。
+
+排查刷新后任务时，先查看 `GET /api/folders/execute/status?operationId=...`：`completed`
+表示可重放结果，`failed` 表示有确定失败，`needs_reconciliation` 表示不能安全判断是否
+完成。HTTP 410 `OPERATION_EXPIRED` 是安全终态，不允许重新发起同一标识。测试应用数据
+必须通过 `EXCEL_BRO_CONFIG_DIR` 指向隔离临时目录，不读取或修改用户真实账本。
+
 ### Custom Functions 资源
 
 清单中的 Custom Functions `<Script>` 必须指向可直接执行的 JavaScript 文件，而不是 `functions.html`。`npm run dev:addin` 的 `predev` 钩子和 `npm run build:addin` 都会生成 `apps/excel-addin/dist/functions.js`；开发服务会通过 `/functions.js` 提供该 IIFE bundle，安装包则直接从前端静态目录提供它。修改清单后，需停止并重新旁加载 Excel 加载项。
@@ -258,6 +282,7 @@ python -m compileall -q server/app
 | 拆分工作表并聚合 | `apps/excel-addin/src/splitAggregate.ts` |
 | API 请求与错误显示 | `apps/excel-addin/src/api.ts`, `server/app/main.py` |
 | 任务进度、事件归并与审查轨迹 | `contracts.ts`, `models.py`, `useActivityProgress.ts`, `main.py` |
+| 文件夹任务身份、重连与独立恢复 | `task_ledger.py`, `folder_mutex.py`, `folderOperationRecovery.ts`, `useFolderBackups.ts` |
 | 需求确认机制 | `server/app/intent.py` |
 | 模型配置、鉴权和 HTTP 适配 | `server/app/llm/` |
 | 模型 Agent 工具 | `server/app/excel_agent.py` |
@@ -360,6 +385,9 @@ ExcelApi 1.15 的数据源字符串读取。修改最低版本时必须同步预
 后端测试：
 
 - `test_main.py`：API 和错误协议
+- `test_task_ledger.py`：持久任务身份、事件重放、异常退出和过期墓碑
+- `test_folder_mutex.py`：同进程及跨进程文件夹写入排他
+- `test_managed_directories.py`、`test_managed_recovery.py`：受管目录发现和独立恢复
 - `test_models.py`：Pydantic 模型
 - `test_planner.py`：基础模式和规划
 - `test_agent_loop_protection.py`：Agent 预算、循环检测、降级与收尾提示

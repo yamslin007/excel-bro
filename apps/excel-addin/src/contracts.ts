@@ -849,6 +849,7 @@ export interface FolderSelection {
 }
 
 export interface FolderExecuteResult {
+  executionId?: string | null;
   filesModified: string[];
   backups: string[];
   backupDirectory?: string | null;
@@ -869,6 +870,43 @@ export interface FolderUndoResult {
   filesRestored: string[];
   executionsUndone: number;
   remainingUndoCount: number;
+}
+
+export interface FolderExecutionStatusResult {
+  operationId: string;
+  status: "running" | "completed" | "failed" | "needs_reconciliation";
+  lastSequence: number;
+  result?: FolderExecuteResult | null;
+  error?: {
+    status?: number;
+    code?: string;
+    message?: string;
+    retryable?: boolean;
+  } | null;
+}
+
+export interface ManagedFolderRecoveryDirectory {
+  directoryId: string;
+  folderName: string;
+  folderPath: string;
+  status: "active" | "unavailable" | "unsafe";
+  recoveryCount: number;
+  attentionCount: number;
+  operationCount: number;
+  lastScannedAt?: string | null;
+  statusReason?: string | null;
+}
+
+export interface ManagedFolderRecoveryDirectoriesResult {
+  directories: ManagedFolderRecoveryDirectory[];
+}
+
+export interface FolderManagedRecoveryResult {
+  operationId: string;
+  undoId: string;
+  status: "completed";
+  filesRestored: string[];
+  alreadyRestored: boolean;
 }
 
 export interface FolderBackupFileInfo {

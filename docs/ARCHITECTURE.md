@@ -222,10 +222,23 @@ token 统计。
 执行器直接向活动 Hook 推送预检、撤销数据捕获、逐动作、拆分子表和验证事件。
 文件夹执行通过 `/api/folders/execute/stream` 推送预检、逐动作、逐子表、集中备份、
 逐文件原子保存和验证事件。客户端断线时用同一 `operationId` 和最后收到的
-`afterSequence` 重连；服务端只补发缺失事件并复用最终结果，不会再次写文件。完成状态按
-`progress.folderOperationTtlSeconds` 保留，注册表容量由
-`progress.folderMaxPendingOperations` 限制；状态可通过
-`GET /api/folders/execute/status` 查询。
+`afterSequence` 重连。`FolderOperationLedger` 把请求指纹、单调事件、终态结果和错误
+持久保存到本机应用数据目录的 SQLite；内存记录只是热缓存。完成/失败记录按
+`taskRecovery.operationRetentionDays` 保留完整载荷，之后压缩成永久幂等墓碑，因此旧
+`operationId` 不会在 TTL、容量淘汰或服务重启后变成一份新的写入。旧的非流式写入
+入口统一拒绝执行。状态通过 `GET /api/folders/execute/status` 查询。
+
+前端在本地保存当前待挂接的文件夹操作身份；任务窗格刷新后先查询持久状态，再用同一
+操作标识重连。已完成结果可以跨服务重启重放；重启时仍是 `running` 或记录证据不足的
+任务转换为 `needs_reconciliation`，不会自动重做 Excel 写入。用户已登记的工作目录由
+持久索引定位，启动只扫描这些目录的受管恢复元数据，不扫描整盘，也不自动扩展授权。
+执行、撤销和独立恢复共享规范化目录的进程内及跨进程排他锁；独立恢复还必须核对
+manifest revision、生命周期、路径边界和写前/写后文件指纹。
+
+这是 [任务断点恢复指导 v0.3](TASK_CHECKPOINT_RECOVERY_GUIDE.md) 的阶段 A：支持持久
+身份、事件补收、安全挂起和恢复到执行前，但**不是**节点级继续执行。保存 DAG 当前节点、
+模型消息/摘要、工具游标与中间产物后跳过已完成节点，以及 60 秒提醒后的预算暂停继续，
+仍属于阶段 B/C。
 
 活动 Hook 从 `started` 起就把步骤加入有序时间线，按 `operationId + sequence` 隔离
 并去重事件，再按 `stepId` 原位更新。每段活动在消息流中拥有独立消息和稳定

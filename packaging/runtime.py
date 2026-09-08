@@ -9,6 +9,8 @@ from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from server.app.app_data import application_data_root
+
 
 def _bundle_root() -> Path:
     return Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[1]))
@@ -34,16 +36,10 @@ def _serve_frontend(install_root: Path) -> None:
     server.serve_forever()
 
 
-def _data_root() -> Path:
-    if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support" / "Excel Bro"
-    return Path(os.environ["LOCALAPPDATA"]) / "Excel Bro"
-
-
 def main() -> None:
     install_root = Path(sys.executable).resolve().parent
     bundle_root = _bundle_root()
-    data_root = _data_root()
+    data_root = application_data_root()
     data_root.mkdir(parents=True, exist_ok=True)
     os.environ["EXCEL_BRO_CONFIG_DIR"] = str(data_root)
     os.environ["EXCEL_BRO_CAPABILITIES_PATH"] = str(

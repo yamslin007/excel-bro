@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 from pathlib import Path
+import sqlite3
 
 import httpx
 import pytest
@@ -26,6 +27,7 @@ def clear_model_environment(
 ) -> None:
     turn_registry.reset()
     main_module._folder_operations.clear()
+    monkeypatch.setenv("EXCEL_BRO_CONFIG_DIR", str(tmp_path / "app-data"))
     for name in (
         "AI_API_KEY",
         "AI_BASE_URL",
@@ -744,6 +746,7 @@ def test_turn_stream_emits_steps_then_result(
 
 def test_folder_execute_stream_reuses_operation_without_writing_twice(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     calls = 0
 
@@ -792,6 +795,7 @@ def test_folder_execute_stream_reuses_operation_without_writing_twice(
         )
 
     monkeypatch.setattr(main_module, "execute_folder_plan", fake_execute)
+    monkeypatch.setattr(main_module, "folder_session_root", lambda _session_id: tmp_path)
     payload = {
         "sessionId": "session-stream-test",
         "operationId": "folder-operation-test",
@@ -807,6 +811,12 @@ def test_folder_execute_stream_reuses_operation_without_writing_twice(
     client = TestClient(app)
 
     first = client.post("/api/folders/execute/stream", json=payload)
+    main_module._folder_operations.clear()
+    monkeypatch.setattr(
+        main_module,
+        "folder_session_root",
+        lambda _session_id: (_ for _ in ()).throw(ValueError("会话已失效")),
+    )
     second = client.post(
         "/api/folders/execute/stream",
         json={**payload, "afterSequence": 1},
@@ -829,6 +839,184 @@ def test_folder_execute_stream_reuses_operation_without_writing_twice(
     assert [name for name, _ in second_events] == ["result"]
     assert status.json()["status"] == "completed"
     assert status.json()["lastSequence"] == 1
+
+
+def test_folder_execute_stream_reports_unknown_effect_as_needs_reconciliation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def fake_execute(request, on_progress=None):
+        raise RuntimeError("模拟保存窗口中断")
+
+    monkeypatch.setattr(main_module, "execute_folder_plan", fake_execute)
+    monkeypatch.setattr(main_module, "folder_session_root", lambda _session_id: tmp_path)
+    payload = {
+        "sessionId": "session-reconciliation-test",
+        "operationId": "folder-reconciliation-operation",
+        "plan": {
+            "id": "folder-plan-reconciliation",
+            "title": "创建结果表",
+            "summary": "创建一张结果表",
+            "assumptions": [],
+            "warnings": [],
+            "actions": [{"type": "createWorksheet", "sheet": "结果"}],
+        },
+    }
+    client = TestClient(app)
+
+    response = client.post("/api/folders/execute/stream", json=payload)
+    status = client.get(
+        "/api/folders/execute/status", params={"operationId": payload["operationId"]}
+    )
+
+    assert response.status_code == 200
+    assert [name for name, _payload in _parse_sse(response.text)][-1] == "error"
+    assert status.status_code == 200
+    assert status.json()["status"] == "needs_reconciliation"
+    assert status.json()["error"]["code"] == (
+        "FOLDER_EXECUTION_REQUIRES_RECONCILIATION"
+    )
+
+
+def test_folder_execute_stream_refuses_unfinished_persisted_operation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls = 0
+
+    def fake_execute(request, on_progress=None):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("遗留 running 任务不能被重新执行")
+
+    monkeypatch.setattr(main_module, "execute_folder_plan", fake_execute)
+    monkeypatch.setattr(main_module, "folder_session_root", lambda _session_id: tmp_path)
+    payload = {
+        "sessionId": "session-stream-test",
+        "operationId": "folder-interrupted-operation",
+        "plan": {
+            "id": "folder-plan-test",
+            "title": "创建结果表",
+            "summary": "创建一张结果表",
+            "assumptions": [],
+            "warnings": [],
+            "actions": [{"type": "createWorksheet", "sheet": "结果"}],
+        },
+    }
+    validated_request = main_module.FolderExecuteRequest.model_validate(payload)
+    request_fingerprint = main_module._folder_request_fingerprint(validated_request)
+    main_module._folder_operation_ledger.register(
+        payload["operationId"], request_fingerprint
+    )
+    main_module._folder_operations.clear()
+    response = TestClient(app).post("/api/folders/execute/stream", json=payload)
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "OPERATION_REQUIRES_RECONCILIATION"
+    assert calls == 0
+
+
+def test_folder_execute_stream_refuses_expired_operation_without_reexecution(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    calls = 0
+
+    def fake_execute(request, on_progress=None):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("过期任务不能被重新执行")
+
+    monkeypatch.setattr(main_module, "execute_folder_plan", fake_execute)
+    monkeypatch.setattr(main_module, "folder_session_root", lambda _session_id: tmp_path)
+    payload = {
+        "sessionId": "session-expired-test",
+        "operationId": "folder-expired-operation",
+        "plan": {
+            "id": "folder-plan-expired",
+            "title": "创建结果表",
+            "summary": "创建一张结果表",
+            "assumptions": [],
+            "warnings": [],
+            "actions": [{"type": "createWorksheet", "sheet": "结果"}],
+        },
+    }
+    validated_request = main_module.FolderExecuteRequest.model_validate(payload)
+    request_fingerprint = main_module._folder_request_fingerprint(validated_request)
+    main_module._folder_operation_ledger.register(
+        payload["operationId"], request_fingerprint
+    )
+    main_module._folder_operation_ledger.finish(
+        payload["operationId"],
+        status="completed",
+        result={"filesModified": ["结果.xlsx"]},
+    )
+    with sqlite3.connect(main_module._folder_operation_ledger._path()) as connection:
+        connection.execute(
+            "UPDATE folder_operations SET updated_at = 0 WHERE operation_id = ?",
+            (payload["operationId"],),
+        )
+    assert main_module._folder_operation_ledger.compact_terminal_operations(30) == 1
+
+    client = TestClient(app)
+    response = client.post("/api/folders/execute/stream", json=payload)
+    status = client.get(
+        "/api/folders/execute/status",
+        params={"operationId": payload["operationId"]},
+    )
+
+    assert response.status_code == 410
+    assert response.json()["detail"]["code"] == "OPERATION_EXPIRED"
+    assert status.status_code == 410
+    assert status.json()["detail"]["code"] == "OPERATION_EXPIRED"
+    assert calls == 0
+
+
+def test_legacy_folder_execute_endpoint_cannot_bypass_idempotency() -> None:
+    response = TestClient(app).post(
+        "/api/folders/execute",
+        json={
+            "sessionId": "legacy-session",
+            "plan": {
+                "id": "folder-plan-test",
+                "title": "创建结果表",
+                "summary": "创建一张结果表",
+                "assumptions": [],
+                "warnings": [],
+                "actions": [{"type": "createWorksheet", "sheet": "结果"}],
+            },
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "IDEMPOTENT_EXECUTION_REQUIRED"
+
+
+def test_opening_backup_manager_registers_directory_for_restart_discovery(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "work"
+    root.mkdir()
+    client = TestClient(app)
+
+    backups = client.get(
+        "/api/folders/backups", params={"folderPath": str(root)}
+    )
+    directories = client.get("/api/folders/recovery/directories")
+
+    assert backups.status_code == 200
+    assert directories.status_code == 200
+    registered = directories.json()["directories"]
+    assert len(registered) == 1
+    assert Path(registered[0]["folderPath"]) == root
+    assert registered[0]["status"] == "active"
+    assert not (root / ".excel-bro-backups").exists()
+
+    removed = client.delete(
+        f"/api/folders/recovery/directories/{registered[0]['directoryId']}"
+    )
+    assert removed.status_code == 200
+    assert client.get("/api/folders/recovery/directories").json()["directories"] == []
 
 
 def test_turn_stream_serializes_model_error_as_event(

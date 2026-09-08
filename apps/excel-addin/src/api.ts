@@ -20,6 +20,9 @@ import {
   type FolderBackupPinResult,
   type FolderBackupsResult,
   type FolderExecuteResult,
+  type FolderExecutionStatusResult,
+  type FolderManagedRecoveryResult,
+  type ManagedFolderRecoveryDirectoriesResult,
   type FolderLegacyCollectResult,
   type FolderUndoResult,
   type FolderSelection,
@@ -531,15 +534,6 @@ export async function executeFolderPlan(
         }),
         signal: hooks.signal
       });
-      if (response.status === 404 || response.status === 405) {
-        const legacy = await fetch(`${API_BASE_URL}/api/folders/execute`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ sessionId, plan }),
-          signal: hooks.signal
-        });
-        return responseJson<FolderExecuteResult>(legacy);
-      }
       if (!response.ok) {
         throw await requestError(response, "文件夹计划流式执行失败");
       }
@@ -646,6 +640,16 @@ export async function executeFolderPlan(
   throw new Error("文件夹计划执行失败");
 }
 
+export async function getFolderExecutionStatus(
+  operationId: string
+): Promise<FolderExecutionStatusResult> {
+  const params = new URLSearchParams({ operationId });
+  const response = await fetch(
+    `${API_BASE_URL}/api/folders/execute/status?${params.toString()}`
+  );
+  return responseJson<FolderExecutionStatusResult>(response);
+}
+
 export async function undoFolderExecution(
   sessionId: string,
   undoId: string
@@ -671,6 +675,36 @@ export async function listFolderBackups(
     `${API_BASE_URL}/api/folders/backups?${params.toString()}`
   );
   return responseJson<FolderBackupsResult>(response);
+}
+
+export async function listManagedFolderRecoveryDirectories(): Promise<ManagedFolderRecoveryDirectoriesResult> {
+  const response = await fetch(`${API_BASE_URL}/api/folders/recovery/directories`);
+  return responseJson<ManagedFolderRecoveryDirectoriesResult>(response);
+}
+
+export async function removeManagedFolderRecoveryDirectory(
+  directoryId: string
+): Promise<{ directoryId: string; removed: boolean }> {
+  const response = await fetch(
+    `${API_BASE_URL}/api/folders/recovery/directories/${encodeURIComponent(directoryId)}`,
+    { method: "DELETE" }
+  );
+  return responseJson<{ directoryId: string; removed: boolean }>(response);
+}
+
+export async function restoreManagedFolderBackup(input: {
+  directoryId: string;
+  undoId: string;
+  expectedRevision: number;
+  operationId: string;
+  confirmed: true;
+}): Promise<FolderManagedRecoveryResult> {
+  const response = await fetch(`${API_BASE_URL}/api/folders/recovery/restore`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input)
+  });
+  return responseJson<FolderManagedRecoveryResult>(response);
 }
 
 export async function openFolderBackupDirectory(

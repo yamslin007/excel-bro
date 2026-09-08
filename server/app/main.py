@@ -7,8 +7,10 @@ import logging
 import uuid
 import time
 from collections import deque
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Any, AsyncIterator
 
 from dotenv import load_dotenv
@@ -32,12 +34,15 @@ from .folder_workbooks import (
     cleanup_folder_backups,
     delete_folder_backup,
     execute_folder_plan,
+    folder_session_root,
+    inspect_managed_folder_recovery,
     export_folder_backup,
     list_folder_backups,
     open_folder_backup_directory,
     set_folder_backup_pinned,
     query_folder_data,
     refresh_folder,
+    restore_managed_folder_backup,
     scan_folder_by_path,
     select_and_scan_folder,
     collect_legacy_folder_backups,
@@ -61,10 +66,14 @@ from .models import (
     FolderExecuteResponse,
     FolderLegacyCollectRequest,
     FolderLegacyCollectResponse,
+    FolderManagedRecoveryRequest,
+    FolderManagedRecoveryResponse,
     FolderUndoRequest,
     FolderUndoResponse,
     IntentCheckRequest,
     IntentCheckResponse,
+    ManagedFolderRecoveryDirectoriesResponse,
+    ManagedFolderRecoveryDirectory,
     ModelSettingsResponse,
     PlanRequest,
     PlanValidateRequest,
@@ -97,6 +106,13 @@ from .llm import (
     upsert_managed_connection,
     update_model_api_key,
 )
+from .folder_mutex import FolderWriteBusyError
+from .task_ledger import (
+    ExpiredOperationError,
+    FolderOperationLedger,
+    FolderOperationRecord,
+    ManagedDirectoryRecord,
+)
 from .planner import create_plan
 from .plan_chat import chat_modify_plan
 from .rule_generator import (
@@ -109,10 +125,27 @@ from .turn_state import TurnStateError, turn_registry
 load_dotenv("server/.env")
 logger = logging.getLogger(__name__)
 
+@asynccontextmanager
+async def _app_lifespan(_app: FastAPI):
+    try:
+        await run_in_threadpool(
+            _folder_operation_ledger.compact_terminal_operations,
+            capability_int("taskRecovery", "operationRetentionDays"),
+        )
+    except Exception:
+        logger.exception("启动时无法压缩已过期的文件夹任务记录")
+    try:
+        await run_in_threadpool(_scan_registered_work_directories)
+    except Exception:
+        logger.exception("启动时无法扫描已登记工作目录的恢复元数据")
+    yield
+
+
 app = FastAPI(
     title="Excel Bro Local Service",
     version="0.1.0",
     description="Local planning and analysis service for the Excel Bro add-in.",
+    lifespan=_app_lifespan,
 )
 
 ALLOWED_ORIGINS = [
@@ -606,6 +639,92 @@ class _FolderOperationState:
 
 _folder_operations: dict[str, _FolderOperationState] = {}
 _folder_operations_lock = asyncio.Lock()
+_folder_operation_ledger = FolderOperationLedger()
+
+
+def _scan_registered_work_directories() -> list[ManagedDirectoryRecord]:
+    scanned: list[ManagedDirectoryRecord] = []
+    for registered in _folder_operation_ledger.managed_directories():
+        path = Path(registered.path)
+        try:
+            inspection = inspect_managed_folder_recovery(path)
+        except (OSError, ValueError) as error:
+            status = "unavailable" if not path.exists() else "unsafe"
+            scanned.append(
+                _folder_operation_ledger.record_directory_scan(
+                    registered.directory_id,
+                    status=status,
+                    recovery_count=registered.recovery_count,
+                    attention_count=max(registered.attention_count, 1),
+                    operation_count=registered.operation_count,
+                    error=str(error),
+                )
+            )
+            continue
+        scanned.append(
+            _folder_operation_ledger.record_directory_scan(
+                registered.directory_id,
+                status="active",
+                recovery_count=int(inspection["recoveryCount"]),
+                attention_count=int(inspection["attentionCount"]),
+                operation_count=int(inspection["operationCount"]),
+                error=(
+                    "；".join(str(item) for item in inspection["warnings"])[:2000]
+                    if inspection["warnings"]
+                    else None
+                ),
+            )
+        )
+    return scanned
+
+
+def _register_work_directory(folder_path: str) -> ManagedDirectoryRecord:
+    return _folder_operation_ledger.register_directory(
+        folder_path,
+        max_entries=capability_int("taskRecovery", "maxRegisteredDirectories"),
+    )
+
+
+def _managed_directory_view(
+    record: ManagedDirectoryRecord,
+) -> ManagedFolderRecoveryDirectory:
+    return ManagedFolderRecoveryDirectory(
+        directoryId=record.directory_id,
+        folderName=Path(record.path).name or record.path,
+        folderPath=record.path,
+        status=record.status,
+        recoveryCount=record.recovery_count,
+        attentionCount=record.attention_count,
+        operationCount=record.operation_count,
+        lastScannedAt=(
+            datetime.fromtimestamp(record.last_scanned_at).astimezone().isoformat()
+            if record.last_scanned_at is not None
+            else None
+        ),
+        statusReason=record.last_error,
+    )
+
+
+def _folder_state_from_record(record: FolderOperationRecord) -> _FolderOperationState:
+    return _FolderOperationState(
+        request_fingerprint=record.request_fingerprint,
+        created_at=record.created_at,
+        events=_folder_operation_ledger.events(record.operation_id),
+        sequence=record.last_sequence,
+        status=record.status,
+        result=record.result,
+        error=record.error,
+    )
+
+
+def _task_state_error(error: Exception) -> HTTPException:
+    logger.exception("持久任务记录不可用")
+    return service_error(
+        503,
+        "TASK_STATE_UNAVAILABLE",
+        "无法安全保存或读取任务状态，已停止执行以避免重复写入。",
+        retryable=False,
+    )
 
 
 def _folder_request_fingerprint(request: FolderExecuteRequest) -> str:
@@ -632,13 +751,13 @@ async def _record_folder_progress(
     state: _FolderOperationState,
     event: dict[str, object],
 ) -> None:
-    state.sequence += 1
+    next_sequence = state.sequence + 1
     payload = {
         "schemaVersion": 1,
         "operationId": operation_id,
-        "sequence": state.sequence,
+        "sequence": next_sequence,
         "phase": event.get("phase", "executing"),
-        "stepId": event.get("stepId", f"folder-{state.sequence}"),
+        "stepId": event.get("stepId", f"folder-{next_sequence}"),
         "status": event.get("status", "progress"),
         "title": event.get("title", "正在执行文件夹操作"),
         "summary": event.get("summary"),
@@ -659,7 +778,15 @@ async def _record_folder_progress(
     validated_event = TaskProgressEvent.model_validate(payload)
     _log_task_progress(validated_event)
     validated = validated_event.model_dump(mode="json")
+    execution_id = event.get("executionId")
+    _folder_operation_ledger.append_event(
+        operation_id,
+        next_sequence,
+        validated,
+        execution_id=execution_id if isinstance(execution_id, str) else None,
+    )
     async with state.condition:
+        state.sequence = next_sequence
         state.events.append(validated)
         state.condition.notify_all()
 
@@ -679,10 +806,6 @@ async def _run_folder_operation(
 
     try:
         result = await run_in_threadpool(execute_folder_plan, request, on_progress)
-        async with state.condition:
-            state.result = result.model_dump(mode="json")
-            state.status = "completed"
-            state.condition.notify_all()
     except Exception as error:
         expected_error = isinstance(error, (OSError, ValueError, RuntimeError))
         if not expected_error:
@@ -694,30 +817,108 @@ async def _run_folder_operation(
             if expected_error
             else "文件夹执行发生未预期错误，请查看诊断日志。"
         )
-        await _record_folder_progress(
-            operation_id,
-            state,
-            {
-                "phase": "executing",
-                "stepId": "folder.failed",
-                "status": "failed",
-                "title": "文件夹操作执行失败",
-                "summary": public_message[:1000],
-            },
-        )
-        async with state.condition:
-            state.error = (
-                _folder_stream_error(error)
-                if expected_error
-                else {
-                    "status": 500,
-                    "code": "INTERNAL_ERROR",
-                    "message": public_message,
-                    "retryable": False,
-                }
+        try:
+            await _record_folder_progress(
+                operation_id,
+                state,
+                {
+                    "phase": "executing",
+                    "stepId": "folder.failed",
+                    "status": "failed",
+                    "title": "文件夹操作执行失败",
+                    "summary": public_message[:1000],
+                },
             )
-            state.status = "failed"
+        except Exception:
+            logger.exception(
+                "文件夹执行失败后无法持久保存进度 operation_id=%s", operation_id
+            )
+        error_payload = {
+            "status": 409 if expected_error else 500,
+            "code": (
+                "FOLDER_EXECUTION_REQUIRES_RECONCILIATION"
+                if expected_error
+                else "INTERNAL_ERROR"
+            ),
+            "message": (
+                f"{public_message} 为避免重复写入，请先核对任务状态。"
+                if expected_error
+                else public_message
+            ),
+            "retryable": False,
+        }
+        try:
+            _folder_operation_ledger.finish(
+                operation_id,
+                status="needs_reconciliation",
+                error=error_payload,
+            )
+        except Exception:
+            logger.exception(
+                "文件夹执行失败后无法持久提交状态 operation_id=%s", operation_id
+            )
+        async with state.condition:
+            state.error = error_payload
+            state.status = "needs_reconciliation"
             state.condition.notify_all()
+        return
+
+    result_payload = result.model_dump(mode="json")
+    execution_id = result_payload.get("executionId")
+    undo = result_payload.get("undo")
+    undo_id = undo.get("undoId") if isinstance(undo, dict) else None
+    try:
+        _folder_operation_ledger.finish(
+            operation_id,
+            status="completed",
+            result=result_payload,
+            execution_id=execution_id if isinstance(execution_id, str) else None,
+            undo_id=undo_id if isinstance(undo_id, str) else None,
+        )
+    except Exception:
+        logger.exception(
+            "文件夹写入完成但无法持久提交完成状态 operation_id=%s", operation_id
+        )
+        persisted: FolderOperationRecord | None = None
+        try:
+            persisted = _folder_operation_ledger.get(operation_id)
+        except Exception:
+            logger.exception(
+                "文件夹写入完成后无法复核持久状态 operation_id=%s", operation_id
+            )
+        if persisted is not None and persisted.status == "completed":
+            async with state.condition:
+                state.result = persisted.result or result_payload
+                state.status = "completed"
+                state.condition.notify_all()
+            return
+        error_payload = {
+            "status": 503,
+            "code": "TASK_STATE_UNAVAILABLE",
+            "message": "文件可能已经写入，但完成状态未能安全保存。请先核对任务，系统不会自动重试。",
+            "retryable": False,
+        }
+        try:
+            _folder_operation_ledger.finish(
+                operation_id,
+                status="needs_reconciliation",
+                error=error_payload,
+            )
+        except Exception:
+            logger.exception(
+                "无法把状态提交失败的文件夹任务标记为待核对 operation_id=%s",
+                operation_id,
+            )
+        async with state.condition:
+            state.error = error_payload
+            state.status = "needs_reconciliation"
+            state.condition.notify_all()
+        return
+
+    async with state.condition:
+        state.result = result_payload
+        state.status = "completed"
+        state.condition.notify_all()
 
 
 def _prune_folder_operations(now: float) -> None:
@@ -849,14 +1050,22 @@ async def turn_stream(request: TurnRequest) -> StreamingResponse:
 
 @app.post("/api/folders/select", response_model=FolderCatalog | None)
 async def select_folder() -> FolderCatalog | None:
-    return await run_in_threadpool(select_and_scan_folder)
+    catalog = await run_in_threadpool(select_and_scan_folder)
+    if catalog is not None:
+        try:
+            await run_in_threadpool(_register_work_directory, catalog.folderPath)
+        except Exception as error:
+            raise _task_state_error(error) from error
+    return catalog
 
 
 @app.post("/api/folders/scan", response_model=FolderCatalog)
 async def scan_folder_endpoint(request: FolderScanRequest) -> FolderCatalog:
     """按路径扫描文件夹（不弹对话框），供前端在会话丢失后静默重建。"""
     try:
-        return await run_in_threadpool(scan_folder_by_path, request.folderPath)
+        catalog = await run_in_threadpool(scan_folder_by_path, request.folderPath)
+        await run_in_threadpool(_register_work_directory, catalog.folderPath)
+        return catalog
     except (OSError, ValueError) as error:
         raise service_error(
             422, "FOLDER_DATA_ERROR", str(error), retryable=True
@@ -875,6 +1084,209 @@ async def refresh_folder_endpoint(
         ) from error
 
 
+@app.get(
+    "/api/folders/recovery/directories",
+    response_model=ManagedFolderRecoveryDirectoriesResponse,
+)
+async def managed_folder_recovery_directories(
+) -> ManagedFolderRecoveryDirectoriesResponse:
+    try:
+        records = await run_in_threadpool(_scan_registered_work_directories)
+    except Exception as error:
+        raise _task_state_error(error) from error
+    return ManagedFolderRecoveryDirectoriesResponse(
+        directories=[
+            _managed_directory_view(record)
+            for record in records
+            if record.status != "removed"
+        ]
+    )
+
+
+@app.delete("/api/folders/recovery/directories/{directory_id}")
+async def remove_managed_folder_recovery_directory(
+    directory_id: str,
+) -> dict[str, object]:
+    if len(directory_id) != 64 or any(
+        character not in "0123456789abcdef" for character in directory_id
+    ):
+        raise service_error(
+            422, "INVALID_REQUEST", "工作目录标识无效。", retryable=False
+        )
+    try:
+        removed = await run_in_threadpool(
+            _folder_operation_ledger.remove_directory, directory_id
+        )
+    except Exception as error:
+        raise _task_state_error(error) from error
+    if not removed:
+        raise service_error(
+            404,
+            "MANAGED_DIRECTORY_NOT_FOUND",
+            "未找到已登记的工作目录。",
+            retryable=False,
+        )
+    return {"directoryId": directory_id, "removed": True}
+
+
+@app.post(
+    "/api/folders/recovery/restore",
+    response_model=FolderManagedRecoveryResponse,
+)
+async def restore_managed_folder_recovery(
+    request: FolderManagedRecoveryRequest,
+) -> FolderManagedRecoveryResponse:
+    try:
+        directory = await run_in_threadpool(
+            _folder_operation_ledger.managed_directory, request.directoryId
+        )
+    except Exception as error:
+        raise _task_state_error(error) from error
+    if directory is None or directory.status == "removed":
+        raise service_error(
+            404,
+            "MANAGED_DIRECTORY_NOT_FOUND",
+            "未找到已登记的工作目录，请重新选择原目录。",
+            retryable=False,
+        )
+    if directory.status != "active":
+        raise service_error(
+            409,
+            "MANAGED_DIRECTORY_UNAVAILABLE",
+            directory.last_error or "原工作目录当前不可用，请重新选择并核对。",
+            retryable=False,
+        )
+
+    recovery_fingerprint = hashlib.sha256(
+        json.dumps(
+            {
+                "directoryId": request.directoryId,
+                "undoId": request.undoId,
+                "expectedRevision": request.expectedRevision,
+                "direction": "restore_before",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    try:
+        operation, created = await run_in_threadpool(
+            _folder_operation_ledger.register,
+            request.operationId,
+            recovery_fingerprint,
+            work_directory=directory.path,
+            plan_id=f"recovery:{request.undoId}",
+        )
+    except ExpiredOperationError as error:
+        raise service_error(
+            410,
+            "OPERATION_EXPIRED",
+            "这个恢复操作已超过保留期，不能用原标识重新执行。请刷新恢复列表后重新确认。",
+            retryable=False,
+        ) from error
+    except Exception as error:
+        raise _task_state_error(error) from error
+    if operation.request_fingerprint != recovery_fingerprint:
+        raise service_error(
+            409,
+            "OPERATION_ID_CONFLICT",
+            "这个恢复操作标识已用于其他请求，请刷新恢复列表。",
+            retryable=False,
+        )
+    if operation.status == "completed" and operation.result is not None:
+        return FolderManagedRecoveryResponse.model_validate(operation.result)
+    if not created and operation.status == "running":
+        # 相同恢复身份允许可重入：若上一请求仍在执行，文件夹排他锁会返回 busy；
+        # 若文件已恢复但完成事务未提交，效果核对会识别执行前指纹并补记完成状态。
+        pass
+    elif operation.status in {"failed", "needs_reconciliation"}:
+        try:
+            operation = await run_in_threadpool(
+                _folder_operation_ledger.reopen_for_recovery,
+                request.operationId,
+                recovery_fingerprint,
+            )
+        except Exception as error:
+            raise _task_state_error(error) from error
+    elif operation.status != "running":
+        raise service_error(
+            409,
+            "RECOVERY_OPERATION_CONFLICT",
+            "恢复操作状态已变化，请刷新后核对。",
+            retryable=False,
+        )
+
+    try:
+        restored = await run_in_threadpool(
+            restore_managed_folder_backup,
+            Path(directory.path),
+            undo_id=request.undoId,
+            expected_revision=request.expectedRevision,
+            recovery_operation_id=request.operationId,
+        )
+    except FolderWriteBusyError as error:
+        raise service_error(
+            409, "RECOVERY_OPERATION_BUSY", str(error), retryable=True
+        ) from error
+    except (OSError, ValueError, RuntimeError) as error:
+        error_payload = {
+            "status": 409,
+            "code": "RECOVERY_REQUIRES_RECONCILIATION",
+            "message": str(error),
+            "retryable": False,
+        }
+        try:
+            await run_in_threadpool(
+                _folder_operation_ledger.finish,
+                request.operationId,
+                status="needs_reconciliation",
+                error=error_payload,
+                undo_id=request.undoId,
+            )
+        except Exception:
+            logger.exception(
+                "无法持久提交恢复待核对状态 operation_id=%s", request.operationId
+            )
+        raise service_error(
+            409,
+            "RECOVERY_REQUIRES_RECONCILIATION",
+            str(error),
+            retryable=False,
+        ) from error
+
+    response = FolderManagedRecoveryResponse(
+        operationId=request.operationId,
+        undoId=request.undoId,
+        status="completed",
+        filesRestored=restored.filesRestored,
+        alreadyRestored=not restored.filesRestored,
+    )
+    payload = response.model_dump(mode="json")
+    try:
+        await run_in_threadpool(
+            _folder_operation_ledger.finish,
+            request.operationId,
+            status="completed",
+            result=payload,
+            undo_id=request.undoId,
+        )
+    except Exception as error:
+        try:
+            persisted = await run_in_threadpool(
+                _folder_operation_ledger.get, request.operationId
+            )
+        except Exception:
+            persisted = None
+        if (
+            persisted is not None
+            and persisted.status == "completed"
+            and persisted.result is not None
+        ):
+            return FolderManagedRecoveryResponse.model_validate(persisted.result)
+        raise _task_state_error(error) from error
+    return response
+
+
 @app.post("/api/folders/snapshot", response_model=WorkbookSnapshot)
 async def folder_snapshot(request: FolderSnapshotRequest) -> WorkbookSnapshot:
     try:
@@ -888,19 +1300,12 @@ async def folder_snapshot(request: FolderSnapshotRequest) -> WorkbookSnapshot:
 
 @app.post("/api/folders/execute", response_model=FolderExecuteResponse)
 async def folder_execute(request: FolderExecuteRequest) -> FolderExecuteResponse:
-    try:
-        return await run_in_threadpool(execute_folder_plan, request)
-    except (OSError, ValueError) as error:
-        raise service_error(
-            422, "FOLDER_EXECUTION_ERROR", str(error), retryable=True
-        ) from error
-    except RuntimeError as error:
-        # 原子替换失败并已回滚。预检会拦掉「文件被占用」这个常见原因，但仍可能
-        # 输在竞态上（预检之后、替换之前文件被打开）。这类失败必须是明确的 4xx：
-        # 逃逸成 500 会丢掉 CORS 头，前端只能看到 Failed to fetch。
-        raise service_error(
-            422, "FOLDER_EXECUTION_ERROR", str(error), retryable=True
-        ) from error
+    raise service_error(
+        409,
+        "IDEMPOTENT_EXECUTION_REQUIRED",
+        "此兼容入口不再接受写入；请使用带稳定 operationId 的流式执行入口。",
+        retryable=False,
+    )
 
 
 @app.post("/api/folders/execute/stream")
@@ -926,6 +1331,46 @@ async def folder_execute_stream(request: FolderExecuteRequest) -> StreamingRespo
                 retryable=False,
             )
         if state is None:
+            try:
+                existing_record = _folder_operation_ledger.get(operation_id)
+            except Exception as error:
+                raise _task_state_error(error) from error
+            if existing_record is None:
+                try:
+                    expired_fingerprint = _folder_operation_ledger.expired_fingerprint(
+                        operation_id
+                    )
+                except Exception as error:
+                    raise _task_state_error(error) from error
+                if expired_fingerprint is not None:
+                    raise service_error(
+                        410,
+                        "OPERATION_EXPIRED",
+                        "这个执行任务已超过结果保留期；为避免重复写入，不会重新创建执行。",
+                        retryable=False,
+                    )
+            if existing_record is not None:
+                if existing_record.request_fingerprint != request_fingerprint:
+                    raise service_error(
+                        409,
+                        "OPERATION_ID_CONFLICT",
+                        "这个 operationId 已用于另一份执行请求，请重新生成操作标识。",
+                        retryable=False,
+                    )
+                if existing_record.status in {"completed", "failed"}:
+                    try:
+                        state = _folder_state_from_record(existing_record)
+                    except Exception as error:
+                        raise _task_state_error(error) from error
+                    _folder_operations[operation_id] = state
+                else:
+                    raise service_error(
+                        409,
+                        "OPERATION_REQUIRES_RECONCILIATION",
+                        "上次执行没有留下可确认的完成状态。为避免重复写入，已停止自动重试，请先核对任务。",
+                        retryable=False,
+                    )
+        if state is None:
             max_operations = capability_int(
                 "progress", "folderMaxPendingOperations"
             )
@@ -949,14 +1394,58 @@ async def folder_execute_stream(request: FolderExecuteRequest) -> StreamingRespo
                     "当前文件夹执行任务过多，请稍后重试。",
                     retryable=True,
                 )
-            state = _FolderOperationState(
-                request_fingerprint=request_fingerprint,
-                created_at=time.time(),
-            )
-            _folder_operations[operation_id] = state
-            state.task = asyncio.create_task(
-                _run_folder_operation(operation_id, state, request)
-            )
+            try:
+                work_directory = str(folder_session_root(request.sessionId))
+            except ValueError as error:
+                raise service_error(
+                    422, "FOLDER_DATA_ERROR", str(error), retryable=True
+                ) from error
+            try:
+                record, created = _folder_operation_ledger.register(
+                    operation_id,
+                    request_fingerprint,
+                    work_directory=work_directory,
+                    session_id=request.sessionId,
+                    plan_id=request.plan.id,
+                )
+            except ExpiredOperationError as error:
+                raise service_error(
+                    410,
+                    "OPERATION_EXPIRED",
+                    "这个执行任务已超过结果保留期；为避免重复写入，不会重新创建执行。",
+                    retryable=False,
+                ) from error
+            except Exception as error:
+                raise _task_state_error(error) from error
+            if record.request_fingerprint != request_fingerprint:
+                raise service_error(
+                    409,
+                    "OPERATION_ID_CONFLICT",
+                    "这个 operationId 已用于另一份执行请求，请重新生成操作标识。",
+                    retryable=False,
+                )
+            if created:
+                state = _FolderOperationState(
+                    request_fingerprint=request_fingerprint,
+                    created_at=record.created_at,
+                )
+                _folder_operations[operation_id] = state
+                state.task = asyncio.create_task(
+                    _run_folder_operation(operation_id, state, request)
+                )
+            elif record.status in {"completed", "failed"}:
+                try:
+                    state = _folder_state_from_record(record)
+                except Exception as error:
+                    raise _task_state_error(error) from error
+                _folder_operations[operation_id] = state
+            else:
+                raise service_error(
+                    409,
+                    "OPERATION_REQUIRES_RECONCILIATION",
+                    "上次执行没有留下可确认的完成状态。为避免重复写入，已停止自动重试，请先核对任务。",
+                    retryable=False,
+                )
 
     async def generate() -> AsyncIterator[str]:
         event_index = min(request.afterSequence, len(state.events))
@@ -981,7 +1470,7 @@ async def folder_execute_stream(request: FolderExecuteRequest) -> StreamingRespo
             if status == "completed" and result is not None:
                 yield _sse_frame("result", result)
                 return
-            if status == "failed" and error is not None:
+            if status in {"failed", "needs_reconciliation"} and error is not None:
                 yield _sse_frame("error", error)
                 return
             if heartbeat and not pending:
@@ -996,17 +1485,47 @@ async def folder_execute_stream(request: FolderExecuteRequest) -> StreamingRespo
 
 @app.get("/api/folders/execute/status")
 async def folder_execute_status(operationId: str) -> dict[str, Any]:
-    """返回可恢复的文件夹操作状态；结果完成后在 TTL 内可查询。"""
+    """返回持久文件夹操作状态；查询本身绝不创建执行。"""
     async with _folder_operations_lock:
         _prune_folder_operations(time.time())
         state = _folder_operations.get(operationId)
         if state is None:
-            raise service_error(
-                404,
-                "OPERATION_NOT_FOUND",
-                "未找到该文件夹执行任务，可能尚未开始或状态已过期。",
-                retryable=False,
-            )
+            try:
+                record = _folder_operation_ledger.get(operationId)
+            except Exception as error:
+                raise _task_state_error(error) from error
+            if record is None:
+                try:
+                    expired_fingerprint = _folder_operation_ledger.expired_fingerprint(
+                        operationId
+                    )
+                except Exception as error:
+                    raise _task_state_error(error) from error
+                if expired_fingerprint is not None:
+                    raise service_error(
+                        410,
+                        "OPERATION_EXPIRED",
+                        "这个执行任务已超过结果保留期；查询不会创建新的执行。",
+                        retryable=False,
+                    )
+                raise service_error(
+                    404,
+                    "OPERATION_NOT_FOUND",
+                    "未找到该文件夹执行任务；查询不会创建新的执行。",
+                    retryable=False,
+                )
+            try:
+                state = _folder_state_from_record(record)
+            except Exception as error:
+                raise _task_state_error(error) from error
+            if state.status == "running":
+                state.status = "needs_reconciliation"
+                state.error = {
+                    "status": 409,
+                    "code": "OPERATION_REQUIRES_RECONCILIATION",
+                    "message": "执行现场已不在当前进程中，需要核对后才能继续。",
+                    "retryable": False,
+                }
         return {
             "operationId": operationId,
             "status": state.status,
@@ -1032,11 +1551,17 @@ async def folder_backups(
 ) -> FolderBackupsResponse:
     """列备份。sessionId 与 folderPath 二选一：前者带撤销能力，后者只读。"""
     try:
-        return await run_in_threadpool(list_folder_backups, sessionId, folderPath)
+        response = await run_in_threadpool(list_folder_backups, sessionId, folderPath)
     except (OSError, ValueError) as error:
         raise service_error(
             422, "FOLDER_BACKUP_ERROR", str(error), retryable=True
         ) from error
+    try:
+        await run_in_threadpool(_register_work_directory, response.folderPath)
+    except Exception:
+        # 目录索引只负责重启发现；索引暂时不可写时不应阻断普通备份查看和导出。
+        logger.exception("打开备份管理时无法登记工作目录 path=%s", response.folderPath)
+    return response
 
 
 @app.post("/api/folders/backups/open", response_model=FolderBackupOpenResponse)
@@ -1300,3 +1825,5 @@ async def intent(request: IntentCheckRequest) -> IntentCheckResponse:
         ) from error
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
+    ManagedFolderRecoveryDirectoriesResponse,
+    ManagedFolderRecoveryDirectory,

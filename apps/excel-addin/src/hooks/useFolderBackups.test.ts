@@ -7,7 +7,9 @@ import {
   deleteFolderBackup,
   exportFolderBackup,
   listFolderBackups,
+  listManagedFolderRecoveryDirectories,
   openFolderBackupDirectory,
+  restoreManagedFolderBackup,
   setFolderBackupPinned
 } from "../api";
 import { useFolderBackups } from "./useFolderBackups";
@@ -18,16 +20,20 @@ vi.mock("../api", () => ({
   deleteFolderBackup: vi.fn(),
   exportFolderBackup: vi.fn(),
   listFolderBackups: vi.fn(),
+  listManagedFolderRecoveryDirectories: vi.fn(),
   openFolderBackupDirectory: vi.fn(),
+  restoreManagedFolderBackup: vi.fn(),
   setFolderBackupPinned: vi.fn()
 }));
 
 const listMock = vi.mocked(listFolderBackups);
+const listManagedMock = vi.mocked(listManagedFolderRecoveryDirectories);
 const cleanupMock = vi.mocked(cleanupFolderBackups);
 const deleteMock = vi.mocked(deleteFolderBackup);
 const exportMock = vi.mocked(exportFolderBackup);
 const collectMock = vi.mocked(collectLegacyFolderBackups);
 const openMock = vi.mocked(openFolderBackupDirectory);
+const recoverMock = vi.mocked(restoreManagedFolderBackup);
 const pinMock = vi.mocked(setFolderBackupPinned);
 
 const emptyResult = {
@@ -50,6 +56,7 @@ describe("useFolderBackups", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     listMock.mockResolvedValue(emptyResult);
+    listManagedMock.mockResolvedValue({ directories: [] });
     cleanupMock.mockResolvedValue({
       deletedExecutions: 0,
       deletedFiles: 0,
@@ -77,6 +84,13 @@ describe("useFolderBackups", () => {
     openMock.mockResolvedValue({
       opened: true,
       directory: "C:\\work\\.excel-bro-backups"
+    });
+    recoverMock.mockResolvedValue({
+      operationId: "recovery-test-operation",
+      undoId: "a".repeat(32),
+      status: "completed",
+      filesRestored: ["scores.xlsx"],
+      alreadyRestored: false
     });
     pinMock.mockResolvedValue({ undoId: "a".repeat(32), pinned: true });
     collectMock.mockResolvedValue({ collectedFiles: [], failures: [] });
@@ -240,5 +254,51 @@ describe("useFolderBackups", () => {
 
     expect(listMock).not.toHaveBeenCalled();
     expect(result.current.data).toBeNull();
+  });
+
+  it("matches the registered directory and reuses a recovery operation id", async () => {
+    listManagedMock.mockResolvedValue({
+      directories: [
+        {
+          directoryId: "d".repeat(64),
+          folderName: "work",
+          folderPath: "c:/WORK/",
+          status: "active",
+          recoveryCount: 1,
+          attentionCount: 0,
+          operationCount: 1
+        }
+      ]
+    });
+    recoverMock
+      .mockRejectedValueOnce(new Error("连接中断"))
+      .mockResolvedValueOnce({
+        operationId: "recovery-retry-operation",
+        undoId: "a".repeat(32),
+        status: "completed",
+        filesRestored: ["scores.xlsx"],
+        alreadyRestored: false
+      });
+    const { result } = renderHook(() => useFolderBackups(sessionTarget));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    await act(async () => {
+      await result.current.recoverBackup("a".repeat(32), 4);
+    });
+    await act(async () => {
+      await result.current.recoverBackup("a".repeat(32), 4);
+    });
+
+    expect(result.current.managedDirectory?.directoryId).toBe("d".repeat(64));
+    expect(recoverMock.mock.calls[0][0].operationId).toBe(
+      recoverMock.mock.calls[1][0].operationId
+    );
+    expect(recoverMock.mock.calls[1][0]).toMatchObject({
+      directoryId: "d".repeat(64),
+      undoId: "a".repeat(32),
+      expectedRevision: 4,
+      confirmed: true
+    });
+    expect(result.current.notice).toContain("已恢复 1 个文件");
   });
 });

@@ -5,10 +5,15 @@ import {
   deleteFolderBackup,
   exportFolderBackup,
   listFolderBackups,
+  listManagedFolderRecoveryDirectories,
   openFolderBackupDirectory,
+  restoreManagedFolderBackup,
   setFolderBackupPinned
 } from "../api";
-import type { FolderBackupsResult } from "../contracts";
+import type {
+  FolderBackupsResult,
+  ManagedFolderRecoveryDirectory
+} from "../contracts";
 
 /**
  * 备份查看的定位方式。
@@ -25,11 +30,14 @@ export type FolderBackupTarget =
 
 export function useFolderBackups(target: FolderBackupTarget) {
   const [data, setData] = useState<FolderBackupsResult | null>(null);
+  const [managedDirectory, setManagedDirectory] =
+    useState<ManagedFolderRecoveryDirectory | null>(null);
   const [loading, setLoading] = useState(true);
   const [working, setWorking] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const pendingExportOperationIds = useRef(new Map<string, string>());
+  const pendingRecoveryOperationIds = useRef(new Map<string, string>());
 
   const sessionId = target.kind === "session" ? target.sessionId : "";
   const folderPath = target.kind === "unavailable" ? "" : target.folderPath;
@@ -44,11 +52,29 @@ export function useFolderBackups(target: FolderBackupTarget) {
     setLoading(true);
     setError("");
     try {
-      setData(
-        await listFolderBackups(
-          sessionId ? { sessionId } : { folderPath }
-        )
+      const backupData = await listFolderBackups(
+        sessionId ? { sessionId } : { folderPath }
       );
+      setData(backupData);
+      try {
+        const recoveryDirectories = await listManagedFolderRecoveryDirectories();
+        const normalizedFolderPath = backupData.folderPath
+          .replaceAll("/", "\\")
+          .replace(/\\+$/, "")
+          .toLocaleLowerCase();
+        setManagedDirectory(
+          recoveryDirectories.directories.find(
+            (directory) =>
+              directory.folderPath
+                .replaceAll("/", "\\")
+                .replace(/\\+$/, "")
+                .toLocaleLowerCase() === normalizedFolderPath
+          ) ?? null
+        );
+      } catch {
+        // 恢复索引暂时不可用时，仍保留普通备份查看、导出和清理能力。
+        setManagedDirectory(null);
+      }
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "读取备份失败");
     } finally {
@@ -62,7 +88,53 @@ export function useFolderBackups(target: FolderBackupTarget) {
 
   useEffect(() => {
     pendingExportOperationIds.current.clear();
+    pendingRecoveryOperationIds.current.clear();
   }, [folderPath, sessionId]);
+
+  const recoverBackup = useCallback(
+    async (undoId: string, expectedRevision?: number) => {
+      if (!managedDirectory || managedDirectory.status !== "active") {
+        setError(
+          managedDirectory?.statusReason ??
+            "原工作目录当前不可用于恢复，请重新选择该工作目录后再试。"
+        );
+        return null;
+      }
+      if (expectedRevision === undefined) {
+        setError("这份恢复点缺少版本信息，只能取出副本后人工核对。");
+        return null;
+      }
+      setWorking(true);
+      setError("");
+      const operationId =
+        pendingRecoveryOperationIds.current.get(undoId) ??
+        `recovery-${Date.now().toString(36)}-${Math.random().toString(16).slice(2)}`;
+      pendingRecoveryOperationIds.current.set(undoId, operationId);
+      try {
+        const result = await restoreManagedFolderBackup({
+          directoryId: managedDirectory.directoryId,
+          undoId,
+          expectedRevision,
+          operationId,
+          confirmed: true
+        });
+        pendingRecoveryOperationIds.current.delete(undoId);
+        setNotice(
+          result.alreadyRestored
+            ? "文件已经处于执行前状态，无需重复恢复。"
+            : `已恢复 ${result.filesRestored.length} 个文件到本次执行前的状态。`
+        );
+        await reload();
+        return result;
+      } catch (reason) {
+        setError(reason instanceof Error ? reason.message : "恢复文件失败");
+        return null;
+      } finally {
+        setWorking(false);
+      }
+    },
+    [managedDirectory, reload]
+  );
 
   const openBackupDirectory = useCallback(async () => {
     const directoryToken = data?.openDirectoryToken;
@@ -259,6 +331,7 @@ export function useFolderBackups(target: FolderBackupTarget) {
 
   return {
     data,
+    managedDirectory,
     loading,
     working,
     error,
@@ -267,6 +340,7 @@ export function useFolderBackups(target: FolderBackupTarget) {
     reload,
     openBackupDirectory,
     exportBackup,
+    recoverBackup,
     deleteBackup,
     setBackupPinned,
     cleanup,
