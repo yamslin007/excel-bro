@@ -20,7 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from .capabilities import capabilities, capability_int
+from .capabilities import capabilities, capability_float, capability_int
 from .capabilities import model_timeout_seconds
 from .intent import check_intent
 from .folder_workbooks import (
@@ -32,13 +32,17 @@ from .folder_workbooks import (
     FolderSnapshotRequest,
     create_folder_snapshot,
     cleanup_folder_backups,
+    cleanup_folder_task_artifacts,
     delete_folder_backup,
     execute_folder_plan,
+    folder_execution_context,
+    folder_resume_checkpoint_summary,
     folder_session_root,
     inspect_managed_folder_recovery,
     export_folder_backup,
     list_folder_backups,
     open_folder_backup_directory,
+    resume_folder_plan,
     set_folder_backup_pinned,
     query_folder_data,
     refresh_folder,
@@ -64,6 +68,7 @@ from .models import (
     FolderBackupPinResponse,
     FolderBackupsResponse,
     FolderExecuteResponse,
+    FolderExecutionResumeRequest,
     FolderLegacyCollectRequest,
     FolderLegacyCollectResponse,
     FolderManagedRecoveryRequest,
@@ -76,6 +81,7 @@ from .models import (
     ManagedFolderRecoveryDirectory,
     ModelSettingsResponse,
     PlanRequest,
+    PlanningContinueRequest,
     PlanValidateRequest,
     TestModelConnectionResponse,
     SetFormulaModelRequest,
@@ -112,7 +118,9 @@ from .task_ledger import (
     FolderOperationLedger,
     FolderOperationRecord,
     ManagedDirectoryRecord,
+    PlanningTaskRecord,
 )
+from .excel_agent import AgentBudgetPause
 from .planner import create_plan
 from .plan_chat import chat_modify_plan
 from .rule_generator import (
@@ -640,6 +648,8 @@ class _FolderOperationState:
 _folder_operations: dict[str, _FolderOperationState] = {}
 _folder_operations_lock = asyncio.Lock()
 _folder_operation_ledger = FolderOperationLedger()
+_active_planning_tasks: set[str] = set()
+_active_planning_tasks_lock = asyncio.Lock()
 
 
 def _scan_registered_work_directories() -> list[ManagedDirectoryRecord]:
@@ -804,8 +814,24 @@ async def _run_folder_operation(
         )
         future.result(timeout=10)
 
+    def on_checkpoint(checkpoint: dict[str, object]) -> None:
+        _folder_operation_ledger.commit_checkpoint(
+            operation_id,
+            kind=str(checkpoint.get("kind") or "folder_publish"),
+            payload=checkpoint,
+        )
+
     try:
-        result = await run_in_threadpool(execute_folder_plan, request, on_progress)
+        checkpoint_supported = (
+            len(request.plan.actions) == 1
+            and request.plan.actions[0].type == "splitGroupAggregate"
+        )
+        if checkpoint_supported:
+            result = await run_in_threadpool(
+                execute_folder_plan, request, on_progress, on_checkpoint
+            )
+        else:
+            result = await run_in_threadpool(execute_folder_plan, request, on_progress)
     except Exception as error:
         expected_error = isinstance(error, (OSError, ValueError, RuntimeError))
         if not expected_error:
@@ -915,8 +941,124 @@ async def _run_folder_operation(
             state.condition.notify_all()
         return
 
+    try:
+        await run_in_threadpool(
+            cleanup_folder_task_artifacts,
+            folder_session_root(request.sessionId),
+            operation_id,
+        )
+    except Exception:
+        logger.warning(
+            "已完成任务的暂存产物仍待清理 operation_id=%s",
+            operation_id,
+            exc_info=True,
+        )
+
     async with state.condition:
         state.result = result_payload
+        state.status = "completed"
+        state.condition.notify_all()
+
+
+async def _run_folder_resume(
+    operation_id: str,
+    state: _FolderOperationState,
+    record: FolderOperationRecord,
+    checkpoint_payload: dict[str, Any],
+) -> None:
+    loop = asyncio.get_running_loop()
+
+    def on_progress(event: dict[str, object]) -> None:
+        future = asyncio.run_coroutine_threadsafe(
+            _record_folder_progress(operation_id, state, event), loop
+        )
+        future.result(timeout=10)
+
+    def on_checkpoint(checkpoint: dict[str, object]) -> None:
+        _folder_operation_ledger.commit_checkpoint(
+            operation_id,
+            kind=str(checkpoint.get("kind") or "folder_publish"),
+            payload=checkpoint,
+        )
+
+    try:
+        if record.authorization is None:
+            raise ValueError("任务缺少原授权现场，不能续跑")
+        result = await run_in_threadpool(
+            resume_folder_plan,
+            operation_id,
+            record.authorization,
+            checkpoint_payload,
+            on_progress,
+            on_checkpoint,
+        )
+        result_payload = result.model_dump(mode="json")
+        undo = result_payload.get("undo")
+        undo_id = undo.get("undoId") if isinstance(undo, dict) else None
+        _folder_operation_ledger.finish(
+            operation_id,
+            status="completed",
+            result=result_payload,
+            execution_id=result.executionId,
+            undo_id=undo_id if isinstance(undo_id, str) else None,
+        )
+    except Exception as error:
+        expected_error = isinstance(error, (OSError, ValueError, RuntimeError))
+        if not expected_error:
+            logger.exception("断点续跑出现未预期异常 operation_id=%s", operation_id)
+        message = str(error) if expected_error else "断点续跑发生未预期错误，请查看诊断日志。"
+        try:
+            await _record_folder_progress(
+                operation_id,
+                state,
+                {
+                    "phase": "saving",
+                    "stepId": "folder.resume.failed",
+                    "status": "failed",
+                    "title": "断点续跑已安全停止",
+                    "summary": message[:1000],
+                },
+            )
+        except Exception:
+            logger.exception("断点续跑失败后无法保存进度 operation_id=%s", operation_id)
+        error_payload = {
+            "status": 409 if expected_error else 500,
+            "code": "FOLDER_RESUME_CONFLICT" if expected_error else "INTERNAL_ERROR",
+            "message": message,
+            "retryable": False,
+        }
+        try:
+            _folder_operation_ledger.finish(
+                operation_id, status="needs_reconciliation", error=error_payload
+            )
+        except Exception:
+            logger.exception("断点续跑失败后无法提交状态 operation_id=%s", operation_id)
+        async with state.condition:
+            state.error = error_payload
+            state.status = "needs_reconciliation"
+            state.condition.notify_all()
+        return
+
+
+    try:
+        if record.authorization is not None and isinstance(
+            record.authorization.get("root"), str
+        ):
+            await run_in_threadpool(
+                cleanup_folder_task_artifacts,
+                str(record.authorization["root"]),
+                operation_id,
+            )
+    except Exception:
+        logger.warning(
+            "已完成续跑任务的暂存产物仍待清理 operation_id=%s",
+            operation_id,
+            exc_info=True,
+        )
+
+    async with state.condition:
+        state.result = result_payload
+        state.error = None
         state.status = "completed"
         state.condition.notify_all()
 
@@ -932,92 +1074,190 @@ def _prune_folder_operations(now: float) -> None:
         _folder_operations.pop(operation_id, None)
 
 
-@app.post("/api/turn/stream")
-async def turn_stream(request: TurnRequest) -> StreamingResponse:
-    """plan 分支的流式版本：实时推送分步进度，最后推送完整结果或错误事件。
+def _planning_request_fingerprint(request: PlanRequest) -> str:
+    encoded = request.model_dump_json(
+        exclude={"turnId"}, exclude_none=True
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
-    仅服务 plan 请求；intent 判断很快，不走流式。HTTP 已返回 200，模型错误
-    通过流内 error 事件表达，字段与 /api/turn 的 service_error 完全一致。
-    """
-    if isinstance(request, IntentCheckRequest):
-        raise service_error(
-            422,
-            "INVALID_REQUEST",
-            "流式端点仅用于规划请求，意图判断请调用 /api/turn。",
-            retryable=False,
+
+def _planning_pause_payload(
+    record: PlanningTaskRecord,
+    *,
+    interrupted: bool = False,
+) -> dict[str, Any]:
+    maximum_extensions = capability_int("taskRecovery", "planningMaxExtensions")
+    hard_seconds = capability_float("taskRecovery", "planningHardWallTimeSeconds")
+    extension_seconds = capability_float("taskRecovery", "planningExtensionSeconds")
+    within_hard_limit = record.active_elapsed_seconds < hard_seconds
+    can_continue = (
+        record.checkpoint is not None
+        and within_hard_limit
+        and (
+            record.status == "running"
+            or (
+                record.status == "waiting_user"
+                and record.extension_count < maximum_extensions
+                and record.approved_wall_time_seconds < hard_seconds
+            )
         )
+    )
+    workbook = record.request.get("workbook")
+    workbook_snapshot = workbook if isinstance(workbook, dict) else {}
+    return {
+        "kind": "planning_pause",
+        "turnId": record.turn_id,
+        "status": "interrupted" if interrupted else "waiting_user",
+        "revision": record.revision,
+        "lastSequence": record.last_sequence,
+        "reason": record.pause_reason
+        or (
+            "服务重启后已找回已保存的规划现场。"
+            if interrupted
+            else "本轮处理时间已用完，当前进度已安全保存。"
+        ),
+        "activeElapsedSeconds": record.active_elapsed_seconds,
+        "approvedWallTimeSeconds": record.approved_wall_time_seconds,
+        "extensionSeconds": min(
+            extension_seconds,
+            max(hard_seconds - record.approved_wall_time_seconds, 0.0),
+        ),
+        "extensionCount": record.extension_count,
+        "maximumExtensions": maximum_extensions,
+        "canContinue": can_continue,
+        "requiresExtension": record.status == "waiting_user",
+        "sourceFingerprint": workbook_snapshot.get("sourceFingerprint"),
+        "sourceFingerprintSheets": workbook_snapshot.get("sourceFingerprintSheets", []),
+    }
 
-    turn_id = request.turnId or f"turn-{uuid.uuid4().hex}"
 
-    async def generate() -> AsyncIterator[str]:
-        try:
-            state = turn_registry.touch(turn_id)
-            async with state.completion_lock:
-                cached = turn_registry.cached_completion(turn_id, request)
-                if cached is not None:
-                    result = cached.model_copy(update={"turnId": turn_id})
-                    yield _sse_frame("result", result.model_dump(mode="json"))
-                    return
-
-                queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-                event_sequence = 0
-
-                async def on_event(event: dict[str, Any]) -> None:
-                    nonlocal event_sequence
-                    event_sequence += 1
-                    payload = {
-                        "schemaVersion": 1,
-                        "operationId": turn_id,
-                        "sequence": event_sequence,
-                        "phase": event.get("phase", "planning"),
-                        "stepId": event.get(
-                            "stepId", f"planning-{event_sequence}"
-                        ),
-                        "status": event.get("status", "progress"),
-                        "title": event.get("title", "正在处理"),
-                        "summary": event.get("summary"),
-                        "detail": event.get("detail"),
-                        "current": event.get("current"),
-                        "total": event.get("total"),
-                        "unit": event.get("unit"),
-                        "actionIndex": event.get("actionIndex"),
-                        "actionCount": event.get("actionCount"),
-                        "actionType": event.get("actionType"),
-                        "toolName": event.get("toolName"),
-                        "facts": event.get("facts"),
-                        "target": event.get("target"),
-                        "trace": event.get("trace"),
-                        "timestamp": datetime.now().astimezone().isoformat(),
-                    }
-                    validated = TaskProgressEvent.model_validate(payload)
-                    _log_task_progress(validated)
-                    await queue.put(validated.model_dump(mode="json"))
-
-                task = asyncio.create_task(
-                    create_plan(
-                        request,
-                        tool_cache=state.tool_cache,
-                        on_event=on_event,
-                    )
+async def _planning_task_stream(
+    request: PlanRequest,
+    record: PlanningTaskRecord,
+    *,
+    after_sequence: int = 0,
+) -> AsyncIterator[str]:
+    turn_id = record.turn_id
+    state = turn_registry.touch(turn_id)
+    task: asyncio.Task[AssistantResponse] | None = None
+    async with state.completion_lock:
+        async with _active_planning_tasks_lock:
+            if turn_id in _active_planning_tasks:
+                yield _sse_frame(
+                    "error",
+                    {
+                        "status": 409,
+                        "code": "PLANNING_TASK_STILL_RUNNING",
+                        "message": "该规划任务仍在处理中，请勿重复继续。",
+                        "retryable": True,
+                    },
                 )
-                while True:
-                    drain = asyncio.ensure_future(queue.get())
-                    done, _pending = await asyncio.wait(
-                        {drain, task},
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    if drain in done:
-                        yield _sse_frame("step", drain.result())
-                        continue
-                    drain.cancel()
-                    break
-                # task 已完成：先排空剩余 step，再产出结果。
-                while not queue.empty():
-                    yield _sse_frame("step", queue.get_nowait())
+                return
+            _active_planning_tasks.add(turn_id)
+        try:
+            persisted_events = _folder_operation_ledger.planning_events(turn_id)
+            for event in persisted_events:
+                if int(event.get("sequence", 0) or 0) > after_sequence:
+                    yield _sse_frame("step", event)
+
+            queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+            event_sequence = record.last_sequence
+            current_record = record
+
+            async def on_event(event: dict[str, Any]) -> None:
+                nonlocal event_sequence, current_record
+                event_sequence += 1
+                payload = {
+                    "schemaVersion": 1,
+                    "operationId": turn_id,
+                    "sequence": event_sequence,
+                    "phase": event.get("phase", "planning"),
+                    "stepId": event.get("stepId", f"planning-{event_sequence}"),
+                    "status": event.get("status", "progress"),
+                    "title": event.get("title", "正在处理"),
+                    "summary": event.get("summary"),
+                    "detail": event.get("detail"),
+                    "current": event.get("current"),
+                    "total": event.get("total"),
+                    "unit": event.get("unit"),
+                    "actionIndex": event.get("actionIndex"),
+                    "actionCount": event.get("actionCount"),
+                    "actionType": event.get("actionType"),
+                    "toolName": event.get("toolName"),
+                    "facts": event.get("facts"),
+                    "target": event.get("target"),
+                    "trace": event.get("trace"),
+                    "timestamp": datetime.now().astimezone().isoformat(),
+                }
+                validated = TaskProgressEvent.model_validate(payload)
+                _log_task_progress(validated)
+                serialized = validated.model_dump(mode="json")
+                current_record = _folder_operation_ledger.append_planning_event(
+                    turn_id, event_sequence, serialized
+                )
+                await queue.put(serialized)
+
+            async def on_checkpoint(checkpoint: dict[str, Any]) -> None:
+                nonlocal current_record
+                loop_state = checkpoint.get("loopState")
+                elapsed = (
+                    float(loop_state.get("activeElapsedSeconds", 0.0) or 0.0)
+                    if isinstance(loop_state, dict)
+                    else current_record.active_elapsed_seconds
+                )
+                current_record = _folder_operation_ledger.save_planning_checkpoint(
+                    turn_id,
+                    checkpoint,
+                    active_elapsed_seconds=elapsed,
+                )
+
+            task = asyncio.create_task(
+                create_plan(
+                    request,
+                    tool_cache=state.tool_cache,
+                    on_event=on_event,
+                    on_checkpoint=on_checkpoint,
+                    resume_checkpoint=current_record.checkpoint,
+                    approved_wall_time_seconds=current_record.approved_wall_time_seconds,
+                )
+            )
+            while True:
+                drain = asyncio.ensure_future(queue.get())
+                done, _pending = await asyncio.wait(
+                    {drain, task}, return_when=asyncio.FIRST_COMPLETED
+                )
+                if drain in done:
+                    yield _sse_frame("step", drain.result())
+                    continue
+                drain.cancel()
+                break
+            while not queue.empty():
+                yield _sse_frame("step", queue.get_nowait())
+            try:
                 response = await task
-                turn_registry.record_completion(turn_id, request, response)
-                result = response.model_copy(update={"turnId": turn_id})
-                yield _sse_frame("result", result.model_dump(mode="json"))
+            except AgentBudgetPause as pause:
+                loop_state = pause.checkpoint.get("loopState")
+                elapsed = (
+                    float(loop_state.get("activeElapsedSeconds", 0.0) or 0.0)
+                    if isinstance(loop_state, dict)
+                    else current_record.active_elapsed_seconds
+                )
+                current_record = _folder_operation_ledger.pause_planning_task(
+                    turn_id,
+                    pause.checkpoint,
+                    active_elapsed_seconds=elapsed,
+                    reason="本轮处理时间已用完，当前进度已安全保存。",
+                )
+                yield _sse_frame("paused", _planning_pause_payload(current_record))
+                return
+            result = response.model_copy(update={"turnId": turn_id})
+            current_record = _folder_operation_ledger.finish_planning_task(
+                turn_id,
+                status="completed",
+                result=result.model_dump(mode="json"),
+            )
+            turn_registry.record_completion(turn_id, request, response)
+            yield _sse_frame("result", current_record.result or result.model_dump(mode="json"))
         except (
             LLMTimeoutError,
             LLMConnectError,
@@ -1028,6 +1268,21 @@ async def turn_stream(request: TurnRequest) -> StreamingResponse:
             ValueError,
         ) as error:
             status, code, message, retryable = _map_turn_error(error)
+            try:
+                current = _folder_operation_ledger.planning_task(turn_id)
+                if current is not None and current.status == "running":
+                    _folder_operation_ledger.finish_planning_task(
+                        turn_id,
+                        status="failed",
+                        error={
+                            "status": status,
+                            "code": code,
+                            "message": message,
+                            "retryable": retryable,
+                        },
+                    )
+            except Exception:
+                logger.exception("无法保存规划任务失败状态 turn_id=%s", turn_id)
             yield _sse_frame(
                 "error",
                 {
@@ -1037,14 +1292,216 @@ async def turn_stream(request: TurnRequest) -> StreamingResponse:
                     "retryable": retryable,
                 },
             )
+        except Exception:
+            # SSE headers have already been sent, so an unexpected failure must be
+            # represented in both the durable ledger and the event stream.  Without
+            # this branch the client sees a broken connection while the task remains
+            # incorrectly marked as running forever.
+            logger.exception("规划任务发生未处理异常 turn_id=%s", turn_id)
+            failure = {
+                "status": 500,
+                "code": "PLANNING_TASK_FAILED",
+                "message": "规划任务未能安全保存当前状态，请重新发起任务。",
+                "retryable": False,
+            }
+            try:
+                current = _folder_operation_ledger.planning_task(turn_id)
+                if current is not None and current.status == "running":
+                    _folder_operation_ledger.finish_planning_task(
+                        turn_id,
+                        status="failed",
+                        error=failure,
+                    )
+            except Exception:
+                logger.exception("无法保存规划任务意外失败状态 turn_id=%s", turn_id)
+            yield _sse_frame("error", failure)
+        finally:
+            # Closing an SSE response can finalize this async generator while the
+            # model request is still running.  Do not release the active-task fence
+            # until that child task has actually stopped; otherwise a reconnect can
+            # resume the same checkpoint concurrently with the orphaned request.
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    logger.exception(
+                        "断开规划流时等待后台任务停止失败 turn_id=%s", turn_id
+                    )
+            async with _active_planning_tasks_lock:
+                _active_planning_tasks.discard(turn_id)
+
+
+@app.post("/api/turn/stream")
+async def turn_stream(request: TurnRequest) -> StreamingResponse:
+    """Persisted planning stream with safe budget-pause boundaries."""
+    if isinstance(request, IntentCheckRequest):
+        raise service_error(
+            422,
+            "INVALID_REQUEST",
+            "流式端点仅用于规划请求，意图判断请调用 /api/turn。",
+            retryable=False,
+        )
+    turn_id = request.turnId or f"turn-{uuid.uuid4().hex}"
+    normalized_request = request.model_copy(update={"turnId": turn_id})
+    try:
+        record, created = _folder_operation_ledger.register_planning_task(
+            turn_id,
+            _planning_request_fingerprint(normalized_request),
+            normalized_request.model_dump(mode="json", exclude_none=True),
+            approved_wall_time_seconds=capability_float(
+                "taskRecovery", "planningReminderSeconds"
+            ),
+        )
+    except Exception as error:
+        raise _task_state_error(error) from error
+
+    async def generate() -> AsyncIterator[str]:
+        if not created:
+            if record.status == "completed" and record.result is not None:
+                yield _sse_frame("result", record.result)
+                return
+            if record.status == "waiting_user":
+                yield _sse_frame("paused", _planning_pause_payload(record))
+                return
+            if record.status == "running":
+                async with _active_planning_tasks_lock:
+                    active = turn_id in _active_planning_tasks
+                if active:
+                    yield _sse_frame(
+                        "error",
+                        {
+                            "status": 409,
+                            "code": "PLANNING_TASK_STILL_RUNNING",
+                            "message": "该规划任务仍在处理中。",
+                            "retryable": True,
+                        },
+                    )
+                else:
+                    yield _sse_frame(
+                        "paused", _planning_pause_payload(record, interrupted=True)
+                    )
+                return
+            error = record.error or {}
+            yield _sse_frame(
+                "error",
+                {
+                    "status": error.get("status", 409),
+                    "code": error.get("code", "PLANNING_TASK_STOPPED"),
+                    "message": error.get("message", "规划任务已经停止。"),
+                    "retryable": bool(error.get("retryable", False)),
+                },
+            )
+            return
+        async for item in _planning_task_stream(normalized_request, record):
+            yield item
 
     return StreamingResponse(
         generate(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/api/turn/{turn_id}/status")
+async def planning_task_status(turn_id: str) -> dict[str, Any]:
+    record = _folder_operation_ledger.planning_task(turn_id)
+    if record is None:
+        raise service_error(
+            404, "PLANNING_TASK_NOT_FOUND", "未找到该规划任务。", retryable=False
+        )
+    async with _active_planning_tasks_lock:
+        active = turn_id in _active_planning_tasks
+    if record.status == "completed":
+        return {
+            "turnId": turn_id,
+            "status": "completed",
+            "revision": record.revision,
+            "lastSequence": record.last_sequence,
+            "result": record.result,
+            "canContinue": False,
+        }
+    if record.status in {"running", "waiting_user"}:
+        interrupted = record.status == "running" and not active
+        return {
+            **_planning_pause_payload(record, interrupted=interrupted),
+            "status": "running" if active else ("interrupted" if interrupted else "waiting_user"),
+            "canContinue": False if active else _planning_pause_payload(record, interrupted=interrupted)["canContinue"],
+        }
+    return {
+        "turnId": turn_id,
+        "status": record.status,
+        "revision": record.revision,
+        "lastSequence": record.last_sequence,
+        "error": record.error,
+        "canContinue": False,
+    }
+
+
+@app.post("/api/turn/continue/stream")
+async def planning_task_continue_stream(
+    request: PlanningContinueRequest,
+) -> StreamingResponse:
+    async with _active_planning_tasks_lock:
+        if request.turnId in _active_planning_tasks:
+            raise service_error(
+                409,
+                "PLANNING_TASK_STILL_RUNNING",
+                "该规划任务仍在处理中，不能重复继续。",
+                retryable=True,
+            )
+    existing = _folder_operation_ledger.planning_task(request.turnId)
+    if existing is None or existing.checkpoint is None:
+        raise service_error(
+            409,
+            "PLANNING_CHECKPOINT_NOT_AVAILABLE",
+            "该任务没有可验证的完整规划现场，不能继续。",
+            retryable=False,
+        )
+    extension_seconds = (
+        capability_float("taskRecovery", "planningExtensionSeconds")
+        if existing.status == "waiting_user"
+        else 0.0
+    )
+    try:
+        claimed, should_run = _folder_operation_ledger.claim_planning_continuation(
+            request.turnId,
+            expected_revision=request.expectedRevision,
+            request_id=request.requestId,
+            extension_seconds=extension_seconds,
+            maximum_extensions=capability_int(
+                "taskRecovery", "planningMaxExtensions"
+            ),
+            hard_wall_time_seconds=capability_float(
+                "taskRecovery", "planningHardWallTimeSeconds"
+            ),
+        )
+    except RuntimeError as error:
+        raise service_error(
+            409, "PLANNING_CONTINUE_CONFLICT", str(error), retryable=True
+        ) from error
+    if not should_run:
+        if claimed.status == "completed" and claimed.result is not None:
+            async def completed() -> AsyncIterator[str]:
+                yield _sse_frame("result", claimed.result or {})
+            return StreamingResponse(completed(), media_type="text/event-stream")
+        raise service_error(
+            409,
+            "PLANNING_TASK_STOPPED",
+            "该规划任务已经停止，不能继续。",
+            retryable=False,
+        )
+    plan_request = PlanRequest.model_validate(claimed.request)
+    return StreamingResponse(
+        _planning_task_stream(
+            plan_request,
+            claimed,
+            after_sequence=request.afterSequence,
+        ),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
 
 
@@ -1425,6 +1882,22 @@ async def folder_execute_stream(request: FolderExecuteRequest) -> StreamingRespo
                     retryable=False,
                 )
             if created:
+                checkpoint_supported = (
+                    len(request.plan.actions) == 1
+                    and request.plan.actions[0].type == "splitGroupAggregate"
+                )
+                if checkpoint_supported:
+                    try:
+                        authorization = folder_execution_context(request)
+                        record = _folder_operation_ledger.save_execution_context(
+                            operation_id,
+                            request=request.model_dump(
+                                mode="json", exclude={"afterSequence"}, exclude_none=True
+                            ),
+                            authorization=authorization,
+                        )
+                    except Exception as error:
+                        raise _task_state_error(error) from error
                 state = _FolderOperationState(
                     request_fingerprint=request_fingerprint,
                     created_at=record.created_at,
@@ -1526,13 +1999,176 @@ async def folder_execute_status(operationId: str) -> dict[str, Any]:
                     "message": "执行现场已不在当前进程中，需要核对后才能继续。",
                     "retryable": False,
                 }
+        try:
+            persisted = _folder_operation_ledger.get(operationId)
+            checkpoint = _folder_operation_ledger.checkpoint(operationId)
+        except Exception as error:
+            raise _task_state_error(error) from error
+        checkpoint_stage = (
+            str(checkpoint.payload.get("stage")) if checkpoint is not None else None
+        )
+        resume_summary: dict[str, object] = {
+            "canResume": False,
+            "reason": None,
+        }
+        resume_candidate = (
+            state.task is None
+            and state.status in {"running", "needs_reconciliation"}
+            and checkpoint_stage in {"publish_prepared", "publishing", "published"}
+        )
+        if resume_candidate and persisted is not None and checkpoint is not None:
+            if persisted.authorization is None:
+                resume_summary["reason"] = "任务缺少原授权现场"
+            else:
+                try:
+                    resume_summary = folder_resume_checkpoint_summary(
+                        operationId,
+                        persisted.authorization,
+                        checkpoint.payload,
+                    )
+                except Exception as error:
+                    logger.warning(
+                        "核对文件夹任务续跑条件失败 operation_id=%s: %s",
+                        operationId,
+                        error,
+                    )
+                    resume_summary = {
+                        "canResume": False,
+                        "reason": "恢复资料当前无法安全核对",
+                    }
         return {
             "operationId": operationId,
             "status": state.status,
             "lastSequence": state.sequence,
             "result": state.result,
             "error": state.error,
+            "revision": persisted.revision if persisted is not None else None,
+            "canResume": bool(resume_summary.get("canResume")),
+            "checkpointStage": checkpoint_stage,
+            "resumeReason": resume_summary.get("reason"),
+            "resumeFilesApplied": resume_summary.get("filesApplied"),
+            "resumeFilesPending": resume_summary.get("filesPending"),
         }
+
+
+@app.post("/api/folders/execute/resume/stream")
+async def folder_execute_resume_stream(
+    request: FolderExecutionResumeRequest,
+) -> StreamingResponse:
+    """Explicitly continue a durable folder publish from its last safe boundary."""
+
+    operation_id = request.operationId
+    async with _folder_operations_lock:
+        active = _folder_operations.get(operation_id)
+        if active is not None and active.task is not None and not active.task.done():
+            raise service_error(
+                409,
+                "OPERATION_STILL_RUNNING",
+                "该任务仍在当前进程中执行，不能同时发起续跑。",
+                retryable=True,
+            )
+        try:
+            existing = _folder_operation_ledger.get(operation_id)
+            checkpoint = _folder_operation_ledger.checkpoint(operation_id)
+        except Exception as error:
+            raise _task_state_error(error) from error
+        if existing is None:
+            raise service_error(
+                404, "OPERATION_NOT_FOUND", "未找到可续跑的任务。", retryable=False
+            )
+        if existing.status == "completed":
+            state = _folder_state_from_record(existing)
+            _folder_operations[operation_id] = state
+        else:
+            if existing.revision != request.expectedRevision:
+                raise service_error(
+                    409,
+                    "RESUME_CLAIM_CONFLICT",
+                    "任务状态已变化，请刷新后再决定是否继续。",
+                    retryable=True,
+                )
+            if checkpoint is None:
+                raise service_error(
+                    409,
+                    "CHECKPOINT_NOT_AVAILABLE",
+                    "该任务没有留下可验证的安全断点，不能续跑。",
+                    retryable=False,
+                )
+            if existing.authorization is None:
+                raise service_error(
+                    409,
+                    "RESUME_CONTEXT_NOT_AVAILABLE",
+                    "该任务缺少原授权现场，不能安全续跑。",
+                    retryable=False,
+                )
+            try:
+                resume_summary = folder_resume_checkpoint_summary(
+                    operation_id,
+                    existing.authorization,
+                    checkpoint.payload,
+                )
+            except Exception as error:
+                raise service_error(
+                    409,
+                    "RESUME_RECONCILIATION_FAILED",
+                    f"恢复资料当前无法安全核对：{error}",
+                    retryable=False,
+                ) from error
+            if not bool(resume_summary.get("canResume")):
+                raise service_error(
+                    409,
+                    "RESUME_NOT_SAFE",
+                    str(resume_summary.get("reason") or "当前文件状态不允许继续任务。"),
+                    retryable=False,
+                )
+            try:
+                claimed = _folder_operation_ledger.claim_for_resume(
+                    operation_id, expected_revision=request.expectedRevision
+                )
+            except RuntimeError as error:
+                raise service_error(
+                    409, "RESUME_CLAIM_CONFLICT", str(error), retryable=True
+                ) from error
+            state = _folder_state_from_record(claimed)
+            _folder_operations[operation_id] = state
+            state.task = asyncio.create_task(
+                _run_folder_resume(operation_id, state, claimed, checkpoint.payload)
+            )
+
+    async def generate() -> AsyncIterator[str]:
+        event_index = min(request.afterSequence, len(state.events))
+        heartbeat_seconds = capability_int("progress", "heartbeatSeconds")
+        while True:
+            heartbeat = False
+            async with state.condition:
+                if event_index >= len(state.events) and state.status == "running":
+                    try:
+                        await asyncio.wait_for(
+                            state.condition.wait(), timeout=heartbeat_seconds
+                        )
+                    except TimeoutError:
+                        heartbeat = True
+                pending = state.events[event_index:]
+                event_index = len(state.events)
+                status = state.status
+                result = state.result
+                error = state.error
+            for event in pending:
+                yield _sse_frame("progress", event)
+            if status == "completed" and result is not None:
+                yield _sse_frame("result", result)
+                return
+            if status in {"failed", "needs_reconciliation"} and error is not None:
+                yield _sse_frame("error", error)
+                return
+            if heartbeat and not pending:
+                yield ": heartbeat\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.post("/api/folders/undo", response_model=FolderUndoResponse)

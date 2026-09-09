@@ -45,7 +45,7 @@ def _default_loop_config() -> LoopConfig:
         max_turns=capability_int("agent", "maxTurns"),
         max_total_tokens=capability_int("agent", "maxTotalTokens"),
         max_wall_time_seconds=capability_float(
-            "agent", "maxWallTimeSeconds"
+            "taskRecovery", "planningHardWallTimeSeconds"
         ),
         max_consecutive_errors=capability_int(
             "agent", "maxConsecutiveErrors"
@@ -122,6 +122,15 @@ computeValues 表达，改完数据直接重跑就是新结果。
 完成分析后优先调用 submit_plan 或 submit_answer。若模型不支持工具调用，也可以
 直接返回符合 AssistantResponse JSON Schema 的 JSON。
 """.strip()
+
+
+class AgentBudgetPause(RuntimeError):
+    """A complete planning boundary was saved and now awaits user budget approval."""
+
+    def __init__(self, checkpoint: dict[str, Any], approved_seconds: float) -> None:
+        super().__init__("本轮处理时间已用完，任务现场已保存。")
+        self.checkpoint = checkpoint
+        self.approved_seconds = approved_seconds
 
 
 def _column_number(name: str) -> int:
@@ -866,13 +875,28 @@ async def run_excel_agent(
     timeout: float,
     tool_cache: dict[str, Any] | None = None,
     on_event: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    on_checkpoint: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    resume_checkpoint: dict[str, Any] | None = None,
+    approved_wall_time_seconds: float | None = None,
     config: LoopConfig | None = None,
 ) -> AssistantResponse:
     """运行受预算和循环检测保护的 Excel 规划 Agent。"""
     cache = tool_cache
     loop_config = config or _default_loop_config()
-    state = LoopState()
-    start_time = time.time()
+    if resume_checkpoint is not None:
+        if (
+            resume_checkpoint.get("schemaVersion") != 1
+            or resume_checkpoint.get("kind") != "planning"
+        ):
+            raise ValueError("规划检查点版本或类型不受支持")
+        raw_loop_state = resume_checkpoint.get("loopState")
+        if not isinstance(raw_loop_state, dict):
+            raise ValueError("规划检查点缺少循环状态")
+        state = LoopState.from_checkpoint(raw_loop_state)
+    else:
+        state = LoopState()
+    elapsed_before_run = state.elapsed_time
+    start_time = time.monotonic()
 
     async def emit(
         step_id: str,
@@ -935,26 +959,127 @@ async def run_excel_agent(
             for image in request.images
         )
 
-    messages: list[dict[str, Any]] = [
-        {"role": "system", "content": AGENT_SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": user_content,
-        },
-    ]
+    if resume_checkpoint is not None:
+        raw_messages = resume_checkpoint.get("messages")
+        if not isinstance(raw_messages, list) or not all(
+            isinstance(item, dict) for item in raw_messages
+        ):
+            raise ValueError("规划检查点缺少完整消息现场")
+        messages = [dict(item) for item in raw_messages]
+        if cache is not None and isinstance(resume_checkpoint.get("toolCache"), dict):
+            cache.clear()
+            cache.update(dict(resume_checkpoint["toolCache"]))
+    else:
+        messages = [
+            {"role": "system", "content": AGENT_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": user_content,
+            },
+        ]
 
     await emit("planning.understand", "正在理解需求", status="started")
     # 前端已带回确定性查询结果，或用户已经从结构化选项确认了最终口径时，
     # 去掉只读工具，直接进入提交。运行时聚合动作会在执行阶段读取完整数据。
-    tools = (
+    initial_tools = (
         AGENT_TOOLS_WITH_DATA
         if request.dataResults or request.planningReadPolicy == "none"
         else AGENT_TOOLS
     )
-    repairing_submission = False
+    tool_mode = (
+        str(resume_checkpoint.get("toolMode"))
+        if resume_checkpoint is not None
+        else ("terminal" if initial_tools is AGENT_TOOLS_WITH_DATA else "full")
+    )
+    tools = {
+        "full": AGENT_TOOLS,
+        "terminal": AGENT_TOOLS_WITH_DATA,
+        "plan_only": PLAN_ONLY_TOOLS,
+    }.get(tool_mode)
+    if tools is None:
+        raise ValueError("规划检查点包含未知工具集合")
+    repairing_submission = bool(
+        resume_checkpoint.get("repairingSubmission")
+        if resume_checkpoint is not None
+        else False
+    )
+    next_turn_index = max(
+        int(resume_checkpoint.get("nextTurnIndex", 0) or 0)
+        if resume_checkpoint is not None
+        else 0,
+        0,
+    )
+    pending_assistant_message = (
+        dict(resume_checkpoint["pendingAssistantMessage"])
+        if resume_checkpoint is not None
+        and isinstance(resume_checkpoint.get("pendingAssistantMessage"), dict)
+        else None
+    )
+
+    def update_elapsed() -> None:
+        state.elapsed_time = elapsed_before_run + (time.monotonic() - start_time)
+
+    def current_tool_mode() -> str:
+        if tools is PLAN_ONLY_TOOLS:
+            return "plan_only"
+        if tools is AGENT_TOOLS_WITH_DATA:
+            return "terminal"
+        return "full"
+
+    async def save_boundary(
+        stage: str,
+        *,
+        upcoming_turn: int,
+        pending_message: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        update_elapsed()
+        checkpoint = {
+            "schemaVersion": 1,
+            "kind": "planning",
+            "stage": stage,
+            "messages": messages,
+            "toolCache": dict(cache or {}),
+            "loopState": state.to_checkpoint(),
+            "toolMode": current_tool_mode(),
+            "repairingSubmission": repairing_submission,
+            "nextTurnIndex": upcoming_turn,
+            "pendingAssistantMessage": pending_message,
+        }
+        if on_checkpoint is not None:
+            await on_checkpoint(checkpoint)
+        return checkpoint
+
+    async def pause_if_needed(
+        stage: str,
+        *,
+        upcoming_turn: int,
+        pending_message: dict[str, Any] | None = None,
+    ) -> None:
+        # Every resumable boundary is committed, not only the boundary that
+        # happens to cross the soft time budget.  A process can exit before the
+        # reminder is due, and recovery still needs the latest complete model
+        # response or tool batch instead of falling back to a fresh run.
+        checkpoint = await save_boundary(
+            stage,
+            upcoming_turn=upcoming_turn,
+            pending_message=pending_message,
+        )
+        if approved_wall_time_seconds is None:
+            return
+        update_elapsed()
+        if state.elapsed_time < approved_wall_time_seconds:
+            return
+        await emit(
+            "planning.budget_pause",
+            "已安全保存当前进度",
+            status="warning",
+            summary="本轮处理时间已用完；继续前不会启动新的模型或工具调用。",
+        )
+        raise AgentBudgetPause(checkpoint, approved_wall_time_seconds)
+
     async with OpenAICompatibleClient(connection, timeout=timeout) as client:
-        for turn_index in range(loop_config.max_turns):
-            state.elapsed_time = time.time() - start_time
+        for turn_index in range(next_turn_index, loop_config.max_turns):
+            update_elapsed()
             state.turn_index = turn_index
             stop_flag, stop_reason = should_stop(state, loop_config)
             if stop_flag:
@@ -988,7 +1113,7 @@ async def run_excel_agent(
                         messages, warning_prompt
                     )
 
-            if turn_index == 0:
+            if turn_index == 0 and resume_checkpoint is None:
                 authorized_count = len(request.workbook.worksheets)
                 understanding_summary = (
                     f"已整理用户目标，并将规划范围限制在 {authorized_count} 张已授权工作表内。"
@@ -1005,28 +1130,48 @@ async def run_excel_agent(
                     },
                 )
             model_step_id = f"planning.model.{turn_index + 1}"
-            await emit(
-                model_step_id,
-                "正在生成操作方案"
-                if turn_index == 0
-                else f"正在修正操作方案（第 {turn_index + 1} 轮）",
-                status="started",
+            if pending_assistant_message is not None:
+                message = pending_assistant_message
+                pending_assistant_message = None
+                await emit(
+                    model_step_id,
+                    "正在继续已保存的工具步骤",
+                    status="completed",
+                    summary="已复用暂停前完整返回的模型响应。",
+                )
+            else:
+                await pause_if_needed(
+                    "before_model", upcoming_turn=turn_index
+                )
+                await emit(
+                    model_step_id,
+                    "正在生成操作方案"
+                    if turn_index == 0
+                    else f"正在修正操作方案（第 {turn_index + 1} 轮）",
+                    status="started",
+                )
+                payload, usage = await client.chat_completions(
+                    messages=messages,
+                    tools=tools,
+                    tool_choice="auto",
+                    max_tokens=(
+                        REPAIR_MAX_OUTPUT_TOKENS
+                        if repairing_submission
+                        else MAX_OUTPUT_TOKENS
+                    ),
+                )
+                state.total_tokens += usage.get("total_tokens", 0)
+                message = payload["choices"][0]["message"]
+            assistant_message = dict(message)
+            assistant_message.setdefault("role", "assistant")
+            await pause_if_needed(
+                "model_response_saved",
+                upcoming_turn=turn_index,
+                pending_message=assistant_message,
             )
-            payload, usage = await client.chat_completions(
-                messages=messages,
-                tools=tools,
-                tool_choice="auto",
-                max_tokens=(
-                    REPAIR_MAX_OUTPUT_TOKENS
-                    if repairing_submission
-                    else MAX_OUTPUT_TOKENS
-                ),
-            )
-            state.total_tokens += usage.get("total_tokens", 0)
-            message = payload["choices"][0]["message"]
-            tool_calls = message.get("tool_calls") or []
+            tool_calls = assistant_message.get("tool_calls") or []
             if not tool_calls:
-                content = message.get("content") or ""
+                content = assistant_message.get("content") or ""
                 try:
                     parsed = _parse_content(content)
                     if isinstance(parsed, PlanResponse):
@@ -1093,9 +1238,8 @@ async def run_excel_agent(
                     )
                     continue
 
-            assistant_message = dict(message)
-            assistant_message.setdefault("role", "assistant")
-            messages.append(assistant_message)
+            if not messages or messages[-1] != assistant_message:
+                messages.append(assistant_message)
             requested_tool_names = [
                 str((tool_call.get("function") or {}).get("name", "")).strip()
                 for tool_call in tool_calls
@@ -1347,8 +1491,11 @@ async def run_excel_agent(
                     "工作簿只读探索已完成。下一轮必须基于现有工作簿上下文和"
                     "工具结果直接调用 submit_plan 或 submit_answer；不要继续读取数据。",
                 )
+            await pause_if_needed(
+                "tool_batch_completed", upcoming_turn=turn_index + 1
+            )
     state.turn_index = loop_config.max_turns
-    state.elapsed_time = time.time() - start_time
+    update_elapsed()
     logger.warning(
         "Agent loop exhausted: turns=%s, tokens=%s, errors=%s, loop=%s",
         state.turn_index,

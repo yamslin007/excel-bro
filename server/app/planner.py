@@ -392,6 +392,9 @@ async def create_plan(
     *,
     tool_cache: dict[str, Any] | None = None,
     on_event: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    on_checkpoint: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    resume_checkpoint: dict[str, Any] | None = None,
+    approved_wall_time_seconds: float | None = None,
 ) -> AssistantResponse:
     structural_plan = _local_bulk_worksheet_deletion_plan(request)
     if structural_plan is not None:
@@ -416,6 +419,9 @@ async def create_plan(
             timeout=timeout,
             tool_cache=tool_cache,
             on_event=on_event,
+            on_checkpoint=on_checkpoint,
+            resume_checkpoint=resume_checkpoint,
+            approved_wall_time_seconds=approved_wall_time_seconds,
         )
     except (KeyError, IndexError, TypeError, ValidationError) as error:
         raise ValueError(f"模型计划无法通过安全校验：{error}") from error

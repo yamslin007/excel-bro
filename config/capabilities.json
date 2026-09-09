@@ -93,6 +93,11 @@
   },
   "taskRecovery": {
     "maxRegisteredDirectories": 50,
-    "operationRetentionDays": 30
+    "operationRetentionDays": 30,
+    "maxCheckpointBytes": 67108864,
+    "planningReminderSeconds": 60,
+    "planningExtensionSeconds": 60,
+    "planningHardWallTimeSeconds": 300,
+    "planningMaxExtensions": 4
   }
 }

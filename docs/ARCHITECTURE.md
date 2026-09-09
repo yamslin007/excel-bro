@@ -122,7 +122,8 @@ server/app/
 ├── planner.py              # 基础模式与最终规划
 ├── excel_agent.py          # 模型工具循环
 ├── agent_loop_protection.py # Agent 预算、循环检测和安全降级
-├── turn_state.py           # turnId 状态、TTL 和缓存
+├── turn_state.py           # turnId 进程内热状态、TTL 和缓存
+├── task_ledger.py          # SQLite 持久任务、规划现场、事件、预算和幂等状态
 ├── folder_workbooks.py     # 文件夹执行
 ├── folder_data.py          # 文件夹确定性查询
 ├── capabilities.py         # 共享能力配置
@@ -203,9 +204,11 @@ Office.js 执行快照按真实 executionId 绑定，成功、动作失败和验
 全部动作均未改变目标时不进入文件保存与恢复点创建。暂时无法可靠比较的动作保守地
 视为已变化，避免为了节省空间而漏掉恢复点。
 
-达到任一预算或耗尽轮次后不再抛出裸异常，而是返回 provider 为 system 的
+达到 token、轮次、连续错误等硬限制后不再抛出裸异常，而是返回 provider 为 system 的
 AnswerResponse，其中包含停止原因、压缩后的工具调用记录和针对截断、格式错误
-或循环的建议。限额集中在 config/capabilities.json 的 agent 段。
+或循环的建议。流式规划另受 `taskRecovery` 的时间预算控制：首次 60 秒，在完整模型响应
+或工具批次边界持久保存现场并暂停；用户通过带 revision 和稳定 requestId 的明确操作继续，
+每次增加 60 秒且累计不超过 300 秒。继续不会提高 token、轮次或错误上限。
 OpenAI-compatible 适配器统一返回 payload 与 usage；缺失 usage 的服务会得到零值
 token 统计。
 
@@ -235,10 +238,12 @@ token 统计。
 执行、撤销和独立恢复共享规范化目录的进程内及跨进程排他锁；独立恢复还必须核对
 manifest revision、生命周期、路径边界和写前/写后文件指纹。
 
-这是 [任务断点恢复指导 v0.3](TASK_CHECKPOINT_RECOVERY_GUIDE.md) 的阶段 A：支持持久
-身份、事件补收、安全挂起和恢复到执行前，但**不是**节点级继续执行。保存 DAG 当前节点、
-模型消息/摘要、工具游标与中间产物后跳过已完成节点，以及 60 秒提醒后的预算暂停继续，
-仍属于阶段 B/C。
+这是 [任务断点恢复指导 v0.4](TASK_CHECKPOINT_RECOVERY_GUIDE.md) 的阶段 A/B 实现：阶段 A
+提供持久身份、事件补收、安全挂起和恢复到执行前；B1 仅对单个
+`splitGroupAggregate` 保存完整暂存产物和逐文件发布 checkpoint，重启后核对指纹并跳过
+已发布文件；B2 保存流式规划的 messages、LoopState、工具缓存、开放工具模式、修复状态和
+完整待处理模型响应，可在安全边界暂停并显式继续。任意 DAG、备用模型接续和 Office.js
+写入跨重启续跑仍属于阶段 C。
 
 活动 Hook 从 `started` 起就把步骤加入有序时间线，按 `operationId + sequence` 隔离
 并去重事件，再按 `stepId` 原位更新。每段活动在消息流中拥有独立消息和稳定
@@ -279,6 +284,8 @@ manifest revision、生命周期、路径边界和写前/写后文件指纹。
 
 - `POST /api/turn`：统一轮次入口
 - `POST /api/turn/stream`：SSE 流式规划
+- `GET /api/turn/{turnId}/status`：查询持久规划状态、预算和续跑能力
+- `POST /api/turn/continue/stream`：按 revision 与稳定 requestId 显式继续暂停的规划
 - `POST /api/intent`：兼容意图入口
 - `POST /api/plan`：兼容规划入口
 - `GET /api/models`：模型目录
@@ -292,6 +299,7 @@ manifest revision、生命周期、路径边界和写前/写后文件指纹。
 - `POST /api/folders/execute`：兼容的非流式文件夹执行入口
 - `POST /api/folders/execute/stream`：带 operationId 幂等保护的 SSE 文件夹执行入口
 - `GET /api/folders/execute/status`：查询可恢复的文件夹执行状态和最终结果
+- `POST /api/folders/execute/resume/stream`：继续经核验的 B1 拆分任务剩余发布
 - `GET /api/folders/backups`：列出当前工作目录的受管理备份
 - `POST /api/folders/backups/export`：按 operationId 幂等取出副本到固定 `exports/` 目录
 - `POST /api/folders/backups/delete`：按修订号和影响摘要复核后事务删除指定受管备份

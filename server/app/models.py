@@ -1440,6 +1440,17 @@ class FolderManagedRecoveryRequest(BaseModel):
     confirmed: Literal[True]
 
 
+class FolderExecutionResumeRequest(BaseModel):
+    operationId: str = Field(
+        min_length=8,
+        max_length=100,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+    )
+    expectedRevision: int = Field(ge=1)
+    confirmed: Literal[True]
+    afterSequence: int = Field(default=0, ge=0)
+
+
 class FolderManagedRecoveryResponse(BaseModel):
     operationId: str = Field(min_length=8, max_length=100)
     undoId: str = Field(min_length=32, max_length=32)
@@ -1958,6 +1969,14 @@ class PlanRequest(BaseModel):
         str,
         StringConstraints(strip_whitespace=True, min_length=1, max_length=200),
     ] | None = None
+
+
+class PlanningContinueRequest(BaseModel):
+    turnId: TurnId
+    expectedRevision: int = Field(ge=1)
+    requestId: str = Field(min_length=8, max_length=100)
+    confirmed: Literal[True]
+    afterSequence: int = Field(default=0, ge=0)
 
 
 class PlanResponse(BaseModel):

@@ -58,11 +58,21 @@ export function normalizeStoredMessage(message: ChatMessage): ChatMessage {
             : ("pending" as const)
       }
     : undefined;
+  const planningResume = message.planningResume
+    ? {
+        ...message.planningResume,
+        status:
+          message.planningResume.status === "resuming"
+            ? ("pending" as const)
+            : message.planningResume.status
+      }
+    : undefined;
   const normalizedMessage: ChatMessage = {
     ...message,
     plan: message.plan ?? staleSourceConfirm?.plan,
     verification: normalizeStoredVerification(message.verification),
-    staleSourceConfirm
+    staleSourceConfirm,
+    planningResume
   };
   if (!message.clarification) return normalizedMessage;
   return {

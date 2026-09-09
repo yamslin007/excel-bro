@@ -45,6 +45,58 @@ class LoopState:
     last_error_message: str | None = None
     last_failed_plan: dict[str, Any] | None = None
 
+    def to_checkpoint(self) -> dict[str, Any]:
+        return {
+            "turnIndex": self.turn_index,
+            "toolCallHistory": list(self.tool_call_history),
+            "cacheHitCounts": dict(self.cache_hit_counts),
+            "consecutiveErrors": self.consecutive_errors,
+            "totalTokens": self.total_tokens,
+            "lastWarning": self.last_warning,
+            "detectedPathLoop": self.detected_path_loop,
+            "activeElapsedSeconds": self.elapsed_time,
+            "encounteredTruncation": self.encountered_truncation,
+            "lastErrorMessage": self.last_error_message,
+            "lastFailedPlan": self.last_failed_plan,
+        }
+
+    @classmethod
+    def from_checkpoint(cls, value: dict[str, Any]) -> "LoopState":
+        return cls(
+            turn_index=max(int(value.get("turnIndex", 0) or 0), 0),
+            tool_call_history=[
+                str(item) for item in value.get("toolCallHistory", [])
+            ],
+            cache_hit_counts={
+                str(key): max(int(count), 0)
+                for key, count in dict(value.get("cacheHitCounts", {})).items()
+            },
+            consecutive_errors=max(int(value.get("consecutiveErrors", 0) or 0), 0),
+            total_tokens=max(int(value.get("totalTokens", 0) or 0), 0),
+            last_warning=(
+                str(value["lastWarning"]) if value.get("lastWarning") else None
+            ),
+            detected_path_loop=(
+                str(value["detectedPathLoop"])
+                if value.get("detectedPathLoop")
+                else None
+            ),
+            elapsed_time=max(
+                float(value.get("activeElapsedSeconds", 0.0) or 0.0), 0.0
+            ),
+            encountered_truncation=bool(value.get("encounteredTruncation")),
+            last_error_message=(
+                str(value["lastErrorMessage"])
+                if value.get("lastErrorMessage")
+                else None
+            ),
+            last_failed_plan=(
+                dict(value["lastFailedPlan"])
+                if isinstance(value.get("lastFailedPlan"), dict)
+                else None
+            ),
+        )
+
 
 @dataclass
 class LoopConfig:

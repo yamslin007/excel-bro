@@ -9,6 +9,8 @@ import {
 } from "react";
 import {
   checkIntent,
+  continuePlanningTask,
+  getPlanningTaskStatus,
   streamAssistantResponse,
   createFolderSnapshot,
   executeFolderPlan,
@@ -17,6 +19,7 @@ import {
   getFolderExecutionStatus,
   isLocalServiceConnectionError,
   refreshFolder,
+  resumeFolderExecution,
   scanFolderByPath,
   selectFolder,
 } from "./api";
@@ -33,6 +36,7 @@ import type {
   IntentMemory,
   IntentOption,
   IntentScopeContext,
+  PlanningStreamResult,
   QueryTableArguments,
   ResultContext,
   VerificationReport,
@@ -1459,13 +1463,10 @@ export default function App() {
     folderRecoveryAttachStartedRef.current = true;
     const pending = loadPendingFolderOperation();
     if (!pending) return;
-    if (
-      chatHistory.conversations.some((conversation) =>
-        conversation.messages.some(
-          (message) => message.folderOperationId === pending.operationId
-        )
-      )
-    ) {
+    const existingOperationMessage = chatHistory.conversations
+      .flatMap((conversation) => conversation.messages)
+      .find((message) => message.folderOperationId === pending.operationId);
+    if (existingOperationMessage && !existingOperationMessage.folderResume) {
       clearPendingFolderOperation(pending.operationId);
       return;
     }
@@ -1522,6 +1523,23 @@ export default function App() {
         persisted.status === "failed" ||
         persisted.status === "needs_reconciliation"
       ) {
+        if (
+          persisted.canResume &&
+          typeof persisted.revision === "number" &&
+          persisted.revision > 0
+        ) {
+          appendFolderOperationNotice(
+            pending,
+            "上次任务在安全断点处停止。已完成的拆分结果和备份仍可校验；继续时只发布尚未完成的文件，不会重新计算，也不会覆盖后来被修改的文件。",
+            true,
+            {
+              operationId: pending.operationId,
+              expectedRevision: persisted.revision,
+              status: "pending"
+            }
+          );
+          return;
+        }
         appendFolderOperationNotice(
           pending,
           `上次文件夹任务已停止。任务状态：需要核对。写入状态：不能仅凭任务记录确定。验收状态：尚未完成。${
@@ -1680,12 +1698,35 @@ export default function App() {
         ...current,
         conversations: current.conversations.map((conversation) => {
           if (conversation.id !== targetConversationId) return conversation;
-          if (
-            conversation.messages.some(
-              (message) => message.folderOperationId === pending.operationId
-            )
-          ) {
-            return conversation;
+          const operationMessageIndex = conversation.messages.findIndex(
+            (message) => message.folderOperationId === pending.operationId
+          );
+          const outcomeMessage: ChatMessage = {
+            id:
+              operationMessageIndex >= 0
+                ? conversation.messages[operationMessageIndex].id
+                : messageId(),
+            role: "assistant",
+            text: folderExecutionOutcomeText(pending.plan, result, recovered),
+            verification: result.verification,
+            executedPlanId: result.undo ? pending.plan.id : undefined,
+            executedUndoId: result.undo?.undoId,
+            folderOperationId: pending.operationId,
+            createdAt
+          };
+          if (operationMessageIndex >= 0) {
+            if (!conversation.messages[operationMessageIndex].folderResume) {
+              return conversation;
+            }
+            const nextMessages = conversation.messages.map((message, index) =>
+              index === operationMessageIndex ? outcomeMessage : message
+            );
+            return {
+              ...conversation,
+              title: conversationTitle(nextMessages),
+              messages: nextMessages,
+              updatedAt: createdAt
+            };
           }
           const existingMessages = preserveActivity
             ? conversation.messages
@@ -1697,16 +1738,7 @@ export default function App() {
               );
           const nextMessages = [
             ...existingMessages,
-            {
-              id: messageId(),
-              role: "assistant" as const,
-              text: folderExecutionOutcomeText(pending.plan, result, recovered),
-              verification: result.verification,
-              executedPlanId: result.undo ? pending.plan.id : undefined,
-              executedUndoId: result.undo?.undoId,
-              folderOperationId: pending.operationId,
-              createdAt
-            }
+            outcomeMessage
           ].slice(-MAX_MESSAGES_PER_CONVERSATION);
           return {
             ...conversation,
@@ -1728,7 +1760,8 @@ export default function App() {
       "conversationId" | "operationId" | "activityMessageId"
     >,
     text: string,
-    preserveActivity = false
+    preserveActivity = false,
+    folderResume?: ChatMessage["folderResume"]
   ): void {
     const createdAt = new Date().toISOString();
     setChatHistory((current) => {
@@ -1742,12 +1775,22 @@ export default function App() {
         ...current,
         conversations: current.conversations.map((conversation) => {
           if (conversation.id !== targetConversationId) return conversation;
-          if (
-            conversation.messages.some(
-              (message) => message.folderOperationId === pending.operationId
-            )
-          ) {
-            return conversation;
+          const existingIndex = conversation.messages.findIndex(
+            (message) => message.folderOperationId === pending.operationId
+          );
+          if (existingIndex >= 0) {
+            if (!folderResume) return conversation;
+            const nextMessages = conversation.messages.map((message, index) =>
+              index === existingIndex
+                ? { ...message, text, folderResume, createdAt }
+                : message
+            );
+            return {
+              ...conversation,
+              title: conversationTitle(nextMessages),
+              messages: nextMessages,
+              updatedAt: createdAt
+            };
           }
           const existingMessages = preserveActivity
             ? conversation.messages
@@ -1764,6 +1807,7 @@ export default function App() {
               role: "system" as const,
               text,
               folderOperationId: pending.operationId,
+              folderResume,
               createdAt
             }
           ].slice(-MAX_MESSAGES_PER_CONVERSATION);
@@ -1776,6 +1820,323 @@ export default function App() {
         })
       };
     });
+  }
+
+  function updateFolderResumeMessage(
+    messageIdValue: string,
+    update: (message: ChatMessage) => ChatMessage
+  ): void {
+    const updatedAt = new Date().toISOString();
+    setChatHistory((current) => ({
+      ...current,
+      conversations: current.conversations.map((conversation) => {
+        if (!conversation.messages.some((message) => message.id === messageIdValue)) {
+          return conversation;
+        }
+        return {
+          ...conversation,
+          messages: conversation.messages.map((message) =>
+            message.id === messageIdValue ? update(message) : message
+          ),
+          updatedAt
+        };
+      })
+    }));
+  }
+
+  async function resumeInterruptedFolderOperation(message: ChatMessage): Promise<void> {
+    const resume = message.folderResume;
+    const pending = loadPendingFolderOperation();
+    if (!resume || !pending || pending.operationId !== resume.operationId) {
+      updateFolderResumeMessage(message.id, (current) => ({
+        ...current,
+        text: "本机没有找到这项任务的完整请求记录，不能安全续跑。请打开「备份与恢复」核对文件。",
+        folderResume: current.folderResume
+          ? { ...current.folderResume, status: "failed" }
+          : undefined
+      }));
+      return;
+    }
+    updateFolderResumeMessage(message.id, (current) => ({
+      ...current,
+      folderResume: current.folderResume
+        ? { ...current.folderResume, status: "resuming" }
+        : undefined
+    }));
+    beginActivity(
+      "正在从安全断点继续",
+      "先核对实际文件，再跳过已完成发布，只继续剩余文件。",
+      {
+        operationId: resume.operationId,
+        phase: "saving",
+        stepId: "execution.resume"
+      }
+    );
+    setStatus("executing");
+    try {
+      const latest = await getFolderExecutionStatus(resume.operationId);
+      if (latest.status === "completed" && latest.result) {
+        appendFolderOperationOutcome(pending, latest.result, true, true);
+        clearPendingFolderOperation(resume.operationId);
+        finishActivity("completed", "已找回原任务的完成结果");
+        return;
+      }
+      if (!latest.canResume || typeof latest.revision !== "number") {
+        throw new Error(
+          latest.error?.message ?? "服务端没有确认可用的安全断点，不能继续。"
+        );
+      }
+      const result = await resumeFolderExecution(
+        resume.operationId,
+        latest.revision,
+        {
+          onProgress: applyProgressEvent,
+          onConnectionState: (connectionState, detail) => {
+            if (connectionState === "interrupted") {
+              markActivityInterrupted(detail ?? "连接中断，续跑结果待确认。");
+            } else {
+              markActivityConnected();
+            }
+          }
+        }
+      );
+      appendFolderOperationOutcome(pending, result, true, true);
+      if (result.undo) {
+        pushFolderUndo({
+          planId: pending.plan.id,
+          undoId: result.undo.undoId,
+          sessionId: result.undo.sessionId
+        });
+      }
+      clearPendingFolderOperation(resume.operationId);
+      finishActivity(
+        result.verification.status === "verified" ? "completed" : "warning",
+        result.verification.status === "verified"
+          ? "断点续跑完成并通过验收"
+          : "断点续跑完成，验收结果需要查看"
+      );
+    } catch (reason) {
+      const detail = reason instanceof Error ? reason.message : String(reason);
+      updateFolderResumeMessage(message.id, (current) => ({
+        ...current,
+        text: `续跑已安全停止：${detail} 没有覆盖无法确认状态的文件；你可以核对后重试，或在「备份与恢复」中恢复执行前版本。`,
+        folderResume: current.folderResume
+          ? { ...current.folderResume, status: "failed" }
+          : undefined
+      }));
+      finishActivity("warning", "续跑已安全停止");
+    } finally {
+      setStatus("idle");
+    }
+  }
+
+  function applyPlanningContinuationResult(
+    message: ChatMessage,
+    response: PlanningStreamResult,
+    baseline: NonNullable<ChatMessage["planningResume"]>
+  ): "paused" | "completed" {
+    if (response.kind === "planning_pause") {
+      updateFolderResumeMessage(message.id, (current) => ({
+        ...current,
+        text: response.reason,
+        provider: "system",
+        planningResume: {
+          ...baseline,
+          expectedRevision: response.revision,
+          lastSequence: response.lastSequence,
+          status: "pending",
+          reason: response.reason,
+          extensionSeconds: response.extensionSeconds,
+          activeElapsedSeconds: response.activeElapsedSeconds,
+          requestId: undefined,
+          sourceFingerprint:
+            response.sourceFingerprint ?? baseline.sourceFingerprint,
+          sourceFingerprintSheets:
+            response.sourceFingerprintSheets?.length
+              ? response.sourceFingerprintSheets
+              : baseline.sourceFingerprintSheets
+        }
+      }));
+      return "paused";
+    }
+    if (response.kind === "answer") {
+      updateFolderResumeMessage(message.id, (current) => ({
+        ...current,
+        text: response.message,
+        resultContext: response.resultContext ?? undefined,
+        provider: response.provider,
+        planningResume: undefined
+      }));
+      return "completed";
+    }
+    const plan: AnalysisPlan = {
+      ...response.plan,
+      sourceFingerprint:
+        baseline.sourceFingerprint ?? response.plan.sourceFingerprint,
+      sourceFingerprintSheets:
+        baseline.sourceFingerprintSheets?.length
+          ? baseline.sourceFingerprintSheets
+          : response.plan.sourceFingerprintSheets
+    };
+    updateFolderResumeMessage(message.id, (current) => ({
+      ...current,
+      text: plan.summary,
+      plan,
+      provider: response.provider,
+      planningResume: undefined
+    }));
+    return "completed";
+  }
+
+  async function resumePlanningTaskFromMessage(message: ChatMessage): Promise<void> {
+    const resume = message.planningResume;
+    if (!resume || busy) return;
+    const requestId = resume.requestId ?? messageId();
+    const turnController = new AbortController();
+    turnAbortRef.current = turnController;
+    setStatus("planning");
+    updateFolderResumeMessage(message.id, (current) => ({
+      ...current,
+      planningResume: current.planningResume
+        ? { ...current.planningResume, status: "resuming", requestId }
+        : undefined
+    }));
+    beginActivity(
+      "正在从保存的进度继续",
+      "正在核对任务状态和原始数据范围，然后从下一个安全边界继续。"
+    );
+    try {
+      const taskStatus = await getPlanningTaskStatus(
+        resume.turnId,
+        turnController.signal
+      );
+      if (taskStatus.status === "completed") {
+        applyPlanningContinuationResult(message, taskStatus.result, resume);
+        markServerOnline();
+        finishActivity("completed", "已找回任务的完成结果");
+        return;
+      }
+      if (taskStatus.status === "failed" || taskStatus.status === "cancelled") {
+        const detail = taskStatus.error?.message ?? "该规划任务已经停止，不能继续。";
+        updateFolderResumeMessage(message.id, (current) => ({
+          ...current,
+          text: detail,
+          planningResume: current.planningResume
+            ? { ...current.planningResume, status: "failed" }
+            : undefined
+        }));
+        finishActivity("warning", "任务已经停止");
+        return;
+      }
+      if (taskStatus.status === "running") {
+        updateFolderResumeMessage(message.id, (current) => ({
+          ...current,
+          text: "任务仍在处理中，无需重复继续。稍后再查看状态。",
+          planningResume: current.planningResume
+            ? { ...current.planningResume, status: "pending" }
+            : undefined
+        }));
+        finishActivity("warning", "任务仍在处理中");
+        return;
+      }
+      if (!taskStatus.canContinue) {
+        updateFolderResumeMessage(message.id, (current) => ({
+          ...current,
+          text: "该任务已达到安全处理上限，不能再追加运行时间。请简化需求后重新发送。",
+          planningResume: current.planningResume
+            ? { ...current.planningResume, status: "failed" }
+            : undefined
+        }));
+        finishActivity("warning", "已达到安全处理上限");
+        return;
+      }
+
+      const sourceFingerprint =
+        taskStatus.sourceFingerprint ?? resume.sourceFingerprint;
+      const sourceFingerprintSheets =
+        taskStatus.sourceFingerprintSheets?.length
+          ? taskStatus.sourceFingerprintSheets
+          : resume.sourceFingerprintSheets;
+      if (
+        sourceMode === "workbook" &&
+        isRunningInExcel() &&
+        sourceFingerprint &&
+        sourceFingerprintSheets?.length
+      ) {
+        const currentFingerprint = await captureWorkbookSourceFingerprint(
+          sourceFingerprintSheets
+        );
+        if (currentFingerprint !== sourceFingerprint) {
+          updateFolderResumeMessage(message.id, (current) => ({
+            ...current,
+            text: "原任务使用的数据已经变化，不能继续旧的规划现场。请按当前数据重新发送需求。",
+            planningResume: current.planningResume
+              ? { ...current.planningResume, status: "failed" }
+              : undefined
+          }));
+          finishActivity("warning", "数据已经变化，未继续旧任务");
+          return;
+        }
+      }
+
+      const baseline = {
+        ...resume,
+        expectedRevision: taskStatus.revision,
+        lastSequence: taskStatus.lastSequence,
+        requestId,
+        sourceFingerprint,
+        sourceFingerprintSheets
+      };
+      updateFolderResumeMessage(message.id, (current) => ({
+        ...current,
+        planningResume: baseline
+      }));
+      const result = await continuePlanningTask(
+        {
+          turnId: resume.turnId,
+          expectedRevision: taskStatus.revision,
+          requestId,
+          afterSequence: resume.lastSequence
+        },
+        {
+          signal: turnController.signal,
+          onProgress: applyProgressEvent
+        }
+      );
+      markServerOnline();
+      const outcome = applyPlanningContinuationResult(message, result, baseline);
+      finishActivity(
+        outcome === "completed" ? "completed" : "warning",
+        outcome === "completed"
+          ? "已从保存的进度完成任务"
+          : "进度已再次保存，等待你继续",
+        outcome === "paused" ? "awaiting_input" : undefined
+      );
+    } catch (reason) {
+      if (isAbortError(reason)) {
+        updateFolderResumeMessage(message.id, (current) => ({
+          ...current,
+          planningResume: current.planningResume
+            ? { ...current.planningResume, status: "pending", requestId }
+            : undefined
+        }));
+        finishActivity("cancelled", "已停止接收进度，任务现场仍保留");
+        return;
+      }
+      const detail = reason instanceof Error ? reason.message : String(reason);
+      if (isLocalServiceConnectionError(reason)) markServerOffline();
+      updateFolderResumeMessage(message.id, (current) => ({
+        ...current,
+        text: `继续任务时连接中断：${detail} 已保存的进度仍然保留，可以使用同一按钮重试。`,
+        planningResume: current.planningResume
+          ? { ...current.planningResume, status: "pending", requestId }
+          : undefined
+      }));
+      finishActivity("warning", "继续任务时连接中断");
+    } finally {
+      if (turnAbortRef.current === turnController) turnAbortRef.current = null;
+      setStatus("idle");
+    }
   }
 
   function beginActivity(
@@ -2512,6 +2873,33 @@ export default function App() {
         }
       );
       markServerOnline();
+      if (response.kind === "planning_pause") {
+        appendMessage({
+          role: "assistant",
+          text: response.reason,
+          intentMemory,
+          provider: "system",
+          querySourceMode: sourceMode,
+          querySourceSheetNames: effectiveSheetNames,
+          planningResume: {
+            turnId: response.turnId,
+            expectedRevision: response.revision,
+            lastSequence: response.lastSequence,
+            status: "pending",
+            reason: response.reason,
+            extensionSeconds: response.extensionSeconds,
+            activeElapsedSeconds: response.activeElapsedSeconds,
+            sourceFingerprint:
+              response.sourceFingerprint ?? requestWorkbook.sourceFingerprint,
+            sourceFingerprintSheets:
+              response.sourceFingerprintSheets?.length
+                ? response.sourceFingerprintSheets
+                : effectiveSheetNames
+          }
+        });
+        finishActivity("warning", "进度已保存，等待你继续", "awaiting_input");
+        return;
+      }
       if (response.kind === "answer") {
         const querySourceSheetIds = currentWorksheets
           .map((sheet) => sheet.sourceSheetId)
@@ -2590,13 +2978,33 @@ export default function App() {
       } else {
         markServerOnline();
       }
-      appendMessage({
-        role: "system",
-        text:
-          reason instanceof Error
-            ? reason.message
-            : "没有连接到本地 AI 服务，请确认服务已经启动。"
-      });
+      if (isLocalServiceConnectionError(reason) && turnId) {
+        appendMessage({
+          role: "assistant",
+          provider: "system",
+          text: "连接中断，但服务端可能已经保存了规划现场。恢复连接后可在这里核对并继续。",
+          intentMemory,
+          planningResume: {
+            turnId,
+            expectedRevision: 1,
+            lastSequence: 0,
+            status: "pending",
+            reason: "连接中断，等待恢复后核对任务状态。",
+            extensionSeconds: 0,
+            activeElapsedSeconds: 0,
+            sourceFingerprint: workbook.sourceFingerprint,
+            sourceFingerprintSheets: selectedNamesFor(workbook)
+          }
+        });
+      } else {
+        appendMessage({
+          role: "system",
+          text:
+            reason instanceof Error
+              ? reason.message
+              : "没有连接到本地 AI 服务，请确认服务已经启动。"
+        });
+      }
     } finally {
       setStatus("idle");
     }
@@ -6751,6 +7159,77 @@ export default function App() {
                 <ScopeSelectionGuidance {...message.scopeSelectionGuidance} />
               ) : (
                 message.text && <p className="message-text">{message.text}</p>
+              )}
+              {message.folderResume && (
+                <section className="folder-resume-card" aria-label="继续未完成的文件夹任务">
+                  <div className="folder-resume-copy">
+                    <strong>可从安全断点继续</strong>
+                    <span>先核对文件状态；已完成的会跳过，外部修改会立即停止。</span>
+                  </div>
+                  <div className="folder-resume-actions">
+                    <button
+                      type="button"
+                      className="primary-button"
+                      disabled={busy || message.folderResume.status === "resuming"}
+                      onClick={() => void resumeInterruptedFolderOperation(message)}
+                    >
+                      {message.folderResume.status === "resuming"
+                        ? "正在继续..."
+                        : message.folderResume.status === "failed"
+                          ? "重新核对并继续"
+                          : "继续剩余任务"}
+                    </button>
+                    <button
+                      type="button"
+                      className="secondary-button"
+                      disabled={busy}
+                      onClick={() => {
+                        setContextOpen(false);
+                        closeAllDrawers();
+                        setFolderBackupOpen(true);
+                      }}
+                    >
+                      查看备份
+                    </button>
+                  </div>
+                </section>
+              )}
+              {message.planningResume && (
+                <section
+                  className="folder-resume-card planning-resume-card"
+                  aria-label="继续已保存的规划任务"
+                >
+                  <div className="folder-resume-copy">
+                    <strong>
+                      {message.planningResume.status === "resuming"
+                        ? "正在从保存的进度继续"
+                        : "进度已保存"}
+                    </strong>
+                    <span>{message.planningResume.reason}</span>
+                    <span>
+                      已完成约 {Math.round(message.planningResume.activeElapsedSeconds)} 秒有效处理；
+                      继续时不会重做已经提交的工具结果。
+                    </span>
+                  </div>
+                  <div className="folder-resume-actions">
+                    <button
+                      type="button"
+                      className="primary-button"
+                      disabled={
+                        busy || message.planningResume.status === "resuming"
+                      }
+                      onClick={() => void resumePlanningTaskFromMessage(message)}
+                    >
+                      {message.planningResume.status === "resuming"
+                        ? "正在继续..."
+                        : message.planningResume.extensionSeconds > 0
+                          ? `继续处理（约 ${Math.round(
+                              message.planningResume.extensionSeconds
+                            )} 秒）`
+                          : "核对任务状态"}
+                    </button>
+                  </div>
+                </section>
               )}
               {message.intentMemory?.toolRequest && message.resultContext && (
                 <button

@@ -187,6 +187,128 @@ def test_progress_events_summarize_tools_without_exposing_raw_rows(
     assert "甲" not in serialized
 
 
+def test_budget_pause_resumes_complete_model_response_without_repeating_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def responder(call_count: int):
+        if call_count == 1:
+            return (
+                _tool_payload(
+                    "read_range",
+                    {"sheet": "Sheet1", "range": "A1:B3"},
+                    "read-after-resume",
+                ),
+                _usage(),
+            )
+        return (
+            _tool_payload(
+                "submit_answer",
+                {"message": "已从保存的模型响应继续。"},
+                "answer-after-resume",
+            ),
+            _usage(),
+        )
+
+    class SlowFirstClient(_FakeClient):
+        async def chat_completions(self, **kwargs: Any):
+            if self.call_count == 0:
+                await asyncio.sleep(0.08)
+            return await super().chat_completions(**kwargs)
+
+    client = SlowFirstClient(responder)
+    _install_client(monkeypatch, client)
+    original_execute_tool = excel_agent._execute_tool
+    executed_tools: list[str] = []
+
+    def counted_execute_tool(request, name, arguments):
+        executed_tools.append(name)
+        return original_execute_tool(request, name, arguments)
+
+    monkeypatch.setattr(excel_agent, "_execute_tool", counted_execute_tool)
+    checkpoints: list[dict[str, Any]] = []
+
+    async def save_checkpoint(checkpoint: dict[str, Any]) -> None:
+        checkpoints.append(copy.deepcopy(checkpoint))
+
+    with pytest.raises(excel_agent.AgentBudgetPause) as paused:
+        asyncio.run(
+            excel_agent.run_excel_agent(
+                _request(),
+                connection=_connection(),
+                timeout=10,
+                tool_cache={},
+                on_checkpoint=save_checkpoint,
+                approved_wall_time_seconds=0.05,
+                config=LoopConfig(max_wall_time_seconds=3600),
+            )
+        )
+
+    checkpoint = paused.value.checkpoint
+    assert checkpoint["stage"] == "model_response_saved"
+    assert checkpoint["pendingAssistantMessage"]["tool_calls"][0]["function"][
+        "name"
+    ] == "read_range"
+    assert executed_tools == []
+    assert checkpoints[-1] == checkpoint
+
+    response = asyncio.run(
+        excel_agent.run_excel_agent(
+            _request(),
+            connection=_connection(),
+            timeout=10,
+            tool_cache={},
+            resume_checkpoint=checkpoint,
+            approved_wall_time_seconds=10,
+            config=LoopConfig(max_wall_time_seconds=3600),
+        )
+    )
+
+    assert response.kind == "answer"
+    assert response.message == "已从保存的模型响应继续。"
+    assert executed_tools.count("read_range") == 1
+    assert client.call_count == 2
+
+
+def test_complete_model_response_is_checkpointed_before_budget_pause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _FakeClient(
+        lambda _call_count: (
+            _content_payload(
+                json.dumps(
+                    {"kind": "answer", "message": "已经完成只读分析。"},
+                    ensure_ascii=False,
+                )
+            ),
+            _usage(),
+        )
+    )
+    _install_client(monkeypatch, client)
+    checkpoints: list[dict[str, Any]] = []
+
+    async def save_checkpoint(checkpoint: dict[str, Any]) -> None:
+        checkpoints.append(copy.deepcopy(checkpoint))
+
+    response = asyncio.run(
+        excel_agent.run_excel_agent(
+            _request(),
+            connection=_connection(),
+            timeout=10,
+            tool_cache={},
+            on_checkpoint=save_checkpoint,
+            approved_wall_time_seconds=60,
+            config=LoopConfig(max_wall_time_seconds=3600),
+        )
+    )
+
+    assert response.kind == "answer"
+    stages = [checkpoint["stage"] for checkpoint in checkpoints]
+    assert stages[:2] == ["before_model", "model_response_saved"]
+    response_checkpoint = checkpoints[1]
+    assert response_checkpoint["pendingAssistantMessage"]["content"]
+    assert response_checkpoint["nextTurnIndex"] == 0
+
+
 def test_consecutive_invalid_plans_trigger_safe_degradation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

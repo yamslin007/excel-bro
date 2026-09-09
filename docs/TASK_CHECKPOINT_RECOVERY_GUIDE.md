@@ -1,9 +1,9 @@
 # Excel Bro 任务检查点、挂起与断点恢复开发指导
 
-版本：v0.3（阶段 A 实施跟踪版）  
-日期：2026-09-08  
-核对代码基线：`ac1d896`  
-状态：阶段 A 已实现并通过自动化测试，仍待真实 Excel/安装环境故障验收；阶段 B/C 未实现，现有程序不支持节点级断点续跑或超时后暂停继续。  
+版本：v0.4（阶段 B 实施跟踪版）
+日期：2026-09-09
+核对代码基线：阶段 B 当前实现（承接 `16d3e8d`）
+状态：阶段 A 已实现；阶段 B1/B2 已在限定路径完成代码和自动化验证，仍待真实 Excel/安装环境故障验收；阶段 C 未实现。当前只承诺 `splitGroupAggregate` 文件夹发布续跑，以及流式规划在完整模型响应/工具批次边界的预算暂停继续，不承诺任意 DAG、备用模型或 Office.js 写入续跑。
 适用项目：当前 Excel Bro，包括 Python 规划服务、文件夹执行、Office.js 当前工作簿执行。独立桌面版可复用本设计，但不是实施前提。
 
 ## 0. 给评审者的说明
@@ -21,11 +21,11 @@
 | SQLite 与 manifest | ADR 0001 已选 SQLite 保存任务调度账本，manifest 与实际文件继续作为效果证据 | 第 12 章 |
 | 执行时求值 | 预览样本不固定写入值；执行时记录实际采用的输入版本 | 第 8、11 章 |
 | 并发 | 阶段 A 已接入稳定任务身份、规范化目录的进程内/跨进程排他及备份生命周期保护 | 第 1、7、15 章 |
-| 60 秒预算 | 拟作为可配置提醒阈值；安全暂停后由用户追加预算，不再作为所有任务的统一终止线 | 第 10、13 章 |
-| 多文件部分发布 | 第一阶段只核对和受控恢复；第二阶段可开放继续发布，两种恢复方向不得交叉执行 | 第 8 章 |
+| 60 秒预算 | 已作为流式规划的可配置软份额；安全暂停后由用户明确追加预算，不是所有任务的统一终止线 | 第 10、13 章 |
+| 多文件部分发布 | B1 已对 `splitGroupAggregate` 开放受控继续发布；继续与恢复方向不得交叉执行 | 第 8 章 |
 | 耐久性 | manifest 已有刷新处理，不代表整条链路已证明断电可靠；两种记录/文件错位都须核对 | 第 4、12、16 章 |
 
-阶段 A 的 API、配置与状态已经落地；后文章节同时保留阶段 B/C 的拟议协议。看到“建议”或“拟新增”时，应结合第 15 章状态判断是否已经实现。
+阶段 A 及阶段 B 的受限 API、配置与状态已经落地；后文章节仍保留阶段 C 和阶段 B 扩展项的拟议协议。看到“建议”或“拟新增”时，应结合第 15 章状态判断是否已经实现。
 
 ### 0.2 阅读与评审要求
 
@@ -43,21 +43,21 @@
 
 ## 1. 当前项目事实与缺口
 
-下表是 2026-09-08 的静态代码核对结果。本文没有进行强制结束进程或断电实验。行号可能随开发变化，应以符号定位为准。
+下表是 2026-09-09 的代码核对结果。B1 已包含真实子进程强制退出测试；尚未进行真实 Excel 宿主、安装包和断电实验。行号可能随开发变化，应以符号定位为准。
 
 | 范围 | 当前代码依据 | 当前能力及不足 |
 | --- | --- | --- |
-| 文件夹进度任务 | `server/app/main.py`：`_FolderOperationState`、`_folder_operations` | 状态、事件、结果保存在进程内存，重启后不保留 |
-| 文件夹执行重连 | 同文件：`folder_execute_stream`、`folder_execute_status` | 仅在记录仍存在时，相同 operationId 和请求指纹复用任务；afterSequence 补收事件；无磁盘任务恢复 |
-| 前端重连 | `apps/excel-addin/src/api.ts`：`executeFolderPlan` | 首次失败且错误不属于 ApiRequestError 时，最多自动重试一次；判断按错误类型，不能保证均为网络错误；ApiRequestError 即使 retryable=true 也不自动重试 |
-| 重载后挂接 | `App.tsx`、`useActivityProgress.ts` | 有对话和完成日志持久化；已核对当前调用路径，没有通过执行状态接口自动重新挂接中断任务 |
-| 规划状态 | `server/app/turn_state.py`：`TurnRegistry` | 意图阶段、工具缓存、已完成回答/计划的幂等缓存均在内存 |
-| 模型循环 | `server/app/excel_agent.py`：`run_excel_agent` | 每次创建新的 LoopState 和 messages，未持久保存循环现场 |
+| 文件夹进度任务 | `server/app/task_ledger.py`、`server/app/main.py` | SQLite 持久保存身份、事件、checkpoint、终态和幂等墓碑；进程内表只作为活跃任务热状态 |
+| 文件夹执行重连 | `folder_execute_stream`、`folder_execute_status`、`folder_execute_resume_stream` | 相同 operationId/请求指纹可补收事件和终态；B1 对有完整产物与指纹证据的拆分发布允许显式续跑 |
+| 前端重连 | `apps/excel-addin/src/App.tsx`、`api.ts` | 保存 operationId/turnId，刷新或断线后先查持久状态；不会因连接失败自动创建新的写入或规划任务 |
+| 重载后挂接 | `App.tsx`、`conversation.ts` | 文件夹执行和预算暂停卡可在重载后查询原任务；`resuming` 临时状态会恢复为可再次核对的 `pending` |
+| 规划状态 | `task_ledger.py`、`turn_state.py` | 流式规划的请求、事件、checkpoint、预算、终态持久化；TurnRegistry 仍保留进程内热缓存，兼容非流式 `/api/plan` 不具备 B2 恢复保证 |
+| 模型循环 | `excel_agent.py`、`agent_loop_protection.py` | 保存 messages、LoopState、工具缓存、开放工具模式、修复状态、下一轮位置和完整待处理模型响应；只在安全边界暂停 |
 | 模型重试 | `server/app/llm/client.py`：`chat_completions` | 有同一连接的有限重试；不是跨进程恢复或本方案的备用模型调度 |
-| 文件夹动作 | `server/app/folder_workbooks.py`：`_execute_folder_plan` | 动作先修改内存工作簿，再集中调用保存；“动作完成”不等于中间结果已落盘 |
-| 文件夹保存与恢复 | 同文件：`_save_workbooks_atomically`、`_backup_entry`、`_restore_folder_undo_impl` | 已有副本、前后指纹和生命周期；恢复入口仍依赖 session.undo_stack、现行 v2 manifest、ready 状态及指纹核对，不能直接恢复重启后的部分发布任务 |
-| 并发保护 | `main.py`：`_run_folder_operation`；`folder_workbooks.py`：`_backup_cleanup_lock` | 不同 operation 可在线程池并行执行；已有 RLock 和恢复/删除等占用集合，但不是覆盖整个执行期的目标文件锁 |
-| 应用数据目录 | `packaging/runtime.py`：`_data_root`；`server/app/llm/config.py` | 安装运行入口已有应用数据目录并设置 EXCEL_BRO_CONFIG_DIR；开发入口的任务存储路径需统一 |
+| 文件夹动作 | `folder_workbooks.py`：`_execute_folder_plan`、`resume_folder_plan` | B1 仅支持单个 `splitGroupAggregate` 的完整计算产物暂存和逐文件发布续跑；其他动作仍不按步骤号跳过 |
+| 文件夹保存与恢复 | 同文件的暂存、publish checkpoint 与 manifest 逻辑 | 每个目标记录暂存产物、写前/写后指纹和发布状态；重启后先核对实际文件，只发布仍为写前态的目标，不重新计算 |
+| 并发保护 | `main.py`、`folder_write_guard`、任务账本 CAS | 规范化工作目录具有进程内和跨进程排他；继续请求按 revision 领取，恢复点仍受生命周期保护 |
+| 应用数据目录 | `server/app/app_data.py`、`packaging/runtime.py` | 开发/安装共用应用数据解析；SQLite 账本位于本机应用数据，工作簿大产物仍在已登记工作目录 |
 | 文件刷新 | `folder_workbooks.py`：`_atomic_write_manifest`、`_save_workbooks_atomically` | manifest 已执行 flush、fsync、替换和占用重试；工作簿临时输出没有同样的显式 fsync，整链路断电耐久性未验证 |
 | 当前工作簿动作 | `apps/excel-addin/src/excel.ts`：`executePlan` | 循环执行动作并同步到 Excel；异常可返回部分撤销资料，没有持久化节点调度器 |
 
@@ -66,19 +66,17 @@
 - `server/tests/test_main.py::test_folder_execute_stream_reuses_operation_without_writing_twice`。
 - `apps/excel-addin/src/api.test.ts` 中的 `reconnects with the same operationId and forwards progress`。
 - `server/tests/test_folder_workbooks.py` 的验证失败后撤销、回滚失败保留救援副本、外部修改后拒绝撤销等测试。
+- `test_split_group_resume_after_real_process_exit_before_publish` 的真实子进程退出与逐文件恢复发布。
+- `server/tests/test_agent_integration.py` 的完整模型响应后暂停、恢复时复用响应且工具只调用一次。
+- `server/tests/test_main.py` 与 `test_task_ledger.py` 的规划暂停、刷新/重启持久化、CAS 修订和稳定 requestId 去重。
 
-这些测试能证明各自覆盖的重连或恢复行为，不能代替跨进程续跑测试。
+这些测试能证明受支持路径的重连或恢复行为，不能代替真实 Excel、安装环境和断电测试。
 
-当前 `progress.folderOperationTtlSeconds=3600`，清理只处理非运行任务，但年龄从 created_at 计算；不能描述为“每个任务完成后必定保留一小时”。容量淘汰同样会移除已结束任务及其全部事件。记录不存在时：
+`progress.folderOperationTtlSeconds=3600` 现在只控制进程内热缓存；SQLite 终态保留期由 `taskRecovery.operationRetentionDays` 控制，清理载荷后仍保留幂等墓碑。未知或过期 operationId 不会进入创建分支重做写入。非流式文件夹兼容入口也经过相同持久准入与目录排他。
 
-- `GET /api/folders/execute/status` 返回 404 / OPERATION_NOT_FOUND。
-- `POST /api/folders/execute/stream` 的 state is None 分支会注册任务并再次调度，不是只返回空事件。
-- 旧 sessionId 可能已失效，也可能在同进程淘汰时仍有效。因此存在重新执行风险，不能断言必定重复写入或必定安全。
-- 非流式兼容写入入口也必须纳入持久身份和互斥改造，不能成为绕过恢复保护的路径。
+规划默认仍受 8 轮和 20,000 token 硬限制。流式规划首次获批 60 秒有效运行时间，每次显式继续增加 60 秒，最多 4 次，硬上限 300 秒；软份额只在完整模型响应或完整工具批次等安全边界生效，不会在第 60 秒强杀在途调用。`llm.timeoutSeconds=60` 是独立网络等待配置。继续只增加时间，不提高 token、轮次或连续错误上限。
 
-当前 `agent` 默认限制为 8 轮、20,000 token、60 秒规划时间。时间只在轮次边界检查；在途模型调用及内部重试可能超过 60 秒，且它不是整次 Excel 写入的总超时。`llm.timeoutSeconds=60` 是另一项网络等待配置，部分调用可被 `AI_TIMEOUT_SECONDS` 覆盖；客户端默认最多重试 5 次。以上限额来自代码和配置，不是已经测得的任务耗时或费用分布。
-
-现有状态恢复不等于持久任务恢复：备份 manifest 在保存阶段生成，没有规划消息、完整节点现场或持久 operation 映射；服务端目录登记在内存，前端保存的工作目录偏好也不能直接充当后端恢复授权。
+当前恢复仍有明确边界：文件夹节点级续跑限于单个 `splitGroupAggregate`；规划恢复限于 `/api/turn/stream`；备用模型切换、任意 DAG/子任务恢复、Office.js 写入跨重启续跑及通用取消仍属于阶段 C 或后续扩展。持久目录索引只用于定位已登记目录，不能替代当前授权。
 
 ## 2. 目标、定义与不变边界
 
@@ -453,7 +451,7 @@ checkpoint 恢复不是恢复某个网页的滚动位置。聊天历史恢复也
 
 ### 10.4 60 秒提醒、安全暂停与预算追加
 
-以下为阶段 B2 的拟议行为，当前程序没有这些交互。默认提醒份额建议为 60 秒，可配置；任务总上限、单次追加份额、最大追加次数必须在实施前依据测试和产品约束确定，不能留为无限。
+以下行为已在 `/api/turn/stream` 的受支持规划路径实现。默认软份额为 60 秒，可配置；到达份额后不会强杀在途模型调用，而是在下一个完整模型响应或完整工具批次边界保存现场并暂停。非流式兼容规划、Office.js 写入执行和阶段 C 的细粒度节点不继承这项保证。
 
 | 限制 | 职责 | 到达后的动作 |
 | --- | --- | --- |
@@ -483,9 +481,9 @@ checkpoint 恢复不是恢复某个网页的滚动位置。聊天历史恢复也
 
 ### 10.5 配置与最小现场要求
 
-新增预算配置集中于 `config/capabilities.json`；建议区分提醒份额、硬有效运行总时长、允许的追加份额/次数、总轮次/token、重试上限。不得直接把旧 maxWallTimeSeconds 调大就宣称实现暂停续跑，旧配置与新配置的迁移规则必须写明。限额数值及配置键名在阶段 B2 开工前固定，本次不改配置文件。
+预算配置集中于 `config/capabilities.json`：`planningReminderSeconds=60`、`planningExtensionSeconds=60`、`planningHardWallTimeSeconds=300`、`planningMaxExtensions=4`。生产规划循环的时间硬上限读取 `planningHardWallTimeSeconds`；旧 `agent.maxWallTimeSeconds` 暂时保留为兼容配置但不再驱动该循环。轮次、token、连续错误和模型网络重试仍使用原有独立限制，普通继续不会提高它们。
 
-B2 至少保存最终确认需求、规划阶段和开放工具集合、完整模型响应、已完成工具结果、未完成调用、修复状态及预算。暂停中刷新/重启后仍可找回同一任务，才可展示“从当前进度继续”。不具备现场持久化的阶段只能说明暂不支持，不提供实为重跑的“继续”按钮。
+B2 当前保存原请求（含最终确认需求与来源指纹）、messages、LoopState、开放工具模式、工具缓存、修复状态、下一轮位置、完整待处理模型响应、事件序列、预算和稳定继续 requestId。刷新/重启后先查询持久状态，再按 revision 显式继续；已完成的模型响应和工具结果不会重做。半份响应不会成为 checkpoint，不具备这些证据的路径不展示续跑能力。
 
 ## 11. 授权、来源版本与确认有效性
 
@@ -519,15 +517,15 @@ B2 至少保存最终确认需求、规划阶段和开放工具集合、完整�
 
 任务元数据存本机应用数据目录，文件夹大型产物与既有恢复资料放在用户已登记的工作目录。阶段 A 已由 `server/app/app_data.py` 与 `packaging/runtime.py` 统一开发/安装解析规则：`EXCEL_BRO_CONFIG_DIR` 优先，否则使用平台应用数据目录，不依赖当前 shell 所在目录定位历史任务。
 
-以下为逻辑布局。阶段 A 已选择 SQLite，当前账本物理位置为 `tasks/state.sqlite3`：
+以下为逻辑布局。阶段 A/B 共用 SQLite，当前账本物理位置为 `tasks/state.sqlite3`：
 
 ```text
 %LOCALAPPDATA%/Excel Bro/tasks/
-├── state.sqlite3           阶段 A 的任务身份、事件、结果、幂等墓碑及目录索引
-└── artifacts/              阶段 B/C 拟增加的规划、工具和受控小型产物
+├── state.sqlite3           任务身份、规划现场、事件、结果、预算、幂等墓碑及目录索引
+└── artifacts/              保留给阶段 C 的受控大型规划/工具产物（B2 现场当前在 SQLite）
 
 已登记的工作目录/.excel-bro-backups/
-├── tasks/<taskId>/         拟新增：文件夹任务的暂存工作簿与中间产物
+├── tasks/<sha256(taskId)>/ B1 已实现：文件夹任务的暂存工作簿与中间产物
 ├── executions/<undoId>/    复用：执行前副本与恢复清单
 ├── operations/             复用：恢复事务救援资料
 ├── exports/                复用：用户取出的副本
@@ -596,7 +594,7 @@ B2 至少保存最终确认需求、规划阶段和开放工具集合、完整�
 
 ## 13. API、前端与用户体验
 
-以下包含已实现的阶段 A 接口语义和阶段 B/C 的拟议接口；状态以表中说明为准：
+以下包含已实现的阶段 A/B 接口语义和阶段 C 的拟议接口；状态以表中说明为准：
 
 | 语义 | 状态 | 输入 | 行为 |
 | --- | --- | --- | --- |
@@ -604,10 +602,12 @@ B2 至少保存最终确认需求、规划阶段和开放工具集合、完整�
 | 查询文件夹执行 | 阶段 A 已实现 | operationId | 返回运行、完成、失败或需核对状态；查询不会创建执行 |
 | 订阅文件夹事件 | 阶段 A 已实现 | operationId、afterSequence | 补发已提交事件并复用终态结果 |
 | 独立恢复文件 | 阶段 A 已实现 | directoryId、undoId、expectedRevision、稳定 operationId、明确确认 | 取得与原执行相同的目录排他，核对后续修改与 manifest 后恢复到执行前；重复请求可重入 |
-| 预检节点续跑 | 阶段 B/C 未实现 | taskId、预期 revision | 检查授权、输入、产物与未知写入，返回续跑方案 |
-| 继续业务节点 | 阶段 B 未实现 | taskId、恢复方案修订、明确选择 | 原子核对修订并领取；重复请求返回同一操作状态 |
-| 追加预算并继续 | 阶段 B2 未实现 | taskId、expectedRevision、稳定 requestId、明确的追加额度 | 检查硬上限和暂停原因，只追加一次，重新核对后调度；不授权 Excel 写入 |
-| 取消/放弃 | 阶段 B/C 未实现 | taskId、预期 revision | 记录停止意图，安全结束；不隐式删除已经写入的结果 |
+| 查询规划任务 | 阶段 B2 已实现 | `GET /api/turn/{turnId}/status` | 返回持久状态、revision、事件位置、预算、来源指纹及是否可继续；查询不会自动继续 |
+| 文件夹续跑预检 | 阶段 B1 限定实现 | operationId、持久 checkpoint | 仅对单个 `splitGroupAggregate` 核对授权、产物、manifest 和各文件真实指纹 |
+| 继续文件夹发布 | 阶段 B1 限定实现 | operationId、expectedRevision、明确确认 | `POST /api/folders/execute/resume/stream` 原子领取后只发布未完成文件；不重新计算 |
+| 追加预算并继续 | 阶段 B2 限定实现 | turnId、expectedRevision、稳定 requestId、明确确认 | `POST /api/turn/continue/stream` 检查硬上限，同 requestId 只追加一次；不授权 Excel 写入 |
+| 通用节点续跑 | 阶段 C 未实现 | taskId、恢复方案修订 | 尚不支持任意动作、任意 DAG 或子任务栈继续 |
+| 取消/放弃 | 后续扩展未实现 | taskId、预期 revision | 记录停止意图，安全结束；不隐式删除已经写入的结果 |
 | 切换接续模型 | 阶段 C 未实现 | taskId、允许的 connectionId | 在受支持边界应用，保留范围与预算 |
 
 恢复预检和真正执行之间仍需复核，不能依赖预检时刻的旧状态。未知任务 ID、已过期状态和不匹配内容应明确报错，不创建新任务。
@@ -665,7 +665,7 @@ B2 至少保存最终确认需求、规划阶段和开放工具集合、完整�
 
 ## 15. 分阶段交付与进入下一阶段的条件
 
-阶段 A 已完成代码与自动化测试，仍需真实 Excel、安装包和强制进程终止矩阵的人工验收；阶段 B/C 待实施。本章替代原 R0–R5 清单。每阶段都先做对应协议和故障实验，不把实验单独推迟到最后。
+阶段 A 已完成代码与自动化测试；阶段 B1/B2 已完成限定范围代码和自动化测试。A/B 仍需真实 Excel、安装包及故障矩阵人工验收，阶段 C 待实施。本章替代原 R0–R5 清单。每阶段都先做对应协议和故障实验，不把实验单独推迟到最后。
 
 ### 15.1 阶段 A：中断识别、安全核对与恢复基础
 
@@ -686,12 +686,12 @@ B2 至少保存最终确认需求、规划阶段和开放工具集合、完整�
 
 只对输入版本明确、必要产物持久化、效果可核对的边界开放。
 
-| 子项 | 实施内容 | 退出条件 |
-| --- | --- | --- |
-| B1 文件夹续跑 | 一类通用分组/拆分任务的稳定输入、完整计算结果或可重算段、暂存、冻结名称、逐文件发布和最终验收 | 强制中断后结果等价，无重复输出；部分发布按确认方向处理；保留执行前恢复能力 |
-| B2 预算暂停继续 | 第 10.4–10.5 节、追加预算接口及 UI；保存支持路径的最小规划/工具现场 | 达到软阈值安全暂停；用户追加后从原进度继续；刷新/重启、多次点击、token 同时耗尽等场景通过 |
+| 子项 | 状态 | 实施内容 | 退出条件 |
+| --- | --- | --- | --- |
+| B1 文件夹续跑 | 限定实现，待人工验收 | 单个 `splitGroupAggregate` 的稳定输入、完整计算结果、暂存、冻结名称、逐文件发布和最终验收 | 自动化含真实子进程退出、部分发布与来源变化拒绝；待真实 Excel/安装环境验证 |
+| B2 预算暂停继续 | 限定实现，待人工验收 | 流式规划保存最小消息/工具/预算现场，提供状态查询、CAS 继续接口和恢复卡 | 自动化覆盖安全边界、重启持久化、重复 requestId 和旧 revision；待真实模型长任务、刷新/重启及硬预算组合验收 |
 
-B1 与 B2 共用阶段 A 的身份、存储和调度契约；可分别验收，但不能用 B1 已交付宣称 B2 已实现。B2 可先限制为完整模型轮次和已完成工具批次，不要求阶段 C 的所有分页/分块优化；等待中的 Office.js 数据请求必须重连原授权宿主或明确挂起，不能由后端扩大读取。
+B1 与 B2 共用阶段 A 的身份、存储和调度契约并分别声明边界。B2 目前限制为完整模型响应和完整工具批次，不包含阶段 C 的分页/分块检查点；等待中的 Office.js 数据请求仍必须重连原授权宿主或明确挂起，不能由后端扩大读取。
 
 发布说明必须列出支持的动作与暂停节点。不支持的节点走阶段 A 的核对出口，不按界面步骤序号跳过。
 
@@ -810,6 +810,7 @@ Windows 后端测试如需指定 basetemp，应使用仓库 .tmp 内每次新建
 
 版本记录：
 
+- v0.4，2026-09-09：实施阶段 B 的限定路径。B1 为单个 `splitGroupAggregate` 增加持久暂存、逐文件 checkpoint、指纹核对和显式继续发布；B2 为流式规划增加消息/工具/LoopState checkpoint、60 秒软份额、CAS 预算追加、状态查询和前端恢复卡。自动化测试已覆盖真实子进程退出、工具不重复调用、刷新持久化和请求去重；真实 Excel/安装环境验收及阶段 C 能力仍未完成。
 - v0.3，2026-09-08：实施阶段 A。新增 SQLite 持久任务账本、永久幂等墓碑、统一应用数据目录、受管工作目录索引、进程内/跨进程目录排他、独立文件恢复和任务窗格刷新挂接；补充异常退出、并发、恢复中断、后续编辑冲突和过期重放测试。阶段 B/C 仍未实现，真实 Excel/安装环境故障矩阵仍待人工验收。
 - v0.2，2026-09-08：整合两轮评审及代码复核；明确三阶段、第一阶段三层互斥、过期请求拒绝重建、单一调度权威与双向效果核对、输入版本和多文件恢复方向；新增 60 秒提醒/安全暂停/预算追加、持久目录定位及 C29–C43 验收。SQLite 不再预先选定；评审原文保留。仅文档更新，运行代码、配置和能力未改变。
 - v0.1，2026-09-08：形成当前 Excel Bro 的 checkpoint、挂起、核对、模型接续及分阶段实施指导，供独立评审。所有新增模块、接口、存储和状态均未实施。

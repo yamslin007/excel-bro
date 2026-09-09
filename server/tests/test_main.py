@@ -716,6 +716,7 @@ def test_turn_stream_emits_steps_then_result(
         *,
         tool_cache: object = None,
         on_event=None,
+        **_checkpoint_options: object,
     ) -> AnswerResponse:
         if on_event is not None:
             await on_event({"phase": "planning", "title": "正在查看工作簿结构"})
@@ -878,6 +879,118 @@ def test_folder_execute_stream_reports_unknown_effect_as_needs_reconciliation(
     )
 
 
+def test_folder_resume_stream_claims_checkpoint_and_returns_original_result(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    operation_id = "folder-resume-operation"
+    ledger = main_module._folder_operation_ledger
+    ledger.register(operation_id, "resume-fingerprint")
+    ledger.save_execution_context(
+        operation_id,
+        request={"operationId": operation_id, "plan": {"id": "split-plan"}},
+        authorization={"schemaVersion": 1, "root": str(tmp_path), "targets": []},
+    )
+    ledger.commit_checkpoint(
+        operation_id,
+        kind="splitGroupAggregate",
+        payload={
+            "schemaVersion": 1,
+            "kind": "splitGroupAggregate",
+            "stage": "publish_prepared",
+            "executionId": "a" * 32,
+        },
+    )
+    record = ledger.get(operation_id)
+    assert record is not None
+    captured: dict[str, object] = {}
+
+    def fake_resume(
+        received_operation_id,
+        authorization,
+        checkpoint,
+        on_progress=None,
+        on_checkpoint=None,
+    ):
+        captured["operationId"] = received_operation_id
+        captured["authorization"] = authorization
+        captured["checkpoint"] = checkpoint
+        return main_module.FolderExecuteResponse.model_validate(
+            {
+                "executionId": "a" * 32,
+                "filesModified": ["cinema.xlsx"],
+                "backups": [".excel-bro-backups/executions/backup/cinema.xlsx"],
+                "backupWarnings": [],
+                "actionResults": [],
+                "verification": {
+                    "status": "verified",
+                    "passed": True,
+                    "checks": [],
+                    "unverifiedActions": [],
+                },
+                "executionMs": 0,
+                "verificationMs": 1,
+            }
+        )
+
+    monkeypatch.setattr(main_module, "resume_folder_plan", fake_resume)
+    monkeypatch.setattr(
+        main_module,
+        "folder_resume_checkpoint_summary",
+        lambda *_args: {"canResume": True, "filesApplied": 0, "filesPending": 1},
+    )
+    response = TestClient(app).post(
+        "/api/folders/execute/resume/stream",
+        json={
+            "operationId": operation_id,
+            "expectedRevision": record.revision,
+            "confirmed": True,
+        },
+    )
+
+    assert response.status_code == 200
+    events = _parse_sse(response.text)
+    assert events[-1][0] == "result"
+    assert events[-1][1]["filesModified"] == ["cinema.xlsx"]
+    assert captured["operationId"] == operation_id
+    assert captured["authorization"] == record.authorization
+    assert captured["checkpoint"] == ledger.checkpoint(operation_id).payload
+    assert ledger.get(operation_id).status == "completed"
+
+
+def test_folder_resume_stream_rejects_stale_revision(tmp_path: Path) -> None:
+    operation_id = "folder-resume-stale"
+    ledger = main_module._folder_operation_ledger
+    ledger.register(operation_id, "resume-fingerprint")
+    ledger.save_execution_context(
+        operation_id,
+        request={"operationId": operation_id, "plan": {"id": "split-plan"}},
+        authorization={"schemaVersion": 1, "root": str(tmp_path), "targets": []},
+    )
+    ledger.commit_checkpoint(
+        operation_id,
+        kind="splitGroupAggregate",
+        payload={
+            "schemaVersion": 1,
+            "kind": "splitGroupAggregate",
+            "stage": "publish_prepared",
+            "executionId": "b" * 32,
+        },
+    )
+
+    response = TestClient(app).post(
+        "/api/folders/execute/resume/stream",
+        json={
+            "operationId": operation_id,
+            "expectedRevision": 1,
+            "confirmed": True,
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "RESUME_CLAIM_CONFLICT"
+
+
 def test_folder_execute_stream_refuses_unfinished_persisted_operation(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1029,6 +1142,7 @@ def test_turn_stream_serializes_model_error_as_event(
         *,
         tool_cache: object = None,
         on_event=None,
+        **_checkpoint_options: object,
     ) -> AnswerResponse:
         raise LLMTimeoutError("模型响应超时")
 
@@ -1045,6 +1159,105 @@ def test_turn_stream_serializes_model_error_as_event(
     assert error_events[0]["retryable"] is True
 
 
+def test_turn_stream_persists_unexpected_failure_and_returns_safe_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def failing_create_plan(
+        _request: object,
+        *,
+        tool_cache: object = None,
+        on_event=None,
+        **_checkpoint_options: object,
+    ) -> AnswerResponse:
+        raise RuntimeError("不应返回给用户的内部错误")
+
+    monkeypatch.setattr(main_module, "create_plan", failing_create_plan)
+    payload = {**_STREAM_PAYLOAD, "turnId": "turn-unexpected-failure-test"}
+
+    response = TestClient(app).post("/api/turn/stream", json=payload)
+
+    assert response.status_code == 200
+    events = _parse_sse(response.text)
+    error = next(value for name, value in events if name == "error")
+    assert error == {
+        "status": 500,
+        "code": "PLANNING_TASK_FAILED",
+        "message": "规划任务未能安全保存当前状态，请重新发起任务。",
+        "retryable": False,
+    }
+    assert "内部错误" not in response.text
+    record = main_module._folder_operation_ledger.planning_task(
+        "turn-unexpected-failure-test"
+    )
+    assert record is not None
+    assert record.status == "failed"
+    assert record.error == error
+
+
+def test_closing_planning_stream_stops_worker_before_releasing_active_fence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker_cancelled = asyncio.Event()
+
+    async def hanging_create_plan(
+        _request: object,
+        *,
+        tool_cache: object = None,
+        on_event=None,
+        on_checkpoint=None,
+        **_checkpoint_options: object,
+    ) -> AnswerResponse:
+        checkpoint = {
+            "schemaVersion": 1,
+            "kind": "planning",
+            "stage": "tool_batch_completed",
+            "messages": [{"role": "user", "content": "继续前的安全现场"}],
+            "toolCache": {},
+            "loopState": {"activeElapsedSeconds": 1},
+            "toolMode": "all",
+            "repairingSubmission": False,
+            "nextTurnIndex": 1,
+            "pendingAssistantMessage": None,
+        }
+        if on_checkpoint is not None:
+            await on_checkpoint(checkpoint)
+        if on_event is not None:
+            await on_event({"phase": "planning", "title": "已保存安全现场"})
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            worker_cancelled.set()
+            raise
+        return AnswerResponse(kind="answer", message="不会到达", provider="local")
+
+    monkeypatch.setattr(main_module, "create_plan", hanging_create_plan)
+    payload = {**_STREAM_PAYLOAD, "turnId": "turn-stream-close-test"}
+    request = main_module.PlanRequest.model_validate(payload)
+    record, created = main_module._folder_operation_ledger.register_planning_task(
+        request.turnId or "",
+        main_module._planning_request_fingerprint(request),
+        request.model_dump(mode="json", exclude_none=True),
+        approved_wall_time_seconds=60,
+    )
+    assert created is True
+
+    async def close_after_first_event() -> None:
+        stream = main_module._planning_task_stream(request, record)
+        first = await anext(stream)
+        assert "event: step" in first
+        assert request.turnId in main_module._active_planning_tasks
+        await stream.aclose()
+
+    asyncio.run(close_after_first_event())
+
+    assert worker_cancelled.is_set()
+    assert request.turnId not in main_module._active_planning_tasks
+    persisted = main_module._folder_operation_ledger.planning_task(request.turnId or "")
+    assert persisted is not None
+    assert persisted.status == "running"
+    assert persisted.checkpoint is not None
+
+
 def test_turn_stream_maps_overloaded_429_to_friendly_message(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1055,6 +1268,7 @@ def test_turn_stream_maps_overloaded_429_to_friendly_message(
         *,
         tool_cache: object = None,
         on_event=None,
+        **_checkpoint_options: object,
     ) -> AnswerResponse:
         raise LLMHTTPStatusError(
             429,
@@ -1089,6 +1303,7 @@ def test_turn_stream_returns_cached_completion_without_steps(
         *,
         tool_cache: object = None,
         on_event=None,
+        **_checkpoint_options: object,
     ) -> AnswerResponse:
         nonlocal calls
         calls += 1
@@ -1107,6 +1322,94 @@ def test_turn_stream_returns_cached_completion_without_steps(
     second_events = _parse_sse(second.text)
     assert [name for name, _ in second_events] == ["result"]
     assert calls == 1  # 第二次命中缓存，不再规划
+
+
+def test_turn_stream_pauses_persists_and_continues_from_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    resumed_checkpoints: list[dict | None] = []
+
+    async def pausing_create_plan(
+        _request: object,
+        *,
+        tool_cache: object = None,
+        on_event=None,
+        on_checkpoint=None,
+        resume_checkpoint=None,
+        approved_wall_time_seconds=None,
+    ) -> AnswerResponse:
+        nonlocal calls
+        calls += 1
+        resumed_checkpoints.append(resume_checkpoint)
+        if resume_checkpoint is None:
+            checkpoint = {
+                "schemaVersion": 1,
+                "kind": "planning",
+                "stage": "tool_batch_completed",
+                "messages": [{"role": "user", "content": "查看当前数据"}],
+                "toolCache": {"context": "saved"},
+                "loopState": {"activeElapsedSeconds": 60},
+                "toolMode": "terminal",
+                "repairingSubmission": False,
+                "nextTurnIndex": 1,
+                "pendingAssistantMessage": None,
+            }
+            if on_checkpoint is not None:
+                await on_checkpoint(checkpoint)
+            raise main_module.AgentBudgetPause(
+                checkpoint, float(approved_wall_time_seconds or 60)
+            )
+        return AnswerResponse(kind="answer", message="续跑完成", provider="local")
+
+    monkeypatch.setattr(main_module, "create_plan", pausing_create_plan)
+    payload = {
+        **_STREAM_PAYLOAD,
+        "turnId": "turn-planning-pause-test",
+        "workbook": {
+            **_STREAM_PAYLOAD["workbook"],
+            "sourceFingerprint": "sha256:original-source",
+            "sourceFingerprintSheets": ["数据"],
+        },
+    }
+    client = TestClient(app)
+
+    first = client.post("/api/turn/stream", json=payload)
+    first_events = _parse_sse(first.text)
+    pause = next(value for name, value in first_events if name == "paused")
+    assert pause["kind"] == "planning_pause"
+    assert pause["canContinue"] is True
+    assert pause["sourceFingerprint"] == "sha256:original-source"
+
+    status = client.get("/api/turn/turn-planning-pause-test/status")
+    assert status.status_code == 200
+    assert status.json()["status"] == "waiting_user"
+    assert status.json()["revision"] == pause["revision"]
+
+    continued = client.post(
+        "/api/turn/continue/stream",
+        json={
+            "turnId": "turn-planning-pause-test",
+            "expectedRevision": pause["revision"],
+            "requestId": "continue-request-0001",
+            "confirmed": True,
+            "afterSequence": pause["lastSequence"],
+        },
+    )
+    continued_events = _parse_sse(continued.text)
+    result = next(value for name, value in continued_events if name == "result")
+    assert result["message"] == "续跑完成"
+    assert calls == 2
+    assert resumed_checkpoints[0] is None
+    assert resumed_checkpoints[1] is not None
+    assert resumed_checkpoints[1]["toolCache"] == {"context": "saved"}
+    record = main_module._folder_operation_ledger.planning_task(
+        "turn-planning-pause-test"
+    )
+    assert record is not None
+    assert record.status == "completed"
+    assert record.extension_count == 1
+    assert record.approved_wall_time_seconds == 120
 
 
 def test_turn_stream_rejects_intent_request() -> None:

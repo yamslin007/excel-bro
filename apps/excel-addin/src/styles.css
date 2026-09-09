@@ -5690,6 +5690,56 @@ textarea:focus-visible {
   font-size: var(--font-size-caption);
 }
 
+.folder-resume-card {
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  width: 100%;
+  margin-top: 10px;
+  padding: 14px 16px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-hover);
+  box-shadow: 0 4px 14px rgba(31, 41, 55, 0.06);
+}
+
+.planning-resume-card {
+  border-color: color-mix(in srgb, var(--color-brand) 45%, var(--color-border));
+  background: color-mix(in srgb, var(--color-brand-soft) 68%, var(--color-surface));
+}
+
+.folder-resume-copy {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.folder-resume-copy strong {
+  color: var(--color-text-primary);
+}
+
+.folder-resume-copy span {
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-caption);
+  line-height: 1.5;
+}
+
+.folder-resume-actions {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+@media (max-width: 520px) {
+  .folder-resume-card {
+    align-items: stretch;
+    flex-direction: column;
+  }
+}
+
 .folder-backup-recovery-confirm {
   border-color: rgba(46, 125, 94, 0.32);
   background: rgba(237, 249, 244, 0.94);

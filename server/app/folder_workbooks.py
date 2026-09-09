@@ -32,7 +32,7 @@ from openpyxl.worksheet.filters import FilterColumn, Filters
 from openpyxl.worksheet.table import Table, TableStyleInfo
 from openpyxl.utils import absolute_coordinate, get_column_letter, quote_sheetname, range_boundaries
 from openpyxl.workbook.defined_name import DefinedName
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, TypeAdapter
 
 from .models import (
     ActionExecutionResult,
@@ -142,6 +142,7 @@ class FolderExecuteRequest(BaseModel):
 
 
 FolderProgressCallback = Callable[[dict[str, object]], None]
+FolderCheckpointCallback = Callable[[dict[str, object]], None]
 
 
 def _emit_folder_progress(
@@ -469,6 +470,60 @@ def _legacy_root(root: Path) -> Path:
 
 def _operations_root(root: Path) -> Path:
     return _backup_root(root) / "operations"
+
+
+def _tasks_root(root: Path) -> Path:
+    return _backup_root(root) / "tasks"
+
+
+def _task_artifact_directory(root: Path, operation_id: str) -> Path:
+    """Return a traversal-safe durable artifact directory for one operation."""
+
+    tasks_root = _ensure_safe_backup_storage(root, "tasks")
+    task_key = hashlib.sha256(operation_id.encode("utf-8")).hexdigest()
+    directory = tasks_root / task_key / "artifacts"
+    directory.mkdir(parents=True, exist_ok=True)
+    if _has_reparse_point(directory, tasks_root):
+        raise ValueError("任务暂存目录不能是符号链接、junction 或 reparse point")
+    return directory
+
+
+def cleanup_folder_task_artifacts(root_value: str | Path, operation_id: str) -> None:
+    """Best-effort-safe deletion of completed task artifacts only.
+
+    The caller decides that the durable task record is terminal.  This function
+    only accepts the exact hash-derived directory below the managed backup root
+    and refuses any tree containing a link or Windows reparse point.
+    """
+
+    if not operation_id.strip():
+        raise ValueError("任务标识不能为空")
+    root = validate_managed_work_directory(Path(root_value))
+    backup_root = _backup_root(root)
+    tasks_root = _tasks_root(root)
+    task_directory = tasks_root / hashlib.sha256(
+        operation_id.encode("utf-8")
+    ).hexdigest()
+    if not task_directory.exists():
+        return
+    expected = Path(os.path.abspath(tasks_root / task_directory.name))
+    actual = Path(os.path.abspath(task_directory))
+    if actual != expected or not _is_relative_to(actual, backup_root):
+        raise ValueError("任务暂存目录未通过路径边界检查")
+    if (
+        not tasks_root.is_dir()
+        or not task_directory.is_dir()
+        or _has_reparse_point(tasks_root, backup_root)
+        or _has_reparse_point(task_directory, backup_root)
+        or _tree_has_reparse_point(task_directory)
+    ):
+        raise ValueError("任务暂存目录包含不安全的链接或 reparse point")
+    shutil.rmtree(task_directory)
+    try:
+        if tasks_root.exists() and not any(tasks_root.iterdir()):
+            tasks_root.rmdir()
+    except OSError:
+        _logger.debug("空任务暂存容器仍待清理：%s", tasks_root, exc_info=True)
 
 
 def _ensure_safe_backup_storage(root: Path, child_name: str) -> Path:
@@ -1100,6 +1155,69 @@ def folder_session_root(session_id: str) -> Path:
     """Return the exact root previously authorized by a folder session."""
 
     return _session(session_id).root
+
+
+def folder_execution_context(request: FolderExecuteRequest) -> dict[str, object]:
+    """Freeze the exact server-authorized folder targets before execution."""
+
+    session = _session(request.sessionId)
+    if not session.selected_targets:
+        raise ValueError("文件夹数据范围尚未确认，请先生成预览")
+    targets: list[dict[str, str]] = []
+    for reference, (path, sheet_name) in sorted(session.selected_targets.items()):
+        targets.append(
+            {
+                "reference": reference,
+                "relativePath": path.relative_to(session.root).as_posix(),
+                "sheetName": sheet_name,
+            }
+        )
+    return {
+        "schemaVersion": 1,
+        "root": str(session.root),
+        "sourceFingerprint": session.source_fingerprint,
+        "targets": targets,
+    }
+
+
+def _restore_folder_execution_session(
+    authorization: dict[str, object],
+) -> tuple[str, _FolderSession]:
+    """Rebuild only the exact persisted authorization; never accept caller paths."""
+
+    root_value = authorization.get("root")
+    raw_targets = authorization.get("targets")
+    if not isinstance(root_value, str) or not isinstance(raw_targets, list):
+        raise ValueError("任务授权现场不完整，不能续跑")
+    root = validate_managed_work_directory(Path(root_value))
+    session = _FolderSession(root, {})
+    for raw_target in raw_targets:
+        if not isinstance(raw_target, dict):
+            raise ValueError("任务授权目标格式无效，不能续跑")
+        reference = raw_target.get("reference")
+        relative_value = raw_target.get("relativePath")
+        sheet_name = raw_target.get("sheetName")
+        if not all(isinstance(value, str) and value for value in (reference, relative_value, sheet_name)):
+            raise ValueError("任务授权目标缺少字段，不能续跑")
+        relative = Path(str(relative_value).replace("/", os.sep))
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError("任务授权目标路径越界，不能续跑")
+        path = Path(os.path.abspath(root / relative))
+        if not _is_relative_to(path, root) or _has_reparse_point(path.parent, root):
+            raise ValueError("任务授权目标不在原工作目录内，不能续跑")
+        file_id = uuid.uuid5(
+            uuid.NAMESPACE_URL, relative.as_posix().casefold()
+        ).hex
+        session.files[file_id] = path
+        session.selected_targets[str(reference)] = (path, str(sheet_name))
+    source_fingerprint = authorization.get("sourceFingerprint")
+    session.source_fingerprint = (
+        str(source_fingerprint) if isinstance(source_fingerprint, str) else None
+    )
+    session_id = uuid.uuid4().hex
+    _prune_sessions(reserve_slot=True)
+    _sessions[session_id] = session
+    return session_id, session
 
 
 def _backup_entry(
@@ -3488,6 +3606,10 @@ def _save_workbooks_atomically(
     plan_id: str,
     plan_title: str,
     on_progress: FolderProgressCallback | None = None,
+    *,
+    operation_id: str | None = None,
+    on_checkpoint: FolderCheckpointCallback | None = None,
+    checkpoint_context: dict[str, object] | None = None,
 ) -> tuple[
     list[str],
     list[str],
@@ -3538,6 +3660,12 @@ def _save_workbooks_atomically(
     backup_root = _backup_root(session.root)
     _ensure_safe_backup_storage(session.root, "executions")
     temporary_paths: dict[Path, Path] = {}
+    durable_artifacts = operation_id is not None and on_checkpoint is not None
+    artifact_directory = (
+        _task_artifact_directory(session.root, operation_id)
+        if durable_artifacts and operation_id is not None
+        else None
+    )
     existed_before = {path: path.exists() for path, _ in targets}
     _emit_folder_progress(
         on_progress,
@@ -3554,10 +3682,19 @@ def _save_workbooks_atomically(
     )
     try:
         for target_index, (path, workbook) in enumerate(targets, start=1):
-            temporary = path.with_name(
-                f".{path.name}.excel-bro-tmp-{uuid.uuid4().hex}{path.suffix}"
-            )
-            workbook.save(temporary)
+            if artifact_directory is not None:
+                temporary = artifact_directory / path.relative_to(session.root)
+                temporary.parent.mkdir(parents=True, exist_ok=True)
+                candidate = temporary.with_name(
+                    f".{temporary.name}.preparing-{uuid.uuid4().hex}"
+                )
+                workbook.save(candidate)
+                os.replace(candidate, temporary)
+            else:
+                temporary = path.with_name(
+                    f".{path.name}.excel-bro-tmp-{uuid.uuid4().hex}{path.suffix}"
+                )
+                workbook.save(temporary)
             temporary_paths[path] = temporary
             _emit_folder_progress(
                 on_progress,
@@ -3607,11 +3744,17 @@ def _save_workbooks_atomically(
                 "postFingerprint": None,
                 "sizeBytes": 0,
                 "state": "pending",
+                "artifactRelativePath": (
+                    temporary_paths[path].relative_to(session.root).as_posix()
+                    if artifact_directory is not None
+                    else None
+                ),
             }
         )
     manifest: dict[str, object] = {
         "version": BACKUP_MANIFEST_VERSION,
         "undoId": execution_id,
+        "operationId": operation_id,
         "planId": plan_id,
         "planTitle": plan_title,
         "createdAt": datetime.now().astimezone().isoformat(),
@@ -3674,6 +3817,20 @@ def _save_workbooks_atomically(
             int(item.get("sizeBytes", 0) or 0) for item in manifest_files
         )
         _set_manifest_status(backup_directory, manifest, "prepared")
+        if on_checkpoint is not None:
+            on_checkpoint(
+                {
+                    **(checkpoint_context or {}),
+                    "schemaVersion": 1,
+                    "kind": "splitGroupAggregate",
+                    "stage": "publish_prepared",
+                    "executionId": execution_id,
+                    "backupManifestRelativePath": (
+                        backup_directory / "manifest.json"
+                    ).relative_to(session.root).as_posix(),
+                    "files": [dict(item) for item in manifest_files],
+                }
+            )
         _emit_folder_progress(
             on_progress,
             {
@@ -3714,7 +3871,18 @@ def _save_workbooks_atomically(
             },
         )
         for target_index, (path, _) in enumerate(targets, start=1):
-            temporary_paths[path].replace(path)
+            source = temporary_paths[path]
+            if durable_artifacts:
+                publish_temporary = path.with_name(
+                    f".{path.name}.excel-bro-publish-{uuid.uuid4().hex}{path.suffix}"
+                )
+                try:
+                    shutil.copy2(source, publish_temporary)
+                    publish_temporary.replace(path)
+                finally:
+                    publish_temporary.unlink(missing_ok=True)
+            else:
+                source.replace(path)
             replaced.append(path)
             actual_post_fingerprint = _file_content_fingerprint(path)
             expected_post_fingerprint = manifest_files[target_index - 1].get(
@@ -3724,6 +3892,20 @@ def _save_workbooks_atomically(
                 raise RuntimeError(f"保存后文件指纹不一致：{path.name}")
             manifest_files[target_index - 1]["state"] = "applied"
             _set_manifest_status(backup_directory, manifest, "applying")
+            if on_checkpoint is not None:
+                on_checkpoint(
+                    {
+                        **(checkpoint_context or {}),
+                        "schemaVersion": 1,
+                        "kind": "splitGroupAggregate",
+                        "stage": "publishing",
+                        "executionId": execution_id,
+                        "backupManifestRelativePath": (
+                            backup_directory / "manifest.json"
+                        ).relative_to(session.root).as_posix(),
+                        "files": [dict(item) for item in manifest_files],
+                    }
+                )
             _emit_folder_progress(
                 on_progress,
                 {
@@ -3757,6 +3939,20 @@ def _save_workbooks_atomically(
             )
         manifest["totalBytes"] = total_bytes
         _set_manifest_status(backup_directory, manifest, "ready", completed=True)
+        if on_checkpoint is not None:
+            on_checkpoint(
+                {
+                    **(checkpoint_context or {}),
+                    "schemaVersion": 1,
+                    "kind": "splitGroupAggregate",
+                    "stage": "published",
+                    "executionId": execution_id,
+                    "backupManifestRelativePath": (
+                        backup_directory / "manifest.json"
+                    ).relative_to(session.root).as_posix(),
+                    "files": [dict(item) for item in manifest_files],
+                }
+            )
         _emit_folder_progress(
             on_progress,
             {
@@ -4336,6 +4532,7 @@ def undo_folder_execution(request: FolderUndoRequest) -> FolderUndoResponse:
 def _execute_folder_plan(
     request: FolderExecuteRequest,
     on_progress: FolderProgressCallback | None = None,
+    on_checkpoint: FolderCheckpointCallback | None = None,
 ) -> FolderExecuteResponse:
     session = _session(request.sessionId)
     execution_id = uuid.uuid4().hex
@@ -5221,6 +5418,28 @@ def _execute_folder_plan(
     with _backup_cleanup_lock:
         _active_backup_ids.add(execution_id)
     try:
+        checkpoint_supported = (
+            request.operationId is not None
+            and len(request.plan.actions) == 1
+            and request.plan.actions[0].type == "splitGroupAggregate"
+        )
+        serialized_dynamic_criteria = [
+            {
+                "actionIndex": action_index,
+                "targetRelativePath": path.relative_to(session.root).as_posix(),
+                "criterion": criterion.model_dump(mode="json", exclude_none=True),
+            }
+            for action_index, criteria in dynamic_criteria_by_action.items()
+            for path, criterion in criteria
+        ]
+        checkpoint_context: dict[str, object] = {
+            "plan": request.plan.model_dump(mode="json", exclude_none=True),
+            "actionResults": [
+                result.model_dump(mode="json", exclude_none=True)
+                for result in action_results
+            ],
+            "dynamicCriteria": serialized_dynamic_criteria,
+        }
         (
             modified,
             backups,
@@ -5235,6 +5454,9 @@ def _execute_folder_plan(
             request.plan.id,
             request.plan.title,
             on_progress,
+            operation_id=request.operationId if checkpoint_supported else None,
+            on_checkpoint=on_checkpoint if checkpoint_supported else None,
+            checkpoint_context=checkpoint_context if checkpoint_supported else None,
         )
         undo_reference = (
             _register_folder_undo(
@@ -5308,16 +5530,342 @@ def _execute_folder_plan(
             _active_backup_ids.discard(execution_id)
 
 
+def _checkpoint_root_path(root: Path, value: object, *, label: str) -> Path:
+    relative = _safe_manifest_relative_path(value)
+    if relative is None:
+        raise ValueError(f"检查点中的{label}路径无效")
+    candidate = Path(os.path.abspath(root / relative))
+    if not _is_relative_to(candidate, root) or _has_reparse_point(candidate.parent, root):
+        raise ValueError(f"检查点中的{label}路径越界或包含 reparse point")
+    return candidate
+
+
+def _resume_dynamic_criteria(
+    root: Path, checkpoint: dict[str, object]
+) -> dict[int, list[tuple[Path, VerificationCriterion]]]:
+    adapter = TypeAdapter(VerificationCriterion)
+    result: dict[int, list[tuple[Path, VerificationCriterion]]] = {}
+    raw_items = checkpoint.get("dynamicCriteria", [])
+    if not isinstance(raw_items, list):
+        raise ValueError("检查点中的动态验收条件无效")
+    for raw_item in raw_items:
+        if not isinstance(raw_item, dict):
+            raise ValueError("检查点中的动态验收条件项目无效")
+        action_index = raw_item.get("actionIndex")
+        if not isinstance(action_index, int) or action_index < 0:
+            raise ValueError("检查点中的动作序号无效")
+        path = _checkpoint_root_path(
+            root, raw_item.get("targetRelativePath"), label="验收目标"
+        )
+        criterion = adapter.validate_python(raw_item.get("criterion"))
+        result.setdefault(action_index, []).append((path, criterion))
+    return result
+
+
+def folder_resume_checkpoint_summary(
+    operation_id: str,
+    authorization: dict[str, object],
+    checkpoint: dict[str, object],
+) -> dict[str, object]:
+    """Read-only proof that a checkpoint can continue against current files."""
+
+    root_value = authorization.get("root")
+    execution_id = checkpoint.get("executionId")
+    if not isinstance(root_value, str) or not isinstance(execution_id, str):
+        return {"canResume": False, "reason": "任务现场不完整"}
+    root = validate_managed_work_directory(Path(root_value))
+    if not _UNDO_ID_PATTERN.fullmatch(execution_id):
+        return {"canResume": False, "reason": "执行标识无效"}
+    backup_directory = _executions_root(root) / execution_id
+    manifest = _read_manifest(backup_directory)
+    if manifest.get("operationId") != operation_id:
+        return {"canResume": False, "reason": "恢复资料不属于当前任务"}
+    if manifest.get("status") not in {"prepared", "applying", "ready"}:
+        return {
+            "canResume": False,
+            "reason": "恢复资料已进入回滚或人工核对流程",
+        }
+    raw_files = manifest.get("files")
+    if not isinstance(raw_files, list) or not raw_files:
+        return {"canResume": False, "reason": "恢复资料没有可发布文件"}
+    applied = 0
+    pending = 0
+    conflicts: list[str] = []
+    for raw_item in raw_files:
+        if not isinstance(raw_item, dict):
+            return {"canResume": False, "reason": "恢复资料包含无效文件项"}
+        target = _checkpoint_root_path(
+            root, raw_item.get("originalRelativePath"), label="目标文件"
+        )
+        expected_post = raw_item.get("postFingerprint")
+        expected_prior = raw_item.get("priorFingerprint")
+        existed_before = bool(raw_item.get("existedBefore"))
+        if not isinstance(expected_post, str):
+            return {"canResume": False, "reason": "恢复资料缺少目标指纹"}
+        actual = _file_content_fingerprint(target) if target.is_file() else None
+        if actual == expected_post:
+            applied += 1
+            continue
+        is_pre_state = (
+            actual == expected_prior
+            if existed_before and isinstance(expected_prior, str)
+            else not target.exists()
+        )
+        if not is_pre_state:
+            conflicts.append(str(target.relative_to(root)))
+            continue
+        artifact = _checkpoint_root_path(
+            root, raw_item.get("artifactRelativePath"), label="暂存产物"
+        )
+        expected_artifact_root = _tasks_root(root) / hashlib.sha256(
+            operation_id.encode("utf-8")
+        ).hexdigest() / "artifacts"
+        if (
+            not _is_relative_to(artifact, expected_artifact_root)
+            or not artifact.is_file()
+            or _file_content_fingerprint(artifact) != expected_post
+        ):
+            return {
+                "canResume": False,
+                "reason": f"待发布产物不存在或已损坏：{target.name}",
+            }
+        pending += 1
+    if conflicts:
+        return {
+            "canResume": False,
+            "reason": "文件已被外部修改：" + "、".join(conflicts),
+            "filesApplied": applied,
+            "filesPending": pending,
+        }
+    return {
+        "canResume": True,
+        "reason": None,
+        "filesApplied": applied,
+        "filesPending": pending,
+    }
+
+
+def resume_folder_plan(
+    operation_id: str,
+    authorization: dict[str, object],
+    checkpoint: dict[str, object],
+    on_progress: FolderProgressCallback | None = None,
+    on_checkpoint: FolderCheckpointCallback | None = None,
+) -> FolderExecuteResponse:
+    """Continue a prepared split/group publish without recomputing its result."""
+
+    if checkpoint.get("schemaVersion") != 1 or checkpoint.get("kind") != "splitGroupAggregate":
+        raise ValueError("该任务检查点版本或类型暂不支持续跑")
+    plan = AnalysisPlan.model_validate(checkpoint.get("plan"))
+    if len(plan.actions) != 1 or plan.actions[0].type != "splitGroupAggregate":
+        raise ValueError("阶段 B 当前只支持拆分汇总任务从断点续跑")
+    execution_id = checkpoint.get("executionId")
+    if not isinstance(execution_id, str) or not _UNDO_ID_PATTERN.fullmatch(execution_id):
+        raise ValueError("检查点缺少有效执行标识")
+
+    session_id, session = _restore_folder_execution_session(authorization)
+    with folder_write_guard(session.root):
+        backup_directory = _executions_root(session.root) / execution_id
+        manifest = _read_manifest(backup_directory)
+        if manifest.get("operationId") != operation_id:
+            raise ValueError("恢复资料不属于当前任务")
+        if manifest.get("status") in {
+            "recovering",
+            "restored",
+            "rolled_back",
+            "needs_attention",
+        }:
+            raise ValueError("恢复资料已进入回滚或人工核对流程，不能继续原任务")
+        raw_files = manifest.get("files")
+        if not isinstance(raw_files, list) or not raw_files:
+            raise ValueError("恢复资料没有可发布文件")
+
+        _emit_folder_progress(
+            on_progress,
+            {
+                "executionId": execution_id,
+                "phase": "saving",
+                "stepId": "folder.resume.inspect",
+                "status": "started",
+                "title": "正在核对断点与实际文件",
+                "summary": "仅继续尚未发布的文件，不会重新计算拆分结果。",
+                "current": 0,
+                "total": len(raw_files),
+                "unit": "files",
+            },
+        )
+        pending: list[tuple[Path, Path, dict[str, object]]] = []
+        conflicts: list[str] = []
+        for raw_item in raw_files:
+            if not isinstance(raw_item, dict):
+                raise ValueError("恢复资料包含无效文件项")
+            target = _checkpoint_root_path(
+                session.root, raw_item.get("originalRelativePath"), label="目标文件"
+            )
+            expected_post = raw_item.get("postFingerprint")
+            expected_prior = raw_item.get("priorFingerprint")
+            existed_before = bool(raw_item.get("existedBefore"))
+            if not isinstance(expected_post, str):
+                raise ValueError("恢复资料缺少目标指纹")
+            actual = _file_content_fingerprint(target) if target.is_file() else None
+            if actual == expected_post:
+                raw_item["state"] = "applied"
+                continue
+            artifact = _checkpoint_root_path(
+                session.root, raw_item.get("artifactRelativePath"), label="暂存产物"
+            )
+            task_artifacts = _task_artifact_directory(session.root, operation_id)
+            if not _is_relative_to(artifact, task_artifacts):
+                raise ValueError("检查点引用了当前任务之外的暂存产物")
+            if not artifact.is_file() or _file_content_fingerprint(artifact) != expected_post:
+                raise ValueError(f"暂存产物不存在或已损坏：{target.name}")
+            is_pre_state = (
+                actual == expected_prior
+                if existed_before and isinstance(expected_prior, str)
+                else not target.exists()
+            )
+            if not is_pre_state:
+                conflicts.append(str(target.relative_to(session.root)))
+                continue
+            pending.append((target, artifact, raw_item))
+        if conflicts:
+            raise ValueError(
+                "以下文件既不是执行前状态，也不是本任务目标状态，可能已被外部修改："
+                + "、".join(conflicts)
+            )
+
+        _emit_folder_progress(
+            on_progress,
+            {
+                "executionId": execution_id,
+                "phase": "saving",
+                "stepId": "folder.resume.inspect",
+                "status": "completed",
+                "title": "断点核对完成",
+                "summary": f"{len(raw_files) - len(pending)} 个文件已完成，{len(pending)} 个文件待继续。",
+                "current": len(raw_files),
+                "total": len(raw_files),
+                "unit": "files",
+            },
+        )
+        for target_index, (target, artifact, raw_item) in enumerate(pending, start=1):
+            if _is_locked_for_writing(target):
+                raise ValueError(f"文件正在被其他程序占用，不能继续：{target.name}")
+            publish_temporary = target.with_name(
+                f".{target.name}.excel-bro-resume-{uuid.uuid4().hex}{target.suffix}"
+            )
+            try:
+                shutil.copy2(artifact, publish_temporary)
+                publish_temporary.replace(target)
+            finally:
+                publish_temporary.unlink(missing_ok=True)
+            if _file_content_fingerprint(target) != raw_item.get("postFingerprint"):
+                raise RuntimeError(f"续跑发布后的文件指纹不一致：{target.name}")
+            raw_item["state"] = "applied"
+            _set_manifest_status(backup_directory, manifest, "applying")
+            checkpoint = {
+                **checkpoint,
+                "stage": "publishing",
+                "files": [dict(item) for item in raw_files if isinstance(item, dict)],
+            }
+            if on_checkpoint is not None:
+                on_checkpoint(checkpoint)
+            _emit_folder_progress(
+                on_progress,
+                {
+                    "executionId": execution_id,
+                    "phase": "saving",
+                    "stepId": "folder.resume.publish",
+                    "status": "progress",
+                    "title": "正在继续未完成的文件发布",
+                    "summary": f"已继续 {target_index} / {len(pending)} 个待发布文件。",
+                    "current": target_index,
+                    "total": len(pending),
+                    "unit": "files",
+                    "target": {"file": str(target.relative_to(session.root))},
+                },
+            )
+
+        _set_manifest_status(backup_directory, manifest, "ready", completed=True)
+        checkpoint = {
+            **checkpoint,
+            "stage": "published",
+            "files": [dict(item) for item in raw_files if isinstance(item, dict)],
+        }
+        if on_checkpoint is not None:
+            on_checkpoint(checkpoint)
+
+        undo_targets: list[_FolderUndoTarget] = []
+        backups: list[str] = []
+        modified: list[str] = []
+        for raw_item in raw_files:
+            assert isinstance(raw_item, dict)
+            target = _checkpoint_root_path(
+                session.root, raw_item.get("originalRelativePath"), label="目标文件"
+            )
+            backup_relative = _safe_manifest_relative_path(
+                raw_item.get("backupRelativePath")
+            )
+            backup = backup_directory / backup_relative if backup_relative else None
+            modified.append(str(target.relative_to(session.root)))
+            if backup is not None:
+                backups.append(str(backup.relative_to(session.root)))
+            undo_targets.append(
+                _FolderUndoTarget(
+                    path=target,
+                    backup_path=backup,
+                    prior_fingerprint=(
+                        str(raw_item["priorFingerprint"])
+                        if isinstance(raw_item.get("priorFingerprint"), str)
+                        else None
+                    ),
+                    post_fingerprint=str(raw_item["postFingerprint"]),
+                )
+            )
+        undo_reference = _register_folder_undo(
+            session,
+            session_id,
+            execution_id,
+            plan.id,
+            backup_directory,
+            undo_targets,
+        )
+        raw_action_results = checkpoint.get("actionResults", [])
+        if not isinstance(raw_action_results, list):
+            raise ValueError("检查点中的动作结果无效")
+        action_results = [
+            ActionExecutionResult.model_validate(item) for item in raw_action_results
+        ]
+        verification_started = time.perf_counter()
+        verification = _verify_folder_plan(
+            session, plan, _resume_dynamic_criteria(session.root, checkpoint)
+        )
+        verification_ms = (time.perf_counter() - verification_started) * 1000
+        return FolderExecuteResponse(
+            executionId=execution_id,
+            filesModified=modified,
+            backups=backups,
+            backupDirectory=str(_backup_root(session.root)),
+            backupWarnings=[],
+            actionResults=action_results,
+            verification=verification,
+            undo=undo_reference,
+            executionMs=0,
+            verificationMs=verification_ms,
+        )
+
+
 def execute_folder_plan(
     request: FolderExecuteRequest,
     on_progress: FolderProgressCallback | None = None,
+    on_checkpoint: FolderCheckpointCallback | None = None,
 ) -> FolderExecuteResponse:
     session = _session(request.sessionId)
     with folder_write_guard(session.root):
         opened: list[Workbook] = []
         token = _OPEN_WRITE_WORKBOOKS.set(opened)
         try:
-            return _execute_folder_plan(request, on_progress)
+            return _execute_folder_plan(request, on_progress, on_checkpoint)
         finally:
             for workbook in opened:
                 try:

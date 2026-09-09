@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
+import subprocess
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -18,12 +20,16 @@ from server.app.folder_workbooks import (
     OUTPUT_FILE_NAME,
     create_folder_snapshot,
     cleanup_folder_backups,
+    cleanup_folder_task_artifacts,
     delete_folder_backup,
     execute_folder_plan,
     export_folder_backup,
+    folder_execution_context,
+    folder_resume_checkpoint_summary,
     list_folder_backups,
     open_folder_backup_directory,
     refresh_folder,
+    resume_folder_plan,
     scan_folder,
     scan_folder_by_path,
     set_folder_backup_pinned,
@@ -31,6 +37,7 @@ from server.app.folder_workbooks import (
 )
 from server.app.models import AnalysisPlan, FolderUndoRequest, PlanRequest
 from server.app.planner import create_plan
+from server.app.task_ledger import FolderOperationLedger
 
 
 def _stamp_plan(plan: AnalysisPlan, snapshot) -> AnalysisPlan:
@@ -3128,6 +3135,279 @@ def test_folder_mode_splits_full_table_and_calculates_group_ratios(
         1,
         pytest.approx(1 / 6),
     ]
+
+
+def test_split_group_checkpoint_resumes_staged_artifact_and_rejects_external_edit(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "cinema.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "sheet-dc1"
+    sheet.append(["影院名称", "影院编码", "影厅", "影片名称"])
+    sheet.append(["怀化横店电影城", "43122301", "1号厅", "恐怖游轮"])
+    sheet.append(["怀化横店电影城", "43122301", "2号厅", "恐怖游轮"])
+    sheet.append(["怀化横店电影城", "43122301", "3号厅", "功夫女足"])
+    workbook.save(source)
+    workbook.close()
+
+    catalog = scan_folder(tmp_path)
+    snapshot = create_folder_snapshot(
+        FolderSnapshotRequest(
+            sessionId=catalog.sessionId,
+            selections=[FolderSelection(fileId=catalog.files[0].id, sheets=["sheet-dc1"])],
+        )
+    )
+    plan = _stamp_plan(
+        AnalysisPlan.model_validate(
+            {
+                "id": "split-resume",
+                "title": "按影片拆分",
+                "summary": "生成可续跑的影片拆分结果",
+                "actions": [
+                    {
+                        "type": "splitGroupAggregate",
+                        "sheet": snapshot.worksheets[0].name,
+                        "splitBy": "影片名称",
+                        "groupBy": ["影院名称", "影院编码"],
+                        "metrics": [
+                            {
+                                "operation": "countRows",
+                                "outputName": "计数项:影厅",
+                                "ratioOutputName": "占比",
+                            }
+                        ],
+                    }
+                ],
+            }
+        ),
+        snapshot,
+    )
+    request = FolderExecuteRequest(
+        sessionId=catalog.sessionId,
+        operationId="split-resume-operation",
+        plan=plan,
+    )
+    authorization = folder_execution_context(request)
+    checkpoints: list[dict[str, object]] = []
+
+    execute_folder_plan(
+        request,
+        on_checkpoint=lambda value: checkpoints.append(
+            json.loads(json.dumps(value, ensure_ascii=False))
+        ),
+    )
+
+    prepared = next(item for item in checkpoints if item["stage"] == "publish_prepared")
+    manifest_path = tmp_path / str(prepared["backupManifestRelativePath"])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    backup_directory = manifest_path.parent
+    shutil.copy2(backup_directory / "cinema.xlsx", source)
+    manifest["status"] = "prepared"
+    manifest.pop("completedAt", None)
+    for item in manifest["files"]:
+        item["state"] = "prepared"
+    folder_workbooks_module._atomic_write_manifest(backup_directory, manifest)
+    folder_workbooks_module._sessions.clear()
+
+    summary = folder_resume_checkpoint_summary(
+        request.operationId or "", authorization, prepared
+    )
+    assert summary == {
+        "canResume": True,
+        "reason": None,
+        "filesApplied": 0,
+        "filesPending": 1,
+    }
+
+    resumed_checkpoints: list[dict[str, object]] = []
+    resumed = resume_folder_plan(
+        request.operationId or "",
+        authorization,
+        prepared,
+        on_checkpoint=lambda value: resumed_checkpoints.append(value),
+    )
+
+    updated = load_workbook(source, data_only=True)
+    assert updated["恐怖游轮"]["D2"].value == 2
+    updated.close()
+    assert resumed.verification.status == "verified"
+    assert resumed_checkpoints[-1]["stage"] == "published"
+
+    shutil.copy2(backup_directory / "cinema.xlsx", source)
+    changed = load_workbook(source)
+    changed["sheet-dc1"]["A2"] = "外部修改"
+    changed.save(source)
+    changed.close()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["status"] = "prepared"
+    for item in manifest["files"]:
+        item["state"] = "prepared"
+    folder_workbooks_module._atomic_write_manifest(backup_directory, manifest)
+    folder_workbooks_module._sessions.clear()
+
+    summary = folder_resume_checkpoint_summary(
+        request.operationId or "", authorization, prepared
+    )
+    assert summary["canResume"] is False
+    assert "外部修改" in str(summary["reason"])
+
+    with pytest.raises(ValueError, match="外部修改"):
+        resume_folder_plan(request.operationId or "", authorization, prepared)
+
+
+def test_split_group_resume_after_real_process_exit_before_publish(tmp_path: Path) -> None:
+    source = tmp_path / "cinema.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "sheet-dc1"
+    sheet.append(["影院名称", "影院编码", "影厅", "影片名称"])
+    sheet.append(["怀化横店电影城", "43122301", "1号厅", "恐怖游轮"])
+    sheet.append(["怀化横店电影城", "43122301", "2号厅", "恐怖游轮"])
+    sheet.append(["怀化横店电影城", "43122301", "3号厅", "功夫女足"])
+    workbook.save(source)
+    workbook.close()
+    original_fingerprint = folder_workbooks_module._file_content_fingerprint(source)
+    database = tmp_path / "task-state.sqlite3"
+    operation_id = "split-real-crash-operation"
+
+    script = r'''
+import os
+import sys
+from pathlib import Path
+from server.app.folder_workbooks import (
+    FolderExecuteRequest,
+    FolderSelection,
+    FolderSnapshotRequest,
+    create_folder_snapshot,
+    execute_folder_plan,
+    folder_execution_context,
+    scan_folder,
+)
+from server.app.models import AnalysisPlan
+from server.app.task_ledger import FolderOperationLedger
+
+root = Path(sys.argv[1])
+database = Path(sys.argv[2])
+operation_id = sys.argv[3]
+catalog = scan_folder(root)
+source_file = next(item for item in catalog.files if item.name == "cinema.xlsx")
+snapshot = create_folder_snapshot(
+    FolderSnapshotRequest(
+        sessionId=catalog.sessionId,
+        selections=[FolderSelection(fileId=source_file.id, sheets=["sheet-dc1"])],
+    )
+)
+plan = AnalysisPlan.model_validate(
+    {
+        "id": "split-real-crash",
+        "title": "按影片拆分",
+        "summary": "异常退出后继续发布",
+        "actions": [
+            {
+                "type": "splitGroupAggregate",
+                "sheet": snapshot.worksheets[0].name,
+                "splitBy": "影片名称",
+                "groupBy": ["影院名称", "影院编码"],
+                "metrics": [
+                    {
+                        "operation": "countRows",
+                        "outputName": "计数项:影厅",
+                        "ratioOutputName": "占比",
+                    }
+                ],
+            }
+        ],
+        "sourceFingerprint": snapshot.sourceFingerprint,
+        "sourceFingerprintSheets": snapshot.sourceFingerprintSheets,
+    }
+)
+request = FolderExecuteRequest(
+    sessionId=catalog.sessionId,
+    operationId=operation_id,
+    plan=plan,
+)
+ledger = FolderOperationLedger(lambda: database, executor_id="crashed-process")
+ledger.register(
+    operation_id,
+    "real-crash-fingerprint",
+    work_directory=str(root),
+    session_id=catalog.sessionId,
+    plan_id=plan.id,
+)
+ledger.save_execution_context(
+    operation_id,
+    request=request.model_dump(mode="json", exclude_none=True),
+    authorization=folder_execution_context(request),
+)
+
+def checkpoint(value):
+    ledger.commit_checkpoint(
+        operation_id,
+        kind=str(value.get("kind") or "folder_publish"),
+        payload=value,
+    )
+    if value.get("stage") == "publish_prepared":
+        os._exit(23)
+
+execute_folder_plan(request, on_checkpoint=checkpoint)
+raise SystemExit(99)
+'''
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path), str(database), operation_id],
+        cwd=str(Path(__file__).resolve().parents[2]),
+        check=False,
+    )
+
+    assert completed.returncode == 23
+    assert folder_workbooks_module._file_content_fingerprint(source) == original_fingerprint
+    interrupted_ledger = FolderOperationLedger(
+        lambda: database, executor_id="replacement-process"
+    )
+    record = interrupted_ledger.get(operation_id)
+    checkpoint = interrupted_ledger.checkpoint(operation_id)
+    assert record is not None and checkpoint is not None
+    assert checkpoint.payload["stage"] == "publish_prepared"
+    assert record.authorization is not None
+    summary = folder_resume_checkpoint_summary(
+        operation_id, record.authorization, checkpoint.payload
+    )
+    assert summary["canResume"] is True
+    claimed = interrupted_ledger.claim_for_resume(
+        operation_id, expected_revision=record.revision
+    )
+
+    folder_workbooks_module._sessions.clear()
+    resumed = resume_folder_plan(
+        operation_id,
+        claimed.authorization or {},
+        checkpoint.payload,
+        on_checkpoint=lambda value: interrupted_ledger.commit_checkpoint(
+            operation_id,
+            kind=str(value.get("kind") or "folder_publish"),
+            payload=value,
+        ),
+    )
+
+    updated = load_workbook(source, data_only=True)
+    assert updated["恐怖游轮"]["D2"].value == 2
+    updated.close()
+    assert resumed.verification.status == "verified"
+    assert interrupted_ledger.checkpoint(operation_id).payload["stage"] == "published"
+
+
+def test_completed_task_artifact_cleanup_only_removes_exact_operation(
+    tmp_path: Path,
+) -> None:
+    first = folder_workbooks_module._task_artifact_directory(tmp_path, "operation-one")
+    second = folder_workbooks_module._task_artifact_directory(tmp_path, "operation-two")
+    (first / "result.xlsx").write_bytes(b"first")
+    (second / "result.xlsx").write_bytes(b"second")
+
+    cleanup_folder_task_artifacts(tmp_path, "operation-one")
+
+    assert not first.parent.exists()
+    assert (second / "result.xlsx").read_bytes() == b"second"
 
 
 def test_folder_bulk_delete_keeps_source_sheet_and_can_be_undone(

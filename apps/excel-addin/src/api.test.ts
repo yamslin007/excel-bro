@@ -8,16 +8,19 @@ import {
   deleteModelConnection,
   cleanupFolderBackups,
   collectLegacyFolderBackups,
+  continuePlanningTask,
   executeFolderPlan,
   executeFolderQuery,
   exportFolderBackup,
   getFolderExecutionStatus,
+  getPlanningTaskStatus,
   getModelSettings,
   listModels,
   listFolderBackups,
   listManagedFolderRecoveryDirectories,
   openFolderBackupDirectory,
   removeManagedFolderRecoveryDirectory,
+  resumeFolderExecution,
   refreshFolder,
   restoreManagedFolderBackup,
   saveModelConnection,
@@ -767,6 +770,86 @@ describe("streaming assistant response", () => {
     expect(response).toMatchObject({ kind: "answer", message: "完成" });
   });
 
+  it("returns a durable planning pause instead of treating it as an error", async () => {
+    const pause = {
+      kind: "planning_pause",
+      turnId: "turn-stream-test",
+      status: "waiting_user",
+      revision: 4,
+      lastSequence: 2,
+      reason: "本轮处理时间已用完，当前进度已安全保存。",
+      activeElapsedSeconds: 60,
+      approvedWallTimeSeconds: 60,
+      extensionSeconds: 60,
+      extensionCount: 0,
+      maximumExtensions: 4,
+      canContinue: true,
+      requiresExtension: true,
+      sourceFingerprint: "sha256:source",
+      sourceFingerprintSheets: ["Sheet1"]
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        sseStreamResponse([`event: paused\ndata: ${JSON.stringify(pause)}\n\n`])
+      )
+    );
+
+    await expect(streamAssistantResponse(streamPlanRequest)).resolves.toEqual(pause);
+  });
+
+  it("checks persisted status and explicitly continues with a stable request id", async () => {
+    const statusPayload = {
+      kind: "planning_pause",
+      turnId: "turn-stream-test",
+      status: "waiting_user",
+      revision: 7,
+      lastSequence: 3,
+      reason: "进度已保存",
+      activeElapsedSeconds: 60,
+      approvedWallTimeSeconds: 60,
+      extensionSeconds: 60,
+      extensionCount: 0,
+      maximumExtensions: 4,
+      canContinue: true,
+      requiresExtension: true,
+      sourceFingerprintSheets: ["Sheet1"]
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(statusPayload), {
+          status: 200,
+          headers: { "Content-Type": "application/json" }
+        })
+      )
+      .mockResolvedValueOnce(
+        sseStreamResponse([
+          'event: result\ndata: {"kind":"answer","message":"续跑完成","provider":"model","turnId":"turn-stream-test"}\n\n'
+        ])
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const status = await getPlanningTaskStatus("turn-stream-test");
+    const response = await continuePlanningTask({
+      turnId: "turn-stream-test",
+      expectedRevision: status.revision,
+      requestId: "continue-request-0001",
+      afterSequence: status.lastSequence
+    });
+
+    expect(status.status).toBe("waiting_user");
+    expect(response).toMatchObject({ kind: "answer", message: "续跑完成" });
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      expect.stringContaining("/api/turn/continue/stream"),
+      expect.objectContaining({
+        method: "POST",
+        body: expect.stringContaining('"confirmed":true')
+      })
+    );
+  });
+
   it("throws ApiRequestError when the stream emits an error event", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       sseStreamResponse([
@@ -922,6 +1005,62 @@ describe("executeFolderPlan streaming", () => {
 });
 
 describe("folder recovery API", () => {
+  it("resumes only the identified checkpoint revision and forwards progress", async () => {
+    const progressFrame = `event: progress\ndata: ${JSON.stringify({
+      schemaVersion: 1,
+      operationId: "execution-resume",
+      sequence: 8,
+      phase: "saving",
+      stepId: "folder.resume.publish",
+      status: "progress",
+      title: "正在继续未完成的文件发布",
+      current: 1,
+      total: 1,
+      unit: "files",
+      timestamp: "2026-09-09T00:00:00Z"
+    })}\n\n`;
+    const resultFrame = `event: result\ndata: ${JSON.stringify({
+      executionId: "a".repeat(32),
+      filesModified: ["cinema.xlsx"],
+      backups: [],
+      backupWarnings: [],
+      actionResults: [],
+      verification: {
+        status: "verified",
+        passed: true,
+        checks: [],
+        unverifiedActions: []
+      },
+      undo: null,
+      executionMs: 0,
+      verificationMs: 1
+    })}\n\n`;
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(sseStreamResponse([progressFrame, resultFrame]));
+    vi.stubGlobal("fetch", fetchMock);
+    const progress: TaskProgressEvent[] = [];
+
+    const result = await resumeFolderExecution("execution-resume", 12, {
+      onProgress: (event) => progress.push(event)
+    });
+
+    expect(result.filesModified).toEqual(["cinema.xlsx"]);
+    expect(progress).toHaveLength(1);
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining("/api/folders/execute/resume/stream"),
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          operationId: "execution-resume",
+          expectedRevision: 12,
+          confirmed: true,
+          afterSequence: 0
+        })
+      })
+    );
+  });
+
   it("queries the existing operation without creating a new execution", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(

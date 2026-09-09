@@ -194,8 +194,9 @@ bash packaging/build_mac.sh
   不得因旧会话失效生成新标识。
 - `progress.folderOperationTtlSeconds` 只控制进程内热缓存；持久终态保留期由
   `taskRecovery.operationRetentionDays` 控制。到期后只清除事件/结果载荷并保留幂等墓碑。
-- 服务重启后，已完成任务可重放结果；遗留 `running` 任务只能进入核对。阶段 A 不会从
-  DAG 节点继续，也没有预算追加入口。
+- 服务重启后，已完成任务可重放结果；遗留 `running` 文件夹任务先进入核对。只有单个
+  `splitGroupAggregate` 且暂存产物、manifest 与真实文件指纹都完整时，才会通过
+  `POST /api/folders/execute/resume/stream` 继续剩余发布；其他动作不会按步骤序号跳过。
 - `GET /api/folders/recovery/directories` 只返回后端登记目录。独立恢复必须携带目录 ID、
   `undoId`、manifest revision、稳定恢复操作 ID 和明确确认。
 - `folder_write_guard` 对规范化工作目录提供进程内和跨进程排他。执行、撤销、恢复均须
@@ -205,6 +206,23 @@ bash packaging/build_mac.sh
 表示可重放结果，`failed` 表示有确定失败，`needs_reconciliation` 表示不能安全判断是否
 完成。HTTP 410 `OPERATION_EXPIRED` 是安全终态，不允许重新发起同一标识。测试应用数据
 必须通过 `EXCEL_BRO_CONFIG_DIR` 指向隔离临时目录，不读取或修改用户真实账本。
+
+### 规划预算暂停与恢复调试
+
+流式规划通过 `POST /api/turn/stream` 建立持久 turnId。软时间份额到达后只在完整模型响应
+或完整工具批次边界暂停，事件流返回 `planning_pause`；前端保存 turnId、revision、
+lastSequence、稳定 requestId 和原来源指纹。刷新或网络中断后应先调用
+`GET /api/turn/{turnId}/status`，用户明确继续时再调用 `POST /api/turn/continue/stream`。
+
+- 同一继续动作重试必须复用 requestId；旧 revision 应返回冲突，不得重复增加预算。
+- 当前默认首次/每次追加均为 60 秒，硬上限 300 秒，最多追加 4 次；配置位于
+  `taskRecovery`。继续只增加时间，不提高 `agent.maxTurns`、`maxTotalTokens` 或错误上限。
+- checkpoint 保存在 `tasks/state.sqlite3`，包含消息、LoopState、工具缓存、工具模式、修复
+  状态和完整待处理模型响应。不要把完整 checkpoint 写入普通诊断日志。
+- `/api/plan` 是兼容非流式入口，不具备 B2 的跨重启继续保证。备用模型、任意 DAG 和
+  Office.js 写入续跑仍未实现。
+- 意外异常必须把任务标记为 `failed` 并发出安全 SSE 错误；若状态长期为 `running`，先检查
+  账本写入失败和服务日志，不要直接新建同一语义的写入任务。
 
 ### Custom Functions 资源
 

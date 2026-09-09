@@ -2,11 +2,15 @@ import {
   assertTestModelConnectionResponse,
   assertIntentCheckResponse,
   assertAssistantResponse,
+  assertPlanningPauseResult,
   assertDataToolResult,
   assertModelSettings,
   parseTaskProgressEvent,
   parseTurnStepEvent,
   type AssistantResponse,
+  type PlanningPauseResult,
+  type PlanningStreamResult,
+  type PlanningTaskStatusResult,
   type TaskProgressEvent,
   type TurnStepEvent,
   type AnalysisPlan,
@@ -191,10 +195,87 @@ function parseSseFrame(frame: string): { event: string; data: string } | null {
   return { event, data: dataLines.join("\n") };
 }
 
+async function consumePlanningStream(
+  response: Response,
+  turnId: string,
+  hooks: StreamHooks
+): Promise<PlanningStreamResult> {
+  if (!response.body) {
+    throw new ApiRequestError(502, "SERVICE_ERROR", "本地 AI 服务没有返回数据流", true);
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let result: PlanningStreamResult | null = null;
+  let legacySequence = 0;
+
+  const handleFrame = (frame: string): void => {
+    const parsed = parseSseFrame(frame);
+    if (!parsed) return;
+    const payload: unknown = JSON.parse(parsed.data);
+    if (parsed.event === "step" || parsed.event === "progress") {
+      legacySequence += 1;
+      const progress = parseTaskProgressEvent(payload, turnId, legacySequence);
+      if (progress && hooks.onProgress) hooks.onProgress(progress);
+      const step = parseTurnStepEvent(payload);
+      if (step && hooks.onStep) hooks.onStep(step);
+      return;
+    }
+    if (parsed.event === "error") {
+      const detail = (payload ?? {}) as {
+        status?: unknown;
+        code?: unknown;
+        message?: unknown;
+        retryable?: unknown;
+      };
+      throw new ApiRequestError(
+        typeof detail.status === "number" ? detail.status : 502,
+        typeof detail.code === "string" ? detail.code : "SERVICE_ERROR",
+        typeof detail.message === "string" ? detail.message : "本地 AI 服务请求失败",
+        typeof detail.retryable === "boolean" ? detail.retryable : false
+      );
+    }
+    if (parsed.event === "paused") {
+      assertPlanningPauseResult(payload);
+      result = payload;
+      return;
+    }
+    if (parsed.event === "result") {
+      assertAssistantResponse(payload);
+      result = payload;
+    }
+  };
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (value) buffer += decoder.decode(value, { stream: true });
+    let separator = buffer.indexOf("\n\n");
+    while (separator !== -1) {
+      const frame = buffer.slice(0, separator);
+      buffer = buffer.slice(separator + 2);
+      if (frame.trim()) handleFrame(frame);
+      separator = buffer.indexOf("\n\n");
+    }
+    if (done) break;
+  }
+
+  const tail = buffer.trim();
+  if (tail) handleFrame(tail);
+  if (!result) {
+    throw new ApiRequestError(
+      502,
+      "SERVICE_ERROR",
+      "本地 AI 服务未返回完整结果",
+      true
+    );
+  }
+  return result;
+}
+
 export async function streamAssistantResponse(
   request: PlanRequest,
   hooks: StreamHooks = {}
-): Promise<AssistantResponse> {
+): Promise<PlanningStreamResult> {
   recordModelCall();
 
   const signal = hooks.signal;
@@ -222,87 +303,47 @@ export async function streamAssistantResponse(
     throw await requestError(response, "本地 AI 服务流式请求失败");
   }
 
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let result: AssistantResponse | null = null;
-  let legacySequence = 0;
+  return consumePlanningStream(
+    response,
+    request.turnId ?? "legacy-turn",
+    hooks
+  );
+}
 
-  const handleFrame = (frame: string): void => {
-    const parsed = parseSseFrame(frame);
-    if (!parsed) {
-      return;
-    }
-    const payload: unknown = JSON.parse(parsed.data);
-    if (parsed.event === "step" || parsed.event === "progress") {
-      legacySequence += 1;
-      const progress = parseTaskProgressEvent(
-        payload,
-        request.turnId ?? "legacy-turn",
-        legacySequence
-      );
-      if (progress && hooks.onProgress) {
-        hooks.onProgress(progress);
-      }
-      const step = parseTurnStepEvent(payload);
-      if (step && hooks.onStep) {
-        hooks.onStep(step);
-      }
-      return;
-    }
-    if (parsed.event === "error") {
-      const detail = (payload ?? {}) as {
-        status?: unknown;
-        code?: unknown;
-        message?: unknown;
-        retryable?: unknown;
-      };
-      throw new ApiRequestError(
-        typeof detail.status === "number" ? detail.status : 502,
-        typeof detail.code === "string" ? detail.code : "SERVICE_ERROR",
-        typeof detail.message === "string" ? detail.message : "本地 AI 服务请求失败",
-        typeof detail.retryable === "boolean" ? detail.retryable : false
-      );
-    }
-    if (parsed.event === "result") {
-      assertAssistantResponse(payload);
-      result = payload;
-    }
-  };
-
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (value) {
-      buffer += decoder.decode(value, { stream: true });
-    }
-    let separator = buffer.indexOf("\n\n");
-    while (separator !== -1) {
-      const frame = buffer.slice(0, separator);
-      buffer = buffer.slice(separator + 2);
-      if (frame.trim()) {
-        handleFrame(frame);
-      }
-      separator = buffer.indexOf("\n\n");
-    }
-    if (done) {
-      break;
-    }
+export async function getPlanningTaskStatus(
+  turnId: string,
+  signal?: AbortSignal
+): Promise<PlanningTaskStatusResult> {
+  const response = await fetch(
+    `${API_BASE_URL}/api/turn/${encodeURIComponent(turnId)}/status`,
+    { signal }
+  );
+  if (!response.ok) {
+    throw await requestError(response, "读取规划任务状态失败");
   }
+  return (await response.json()) as PlanningTaskStatusResult;
+}
 
-  const tail = buffer.trim();
-  if (tail) {
-    handleFrame(tail);
+export async function continuePlanningTask(
+  request: {
+    turnId: string;
+    expectedRevision: number;
+    requestId: string;
+    afterSequence: number;
+  },
+  hooks: StreamHooks = {}
+): Promise<PlanningStreamResult> {
+  recordModelCall();
+  const response = await fetch(`${API_BASE_URL}/api/turn/continue/stream`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...request, confirmed: true }),
+    signal: hooks.signal
+  });
+  if (!response.ok || !response.body) {
+    throw await requestError(response, "继续规划任务失败");
   }
-
-  if (!result) {
-    throw new ApiRequestError(
-      502,
-      "SERVICE_ERROR",
-      "本地 AI 服务未返回完整结果",
-      true
-    );
-  }
-  return result;
+  return consumePlanningStream(response, request.turnId, hooks);
 }
 
 export async function checkIntent(
@@ -648,6 +689,105 @@ export async function getFolderExecutionStatus(
     `${API_BASE_URL}/api/folders/execute/status?${params.toString()}`
   );
   return responseJson<FolderExecutionStatusResult>(response);
+}
+
+export async function resumeFolderExecution(
+  operationId: string,
+  expectedRevision: number,
+  hooks: FolderExecuteHooks = {}
+): Promise<FolderExecuteResult> {
+  const response = await fetch(`${API_BASE_URL}/api/folders/execute/resume/stream`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      operationId,
+      expectedRevision,
+      confirmed: true,
+      afterSequence: 0
+    }),
+    signal: hooks.signal
+  });
+  if (!response.ok) {
+    throw await requestError(response, "文件夹任务断点续跑失败");
+  }
+  if (!response.body) {
+    throw new ApiRequestError(
+      502,
+      "EMPTY_EXECUTION_STREAM",
+      "断点续跑进度流未返回响应体",
+      false
+    );
+  }
+  hooks.onConnectionState?.("connected");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let result: FolderExecuteResult | null = null;
+  let legacySequence = 0;
+  const handleFrame = (frame: string): void => {
+    const parsed = parseSseFrame(frame);
+    if (!parsed) return;
+    const payload: unknown = JSON.parse(parsed.data);
+    if (parsed.event === "progress" || parsed.event === "step") {
+      legacySequence += 1;
+      const progress = parseTaskProgressEvent(
+        payload,
+        operationId,
+        legacySequence
+      );
+      if (progress) hooks.onProgress?.(progress);
+      return;
+    }
+    if (parsed.event === "error") {
+      const detail = (payload ?? {}) as {
+        status?: unknown;
+        code?: unknown;
+        message?: unknown;
+        retryable?: unknown;
+      };
+      throw new ApiRequestError(
+        typeof detail.status === "number" ? detail.status : 502,
+        typeof detail.code === "string" ? detail.code : "SERVICE_ERROR",
+        typeof detail.message === "string" ? detail.message : "断点续跑失败",
+        typeof detail.retryable === "boolean" ? detail.retryable : false
+      );
+    }
+    if (parsed.event === "result") {
+      if (!payload || typeof payload !== "object") {
+        throw new Error("断点续跑结果格式无效");
+      }
+      result = payload as FolderExecuteResult;
+    }
+  };
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (value) buffer += decoder.decode(value, { stream: true });
+      let separator = buffer.indexOf("\n\n");
+      while (separator !== -1) {
+        const frame = buffer.slice(0, separator);
+        buffer = buffer.slice(separator + 2);
+        if (frame.trim()) handleFrame(frame);
+        separator = buffer.indexOf("\n\n");
+      }
+      if (done) break;
+    }
+    if (buffer.trim()) handleFrame(buffer.trim());
+  } catch (reason) {
+    if (!hooks.signal?.aborted) {
+      hooks.onConnectionState?.("interrupted", "连接中断，续跑任务状态待确认。");
+    }
+    throw reason;
+  }
+  if (!result) {
+    throw new ApiRequestError(
+      502,
+      "SERVICE_ERROR",
+      "断点续跑进度流已结束，但没有返回完整结果",
+      true
+    );
+  }
+  return result;
 }
 
 export async function undoFolderExecution(

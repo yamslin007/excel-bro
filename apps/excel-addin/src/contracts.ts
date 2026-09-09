@@ -883,6 +883,12 @@ export interface FolderExecutionStatusResult {
     message?: string;
     retryable?: boolean;
   } | null;
+  revision?: number | null;
+  canResume?: boolean;
+  checkpointStage?: "publish_prepared" | "publishing" | "published" | null;
+  resumeReason?: string | null;
+  resumeFilesApplied?: number | null;
+  resumeFilesPending?: number | null;
 }
 
 export interface ManagedFolderRecoveryDirectory {
@@ -1158,6 +1164,52 @@ export type AssistantResponse =
       turnId?: string | null;
     };
 
+export interface PlanningPauseResult {
+  kind: "planning_pause";
+  turnId: string;
+  status: "waiting_user" | "interrupted";
+  revision: number;
+  lastSequence: number;
+  reason: string;
+  activeElapsedSeconds: number;
+  approvedWallTimeSeconds: number;
+  extensionSeconds: number;
+  extensionCount: number;
+  maximumExtensions: number;
+  canContinue: boolean;
+  requiresExtension: boolean;
+  sourceFingerprint?: string | null;
+  sourceFingerprintSheets?: string[];
+}
+
+export type PlanningStreamResult = AssistantResponse | PlanningPauseResult;
+
+export type PlanningTaskStatusResult =
+  | (Omit<PlanningPauseResult, "status"> & {
+      status: "running" | "waiting_user" | "interrupted";
+    })
+  | {
+      turnId: string;
+      status: "completed";
+      revision: number;
+      lastSequence: number;
+      result: AssistantResponse;
+      canContinue: false;
+    }
+  | {
+      turnId: string;
+      status: "failed" | "cancelled";
+      revision: number;
+      lastSequence: number;
+      error?: {
+        status?: number;
+        code?: string;
+        message?: string;
+        retryable?: boolean;
+      } | null;
+      canContinue: false;
+    };
+
 export interface TurnStepEvent {
   phase: "planning";
   title: string;
@@ -1340,6 +1392,38 @@ export function assertAssistantResponse(
     throw new Error("服务返回了未知响应类型");
   }
   assertEditablePlan(response.plan);
+}
+
+export function assertPlanningPauseResult(
+  value: unknown
+): asserts value is PlanningPauseResult {
+  if (!value || typeof value !== "object") {
+    throw new Error("服务返回的暂停状态不是有效对象");
+  }
+  const result = value as Partial<PlanningPauseResult>;
+  if (
+    result.kind !== "planning_pause" ||
+    typeof result.turnId !== "string" ||
+    (result.status !== "waiting_user" && result.status !== "interrupted") ||
+    typeof result.revision !== "number" ||
+    typeof result.lastSequence !== "number" ||
+    typeof result.reason !== "string" ||
+    typeof result.activeElapsedSeconds !== "number" ||
+    typeof result.approvedWallTimeSeconds !== "number" ||
+    typeof result.extensionSeconds !== "number" ||
+    typeof result.extensionCount !== "number" ||
+    typeof result.maximumExtensions !== "number" ||
+    typeof result.canContinue !== "boolean" ||
+    typeof result.requiresExtension !== "boolean"
+  ) {
+    throw new Error("服务返回的规划暂停状态缺少必要字段");
+  }
+  if (
+    result.sourceFingerprintSheets !== undefined &&
+    !Array.isArray(result.sourceFingerprintSheets)
+  ) {
+    throw new Error("服务返回的规划来源工作表无效");
+  }
 }
 
 /**

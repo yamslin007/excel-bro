@@ -79,6 +79,25 @@ export interface ChatMessage {
   executedUndoId?: string;
   /** 文件夹执行的持久操作 ID，用于刷新恢复结果去重。 */
   folderOperationId?: string;
+  /** 服务端已确认存在安全断点；只有用户明确点击后才继续未完成发布。 */
+  folderResume?: {
+    operationId: string;
+    expectedRevision: number;
+    status: "pending" | "resuming" | "completed" | "failed";
+  };
+  /** 规划达到本轮安全时长边界后保存的现场；刷新后仍可由用户明确继续。 */
+  planningResume?: {
+    turnId: string;
+    expectedRevision: number;
+    lastSequence: number;
+    status: "pending" | "resuming" | "completed" | "failed";
+    reason: string;
+    extensionSeconds: number;
+    activeElapsedSeconds: number;
+    requestId?: string;
+    sourceFingerprint?: string | null;
+    sourceFingerprintSheets?: string[];
+  };
   /**
    * 计划里含预览时算出的固定值、且源数据已变。带上原计划让用户能在确认后
    * 坚持执行（executePlan 的 acknowledgeStaleSource）。
