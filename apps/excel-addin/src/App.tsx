@@ -7746,6 +7746,22 @@ export default function App() {
                 </section>
               ) : message.scopeSelectionGuidance ? (
                 <ScopeSelectionGuidance {...message.scopeSelectionGuidance} />
+              ) : message.text &&
+                message.intentMemory?.toolRequest &&
+                message.resultContext ? (
+                <section className="query-result-card">
+                  <p className="message-text">{message.text}</p>
+                  <div className="query-result-actions">
+                    <button
+                      type="button"
+                      className="secondary-button query-result-save-button"
+                      disabled={busy}
+                      onClick={() => saveQueryFromMessage(message)}
+                    >
+                      保存为固化查询
+                    </button>
+                  </div>
+                </section>
               ) : (
                 message.text && <p className="message-text">{message.text}</p>
               )}
@@ -7929,16 +7945,6 @@ export default function App() {
                       )}
                   </div>
                 </section>
-              )}
-              {message.intentMemory?.toolRequest && message.resultContext && (
-                <button
-                  type="button"
-                  className="secondary-button"
-                  disabled={busy}
-                  onClick={() => saveQueryFromMessage(message)}
-                >
-                  保存为固化查询
-                </button>
               )}
               {message.attachmentNames &&
                 message.attachmentNames.length > 0 && (

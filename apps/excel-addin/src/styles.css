@@ -3552,6 +3552,33 @@ textarea:focus-visible {
   box-shadow: none;
 }
 
+.query-result-card {
+  overflow: hidden;
+  border: 1px solid var(--color-border);
+  border-radius: 14px;
+  background: var(--color-background);
+  box-shadow: var(--shadow-sm);
+}
+
+.query-result-card .message-text {
+  border-radius: 0;
+  background: transparent;
+  padding: 12px 16px;
+  box-shadow: none;
+}
+
+.query-result-actions {
+  display: flex;
+  align-items: center;
+  min-height: 40px;
+  border-top: 1px solid var(--color-border);
+  padding: 10px 16px 12px;
+}
+
+.query-result-save-button {
+  min-height: 36px;
+}
+
 .user .message-content {
   max-width: 82%;
 }
@@ -7152,6 +7179,24 @@ button.selected > .sheet-checkbox {
   border-radius: 14px;
   box-shadow: 0 4px 18px rgba(34, 48, 40, 0.12);
   overflow-wrap: break-word;
+}
+
+.chat-shell[data-has-background="true"] .query-result-card {
+  border-color: color-mix(in srgb, var(--color-border) 75%, transparent);
+  background: color-mix(in srgb, var(--color-background) 90%, transparent);
+  -webkit-backdrop-filter: blur(10px);
+  backdrop-filter: blur(10px);
+  box-shadow: 0 4px 18px rgba(34, 48, 40, 0.12);
+}
+
+.chat-shell[data-has-background="true"] .query-result-card .message-text {
+  background: transparent;
+  backdrop-filter: none;
+  box-shadow: none;
+}
+
+.chat-shell[data-has-background="true"] .query-result-actions {
+  border-top-color: color-mix(in srgb, var(--color-border) 68%, transparent);
 }
 
 /* 用户气泡：跟随主题品牌色（温暖橙、宁静蓝、活力绿切换时自动协调） */
