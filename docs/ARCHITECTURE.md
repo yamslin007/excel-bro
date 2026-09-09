@@ -207,7 +207,7 @@ Office.js 执行快照按真实 executionId 绑定，成功、动作失败和验
 达到 token、轮次、连续错误等硬限制后不再抛出裸异常，而是返回 provider 为 system 的
 AnswerResponse，其中包含停止原因、压缩后的工具调用记录和针对截断、格式错误
 或循环的建议。流式规划另受 `taskRecovery` 的时间预算控制：首次 60 秒，在完整模型响应
-或工具批次边界持久保存现场并暂停；用户通过带 revision 和稳定 requestId 的明确操作继续，
+或完整单次工具调用边界持久保存现场并暂停；用户通过带 revision 和稳定 requestId 的明确操作继续，
 每次增加 60 秒且累计不超过 300 秒。继续不会提高 token、轮次或错误上限。
 OpenAI-compatible 适配器统一返回 payload 与 usage；缺失 usage 的服务会得到零值
 token 统计。
@@ -238,12 +238,21 @@ token 统计。
 执行、撤销和独立恢复共享规范化目录的进程内及跨进程排他锁；独立恢复还必须核对
 manifest revision、生命周期、路径边界和写前/写后文件指纹。
 
-这是 [任务断点恢复指导 v0.4](TASK_CHECKPOINT_RECOVERY_GUIDE.md) 的阶段 A/B 实现：阶段 A
+这是 [任务断点恢复指导 v0.5](TASK_CHECKPOINT_RECOVERY_GUIDE.md) 的分阶段实现：阶段 A
 提供持久身份、事件补收、安全挂起和恢复到执行前；B1 仅对单个
 `splitGroupAggregate` 保存完整暂存产物和逐文件发布 checkpoint，重启后核对指纹并跳过
 已发布文件；B2 保存流式规划的 messages、LoopState、工具缓存、开放工具模式、修复状态和
-完整待处理模型响应，可在安全边界暂停并显式继续。任意 DAG、备用模型接续和 Office.js
-写入跨重启续跑仍属于阶段 C。
+完整待处理模型响应，可在安全边界暂停并显式继续。阶段 C 进一步按单个工具调用保存完成
+状态，允许用户在完整模型调用边界显式选择已配置备用连接，并为已保存工作簿中的
+`writeValues`、`writeFormulas`（非 R1C1 铺满）、`setFill`、`setFont` 和
+`setNumberFormat` 提供动作级续跑。任意 DAG、结构动作和复杂对象续跑仍未开放。
+
+Office 动作恢复由服务端 SQLite 账本作为权威现场：确认执行后、首个写入前登记计划、原始
+授权和稳定工作簿 URL 身份；每一步在 `context.sync()` 前提交目标范围的写前快照，写入并
+读取实际状态后再提交累计检查点。刷新或异常退出后，前端本地只保存 operationId 等发现
+索引；继续前重新查询服务端、核对当前工作簿身份，并对在途范围做三态判断。只有完全匹配
+预期结果时补记为已完成，完全匹配写前状态时重试，其他状态保持挂起。写入权通过 revision
+和轮换 ownerToken 约束，状态查询不返回令牌。
 
 活动 Hook 从 `started` 起就把步骤加入有序时间线，按 `operationId + sequence` 隔离
 并去重事件，再按 `stepId` 原位更新。每段活动在消息流中拥有独立消息和稳定
@@ -335,6 +344,8 @@ PlanResponse.provider 仍只允许 model 或 local。
 - 常用工作目录的扫描目录与工作表勾选会本地保存；首次产品引导的“以后再设置”也使用版本化 UI 偏好记录。重新使用目录时仍由后端扫描和校验，缓存不能代替文件访问检查。
 - 设置工作目录只建立候选文件范围，不等于授权其中全部工作表；授权边界仍由用户的工作表勾选确定，首次设置不会自动勾选。
 - 对 API Key 只保存到后端本地配置，不进入前端 localStorage。
+- Office.js 待恢复任务在 localStorage 中只保存 operationId、对话定位和稳定工作簿身份；
+  完整计划、授权、写前快照和动作检查点仅由服务端持久账本提供。
 - 数据量较小，读写频率可接受。
 
 ## 性能考虑

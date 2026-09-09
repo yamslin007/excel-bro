@@ -15,7 +15,7 @@ import server.app.main as main_module
 import server.app.llm.config as llm_config
 import server.app.folder_workbooks as folder_workbooks_module
 from server.app.main import app
-from server.app.llm import selected_model_config
+from server.app.llm import ModelConnection, selected_model_config
 from server.app.models import AnswerResponse
 from server.app.turn_state import turn_registry
 
@@ -56,6 +56,149 @@ def test_health_reports_local_mode_without_model_config() -> None:
         "mode": "local",
         "model": None,
     }
+
+
+def _office_plan(action: dict[str, object]) -> dict[str, object]:
+    return {
+        "id": "office-plan-1",
+        "title": "写入测试",
+        "summary": "测试 Office 动作级断点",
+        "assumptions": [],
+        "warnings": [],
+        "actions": [action],
+    }
+
+
+def test_office_recovery_api_requires_supported_saved_workbook_action() -> None:
+    client = TestClient(app)
+    unsupported = client.post(
+        "/api/office/executions/register",
+        json={
+            "operationId": "office-api-unsupported",
+            "plan": _office_plan(
+                {"type": "deleteWorksheet", "sheet": "Sheet1"}
+            ),
+            "authorizedSheetNames": ["Sheet1"],
+            "allowedExternalFiles": [],
+            "workbookIdentity": "url:c:/work/report.xlsx",
+            "confirmed": True,
+        },
+    )
+    assert unsupported.status_code == 422
+    assert unsupported.json()["detail"]["code"] == "OFFICE_RECOVERY_UNSUPPORTED_ACTION"
+
+    unsaved = client.post(
+        "/api/office/executions/register",
+        json={
+            "operationId": "office-api-unsaved",
+            "plan": _office_plan(
+                {
+                    "type": "writeValues",
+                    "sheet": "Sheet1",
+                    "range": "A1",
+                    "values": [["ok"]],
+                }
+            ),
+            "authorizedSheetNames": ["Sheet1"],
+            "allowedExternalFiles": [],
+            "workbookIdentity": "unsaved",
+            "confirmed": True,
+        },
+    )
+    assert unsaved.status_code == 422
+
+
+def test_office_recovery_api_persists_action_receipt_and_completion() -> None:
+    client = TestClient(app)
+    operation_id = "office-api-execution-0001"
+    plan = _office_plan(
+        {
+            "type": "writeValues",
+            "sheet": "Sheet1",
+            "range": "A1",
+            "values": [["ok"]],
+        }
+    )
+    registered = client.post(
+        "/api/office/executions/register",
+        json={
+            "operationId": operation_id,
+            "plan": plan,
+            "authorizedSheetNames": ["Sheet1"],
+            "allowedExternalFiles": [],
+            "workbookIdentity": "url:c:/work/report.xlsx",
+            "confirmed": True,
+        },
+    )
+    assert registered.status_code == 200
+    state = registered.json()
+    assert state["ownerToken"]
+    before = {
+        "actionIndex": 0,
+        "sheet": "Sheet1",
+        "range": "A1",
+        "formulas": [[None]],
+        "numberFormat": [["General"]],
+        "fillColor": "#FFFFFF",
+        "fontBold": False,
+        "fontColor": "#000000",
+    }
+    started = client.post(
+        f"/api/office/executions/{operation_id}/actions/start",
+        json={
+            "expectedRevision": state["revision"],
+            "ownerToken": state["ownerToken"],
+            "actionIndex": 0,
+            "beforeSnapshot": before,
+        },
+    )
+    assert started.status_code == 200
+    state = started.json()
+    assert state["requiresReconciliation"] is True
+    checkpoint = {
+        "planId": "office-plan-1",
+        "executionId": operation_id,
+        "workbookIdentity": "url:c:/work/report.xlsx",
+        "capturedAt": "2026-09-09T00:00:00Z",
+        "coverage": "full",
+        "completedActionCount": 1,
+        "uncertainActionIndexes": [],
+        "postStateCoverage": "complete",
+        "ranges": [{**before, "postFingerprint": "fnv1a32:12345678"}],
+        "createdWorksheets": [],
+        "createdWorksheetStates": [],
+        "deletedWorksheets": [],
+        "skippedWorksheets": [],
+    }
+    action_completed = client.post(
+        f"/api/office/executions/{operation_id}/actions/complete",
+        json={
+            "expectedRevision": state["revision"],
+            "ownerToken": state["ownerToken"],
+            "actionIndex": 0,
+            "checkpoint": checkpoint,
+        },
+    )
+    assert action_completed.status_code == 200
+    state = action_completed.json()
+    assert state["nextActionIndex"] == 1
+    finished = client.post(
+        f"/api/office/executions/{operation_id}/complete",
+        json={
+            "expectedRevision": state["revision"],
+            "ownerToken": state["ownerToken"],
+            "result": {
+                "actionResults": [],
+                "verification": {"status": "verified"},
+            },
+        },
+    )
+    assert finished.status_code == 200
+    assert finished.json()["status"] == "completed"
+
+    status = client.get(f"/api/office/executions/{operation_id}")
+    assert status.status_code == 200
+    assert status.json()["ownerToken"] is None
 
 
 def test_diagnostics_records_unhandled_exceptions() -> None:
@@ -1410,6 +1553,128 @@ def test_turn_stream_pauses_persists_and_continues_from_checkpoint(
     assert record.status == "completed"
     assert record.extension_count == 1
     assert record.approved_wall_time_seconds == 120
+
+
+def test_model_timeout_pauses_and_user_can_switch_configured_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str | None] = []
+
+    async def model_fails_then_resumes(
+        request: object,
+        *,
+        tool_cache: object = None,
+        on_event=None,
+        on_checkpoint=None,
+        resume_checkpoint=None,
+        **_options: object,
+    ) -> AnswerResponse:
+        model_id = getattr(request, "modelId", None)
+        calls.append(model_id)
+        if resume_checkpoint is None:
+            checkpoint = {
+                "schemaVersion": 2,
+                "kind": "planning",
+                "stage": "before_model",
+                "messages": [{"role": "user", "content": "分析数据"}],
+                "toolCache": {"context": "saved"},
+                "loopState": {"activeElapsedSeconds": 12},
+                "toolMode": "full",
+                "repairingSubmission": False,
+                "nextTurnIndex": 0,
+                "pendingAssistantMessage": None,
+                "nextToolIndex": 0,
+                "toolBatchState": {},
+            }
+            assert on_checkpoint is not None
+            await on_checkpoint(checkpoint)
+            raise main_module.LLMTimeoutError("timeout")
+        assert model_id == "connection:fallback"
+        assert resume_checkpoint["toolCache"] == {"context": "saved"}
+        return AnswerResponse(kind="answer", message="备用模型接续完成", provider="model")
+
+    monkeypatch.setattr(main_module, "create_plan", model_fails_then_resumes)
+    monkeypatch.setattr(
+        main_module,
+        "model_settings_view",
+        lambda: {
+            "connections": [
+                {
+                    "catalogModelId": "connection:primary",
+                    "label": "主模型",
+                    "modelId": "primary-model",
+                    "supportsVision": True,
+                },
+                {
+                    "catalogModelId": "connection:fallback",
+                    "label": "备用模型",
+                    "modelId": "fallback-model",
+                    "supportsVision": True,
+                },
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        main_module,
+        "selected_model_config",
+        lambda model_id: ModelConnection(
+            base_url="https://fallback.example.test/v1",
+            model="fallback-model",
+            api_key="secret-not-persisted",
+            supports_vision=True,
+        )
+        if model_id == "connection:fallback"
+        else None,
+    )
+    payload = {
+        **_STREAM_PAYLOAD,
+        "turnId": "turn-model-fallback-test",
+        "modelId": "connection:primary",
+    }
+    client = TestClient(app)
+
+    first = client.post("/api/turn/stream", json=payload)
+    pause = next(
+        value for name, value in _parse_sse(first.text) if name == "paused"
+    )
+    assert pause["pauseType"] == "model_error"
+    assert pause["requiresExtension"] is False
+    assert pause["canSwitchModel"] is True
+    assert pause["currentModelId"] == "connection:primary"
+    assert [item["catalogModelId"] for item in pause["availableModelConnections"]] == [
+        "connection:fallback"
+    ]
+    assert "secret-not-persisted" not in first.text
+
+    continued = client.post(
+        "/api/turn/continue/stream",
+        json={
+            "turnId": "turn-model-fallback-test",
+            "expectedRevision": pause["revision"],
+            "requestId": "fallback-request-0001",
+            "confirmed": True,
+            "afterSequence": pause["lastSequence"],
+            "modelId": "connection:fallback",
+            "confirmModelSwitch": True,
+        },
+    )
+    continued_events = _parse_sse(continued.text)
+    assert any(
+        name == "step" and value["title"] == "已切换到用户选择的备用模型"
+        for name, value in continued_events
+    )
+    result = next(value for name, value in continued_events if name == "result")
+    assert result["message"] == "备用模型接续完成"
+    assert calls == ["connection:primary", "connection:fallback"]
+    record = main_module._folder_operation_ledger.planning_task(
+        "turn-model-fallback-test"
+    )
+    assert record is not None
+    assert record.current_model_id == "connection:fallback"
+    assert record.extension_count == 0
+    assert record.approved_wall_time_seconds == 60
+    assert len(record.model_switches) == 1
+    assert "secret-not-persisted" not in json.dumps(record.model_switches)
 
 
 def test_turn_stream_rejects_intent_request() -> None:

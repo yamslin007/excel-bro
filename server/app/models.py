@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import binascii
 import re
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field, StringConstraints, field_validator, model_validator
 
@@ -1977,6 +1977,104 @@ class PlanningContinueRequest(BaseModel):
     requestId: str = Field(min_length=8, max_length=100)
     confirmed: Literal[True]
     afterSequence: int = Field(default=0, ge=0)
+    modelId: Annotated[
+        str,
+        StringConstraints(strip_whitespace=True, min_length=1, max_length=200),
+    ] | None = None
+    confirmModelSwitch: bool = False
+
+    @model_validator(mode="after")
+    def validate_model_switch_confirmation(self) -> "PlanningContinueRequest":
+        if self.modelId is not None and not self.confirmModelSwitch:
+            raise ValueError("切换备用模型需要明确确认")
+        if self.modelId is None and self.confirmModelSwitch:
+            raise ValueError("确认切换时必须选择备用模型")
+        return self
+
+
+class OfficeExecutionRegisterRequest(BaseModel):
+    operationId: str = Field(
+        min_length=8,
+        max_length=100,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+    )
+    plan: AnalysisPlan
+    authorizedSheetNames: list[str] = Field(min_length=1, max_length=200)
+    allowedExternalFiles: list[str] = Field(default_factory=list, max_length=200)
+    workbookIdentity: str = Field(min_length=5, max_length=4000)
+    confirmed: Literal[True]
+
+    @field_validator("workbookIdentity")
+    @classmethod
+    def validate_workbook_identity(cls, value: str) -> str:
+        if not value.startswith("url:"):
+            raise ValueError("未保存或无法稳定识别的工作簿不能启用自动断点续跑")
+        return value
+
+
+class OfficeActionStartRequest(BaseModel):
+    expectedRevision: int = Field(ge=1)
+    ownerToken: str = Field(min_length=32, max_length=100)
+    actionIndex: int = Field(ge=0)
+    beforeSnapshot: dict[str, Any]
+
+
+class OfficeActionCompleteRequest(BaseModel):
+    expectedRevision: int = Field(ge=1)
+    ownerToken: str = Field(min_length=32, max_length=100)
+    actionIndex: int = Field(ge=0)
+    checkpoint: dict[str, Any]
+
+
+class OfficeExecutionSuspendRequest(BaseModel):
+    expectedRevision: int = Field(ge=1)
+    ownerToken: str = Field(min_length=32, max_length=100)
+    code: str = Field(min_length=1, max_length=100)
+    message: str = Field(min_length=1, max_length=2000)
+
+
+class OfficeExecutionResumeRequest(BaseModel):
+    expectedRevision: int = Field(ge=1)
+    confirmed: Literal[True]
+
+
+class OfficeActionReconcileRequest(BaseModel):
+    expectedRevision: int = Field(ge=1)
+    actionIndex: int = Field(ge=0)
+    outcome: Literal["applied", "not_applied"]
+    checkpoint: dict[str, Any] | None = None
+    confirmed: Literal[True]
+
+    @model_validator(mode="after")
+    def validate_checkpoint(self) -> "OfficeActionReconcileRequest":
+        if self.outcome == "applied" and self.checkpoint is None:
+            raise ValueError("补记已应用动作必须提供完整检查点")
+        return self
+
+
+class OfficeExecutionFinishRequest(BaseModel):
+    expectedRevision: int = Field(ge=1)
+    ownerToken: str = Field(min_length=32, max_length=100)
+    result: dict[str, Any]
+
+
+class OfficeExecutionStateResponse(BaseModel):
+    operationId: str
+    status: Literal["running", "needs_reconciliation", "completed", "failed"]
+    revision: int = Field(ge=1)
+    workbookIdentity: str
+    plan: AnalysisPlan
+    authorizedSheetNames: list[str]
+    allowedExternalFiles: list[str] = Field(default_factory=list)
+    nextActionIndex: int = Field(ge=0)
+    inFlightActionIndex: int | None = Field(default=None, ge=0)
+    beforeSnapshot: dict[str, Any] | None = None
+    checkpoint: dict[str, Any] | None = None
+    result: dict[str, Any] | None = None
+    error: dict[str, Any] | None = None
+    canResume: bool
+    requiresReconciliation: bool
+    ownerToken: str | None = None
 
 
 class PlanResponse(BaseModel):

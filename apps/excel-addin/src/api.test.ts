@@ -8,23 +8,28 @@ import {
   deleteModelConnection,
   cleanupFolderBackups,
   collectLegacyFolderBackups,
+  completeOfficeAction,
   continuePlanningTask,
   executeFolderPlan,
   executeFolderQuery,
   exportFolderBackup,
   getFolderExecutionStatus,
+  getOfficeExecutionStatus,
   getPlanningTaskStatus,
   getModelSettings,
   listModels,
   listFolderBackups,
   listManagedFolderRecoveryDirectories,
   openFolderBackupDirectory,
+  reconcileOfficeActionReceipt,
+  registerOfficeExecution,
   removeManagedFolderRecoveryDirectory,
   resumeFolderExecution,
   refreshFolder,
   restoreManagedFolderBackup,
   saveModelConnection,
   scanFolderByPath,
+  startOfficeAction,
   streamAssistantResponse,
   setFolderBackupPinned,
   testModelConnection,
@@ -785,6 +790,10 @@ describe("streaming assistant response", () => {
       maximumExtensions: 4,
       canContinue: true,
       requiresExtension: true,
+      pauseType: "budget",
+      modelSwitchCount: 0,
+      canSwitchModel: false,
+      availableModelConnections: [],
       sourceFingerprint: "sha256:source",
       sourceFingerprintSheets: ["Sheet1"]
     };
@@ -813,6 +822,10 @@ describe("streaming assistant response", () => {
       maximumExtensions: 4,
       canContinue: true,
       requiresExtension: true,
+      pauseType: "budget",
+      modelSwitchCount: 0,
+      canSwitchModel: false,
+      availableModelConnections: [],
       sourceFingerprintSheets: ["Sheet1"]
     };
     const fetchMock = vi
@@ -848,6 +861,32 @@ describe("streaming assistant response", () => {
         body: expect.stringContaining('"confirmed":true')
       })
     );
+  });
+
+  it("sends an explicitly confirmed fallback model when continuing", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      sseStreamResponse([
+        'event: result\ndata: {"kind":"answer","message":"备用模型完成","provider":"model","turnId":"turn-fallback-test"}\n\n'
+      ])
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await continuePlanningTask({
+      turnId: "turn-fallback-test",
+      expectedRevision: 9,
+      requestId: "fallback-request-0001",
+      afterSequence: 4,
+      modelId: "connection:fallback",
+      confirmModelSwitch: true
+    });
+
+    const options = fetchMock.mock.calls[0]?.[1] as RequestInit;
+    expect(JSON.parse(String(options.body))).toMatchObject({
+      turnId: "turn-fallback-test",
+      modelId: "connection:fallback",
+      confirmModelSwitch: true,
+      confirmed: true
+    });
   });
 
   it("throws ApiRequestError when the stream emits an error event", async () => {
@@ -1001,6 +1040,169 @@ describe("executeFolderPlan streaming", () => {
       retryable: false
     });
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("Office execution recovery API", () => {
+  const plan = {
+    id: "office-plan-1",
+    title: "写入",
+    summary: "写入",
+    assumptions: [],
+    warnings: [],
+    actions: [
+      {
+        type: "writeValues" as const,
+        sheet: "Sheet1",
+        range: "A1",
+        values: [["ok"]]
+      }
+    ]
+  };
+  const state = {
+    operationId: "office-execution-1",
+    status: "running",
+    revision: 1,
+    workbookIdentity: "url:c:/work/report.xlsx",
+    plan,
+    authorizedSheetNames: ["Sheet1"],
+    allowedExternalFiles: [],
+    nextActionIndex: 0,
+    inFlightActionIndex: null,
+    beforeSnapshot: null,
+    checkpoint: null,
+    result: null,
+    error: null,
+    canResume: true,
+    requiresReconciliation: false,
+    ownerToken: "a".repeat(32)
+  };
+  const beforeSnapshot = {
+    actionIndex: 0,
+    sheet: "Sheet1",
+    range: "A1",
+    formulas: [[null]],
+    numberFormat: [["General"]],
+    fillColor: "#FFFFFF",
+    fontBold: false,
+    fontColor: "#000000",
+    format: null
+  };
+
+  it("registers before writing and queries without creating another execution", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify(state)))
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ ...state, ownerToken: null }))
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await registerOfficeExecution({
+      operationId: state.operationId,
+      plan,
+      authorizedSheetNames: ["Sheet1"],
+      allowedExternalFiles: [],
+      workbookIdentity: state.workbookIdentity
+    });
+    await getOfficeExecutionStatus(state.operationId);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      expect.stringContaining("/api/office/executions/register"),
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          operationId: state.operationId,
+          plan,
+          authorizedSheetNames: ["Sheet1"],
+          allowedExternalFiles: [],
+          workbookIdentity: state.workbookIdentity,
+          confirmed: true
+        })
+      })
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      expect.stringContaining(`/api/office/executions/${state.operationId}`)
+    );
+  });
+
+  it("submits a write-ahead snapshot and a durable completion checkpoint", async () => {
+    const started = {
+      ...state,
+      revision: 2,
+      inFlightActionIndex: 0,
+      beforeSnapshot,
+      requiresReconciliation: true
+    };
+    const checkpoint = {
+      planId: plan.id,
+      executionId: state.operationId,
+      workbookIdentity: state.workbookIdentity,
+      capturedAt: "2026-09-09T00:00:00Z",
+      coverage: "full" as const,
+      completedActionCount: 1,
+      uncertainActionIndexes: [],
+      postStateCoverage: "complete" as const,
+      ranges: [{ ...beforeSnapshot, postFingerprint: "fnv1a32:12345678" }],
+      createdWorksheets: [],
+      createdWorksheetStates: [],
+      deletedWorksheets: [],
+      skippedWorksheets: []
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify(started)))
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            ...started,
+            revision: 3,
+            nextActionIndex: 1,
+            inFlightActionIndex: null,
+            checkpoint,
+            requiresReconciliation: false
+          })
+        )
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ ...started, checkpoint }))
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await startOfficeAction(state.operationId, {
+      expectedRevision: 1,
+      ownerToken: state.ownerToken,
+      actionIndex: 0,
+      beforeSnapshot
+    });
+    await completeOfficeAction(state.operationId, {
+      expectedRevision: 2,
+      ownerToken: state.ownerToken,
+      actionIndex: 0,
+      checkpoint
+    });
+    await reconcileOfficeActionReceipt(state.operationId, {
+      expectedRevision: 2,
+      actionIndex: 0,
+      outcome: "applied",
+      checkpoint
+    });
+
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body).beforeSnapshot).toEqual(
+      beforeSnapshot
+    );
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body).checkpoint).toEqual(
+      checkpoint
+    );
+    expect(JSON.parse(fetchMock.mock.calls[2][1].body)).toEqual({
+      expectedRevision: 2,
+      actionIndex: 0,
+      outcome: "applied",
+      checkpoint,
+      confirmed: true
+    });
   });
 });
 

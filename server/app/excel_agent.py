@@ -885,7 +885,7 @@ async def run_excel_agent(
     loop_config = config or _default_loop_config()
     if resume_checkpoint is not None:
         if (
-            resume_checkpoint.get("schemaVersion") != 1
+            resume_checkpoint.get("schemaVersion") not in {1, 2}
             or resume_checkpoint.get("kind") != "planning"
         ):
             raise ValueError("规划检查点版本或类型不受支持")
@@ -1015,6 +1015,18 @@ async def run_excel_agent(
         and isinstance(resume_checkpoint.get("pendingAssistantMessage"), dict)
         else None
     )
+    next_tool_index = max(
+        int(resume_checkpoint.get("nextToolIndex", 0) or 0)
+        if resume_checkpoint is not None
+        else 0,
+        0,
+    )
+    restored_tool_batch_state = (
+        dict(resume_checkpoint["toolBatchState"])
+        if resume_checkpoint is not None
+        and isinstance(resume_checkpoint.get("toolBatchState"), dict)
+        else {}
+    )
 
     def update_elapsed() -> None:
         state.elapsed_time = elapsed_before_run + (time.monotonic() - start_time)
@@ -1031,10 +1043,12 @@ async def run_excel_agent(
         *,
         upcoming_turn: int,
         pending_message: dict[str, Any] | None = None,
+        upcoming_tool: int = 0,
+        tool_batch_state: dict[str, bool] | None = None,
     ) -> dict[str, Any]:
         update_elapsed()
         checkpoint = {
-            "schemaVersion": 1,
+            "schemaVersion": 2,
             "kind": "planning",
             "stage": stage,
             "messages": messages,
@@ -1044,6 +1058,8 @@ async def run_excel_agent(
             "repairingSubmission": repairing_submission,
             "nextTurnIndex": upcoming_turn,
             "pendingAssistantMessage": pending_message,
+            "nextToolIndex": upcoming_tool,
+            "toolBatchState": dict(tool_batch_state or {}),
         }
         if on_checkpoint is not None:
             await on_checkpoint(checkpoint)
@@ -1054,6 +1070,8 @@ async def run_excel_agent(
         *,
         upcoming_turn: int,
         pending_message: dict[str, Any] | None = None,
+        upcoming_tool: int = 0,
+        tool_batch_state: dict[str, bool] | None = None,
     ) -> None:
         # Every resumable boundary is committed, not only the boundary that
         # happens to cross the soft time budget.  A process can exit before the
@@ -1063,6 +1081,8 @@ async def run_excel_agent(
             stage,
             upcoming_turn=upcoming_turn,
             pending_message=pending_message,
+            upcoming_tool=upcoming_tool,
+            tool_batch_state=tool_batch_state,
         )
         if approved_wall_time_seconds is None:
             return
@@ -1130,9 +1150,11 @@ async def run_excel_agent(
                     },
                 )
             model_step_id = f"planning.model.{turn_index + 1}"
+            resuming_tool_batch = False
             if pending_assistant_message is not None:
                 message = pending_assistant_message
                 pending_assistant_message = None
+                resuming_tool_batch = next_tool_index > 0
                 await emit(
                     model_step_id,
                     "正在继续已保存的工具步骤",
@@ -1168,6 +1190,10 @@ async def run_excel_agent(
                 "model_response_saved",
                 upcoming_turn=turn_index,
                 pending_message=assistant_message,
+                upcoming_tool=next_tool_index if resuming_tool_batch else 0,
+                tool_batch_state=(
+                    restored_tool_batch_state if resuming_tool_batch else None
+                ),
             )
             tool_calls = assistant_message.get("tool_calls") or []
             if not tool_calls:
@@ -1238,7 +1264,9 @@ async def run_excel_agent(
                     )
                     continue
 
-            if not messages or messages[-1] != assistant_message:
+            if not resuming_tool_batch and (
+                not messages or messages[-1] != assistant_message
+            ):
                 messages.append(assistant_message)
             requested_tool_names = [
                 str((tool_call.get("function") or {}).get("name", "")).strip()
@@ -1271,9 +1299,20 @@ async def run_excel_agent(
                     if fact is not None
                 ],
             )
-            successful_readonly_batch = False
-            readonly_batch_had_error = False
-            for tool_index, tool_call in enumerate(tool_calls):
+            successful_readonly_batch = bool(
+                restored_tool_batch_state.get("successfulReadonly")
+                if resuming_tool_batch
+                else False
+            )
+            readonly_batch_had_error = bool(
+                restored_tool_batch_state.get("readonlyHadError")
+                if resuming_tool_batch
+                else False
+            )
+            tool_start_index = next_tool_index if resuming_tool_batch else 0
+            if tool_start_index > len(tool_calls):
+                raise ValueError("规划检查点的工具序号超出完整模型响应范围")
+            for tool_index, tool_call in enumerate(tool_calls[tool_start_index:], start=tool_start_index):
                 function = tool_call.get("function") or {}
                 name = str(function.get("name", ""))
                 arguments: dict[str, Any] = {}
@@ -1480,6 +1519,16 @@ async def run_excel_agent(
                         "content": tool_content,
                     }
                 )
+                await pause_if_needed(
+                    "tool_completed",
+                    upcoming_turn=turn_index,
+                    pending_message=assistant_message,
+                    upcoming_tool=tool_index + 1,
+                    tool_batch_state={
+                        "successfulReadonly": successful_readonly_batch,
+                        "readonlyHadError": readonly_batch_had_error,
+                    },
+                )
             if (
                 successful_readonly_batch
                 and not readonly_batch_had_error
@@ -1494,6 +1543,8 @@ async def run_excel_agent(
             await pause_if_needed(
                 "tool_batch_completed", upcoming_turn=turn_index + 1
             )
+            next_tool_index = 0
+            restored_tool_batch_state = {}
     state.turn_index = loop_config.max_turns
     update_elapsed()
     logger.warning(

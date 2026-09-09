@@ -5,6 +5,7 @@ import {
   assertPlanningPauseResult,
   assertDataToolResult,
   assertModelSettings,
+  assertOfficeExecutionState,
   parseTaskProgressEvent,
   parseTurnStepEvent,
   type AssistantResponse,
@@ -33,6 +34,10 @@ import {
   type IntentCheckRequest,
   type IntentCheckResponse,
   type ModelSettings,
+  type OfficeExecutionState,
+  type PlanExecutionResult,
+  type ExecutionUndoSnapshot,
+  type UndoRangeSnapshot,
   type PlanRequest,
   type PlanValidateRequest,
   type TestModelConnectionResponse,
@@ -330,6 +335,8 @@ export async function continuePlanningTask(
     expectedRevision: number;
     requestId: string;
     afterSequence: number;
+    modelId?: string;
+    confirmModelSwitch?: true;
   },
   hooks: StreamHooks = {}
 ): Promise<PlanningStreamResult> {
@@ -504,6 +511,154 @@ export async function validatePlan(
     throw await requestError(response, "计划校验失败");
   }
   return (await response.json()) as AnalysisPlan;
+}
+
+async function officeExecutionResponse(
+  response: Response,
+  fallback: string
+): Promise<OfficeExecutionState> {
+  if (!response.ok) throw await requestError(response, fallback);
+  const payload: unknown = await response.json();
+  assertOfficeExecutionState(payload);
+  return payload;
+}
+
+export async function registerOfficeExecution(input: {
+  operationId: string;
+  plan: AnalysisPlan;
+  authorizedSheetNames: string[];
+  allowedExternalFiles: string[];
+  workbookIdentity: string;
+}): Promise<OfficeExecutionState> {
+  const response = await fetch(`${API_BASE_URL}/api/office/executions/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...input, confirmed: true })
+  });
+  return officeExecutionResponse(response, "无法登记 Office 写入现场");
+}
+
+export async function getOfficeExecutionStatus(
+  operationId: string
+): Promise<OfficeExecutionState> {
+  const response = await fetch(
+    `${API_BASE_URL}/api/office/executions/${encodeURIComponent(operationId)}`
+  );
+  return officeExecutionResponse(response, "无法读取 Office 写入现场");
+}
+
+export async function startOfficeAction(
+  operationId: string,
+  input: {
+    expectedRevision: number;
+    ownerToken: string;
+    actionIndex: number;
+    beforeSnapshot: UndoRangeSnapshot;
+  }
+): Promise<OfficeExecutionState> {
+  const response = await fetch(
+    `${API_BASE_URL}/api/office/executions/${encodeURIComponent(operationId)}/actions/start`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(input)
+    }
+  );
+  return officeExecutionResponse(response, "无法登记 Office 动作写前状态");
+}
+
+export async function completeOfficeAction(
+  operationId: string,
+  input: {
+    expectedRevision: number;
+    ownerToken: string;
+    actionIndex: number;
+    checkpoint: ExecutionUndoSnapshot;
+  }
+): Promise<OfficeExecutionState> {
+  const response = await fetch(
+    `${API_BASE_URL}/api/office/executions/${encodeURIComponent(operationId)}/actions/complete`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(input)
+    }
+  );
+  return officeExecutionResponse(response, "无法提交 Office 动作完成回执");
+}
+
+export async function suspendOfficeExecution(
+  operationId: string,
+  input: {
+    expectedRevision: number;
+    ownerToken: string;
+    code: string;
+    message: string;
+  }
+): Promise<OfficeExecutionState> {
+  const response = await fetch(
+    `${API_BASE_URL}/api/office/executions/${encodeURIComponent(operationId)}/suspend`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(input)
+    }
+  );
+  return officeExecutionResponse(response, "无法挂起 Office 写入现场");
+}
+
+export async function claimOfficeExecutionResume(
+  operationId: string,
+  expectedRevision: number
+): Promise<OfficeExecutionState> {
+  const response = await fetch(
+    `${API_BASE_URL}/api/office/executions/${encodeURIComponent(operationId)}/resume`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expectedRevision, confirmed: true })
+    }
+  );
+  return officeExecutionResponse(response, "无法领取 Office 断点任务");
+}
+
+export async function reconcileOfficeActionReceipt(
+  operationId: string,
+  input: {
+    expectedRevision: number;
+    actionIndex: number;
+    outcome: "applied" | "not_applied";
+    checkpoint?: ExecutionUndoSnapshot;
+  }
+): Promise<OfficeExecutionState> {
+  const response = await fetch(
+    `${API_BASE_URL}/api/office/executions/${encodeURIComponent(operationId)}/actions/reconcile`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...input, confirmed: true })
+    }
+  );
+  return officeExecutionResponse(response, "无法核对 Office 在途动作");
+}
+
+export async function finishOfficeExecution(
+  operationId: string,
+  input: {
+    expectedRevision: number;
+    ownerToken: string;
+    result: PlanExecutionResult;
+  }
+): Promise<OfficeExecutionState> {
+  const response = await fetch(
+    `${API_BASE_URL}/api/office/executions/${encodeURIComponent(operationId)}/complete`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(input)
+    }
+  );
+  return officeExecutionResponse(response, "无法提交 Office 任务完成回执");
 }
 
 export async function selectFolder(): Promise<FolderCatalog | null> {

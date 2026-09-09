@@ -85,6 +85,17 @@ export interface ChatMessage {
     expectedRevision: number;
     status: "pending" | "resuming" | "completed" | "failed";
   };
+  /** 已保存工作簿中、受控区域写入的服务端断点。 */
+  officeExecutionId?: string;
+  officeResume?: {
+    operationId: string;
+    expectedRevision: number;
+    status: "pending" | "resuming" | "completed" | "failed";
+    requiresReconciliation: boolean;
+    nextActionIndex: number;
+    totalActions: number;
+    reason: string;
+  };
   /** 规划达到本轮安全时长边界后保存的现场；刷新后仍可由用户明确继续。 */
   planningResume?: {
     turnId: string;
@@ -94,6 +105,17 @@ export interface ChatMessage {
     reason: string;
     extensionSeconds: number;
     activeElapsedSeconds: number;
+    pauseType?: "budget" | "model_error" | "interrupted";
+    currentModelId?: string | null;
+    modelSwitchCount?: number;
+    canSwitchModel?: boolean;
+    availableModelConnections?: Array<{
+      catalogModelId: string;
+      label: string;
+      modelId: string;
+      supportsVision: boolean;
+    }>;
+    selectedFallbackModelId?: string;
     requestId?: string;
     sourceFingerprint?: string | null;
     sourceFingerprintSheets?: string[];

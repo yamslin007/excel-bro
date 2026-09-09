@@ -1149,6 +1149,62 @@ export interface ExecutionUndoSnapshot {
   skippedWorksheets: string[];
 }
 
+/**
+ * 服务端持久化的 Office.js 写入现场。只有受控区域动作且工作簿具有稳定 URL
+ * 身份时才会创建；ownerToken 只在登记/领取写入权后返回。
+ */
+export interface OfficeExecutionState {
+  operationId: string;
+  status: "running" | "needs_reconciliation" | "completed" | "failed";
+  revision: number;
+  workbookIdentity: string;
+  plan: AnalysisPlan;
+  authorizedSheetNames: string[];
+  allowedExternalFiles: string[];
+  nextActionIndex: number;
+  inFlightActionIndex?: number | null;
+  beforeSnapshot?: UndoRangeSnapshot | null;
+  checkpoint?: ExecutionUndoSnapshot | null;
+  result?: PlanExecutionResult | null;
+  error?: { code?: string; message?: string } | null;
+  canResume: boolean;
+  requiresReconciliation: boolean;
+  ownerToken?: string | null;
+}
+
+export function assertOfficeExecutionState(
+  value: unknown
+): asserts value is OfficeExecutionState {
+  if (!value || typeof value !== "object") {
+    throw new Error("服务返回的 Office 恢复状态不是有效对象");
+  }
+  const state = value as Partial<OfficeExecutionState>;
+  if (
+    typeof state.operationId !== "string" ||
+    !["running", "needs_reconciliation", "completed", "failed"].includes(
+      String(state.status)
+    ) ||
+    typeof state.revision !== "number" ||
+    typeof state.workbookIdentity !== "string" ||
+    !state.plan ||
+    !Array.isArray(state.plan.actions) ||
+    !Array.isArray(state.authorizedSheetNames) ||
+    !Array.isArray(state.allowedExternalFiles) ||
+    typeof state.nextActionIndex !== "number" ||
+    typeof state.canResume !== "boolean" ||
+    typeof state.requiresReconciliation !== "boolean"
+  ) {
+    throw new Error("服务返回的 Office 恢复状态缺少必要字段");
+  }
+  if (
+    state.inFlightActionIndex !== undefined &&
+    state.inFlightActionIndex !== null &&
+    typeof state.inFlightActionIndex !== "number"
+  ) {
+    throw new Error("服务返回的 Office 在途动作位置无效");
+  }
+}
+
 export type AssistantResponse =
   | {
       kind: "answer";
@@ -1178,6 +1234,16 @@ export interface PlanningPauseResult {
   maximumExtensions: number;
   canContinue: boolean;
   requiresExtension: boolean;
+  pauseType: "budget" | "model_error" | "interrupted";
+  currentModelId?: string | null;
+  modelSwitchCount: number;
+  canSwitchModel: boolean;
+  availableModelConnections: Array<{
+    catalogModelId: string;
+    label: string;
+    modelId: string;
+    supportsVision: boolean;
+  }>;
   sourceFingerprint?: string | null;
   sourceFingerprintSheets?: string[];
 }
@@ -1414,7 +1480,13 @@ export function assertPlanningPauseResult(
     typeof result.extensionCount !== "number" ||
     typeof result.maximumExtensions !== "number" ||
     typeof result.canContinue !== "boolean" ||
-    typeof result.requiresExtension !== "boolean"
+    typeof result.requiresExtension !== "boolean" ||
+    (result.pauseType !== "budget" &&
+      result.pauseType !== "model_error" &&
+      result.pauseType !== "interrupted") ||
+    typeof result.modelSwitchCount !== "number" ||
+    typeof result.canSwitchModel !== "boolean" ||
+    !Array.isArray(result.availableModelConnections)
   ) {
     throw new Error("服务返回的规划暂停状态缺少必要字段");
   }
@@ -1423,6 +1495,19 @@ export function assertPlanningPauseResult(
     !Array.isArray(result.sourceFingerprintSheets)
   ) {
     throw new Error("服务返回的规划来源工作表无效");
+  }
+  if (
+    result.availableModelConnections.some(
+      (connection) =>
+        !connection ||
+        typeof connection !== "object" ||
+        typeof connection.catalogModelId !== "string" ||
+        typeof connection.label !== "string" ||
+        typeof connection.modelId !== "string" ||
+        typeof connection.supportsVision !== "boolean"
+    )
+  ) {
+    throw new Error("服务返回的备用模型连接无效");
   }
 }
 

@@ -3793,11 +3793,228 @@ function loadedRangePostFingerprint(range: Excel.Range): string {
   });
 }
 
-function currentOfficeWorkbookIdentity(): string | undefined {
+export function currentOfficeWorkbookIdentity(): string | undefined {
   if (typeof Office === "undefined") return undefined;
   const url = (Office as any).context?.document?.url;
   if (typeof url !== "string" || !url.trim()) return undefined;
   return `url:${url.trim().replace(/\\/g, "/").toLocaleLowerCase()}`;
+}
+
+const OFFICE_RECOVERY_ACTION_TYPES = new Set<ExcelAction["type"]>([
+  "writeValues",
+  "writeFormulas",
+  "setFill",
+  "setFont",
+  "setNumberFormat"
+]);
+
+export interface OfficeRecoverySupport {
+  supported: boolean;
+  reason?: string;
+}
+
+export function officeRecoverySupport(plan: AnalysisPlan): OfficeRecoverySupport {
+  const sourceSheets = new Set(
+    (plan.sourceFingerprintSheets ?? []).map((name) => name.toLocaleLowerCase())
+  );
+  for (const [index, action] of plan.actions.entries()) {
+    if (!OFFICE_RECOVERY_ACTION_TYPES.has(action.type)) {
+      return {
+        supported: false,
+        reason: `第 ${index + 1} 步 ${action.type} 暂不支持跨重启自动续跑`
+      };
+    }
+    if (action.type === "writeFormulas" && action.formulaR1C1) {
+      return {
+        supported: false,
+        reason: `第 ${index + 1} 步 R1C1 铺满公式暂不支持跨重启效果核对`
+      };
+    }
+    if (sourceSheets.has(action.sheet.toLocaleLowerCase())) {
+      return {
+        supported: false,
+        reason: `第 ${index + 1} 步会修改来源工作表，暂不能区分任务自身修改与恢复期间的外部修改`
+      };
+    }
+    if (
+      action.type === "setFont" &&
+      action.bold === undefined &&
+      !action.color
+    ) {
+      return {
+        supported: false,
+        reason: `第 ${index + 1} 步没有可核对的字体变更`
+      };
+    }
+  }
+  return plan.actions.length > 0
+    ? { supported: true }
+    : { supported: false, reason: "空计划不需要断点续跑" };
+}
+
+export interface OfficeRangeObservedState {
+  formulas: CellValue[][];
+  numberFormat: string[][];
+  fillColor: string;
+  fontBold: boolean;
+  fontColor: string;
+}
+
+export type OfficeActionReconciliationOutcome =
+  | "applied"
+  | "not_applied"
+  | "unknown";
+
+function sameMatrix(left: unknown[][], right: unknown[][]): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function sameColor(left: string, right: string): boolean {
+  return left.trim().toLocaleUpperCase() === right.trim().toLocaleUpperCase();
+}
+
+function observedRangeFingerprint(state: OfficeRangeObservedState): string {
+  return localStateFingerprint({
+    formulas: state.formulas.map((row) => row.map(normalizeValue)),
+    numberFormat: state.numberFormat,
+    fillColor: state.fillColor,
+    fontBold: state.fontBold,
+    fontColor: state.fontColor
+  });
+}
+
+function undoRangeBeforeFingerprint(saved: ExecutionUndoSnapshot["ranges"][number]): string {
+  return localStateFingerprint({
+    formulas: saved.formulas.map((row) => row.map(normalizeValue)),
+    numberFormat: saved.numberFormat,
+    fillColor: saved.fillColor,
+    fontBold: saved.fontBold,
+    fontColor: saved.fontColor
+  });
+}
+
+export function classifyOfficeActionState(
+  action: ExcelAction,
+  before: ExecutionUndoSnapshot["ranges"][number],
+  observed: OfficeRangeObservedState
+): OfficeActionReconciliationOutcome {
+  let matchesExpected = false;
+  switch (action.type) {
+    case "writeValues":
+      matchesExpected = sameMatrix(
+        observed.formulas,
+        action.values.map((row) => row.map(normalizeValue))
+      );
+      break;
+    case "writeFormulas":
+      matchesExpected =
+        !action.formulaR1C1 && sameMatrix(observed.formulas, action.formulas);
+      break;
+    case "setFill":
+      matchesExpected = sameColor(observed.fillColor, action.color);
+      break;
+    case "setFont":
+      matchesExpected =
+        (action.bold === undefined || observed.fontBold === action.bold) &&
+        (!action.color || sameColor(observed.fontColor, action.color));
+      break;
+    case "setNumberFormat":
+      matchesExpected = observed.numberFormat.every((row) =>
+        row.every((value) => value === action.formatCode)
+      );
+      break;
+    default:
+      return "unknown";
+  }
+  if (matchesExpected) return "applied";
+  if (observedRangeFingerprint(observed) === undoRangeBeforeFingerprint(before)) {
+    return "not_applied";
+  }
+  return "unknown";
+}
+
+export function appendOfficeRangeCheckpoint(input: {
+  plan: AnalysisPlan;
+  operationId: string;
+  workbookIdentity: string;
+  previous?: ExecutionUndoSnapshot | null;
+  before: ExecutionUndoSnapshot["ranges"][number];
+  actionIndex: number;
+  postFingerprint: string;
+}): ExecutionUndoSnapshot {
+  const savedRange = { ...input.before, postFingerprint: input.postFingerprint };
+  const previousRanges = (input.previous?.ranges ?? []).filter(
+    (item) => item.actionIndex !== input.actionIndex
+  );
+  const completedActionCount = input.actionIndex + 1;
+  return {
+    planId: input.plan.id,
+    executionId: input.operationId,
+    workbookIdentity: input.workbookIdentity,
+    capturedAt: new Date().toISOString(),
+    coverage:
+      completedActionCount === input.plan.actions.length ? "full" : "partial",
+    completedActionCount,
+    uncertainActionIndexes: [],
+    postStateCoverage: "complete",
+    ranges: [...previousRanges, savedRange],
+    createdWorksheets: [],
+    createdWorksheetStates: [],
+    deletedWorksheets: [],
+    skippedWorksheets: []
+  };
+}
+
+export async function reconcileOfficeRangeAction(input: {
+  plan: AnalysisPlan;
+  operationId: string;
+  workbookIdentity: string;
+  actionIndex: number;
+  before: ExecutionUndoSnapshot["ranges"][number];
+  previous?: ExecutionUndoSnapshot | null;
+}): Promise<{
+  outcome: OfficeActionReconciliationOutcome;
+  checkpoint?: ExecutionUndoSnapshot;
+}> {
+  const currentIdentity = currentOfficeWorkbookIdentity();
+  if (!currentIdentity || currentIdentity !== input.workbookIdentity) {
+    throw new Error("当前工作簿与断点记录不一致，已停止自动续跑。");
+  }
+  const action = input.plan.actions[input.actionIndex];
+  if (!action || !officeRecoverySupport({ ...input.plan, actions: [action] }).supported) {
+    throw new Error("在途动作不在 Office 自动恢复白名单内。");
+  }
+  const address = recoverableActionRange(action);
+  if (!address || action.sheet !== input.before.sheet || address !== input.before.range) {
+    throw new Error("在途动作的目标范围与写前快照不一致。");
+  }
+  return Excel.run(async (context) => {
+    const sheet = context.workbook.worksheets.getItemOrNullObject(action.sheet);
+    sheet.load("isNullObject");
+    await context.sync();
+    if (sheet.isNullObject) return { outcome: "unknown" as const };
+    const range = sheet.getRange(address);
+    range.load(
+      "formulas,numberFormat,format/fill/color,format/font/bold,format/font/color"
+    );
+    await context.sync();
+    const observed: OfficeRangeObservedState = {
+      formulas: range.formulas.map((row) => row.map(normalizeValue)),
+      numberFormat: range.numberFormat,
+      fillColor: range.format.fill.color,
+      fontBold: range.format.font.bold,
+      fontColor: range.format.font.color
+    };
+    const outcome = classifyOfficeActionState(action, input.before, observed);
+    if (outcome !== "applied") return { outcome };
+    return {
+      outcome,
+      checkpoint: appendOfficeRangeCheckpoint({
+        ...input,
+        postFingerprint: observedRangeFingerprint(observed)
+      })
+    };
+  });
 }
 
 async function readCreatedWorksheetState(
@@ -4101,6 +4318,22 @@ export interface ExecutePlanOptions {
   operationId?: string;
   /** 由确定性执行器产生的结构化进度，不包含模型隐藏推理。 */
   onProgress?: (event: TaskProgressEvent) => void;
+  /**
+   * 仅供已登记的 Office 区域动作恢复使用。回调必须在写入前/后持久提交；
+   * 任一回调失败都会停止后续动作，避免产生未经登记的写入。
+   */
+  recovery?: {
+    startActionIndex: number;
+    undoSnapshot?: ExecutionUndoSnapshot | null;
+    onBeforeAction: (input: {
+      actionIndex: number;
+      beforeSnapshot: ExecutionUndoSnapshot["ranges"][number];
+    }) => Promise<void>;
+    onActionCompleted: (input: {
+      actionIndex: number;
+      checkpoint: ExecutionUndoSnapshot;
+    }) => Promise<void>;
+  };
 }
 
 export async function executePlan(
@@ -4109,6 +4342,23 @@ export async function executePlan(
 ): Promise<PlanExecutionResult> {
   const operationId =
     options.operationId ?? `execution-${Date.now().toString(36)}`;
+  const startActionIndex = options.recovery?.startActionIndex ?? 0;
+  if (startActionIndex < 0 || startActionIndex > plan.actions.length) {
+    throw new PlanExecutionError(
+      "Office 断点的下一动作位置无效，已停止续跑。",
+      incompleteActionResults(plan, new Map())
+    );
+  }
+  if (
+    options.recovery?.undoSnapshot &&
+    (options.recovery.undoSnapshot.planId !== plan.id ||
+      options.recovery.undoSnapshot.executionId !== operationId)
+  ) {
+    throw new PlanExecutionError(
+      "Office 断点的计划或执行标识不一致，已停止续跑。",
+      incompleteActionResults(plan, new Map())
+    );
+  }
   let progressSequence = 0;
   const emitProgress = (
     event: Omit<
@@ -4272,15 +4522,27 @@ export async function executePlan(
       }
     });
 
-    const actionResults: ActionExecutionResult[] = [];
+    const actionResults: ActionExecutionResult[] = plan.actions
+      .slice(0, startActionIndex)
+      .map((action, index) => ({
+        index,
+        type: action.type,
+        sheet: action.sheet,
+        status: "succeeded"
+      }));
     const dynamicCriteria: VerificationCriterion[] = [];
-    const undoRanges: ExecutionUndoSnapshot["ranges"] = [];
+    const undoRanges: ExecutionUndoSnapshot["ranges"] = [
+      ...(options.recovery?.undoSnapshot?.ranges ?? [])
+    ];
     const createdWorksheets: string[] = [];
     const deletedWorksheets: UndoWorksheetSnapshot[] = [];
     const skippedWorksheets: string[] = [];
     const executionStartedAt = performance.now();
-    for (const [index, action] of plan.actions.entries()) {
+    let recoveryCheckpoint = options.recovery?.undoSnapshot ?? null;
+    for (let index = startActionIndex; index < plan.actions.length; index += 1) {
+      const action = plan.actions[index];
       let undoRange: ExecutionUndoSnapshot["ranges"][number] | null = null;
+      let undoCollected = false;
       let deletedCapture: Awaited<ReturnType<typeof captureDeletedWorksheet>> | null = null;
       const actionUndo: ActionUndoCollector = {
         createdWorksheets: [],
@@ -4306,6 +4568,17 @@ export async function executePlan(
                 positionByName.get(action.sheet)
               )
             : null;
+        if (options.recovery) {
+          if (!undoRange) {
+            throw new Error(
+              `第 ${index + 1} 步缺少完整的区域写前快照，不能按恢复模式执行`
+            );
+          }
+          await options.recovery.onBeforeAction({
+            actionIndex: index,
+            beforeSnapshot: undoRange
+          });
+        }
         emitProgress({
           phase: "backup",
           stepId: `execution.action.${index + 1}.undo`,
@@ -4374,21 +4647,50 @@ export async function executePlan(
         } else if (deletedCapture?.skipped) {
           skippedWorksheets.push(action.sheet);
         }
+        undoCollected = true;
+        if (options.recovery) {
+          if (!undoRange) {
+            throw new Error(`第 ${index + 1} 步无法生成写后核对证据`);
+          }
+          const postState = await captureUndoPostState(context, [undoRange], [], []);
+          if (!postState.complete || !undoRange.postFingerprint) {
+            throw new Error(`第 ${index + 1} 步写后状态未能完整核对`);
+          }
+          const workbookIdentity = currentOfficeWorkbookIdentity();
+          if (!workbookIdentity) {
+            throw new Error("当前工作簿缺少稳定身份，不能提交 Office 动作回执");
+          }
+          recoveryCheckpoint = appendOfficeRangeCheckpoint({
+            plan,
+            operationId,
+            workbookIdentity,
+            previous: recoveryCheckpoint,
+            before: undoRange,
+            actionIndex: index,
+            postFingerprint: undoRange.postFingerprint
+          });
+          await options.recovery.onActionCompleted({
+            actionIndex: index,
+            checkpoint: recoveryCheckpoint
+          });
+        }
       } catch (reason) {
-        if (undoRange) undoRanges.push(undoRange);
-        if (actionUndo.overwrittenRanges.length > 0) {
-          undoRanges.push(...actionUndo.overwrittenRanges);
-        }
-        if (action.type === "createWorksheet") {
-          createdWorksheets.push(action.sheet);
-        }
-        if (actionUndo.createdWorksheets.length > 0) {
-          createdWorksheets.push(...actionUndo.createdWorksheets);
-        }
-        if (deletedCapture?.snapshot) {
-          deletedWorksheets.push(deletedCapture.snapshot);
-        } else if (deletedCapture?.skipped) {
-          skippedWorksheets.push(action.sheet);
+        if (!undoCollected) {
+          if (undoRange) undoRanges.push(undoRange);
+          if (actionUndo.overwrittenRanges.length > 0) {
+            undoRanges.push(...actionUndo.overwrittenRanges);
+          }
+          if (action.type === "createWorksheet") {
+            createdWorksheets.push(action.sheet);
+          }
+          if (actionUndo.createdWorksheets.length > 0) {
+            createdWorksheets.push(...actionUndo.createdWorksheets);
+          }
+          if (deletedCapture?.snapshot) {
+            deletedWorksheets.push(deletedCapture.snapshot);
+          } else if (deletedCapture?.skipped) {
+            skippedWorksheets.push(action.sheet);
+          }
         }
         const detail = excelErrorDetail(reason);
         emitProgress({

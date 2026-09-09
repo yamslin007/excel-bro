@@ -210,7 +210,7 @@ bash packaging/build_mac.sh
 ### 规划预算暂停与恢复调试
 
 流式规划通过 `POST /api/turn/stream` 建立持久 turnId。软时间份额到达后只在完整模型响应
-或完整工具批次边界暂停，事件流返回 `planning_pause`；前端保存 turnId、revision、
+或完整单次工具调用边界暂停，事件流返回 `planning_pause`；前端保存 turnId、revision、
 lastSequence、稳定 requestId 和原来源指纹。刷新或网络中断后应先调用
 `GET /api/turn/{turnId}/status`，用户明确继续时再调用 `POST /api/turn/continue/stream`。
 
@@ -219,10 +219,29 @@ lastSequence、稳定 requestId 和原来源指纹。刷新或网络中断后应
   `taskRecovery`。继续只增加时间，不提高 `agent.maxTurns`、`maxTotalTokens` 或错误上限。
 - checkpoint 保存在 `tasks/state.sqlite3`，包含消息、LoopState、工具缓存、工具模式、修复
   状态和完整待处理模型响应。不要把完整 checkpoint 写入普通诊断日志。
-- `/api/plan` 是兼容非流式入口，不具备 B2 的跨重启继续保证。备用模型、任意 DAG 和
-  Office.js 写入续跑仍未实现。
+- `/api/plan` 是兼容非流式入口，不具备 B2 的跨重启继续保证。流式路径会逐个保存完整
+  工具调用；模型错误暂停后可由用户显式切换到已配置连接，但任意 DAG 仍未实现。
 - 意外异常必须把任务标记为 `failed` 并发出安全 SSE 错误；若状态长期为 `running`，先检查
   账本写入失败和服务日志，不要直接新建同一语义的写入任务。
+
+### Office.js 动作断点恢复调试
+
+当前只对已保存工作簿中的 `writeValues`、`writeFormulas`（非 R1C1 铺满）、`setFill`、
+`setFont` 和 `setNumberFormat` 开放。来源表原地修改、工作表结构变化、图表、透视表等仍按
+普通模式执行，并明确提示不支持跨重启自动续跑。
+
+- 首个写入前调用 `POST /api/office/executions/register`；每一步写入前后分别提交
+  `actions/start` 和 `actions/complete`。完成回执必须早于下一动作。
+- 刷新后先用本地 operationId 调用状态查询；本地记录只是发现索引，不能替代服务端计划、
+  授权、revision 或检查点。
+- 在途动作只能通过实际目标范围判定：匹配预期结果时补记完成，匹配写前指纹时允许重试，
+  两者都不匹配时保持挂起。不得为了恢复而新建 operationId 或改用文件夹执行器。
+- 工作簿身份以 `Office.context.document.url` 的稳定 URL 绑定；未保存工作簿和同名不同路径
+  文件必须拒绝自动接续。
+- 状态查询不包含 ownerToken。登记、显式领取或成功核对会取得/轮换写入令牌；旧 token 或
+  revision 的动作回执必须返回冲突。
+- 浏览器演示模式不能验收这些行为。真实 Excel 至少注入：写前登记后退出、`context.sync()`
+  后回执前退出、回执后退出、工作簿切换、人工修改在途范围和最终完成回执丢失。
 
 ### Custom Functions 资源
 
@@ -336,6 +355,10 @@ python -m compileall -q server/app
 8. 检查固化工具是否需要新增参数绑定。
 9. 补前后端测试。
 10. 更新架构文档。
+
+为动作增加跨重启续跑能力时，还必须提供动作专用的写前状态、预期写后状态和 `unknown`
+判定测试。不能仅因动作已经支持普通执行，就把它加入恢复白名单；结构动作和复杂对象必须
+先建立稳定对象身份及完整效果核对。
 
 文件夹模式的物理备份必须写入所选工作目录的 `.excel-bro-backups`，不得恢复为原文件旁散落备份。新增清理路径时必须复用统一事务删除，并同时验证 manifest、活跃撤销 ID、路径边界、符号链接和 Windows reparse point；不能直接递归删除 `executions/<undoId>`。manifest 使用同目录临时文件加 `os.replace()` 原子更新。`undo.maxEntries` 只限制快速撤销资格；历史磁盘副本按最短保留期、软上限、每文件最后完好副本、主动保留和异常状态分别判断。磁盘安全余量使用 `undo.folderBackupMinFreeBytes` 配置，不得在空间不足时降级成无备份写入。
 

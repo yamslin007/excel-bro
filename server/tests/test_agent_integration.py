@@ -73,6 +73,31 @@ def _tool_payload(name: str, arguments: dict[str, Any], call_id: str) -> dict[st
     }
 
 
+def _multi_tool_payload(
+    calls: list[tuple[str, dict[str, Any], str]],
+) -> dict[str, Any]:
+    return {
+        "choices": [
+            {
+                "message": {
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": json.dumps(arguments, ensure_ascii=False),
+                            },
+                        }
+                        for name, arguments, call_id in calls
+                    ],
+                }
+            }
+        ]
+    }
+
+
 def _content_payload(content: str) -> dict[str, Any]:
     return {"choices": [{"message": {"content": content, "tool_calls": []}}]}
 
@@ -307,6 +332,108 @@ def test_complete_model_response_is_checkpointed_before_budget_pause(
     response_checkpoint = checkpoints[1]
     assert response_checkpoint["pendingAssistantMessage"]["content"]
     assert response_checkpoint["nextTurnIndex"] == 0
+
+
+def test_resume_skips_tools_already_committed_in_same_model_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def responder(call_count: int):
+        if call_count == 1:
+            return (
+                _multi_tool_payload(
+                    [
+                        (
+                            "read_range",
+                            {"sheet": "Sheet1", "range": "A1:A3"},
+                            "read-first",
+                        ),
+                        (
+                            "read_range",
+                            {"sheet": "Sheet1", "range": "B1:B3"},
+                            "read-second",
+                        ),
+                    ]
+                ),
+                _usage(),
+            )
+        return (
+            _tool_payload(
+                "submit_answer",
+                {"message": "两个字段均已读取。"},
+                "answer-after-tools",
+            ),
+            _usage(),
+        )
+
+    client = _FakeClient(responder)
+    _install_client(monkeypatch, client)
+    original_execute_tool = excel_agent._execute_tool
+    executed_ranges: list[str] = []
+
+    def counted_execute_tool(request, name, arguments):
+        if name == "read_range":
+            executed_ranges.append(str(arguments.get("range")))
+        return original_execute_tool(request, name, arguments)
+
+    monkeypatch.setattr(excel_agent, "_execute_tool", counted_execute_tool)
+    committed_checkpoint: dict[str, Any] | None = None
+
+    async def stop_after_first_tool(checkpoint: dict[str, Any]) -> None:
+        nonlocal committed_checkpoint
+        if (
+            checkpoint.get("stage") == "tool_completed"
+            and checkpoint.get("nextToolIndex") == 1
+        ):
+            committed_checkpoint = copy.deepcopy(checkpoint)
+            raise RuntimeError("simulated process exit after first tool")
+
+    with pytest.raises(RuntimeError, match="simulated process exit"):
+        asyncio.run(
+            excel_agent.run_excel_agent(
+                _request(),
+                connection=_connection(),
+                timeout=10,
+                tool_cache={},
+                on_checkpoint=stop_after_first_tool,
+                config=LoopConfig(max_wall_time_seconds=3600),
+            )
+        )
+
+    assert committed_checkpoint is not None
+    assert committed_checkpoint["schemaVersion"] == 2
+    assert committed_checkpoint["nextToolIndex"] == 1
+    assert [message["role"] for message in committed_checkpoint["messages"][-2:]] == [
+        "assistant",
+        "tool",
+    ]
+    assert executed_ranges == ["A1:A3"]
+
+    response = asyncio.run(
+        excel_agent.run_excel_agent(
+            _request(),
+            connection=_connection(),
+            timeout=10,
+            tool_cache={},
+            resume_checkpoint=committed_checkpoint,
+            approved_wall_time_seconds=60,
+            config=LoopConfig(max_wall_time_seconds=3600),
+        )
+    )
+
+    assert response.kind == "answer"
+    assert response.message == "两个字段均已读取。"
+    assert executed_ranges == ["A1:A3", "B1:B3"]
+    assert client.call_count == 2
+    resumed_messages = client.message_snapshots[-1]
+    assistant_messages = [
+        message for message in resumed_messages if message.get("role") == "assistant"
+    ]
+    assert len(assistant_messages) == 1
+    assert [
+        message.get("tool_call_id")
+        for message in resumed_messages
+        if message.get("role") == "tool"
+    ] == ["read-first", "read-second"]
 
 
 def test_consecutive_invalid_plans_trigger_safe_degradation(

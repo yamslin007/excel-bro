@@ -21,6 +21,9 @@ FolderOperationStatus = Literal[
 PlanningTaskStatus = Literal[
     "running", "waiting_user", "completed", "failed", "cancelled"
 ]
+OfficeExecutionStatus = Literal[
+    "running", "needs_reconciliation", "completed", "failed"
+]
 
 
 @dataclass(frozen=True)
@@ -68,7 +71,29 @@ class PlanningTaskRecord:
     active_elapsed_seconds: float
     approved_wall_time_seconds: float
     extension_count: int
+    current_model_id: str | None
+    model_switches: tuple[dict[str, Any], ...]
     executor_id: str
+    revision: int
+    created_at: float
+    updated_at: float
+
+
+@dataclass(frozen=True)
+class OfficeExecutionRecord:
+    operation_id: str
+    request_fingerprint: str
+    plan: dict[str, Any]
+    authorization: dict[str, Any]
+    workbook_identity: str
+    status: OfficeExecutionStatus
+    next_action_index: int
+    in_flight_action_index: int | None
+    before_snapshot: dict[str, Any] | None
+    checkpoint: dict[str, Any] | None
+    result: dict[str, Any] | None
+    error: dict[str, Any] | None
+    owner_token: str
     revision: int
     created_at: float
     updated_at: float
@@ -212,6 +237,8 @@ class FolderOperationLedger:
                     active_elapsed_seconds REAL NOT NULL DEFAULT 0 CHECK (active_elapsed_seconds >= 0),
                     approved_wall_time_seconds REAL NOT NULL CHECK (approved_wall_time_seconds > 0),
                     extension_count INTEGER NOT NULL DEFAULT 0 CHECK (extension_count >= 0),
+                    current_model_id TEXT,
+                    model_switches_json TEXT NOT NULL DEFAULT '{"items":[]}',
                     executor_id TEXT NOT NULL,
                     revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1),
                     created_at REAL NOT NULL,
@@ -232,11 +259,34 @@ class FolderOperationLedger:
                     turn_id TEXT NOT NULL,
                     request_id TEXT NOT NULL,
                     added_seconds REAL NOT NULL CHECK (added_seconds >= 0),
+                    model_id TEXT,
                     created_at REAL NOT NULL,
                     PRIMARY KEY (turn_id, request_id),
                     FOREIGN KEY (turn_id)
                         REFERENCES planning_tasks(turn_id) ON DELETE CASCADE
                 );
+                CREATE TABLE IF NOT EXISTS office_executions (
+                    operation_id TEXT PRIMARY KEY,
+                    request_fingerprint TEXT NOT NULL,
+                    plan_json TEXT NOT NULL,
+                    authorization_json TEXT NOT NULL,
+                    workbook_identity TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (
+                        status IN ('running', 'needs_reconciliation', 'completed', 'failed')
+                    ),
+                    next_action_index INTEGER NOT NULL DEFAULT 0 CHECK (next_action_index >= 0),
+                    in_flight_action_index INTEGER,
+                    before_snapshot_json TEXT,
+                    checkpoint_json TEXT,
+                    result_json TEXT,
+                    error_json TEXT,
+                    owner_token TEXT NOT NULL,
+                    revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1),
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_office_executions_status_updated
+                    ON office_executions(status, updated_at);
                 """
             )
             operation_columns = {
@@ -258,7 +308,32 @@ class FolderOperationLedger:
                     connection.execute(
                         f"ALTER TABLE folder_operations ADD COLUMN {column} TEXT"
                     )
-            connection.execute("PRAGMA user_version = 5")
+            planning_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(planning_tasks)"
+                ).fetchall()
+            }
+            if "current_model_id" not in planning_columns:
+                connection.execute(
+                    "ALTER TABLE planning_tasks ADD COLUMN current_model_id TEXT"
+                )
+            if "model_switches_json" not in planning_columns:
+                connection.execute(
+                    "ALTER TABLE planning_tasks ADD COLUMN model_switches_json "
+                    "TEXT NOT NULL DEFAULT '{\"items\":[]}'"
+                )
+            extension_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(planning_budget_extensions)"
+                ).fetchall()
+            }
+            if "model_id" not in extension_columns:
+                connection.execute(
+                    "ALTER TABLE planning_budget_extensions ADD COLUMN model_id TEXT"
+                )
+            connection.execute("PRAGMA user_version = 7")
             self._initialized_paths.add(path)
 
     @staticmethod
@@ -313,10 +388,45 @@ class FolderOperationLedger:
         )
 
     @classmethod
+    def _office_record(cls, row: sqlite3.Row) -> OfficeExecutionRecord:
+        plan = cls._decode(str(row["plan_json"]))
+        authorization = cls._decode(str(row["authorization_json"]))
+        if plan is None or authorization is None:
+            raise RuntimeError("Office 执行记录缺少计划或授权现场")
+        return OfficeExecutionRecord(
+            operation_id=str(row["operation_id"]),
+            request_fingerprint=str(row["request_fingerprint"]),
+            plan=plan,
+            authorization=authorization,
+            workbook_identity=str(row["workbook_identity"]),
+            status=str(row["status"]),  # type: ignore[arg-type]
+            next_action_index=int(row["next_action_index"]),
+            in_flight_action_index=(
+                int(row["in_flight_action_index"])
+                if row["in_flight_action_index"] is not None
+                else None
+            ),
+            before_snapshot=cls._decode(row["before_snapshot_json"]),
+            checkpoint=cls._decode(row["checkpoint_json"]),
+            result=cls._decode(row["result_json"]),
+            error=cls._decode(row["error_json"]),
+            owner_token=str(row["owner_token"]),
+            revision=int(row["revision"]),
+            created_at=float(row["created_at"]),
+            updated_at=float(row["updated_at"]),
+        )
+
+    @classmethod
     def _planning_record(cls, row: sqlite3.Row) -> PlanningTaskRecord:
         request = cls._decode(str(row["request_json"]))
         if request is None:
             raise RuntimeError("规划任务缺少原始请求")
+        raw_switches = cls._decode(row["model_switches_json"]) or {"items": []}
+        switch_items = raw_switches.get("items", [])
+        if not isinstance(switch_items, list) or not all(
+            isinstance(item, dict) for item in switch_items
+        ):
+            raise RuntimeError("规划任务包含无效的模型切换记录")
         return PlanningTaskRecord(
             turn_id=str(row["turn_id"]),
             request_fingerprint=str(row["request_fingerprint"]),
@@ -332,6 +442,12 @@ class FolderOperationLedger:
             active_elapsed_seconds=float(row["active_elapsed_seconds"]),
             approved_wall_time_seconds=float(row["approved_wall_time_seconds"]),
             extension_count=int(row["extension_count"]),
+            current_model_id=(
+                str(row["current_model_id"])
+                if row["current_model_id"] is not None
+                else None
+            ),
+            model_switches=tuple(dict(item) for item in switch_items),
             executor_id=str(row["executor_id"]),
             revision=int(row["revision"]),
             created_at=float(row["created_at"]),
@@ -822,14 +938,20 @@ class FolderOperationLedger:
                     """
                     INSERT INTO planning_tasks (
                         turn_id, request_fingerprint, request_json, status,
-                        approved_wall_time_seconds, executor_id, created_at, updated_at
-                    ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                        approved_wall_time_seconds, current_model_id,
+                        executor_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)
                     """,
                     (
                         turn_id,
                         request_fingerprint,
                         encoded_request,
                         approved_wall_time_seconds,
+                        (
+                            str(request.get("modelId"))
+                            if request.get("modelId") is not None
+                            else None
+                        ),
                         self.executor_id,
                         now,
                         now,
@@ -967,8 +1089,10 @@ class FolderOperationLedger:
         *,
         active_elapsed_seconds: float,
         reason: str,
+        error: dict[str, Any] | None = None,
     ) -> PlanningTaskRecord:
         encoded = self._encode(checkpoint)
+        encoded_error = self._encode(error) if error is not None else None
         if len(encoded.encode("utf-8")) > capability_int(
             "taskRecovery", "maxCheckpointBytes"
         ):
@@ -980,7 +1104,7 @@ class FolderOperationLedger:
                 """
                 UPDATE planning_tasks
                 SET status = 'waiting_user', checkpoint_json = ?,
-                    active_elapsed_seconds = ?, pause_reason = ?, updated_at = ?,
+                    active_elapsed_seconds = ?, pause_reason = ?, error_json = ?, updated_at = ?,
                     revision = revision + 1
                 WHERE turn_id = ? AND status = 'running' AND executor_id = ?
                 """,
@@ -988,6 +1112,7 @@ class FolderOperationLedger:
                     encoded,
                     max(active_elapsed_seconds, 0.0),
                     reason[:1000],
+                    encoded_error,
                     now,
                     turn_id,
                     self.executor_id,
@@ -1012,6 +1137,8 @@ class FolderOperationLedger:
         extension_seconds: float,
         maximum_extensions: int,
         hard_wall_time_seconds: float,
+        model_id: str | None = None,
+        model_switch_reason: str | None = None,
     ) -> tuple[PlanningTaskRecord, bool]:
         """CAS claim; a stable request_id grants a budget extension at most once."""
 
@@ -1030,12 +1157,20 @@ class FolderOperationLedger:
                 raise RuntimeError("未找到可继续的规划任务")
             duplicate = connection.execute(
                 """
-                SELECT added_seconds FROM planning_budget_extensions
+                SELECT added_seconds, model_id FROM planning_budget_extensions
                 WHERE turn_id = ? AND request_id = ?
                 """,
                 (turn_id, request_id),
             ).fetchone()
             if duplicate is not None:
+                duplicate_model_id = (
+                    str(duplicate["model_id"])
+                    if duplicate["model_id"] is not None
+                    else None
+                )
+                if duplicate_model_id != model_id:
+                    connection.rollback()
+                    raise RuntimeError("同一继续请求不能改用另一模型连接")
                 if row["status"] not in {"running", "waiting_user"}:
                     connection.rollback()
                     return self._planning_record(row), False
@@ -1063,8 +1198,30 @@ class FolderOperationLedger:
             active_elapsed = float(row["active_elapsed_seconds"])
             approved = float(row["approved_wall_time_seconds"])
             extension_count = int(row["extension_count"])
+            current_model_id = (
+                str(row["current_model_id"])
+                if row["current_model_id"] is not None
+                else None
+            )
+            switches = self._decode(row["model_switches_json"]) or {"items": []}
+            switch_items = switches.get("items", [])
+            if not isinstance(switch_items, list):
+                connection.rollback()
+                raise RuntimeError("规划任务的模型切换记录已损坏")
+            if model_id is not None and model_id != current_model_id:
+                switch_items = [
+                    *switch_items,
+                    {
+                        "fromModelId": current_model_id,
+                        "toModelId": model_id,
+                        "reason": (model_switch_reason or "用户明确选择备用模型")[:500],
+                        "createdAt": now,
+                    },
+                ]
+                current_model_id = model_id
+            encoded_switches = self._encode({"items": switch_items})
             added = 0.0
-            if row["status"] == "waiting_user":
+            if row["status"] == "waiting_user" and extension_seconds > 0:
                 if extension_count >= max(maximum_extensions, 0):
                     connection.rollback()
                     raise RuntimeError("规划任务已达到允许的继续次数上限")
@@ -1073,18 +1230,22 @@ class FolderOperationLedger:
                 if added <= 0 or active_elapsed >= hard_wall_time_seconds:
                     connection.rollback()
                     raise RuntimeError("规划任务已达到有效运行总时长上限")
+            elif active_elapsed >= hard_wall_time_seconds:
+                connection.rollback()
+                raise RuntimeError("规划任务已达到有效运行总时长上限")
             connection.execute(
                 """
                 INSERT INTO planning_budget_extensions (
-                    turn_id, request_id, added_seconds, created_at
-                ) VALUES (?, ?, ?, ?)
+                    turn_id, request_id, added_seconds, model_id, created_at
+                ) VALUES (?, ?, ?, ?, ?)
                 """,
-                (turn_id, request_id, added, now),
+                (turn_id, request_id, added, model_id, now),
             )
             changed = connection.execute(
                 """
                 UPDATE planning_tasks
                 SET status = 'running', executor_id = ?, pause_reason = NULL,
+                    error_json = NULL, current_model_id = ?, model_switches_json = ?,
                     approved_wall_time_seconds = approved_wall_time_seconds + ?,
                     extension_count = extension_count + ?, updated_at = ?,
                     revision = revision + 1
@@ -1092,6 +1253,8 @@ class FolderOperationLedger:
                 """,
                 (
                     self.executor_id,
+                    current_model_id,
+                    encoded_switches,
                     added,
                     1 if added > 0 else 0,
                     now,
@@ -1295,3 +1458,351 @@ class FolderOperationLedger:
             ).rowcount
             connection.commit()
         return changed == 1
+
+    def register_office_execution(
+        self,
+        operation_id: str,
+        request_fingerprint: str,
+        *,
+        plan: dict[str, Any],
+        authorization: dict[str, Any],
+        workbook_identity: str,
+    ) -> tuple[OfficeExecutionRecord, bool]:
+        """Register the durable intent before the first supported Office write."""
+
+        encoded_plan = self._encode(plan)
+        encoded_authorization = self._encode(authorization)
+        maximum_size = capability_int("taskRecovery", "maxCheckpointBytes")
+        if len(encoded_plan.encode("utf-8")) > maximum_size:
+            raise ValueError("Office 执行计划超过可持久化容量上限")
+        if len(encoded_authorization.encode("utf-8")) > maximum_size:
+            raise ValueError("Office 执行授权现场超过可持久化容量上限")
+        if not workbook_identity.startswith("url:"):
+            raise ValueError("未保存或无法稳定识别的工作簿不能启用自动断点续跑")
+        now = time.time()
+        owner_token = uuid.uuid4().hex
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM office_executions WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            if row is None:
+                connection.execute(
+                    """
+                    INSERT INTO office_executions (
+                        operation_id, request_fingerprint, plan_json,
+                        authorization_json, workbook_identity, status,
+                        owner_token, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?)
+                    """,
+                    (
+                        operation_id,
+                        request_fingerprint,
+                        encoded_plan,
+                        encoded_authorization,
+                        workbook_identity,
+                        owner_token,
+                        now,
+                        now,
+                    ),
+                )
+                row = connection.execute(
+                    "SELECT * FROM office_executions WHERE operation_id = ?",
+                    (operation_id,),
+                ).fetchone()
+                connection.commit()
+                assert row is not None
+                return self._office_record(row), True
+            connection.commit()
+        record = self._office_record(row)
+        if record.request_fingerprint != request_fingerprint:
+            raise RuntimeError("该 operationId 已用于另一份 Office 执行请求")
+        if record.workbook_identity != workbook_identity:
+            raise RuntimeError("该 Office 执行属于另一个工作簿")
+        return record, False
+
+    def office_execution(self, operation_id: str) -> OfficeExecutionRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM office_executions WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+        return self._office_record(row) if row is not None else None
+
+    def begin_office_action(
+        self,
+        operation_id: str,
+        *,
+        expected_revision: int,
+        owner_token: str,
+        action_index: int,
+        before_snapshot: dict[str, Any],
+    ) -> OfficeExecutionRecord:
+        encoded_snapshot = self._encode(before_snapshot)
+        if len(encoded_snapshot.encode("utf-8")) > capability_int(
+            "taskRecovery", "maxCheckpointBytes"
+        ):
+            raise ValueError("Office 动作写前快照超过容量上限")
+        now = time.time()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            changed = connection.execute(
+                """
+                UPDATE office_executions
+                SET in_flight_action_index = ?, before_snapshot_json = ?,
+                    error_json = NULL, updated_at = ?, revision = revision + 1
+                WHERE operation_id = ? AND revision = ? AND owner_token = ?
+                    AND status = 'running' AND next_action_index = ?
+                    AND in_flight_action_index IS NULL
+                """,
+                (
+                    action_index,
+                    encoded_snapshot,
+                    now,
+                    operation_id,
+                    expected_revision,
+                    owner_token,
+                    action_index,
+                ),
+            ).rowcount
+            if changed != 1:
+                connection.rollback()
+                raise RuntimeError("Office 动作状态已变化，已停止写入")
+            row = connection.execute(
+                "SELECT * FROM office_executions WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            connection.commit()
+        assert row is not None
+        return self._office_record(row)
+
+    def complete_office_action(
+        self,
+        operation_id: str,
+        *,
+        expected_revision: int,
+        owner_token: str,
+        action_index: int,
+        checkpoint: dict[str, Any],
+    ) -> OfficeExecutionRecord:
+        encoded_checkpoint = self._encode(checkpoint)
+        if len(encoded_checkpoint.encode("utf-8")) > capability_int(
+            "taskRecovery", "maxCheckpointBytes"
+        ):
+            raise ValueError("Office 动作检查点超过容量上限")
+        now = time.time()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            changed = connection.execute(
+                """
+                UPDATE office_executions
+                SET next_action_index = ?, in_flight_action_index = NULL,
+                    before_snapshot_json = NULL, checkpoint_json = ?,
+                    error_json = NULL, updated_at = ?, revision = revision + 1
+                WHERE operation_id = ? AND revision = ? AND owner_token = ?
+                    AND status = 'running' AND next_action_index = ?
+                    AND in_flight_action_index = ?
+                """,
+                (
+                    action_index + 1,
+                    encoded_checkpoint,
+                    now,
+                    operation_id,
+                    expected_revision,
+                    owner_token,
+                    action_index,
+                    action_index,
+                ),
+            ).rowcount
+            if changed != 1:
+                connection.rollback()
+                raise RuntimeError("Office 动作回执已过期，写入结果需要核对")
+            row = connection.execute(
+                "SELECT * FROM office_executions WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            connection.commit()
+        assert row is not None
+        return self._office_record(row)
+
+    def suspend_office_execution(
+        self,
+        operation_id: str,
+        *,
+        expected_revision: int,
+        owner_token: str,
+        error: dict[str, Any],
+    ) -> OfficeExecutionRecord:
+        encoded_error = self._encode(error)
+        now = time.time()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            changed = connection.execute(
+                """
+                UPDATE office_executions
+                SET status = CASE
+                        WHEN in_flight_action_index IS NULL THEN 'failed'
+                        ELSE 'needs_reconciliation'
+                    END,
+                    error_json = ?, updated_at = ?, revision = revision + 1
+                WHERE operation_id = ? AND revision = ? AND owner_token = ?
+                    AND status = 'running'
+                """,
+                (
+                    encoded_error,
+                    now,
+                    operation_id,
+                    expected_revision,
+                    owner_token,
+                ),
+            ).rowcount
+            if changed != 1:
+                connection.rollback()
+                raise RuntimeError("Office 执行状态已变化，无法重复挂起")
+            row = connection.execute(
+                "SELECT * FROM office_executions WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            connection.commit()
+        assert row is not None
+        return self._office_record(row)
+
+    def claim_office_resume(
+        self,
+        operation_id: str,
+        *,
+        expected_revision: int,
+    ) -> OfficeExecutionRecord:
+        """Rotate the owner token; an old task pane can no longer commit receipts."""
+
+        now = time.time()
+        owner_token = uuid.uuid4().hex
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            changed = connection.execute(
+                """
+                UPDATE office_executions
+                SET status = 'running', owner_token = ?, error_json = NULL,
+                    updated_at = ?, revision = revision + 1
+                WHERE operation_id = ? AND revision = ?
+                    AND status IN ('running', 'failed', 'needs_reconciliation')
+                    AND in_flight_action_index IS NULL
+                """,
+                (owner_token, now, operation_id, expected_revision),
+            ).rowcount
+            if changed != 1:
+                connection.rollback()
+                raise RuntimeError("Office 任务需要先核对在途动作，或状态已经变化")
+            row = connection.execute(
+                "SELECT * FROM office_executions WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            connection.commit()
+        assert row is not None
+        return self._office_record(row)
+
+    def reconcile_office_action(
+        self,
+        operation_id: str,
+        *,
+        expected_revision: int,
+        action_index: int,
+        outcome: Literal["applied", "not_applied"],
+        checkpoint: dict[str, Any] | None = None,
+    ) -> OfficeExecutionRecord:
+        if outcome == "applied" and checkpoint is None:
+            raise ValueError("补记已应用动作必须提供完整检查点")
+        encoded_checkpoint = self._encode(checkpoint) if checkpoint is not None else None
+        if encoded_checkpoint and len(encoded_checkpoint.encode("utf-8")) > capability_int(
+            "taskRecovery", "maxCheckpointBytes"
+        ):
+            raise ValueError("Office 核对检查点超过容量上限")
+        now = time.time()
+        owner_token = uuid.uuid4().hex
+        next_action_index = action_index + 1 if outcome == "applied" else action_index
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            changed = connection.execute(
+                """
+                UPDATE office_executions
+                SET status = 'running', next_action_index = ?,
+                    in_flight_action_index = NULL, before_snapshot_json = NULL,
+                    checkpoint_json = COALESCE(?, checkpoint_json),
+                    error_json = NULL, owner_token = ?, updated_at = ?,
+                    revision = revision + 1
+                WHERE operation_id = ? AND revision = ?
+                    AND status IN ('running', 'needs_reconciliation')
+                    AND next_action_index = ? AND in_flight_action_index = ?
+                """,
+                (
+                    next_action_index,
+                    encoded_checkpoint,
+                    owner_token,
+                    now,
+                    operation_id,
+                    expected_revision,
+                    action_index,
+                    action_index,
+                ),
+            ).rowcount
+            if changed != 1:
+                connection.rollback()
+                raise RuntimeError("Office 在途动作状态已变化，无法补记")
+            row = connection.execute(
+                "SELECT * FROM office_executions WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            connection.commit()
+        assert row is not None
+        return self._office_record(row)
+
+    def finish_office_execution(
+        self,
+        operation_id: str,
+        *,
+        expected_revision: int,
+        owner_token: str,
+        result: dict[str, Any],
+    ) -> OfficeExecutionRecord:
+        encoded_result = self._encode(result)
+        now = time.time()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT plan_json FROM office_executions WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                raise RuntimeError("未找到 Office 执行记录")
+            plan = self._decode(str(row["plan_json"])) or {}
+            action_count = len(plan.get("actions", []))
+            changed = connection.execute(
+                """
+                UPDATE office_executions
+                SET status = 'completed', result_json = ?, error_json = NULL,
+                    updated_at = ?, revision = revision + 1
+                WHERE operation_id = ? AND revision = ? AND owner_token = ?
+                    AND status = 'running' AND next_action_index = ?
+                    AND in_flight_action_index IS NULL
+                """,
+                (
+                    encoded_result,
+                    now,
+                    operation_id,
+                    expected_revision,
+                    owner_token,
+                    action_count,
+                ),
+            ).rowcount
+            if changed != 1:
+                connection.rollback()
+                raise RuntimeError("Office 任务尚未完成全部动作或完成回执已过期")
+            completed = connection.execute(
+                "SELECT * FROM office_executions WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            connection.commit()
+        assert completed is not None
+        return self._office_record(completed)

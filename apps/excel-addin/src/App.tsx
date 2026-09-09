@@ -9,7 +9,11 @@ import {
 } from "react";
 import {
   checkIntent,
+  claimOfficeExecutionResume,
+  completeOfficeAction,
   continuePlanningTask,
+  finishOfficeExecution,
+  getOfficeExecutionStatus,
   getPlanningTaskStatus,
   streamAssistantResponse,
   createFolderSnapshot,
@@ -18,10 +22,14 @@ import {
   generateFormula,
   getFolderExecutionStatus,
   isLocalServiceConnectionError,
+  reconcileOfficeActionReceipt,
+  registerOfficeExecution,
   refreshFolder,
   resumeFolderExecution,
   scanFolderByPath,
   selectFolder,
+  startOfficeAction,
+  suspendOfficeExecution,
 } from "./api";
 import type {
   AnalysisPlan,
@@ -57,6 +65,7 @@ import {
   captureWorkbookSourceFingerprint,
   captureWorkbookStructure,
   dataEpochsChanged,
+  currentOfficeWorkbookIdentity,
   executePlan,
   isExplicitA1Address,
   isEBSystemSheet,
@@ -64,6 +73,8 @@ import {
   readSelectedRange,
   previewFormulaFirstCell,
   PlanExecutionError,
+  officeRecoverySupport,
+  reconcileOfficeRangeAction,
   StaleSourceError,
   snapshotDataEpochs,
   toolSchemaFingerprintForSnapshot,
@@ -166,6 +177,12 @@ import {
   savePendingFolderOperation,
   type PendingFolderOperation
 } from "./folderOperationRecovery";
+import {
+  clearPendingOfficeExecution,
+  loadPendingOfficeExecution,
+  savePendingOfficeExecution,
+  type PendingOfficeExecution
+} from "./officeOperationRecovery";
 
 export type { ActivityLog, ActivityProgress } from "./hooks/useActivityProgress";
 
@@ -1114,6 +1131,7 @@ export default function App() {
   // sendMessage 起点记录的原始用户文本，写缓存时作为一级 prompt key。
   const rawPromptRef = useRef("");
   const folderRecoveryAttachStartedRef = useRef(false);
+  const officeRecoveryAttachStartedRef = useRef(false);
 
   // 一级斜杠命令定义
   const slashCommands: SlashCommand[] = useMemo(
@@ -1658,6 +1676,66 @@ export default function App() {
     void attach();
   }, []);
 
+  useEffect(() => {
+    if (officeRecoveryAttachStartedRef.current) return;
+    officeRecoveryAttachStartedRef.current = true;
+    const pending = loadPendingOfficeExecution();
+    if (!pending) return;
+
+    const attach = async () => {
+      let persisted;
+      try {
+        persisted = await getOfficeExecutionStatus(pending.operationId);
+        markServerOnline();
+      } catch (reason) {
+        if (isLocalServiceConnectionError(reason)) {
+          markServerOffline();
+          return;
+        }
+        appendOfficeExecutionNotice(
+          pending,
+          `无法找回上次 Office 写入任务：${
+            reason instanceof Error ? reason.message : String(reason)
+          }。没有创建新执行，也没有再次写入。`
+        );
+        return;
+      }
+
+      if (persisted.status === "completed") {
+        if (persisted.result?.undoSnapshot) {
+          pushUndoSnapshot(persisted.result.undoSnapshot);
+        }
+        appendOfficeExecutionNotice(
+          pending,
+          "已找回上次 Office 写入任务的完成回执；不会重复执行已经完成的动作。"
+        );
+        clearPendingOfficeExecution(pending.operationId);
+        return;
+      }
+
+      const currentIdentity = currentOfficeWorkbookIdentity();
+      const identityMatches = currentIdentity === persisted.workbookIdentity;
+      const reason = !currentIdentity
+        ? "当前工作簿尚未保存，无法确认它就是原工作簿。请先保存并重新打开原文件。"
+        : !identityMatches
+          ? "当前不是产生该断点的工作簿。请打开原工作簿后再继续。"
+          : persisted.requiresReconciliation
+            ? "上次停止时有一个动作可能已经写入。继续前会先读取目标范围并核对，不会盲目重放。"
+            : "已完成动作会跳过，将从服务端保存的下一步继续。";
+      appendOfficeExecutionNotice(pending, reason, {
+        operationId: pending.operationId,
+        expectedRevision: persisted.revision,
+        status: identityMatches ? "pending" : "failed",
+        requiresReconciliation: persisted.requiresReconciliation,
+        nextActionIndex: persisted.nextActionIndex,
+        totalActions: persisted.plan.actions.length,
+        reason
+      });
+    };
+
+    void attach();
+  }, []);
+
   function appendMessage(
     message: Omit<ChatMessage, "id" | "createdAt">
   ): string {
@@ -1822,6 +1900,70 @@ export default function App() {
     });
   }
 
+  function appendOfficeExecutionNotice(
+    pending: Pick<
+      PendingOfficeExecution,
+      "conversationId" | "operationId" | "activityMessageId"
+    >,
+    text: string,
+    officeResume?: ChatMessage["officeResume"]
+  ): void {
+    const createdAt = new Date().toISOString();
+    setChatHistory((current) => {
+      const requestedConversationExists = current.conversations.some(
+        (conversation) => conversation.id === pending.conversationId
+      );
+      const targetConversationId = requestedConversationExists
+        ? pending.conversationId
+        : current.activeConversationId;
+      return {
+        ...current,
+        conversations: current.conversations.map((conversation) => {
+          if (conversation.id !== targetConversationId) return conversation;
+          const existingIndex = conversation.messages.findIndex(
+            (message) => message.officeExecutionId === pending.operationId
+          );
+          if (existingIndex >= 0) {
+            const nextMessages = conversation.messages.map((message, index) =>
+              index === existingIndex
+                ? { ...message, text, officeResume, createdAt }
+                : message
+            );
+            return {
+              ...conversation,
+              title: conversationTitle(nextMessages),
+              messages: nextMessages,
+              updatedAt: createdAt
+            };
+          }
+          const existingMessages = conversation.messages.filter(
+            (message) =>
+              message.id !== pending.activityMessageId ||
+              !message.activityPending ||
+              Boolean(message.activityLog)
+          );
+          const nextMessages = [
+            ...existingMessages,
+            {
+              id: messageId(),
+              role: "system" as const,
+              text,
+              officeExecutionId: pending.operationId,
+              officeResume,
+              createdAt
+            }
+          ].slice(-MAX_MESSAGES_PER_CONVERSATION);
+          return {
+            ...conversation,
+            title: conversationTitle(nextMessages),
+            messages: nextMessages,
+            updatedAt: createdAt
+          };
+        })
+      };
+    });
+  }
+
   function updateFolderResumeMessage(
     messageIdValue: string,
     update: (message: ChatMessage) => ChatMessage
@@ -1842,6 +1984,175 @@ export default function App() {
         };
       })
     }));
+  }
+
+  async function resumeInterruptedOfficeExecution(message: ChatMessage): Promise<void> {
+    const resume = message.officeResume;
+    const pending = loadPendingOfficeExecution();
+    if (!resume || !pending || pending.operationId !== resume.operationId) {
+      updateFolderResumeMessage(message.id, (current) => ({
+        ...current,
+        text: "本机没有找到这项 Office 任务的挂接记录，不能安全续跑。",
+        officeResume: current.officeResume
+          ? { ...current.officeResume, status: "failed" }
+          : undefined
+      }));
+      return;
+    }
+    updateFolderResumeMessage(message.id, (current) => ({
+      ...current,
+      officeResume: current.officeResume
+        ? { ...current.officeResume, status: "resuming" }
+        : undefined
+    }));
+    beginActivity(
+      "正在核对 Office 写入断点",
+      "先确认工作簿身份和在途动作，再从下一步继续。",
+      {
+        operationId: resume.operationId,
+        phase: "preflight",
+        stepId: "execution.office.resume"
+      }
+    );
+    setStatus("executing");
+    let state: Awaited<ReturnType<typeof getOfficeExecutionStatus>> | null = null;
+    try {
+      state = await getOfficeExecutionStatus(resume.operationId);
+      const currentIdentity = currentOfficeWorkbookIdentity();
+      if (!currentIdentity || currentIdentity !== state.workbookIdentity) {
+        throw new Error(
+          currentIdentity
+            ? "当前不是产生该断点的工作簿，已停止续跑。"
+            : "当前工作簿尚未保存，无法确认身份，已停止续跑。"
+        );
+      }
+      if (state.inFlightActionIndex !== null && state.inFlightActionIndex !== undefined) {
+        if (!state.beforeSnapshot) {
+          throw new Error("在途动作缺少写前快照，只能人工核对，不能自动续跑。");
+        }
+        const reconciliation = await reconcileOfficeRangeAction({
+          plan: state.plan,
+          operationId: state.operationId,
+          workbookIdentity: state.workbookIdentity,
+          actionIndex: state.inFlightActionIndex,
+          before: state.beforeSnapshot,
+          previous: state.checkpoint
+        });
+        if (reconciliation.outcome === "unknown") {
+          throw new Error(
+            "目标范围既不匹配执行前状态，也不匹配预期写入结果；可能存在部分写入或后续人工修改，已保持挂起。"
+          );
+        }
+        state = await reconcileOfficeActionReceipt(state.operationId, {
+          expectedRevision: state.revision,
+          actionIndex: state.inFlightActionIndex,
+          outcome: reconciliation.outcome,
+          ...(reconciliation.checkpoint
+            ? { checkpoint: reconciliation.checkpoint }
+            : {})
+        });
+      } else {
+        state = await claimOfficeExecutionResume(
+          state.operationId,
+          state.revision
+        );
+      }
+      if (!state.ownerToken) {
+        throw new Error("服务端没有授予本次 Office 续跑写入权。");
+      }
+
+      setActivePlanId(state.plan.id);
+      const result = await executePlan(state.plan, {
+        authorizedSheetNames: state.authorizedSheetNames,
+        allowedExternalFiles: new Set(state.allowedExternalFiles),
+        operationId: state.operationId,
+        onProgress: applyProgressEvent,
+        recovery: {
+          startActionIndex: state.nextActionIndex,
+          undoSnapshot: state.checkpoint,
+          onBeforeAction: async ({ actionIndex, beforeSnapshot }) => {
+            const currentState = state;
+            if (!currentState?.ownerToken) throw new Error("Office 写入权已经失效");
+            state = await startOfficeAction(currentState.operationId, {
+              expectedRevision: currentState.revision,
+              ownerToken: currentState.ownerToken,
+              actionIndex,
+              beforeSnapshot
+            });
+          },
+          onActionCompleted: async ({ actionIndex, checkpoint }) => {
+            const currentState = state;
+            if (!currentState?.ownerToken) throw new Error("Office 写入权已经失效");
+            state = await completeOfficeAction(currentState.operationId, {
+              expectedRevision: currentState.revision,
+              ownerToken: currentState.ownerToken,
+              actionIndex,
+              checkpoint
+            });
+          }
+        }
+      });
+      if (!state.ownerToken) throw new Error("Office 写入权已经失效");
+      state = await finishOfficeExecution(state.operationId, {
+        expectedRevision: state.revision,
+        ownerToken: state.ownerToken,
+        result
+      });
+      pushUndoSnapshot(result.undoSnapshot ?? null);
+      if (result.verification.status === "verified") {
+        markPlanVerified(state.plan.id);
+      }
+      const completedPlanId = state.plan.id;
+      clearPendingOfficeExecution(state.operationId);
+      updateFolderResumeMessage(message.id, (current) => ({
+        ...current,
+        text: `Office 任务已从第 ${resume.nextActionIndex + 1} 步继续并完成；已提交每一步的写入回执。`,
+        verification: result.verification,
+        executedPlanId: completedPlanId,
+        executedExecutionId: result.undoSnapshot?.executionId,
+        officeResume: undefined
+      }));
+      await scan();
+      finishActivity(
+        result.verification.status === "verified" ? "completed" : "warning",
+        "Office 断点任务已完成"
+      );
+    } catch (reason) {
+      const detail = reason instanceof Error ? reason.message : String(reason);
+      if (state?.ownerToken && state.status === "running") {
+        try {
+          state = await suspendOfficeExecution(state.operationId, {
+            expectedRevision: state.revision,
+            ownerToken: state.ownerToken,
+            code: "OFFICE_RESUME_INTERRUPTED",
+            message: detail
+          });
+        } catch {
+          // 若回执响应丢失，旧 revision 可能已推进；保留 operationId，下一次先查权威状态。
+        }
+      }
+      updateFolderResumeMessage(message.id, (current) => ({
+        ...current,
+        text: detail,
+        officeResume: current.officeResume
+          ? {
+              ...current.officeResume,
+              expectedRevision: state?.revision ?? current.officeResume.expectedRevision,
+              requiresReconciliation:
+                state?.inFlightActionIndex !== null &&
+                state?.inFlightActionIndex !== undefined,
+              nextActionIndex:
+                state?.nextActionIndex ?? current.officeResume.nextActionIndex,
+              reason: detail,
+              status: "failed"
+            }
+          : undefined
+      }));
+      finishActivity("warning", "Office 任务仍需核对");
+    } finally {
+      setActivePlanId(null);
+      setStatus("idle");
+    }
   }
 
   async function resumeInterruptedFolderOperation(message: ChatMessage): Promise<void> {
@@ -1948,6 +2259,14 @@ export default function App() {
           reason: response.reason,
           extensionSeconds: response.extensionSeconds,
           activeElapsedSeconds: response.activeElapsedSeconds,
+          pauseType: response.pauseType,
+          currentModelId: response.currentModelId,
+          modelSwitchCount: response.modelSwitchCount,
+          canSwitchModel: response.canSwitchModel,
+          availableModelConnections: response.availableModelConnections,
+          selectedFallbackModelId:
+            baseline.selectedFallbackModelId ??
+            response.availableModelConnections[0]?.catalogModelId,
           requestId: undefined,
           sourceFingerprint:
             response.sourceFingerprint ?? baseline.sourceFingerprint,
@@ -1988,7 +2307,10 @@ export default function App() {
     return "completed";
   }
 
-  async function resumePlanningTaskFromMessage(message: ChatMessage): Promise<void> {
+  async function resumePlanningTaskFromMessage(
+    message: ChatMessage,
+    fallbackModelId?: string
+  ): Promise<void> {
     const resume = message.planningResume;
     if (!resume || busy) return;
     const requestId = resume.requestId ?? messageId();
@@ -2002,8 +2324,10 @@ export default function App() {
         : undefined
     }));
     beginActivity(
-      "正在从保存的进度继续",
-      "正在核对任务状态和原始数据范围，然后从下一个安全边界继续。"
+      fallbackModelId ? "正在切换备用模型并继续" : "正在从保存的进度继续",
+      fallbackModelId
+        ? "正在核对备用连接能力、任务范围和已保存结果，然后从完整断点继续。"
+        : "正在核对任务状态和原始数据范围，然后从下一个安全边界继续。"
     );
     try {
       const taskStatus = await getPlanningTaskStatus(
@@ -2084,6 +2408,14 @@ export default function App() {
         expectedRevision: taskStatus.revision,
         lastSequence: taskStatus.lastSequence,
         requestId,
+        pauseType: taskStatus.pauseType,
+        currentModelId: taskStatus.currentModelId,
+        modelSwitchCount: taskStatus.modelSwitchCount,
+        canSwitchModel: taskStatus.canSwitchModel,
+        availableModelConnections: taskStatus.availableModelConnections,
+        selectedFallbackModelId:
+          resume.selectedFallbackModelId ??
+          taskStatus.availableModelConnections[0]?.catalogModelId,
         sourceFingerprint,
         sourceFingerprintSheets
       };
@@ -2096,7 +2428,10 @@ export default function App() {
           turnId: resume.turnId,
           expectedRevision: taskStatus.revision,
           requestId,
-          afterSequence: resume.lastSequence
+          afterSequence: resume.lastSequence,
+          ...(fallbackModelId
+            ? { modelId: fallbackModelId, confirmModelSwitch: true as const }
+            : {})
         },
         {
           signal: turnController.signal,
@@ -2889,6 +3224,13 @@ export default function App() {
             reason: response.reason,
             extensionSeconds: response.extensionSeconds,
             activeElapsedSeconds: response.activeElapsedSeconds,
+            pauseType: response.pauseType,
+            currentModelId: response.currentModelId,
+            modelSwitchCount: response.modelSwitchCount,
+            canSwitchModel: response.canSwitchModel,
+            availableModelConnections: response.availableModelConnections,
+            selectedFallbackModelId:
+              response.availableModelConnections[0]?.catalogModelId,
             sourceFingerprint:
               response.sourceFingerprint ?? requestWorkbook.sourceFingerprint,
             sourceFingerprintSheets:
@@ -4403,6 +4745,13 @@ export default function App() {
     }
 
     const operationId = `execution-${messageId()}`;
+    const authorizedSheetNames = forceLocal
+      ? [workbook!.activeWorksheet]
+      : selectedNamesFor(workbook!);
+    const recoverySupport = officeRecoverySupport(plan);
+    const workbookIdentity = currentOfficeWorkbookIdentity();
+    let officeState: Awaited<ReturnType<typeof registerOfficeExecution>> | null = null;
+    let recoveryLimitation: string | null = null;
     setActivePlanId(plan.id);
     beginActivity("正在执行操作计划", plan.summary, {
       operationId,
@@ -4414,15 +4763,83 @@ export default function App() {
       "completed";
     let workbookActivitySummary: string | undefined;
     try {
+      if (recoverySupport.supported) {
+        if (!workbookIdentity) {
+          recoveryLimitation =
+            "当前工作簿尚未保存，本次仍按普通模式执行，但不能在关闭任务窗格后自动续跑。";
+        } else {
+          officeState = await registerOfficeExecution({
+            operationId,
+            plan,
+            authorizedSheetNames,
+            allowedExternalFiles: [...(allowedExternalFiles ?? [])],
+            workbookIdentity
+          });
+          if (!officeState.ownerToken) {
+            throw new Error("服务端没有授予本次 Office 写入权，已停止执行。");
+          }
+          const pendingSaved = savePendingOfficeExecution({
+            schemaVersion: 1,
+            operationId,
+            conversationId: chatHistory.activeConversationId,
+            activityMessageId:
+              activeActivityMessageIdRef.current ?? `activity-${operationId}`,
+            workbookIdentity,
+            createdAt: new Date().toISOString()
+          });
+          if (!pendingSaved) {
+            throw new Error("无法保存 Office 任务挂接索引，已停止执行以避免丢失恢复入口。");
+          }
+        }
+      } else {
+        recoveryLimitation = `${recoverySupport.reason ?? "该计划包含复杂对象操作"}；本次不承诺跨重启自动续跑。`;
+      }
       const result = await executePlan(plan, {
-        authorizedSheetNames: forceLocal
-          ? [workbook!.activeWorksheet]
-          : selectedNamesFor(workbook!),
+        authorizedSheetNames,
         allowedExternalFiles,
         acknowledgeStaleSource,
         operationId,
-        onProgress: applyProgressEvent
+        onProgress: applyProgressEvent,
+        ...(officeState
+          ? {
+              recovery: {
+                startActionIndex: officeState.nextActionIndex,
+                undoSnapshot: officeState.checkpoint,
+                onBeforeAction: async ({ actionIndex, beforeSnapshot }) => {
+                  if (!officeState?.ownerToken) {
+                    throw new Error("Office 写入权已经失效");
+                  }
+                  officeState = await startOfficeAction(operationId, {
+                    expectedRevision: officeState.revision,
+                    ownerToken: officeState.ownerToken,
+                    actionIndex,
+                    beforeSnapshot
+                  });
+                },
+                onActionCompleted: async ({ actionIndex, checkpoint }) => {
+                  if (!officeState?.ownerToken) {
+                    throw new Error("Office 写入权已经失效");
+                  }
+                  officeState = await completeOfficeAction(operationId, {
+                    expectedRevision: officeState.revision,
+                    ownerToken: officeState.ownerToken,
+                    actionIndex,
+                    checkpoint
+                  });
+                }
+              }
+            }
+          : {})
       });
+      if (officeState) {
+        if (!officeState.ownerToken) throw new Error("Office 写入权已经失效");
+        officeState = await finishOfficeExecution(operationId, {
+          expectedRevision: officeState.revision,
+          ownerToken: officeState.ownerToken,
+          result
+        });
+        clearPendingOfficeExecution(operationId);
+      }
       recordDiagnosticEvent({
         timestamp: new Date().toISOString(),
         phase: "execution",
@@ -4446,7 +4863,7 @@ export default function App() {
               ? `已记录 ${result.undoSnapshot.ranges.length} 项本次执行撤销数据，并已核对执行后状态。`
               : "已保留本次执行捕获的数据，但执行后状态未能完整核对，暂不能直接撤销。"
             : ""
-        }原始工作表没有被删除或清空。`,
+        }${recoveryLimitation ? `${recoveryLimitation}` : ""}原始工作表没有被删除或清空。`,
         verification: result.verification,
         executedPlanId: plan.id,
         executedExecutionId: result.undoSnapshot?.executionId
@@ -4458,6 +4875,21 @@ export default function App() {
       await scan();
       return true;
     } catch (reason) {
+      if (officeState?.ownerToken && officeState.status === "running") {
+        try {
+          officeState = await suspendOfficeExecution(operationId, {
+            expectedRevision: officeState.revision,
+            ownerToken: officeState.ownerToken,
+            code: "OFFICE_EXECUTION_INTERRUPTED",
+            message: reason instanceof Error ? reason.message : String(reason)
+          });
+          if (!officeState.requiresReconciliation && officeState.nextActionIndex === 0) {
+            clearPendingOfficeExecution(operationId);
+          }
+        } catch {
+          // 动作完成回执可能已提交但响应丢失；保留 operationId，重载后查询权威状态。
+        }
+      }
       if (reason instanceof StaleSourceError) {
         workbookActivityStatus = "warning";
         workbookActivitySummary = reason.message;
@@ -4501,7 +4933,23 @@ export default function App() {
             notRun > 0 ? `其余 ${notRun} 步未执行。` : ""
           }`,
           executedPlanId: reason.undoSnapshot ? plan.id : undefined,
-          executedExecutionId: reason.undoSnapshot?.executionId
+          executedExecutionId: reason.undoSnapshot?.executionId,
+          officeExecutionId: officeState ? operationId : undefined,
+          officeResume:
+            officeState &&
+            (officeState.requiresReconciliation || officeState.nextActionIndex > 0)
+              ? {
+                  operationId,
+                  expectedRevision: officeState.revision,
+                  status: "pending",
+                  requiresReconciliation: officeState.requiresReconciliation,
+                  nextActionIndex: officeState.nextActionIndex,
+                  totalActions: plan.actions.length,
+                  reason:
+                    officeState.error?.message ??
+                    "执行现场已保存；继续前会先核对真实单元格状态。"
+                }
+              : undefined
         });
         return false;
       }
@@ -4515,7 +4963,23 @@ export default function App() {
       }
       appendMessage({
         role: "system",
-        text: reason instanceof Error ? reason.message : "执行计划失败"
+        text: reason instanceof Error ? reason.message : "执行计划失败",
+        officeExecutionId: officeState ? operationId : undefined,
+        officeResume:
+          officeState &&
+          (officeState.requiresReconciliation || officeState.nextActionIndex > 0)
+            ? {
+                operationId,
+                expectedRevision: officeState.revision,
+                status: "pending",
+                requiresReconciliation: officeState.requiresReconciliation,
+                nextActionIndex: officeState.nextActionIndex,
+                totalActions: plan.actions.length,
+                reason:
+                  officeState.error?.message ??
+                  "写入回执尚未完整确认，继续前会先核对真实单元格状态。"
+              }
+            : undefined
       });
       return false;
     } finally {
@@ -7194,6 +7658,39 @@ export default function App() {
                   </div>
                 </section>
               )}
+              {message.officeResume && (
+                <section
+                  className="folder-resume-card office-resume-card"
+                  aria-label="继续已保存的 Office 写入任务"
+                >
+                  <div className="folder-resume-copy">
+                    <strong>
+                      {message.officeResume.requiresReconciliation
+                        ? "需要先核对一个在途写入"
+                        : "可从 Office 动作断点继续"}
+                    </strong>
+                    <span>{message.officeResume.reason}</span>
+                    <span>
+                      已确认到第 {message.officeResume.nextActionIndex} / {message.officeResume.totalActions} 步；
+                      只支持已保存工作簿中的受控区域写入。
+                    </span>
+                  </div>
+                  <div className="folder-resume-actions">
+                    <button
+                      type="button"
+                      className="primary-button"
+                      disabled={busy || message.officeResume.status === "resuming"}
+                      onClick={() => void resumeInterruptedOfficeExecution(message)}
+                    >
+                      {message.officeResume.status === "resuming"
+                        ? "正在核对..."
+                        : message.officeResume.requiresReconciliation
+                          ? "核对并继续"
+                          : "继续剩余步骤"}
+                    </button>
+                  </div>
+                </section>
+              )}
               {message.planningResume && (
                 <section
                   className="folder-resume-card planning-resume-card"
@@ -7203,13 +7700,19 @@ export default function App() {
                     <strong>
                       {message.planningResume.status === "resuming"
                         ? "正在从保存的进度继续"
-                        : "进度已保存"}
+                        : message.planningResume.pauseType === "model_error"
+                          ? "模型连接中断，任务现场已保存"
+                          : "进度已保存"}
                     </strong>
                     <span>{message.planningResume.reason}</span>
                     <span>
                       已完成约 {Math.round(message.planningResume.activeElapsedSeconds)} 秒有效处理；
                       继续时不会重做已经提交的工具结果。
                     </span>
+                    {message.planningResume.pauseType === "model_error" &&
+                      message.planningResume.currentModelId && (
+                        <span>当前连接：{message.planningResume.currentModelId}</span>
+                      )}
                   </div>
                   <div className="folder-resume-actions">
                     <button
@@ -7222,12 +7725,74 @@ export default function App() {
                     >
                       {message.planningResume.status === "resuming"
                         ? "正在继续..."
-                        : message.planningResume.extensionSeconds > 0
+                        : message.planningResume.pauseType === "model_error"
+                          ? "重试当前模型"
+                          : message.planningResume.extensionSeconds > 0
                           ? `继续处理（约 ${Math.round(
                               message.planningResume.extensionSeconds
                             )} 秒）`
                           : "核对任务状态"}
                     </button>
+                    {message.planningResume.pauseType === "model_error" &&
+                      message.planningResume.canSwitchModel &&
+                      (message.planningResume.availableModelConnections?.length ?? 0) > 0 && (
+                        <>
+                          <label className="planning-fallback-field">
+                            <span>备用模型</span>
+                            <select
+                              value={
+                                message.planningResume.selectedFallbackModelId ??
+                                message.planningResume.availableModelConnections?.[0]
+                                  ?.catalogModelId ??
+                                ""
+                              }
+                              disabled={
+                                busy || message.planningResume.status === "resuming"
+                              }
+                              onChange={(event) =>
+                                updateFolderResumeMessage(message.id, (current) => ({
+                                  ...current,
+                                  planningResume: current.planningResume
+                                    ? {
+                                        ...current.planningResume,
+                                        selectedFallbackModelId: event.target.value,
+                                        requestId: undefined
+                                      }
+                                    : undefined
+                                }))
+                              }
+                            >
+                              {message.planningResume.availableModelConnections?.map(
+                                (connection) => (
+                                  <option
+                                    key={connection.catalogModelId}
+                                    value={connection.catalogModelId}
+                                  >
+                                    {connection.label} · {connection.modelId}
+                                  </option>
+                                )
+                              )}
+                            </select>
+                          </label>
+                          <button
+                            type="button"
+                            className="secondary-button"
+                            disabled={
+                              busy ||
+                              message.planningResume.status === "resuming" ||
+                              !message.planningResume.selectedFallbackModelId
+                            }
+                            onClick={() =>
+                              void resumePlanningTaskFromMessage(
+                                message,
+                                message.planningResume?.selectedFallbackModelId
+                              )
+                            }
+                          >
+                            使用备用模型继续
+                          </button>
+                        </>
+                      )}
                   </div>
                 </section>
               )}

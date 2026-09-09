@@ -1,11 +1,14 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  appendOfficeRangeCheckpoint,
+  classifyOfficeActionState,
   dataEpochsChanged,
   executeAction,
   incompleteActionResults,
   matrixVerificationCriteria,
   missingSchemaRequirements,
   planLiveness,
+  officeRecoverySupport,
   preflightPlanActions,
   snapshotDataEpochs,
   sourceFingerprintForSnapshot,
@@ -25,6 +28,119 @@ import type {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+});
+
+describe("Office action checkpoint recovery", () => {
+  const before = {
+    actionIndex: 0,
+    sheet: "Sheet1",
+    range: "A1",
+    formulas: [[null]],
+    numberFormat: [["General"]],
+    fillColor: "#FFFFFF",
+    fontBold: false,
+    fontColor: "#000000",
+    format: null
+  };
+  const baseObserved = {
+    formulas: [[null]],
+    numberFormat: [["General"]],
+    fillColor: "#FFFFFF",
+    fontBold: false,
+    fontColor: "#000000"
+  };
+
+  it("distinguishes an applied write, an untouched range and an unknown conflict", () => {
+    const action: ExcelAction = {
+      type: "writeValues",
+      sheet: "Sheet1",
+      range: "A1",
+      values: [["done"]]
+    };
+    expect(
+      classifyOfficeActionState(action, before, {
+        ...baseObserved,
+        formulas: [["done"]]
+      })
+    ).toBe("applied");
+    expect(classifyOfficeActionState(action, before, baseObserved)).toBe(
+      "not_applied"
+    );
+    expect(
+      classifyOfficeActionState(action, before, {
+        ...baseObserved,
+        formulas: [["manual edit"]]
+      })
+    ).toBe("unknown");
+  });
+
+  it("limits automatic resume to independently verifiable range actions", () => {
+    const supported: AnalysisPlan = {
+      id: "plan-1",
+      title: "write",
+      summary: "write",
+      assumptions: [],
+      warnings: [],
+      actions: [
+        {
+          type: "setFill",
+          sheet: "Sheet1",
+          range: "A1",
+          color: "#00FF00"
+        }
+      ]
+    };
+    expect(officeRecoverySupport(supported).supported).toBe(true);
+    expect(
+      officeRecoverySupport({
+        ...supported,
+        actions: [{ type: "deleteWorksheet", sheet: "Sheet1" }]
+      }).supported
+    ).toBe(false);
+    expect(
+      officeRecoverySupport({
+        ...supported,
+        actions: [
+          {
+            type: "writeFormulas",
+            sheet: "Sheet1",
+            range: "A1:A2",
+            formulas: [["=1"], ["=1"]],
+            formulaR1C1: "=RC[-1]"
+          }
+        ]
+      }).supported
+    ).toBe(false);
+  });
+
+  it("builds a cumulative, workbook-bound undo checkpoint", () => {
+    const plan: AnalysisPlan = {
+      id: "plan-1",
+      title: "write",
+      summary: "write",
+      assumptions: [],
+      warnings: [],
+      actions: [
+        {
+          type: "writeValues",
+          sheet: "Sheet1",
+          range: "A1",
+          values: [["done"]]
+        }
+      ]
+    };
+    const checkpoint = appendOfficeRangeCheckpoint({
+      plan,
+      operationId: "execution-1",
+      workbookIdentity: "url:c:/work/report.xlsx",
+      before,
+      actionIndex: 0,
+      postFingerprint: "fnv1a32:12345678"
+    });
+    expect(checkpoint.coverage).toBe("full");
+    expect(checkpoint.workbookIdentity).toBe("url:c:/work/report.xlsx");
+    expect(checkpoint.ranges[0].postFingerprint).toBe("fnv1a32:12345678");
+  });
 });
 
 describe("safe workbook undo", () => {

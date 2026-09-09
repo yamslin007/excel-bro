@@ -80,6 +80,14 @@ from .models import (
     ManagedFolderRecoveryDirectoriesResponse,
     ManagedFolderRecoveryDirectory,
     ModelSettingsResponse,
+    OfficeActionCompleteRequest,
+    OfficeActionReconcileRequest,
+    OfficeActionStartRequest,
+    OfficeExecutionFinishRequest,
+    OfficeExecutionRegisterRequest,
+    OfficeExecutionResumeRequest,
+    OfficeExecutionStateResponse,
+    OfficeExecutionSuspendRequest,
     PlanRequest,
     PlanningContinueRequest,
     PlanValidateRequest,
@@ -118,6 +126,7 @@ from .task_ledger import (
     FolderOperationLedger,
     FolderOperationRecord,
     ManagedDirectoryRecord,
+    OfficeExecutionRecord,
     PlanningTaskRecord,
 )
 from .excel_agent import AgentBudgetPause
@@ -1081,6 +1090,83 @@ def _planning_request_fingerprint(request: PlanRequest) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+_OFFICE_RECOVERABLE_ACTION_TYPES = {
+    "writeValues",
+    "writeFormulas",
+    "setFill",
+    "setFont",
+    "setNumberFormat",
+}
+
+
+def _office_request_fingerprint(request: OfficeExecutionRegisterRequest) -> str:
+    payload = request.model_dump(mode="json", exclude={"operationId", "confirmed"})
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_office_recovery_plan(request: OfficeExecutionRegisterRequest) -> None:
+    authorized = {name.casefold() for name in request.authorizedSheetNames}
+    source_sheets = {name.casefold() for name in request.plan.sourceFingerprintSheets}
+    for index, action in enumerate(request.plan.actions):
+        if action.type not in _OFFICE_RECOVERABLE_ACTION_TYPES:
+            raise service_error(
+                422,
+                "OFFICE_RECOVERY_UNSUPPORTED_ACTION",
+                f"第 {index + 1} 步 {action.type} 暂不支持跨重启自动续跑。该计划仍可按普通模式执行，但不会声称能够断点恢复。",
+                retryable=False,
+            )
+        if action.sheet.casefold() not in authorized:
+            raise service_error(
+                403,
+                "OFFICE_RECOVERY_SCOPE_MISMATCH",
+                f"第 {index + 1} 步目标工作表「{action.sheet}」不在本次授权范围内。",
+                retryable=False,
+            )
+        if action.sheet.casefold() in source_sheets:
+            raise service_error(
+                422,
+                "OFFICE_RECOVERY_SOURCE_TARGET_OVERLAP",
+                f"第 {index + 1} 步会修改来源工作表，暂不能安全区分任务自身修改与恢复期间的外部修改。",
+                retryable=False,
+            )
+        if action.type == "writeFormulas" and action.formulaR1C1:
+            raise service_error(
+                422,
+                "OFFICE_RECOVERY_UNSUPPORTED_ACTION",
+                "R1C1 铺满公式暂不支持跨重启效果核对。",
+                retryable=False,
+            )
+
+
+def _office_state_payload(
+    record: OfficeExecutionRecord, *, include_owner: bool = False
+) -> OfficeExecutionStateResponse:
+    authorized = record.authorization.get("authorizedSheetNames", [])
+    return OfficeExecutionStateResponse(
+        operationId=record.operation_id,
+        status=record.status,
+        revision=record.revision,
+        workbookIdentity=record.workbook_identity,
+        plan=AnalysisPlan.model_validate(record.plan),
+        authorizedSheetNames=[str(value) for value in authorized],
+        allowedExternalFiles=[
+            str(value) for value in record.authorization.get("allowedExternalFiles", [])
+        ],
+        nextActionIndex=record.next_action_index,
+        inFlightActionIndex=record.in_flight_action_index,
+        beforeSnapshot=record.before_snapshot,
+        checkpoint=record.checkpoint,
+        result=record.result,
+        error=record.error,
+        canResume=record.status in {"running", "failed", "needs_reconciliation"},
+        requiresReconciliation=record.in_flight_action_index is not None,
+        ownerToken=record.owner_token if include_owner else None,
+    )
+
+
 def _planning_pause_payload(
     record: PlanningTaskRecord,
     *,
@@ -1090,6 +1176,28 @@ def _planning_pause_payload(
     hard_seconds = capability_float("taskRecovery", "planningHardWallTimeSeconds")
     extension_seconds = capability_float("taskRecovery", "planningExtensionSeconds")
     within_hard_limit = record.active_elapsed_seconds < hard_seconds
+    model_error = bool(
+        record.error
+        and str(record.error.get("code", "")).startswith("MODEL_")
+        and bool(record.error.get("retryable", False))
+    )
+    requires_extension = record.status == "waiting_user" and not model_error
+    settings = model_settings_view()
+    raw_connections = settings.get("connections", [])
+    requires_vision = bool(record.request.get("images"))
+    available_connections = [
+        {
+            "catalogModelId": str(connection.get("catalogModelId", "")),
+            "label": str(connection.get("label", "")),
+            "modelId": str(connection.get("modelId", "")),
+            "supportsVision": connection.get("supportsVision") is True,
+        }
+        for connection in raw_connections
+        if isinstance(connection, dict)
+        and str(connection.get("catalogModelId", ""))
+        and str(connection.get("catalogModelId", "")) != record.current_model_id
+        and (not requires_vision or connection.get("supportsVision") is True)
+    ]
     can_continue = (
         record.checkpoint is not None
         and within_hard_limit
@@ -1097,8 +1205,13 @@ def _planning_pause_payload(
             record.status == "running"
             or (
                 record.status == "waiting_user"
-                and record.extension_count < maximum_extensions
-                and record.approved_wall_time_seconds < hard_seconds
+                and (
+                    model_error
+                    or (
+                        record.extension_count < maximum_extensions
+                        and record.approved_wall_time_seconds < hard_seconds
+                    )
+                )
             )
         )
     )
@@ -1125,7 +1238,12 @@ def _planning_pause_payload(
         "extensionCount": record.extension_count,
         "maximumExtensions": maximum_extensions,
         "canContinue": can_continue,
-        "requiresExtension": record.status == "waiting_user",
+        "requiresExtension": requires_extension,
+        "pauseType": "model_error" if model_error else ("interrupted" if interrupted else "budget"),
+        "currentModelId": record.current_model_id,
+        "modelSwitchCount": len(record.model_switches),
+        "canSwitchModel": model_error and bool(available_connections),
+        "availableModelConnections": available_connections,
         "sourceFingerprint": workbook_snapshot.get("sourceFingerprint"),
         "sourceFingerprintSheets": workbook_snapshot.get("sourceFingerprintSheets", []),
     }
@@ -1268,29 +1386,40 @@ async def _planning_task_stream(
             ValueError,
         ) as error:
             status, code, message, retryable = _map_turn_error(error)
+            failure = {
+                "status": status,
+                "code": code,
+                "message": message,
+                "retryable": retryable,
+            }
             try:
                 current = _folder_operation_ledger.planning_task(turn_id)
                 if current is not None and current.status == "running":
-                    _folder_operation_ledger.finish_planning_task(
-                        turn_id,
-                        status="failed",
-                        error={
-                            "status": status,
-                            "code": code,
-                            "message": message,
-                            "retryable": retryable,
-                        },
-                    )
+                    if current.checkpoint is not None and retryable and code.startswith("MODEL_"):
+                        current_record = _folder_operation_ledger.pause_planning_task(
+                            turn_id,
+                            current.checkpoint,
+                            active_elapsed_seconds=current.active_elapsed_seconds,
+                            reason=(
+                                f"模型连接中断：{message} 已保存完整规划现场；"
+                                "可以重试当前连接，或明确选择一个已配置的备用模型。"
+                            ),
+                            error=failure,
+                        )
+                    else:
+                        current_record = _folder_operation_ledger.finish_planning_task(
+                            turn_id,
+                            status="failed",
+                            error=failure,
+                        )
             except Exception:
                 logger.exception("无法保存规划任务失败状态 turn_id=%s", turn_id)
+            if current_record.status == "waiting_user":
+                yield _sse_frame("paused", _planning_pause_payload(current_record))
+                return
             yield _sse_frame(
                 "error",
-                {
-                    "status": status,
-                    "code": code,
-                    "message": message,
-                    "retryable": retryable,
-                },
+                failure,
             )
         except Exception:
             # SSE headers have already been sent, so an unexpected failure must be
@@ -1463,8 +1592,61 @@ async def planning_task_continue_stream(
     extension_seconds = (
         capability_float("taskRecovery", "planningExtensionSeconds")
         if existing.status == "waiting_user"
+        and not (
+            existing.error
+            and str(existing.error.get("code", "")).startswith("MODEL_")
+            and bool(existing.error.get("retryable", False))
+        )
         else 0.0
     )
+    selected_model_id = request.modelId
+    if selected_model_id is not None:
+        model_error = bool(
+            existing.status == "waiting_user"
+            and existing.error
+            and str(existing.error.get("code", "")).startswith("MODEL_")
+            and bool(existing.error.get("retryable", False))
+        )
+        if not model_error:
+            raise service_error(
+                409,
+                "MODEL_SWITCH_NOT_ALLOWED",
+                "只有因模型连接故障暂停的任务才能切换备用模型。",
+                retryable=False,
+            )
+        pause_payload = _planning_pause_payload(existing)
+        allowed_ids = {
+            str(item.get("catalogModelId"))
+            for item in pause_payload.get("availableModelConnections", [])
+            if isinstance(item, dict)
+        }
+        if selected_model_id not in allowed_ids:
+            raise service_error(
+                409,
+                "MODEL_SWITCH_NOT_ALLOWED",
+                "所选备用模型未配置、能力不匹配或与当前模型相同。",
+                retryable=False,
+            )
+        try:
+            fallback_config = selected_model_config(selected_model_id)
+        except ValueError as error:
+            raise service_error(
+                409, "MODEL_SWITCH_NOT_ALLOWED", str(error), retryable=False
+            ) from error
+        if fallback_config is None:
+            raise service_error(
+                409,
+                "MODEL_SWITCH_NOT_ALLOWED",
+                "基础模式不能接续需要模型工具调用的规划现场。",
+                retryable=False,
+            )
+        if existing.request.get("images") and not fallback_config.supports_vision:
+            raise service_error(
+                409,
+                "MODEL_SWITCH_CAPABILITY_MISMATCH",
+                "所选备用模型不支持本任务所需的图片输入。",
+                retryable=False,
+            )
     try:
         claimed, should_run = _folder_operation_ledger.claim_planning_continuation(
             request.turnId,
@@ -1476,6 +1658,12 @@ async def planning_task_continue_stream(
             ),
             hard_wall_time_seconds=capability_float(
                 "taskRecovery", "planningHardWallTimeSeconds"
+            ),
+            model_id=selected_model_id,
+            model_switch_reason=(
+                "用户在模型连接故障后明确选择备用模型"
+                if selected_model_id is not None
+                else None
             ),
         )
     except RuntimeError as error:
@@ -1493,7 +1681,31 @@ async def planning_task_continue_stream(
             "该规划任务已经停止，不能继续。",
             retryable=False,
         )
-    plan_request = PlanRequest.model_validate(claimed.request)
+    if selected_model_id is not None:
+        switch_event = TaskProgressEvent.model_validate(
+            {
+                "schemaVersion": 1,
+                "operationId": claimed.turn_id,
+                "sequence": claimed.last_sequence + 1,
+                "phase": "planning",
+                "stepId": f"planning.model.switch.{len(claimed.model_switches)}",
+                "status": "completed",
+                "title": "已切换到用户选择的备用模型",
+                "summary": "保留原任务范围、已完成工具结果和累计预算，从完整检查点继续。",
+                "facts": [
+                    {"label": "备用连接", "value": selected_model_id, "style": "code"}
+                ],
+                "timestamp": datetime.now().astimezone().isoformat(),
+            }
+        )
+        claimed = _folder_operation_ledger.append_planning_event(
+            claimed.turn_id,
+            claimed.last_sequence + 1,
+            switch_event.model_dump(mode="json"),
+        )
+    plan_request = PlanRequest.model_validate(claimed.request).model_copy(
+        update={"modelId": claimed.current_model_id}
+    )
     return StreamingResponse(
         _planning_task_stream(
             plan_request,
@@ -1503,6 +1715,181 @@ async def planning_task_continue_stream(
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+def _office_conflict(error: Exception) -> HTTPException:
+    if isinstance(error, ValueError):
+        return service_error(422, "OFFICE_RECOVERY_INVALID", str(error), retryable=False)
+    if isinstance(error, RuntimeError):
+        return service_error(409, "OFFICE_RECOVERY_CONFLICT", str(error), retryable=True)
+    return _task_state_error(error)
+
+
+@app.post(
+    "/api/office/executions/register",
+    response_model=OfficeExecutionStateResponse,
+)
+async def register_office_execution(
+    request: OfficeExecutionRegisterRequest,
+) -> OfficeExecutionStateResponse:
+    _validate_office_recovery_plan(request)
+    try:
+        record, _created = await run_in_threadpool(
+            _folder_operation_ledger.register_office_execution,
+            request.operationId,
+            _office_request_fingerprint(request),
+            plan=request.plan.model_dump(mode="json"),
+            authorization={
+                "authorizedSheetNames": request.authorizedSheetNames,
+                "allowedExternalFiles": request.allowedExternalFiles,
+            },
+            workbook_identity=request.workbookIdentity,
+        )
+    except Exception as error:
+        raise _office_conflict(error) from error
+    return _office_state_payload(record, include_owner=record.status == "running")
+
+
+@app.get(
+    "/api/office/executions/{operation_id}",
+    response_model=OfficeExecutionStateResponse,
+)
+async def office_execution_status(operation_id: str) -> OfficeExecutionStateResponse:
+    try:
+        record = await run_in_threadpool(
+            _folder_operation_ledger.office_execution, operation_id
+        )
+    except Exception as error:
+        raise _task_state_error(error) from error
+    if record is None:
+        raise service_error(
+            404,
+            "OFFICE_EXECUTION_NOT_FOUND",
+            "未找到这次 Office 执行记录；查询不会创建新的写入任务。",
+            retryable=False,
+        )
+    return _office_state_payload(record)
+
+
+@app.post(
+    "/api/office/executions/{operation_id}/actions/start",
+    response_model=OfficeExecutionStateResponse,
+)
+async def start_office_action(
+    operation_id: str, request: OfficeActionStartRequest
+) -> OfficeExecutionStateResponse:
+    try:
+        record = await run_in_threadpool(
+            _folder_operation_ledger.begin_office_action,
+            operation_id,
+            expected_revision=request.expectedRevision,
+            owner_token=request.ownerToken,
+            action_index=request.actionIndex,
+            before_snapshot=request.beforeSnapshot,
+        )
+    except Exception as error:
+        raise _office_conflict(error) from error
+    return _office_state_payload(record, include_owner=True)
+
+
+@app.post(
+    "/api/office/executions/{operation_id}/actions/complete",
+    response_model=OfficeExecutionStateResponse,
+)
+async def complete_office_action(
+    operation_id: str, request: OfficeActionCompleteRequest
+) -> OfficeExecutionStateResponse:
+    try:
+        record = await run_in_threadpool(
+            _folder_operation_ledger.complete_office_action,
+            operation_id,
+            expected_revision=request.expectedRevision,
+            owner_token=request.ownerToken,
+            action_index=request.actionIndex,
+            checkpoint=request.checkpoint,
+        )
+    except Exception as error:
+        raise _office_conflict(error) from error
+    return _office_state_payload(record, include_owner=True)
+
+
+@app.post(
+    "/api/office/executions/{operation_id}/suspend",
+    response_model=OfficeExecutionStateResponse,
+)
+async def suspend_office_execution(
+    operation_id: str, request: OfficeExecutionSuspendRequest
+) -> OfficeExecutionStateResponse:
+    try:
+        record = await run_in_threadpool(
+            _folder_operation_ledger.suspend_office_execution,
+            operation_id,
+            expected_revision=request.expectedRevision,
+            owner_token=request.ownerToken,
+            error={"code": request.code, "message": request.message},
+        )
+    except Exception as error:
+        raise _office_conflict(error) from error
+    return _office_state_payload(record)
+
+
+@app.post(
+    "/api/office/executions/{operation_id}/resume",
+    response_model=OfficeExecutionStateResponse,
+)
+async def resume_office_execution(
+    operation_id: str, request: OfficeExecutionResumeRequest
+) -> OfficeExecutionStateResponse:
+    try:
+        record = await run_in_threadpool(
+            _folder_operation_ledger.claim_office_resume,
+            operation_id,
+            expected_revision=request.expectedRevision,
+        )
+    except Exception as error:
+        raise _office_conflict(error) from error
+    return _office_state_payload(record, include_owner=True)
+
+
+@app.post(
+    "/api/office/executions/{operation_id}/actions/reconcile",
+    response_model=OfficeExecutionStateResponse,
+)
+async def reconcile_office_action(
+    operation_id: str, request: OfficeActionReconcileRequest
+) -> OfficeExecutionStateResponse:
+    try:
+        record = await run_in_threadpool(
+            _folder_operation_ledger.reconcile_office_action,
+            operation_id,
+            expected_revision=request.expectedRevision,
+            action_index=request.actionIndex,
+            outcome=request.outcome,
+            checkpoint=request.checkpoint,
+        )
+    except Exception as error:
+        raise _office_conflict(error) from error
+    return _office_state_payload(record, include_owner=True)
+
+
+@app.post(
+    "/api/office/executions/{operation_id}/complete",
+    response_model=OfficeExecutionStateResponse,
+)
+async def finish_office_execution(
+    operation_id: str, request: OfficeExecutionFinishRequest
+) -> OfficeExecutionStateResponse:
+    try:
+        record = await run_in_threadpool(
+            _folder_operation_ledger.finish_office_execution,
+            operation_id,
+            expected_revision=request.expectedRevision,
+            owner_token=request.ownerToken,
+            result=request.result,
+        )
+    except Exception as error:
+        raise _office_conflict(error) from error
+    return _office_state_payload(record)
 
 
 @app.post("/api/folders/select", response_model=FolderCatalog | None)
