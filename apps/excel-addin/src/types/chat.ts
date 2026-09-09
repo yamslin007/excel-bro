@@ -99,6 +99,10 @@ export interface ChatMessage {
   /** 规划达到本轮安全时长边界后保存的现场；刷新后仍可由用户明确继续。 */
   planningResume?: {
     turnId: string;
+    /** 原规划任务的过程消息，用于续跑时复用同一张时间线卡片。 */
+    activityMessageId?: string;
+    /** 前端最后实际收到并归并的服务端事件序号。 */
+    clientLastSequence?: number;
     expectedRevision: number;
     lastSequence: number;
     status: "pending" | "resuming" | "completed" | "failed";

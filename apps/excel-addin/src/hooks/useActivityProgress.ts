@@ -70,6 +70,8 @@ export interface ActivityProgress {
 export interface ActivityLog {
   outcome?: ActivityOutcome;
   operationId?: string | null;
+  /** 前端最后成功归并的服务端事件序号；旧日志可能没有。 */
+  sequence?: number;
   steps: ActivityStep[];
   traces?: Array<TaskProgressTrace & { id: string }>;
   totalMs: number;
@@ -82,6 +84,11 @@ interface StartActivityOptions {
   operationId?: string | null;
   phase?: TaskProgressPhase;
   stepId?: string;
+}
+
+interface ResumeActivityOptions extends StartActivityOptions {
+  previousLog?: ActivityLog | null;
+  initialSequence?: number;
 }
 
 interface UseActivityProgressOptions {
@@ -189,6 +196,82 @@ export function useActivityProgress({
       activityRef.current = nextActivity;
       setActivity(nextActivity);
       setActivitySeconds(0);
+    },
+    []
+  );
+
+  const bindActivityOperation = useCallback(
+    (operationId: string) => {
+      updateActivity((current) =>
+        current ? { ...current, operationId } : current
+      );
+    },
+    [updateActivity]
+  );
+
+  const getActivitySnapshot = useCallback(() => activityRef.current, []);
+
+  const resumeActivity = useCallback(
+    (
+      title: string,
+      detail: string,
+      options: ResumeActivityOptions
+    ) => {
+      const now = Date.now();
+      const current = activityRef.current;
+      const canReuseCurrent =
+        current?.operationId === (options.operationId ?? null) &&
+        current.persistenceKey === options.persistenceKey;
+      const previousLog = canReuseCurrent
+        ? {
+            operationId: current.operationId,
+            sequence: current.sequence,
+            steps: current.steps,
+            traces: current.traces,
+            totalMs: Math.max(0, now - current.startedAt),
+            connectionState: current.connectionState,
+            connectionMessage: current.connectionMessage
+          }
+        : options.previousLog;
+      const stepId = options.stepId ?? "planning.resume";
+      const priorSteps = (previousLog?.steps ?? []).map((step) => ({ ...step }));
+      const existingIndex = priorSteps.findIndex((step) => step.id === stepId);
+      const resumeStep: ActivityStep = {
+        id: stepId,
+        label: title,
+        elapsedMs: 0,
+        phase: options.phase ?? "planning",
+        status: "started",
+        detail: detail || undefined,
+        startedAt: now
+      };
+      const steps =
+        existingIndex >= 0
+          ? priorSteps.map((step, index) =>
+              index === existingIndex ? resumeStep : step
+            )
+          : [...priorSteps, resumeStep];
+      const carriedMs = Math.max(0, previousLog?.totalMs ?? 0);
+      const nextActivity: ActivityProgress = {
+        persistenceKey: options.persistenceKey,
+        operationId: options.operationId ?? previousLog?.operationId ?? null,
+        sequence:
+          options.initialSequence ?? previousLog?.sequence ?? current?.sequence ?? -1,
+        phase: options.phase ?? "planning",
+        stepId,
+        status: "started",
+        title,
+        detail,
+        connectionState: "connected",
+        traces: [...(previousLog?.traces ?? [])],
+        steps,
+        completed: terminalSteps(steps),
+        startedAt: now - carriedMs,
+        lastStepAt: now
+      };
+      activityRef.current = nextActivity;
+      setActivity(nextActivity);
+      setActivitySeconds(Math.floor(carriedMs / 1000));
     },
     []
   );
@@ -534,6 +617,7 @@ export function useActivityProgress({
         const log: ActivityLog = {
           outcome: effectiveOutcome,
           operationId: current.operationId,
+          sequence: current.sequence,
           steps: steps.map(persistableStep),
           traces: current.traces,
           totalMs: now - current.startedAt,
@@ -565,6 +649,9 @@ export function useActivityProgress({
     activity,
     activitySeconds,
     startActivity,
+    resumeActivity,
+    bindActivityOperation,
+    getActivitySnapshot,
     advanceActivity,
     completeCurrentStep,
     applyProgressEvent,

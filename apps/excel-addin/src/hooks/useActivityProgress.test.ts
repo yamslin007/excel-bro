@@ -365,6 +365,84 @@ describe("useActivityProgress", () => {
     );
   });
 
+  it("resumes the same persisted timeline and only accepts newer events", () => {
+    const onPersistLog = vi.fn();
+    const { result } = renderHook(() =>
+      useActivityProgress({ onPersistLog })
+    );
+    act(() =>
+      result.current.startActivity("正在规划", "读取字段", {
+        persistenceKey: "activity-message-resume",
+        operationId: "turn-resume-1",
+        stepId: "planning.fields"
+      })
+    );
+    act(() =>
+      result.current.applyProgressEvent(
+        progressEvent({
+          operationId: "turn-resume-1",
+          sequence: 3,
+          stepId: "planning.fields",
+          status: "completed",
+          title: "字段读取完成"
+        })
+      )
+    );
+    act(() => result.current.completeActivity("warning", "连接中断", "interrupted"));
+    const previousLog = onPersistLog.mock.calls[0][0];
+
+    act(() =>
+      result.current.resumeActivity("正在从断点继续", "保留已完成步骤", {
+        persistenceKey: "activity-message-resume",
+        operationId: "turn-resume-1",
+        stepId: "planning.resume.request-1",
+        initialSequence: 3,
+        previousLog
+      })
+    );
+    act(() =>
+      result.current.applyProgressEvent(
+        progressEvent({
+          operationId: "turn-resume-1",
+          sequence: 3,
+          stepId: "planning.duplicate",
+          title: "不应重复显示"
+        })
+      )
+    );
+    act(() =>
+      result.current.applyProgressEvent(
+        progressEvent({
+          operationId: "turn-resume-1",
+          sequence: 4,
+          stepId: "planning.next",
+          title: "继续生成方案"
+        })
+      )
+    );
+
+    expect(result.current.activity).toMatchObject({
+      persistenceKey: "activity-message-resume",
+      operationId: "turn-resume-1",
+      sequence: 4
+    });
+    expect(result.current.activity?.steps).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "planning.fields",
+          label: "字段读取完成"
+        }),
+        expect.objectContaining({ id: "planning.resume.request-1" }),
+        expect.objectContaining({ id: "planning.next", label: "继续生成方案" })
+      ])
+    );
+    expect(
+      result.current.activity?.steps.some(
+        (step) => step.label === "不应重复显示"
+      )
+    ).toBe(false);
+  });
+
   it("persists an unfinished local step with the supplied final status", () => {
     const onPersistLog = vi.fn();
     const { result } = renderHook(() =>

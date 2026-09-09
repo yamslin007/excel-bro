@@ -1677,6 +1677,120 @@ def test_model_timeout_pauses_and_user_can_switch_configured_fallback(
     assert "secret-not-persisted" not in json.dumps(record.model_switches)
 
 
+def test_interrupted_planning_task_can_switch_model_and_resume_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resumed: list[tuple[str | None, object]] = []
+
+    async def resume_from_checkpoint(
+        request: object,
+        *,
+        resume_checkpoint=None,
+        **_options: object,
+    ) -> AnswerResponse:
+        resumed.append((getattr(request, "modelId", None), resume_checkpoint))
+        return AnswerResponse(
+            kind="answer",
+            message="中断任务已由备用模型接续",
+            provider="model",
+        )
+
+    monkeypatch.setattr(main_module, "create_plan", resume_from_checkpoint)
+    monkeypatch.setattr(
+        main_module,
+        "model_settings_view",
+        lambda: {
+            "connections": [
+                {
+                    "catalogModelId": "connection:primary-interrupted",
+                    "label": "原模型",
+                    "modelId": "primary-model",
+                    "supportsVision": True,
+                },
+                {
+                    "catalogModelId": "connection:fallback-interrupted",
+                    "label": "备用模型",
+                    "modelId": "fallback-model",
+                    "supportsVision": True,
+                },
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        main_module,
+        "selected_model_config",
+        lambda model_id: ModelConnection(
+            base_url="https://fallback.example.test/v1",
+            model="fallback-model",
+            api_key="secret-not-persisted",
+            supports_vision=True,
+        )
+        if model_id == "connection:fallback-interrupted"
+        else None,
+    )
+    payload = {
+        **_STREAM_PAYLOAD,
+        "turnId": "turn-interrupted-model-switch-test",
+        "modelId": "connection:primary-interrupted",
+    }
+    request = main_module.PlanRequest.model_validate(payload)
+    record, created = main_module._folder_operation_ledger.register_planning_task(
+        request.turnId or "",
+        main_module._planning_request_fingerprint(request),
+        request.model_dump(mode="json", exclude_none=True),
+        approved_wall_time_seconds=60,
+    )
+    assert created is True
+    checkpoint = {
+        "schemaVersion": 2,
+        "kind": "planning",
+        "stage": "tool_batch_completed",
+        "messages": [{"role": "user", "content": "保留的任务上下文"}],
+        "toolCache": {"context": "saved-before-disconnect"},
+        "loopState": {"activeElapsedSeconds": 8},
+        "toolMode": "full",
+        "repairingSubmission": False,
+        "nextTurnIndex": 1,
+        "pendingAssistantMessage": None,
+        "nextToolIndex": 0,
+        "toolBatchState": {},
+    }
+    main_module._folder_operation_ledger.save_planning_checkpoint(
+        record.turn_id,
+        checkpoint,
+        active_elapsed_seconds=8,
+    )
+    client = TestClient(app)
+
+    status_response = client.get(f"/api/turn/{record.turn_id}/status")
+    assert status_response.status_code == 200
+    status = status_response.json()
+    assert status["status"] == "interrupted"
+    assert status["pauseType"] == "interrupted"
+    assert status["canSwitchModel"] is True
+
+    continued = client.post(
+        "/api/turn/continue/stream",
+        json={
+            "turnId": record.turn_id,
+            "expectedRevision": status["revision"],
+            "requestId": "interrupted-fallback-request-0001",
+            "confirmed": True,
+            "afterSequence": 0,
+            "modelId": "connection:fallback-interrupted",
+            "confirmModelSwitch": True,
+        },
+    )
+    events = _parse_sse(continued.text)
+    result = next(value for name, value in events if name == "result")
+    assert result["message"] == "中断任务已由备用模型接续"
+    assert resumed == [("connection:fallback-interrupted", checkpoint)]
+    persisted = main_module._folder_operation_ledger.planning_task(record.turn_id)
+    assert persisted is not None
+    assert persisted.current_model_id == "connection:fallback-interrupted"
+    assert len(persisted.model_switches) == 1
+
+
 def test_turn_stream_rejects_intent_request() -> None:
     payload = _intent_payload("帮我看看这些数据")
     payload["turnId"] = "turn-stream-intent"

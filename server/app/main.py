@@ -1242,7 +1242,9 @@ def _planning_pause_payload(
         "pauseType": "model_error" if model_error else ("interrupted" if interrupted else "budget"),
         "currentModelId": record.current_model_id,
         "modelSwitchCount": len(record.model_switches),
-        "canSwitchModel": model_error and bool(available_connections),
+        "canSwitchModel": (model_error or interrupted)
+        and record.checkpoint is not None
+        and bool(available_connections),
         "availableModelConnections": available_connections,
         "sourceFingerprint": workbook_snapshot.get("sourceFingerprint"),
         "sourceFingerprintSheets": workbook_snapshot.get("sourceFingerprintSheets", []),
@@ -1254,24 +1256,26 @@ async def _planning_task_stream(
     record: PlanningTaskRecord,
     *,
     after_sequence: int = 0,
+    activity_reserved: bool = False,
 ) -> AsyncIterator[str]:
     turn_id = record.turn_id
     state = turn_registry.touch(turn_id)
     task: asyncio.Task[AssistantResponse] | None = None
     async with state.completion_lock:
-        async with _active_planning_tasks_lock:
-            if turn_id in _active_planning_tasks:
-                yield _sse_frame(
-                    "error",
-                    {
-                        "status": 409,
-                        "code": "PLANNING_TASK_STILL_RUNNING",
-                        "message": "该规划任务仍在处理中，请勿重复继续。",
-                        "retryable": True,
-                    },
-                )
-                return
-            _active_planning_tasks.add(turn_id)
+        if not activity_reserved:
+            async with _active_planning_tasks_lock:
+                if turn_id in _active_planning_tasks:
+                    yield _sse_frame(
+                        "error",
+                        {
+                            "status": 409,
+                            "code": "PLANNING_TASK_STILL_RUNNING",
+                            "message": "该规划任务仍在处理中，请勿重复继续。",
+                            "retryable": True,
+                        },
+                    )
+                    return
+                _active_planning_tasks.add(turn_id)
         try:
             persisted_events = _folder_operation_ledger.planning_events(turn_id)
             for event in persisted_events:
@@ -1599,22 +1603,17 @@ async def planning_task_continue_stream(
         )
         else 0.0
     )
+    interrupted = existing.status == "running"
     selected_model_id = request.modelId
     if selected_model_id is not None:
-        model_error = bool(
-            existing.status == "waiting_user"
-            and existing.error
-            and str(existing.error.get("code", "")).startswith("MODEL_")
-            and bool(existing.error.get("retryable", False))
-        )
-        if not model_error:
+        pause_payload = _planning_pause_payload(existing, interrupted=interrupted)
+        if not pause_payload["canSwitchModel"]:
             raise service_error(
                 409,
                 "MODEL_SWITCH_NOT_ALLOWED",
-                "只有因模型连接故障暂停的任务才能切换备用模型。",
+                "只有因模型连接故障暂停，或执行器中断且现场完整的任务，才能切换备用模型。",
                 retryable=False,
             )
-        pause_payload = _planning_pause_payload(existing)
         allowed_ids = {
             str(item.get("catalogModelId"))
             for item in pause_payload.get("availableModelConnections", [])
@@ -1648,24 +1647,67 @@ async def planning_task_continue_stream(
                 retryable=False,
             )
     try:
-        claimed, should_run = _folder_operation_ledger.claim_planning_continuation(
-            request.turnId,
-            expected_revision=request.expectedRevision,
-            request_id=request.requestId,
-            extension_seconds=extension_seconds,
-            maximum_extensions=capability_int(
-                "taskRecovery", "planningMaxExtensions"
-            ),
-            hard_wall_time_seconds=capability_float(
-                "taskRecovery", "planningHardWallTimeSeconds"
-            ),
-            model_id=selected_model_id,
-            model_switch_reason=(
-                "用户在模型连接故障后明确选择备用模型"
-                if selected_model_id is not None
-                else None
-            ),
-        )
+        async with _active_planning_tasks_lock:
+            if request.turnId in _active_planning_tasks:
+                raise service_error(
+                    409,
+                    "PLANNING_TASK_STILL_RUNNING",
+                    "该规划任务仍在处理中，不能重复继续。",
+                    retryable=True,
+                )
+            claimed, should_run = _folder_operation_ledger.claim_planning_continuation(
+                request.turnId,
+                expected_revision=request.expectedRevision,
+                request_id=request.requestId,
+                extension_seconds=extension_seconds,
+                maximum_extensions=capability_int(
+                    "taskRecovery", "planningMaxExtensions"
+                ),
+                hard_wall_time_seconds=capability_float(
+                    "taskRecovery", "planningHardWallTimeSeconds"
+                ),
+                model_id=selected_model_id,
+                model_switch_reason=(
+                    (
+                        "用户在执行器中断后明确选择备用模型接续断点"
+                        if interrupted
+                        else "用户在模型连接故障后明确选择备用模型"
+                    )
+                    if selected_model_id is not None
+                    else None
+                ),
+            )
+            if should_run:
+                if selected_model_id is not None:
+                    switch_event = TaskProgressEvent.model_validate(
+                        {
+                            "schemaVersion": 1,
+                            "operationId": claimed.turn_id,
+                            "sequence": claimed.last_sequence + 1,
+                            "phase": "planning",
+                            "stepId": f"planning.model.switch.{len(claimed.model_switches)}",
+                            "status": "completed",
+                            "title": "已切换到用户选择的备用模型",
+                            "summary": "保留原任务范围、已完成工具结果和累计预算，从完整检查点继续。",
+                            "facts": [
+                                {
+                                    "label": "备用连接",
+                                    "value": selected_model_id,
+                                    "style": "code",
+                                }
+                            ],
+                            "timestamp": datetime.now().astimezone().isoformat(),
+                        }
+                    )
+                    claimed = _folder_operation_ledger.append_planning_event(
+                        claimed.turn_id,
+                        claimed.last_sequence + 1,
+                        switch_event.model_dump(mode="json"),
+                    )
+                plan_request = PlanRequest.model_validate(claimed.request).model_copy(
+                    update={"modelId": claimed.current_model_id}
+                )
+                _active_planning_tasks.add(request.turnId)
     except RuntimeError as error:
         raise service_error(
             409, "PLANNING_CONTINUE_CONFLICT", str(error), retryable=True
@@ -1681,36 +1723,12 @@ async def planning_task_continue_stream(
             "该规划任务已经停止，不能继续。",
             retryable=False,
         )
-    if selected_model_id is not None:
-        switch_event = TaskProgressEvent.model_validate(
-            {
-                "schemaVersion": 1,
-                "operationId": claimed.turn_id,
-                "sequence": claimed.last_sequence + 1,
-                "phase": "planning",
-                "stepId": f"planning.model.switch.{len(claimed.model_switches)}",
-                "status": "completed",
-                "title": "已切换到用户选择的备用模型",
-                "summary": "保留原任务范围、已完成工具结果和累计预算，从完整检查点继续。",
-                "facts": [
-                    {"label": "备用连接", "value": selected_model_id, "style": "code"}
-                ],
-                "timestamp": datetime.now().astimezone().isoformat(),
-            }
-        )
-        claimed = _folder_operation_ledger.append_planning_event(
-            claimed.turn_id,
-            claimed.last_sequence + 1,
-            switch_event.model_dump(mode="json"),
-        )
-    plan_request = PlanRequest.model_validate(claimed.request).model_copy(
-        update={"modelId": claimed.current_model_id}
-    )
     return StreamingResponse(
         _planning_task_stream(
             plan_request,
             claimed,
             after_sequence=request.afterSequence,
+            activity_reserved=True,
         ),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},

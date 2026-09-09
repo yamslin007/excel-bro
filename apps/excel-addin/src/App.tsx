@@ -855,6 +855,9 @@ export default function App() {
     activity,
     activitySeconds,
     startActivity: startActivityProgress,
+    resumeActivity: resumeActivityProgress,
+    bindActivityOperation,
+    getActivitySnapshot,
     advanceActivity,
     completeCurrentStep,
     applyProgressEvent,
@@ -2254,6 +2257,7 @@ export default function App() {
         planningResume: {
           ...baseline,
           expectedRevision: response.revision,
+          clientLastSequence: response.lastSequence,
           lastSequence: response.lastSequence,
           status: "pending",
           reason: response.reason,
@@ -2307,6 +2311,45 @@ export default function App() {
     return "completed";
   }
 
+  function resumePlanningActivity(
+    resume: NonNullable<ChatMessage["planningResume"]>,
+    title: string,
+    detail: string,
+    initialSequence: number,
+    stepId: string
+  ): string {
+    const liveActivity = getActivitySnapshot();
+    const storedActivityMessage =
+      (resume.activityMessageId
+        ? messages.find((item) => item.id === resume.activityMessageId)
+        : undefined) ??
+      messages.find(
+        (item) => item.activityLog?.operationId === resume.turnId
+      );
+    const reusableLiveMessageId =
+      liveActivity?.operationId === resume.turnId
+        ? liveActivity.persistenceKey
+        : undefined;
+    const persistenceKey =
+      reusableLiveMessageId ?? storedActivityMessage?.id ??
+      appendMessage({ role: "assistant", activityPending: true });
+    setMessages((current) =>
+      current.map((item) =>
+        item.id === persistenceKey ? { ...item, activityPending: true } : item
+      )
+    );
+    activeActivityMessageIdRef.current = persistenceKey;
+    resumeActivityProgress(title, detail, {
+      persistenceKey,
+      operationId: resume.turnId,
+      phase: "planning",
+      stepId,
+      initialSequence,
+      previousLog: storedActivityMessage?.activityLog ?? null
+    });
+    return persistenceKey;
+  }
+
   async function resumePlanningTaskFromMessage(
     message: ChatMessage,
     fallbackModelId?: string
@@ -2323,12 +2366,6 @@ export default function App() {
         ? { ...current.planningResume, status: "resuming", requestId }
         : undefined
     }));
-    beginActivity(
-      fallbackModelId ? "正在切换备用模型并继续" : "正在从保存的进度继续",
-      fallbackModelId
-        ? "正在核对备用连接能力、任务范围和已保存结果，然后从完整断点继续。"
-        : "正在核对任务状态和原始数据范围，然后从下一个安全边界继续。"
-    );
     try {
       const taskStatus = await getPlanningTaskStatus(
         resume.turnId,
@@ -2375,6 +2412,48 @@ export default function App() {
         return;
       }
 
+      const maySwitchModel =
+        taskStatus.pauseType === "model_error" ||
+        taskStatus.pauseType === "interrupted";
+      const globallySelectedFallback =
+        maySwitchModel &&
+        selectedModelId &&
+        selectedModelId !== "local" &&
+        selectedModelId !== taskStatus.currentModelId
+          ? selectedModelId
+          : undefined;
+      const effectiveFallbackModelId =
+        fallbackModelId ?? globallySelectedFallback;
+      if (effectiveFallbackModelId) {
+        const allowed = taskStatus.availableModelConnections.some(
+          (connection) => connection.catalogModelId === effectiveFallbackModelId
+        );
+        if (!taskStatus.canSwitchModel || !allowed) {
+          const label =
+            modelOptions.find((option) => option.id === effectiveFallbackModelId)
+              ?.label ?? effectiveFallbackModelId;
+          updateFolderResumeMessage(message.id, (current) => ({
+            ...current,
+            text: `不能使用「${label}」接管这个断点。请选择恢复卡列出的可用模型，或切回原模型继续。`,
+            planningResume: current.planningResume
+              ? {
+                  ...current.planningResume,
+                  status: "pending",
+                  pauseType: taskStatus.pauseType,
+                  currentModelId: taskStatus.currentModelId,
+                  canSwitchModel: taskStatus.canSwitchModel,
+                  availableModelConnections:
+                    taskStatus.availableModelConnections,
+                  selectedFallbackModelId:
+                    taskStatus.availableModelConnections[0]?.catalogModelId,
+                  requestId: undefined
+                }
+              : undefined
+          }));
+          return;
+        }
+      }
+
       const sourceFingerprint =
         taskStatus.sourceFingerprint ?? resume.sourceFingerprint;
       const sourceFingerprintSheets =
@@ -2403,8 +2482,28 @@ export default function App() {
         }
       }
 
+      const clientLastSequence = Math.min(
+        Math.max(
+          0,
+          resume.clientLastSequence ?? resume.lastSequence ?? 0
+        ),
+        taskStatus.lastSequence
+      );
+      const activityMessageId = resumePlanningActivity(
+        resume,
+        effectiveFallbackModelId
+          ? "正在使用新模型从断点继续"
+          : "正在从保存的进度继续",
+        effectiveFallbackModelId
+          ? "已保留原任务范围、工具结果和累计预算，正在接续未完成步骤。"
+          : "正在补收缺失进度，并从下一个安全边界继续。",
+        clientLastSequence,
+        `planning.resume.${requestId}`
+      );
       const baseline = {
         ...resume,
+        activityMessageId,
+        clientLastSequence,
         expectedRevision: taskStatus.revision,
         lastSequence: taskStatus.lastSequence,
         requestId,
@@ -2428,9 +2527,12 @@ export default function App() {
           turnId: resume.turnId,
           expectedRevision: taskStatus.revision,
           requestId,
-          afterSequence: resume.lastSequence,
-          ...(fallbackModelId
-            ? { modelId: fallbackModelId, confirmModelSwitch: true as const }
+          afterSequence: clientLastSequence,
+          ...(effectiveFallbackModelId
+            ? {
+                modelId: effectiveFallbackModelId,
+                confirmModelSwitch: true as const
+              }
             : {})
         },
         {
@@ -3098,6 +3200,7 @@ export default function App() {
   ) {
     if (!workbook) return;
     setStatus("planning");
+    if (turnId) bindActivityOperation(turnId);
     if (dataResults.length > 0) {
       const scannedRows = dataResults.reduce(
         (total, result) => total + result.scannedRows,
@@ -3209,6 +3312,7 @@ export default function App() {
       );
       markServerOnline();
       if (response.kind === "planning_pause") {
+        const planningActivity = getActivitySnapshot();
         appendMessage({
           role: "assistant",
           text: response.reason,
@@ -3218,6 +3322,11 @@ export default function App() {
           querySourceSheetNames: effectiveSheetNames,
           planningResume: {
             turnId: response.turnId,
+            activityMessageId:
+              planningActivity?.persistenceKey ??
+              activeActivityMessageIdRef.current ??
+              undefined,
+            clientLastSequence: response.lastSequence,
             expectedRevision: response.revision,
             lastSequence: response.lastSequence,
             status: "pending",
@@ -3321,6 +3430,7 @@ export default function App() {
         markServerOnline();
       }
       if (isLocalServiceConnectionError(reason) && turnId) {
+        const planningActivity = getActivitySnapshot();
         appendMessage({
           role: "assistant",
           provider: "system",
@@ -3328,16 +3438,31 @@ export default function App() {
           intentMemory,
           planningResume: {
             turnId,
+            activityMessageId:
+              planningActivity?.persistenceKey ??
+              activeActivityMessageIdRef.current ??
+              undefined,
+            clientLastSequence: Math.max(
+              0,
+              planningActivity?.sequence ?? 0
+            ),
             expectedRevision: 1,
-            lastSequence: 0,
+            lastSequence: Math.max(0, planningActivity?.sequence ?? 0),
             status: "pending",
             reason: "连接中断，等待恢复后核对任务状态。",
             extensionSeconds: 0,
             activeElapsedSeconds: 0,
+            pauseType: "interrupted",
+            currentModelId: selectedModelId || null,
             sourceFingerprint: workbook.sourceFingerprint,
             sourceFingerprintSheets: selectedNamesFor(workbook)
           }
         });
+        finishActivity(
+          "warning",
+          "连接中断，执行结果待确认。",
+          "interrupted"
+        );
       } else {
         appendMessage({
           role: "system",
@@ -7700,7 +7825,8 @@ export default function App() {
                     <strong>
                       {message.planningResume.status === "resuming"
                         ? "正在从保存的进度继续"
-                        : message.planningResume.pauseType === "model_error"
+                        : message.planningResume.pauseType === "model_error" ||
+                            message.planningResume.pauseType === "interrupted"
                           ? "模型连接中断，任务现场已保存"
                           : "进度已保存"}
                     </strong>
@@ -7709,7 +7835,8 @@ export default function App() {
                       已完成约 {Math.round(message.planningResume.activeElapsedSeconds)} 秒有效处理；
                       继续时不会重做已经提交的工具结果。
                     </span>
-                    {message.planningResume.pauseType === "model_error" &&
+                    {(message.planningResume.pauseType === "model_error" ||
+                      message.planningResume.pauseType === "interrupted") &&
                       message.planningResume.currentModelId && (
                         <span>当前连接：{message.planningResume.currentModelId}</span>
                       )}
@@ -7725,15 +7852,22 @@ export default function App() {
                     >
                       {message.planningResume.status === "resuming"
                         ? "正在继续..."
-                        : message.planningResume.pauseType === "model_error"
-                          ? "重试当前模型"
+                        : (message.planningResume.pauseType === "model_error" ||
+                              message.planningResume.pauseType === "interrupted") &&
+                            selectedModelId &&
+                            selectedModelId !== "local" &&
+                            selectedModelId !== message.planningResume.currentModelId
+                          ? `使用「${selectedModel?.label ?? selectedModelId}」从断点继续`
+                          : message.planningResume.pauseType === "model_error"
+                            ? "重试当前模型"
                           : message.planningResume.extensionSeconds > 0
                           ? `继续处理（约 ${Math.round(
                               message.planningResume.extensionSeconds
                             )} 秒）`
                           : "核对任务状态"}
                     </button>
-                    {message.planningResume.pauseType === "model_error" &&
+                    {(message.planningResume.pauseType === "model_error" ||
+                      message.planningResume.pauseType === "interrupted") &&
                       message.planningResume.canSwitchModel &&
                       (message.planningResume.availableModelConnections?.length ?? 0) > 0 && (
                         <>
@@ -7837,6 +7971,10 @@ export default function App() {
                   />
                 )}
               {message.activityLog &&
+                !(
+                  message.activityPending &&
+                  activity?.persistenceKey === message.id
+                ) &&
                 message.activityLog.steps.length > 0 && (
                   <TaskProgressTimeline log={message.activityLog} />
                 )}

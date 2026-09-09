@@ -223,6 +223,12 @@ lastSequence、稳定 requestId 和原来源指纹。刷新或网络中断后应
   工具调用；模型错误暂停后可由用户显式切换到已配置连接，但任意 DAG 仍未实现。
 - 意外异常必须把任务标记为 `failed` 并发出安全 SSE 错误；若状态长期为 `running`，先检查
   账本写入失败和服务日志，不要直接新建同一语义的写入任务。
+- 若状态查询返回 `interrupted`，只有“账本仍为 running、内存无活动执行者、完整 checkpoint
+  存在”时允许继续或显式换模型。顶部模型切换后，恢复按钮应显示具体目标模型，并且请求仍为
+  `POST /api/turn/continue/stream`，不得重新调用 `/api/turn/stream` 或意图识别。
+- 前端恢复时应复用原过程消息、`turnId` 和 `operationId`。`afterSequence` 取客户端最后实际收到
+  的序号，并以状态响应的 `lastSequence` 夹紧；若续跑出现第二张空过程卡或旧步骤从第 1 步重现，
+  优先检查 `activityMessageId`、`persistenceKey` 和持久日志中的 `sequence`。
 
 ### Office.js 动作断点恢复调试
 
