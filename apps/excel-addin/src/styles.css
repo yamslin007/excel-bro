@@ -2765,7 +2765,7 @@ textarea:focus-visible {
   min-height: 0;
   overflow-x: hidden;
   overflow-y: auto;
-  padding: 16px 14px 24px;
+  padding: 16px 14px 4px;
   background: var(--color-background-subtle);
   scroll-behavior: smooth;
 }
@@ -3577,6 +3577,17 @@ textarea:focus-visible {
 
 .query-result-save-button {
   min-height: 36px;
+}
+
+.query-result-card .message-text:hover {
+  transform: none;
+  box-shadow: none;
+}
+
+.query-result-card .query-result-save-button:not(:disabled):hover {
+  transform: none;
+  border-color: var(--color-border-strong);
+  background: var(--color-surface-hover);
 }
 
 .user .message-content {
@@ -5234,7 +5245,7 @@ textarea:focus-visible {
 .composer {
   z-index: 5;
   position: relative;
-  padding: 8px 10px 7px;
+  padding: 4px 10px 8px;
   border-top: 1px solid var(--color-border);
   background: rgba(255, 255, 255, 0.97);
   box-shadow: var(--shadow-sm);
@@ -5246,7 +5257,7 @@ textarea:focus-visible {
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: stretch;
   gap: 6px;
-  margin-bottom: 3px;
+  margin-bottom: 0;
 }
 
 .scope-entry-row .scope-trigger {
@@ -6225,7 +6236,7 @@ button.selected > .sheet-checkbox {
 
 .composer-input-region {
   position: relative;
-  padding-top: 7px;
+  padding-top: 8px;
 }
 
 .composer-input-region.dragging-image::after {
@@ -7199,6 +7210,13 @@ button.selected > .sheet-checkbox {
   border-top-color: color-mix(in srgb, var(--color-border) 68%, transparent);
 }
 
+.chat-shell[data-has-background="true"]
+  .query-result-card
+  .query-result-save-button:not(:disabled):hover {
+  background: color-mix(in srgb, var(--color-surface-hover) 94%, transparent);
+  border-color: color-mix(in srgb, var(--color-border-strong) 78%, transparent);
+}
+
 /* 用户气泡：跟随主题品牌色（温暖橙、宁静蓝、活力绿切换时自动协调） */
 .chat-shell[data-has-background="true"] .user .message-text {
   background: var(--color-brand-text);
@@ -7435,6 +7453,13 @@ button.selected > .sheet-checkbox {
   .chat-shell[data-has-background="true"] .user .message-text:hover {
     transform: translateY(-1px);
     box-shadow: 0 8px 22px rgba(34, 48, 40, 0.18);
+  }
+
+  .chat-shell[data-has-background="true"]
+    .query-result-card
+    .message-text:hover {
+    transform: none;
+    box-shadow: none;
   }
 }
 
