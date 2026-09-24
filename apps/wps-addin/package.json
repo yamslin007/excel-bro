@@ -1,0 +1,29 @@
+{
+	"name": "excel-bro-wps",
+	"version": "0.1.0",
+	"private": true,
+	"type": "module",
+	"addonType": "et",
+	"scripts": {
+		"dev": "vite --port 3889",
+		"debug": "wpsjs debug -p 3889",
+		"build": "tsc --noEmit && vite build",
+		"test": "vitest run",
+		"publish": "wpsjs publish"
+	},
+	"dependencies": {
+		"react": "19.1.1",
+		"react-dom": "19.1.1"
+	},
+	"devDependencies": {
+		"@types/office-js": "1.0.600",
+		"@types/react": "^19.1.10",
+		"@types/react-dom": "^19.1.7",
+		"@vitejs/plugin-react": "^4.7.0",
+		"jsdom": "^29.1.1",
+		"typescript": "^5.9.2",
+		"vite": "^7.1.7",
+		"vitest": "^3.2.4",
+		"wpsjs": "2.2.3"
+	}
+}

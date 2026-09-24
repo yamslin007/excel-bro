@@ -67,22 +67,39 @@ const API_BASE_URL =
 export interface ServiceHealth {
   status: "ok";
   configured: boolean;
-  mode: "model" | "local";
+  mode: "model";
   model: string | null;
 }
 
+/**
+ * 模型目录里的一个真实连接。
+ *
+ * 目录只包含用户实际配置的模型；未配置时 `models` 为空数组、
+ * `defaultModelId` 为 `null`。早期版本会在目录里注入一个
+ * `id: "local"` 的“基础模式”占位项，该入口已移除；此处仍保留
+ * `"local"` 只用于识别并迁移旧的本地选择记录。
+ */
 export interface ModelOption {
   id: string;
   label: string;
-  provider: "model" | "local";
+  provider: "model";
   available: boolean;
   supportsVision: boolean;
 }
 
 export interface ModelCatalog {
-  defaultModelId: string;
+  defaultModelId: string | null;
   models: ModelOption[];
 }
+
+/**
+ * 模型目录的加载状态。
+ * - `idle`：首次目录尚未加载
+ * - `loading`：正在读取模型配置
+ * - `ready`：读取成功（`models` 可能为空，代表确实没有配置模型）
+ * - `failed`：读取失败；不得当作“没有模型”，也不得覆盖已选模型
+ */
+export type ModelCatalogStatus = "idle" | "loading" | "ready" | "failed";
 
 export class ApiRequestError extends Error {
   constructor(
@@ -382,14 +399,14 @@ export async function checkHealth(): Promise<ServiceHealth | null> {
     if (
       value.status !== "ok" ||
       typeof value.configured !== "boolean" ||
-      (value.mode !== "model" && value.mode !== "local")
+      value.mode !== "model"
     ) {
       return null;
     }
     return {
       status: "ok",
       configured: value.configured,
-      mode: value.mode,
+      mode: "model",
       model: typeof value.model === "string" ? value.model : null
     };
   } catch {

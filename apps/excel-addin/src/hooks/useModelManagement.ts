@@ -17,7 +17,10 @@ import type {
 } from "../contracts";
 import { emptyModelConnectionDraft } from "../utils";
 import { MODEL_STORAGE_KEY } from "../conversation";
-import { chooseAvailableModel } from "../modelSelection";
+import {
+  chooseAvailableModel,
+  shouldPersistSelection
+} from "../modelSelection";
 
 export interface ModelConnectionDraft {
   id: string | null;
@@ -41,7 +44,7 @@ interface UseModelManagementOptions {
    */
   refreshServiceHealth: () => Promise<{
     modelOptions: ModelOption[];
-    defaultModelId?: string;
+    defaultModelId?: string | null;
   } | null>;
 }
 
@@ -76,6 +79,7 @@ export function useModelManagement(options: UseModelManagementOptions) {
   const [connectionTestFeedback, setConnectionTestFeedback] =
     useState<ConnectionTestFeedback | null>(null);
   const connectionDraftVersionRef = useRef(0);
+  const verifiedDraftVersionRef = useRef<number | null>(null);
 
   // UI 状态
   const [settingsSaving, setSettingsSaving] = useState(false);
@@ -88,6 +92,7 @@ export function useModelManagement(options: UseModelManagementOptions) {
     Dispatch<SetStateAction<ModelConnectionDraft | null>>
   >((nextDraft) => {
     connectionDraftVersionRef.current += 1;
+    verifiedDraftVersionRef.current = null;
     setConnectionTestFeedback(null);
     setConnectionDraftState(nextDraft);
   }, []);
@@ -109,6 +114,10 @@ export function useModelManagement(options: UseModelManagementOptions) {
 
   /**
    * 打开设置并加载模型设置
+   *
+   * 读取失败不返回 false 也不再阻止调用方：配置表单必须能在后台不可达时
+   * 打开，让用户先填写。失败信息写在 settingsFeedback 里，测试与保存会
+   * 发起真实请求并以本次结果更新状态。
    */
   const openSettings = useCallback(async () => {
     setShowApiKey(false);
@@ -118,27 +127,36 @@ export function useModelManagement(options: UseModelManagementOptions) {
     setSettingsLoading(true);
     try {
       setModelSettings(await getModelSettings());
+      // 读取设置成功已经证明后台可达；同时刷新健康状态/模型目录，
+      // 清除页面初始化阶段可能留下的“后台不可用”旧状态。
+      try {
+        await refreshServiceHealth();
+      } catch {
+        // 设置本身已经读取成功，目录刷新失败不应把设置页重新判成加载失败。
+      }
       return true;
     } catch (reason) {
       setModelSettings(null);
       setSettingsFeedback(
         reason instanceof Error
-          ? reason.message
-          : "无法读取模型设置，请确认本地服务已经启动。"
+          ? `暂时无法连接 Excel Bro 后台：${reason.message}。已填写内容仍保留在当前表单中，请恢复连接后重试。`
+          : "暂时无法连接 Excel Bro 后台。已填写内容仍保留在当前表单中，请恢复连接后重试。"
       );
       return false;
     } finally {
       setSettingsLoading(false);
     }
-  }, []);
+  }, [refreshServiceHealth]);
 
   /**
    * 打开连接创建器
+   *
+   * 不等待后台读取成功：即使 openSettings 失败也进入表单。用户填写完
+   * 再点“测试连接”或“添加并使用”时才发起真实请求。
    */
   const openConnectionCreator = useCallback(async () => {
-    if (await openSettings()) {
-      setConnectionDraft(emptyModelConnectionDraft());
-    }
+    await openSettings();
+    setConnectionDraft(emptyModelConnectionDraft());
   }, [openSettings]);
 
   /**
@@ -153,16 +171,19 @@ export function useModelManagement(options: UseModelManagementOptions) {
 
     // 刷新服务健康状态和模型目录
     const catalog = await refreshServiceHealth();
+    // 目录读取失败时必须保留原选择，不能依据空目录删掉仍然有效的记录。
     if (!catalog) return;
 
     setSelectedModelId((current) => {
       const next = chooseAvailableModel(
         catalog.modelOptions,
         current,
-        catalog.defaultModelId ?? "local",
+        catalog.defaultModelId,
         preferredModelId
       );
-      localStorage.setItem(MODEL_STORAGE_KEY, next);
+      if (shouldPersistSelection(current, next)) {
+        localStorage.setItem(MODEL_STORAGE_KEY, next);
+      }
       return next;
     });
   }, [refreshServiceHealth]);
@@ -249,6 +270,7 @@ export function useModelManagement(options: UseModelManagementOptions) {
       return;
     }
     const draftVersion = connectionDraftVersionRef.current;
+    verifiedDraftVersionRef.current = null;
     setSettingsTesting(true);
     setSettingsFeedback("");
     setConnectionTestFeedback(null);
@@ -259,8 +281,19 @@ export function useModelManagement(options: UseModelManagementOptions) {
         kind: result.ok ? "success" : "error",
         message: result.ok ? "连接成功，当前模型可用。" : result.message
       });
+      if (result.ok) {
+        verifiedDraftVersionRef.current = draftVersion;
+        // 连接测试成功后同步刷新目录状态。否则 WPS 首次预检失败留下的
+        // 红色“后台不可用”提示会与成功结果同时存在。
+        try {
+          await refreshServiceHealth();
+        } catch {
+          // 模型测试结果有效；辅助刷新失败不应覆盖真实测试结果。
+        }
+      }
     } catch (reason) {
       if (connectionDraftVersionRef.current !== draftVersion) return;
+      verifiedDraftVersionRef.current = null;
       setConnectionTestFeedback({
         kind: "error",
         message:
@@ -269,7 +302,7 @@ export function useModelManagement(options: UseModelManagementOptions) {
     } finally {
       setSettingsTesting(false);
     }
-  }, [connectionRequest]);
+  }, [connectionRequest, refreshServiceHealth]);
 
   /**
    * 保存连接
@@ -280,13 +313,19 @@ export function useModelManagement(options: UseModelManagementOptions) {
       setSettingsFeedback("请填写连接名称、服务地址和模型 ID。");
       return;
     }
+    if (verifiedDraftVersionRef.current !== connectionDraftVersionRef.current) {
+      setConnectionTestFeedback({
+        kind: "error",
+        message: "请先测试连接并确认成功，再添加或保存。"
+      });
+      return;
+    }
     const wasCreating = !connectionDraft.id;
     const previousConnectionIds = new Set(
       modelSettings?.connections.map((connection) => connection.id) ?? []
     );
     setSettingsSaving(true);
     setSettingsFeedback("");
-    setConnectionTestFeedback(null);
     try {
       const saved = await saveModelConnection(request);
       const createdConnection = wasCreating
@@ -360,6 +399,34 @@ export function useModelManagement(options: UseModelManagementOptions) {
     }
   }, [refreshModelsAfterSettings]);
 
+  /**
+   * 按最新目录迁移已保存的选择。
+   *
+   * 目录**加载成功后**才调用：此时旧的 `local` 记录或指向已删除连接的选择
+   * 会被迁移到当前有效模型；目录为空则回到未配置状态（空选择）。
+   * 目录加载失败时调用方不得调用本函数。
+   */
+  const migrateModelSelection = useCallback(
+    (catalog: { modelOptions: ModelOption[]; defaultModelId?: string | null }) => {
+      setSelectedModelId((current) => {
+        const next = chooseAvailableModel(
+          catalog.modelOptions,
+          current,
+          catalog.defaultModelId
+        );
+        if (shouldPersistSelection(current, next)) {
+          try {
+            localStorage.setItem(MODEL_STORAGE_KEY, next);
+          } catch {
+            // 存储不可用时本次会话仍使用解析后的选择。
+          }
+        }
+        return next;
+      });
+    },
+    []
+  );
+
   return {
     // 状态
     selectedModelId,
@@ -373,6 +440,9 @@ export function useModelManagement(options: UseModelManagementOptions) {
     settingsLoading,
     settingsFeedback,
     connectionTestFeedback,
+    connectionVerified:
+      connectionTestFeedback?.kind === "success" &&
+      verifiedDraftVersionRef.current === connectionDraftVersionRef.current,
     modelGuideDismissed,
 
     // 操作
@@ -386,6 +456,7 @@ export function useModelManagement(options: UseModelManagementOptions) {
     saveConnection,
     removeConnection,
     saveFormulaModel,
+    migrateModelSelection,
 
     // 状态设置（给特殊场景使用）
     setSelectedModelId,

@@ -13,10 +13,11 @@ from openpyxl import Workbook
 
 import server.app.main as main_module
 import server.app.llm.config as llm_config
+import server.app.planner as planner_module
 import server.app.folder_workbooks as folder_workbooks_module
 from server.app.main import app
 from server.app.llm import ModelConnection, selected_model_config
-from server.app.models import AnswerResponse
+from server.app.models import AnswerResponse, IntentProceedResponse
 from server.app.turn_state import turn_registry
 
 
@@ -46,16 +47,89 @@ def clear_model_environment(
     )
 
 
-def test_health_reports_local_mode_without_model_config() -> None:
+def test_health_reports_unconfigured_model_without_basic_mode() -> None:
+    """未配置任何外部模型时，健康状态必须如实表达「没有模型」。
+
+    历史上这里返回 mode="local"，等价于把「基础模式」当成一种可用模型，
+    会让前台认为已经选好了模型。现在只保留唯一模式 "model"，
+    用 configured=False 表达尚未配置。
+    """
+
     response = TestClient(app).get("/health")
 
     assert response.status_code == 200
     assert response.json() == {
         "status": "ok",
         "configured": False,
-        "mode": "local",
+        "mode": "model",
         "model": None,
     }
+
+
+def _intent_payload(prompt: str, sheet_count: int = 2) -> dict[str, object]:
+    """构造一个「已经没有可用模型」的 /api/intent 请求。
+
+    modelId 留空是唯一诚实的表达：目录里已经不存在 local 占位项，
+    旧客户端缓存下来的 "local" 会被服务端等同为「没有选择模型」，
+    两条路径都必须走到同一个「尚未配置模型」拒绝语义。
+    """
+
+    return {
+        "prompt": prompt,
+        "scope": {
+            "workbookName": "电影报表.xlsx",
+            "sourceMode": "workbook",
+            "selectionMode": "manual",
+            "activeWorksheet": "恐怖游轮",
+            "selectedRange": "恐怖游轮!A1:E19",
+            "totalWorksheetCount": sheet_count,
+            "worksheetNames": [f"影片{index + 1}" for index in range(sheet_count)],
+            "sheets": [
+                {
+                    "name": f"影片{index + 1}",
+                    "usedRange": f"影片{index + 1}!A1:E20",
+                    "rowCount": 20,
+                    "columnCount": 5,
+                    "headers": [
+                        "影院名称",
+                        "影院编码",
+                        "影片名称",
+                        "计数项:影厅",
+                        "占比",
+                    ],
+                }
+                for index in range(sheet_count)
+            ],
+        },
+        "imageCount": 0,
+        "modelId": "",
+    }
+
+
+def _turn_completion_payload(turn_id: str, **overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "turnId": turn_id,
+        "prompt": "查看当前数据",
+        "workbook": {
+            "name": "通用数据.xlsx",
+            "capturedAt": "2026-07-26T00:00:00.000Z",
+            "activeWorksheet": "数据",
+            "selectedRange": "数据!A1:B2",
+            "worksheets": [
+                {
+                    "name": "数据",
+                    "usedRange": "数据!A1:B2",
+                    "rowCount": 2,
+                    "columnCount": 2,
+                    "headers": ["分类", "数值"],
+                    "dataRows": [["甲", 10]],
+                }
+            ],
+        },
+        "modelId": "",
+    }
+    payload.update(overrides)
+    return payload
 
 
 def _office_plan(action: dict[str, object]) -> dict[str, object]:
@@ -267,9 +341,11 @@ def test_health_reports_model_without_exposing_key(
     assert "secret-value" not in response.text
 
 
-def test_model_catalog_includes_local_and_allowlisted_models(
+def test_model_catalog_lists_allowlisted_models_without_a_local_placeholder(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """目录里只能出现真实连接，不能再有 "local" 这个产品入口占位项。"""
+
     monkeypatch.setenv("AI_BASE_URL", "https://api.example.test/v1")
     monkeypatch.setenv("AI_MODEL", "default-model")
     monkeypatch.setenv("AI_MODELS", "fast-model, default-model, reasoning-model")
@@ -280,13 +356,6 @@ def test_model_catalog_includes_local_and_allowlisted_models(
     assert response.json() == {
         "defaultModelId": "default-model",
         "models": [
-            {
-                "id": "local",
-                "label": "基础模式",
-                "provider": "local",
-                "available": True,
-                "supportsVision": False,
-            },
             {
                 "id": "default-model",
                 "label": "default-model",
@@ -310,6 +379,21 @@ def test_model_catalog_includes_local_and_allowlisted_models(
             },
         ],
     }
+    assert "local" not in response.text
+    assert "基础模式" not in response.text
+
+
+def test_model_catalog_is_empty_and_has_no_default_without_any_model() -> None:
+    """一条真实连接都没有时，目录必须是空的、默认值必须是 null。
+
+    这对应「成功但为空」这一态：不能凭空补一个默认选择，
+    否则界面会显示一个并不存在的模型。
+    """
+
+    response = TestClient(app).get("/api/models")
+
+    assert response.status_code == 200
+    assert response.json() == {"defaultModelId": None, "models": []}
 
 
 def test_model_api_key_can_be_updated_without_exposing_it(
@@ -419,15 +503,38 @@ def test_managed_model_connections_have_independent_credentials(
     )
     assert deleted.status_code == 200
     assert deleted.json()["connections"] == []
-    assert TestClient(app).get("/api/models").json()["models"] == [
-        {
-            "id": "local",
-            "label": "基础模式",
-            "provider": "local",
-            "available": True,
+
+    # 删除最后一个连接后，目录回到「成功但为空」，默认值为 null：
+    # 不能因为删光了就退回一个并不存在的默认模型。
+    empty_catalog = TestClient(app).get("/api/models").json()
+    assert empty_catalog == {"defaultModelId": None, "models": []}
+
+    # 已删除连接的 id 不再可用：查询路径返回 None；
+    # 写入路径抛稳定错误（此时一个连接都没有，命中的是「尚未配置」）。
+    # 两条路径都不静默回落到某个别的模型。
+    assert llm_config.resolve_model_config(connection["catalogModelId"]) is None
+    with pytest.raises(llm_config.ModelNotConfiguredError):
+        llm_config.selected_model_config(connection["catalogModelId"])
+
+    # 留一条别的连接后，目录非空，此时「已删除的 id」才是 ModelNotAvailableError，
+    # 与「一条都没有」区分开——前台据此提示「该连接已失效」而不是「去添加模型」。
+    surviving = TestClient(app).post(
+        "/api/settings/model/connections",
+        json={
+            "label": "Kimi",
+            "baseUrl": "https://api.moonshot.cn/v1",
+            "modelId": "moonshot-v1-8k",
+            "apiKey": "surviving-key",
             "supportsVision": False,
-        }
-    ]
+        },
+    ).json()["connections"][0]
+    assert surviving["catalogModelId"] != connection["catalogModelId"]
+
+    still_gone = connection["catalogModelId"]
+    with pytest.raises(llm_config.ModelNotAvailableError):
+        llm_config.selected_model_config(still_gone)
+    assert llm_config.resolve_model_config(still_gone) is None
+    assert llm_config.resolve_model_config(surviving["catalogModelId"]) is not None
 
 
 def test_model_connection_can_be_tested_without_saving(
@@ -525,12 +632,13 @@ def test_model_vision_capability_requires_explicit_configuration(
     monkeypatch.setenv("AI_BASE_URL", "https://api.example.test/v1")
     monkeypatch.setenv("AI_MODEL", "vision-looking-name")
 
+    # 目录里只有真实连接，第一项就是它本身（不再有 local 占位项顶在前面）。
     unconfigured = TestClient(app).get("/api/models").json()
-    assert unconfigured["models"][1]["supportsVision"] is False
+    assert unconfigured["models"][0]["supportsVision"] is False
 
     monkeypatch.setenv("AI_VISION_MODELS", "vision-looking-name")
     configured = TestClient(app).get("/api/models").json()
-    assert configured["models"][1]["supportsVision"] is True
+    assert configured["models"][0]["supportsVision"] is True
 
 
 def test_folder_refresh_endpoint_keeps_session_id(tmp_path: Path) -> None:
@@ -648,55 +756,153 @@ def test_folder_backup_management_rejects_unknown_session() -> None:
     assert delete_response.json()["detail"]["code"] == "FOLDER_BACKUP_DELETE_ERROR"
 
 
-def _intent_payload(prompt: str, sheet_count: int = 2) -> dict[str, object]:
-    return {
-        "prompt": prompt,
-        "scope": {
-            "workbookName": "电影报表.xlsx",
-            "sourceMode": "workbook",
-            "selectionMode": "manual",
-            "activeWorksheet": "恐怖游轮",
-            "selectedRange": "恐怖游轮!A1:E19",
-            "totalWorksheetCount": sheet_count,
-            "worksheetNames": [f"影片{index + 1}" for index in range(sheet_count)],
-            "sheets": [
+def _expect_model_not_configured(response: httpx.Response) -> None:
+    """断言一次「没有可用模型」的调用被明确拒绝，而不是静默降级。
+
+    旧行为是悄悄回落到基础模式并返回 200；现在必须是稳定错误码 409。
+    文案必须给出可执行的下一步（服务地址 / 模型 ID / API Key），
+    而不是含糊的「请求无效」。
+    """
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["code"] == "MODEL_NOT_CONFIGURED"
+    assert "服务地址" in detail["message"]
+    assert "API Key" in detail["message"]
+
+
+# 测试里反复使用的「已配置模型」目录 id。
+_CONFIGURED_MODEL_ID = "connection:test-primary"
+
+
+def _configure_single_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    """给当前测试装一条可用的真实模型连接。
+
+    需要同时换掉三处，因为它们各自持有不同的引用：
+
+    - ``planner_module.selected_model_config``：planner 是
+      ``from .llm import selected_model_config`` 的模块级引用，且现在要求
+      "不可用时抛错"（返回 None 会让它当成解析失败）。
+    - ``main_module.resolve_model_config``：``/api/turn`` 的意图分支用它查
+      "当前有没有可用模型"。
+    - ``main_module.selected_model_config``：``/api/intent`` 端点直接用。
+    """
+
+    connection = ModelConnection(
+        base_url="https://api.example.test/v1",
+        model="test-primary",
+        api_key="test-secret",
+        supports_vision=False,
+    )
+
+    def resolve(model_id: str | None) -> ModelConnection:
+        if model_id == _CONFIGURED_MODEL_ID:
+            return connection
+        raise llm_config.ModelNotAvailableError(
+            f"指定的模型「{model_id}」不存在或已被删除。"
+        )
+
+    monkeypatch.setattr(
+        main_module,
+        "model_settings_view",
+        lambda: {
+            "connections": [
                 {
-                    "name": f"影片{index + 1}",
-                    "usedRange": f"影片{index + 1}!A1:E20",
-                    "rowCount": 20,
-                    "columnCount": 5,
-                    "headers": [
-                        "影院名称",
-                        "影院编码",
-                        "影片名称",
-                        "计数项:影厅",
-                        "占比",
-                    ],
+                    "catalogModelId": _CONFIGURED_MODEL_ID,
+                    "label": "测试模型",
+                    "modelId": "test-primary",
+                    "supportsVision": False,
                 }
-                for index in range(sheet_count)
-            ],
+            ]
         },
-        "imageCount": 0,
-        "modelId": "local",
-    }
+    )
+    monkeypatch.setattr(planner_module, "selected_model_config", resolve)
+    monkeypatch.setattr(main_module, "selected_model_config", resolve)
+    monkeypatch.setattr(main_module, "resolve_model_config", resolve)
 
 
-def test_local_intent_fallback_does_not_apply_business_specific_rules() -> None:
+def _expect_model_not_configured(response: httpx.Response) -> None:
+    """断言一次「没有可用模型」的调用被明确拒绝，而不是静默降级。
+
+    旧行为是悄悄回落到基础模式并返回 200；现在必须是稳定错误码 409。
+    文案必须给出可执行的下一步（服务地址 / 模型 ID / API Key），
+    而不是含糊的「请求无效」。
+    """
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["code"] == "MODEL_NOT_CONFIGURED"
+    assert "服务地址" in detail["message"]
+    assert "API Key" in detail["message"]
+
+
+def test_semantic_intent_is_rejected_without_a_configured_model() -> None:
+    """语义请求在无模型时必须显式失败，不得静默降级为基础模式。"""
+
     response = TestClient(app).post(
         "/api/intent",
         json=_intent_payload("找出占比最高的一个电影"),
     )
 
-    assert response.status_code == 200
-    value = response.json()
-    assert value["kind"] == "proceed"
-    assert value["provider"] == "local"
+    _expect_model_not_configured(response)
 
 
-def test_turn_endpoint_preserves_turn_id_across_decisions() -> None:
+def test_turn_endpoint_rejects_semantic_prompt_without_model() -> None:
+    assert TestClient(app).post(
+        "/api/intent",
+        json=_intent_payload("查看当前数据"),
+    ).status_code == 409
+
+
+def _stub_planner_answer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """把真正的模型调用换成固定应答。
+
+    这些用例校验的是 turnId / 幂等等协议语义，不该真的发网络请求；
+    但必须保留「有模型」的前提，否则会先被 MODEL_NOT_CONFIGURED 拦住。
+    """
+
+    async def fake_create_plan(
+        _request: object,
+        *,
+        tool_cache: object = None,
+        on_event=None,
+        **_options: object,
+    ) -> AnswerResponse:
+        return AnswerResponse(
+            kind="answer",
+            message="查看完成",
+            provider="model",
+        )
+
+    async def fake_check_intent(
+        _request: object, **_kwargs: object
+    ) -> IntentProceedResponse:
+        return IntentProceedResponse(
+            kind="proceed",
+            summary="查看当前数据",
+            confirmedPrompt="查看当前数据",
+            provider="model",
+        )
+
+    monkeypatch.setattr(planner_module, "create_plan", fake_create_plan)
+    monkeypatch.setattr(main_module, "create_plan", fake_create_plan)
+    monkeypatch.setattr(main_module, "check_intent", fake_check_intent)
+
+
+def test_turn_endpoint_preserves_turn_id_across_decisions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """turnId 跨「决策 → 完成」两阶段的语义不变，与模型选择无关。
+
+    这里给一个已配置的模型，让请求能走到真正的规划路径；
+    「没有模型」的拒绝语义由 test_turn_endpoint_rejects_semantic_prompt_without_model 覆盖。
+    """
+
+    _configure_single_model(monkeypatch)
+    _stub_planner_answer(monkeypatch)
     first = TestClient(app).post(
         "/api/turn",
-        json=_intent_payload("查看当前数据"),
+        json={**_intent_payload("查看当前数据"), "modelId": _CONFIGURED_MODEL_ID},
     )
 
     assert first.status_code == 200
@@ -705,39 +911,20 @@ def test_turn_endpoint_preserves_turn_id_across_decisions() -> None:
 
     payload = _intent_payload("继续查看")
     payload["turnId"] = turn_id
+    payload["modelId"] = _CONFIGURED_MODEL_ID
     second = TestClient(app).post("/api/turn", json=payload)
 
     assert second.status_code == 200
     assert second.json()["turnId"] == turn_id
 
 
-def test_turn_completion_is_idempotent() -> None:
-    decision = TestClient(app).post(
-        "/api/turn",
-        json=_intent_payload("查看当前数据"),
-    )
-    turn_id = decision.json()["turnId"]
-    completion = {
-        "turnId": turn_id,
-        "prompt": "查看当前数据",
-        "workbook": {
-            "name": "通用数据.xlsx",
-            "capturedAt": "2026-07-26T00:00:00.000Z",
-            "activeWorksheet": "数据",
-            "selectedRange": "数据!A1:B2",
-            "worksheets": [
-                {
-                    "name": "数据",
-                    "usedRange": "数据!A1:B2",
-                    "rowCount": 2,
-                    "columnCount": 2,
-                    "headers": ["分类", "数值"],
-                    "dataRows": [["甲", 10]],
-                }
-            ],
-        },
-        "modelId": "local",
-    }
+def test_turn_completion_is_idempotent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_single_model(monkeypatch)
+    _stub_planner_answer(monkeypatch)
+    completion = _turn_completion_payload("turn-idempotent-test")
+    completion["modelId"] = _CONFIGURED_MODEL_ID
 
     first = TestClient(app).post("/api/turn", json=completion)
     repeated = TestClient(app).post("/api/turn", json=completion)
@@ -772,29 +959,11 @@ def test_concurrent_turn_completion_only_runs_planner_once(
         return AnswerResponse(
             kind="answer",
             message="完成",
-            provider="local",
+            provider="model",
         )
 
     monkeypatch.setattr(main_module, "create_plan", fake_create_plan)
-    completion = {
-        "turnId": "turn-concurrent-test",
-        "prompt": "查看当前数据",
-        "workbook": {
-            "name": "通用数据.xlsx",
-            "capturedAt": "2026-07-26T00:00:00.000Z",
-            "activeWorksheet": "数据",
-            "worksheets": [
-                {
-                    "name": "数据",
-                    "rowCount": 2,
-                    "columnCount": 2,
-                    "headers": ["分类", "数值"],
-                    "dataRows": [["甲", 10]],
-                }
-            ],
-        },
-        "modelId": "local",
-    }
+    completion = _turn_completion_payload("turn-concurrent-test")
 
     async def run_requests() -> list[httpx.Response]:
         transport = httpx.ASGITransport(app=app)
@@ -847,7 +1016,7 @@ _STREAM_PAYLOAD = {
             }
         ],
     },
-    "modelId": "local",
+    "modelId": "",
 }
 
 
@@ -870,7 +1039,7 @@ def test_turn_stream_emits_steps_then_result(
                     "completedStep": "已查看工作簿结构",
                 }
             )
-        return AnswerResponse(kind="answer", message="完成", provider="local")
+        return AnswerResponse(kind="answer", message="完成", provider="model")
 
     monkeypatch.setattr(main_module, "create_plan", fake_create_plan)
 
@@ -1799,7 +1968,13 @@ def test_turn_stream_rejects_intent_request() -> None:
     assert response.json()["detail"]["code"] == "INVALID_REQUEST"
 
 
-def test_intent_check_allows_explicit_multi_sheet_ratio_request() -> None:
+def test_intent_check_is_rejected_without_a_model_even_when_prompt_is_explicit() -> None:
+    """即使提示词已经足够明确（不需要模型澄清），无模型时也必须拒绝。
+
+    这里曾经返回 200 + provider="local"，等于用规则路径冒充一次模型判断。
+    现在统一走 MODEL_NOT_CONFIGURED，前端据此提示「添加模型」。
+    """
+
     response = TestClient(app).post(
         "/api/intent",
         json=_intent_payload(
@@ -1807,26 +1982,23 @@ def test_intent_check_allows_explicit_multi_sheet_ratio_request() -> None:
         ),
     )
 
-    assert response.status_code == 200
-    assert response.json() == {
-        "kind": "proceed",
-        "summary": "按电影汇总后重新计算整体占比，找出占比最高的电影",
-        "confirmedPrompt": "按电影汇总后重新计算整体占比，找出占比最高的电影",
-        "provider": "local",
-    }
+    _expect_model_not_configured(response)
 
 
-def test_confirmed_intent_is_not_clarified_again() -> None:
+def test_confirmed_intent_still_requires_a_configured_model() -> None:
+    """用户已确认意图也不能绕过模型检查。"""
+
     payload = _intent_payload("找出占比最高的一个电影")
     payload["intentConfirmed"] = True
 
     response = TestClient(app).post("/api/intent", json=payload)
 
-    assert response.status_code == 200
-    assert response.json()["kind"] == "proceed"
+    _expect_model_not_configured(response)
 
 
-def test_local_intent_fallback_does_not_special_case_sheet_names() -> None:
+def test_intent_rejection_does_not_special_case_a_single_sheet_workbook() -> None:
+    """单工作表（自动选区）同样按「没有模型」拒绝，不因表数而走特殊路径。"""
+
     payload = _intent_payload("找出占比最高的一个电影", sheet_count=1)
     scope = payload["scope"]
     assert isinstance(scope, dict)
@@ -1839,10 +2011,7 @@ def test_local_intent_fallback_does_not_special_case_sheet_names() -> None:
 
     response = TestClient(app).post("/api/intent", json=payload)
 
-    assert response.status_code == 200
-    value = response.json()
-    assert value["kind"] == "proceed"
-    assert value["provider"] == "local"
+    _expect_model_not_configured(response)
 
 
 def test_model_intent_retries_invalid_structure_and_keeps_prior_intent(

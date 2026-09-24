@@ -9,7 +9,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from .capabilities import capability_int, model_timeout_seconds
-from .llm import ModelConnection, OpenAICompatibleClient
+from .llm import ModelConnection, ModelNotConfiguredError, OpenAICompatibleClient
 from .models import (
     IntentCheckRequest,
     IntentCheckResponse,
@@ -239,10 +239,11 @@ async def check_intent(
         return deterministic
     read_only_required = is_explicit_read_only_query(request.prompt)
     if config is None:
-        return IntentProceedResponse(
-            provider="local",
-            summary=request.prompt,
-            confirmedPrompt=request.prompt,
+        # 普通 Agent 请求缺少模型时必须明确失败，不能静默把原需求当作
+        # “已确认”放行——那会让用户以为模型已经理解了这个需求。
+        raise ModelNotConfiguredError(
+            "尚未配置模型，无法理解这条需求。请点击「添加模型」，"
+            "填写服务地址、模型 ID 和 API Key 后重试。"
         )
 
     scope_payload: dict[str, Any] = request.scope.model_dump()

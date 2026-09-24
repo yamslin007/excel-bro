@@ -114,6 +114,9 @@ from .llm import (
     model_status,
     ModelConnectionNotFoundError,
     ModelConnectionStoreError,
+    ModelNotAvailableError,
+    ModelNotConfiguredError,
+    resolve_model_config,
     selected_model_config,
     set_formula_model_id,
     test_model_connection,
@@ -170,6 +173,13 @@ ALLOWED_ORIGINS = [
     "https://127.0.0.1:3000",
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    "http://localhost:3889",
+    "http://127.0.0.1:3889",
+    # 兼容修复前由 apps/wps-addin/package.json 启动的 3890 开发页。
+    # 新的 WPS 调试入口统一使用 3889；这里保留精确回环来源，避免已打开
+    # 的任务窗格在热更新后仍因 CORS 预检失败而只能显示 Failed to fetch。
+    "http://localhost:3890",
+    "http://127.0.0.1:3890",
 ]
 
 app.add_middleware(
@@ -331,6 +341,10 @@ def _map_turn_error(error: Exception) -> tuple[int, str, str, bool]:
         return (502, "MODEL_CONNECTION_ERROR", str(error), True)
     if isinstance(error, TurnStateError):
         return (409, error.code, str(error), False)
+    if isinstance(error, ModelNotConfiguredError):
+        return (409, "MODEL_NOT_CONFIGURED", str(error), False)
+    if isinstance(error, ModelNotAvailableError):
+        return (409, "MODEL_NOT_AVAILABLE", str(error), False)
     if isinstance(error, ValueError):
         return (422, "INVALID_REQUEST", str(error), False)
     raise error
@@ -595,7 +609,7 @@ async def turn(request: TurnRequest) -> TurnResponse:
             turn_registry.ensure_decision_allowed(turn_id)
             response = await check_intent(
                 request,
-                config=selected_model_config(request.modelId),
+                config=resolve_model_config(request.modelId),
             )
             turn_registry.record_decision(turn_id, response)
         else:
@@ -615,6 +629,8 @@ async def turn(request: TurnRequest) -> TurnResponse:
         LLMHTTPStatusError,
         LLMTransportError,
         LLMResponseError,
+        ModelNotConfiguredError,
+        ModelNotAvailableError,
         TurnStateError,
         ValueError,
     ) as error:
@@ -1386,6 +1402,8 @@ async def _planning_task_stream(
             LLMHTTPStatusError,
             LLMTransportError,
             LLMResponseError,
+            ModelNotConfiguredError,
+            ModelNotAvailableError,
             TurnStateError,
             ValueError,
         ) as error:
@@ -1628,17 +1646,17 @@ async def planning_task_continue_stream(
             )
         try:
             fallback_config = selected_model_config(selected_model_id)
-        except ValueError as error:
+        except ModelNotConfiguredError as error:
+            raise service_error(
+                409,
+                "MODEL_NOT_CONFIGURED",
+                str(error),
+                retryable=False,
+            ) from error
+        except ModelNotAvailableError as error:
             raise service_error(
                 409, "MODEL_SWITCH_NOT_ALLOWED", str(error), retryable=False
             ) from error
-        if fallback_config is None:
-            raise service_error(
-                409,
-                "MODEL_SWITCH_NOT_ALLOWED",
-                "基础模式不能接续需要模型工具调用的规划现场。",
-                retryable=False,
-            )
         if existing.request.get("images") and not fallback_config.supports_vision:
             raise service_error(
                 409,
@@ -2830,6 +2848,15 @@ async def intent(request: IntentCheckRequest) -> IntentCheckResponse:
             request,
             config=selected_model_config(request.modelId),
         )
+    except (ModelNotConfiguredError, ModelNotAvailableError) as error:
+        # 与 /api/turn、/api/turn/stream 走同一套映射：
+        # 「没有可用模型」必须是可识别的稳定错误码，而不是泛化的 INVALID_REQUEST。
+        # retryable 取映射结果（当前为 False —— 需要用户先去配置模型，
+        # 原样重试不会成功；文案里已给出配置路径）。
+        status, code, message, retryable = _map_turn_error(error)
+        raise service_error(
+            status, code, message, retryable=retryable
+        ) from error
     except LLMTimeoutError as error:
         raise HTTPException(
             status_code=504,

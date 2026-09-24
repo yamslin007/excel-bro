@@ -1773,9 +1773,13 @@ class IntentCheckRequest(BaseModel):
     priorIntent: IntentMemory | None = None
     priorResult: ResultContext | None = None
     toolFailure: IntentToolFailure | None = None
+    # modelId 缺省/空串都表示「本次没有选择任何模型」——这不是缺参数，
+    # 而是一种合法状态：服务端会据此返回 MODEL_NOT_CONFIGURED，让前台
+    # 引导用户去「添加模型」，而不是静默回落到基础模式。
+    # 旧版加载项缓存的 "local" 会被 config 层归一化成同一状态。
     modelId: Annotated[
         str,
-        StringConstraints(strip_whitespace=True, min_length=1, max_length=200),
+        StringConstraints(strip_whitespace=True, max_length=200),
     ] | None = None
 
     @field_validator("priorResult")
@@ -1965,9 +1969,11 @@ class PlanRequest(BaseModel):
     images: list[ImageAttachment] = Field(default_factory=list, max_length=3)
     dataResults: list[DataToolResult] = Field(default_factory=list, max_length=5)
     planningReadPolicy: Literal["ifNeeded", "none"] = "ifNeeded"
+    # 与 IntentCheckRequest 一致：缺省/空串 = 本次没有选择模型，
+    # 由 planner 决定是抛 MODEL_NOT_CONFIGURED 还是走纯本地确定性工具。
     modelId: Annotated[
         str,
-        StringConstraints(strip_whitespace=True, min_length=1, max_length=200),
+        StringConstraints(strip_whitespace=True, max_length=200),
     ] | None = None
 
 

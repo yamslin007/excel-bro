@@ -1333,7 +1333,7 @@ textarea:focus-visible {
   background: #a7aea9;
 }
 
-.base-mode-icon {
+.model-status-icon {
   width: 12px;
   height: 12px;
   flex: 0 0 12px;
@@ -1344,15 +1344,11 @@ textarea:focus-visible {
   stroke-width: 1.3;
 }
 
-.brand-copy span.base-mode {
-  color: #77837b;
-}
-
 .brand-copy span.model-online {
   color: #216f3d;
 }
 
-.base-mode-help-button {
+.model-help-button {
   display: grid;
   width: 16px;
   height: 16px;
@@ -1366,12 +1362,12 @@ textarea:focus-visible {
   padding: 0;
 }
 
-.base-mode-help-button:hover {
+.model-help-button:hover {
   background: #edf3ef;
   color: #216f3d;
 }
 
-.base-mode-help-button svg {
+.model-help-button svg {
   width: 14px;
   height: 14px;
   fill: none;
@@ -1479,27 +1475,16 @@ textarea:focus-visible {
   background: var(--color-text-tertiary);
 }
 
-.model-menu > button .base-mode-icon {
-  color: var(--color-text-secondary);
-}
-
 .model-menu > button .model-option-copy {
   display: grid;
   min-width: 0;
   gap: 1px;
 }
 
-.model-menu > button .model-option-copy > span,
-.model-menu > button .model-option-copy small {
+.model-menu > button .model-option-copy > span {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.model-menu > button .model-option-copy small {
-  color: #77837b;
-  font-size: var(--font-size-caption);
-  line-height: var(--line-height-caption);
 }
 
 .model-menu > button[aria-checked="true"] i {
@@ -7873,11 +7858,11 @@ button.selected > .sheet-checkbox {
   stroke-width: 1.5;
 }
 
-.base-mode-icon {
+.model-status-icon {
   stroke-width: 1.5;
 }
 
-.base-mode-help-button svg {
+.model-help-button svg {
   width: 16px;
   height: 16px;
 }

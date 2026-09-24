@@ -150,13 +150,6 @@ describe("service discovery", () => {
             defaultModelId: "configured-model",
             models: [
               {
-                id: "local",
-                label: "基础模式",
-                provider: "local",
-                available: true,
-                supportsVision: false
-              },
-              {
                 id: "configured-model",
                 label: "configured-model",
                 provider: "model",
@@ -173,7 +166,26 @@ describe("service discovery", () => {
     const catalog = await listModels();
 
     expect(catalog.defaultModelId).toBe("configured-model");
-    expect(catalog.models).toHaveLength(2);
+    expect(catalog.models).toHaveLength(1);
+    expect(catalog.models[0].id).toBe("configured-model");
+  });
+
+  it("represents an unconfigured catalog as an empty list with a null default", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({ defaultModelId: null, models: [] }),
+          { status: 200 }
+        )
+      )
+    );
+
+    const catalog = await listModels();
+
+    // 未配置不再是“基础模式”占位项，而是明确的空目录。
+    expect(catalog.models).toEqual([]);
+    expect(catalog.defaultModelId).toBeNull();
   });
 
   it("reads masked model settings without receiving the complete key", async () => {

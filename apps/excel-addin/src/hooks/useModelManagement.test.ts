@@ -37,9 +37,15 @@ vi.mock("../conversation", () => ({
   MODEL_STORAGE_KEY: "excel-bro.model.v2"
 }));
 
-vi.mock("../modelSelection", () => ({
-  chooseAvailableModel: vi.fn()
-}));
+vi.mock("../modelSelection", async () => {
+  const actual = await vi.importActual<typeof import("../modelSelection")>(
+    "../modelSelection"
+  );
+  return {
+    ...actual,
+    chooseAvailableModel: vi.fn()
+  };
+});
 
 const getModelSettingsMock = vi.mocked(getModelSettings);
 const updateModelSettingsMock = vi.mocked(updateModelSettings);
@@ -144,7 +150,7 @@ describe("useModelManagement", () => {
   });
 
   it("should load model settings", async () => {
-    const { result } = renderModelManagement();
+    const { result, refreshServiceHealth } = renderModelManagement();
 
     await act(async () => {
       await result.current.openSettings();
@@ -152,6 +158,7 @@ describe("useModelManagement", () => {
 
     expect(result.current.modelSettings).toEqual(modelSettings);
     expect(result.current.settingsLoading).toBe(false);
+    expect(refreshServiceHealth).toHaveBeenCalledTimes(1);
   });
 
   it("should open connection creator after loading settings", async () => {
@@ -162,6 +169,82 @@ describe("useModelManagement", () => {
     });
 
     expect(result.current.connectionDraft).toEqual(emptyDraft);
+  });
+
+  it("still opens the connection form when the backend cannot be read", async () => {
+    getModelSettingsMock.mockRejectedValueOnce(new Error("Failed to fetch"));
+    const { result } = renderModelManagement();
+
+    await act(async () => {
+      await result.current.openConnectionCreator();
+    });
+
+    // 表单必须能打开：不能因为后台读取失败就把用户挡在门外。
+    expect(result.current.connectionDraft).toEqual(emptyDraft);
+    expect(result.current.settingsFeedback).toContain("已填写内容仍保留");
+  });
+
+  it("keeps an opened draft when the save request fails", async () => {
+    saveModelConnectionMock.mockRejectedValueOnce(new Error("保存失败"));
+    const { result } = renderModelManagement();
+
+    act(() =>
+      result.current.setConnectionDraft({
+        id: null,
+        label: "New",
+        baseUrl: "https://api.example.com",
+        modelId: "gpt-4.1",
+        apiKey: "sk-test",
+        clearApiKey: false,
+        supportsVision: true
+      })
+    );
+    await act(async () => {
+      await result.current.verifyConnection();
+    });
+    await act(async () => {
+      await result.current.saveConnection();
+    });
+
+    // 失败保留当前表单内容，且不得伪造成功。
+    expect(result.current.connectionDraft).toMatchObject({
+      label: "New",
+      modelId: "gpt-4.1"
+    });
+    expect(result.current.settingsFeedback).toBe("保存失败");
+  });
+
+  it("allows retrying a failed save with the same draft", async () => {
+    saveModelConnectionMock
+      .mockRejectedValueOnce(new Error("后台未就绪"))
+      .mockResolvedValueOnce(modelSettings);
+    const { result } = renderModelManagement();
+
+    act(() =>
+      result.current.setConnectionDraft({
+        id: null,
+        label: "New",
+        baseUrl: "https://api.example.com",
+        modelId: "gpt-4.1",
+        apiKey: "sk-test",
+        clearApiKey: false,
+        supportsVision: true
+      })
+    );
+    await act(async () => {
+      await result.current.verifyConnection();
+    });
+    await act(async () => {
+      await result.current.saveConnection();
+    });
+    expect(result.current.connectionDraft).not.toBeNull();
+
+    await act(async () => {
+      await result.current.saveConnection();
+    });
+
+    expect(saveModelConnectionMock).toHaveBeenCalledTimes(2);
+    expect(result.current.connectionDraft).toBeNull();
   });
 
   it("should populate draft when editing an existing connection", async () => {
@@ -184,7 +267,7 @@ describe("useModelManagement", () => {
   });
 
   it("should test a connection", async () => {
-    const { result } = renderModelManagement();
+    const { result, refreshServiceHealth } = renderModelManagement();
 
     act(() =>
       result.current.setConnectionDraft({
@@ -208,6 +291,7 @@ describe("useModelManagement", () => {
       kind: "success",
       message: "连接成功，当前模型可用。"
     });
+    expect(refreshServiceHealth).toHaveBeenCalledTimes(1);
   });
 
   it("should clear a stale connection test result after editing the draft", async () => {
@@ -239,7 +323,7 @@ describe("useModelManagement", () => {
 
   it("should show connection test failures next to the editor actions", async () => {
     testModelConnectionMock.mockRejectedValueOnce(new Error("API Key 无效。"));
-    const { result } = renderModelManagement();
+    const { result, refreshServiceHealth } = renderModelManagement();
 
     act(() =>
       result.current.setConnectionDraft({
@@ -261,6 +345,7 @@ describe("useModelManagement", () => {
       message: "API Key 无效。"
     });
     expect(result.current.settingsFeedback).toBe("");
+    expect(refreshServiceHealth).not.toHaveBeenCalled();
   });
 
   it("should save an API key and refresh models", async () => {
@@ -291,6 +376,9 @@ describe("useModelManagement", () => {
         supportsVision: true
       })
     );
+    await act(async () => {
+      await result.current.verifyConnection();
+    });
 
     await act(async () => {
       await result.current.saveConnection();
@@ -299,6 +387,65 @@ describe("useModelManagement", () => {
     expect(saveModelConnectionMock).toHaveBeenCalled();
     expect(result.current.connectionDraft).toBeNull();
     expect(result.current.settingsFeedback).toContain("模型连接已添加");
+  });
+
+  it("does not save an untested model connection", async () => {
+    const { result } = renderModelManagement();
+
+    act(() =>
+      result.current.setConnectionDraft({
+        id: null,
+        label: "Untested",
+        baseUrl: "https://api.example.com",
+        modelId: "gpt-4.1",
+        apiKey: "sk-test",
+        clearApiKey: false,
+        supportsVision: false
+      })
+    );
+
+    await act(async () => {
+      await result.current.saveConnection();
+    });
+
+    expect(saveModelConnectionMock).not.toHaveBeenCalled();
+    expect(result.current.connectionVerified).toBe(false);
+    expect(result.current.connectionTestFeedback).toEqual({
+      kind: "error",
+      message: "请先测试连接并确认成功，再添加或保存。"
+    });
+  });
+
+  it("invalidates a successful test after the draft changes", async () => {
+    const { result } = renderModelManagement();
+
+    act(() =>
+      result.current.setConnectionDraft({
+        id: null,
+        label: "Tested",
+        baseUrl: "https://api.example.com",
+        modelId: "gpt-4.1",
+        apiKey: "sk-test",
+        clearApiKey: false,
+        supportsVision: false
+      })
+    );
+    await act(async () => {
+      await result.current.verifyConnection();
+    });
+    expect(result.current.connectionVerified).toBe(true);
+
+    act(() =>
+      result.current.setConnectionDraft((current) =>
+        current ? { ...current, modelId: "gpt-4.1-mini" } : current
+      )
+    );
+
+    expect(result.current.connectionVerified).toBe(false);
+    await act(async () => {
+      await result.current.saveConnection();
+    });
+    expect(saveModelConnectionMock).not.toHaveBeenCalled();
   });
 
   it("should remove a model connection", async () => {
@@ -323,5 +470,47 @@ describe("useModelManagement", () => {
     expect(result.current.settingsFeedback).toContain(
       "/function 公式模型已更新"
     );
+  });
+
+  it("migrates a stored legacy local selection to a real connection", () => {
+    localStorage.setItem(MODEL_STORAGE_KEY, "local");
+    chooseAvailableModelMock.mockReturnValue("gpt-4.1");
+    const { result } = renderModelManagement();
+    expect(result.current.selectedModelId).toBe("local");
+
+    act(() =>
+      result.current.migrateModelSelection({
+        modelOptions: [
+          {
+            id: "gpt-4.1",
+            label: "GPT 4.1",
+            provider: "model",
+            available: true,
+            supportsVision: true
+          }
+        ],
+        defaultModelId: "gpt-4.1"
+      })
+    );
+
+    expect(result.current.selectedModelId).toBe("gpt-4.1");
+    expect(localStorage.getItem(MODEL_STORAGE_KEY)).toBe("gpt-4.1");
+  });
+
+  it("clears the selection when the catalog has no real models", () => {
+    localStorage.setItem(MODEL_STORAGE_KEY, "connection:removed");
+    chooseAvailableModelMock.mockReturnValue("");
+    const { result } = renderModelManagement();
+
+    act(() =>
+      result.current.migrateModelSelection({
+        modelOptions: [],
+        defaultModelId: null
+      })
+    );
+
+    // 回到“未配置”状态，而不是回退到已移除的基础模式。
+    expect(result.current.selectedModelId).toBe("");
+    expect(localStorage.getItem(MODEL_STORAGE_KEY)).toBe("");
   });
 });

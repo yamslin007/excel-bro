@@ -146,7 +146,8 @@ import {
   WorkDirectoryGuide
 } from "./components/WorkDirectoryGuide";
 import type { FolderBackupTarget } from "./hooks/useFolderBackups";
-import { BASE_MODE_DESCRIPTION, BASE_MODE_HELP_TEXT } from "./helpCommand";
+import { MODEL_REQUIRED_HELP_TEXT } from "./helpCommand";
+import { chooseAvailableModel, isRealModelId } from "./modelSelection";
 import { useActivityProgress, type ActivityLog, type ActivityProgress } from "./hooks/useActivityProgress";
 import { useMessageAutoFollow } from "./hooks/useMessageAutoFollow";
 import { useConversation } from "./hooks/useConversation";
@@ -214,7 +215,7 @@ function animatePet(className: string, duration = 800): void {
 
 const CHAT_STORAGE_KEY = "excel-bro.chat.v4";
 const LEGACY_CHAT_STORAGE_KEY = "excel-bro.chat.v3";
-const BASE_MODE_HELP_SHOWN_KEY = "ebBasicModeHelpShown";
+const MODEL_CONFIG_HELP_SHOWN_KEY = "ebModelConfigHelpShown";
 const MAX_STORED_CONVERSATIONS =
   capabilities.conversation.maxStoredConversations;
 const MAX_MESSAGES_PER_CONVERSATION =
@@ -874,8 +875,11 @@ export default function App() {
     serverOnline,
     serviceHealth,
     modelOptions,
-    modelCatalogLoaded,
+    modelCatalogStatus,
+    modelCatalogError,
+    defaultCatalogModelId,
     refreshServiceState,
+    retryModelCatalog,
     markServerOnline,
     markServerOffline
   } = serviceHealthHook;
@@ -895,6 +899,7 @@ export default function App() {
     settingsLoading,
     settingsFeedback,
     connectionTestFeedback,
+    connectionVerified,
     modelGuideDismissed,
     selectModel,
     dismissModelGuide,
@@ -906,6 +911,7 @@ export default function App() {
     saveConnection,
     removeConnection,
     saveFormulaModel,
+    migrateModelSelection,
     setApiKeyDraft,
     setShowApiKey,
     setConnectionDraft,
@@ -1136,12 +1142,32 @@ export default function App() {
   const folderRecoveryAttachStartedRef = useRef(false);
   const officeRecoveryAttachStartedRef = useRef(false);
 
+  // 界面展示的模型必须与请求实际发送的 modelId 完全一致：这里只认目录中
+  // 仍然有效的真实连接，解析不出有效选择时进入“未配置”状态，绝不回退到
+  // 目录首项或已移除的 local 占位项。
+  //
+  // 这个派生值定义在斜杠命令之前：`/model` 二级菜单要靠它标注当前生效项，
+  // 而 useMemo 的调用顺序必须与渲染顺序一致，不能挪到使用点之后再声明。
+  const effectiveModelId = useMemo(
+    () =>
+      chooseAvailableModel(
+        modelOptions,
+        selectedModelId,
+        serviceHealth?.model ?? defaultCatalogModelId
+      ),
+    [modelOptions, selectedModelId, serviceHealth?.model, defaultCatalogModelId]
+  );
+  const selectedModel = useMemo(
+    () => modelOptions.find((option) => option.id === effectiveModelId),
+    [modelOptions, effectiveModelId]
+  );
+
   // 一级斜杠命令定义
   const slashCommands: SlashCommand[] = useMemo(
     () => [
       {
         value: "help",
-        description: "查看基础模式支持的命令（离线功能说明）"
+        description: "查看使用说明与模型配置步骤"
       },
       {
         value: "function",
@@ -1162,7 +1188,7 @@ export default function App() {
         value: option.id,
         label: option.label,
         showSlashPrefix: false,
-        active: option.id === (selectedModelId || "local"),
+        active: option.id === effectiveModelId,
         disabled: !option.available,
         description: option.available
           ? option.supportsVision
@@ -1170,11 +1196,17 @@ export default function App() {
             : "文本模型"
           : "未配置或不可用"
       })),
-    [modelOptions, selectedModelId]
+    [modelOptions, effectiveModelId]
   );
 
   const busy = status !== "idle";
-  const isBaseMode = (selectedModelId || serviceHealth?.model || "local") === "local";
+
+  // 目录成功加载后迁移旧的 local 记录和已删除连接；目录读取失败时必须保留
+  // 原有选择，不能依据空列表删掉仍然有效的记录。
+  useEffect(() => {
+    if (modelCatalogStatus !== "ready") return;
+    migrateModelSelection({ modelOptions });
+  }, [migrateModelSelection, modelCatalogStatus, modelOptions]);
 
   useEffect(() => {
     if (!folderCatalog || sourceMode !== "folder") {
@@ -1262,32 +1294,32 @@ export default function App() {
       applyFolderRefreshResult(refreshed, true);
     }
   });
-  const selectedModel = useMemo(
-    () =>
-      modelOptions.find(
-        (option) => option.id === (selectedModelId || "local")
-      ) ?? modelOptions[0],
-    [modelOptions, selectedModelId]
-  );
+  // 目录成功加载且确实没有真实连接 → 未配置；与“加载中/加载失败”分开表达。
   const supportsVision = selectedModel?.supportsVision === true;
+  const hasConfiguredModel = modelOptions.length > 0;
+  const modelCatalogFailed = modelCatalogStatus === "failed";
+  const modelCatalogLoading = modelCatalogStatus === "loading";
+  const modelNotConfigured =
+    modelCatalogStatus === "ready" && !hasConfiguredModel;
   const headerStatusClassName = !serverOnline
     ? ""
-    : isBaseMode
-      ? "online base-mode"
-      : serviceHealth?.configured
+    : modelCatalogFailed
+      ? "offline"
+      : effectiveModelId && serviceHealth?.configured
         ? "online model-online"
         : "online";
   const headerStatusText = !serverOnline
-    ? "本地服务未连接"
-    : isBaseMode
-      ? "本地服务已连接 · 基础模式"
-      : `模型：${selectedModel?.label ?? serviceHealth?.model}`;
-  const hasConfiguredModel = modelOptions.some(
-    (option) => option.provider === "model" && option.available
-  );
+    ? "Excel Bro 后台未连接"
+    : modelCatalogFailed
+      ? "无法读取模型配置"
+      : modelCatalogLoading
+        ? "正在读取模型配置"
+        : modelNotConfigured
+          ? "尚未配置模型"
+          : `模型：${selectedModel?.label ?? effectiveModelId}`;
   const showFirstModelGuide =
     serverOnline &&
-    modelCatalogLoaded &&
+    modelCatalogStatus === "ready" &&
     !hasConfiguredModel &&
     !modelGuideDismissed &&
     !settingsOpen;
@@ -1298,7 +1330,7 @@ export default function App() {
   const showModelGuide =
     showFirstModelGuide && (!isNarrowPane || widenStepDone);
   const showWorkDirectoryGuide = shouldShowWorkDirectoryGuide({
-    ready: serverOnline && modelCatalogLoaded && workbook !== null,
+    ready: serverOnline && modelCatalogStatus === "ready" && workbook !== null,
     previousStepComplete: hasConfiguredModel || modelGuideDismissed,
     folderConfigured: folderCatalog !== null,
     dismissed: workDirectoryGuideDismissed,
@@ -2415,12 +2447,13 @@ export default function App() {
       const maySwitchModel =
         taskStatus.pauseType === "model_error" ||
         taskStatus.pauseType === "interrupted";
+      // 用解析后的有效选择（而不是原始存储值）：它已经过滤掉不存在的连接和
+      // 已移除的 local，因此这里不会再拿一个失效 id 去接管断点任务。
       const globallySelectedFallback =
         maySwitchModel &&
-        selectedModelId &&
-        selectedModelId !== "local" &&
-        selectedModelId !== taskStatus.currentModelId
-          ? selectedModelId
+        effectiveModelId &&
+        effectiveModelId !== taskStatus.currentModelId
+          ? effectiveModelId
           : undefined;
       const effectiveFallbackModelId =
         fallbackModelId ?? globallySelectedFallback;
@@ -3303,7 +3336,7 @@ export default function App() {
           })),
           dataResults,
           planningReadPolicy,
-          modelId: selectedModelId || null
+          modelId: effectiveModelId || null
         },
         {
           signal: turnAbortRef.current?.signal,
@@ -3453,7 +3486,7 @@ export default function App() {
             extensionSeconds: 0,
             activeElapsedSeconds: 0,
             pauseType: "interrupted",
-            currentModelId: selectedModelId || null,
+            currentModelId: effectiveModelId || null,
             sourceFingerprint: workbook.sourceFingerprint,
             sourceFingerprintSheets: selectedNamesFor(workbook)
           }
@@ -3733,7 +3766,7 @@ export default function App() {
                 structuredFailure?.availableFields ?? [],
               request: intent.request
             },
-            modelId: selectedModelId || null
+            modelId: effectiveModelId || null
           }, turnAbortRef.current?.signal);
           await continueIntentDecision(
             corrected,
@@ -3928,7 +3961,7 @@ export default function App() {
                   .reverse()
                   .find((item) => item.intentMemory)?.intentMemory ?? null,
               priorResult: latestResultContext(messages),
-              modelId: selectedModelId || null
+              modelId: effectiveModelId || null
             },
             turnController.signal
           );
@@ -4347,7 +4380,7 @@ export default function App() {
           sampleRows,
           dictionary,
           extraSheets,
-          modelId: selectedModelId || null
+          modelId: effectiveModelId || null
         });
       } else if (preview.match) {
         // 本地确定性路径：不调模型、不发数据，直接拼两版公式。
@@ -4678,7 +4711,7 @@ export default function App() {
             .reverse()
             .find((message) => message.intentMemory)?.intentMemory ?? null,
         priorResult: latestResultContext(messages),
-        modelId: selectedModelId || null
+        modelId: effectiveModelId || null
       }, turnController.signal);
       markServerOnline();
       const decision = describeIntentDecision(intent);
@@ -5814,21 +5847,12 @@ export default function App() {
   }
 
   function handleSelectModel(modelId: string) {
+    // 只接受目录里仍然有效的真实连接。旧的 "local" 占位项已从模型列表移除，
+    // 万一从旧存储或旧界面残留里传进来，也不能写回选择存储——那会让后续请求
+    // 携带一个不存在的 modelId。
+    if (!isRealModelId(modelId)) return;
     selectModel(modelId);
     setModelMenuOpen(false);
-    if (modelId === "local") {
-      try {
-        if (localStorage.getItem(BASE_MODE_HELP_SHOWN_KEY) !== "1") {
-          localStorage.setItem(BASE_MODE_HELP_SHOWN_KEY, "1");
-          appendMessage({
-            role: "assistant",
-            text: BASE_MODE_HELP_TEXT
-          });
-        }
-      } catch {
-        // localStorage 不可用时跳过持久化，避免阻塞模型切换。
-      }
-    }
   }
 
   async function previewTool(tool: SavedTool) {
@@ -6003,7 +6027,7 @@ export default function App() {
       if (value === "help") {
         appendMessage({
           role: "assistant",
-          text: BASE_MODE_HELP_TEXT
+          text: MODEL_REQUIRED_HELP_TEXT
         });
         setPrompt("");
         setShowSlashAutocomplete(false);
@@ -6125,9 +6149,9 @@ export default function App() {
           </strong>
           <span className={headerStatusClassName}>
             <i />
-            {serverOnline && isBaseMode && (
+            {serverOnline && modelNotConfigured && (
               <svg
-                className="base-mode-icon"
+                className="model-status-icon"
                 viewBox="0 0 16 16"
                 aria-hidden="true"
                 focusable="false"
@@ -6137,12 +6161,12 @@ export default function App() {
               </svg>
             )}
             {headerStatusText}
-            {serverOnline && isBaseMode && (
+            {serverOnline && modelNotConfigured && (
               <button
                 type="button"
-                className="base-mode-help-button"
-                title="查看基础模式帮助"
-                aria-label="查看基础模式帮助"
+                className="model-help-button"
+                title="查看模型配置说明"
+                aria-label="查看模型配置说明"
                 onClick={() => handleSlashCommandSelect("help")}
               >
                 <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">
@@ -6184,31 +6208,16 @@ export default function App() {
                 <button
                   type="button"
                   role="menuitemradio"
-                  aria-checked={option.id === (selectedModelId || "local")}
+                  aria-checked={option.id === effectiveModelId}
                   key={option.id}
                   disabled={!option.available}
                   onClick={() => handleSelectModel(option.id)}
                 >
-                  {option.id === "local" ? (
-                    <svg
-                      className="base-mode-icon model-option-icon"
-                      viewBox="0 0 16 16"
-                      aria-hidden="true"
-                      focusable="false"
-                    >
-                      <circle cx="8" cy="8" r="6.25" />
-                      <path d="M5.5 8h5" />
-                    </svg>
-                  ) : (
-                    <i />
-                  )}
+                  <i />
                   <span className="model-option-copy">
                     <span>{option.label}</span>
-                    {option.id === "local" && (
-                      <small>{BASE_MODE_DESCRIPTION}</small>
-                    )}
                   </span>
-                  {option.id === (selectedModelId || "local") && <b>✓</b>}
+                  {option.id === effectiveModelId && <b>✓</b>}
                 </button>
               ))}
               <div className="model-menu-actions">
@@ -6579,7 +6588,7 @@ export default function App() {
                   {(modelSettings?.connections ?? []).map((connection) => (
                     <article
                       className={`connection-card${
-                        selectedModelId === connection.catalogModelId
+                        effectiveModelId === connection.catalogModelId
                           ? " current"
                           : ""
                       }`}
@@ -6588,7 +6597,7 @@ export default function App() {
                       <div>
                         <div className="connection-card-title">
                           <strong>{connection.label}</strong>
-                          {selectedModelId === connection.catalogModelId && (
+                          {effectiveModelId === connection.catalogModelId && (
                             <b>当前使用</b>
                           )}
                         </div>
@@ -6803,7 +6812,15 @@ export default function App() {
                       type="button"
                       className="tool-preview-button"
                       disabled={
-                        settingsSaving || settingsTesting || !serverOnline
+                        settingsSaving ||
+                        settingsTesting ||
+                        !serverOnline ||
+                        !connectionVerified
+                      }
+                      title={
+                        !connectionVerified
+                          ? "请先测试连接并确认成功"
+                          : undefined
                       }
                       onClick={() => void saveConnection()}
                     >
@@ -7710,7 +7727,7 @@ export default function App() {
                           ? "Agent"
                           : message.provider === "system"
                             ? "系统"
-                            : "基础模式"}
+                            : "本地工具"}
                     </em>
                   )}
                 </span>
@@ -7870,10 +7887,9 @@ export default function App() {
                         ? "正在继续..."
                         : (message.planningResume.pauseType === "model_error" ||
                               message.planningResume.pauseType === "interrupted") &&
-                            selectedModelId &&
-                            selectedModelId !== "local" &&
-                            selectedModelId !== message.planningResume.currentModelId
-                          ? `使用「${selectedModel?.label ?? selectedModelId}」从断点继续`
+                            effectiveModelId &&
+                            effectiveModelId !== message.planningResume.currentModelId
+                          ? `使用「${selectedModel?.label ?? effectiveModelId}」从断点继续`
                           : message.planningResume.pauseType === "model_error"
                             ? "重试当前模型"
                           : message.planningResume.extensionSeconds > 0

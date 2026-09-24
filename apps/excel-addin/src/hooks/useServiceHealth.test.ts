@@ -20,13 +20,20 @@ const model: ModelOption = {
   supportsVision: true
 };
 
+const online = {
+  status: "ok" as const,
+  configured: true,
+  mode: "model" as const,
+  model: model.id
+};
+
 describe("useServiceHealth", () => {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.clearAllMocks();
     checkHealthMock.mockResolvedValue(null);
     listModelsMock.mockResolvedValue({
-      defaultModelId: "local",
+      defaultModelId: model.id,
       models: [model]
     });
   });
@@ -41,24 +48,19 @@ describe("useServiceHealth", () => {
     });
   }
 
-  it("should initialize with offline state and local-only model", async () => {
+  it("starts with an empty model list instead of a virtual base-mode option", async () => {
     const { result } = renderHook(() => useServiceHealth());
     await flushInitialPoll();
 
     expect(result.current.serverOnline).toBe(false);
     expect(result.current.serviceHealth).toBeNull();
-    expect(result.current.modelOptions).toHaveLength(1);
-    expect(result.current.modelOptions[0].id).toBe("local");
-    expect(result.current.modelCatalogLoaded).toBe(false);
+    // 目录尚未加载时列表为空；这里以前会注入一个 id 为 local 的“基础模式”。
+    expect(result.current.modelOptions).toEqual([]);
+    expect(result.current.modelCatalogStatus).toBe("idle");
   });
 
-  it("should refresh service state and model catalog", async () => {
-    checkHealthMock.mockResolvedValue({
-      status: "ok",
-      configured: true,
-      mode: "model",
-      model: model.id
-    });
+  it("reports the catalog as ready and exposes real connections", async () => {
+    checkHealthMock.mockResolvedValue(online);
     const { result } = renderHook(() => useServiceHealth());
 
     let refreshResult: unknown;
@@ -67,20 +69,87 @@ describe("useServiceHealth", () => {
     });
 
     expect(result.current.serverOnline).toBe(true);
-    expect(result.current.serviceHealth).toMatchObject({
-      status: "ok",
-      configured: true,
-      mode: "model"
-    });
-    expect(result.current.modelCatalogLoaded).toBe(true);
+    expect(result.current.modelCatalogStatus).toBe("ready");
     expect(result.current.modelOptions).toEqual([model]);
+    expect(result.current.modelCatalogError).toBe("");
     expect(refreshResult).toEqual({
       modelOptions: [model],
-      defaultModelId: "local"
+      defaultModelId: model.id
     });
   });
 
-  it("should return null when health is unavailable", async () => {
+  it("treats a successful empty catalog as configured-but-empty, not as failure", async () => {
+    checkHealthMock.mockResolvedValue({
+      status: "ok",
+      configured: false,
+      mode: "model",
+      model: null
+    });
+    listModelsMock.mockResolvedValue({ defaultModelId: null, models: [] });
+
+    const { result } = renderHook(() => useServiceHealth());
+    let refreshResult: unknown;
+    await act(async () => {
+      refreshResult = await result.current.refreshServiceState();
+    });
+
+    expect(result.current.modelCatalogStatus).toBe("ready");
+    expect(result.current.modelOptions).toEqual([]);
+    expect(result.current.modelCatalogError).toBe("");
+    expect(refreshResult).toEqual({
+      modelOptions: [],
+      defaultModelId: null
+    });
+  });
+
+  it("keeps the previous catalog and reports failure when the listing request fails", async () => {
+    checkHealthMock.mockResolvedValue(online);
+    const { result } = renderHook(() => useServiceHealth());
+    await act(async () => {
+      await result.current.refreshServiceState();
+    });
+    expect(result.current.modelOptions).toEqual([model]);
+
+    // 目录读取失败：不得清空列表，也不得断言用户没有连接。
+    listModelsMock.mockRejectedValue(new Error("目录请求失败"));
+    let refreshResult: unknown;
+    await act(async () => {
+      refreshResult = await result.current.refreshServiceState();
+    });
+
+    expect(refreshResult).toBeNull();
+    expect(result.current.modelCatalogStatus).toBe("failed");
+    expect(result.current.modelCatalogError).toContain("目录请求失败");
+    expect(result.current.modelOptions).toEqual([model]);
+  });
+
+  it("recovers from a failed catalog through retryModelCatalog", async () => {
+    checkHealthMock.mockResolvedValue(online);
+    const { result } = renderHook(() => useServiceHealth());
+
+    // 让本次读取失败（挂载时的初始 poll 已经消费掉默认实现）。
+    listModelsMock.mockRejectedValue(new Error("后台未就绪"));
+    await act(async () => {
+      await result.current.refreshServiceState();
+    });
+    expect(result.current.modelCatalogStatus).toBe("failed");
+    expect(result.current.modelOptions).toEqual([]);
+    expect(result.current.modelCatalogError).toContain("后台未就绪");
+
+    listModelsMock.mockResolvedValue({
+      defaultModelId: model.id,
+      models: [model]
+    });
+    await act(async () => {
+      await result.current.retryModelCatalog();
+    });
+
+    expect(result.current.modelCatalogStatus).toBe("ready");
+    expect(result.current.modelOptions).toEqual([model]);
+    expect(result.current.modelCatalogError).toBe("");
+  });
+
+  it("returns null when health is unavailable", async () => {
     checkHealthMock.mockResolvedValue(null);
     const { result } = renderHook(() => useServiceHealth());
 
@@ -110,7 +179,7 @@ describe("useServiceHealth", () => {
     checkHealthMock.mockResolvedValue({
       status: "ok",
       configured: false,
-      mode: "local",
+      mode: "model",
       model: null
     });
     const { result } = renderHook(() => useServiceHealth());
@@ -128,12 +197,7 @@ describe("useServiceHealth", () => {
   });
 
   it("should refresh when window gains focus", async () => {
-    checkHealthMock.mockResolvedValue({
-      status: "ok",
-      configured: true,
-      mode: "model",
-      model: model.id
-    });
+    checkHealthMock.mockResolvedValue(online);
     const { result } = renderHook(() => useServiceHealth());
     await flushInitialPoll();
 

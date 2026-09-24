@@ -9,7 +9,7 @@ from pydantic import ValidationError
 
 from .capabilities import model_timeout_seconds
 from .excel_agent import run_excel_agent
-from .llm import selected_model_config
+from .llm import ModelNotConfiguredError, selected_model_config
 from .models import (
     AnalysisPlan,
     AnswerResponse,
@@ -123,6 +123,16 @@ def _resolve_target_sheet(request: PlanRequest, requested: str | None) -> str | 
 
 
 def _local_address_plan(request: PlanRequest) -> AssistantResponse | None:
+    """纯语法地址命令：清空区域 / 地址写值 / 地址写公式。
+
+    这层只做字面解析，不做任何语义理解，因此不依赖外部模型，也不构成
+    “基础模式”这个产品入口的回归——入口已从模型列表和首次引导中移除，
+    模型选择里不会再出现它。
+
+    匹配不上时返回 ``None``，把请求交回模型路径；匹配上时产出的仍是
+    白名单 ``AnalysisPlan``，照旧先预览、再由用户确认后才执行。
+    """
+
     text = _canonical_text(request.prompt).strip()
     clear_match = re.search(
         r"(?:清空|清除)\s*(?:(?P<sheet>[^!，,\s]+)!)?"
@@ -338,20 +348,6 @@ def _numeric_value(value: object) -> float | None:
     return None
 
 
-def _local_analysis(request: PlanRequest) -> AssistantResponse:
-    address_plan = _local_address_plan(request)
-    if address_plan is not None:
-        return address_plan
-    return AnswerResponse(
-        provider="local",
-        message=(
-            "基础模式不支持此操作。\n\n"
-            "💡 输入 /help 查看支持的命令\n"
-            "或配置 AI 模型解锁完整能力。"
-        ),
-    )
-
-
 def _local_data_tool_response(request: PlanRequest) -> AnswerResponse | None:
     if not request.dataResults:
         return None
@@ -399,17 +395,35 @@ async def create_plan(
     structural_plan = _local_bulk_worksheet_deletion_plan(request)
     if structural_plan is not None:
         return structural_plan
-    config = selected_model_config(request.modelId)
-    if config is None:
+    # 纯语法地址命令（清空区域 / 地址写值 / 地址写公式）是已固化下来的确定性
+    # 能力：只做字面解析，不需要模型理解语义，也不该因为“没有选模型”或
+    # “选了模型”而变成两条不同行为。它必须排在模型解析之前。
+    address_plan = _local_address_plan(request)
+    if address_plan is not None:
+        return address_plan
+    # 其余请求都需要外部模型理解需求。没有可用模型时必须显式失败：
+    # 不静默进入规则模式，也不擅自改用其他供应商。
+    try:
+        config = selected_model_config(request.modelId)
+    except ModelNotConfiguredError as error:
         if request.images:
-            raise ValueError("基础模式不支持图片，请选择支持视觉输入的模型")
+            raise ModelNotConfiguredError(
+                "尚未配置模型。图片输入需要支持视觉的外部模型，"
+                "请先点击「添加模型」完成配置。"
+            ) from error
         tool_response = _local_data_tool_response(request)
         if tool_response is not None:
+            # 本条路径的全部计算都已在本地完成，只是把结果读出来，
+            # 不涉及语义理解，也不代表用户“选好了模型”。
             return tool_response
-        return _local_analysis(request)
+        raise ModelNotConfiguredError(
+            "尚未配置模型，无法理解这条需求。请点击「添加模型」，"
+            "填写服务地址、模型 ID 和 API Key 后重试。"
+        ) from error
     if request.images and not config.supports_vision:
         raise ValueError(
-            f"模型「{config.model}」未配置图片能力；请在 AI_VISION_MODELS 中声明"
+            f"模型「{config.model}」未配置图片能力；请在「模型设置」里为该连接"
+            "勾选「支持图片输入」（用 .env 配置时改为把它加进 AI_VISION_MODELS）"
         )
     timeout = model_timeout_seconds()
     try:

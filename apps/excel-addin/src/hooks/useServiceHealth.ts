@@ -1,6 +1,11 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { checkHealth, listModels, type ModelOption } from "../api";
-import type { ServiceHealth } from "../api";
+import type { ModelCatalogStatus, ServiceHealth } from "../api";
+
+export interface ModelCatalogRefreshResult {
+  modelOptions: ModelOption[];
+  defaultModelId: string | null;
+}
 
 /**
  * 服务健康检查 Hook
@@ -9,21 +14,54 @@ import type { ServiceHealth } from "../api";
  * - 管理服务在线状态和健康信息
  * - 定期轮询服务健康状态（5 秒间隔）
  * - 窗口获得焦点时刷新状态
- * - 加载模型目录
+ * - 加载模型目录，并区分「加载中 / 加载失败 / 成功但为空 / 已有真实连接」
+ *
+ * 旧版本这里会把一个虚拟的“基础模式”项作为初始模型列表，导致目录尚未加载
+ * 或读取失败时看起来“已经选好模型”。现在初始列表为空，目录状态单独表达。
  */
 export function useServiceHealth() {
   const [serverOnline, setServerOnline] = useState(false);
   const [serviceHealth, setServiceHealth] = useState<ServiceHealth | null>(null);
-  const [modelOptions, setModelOptions] = useState<ModelOption[]>([
-    {
-      id: "local",
-      label: "基础模式",
-      provider: "local",
-      available: true,
-      supportsVision: false
+  const [modelOptions, setModelOptions] = useState<ModelOption[]>([]);
+  const [modelCatalogStatus, setModelCatalogStatus] =
+    useState<ModelCatalogStatus>("idle");
+  const [modelCatalogError, setModelCatalogError] = useState("");
+  const [defaultCatalogModelId, setDefaultCatalogModelId] = useState<
+    string | null
+  >(null);
+  const hasLoadedCatalogRef = useRef(false);
+
+  /**
+   * 读取模型目录。
+   *
+   * 返回 null 表示本次读取失败：调用方必须保留原有选择，不能把失败
+   * 当成“用户没有配置模型”。
+   */
+  const loadModelCatalog = useCallback(async () => {
+    if (!hasLoadedCatalogRef.current) {
+      setModelCatalogStatus("loading");
     }
-  ]);
-  const [modelCatalogLoaded, setModelCatalogLoaded] = useState(false);
+    try {
+      const catalog = await listModels();
+      hasLoadedCatalogRef.current = true;
+      setModelOptions(catalog.models);
+      setDefaultCatalogModelId(catalog.defaultModelId);
+      setModelCatalogStatus("ready");
+      setModelCatalogError("");
+      return {
+        modelOptions: catalog.models,
+        defaultModelId: catalog.defaultModelId
+      } satisfies ModelCatalogRefreshResult;
+    } catch (reason) {
+      setModelCatalogStatus("failed");
+      setModelCatalogError(
+        reason instanceof Error
+          ? reason.message
+          : "无法读取模型配置，请确认 Excel Bro 后台正在运行。"
+      );
+      return null;
+    }
+  }, []);
 
   /**
    * 刷新服务状态和模型目录
@@ -35,19 +73,17 @@ export function useServiceHealth() {
 
     if (!health) return null;
 
-    try {
-      const catalog = await listModels();
-      setModelOptions(catalog.models);
-      setModelCatalogLoaded(true);
-      return {
-        modelOptions: catalog.models,
-        defaultModelId: catalog.defaultModelId
-      };
-    } catch {
-      // 如果旧版本服务缺少 /api/models 端点，健康指示器仍然有用
-      return null;
-    }
-  }, []);
+    return await loadModelCatalog();
+  }, [loadModelCatalog]);
+
+  /**
+   * 重试模型目录（供“加载失败 → 重试”入口使用）。
+   * 不清空当前选择，也不改变已就绪的列表直到新结果返回。
+   */
+  const retryModelCatalog = useCallback(
+    () => loadModelCatalog(),
+    [loadModelCatalog]
+  );
 
   /**
    * 手动设置服务在线状态
@@ -77,15 +113,7 @@ export function useServiceHealth() {
       setServerOnline(health !== null);
 
       if (!health) return;
-
-      try {
-        const catalog = await listModels();
-        if (!active) return;
-        setModelOptions(catalog.models);
-        setModelCatalogLoaded(true);
-      } catch {
-        // The health indicator remains useful if an older service lacks /api/models.
-      }
+      await loadModelCatalog();
     }
 
     // 初始检查
@@ -105,17 +133,20 @@ export function useServiceHealth() {
       window.clearInterval(intervalId);
       window.removeEventListener("focus", handleFocus);
     };
-  }, []);
+  }, [loadModelCatalog]);
 
   return {
     // 状态
     serverOnline,
     serviceHealth,
     modelOptions,
-    modelCatalogLoaded,
+    modelCatalogStatus,
+    modelCatalogError,
+    defaultCatalogModelId,
 
     // 操作
     refreshServiceState,
+    retryModelCatalog,
     markServerOnline,
     markServerOffline,
 
@@ -123,6 +154,6 @@ export function useServiceHealth() {
     setServerOnline,
     setServiceHealth,
     setModelOptions,
-    setModelCatalogLoaded,
+    setModelCatalogStatus,
   };
 }

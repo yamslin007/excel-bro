@@ -60,7 +60,9 @@ AI_TIMEOUT_SECONDS=60
 - `AI_MODELS` 用英文逗号分隔可切换模型。
 - 只有列入 `AI_VISION_MODELS` 的模型才能接收图片。
 - 本地 Ollama、LM Studio 等无鉴权网关可以留空 `AI_API_KEY`。
-- 新安装的配置模板不会预置服务商或模型；未配置时只显示基础模式和首次添加引导。
+- 新安装的配置模板不会预置服务商或模型；未配置时模型列表为空，顶部入口显示「添加模型」并给出首次添加引导。
+- 模型目录区分四种状态：加载中、加载失败（可重试，且不代表你没有配置模型）、加载成功但为空、已配置真实连接。读取失败时不清空已加载的列表，也不覆盖本机已保存的模型选择。
+- 界面显示的模型与请求携带的 `modelId` 必须来自同一次解析（Excel 与 WPS 共用 `modelSelection.ts`）；没有任何可用连接时不发送模型请求，也不退回规则模式。旧的 `local` 记录会在目录加载成功后迁移到有效真实连接，删除连接后重新计算选择。
 - 任务窗格顶部模型菜单同时提供选择、添加和管理入口。每个独立连接拥有自己的服务地址、模型 ID 和 Key，并写入配置文件同目录下的 `model-connections.json`。
 - 设置页修改会立即生效，完整 Key 不会返回前端。`model-connections.json` 包含密钥，已被 Git 忽略，不能截图、记录日志或手动提交。
 - “测试连接”会发送一个内容固定、输出极短的模型请求，不会读取或发送工作簿数据，也不会保存尚未确认的连接。
@@ -114,6 +116,44 @@ npm run stop:excel
 修改 `manifest.xml` 后应停止再重新旁加载。普通 React/CSS 修改通常只需刷新任务窗格。
 普通工作簿需要通过 Windows 共享加载项目录进行本地测试安装；正式发布使用
 Microsoft 365 集中部署或 AppSource。
+
+### WPS 表格开发验证
+
+apps/wps-addin 是独立的 WPS 表格加载项工作区，不使用 Office 清单或 Office.js
+初始化。W0 核心加载已在目标个人版通过；W1 提供明确授权的分块只读验证，仍不能据此
+开放写入。
+
+依次运行 npm run test:wps、npm run build:wps 和 npm run dev:wps。dev:wps 调用
+固定版本的 wpsjs，将类型为 et、名称为 excel-bro-wps 的开发加载项登记到官方
+publish 调试配置，并在 http://127.0.0.1:3889 提供资源。WPS 子项目的 `dev`
+脚本不单独声明端口，统一服从 `vite.config.ts` 的 3889 严格端口配置，避免任务窗格
+意外从 3890 加载后被后台 CORS 预检拒绝。已有 WPS 进程可能不会
+热加载新登记；保存打开的文档并完全重启 WPS 后，再验收功能区与任务窗格。不要为了
+测试强制结束含未保存文档的进程。
+功能区入口应位于独立的“Excel Bro”选项卡，而不是“开始”内的附加分组；
+修改 `ribbon.xml` 后仅刷新任务窗格不会更新功能区，须重启 WPS 验收。
+点击“打开 Excel Bro”后应显示任务窗格并切回“开始”；若当前宿主不支持
+`ActivateTabMso`，仅跳过切换，不影响任务窗格。
+WPS 可能恢复先前的任务窗格而不再次创建；新建后和恢复时均在侧栏可见后设置
+1080 的默认宽度，仅迁移仍处于旧窄宽度的侧栏，不覆盖已手动拉宽的尺寸。
+
+开发服务器只输出资源路径和布尔能力的脱敏诊断，不记录工作簿名、工作表名、选区值
+或文件路径。首次通过必须记录目标 WPS 完整版本、功能区入口、任务窗格连接状态、
+重启行为和停用行为。后续授权读取与只读 Agent 接入按照
+[WPS 个人版适配指导](./WPS_PERSONAL_EDITION_ADAPTATION_GUIDE.md) 的 W1/W2 阶段实施。
+W1 的自动化与真实宿主验收记录见
+[WPS W1 授权读取验证](./WPS_W1_VALIDATION_2026-09-22.md)。读取限制统一配置在
+config/capabilities.json 的 wpsRead，调整前应记录目标版本的大表耗时。
+
+W2 开发页从 http://127.0.0.1:3889 访问本地服务；服务端只对白名单中的 3889
+localhost/127.0.0.1 来源开放 CORS。只读 Agent 的真实验收见
+[WPS W2 验证记录](./WPS_W2_VALIDATION_2026-09-22.md)。WPS 代码可以复用
+dataTools.ts 的纯计算入口，但不得调用 executeQueryTableTool 或 Excel.run。
+
+W3-A 开发诊断在任务窗格底部的工作簿范围面板中。展开“W3 写入能力检查（只读）”
+并点击“检查当前工作簿”，可查看宿主接口和目标文件的前置条件；此检查不改工作簿。
+`config/capabilities.json` 中的 `wpsWrite.enabled` 保持 `false`。目标版本写入和恢复实测
+记录在 [W3-A 验证记录](./WPS_W3_A_VALIDATION_2026-09-23.md)。
 
 ### 个人 Windows 安装包
 
@@ -329,7 +369,7 @@ python -m compileall -q server/app
 | 需求确认机制 | `server/app/intent.py` |
 | 模型配置、鉴权和 HTTP 适配 | `server/app/llm/` |
 | 模型 Agent 工具 | `server/app/excel_agent.py` |
-| 基础模式和模型选择 | `server/app/planner.py` |
+| 确定性地址命令和模型选择 | `server/app/planner.py`, `apps/excel-addin/src/modelSelection.ts` |
 | Excel 动作协议 | `contracts.ts`, `server/app/models.py` |
 | 文件夹 Excel | `server/app/folder_workbooks.py`, `server/app/folder_data.py` |
 | 固化工具 | `apps/excel-addin/src/storage.ts`, `deterministicTools.ts` |
@@ -436,7 +476,7 @@ ExcelApi 1.15 的数据源字符串读取。修改最低版本时必须同步预
 - `test_folder_mutex.py`：同进程及跨进程文件夹写入排他
 - `test_managed_directories.py`、`test_managed_recovery.py`：受管目录发现和独立恢复
 - `test_models.py`：Pydantic 模型
-- `test_planner.py`：基础模式和规划
+- `test_planner.py`：确定性地址命令与规划；无可用模型时抛稳定错误而非降级
 - `test_agent_loop_protection.py`：Agent 预算、循环检测、降级与收尾提示
 - `test_agent_integration.py`：Agent 主循环熔断和警告注入
 - `test_folder_workbooks.py`：文件夹执行

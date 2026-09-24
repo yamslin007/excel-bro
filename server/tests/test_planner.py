@@ -8,8 +8,14 @@ import httpx
 import pytest
 
 import server.app.llm.config as llm_config
+import server.app.planner as planner_module
 from server.app.models import PlanRequest
 from server.app.planner import create_plan
+
+
+# 测试里反复使用的「用户选了一个模型 id」标记。
+# 注意：它不是在测试环境下真实存在的连接，只是用来表达"请求里带了这个 id"。
+_CONFIGURED_MODEL_ID = "connection:test-primary"
 
 
 @pytest.fixture(autouse=True)
@@ -97,6 +103,12 @@ def _score_request(
 
 
 def test_direct_cell_write_works_even_when_workbook_has_no_data() -> None:
+    """空工作簿上的字面地址写值：不依赖模型，也不需要任何模型配置。
+
+    这条路径由 `_local_address_plan` 在模型解析之前收口，所以请求里
+    不带 modelId 也必须成功——"没有配置模型"不该让已固化的确定性能力失效。
+    """
+
     request = PlanRequest.model_validate(
         {
             "prompt": "在A5单元格填入数字4",
@@ -129,6 +141,8 @@ def test_direct_cell_write_works_even_when_workbook_has_no_data() -> None:
 
 
 def test_direct_formula_and_clear_commands_create_focused_plans() -> None:
+    """字面公式与清空区域同样走确定性快路径，不需要模型。"""
+
     formula = asyncio.run(create_plan(_score_request("在C2单元格写入公式=SUM(B2:B4)")))
     clearing = asyncio.run(create_plan(_score_request("清空 Sheet1!B2:B4")))
 
@@ -309,14 +323,111 @@ def test_bulk_sheet_deletion_rejects_mixed_folder_files() -> None:
         "这份表是谁做的",
     ],
 )
-def test_semantic_requests_decline_without_a_model(prompt: str) -> None:
-    response = asyncio.run(create_plan(_score_request(prompt)))
+def test_semantic_requests_raise_without_a_model(prompt: str) -> None:
+    """语义请求在无模型时必须抛稳定错误，不得静默降级为基础模式。
 
-    assert response.kind == "answer"
-    assert response.provider == "local"
-    assert "基础模式不支持此操作" in response.message
-    assert "/help" in response.message
-    assert "配置 AI 模型" in response.message
+    旧行为是返回 kind="answer" + provider="local" + 「基础模式不支持此操作」，
+    也就是把一次模型失败伪装成一次正常回答。现在必须是可识别的异常，
+    由上层映射成 409 MODEL_NOT_CONFIGURED。
+    """
+
+    request = _score_request(prompt)
+    request.modelId = None
+
+    with pytest.raises(llm_config.ModelNotConfiguredError) as failure:
+        asyncio.run(create_plan(request))
+
+    message = str(failure.value)
+    # 文案给出可执行的下一步：去「添加模型」填服务地址 / 模型 ID / API Key。
+    assert "添加模型" in message
+    assert "服务地址" in message
+    assert "API Key" in message
+
+
+def test_legacy_local_model_id_is_rejected_like_no_model() -> None:
+    """旧客户端缓存的 "local" 等同「没有选择模型」，不能回落到规则模式。"""
+
+    request = _score_request("比较两个工作表")
+    request.modelId = "local"
+
+    with pytest.raises(llm_config.ModelNotConfiguredError):
+        asyncio.run(create_plan(request))
+
+
+def test_legacy_local_selection_is_rejected_when_models_are_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """已配置真实连接时仍携带旧 "local"，必须显式报「模型不可用」。
+
+    旧行为是返回 provider="local" 的离线兜底计划，等于把「用户没有可用模型」
+    伪装成「已经理解并规划好了」。现在只允许失败，并由前端把用户带回模型选择。
+    注意这里刻意不装 mock transport：如果请求真的走到了模型调用，
+    抛出的会是 LLMConnectError，测试就会以另一种方式失败。
+    """
+
+    monkeypatch.setenv("AI_BASE_URL", "http://127.0.0.1:11434/v1")
+    monkeypatch.setenv("AI_MODEL", "configured-model")
+    request = _request()
+    request.modelId = "local"
+
+    with pytest.raises(llm_config.ModelNotAvailableError) as failure:
+        asyncio.run(create_plan(request))
+
+    assert "基础模式" in str(failure.value)
+
+
+def test_deleted_connection_id_reports_model_not_available() -> None:
+    """指定了已删除的连接时给出 MODEL_NOT_AVAILABLE，不偷偷改用别的供应商。
+
+    与「一条连接都没有」必须区分开：那种情况是 MODEL_NOT_CONFIGURED、
+    界面提示去「添加模型」；而这里是"你选的那个已失效"，
+    界面该提示重新选择，而不是让用户以为从没配置过。
+    所以先落一条还在的连接，再请求一个不存在的 id。
+    """
+
+    llm_config.upsert_managed_connection(
+        connection_id=None,
+        label="仍在的连接",
+        base_url="https://api.example.test/v1",
+        model="still-there",
+        api_key="secret",
+        clear_api_key=False,
+        supports_vision=False,
+    )
+
+    request = _score_request("比较两个工作表")
+    request.modelId = "connection:model-deleted-earlier"
+
+    with pytest.raises(llm_config.ModelNotAvailableError) as failure:
+        asyncio.run(create_plan(request))
+
+    assert "不存在" in str(failure.value) or "已删除" in str(failure.value)
+
+
+def test_no_connections_at_all_reports_model_not_configured() -> None:
+    """一条连接都没有时是 MODEL_NOT_CONFIGURED（去添加模型），不是 NOT_AVAILABLE。"""
+
+    request = _score_request("比较两个工作表")
+    request.modelId = None
+
+    with pytest.raises(llm_config.ModelNotConfiguredError):
+        asyncio.run(create_plan(request))
+
+
+def test_deterministic_direct_commands_still_work_without_a_model() -> None:
+    """纯本地确定性指令（清空指定区域）不依赖模型，必须继续可用。
+
+    这是「保留确定性能力」的红线：移除的是基础模式这个产品入口，
+    不是这些已经固化下来的本地工具。因此这里不带任何模型也必须成功。
+    """
+
+    request = _score_request("清空 Sheet1!B2:B4")
+    request.modelId = None
+
+    response = asyncio.run(create_plan(request))
+
+    assert response.kind == "plan"
+    assert response.plan.actions[0].type == "clearRange"
 
 
 def test_keyless_local_gateway_can_be_used(
@@ -491,7 +602,6 @@ def test_request_rejects_model_outside_allowlist(
     with pytest.raises(ValueError, match="允许列表"):
         asyncio.run(create_plan(request))
 
-
 def test_agent_tool_schemas_do_not_contain_local_references() -> None:
     from server.app.excel_agent import AGENT_TOOLS
 
@@ -559,17 +669,31 @@ def test_plan_without_acceptance_criteria_still_validates() -> None:
     assert plan.acceptanceCriteria
 
 
-def test_request_can_force_local_fallback(
+def test_deterministic_address_command_does_not_consult_the_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("AI_BASE_URL", "http://127.0.0.1:11434/v1")
-    monkeypatch.setenv("AI_MODEL", "configured-model")
-    request = _request()
-    request.modelId = "local"
+    """已经配置模型时，字面地址命令仍走本地确定性路径，不消耗模型调用。
+
+    这里把 `selected_model_config` 换成一个「一旦被调用就断言失败」的桩：
+    清空指令必须在模型解析之前就返回计划，否则说明确定性快路径被架空了。
+    """
+
+    def explode(model_id: str | None = None):  # pragma: no cover - 不应被调用
+        raise AssertionError(
+            f"确定性地址命令不应解析模型，却收到了 modelId={model_id!r}"
+        )
+
+    monkeypatch.setattr(planner_module, "selected_model_config", explode)
+
+    request = _score_request("清空 Sheet1!B2:B4")
+    request.modelId = _CONFIGURED_MODEL_ID
 
     response = asyncio.run(create_plan(request))
 
+    assert response.kind == "plan"
     assert response.provider == "local"
+    assert response.plan.actions[0].type == "clearRange"
+    assert response.plan.actions[0].range == "B2:B4"
 
 
 def test_model_agent_inspects_fields_before_submitting_formula_plan(

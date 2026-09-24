@@ -246,3 +246,34 @@ def test_state_changing_request_without_origin_is_allowed() -> None:
 def test_allowed_origins_cover_addin_origins() -> None:
     assert "https://localhost:3000" in ALLOWED_ORIGINS
     assert "https://127.0.0.1:3000" in ALLOWED_ORIGINS
+    assert "http://localhost:3889" in ALLOWED_ORIGINS
+    assert "http://127.0.0.1:3889" in ALLOWED_ORIGINS
+    assert "http://localhost:3890" in ALLOWED_ORIGINS
+    assert "http://127.0.0.1:3890" in ALLOWED_ORIGINS
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "http://localhost:3889",
+        "http://127.0.0.1:3889",
+        "http://localhost:3890",
+        "http://127.0.0.1:3890",
+    ],
+)
+def test_wps_model_connection_preflight_is_allowed(origin: str) -> None:
+    from fastapi.testclient import TestClient
+
+    response = TestClient(app).options(
+        "/api/settings/model/connections/test",
+        headers={
+            "Origin": origin,
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type",
+            "Access-Control-Request-Private-Network": "true",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == origin
+    assert response.headers["access-control-allow-private-network"] == "true"

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<customUI xmlns="http://schemas.microsoft.com/office/2006/01/customui" onLoad="ribbon.OnAddinLoad">
+  <ribbon startFromScratch="false">
+    <tabs>
+      <tab id="excelBroWpsTab" label="Excel Bro">
+        <group id="excelBroWpsGroup" label="Excel Bro">
+          <button id="excelBroShowTaskPane" label="打开 Excel Bro" size="large" visible="true" enabled="true" getImage="ribbon.GetImage" onAction="ribbon.OnAction" />
+        </group>
+      </tab>
+    </tabs>
+  </ribbon>
+</customUI>

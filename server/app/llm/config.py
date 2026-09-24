@@ -21,6 +21,23 @@ class DuplicateModelConnectionError(ValueError):
     pass
 
 
+class ModelNotConfiguredError(ValueError):
+    """没有配置任何真实模型连接时，需要模型的入口必须显式失败。
+
+    这是稳定错误含义：调用方据此返回 MODEL_NOT_CONFIGURED，不得静默
+    降级到规则模式，也不得擅自改用其他供应商。
+    """
+
+
+class ModelNotAvailableError(ValueError):
+    """请求指定的模型 ID 不存在、未配置或已失效。"""
+
+
+# 旧版本前端会在模型选择里保存虚拟的 "local"，它代表“基础模式”而不是一个
+# 真实模型连接。保留这个常量只用于识别和迁移旧记录，不再作为可选项返回。
+LEGACY_LOCAL_MODEL_ID = "local"
+
+
 def _first_env(*names: str) -> str:
     for name in names:
         value = os.getenv(name, "").strip()
@@ -299,14 +316,18 @@ def delete_managed_connection(connection_id: str) -> dict[str, object]:
 
 
 def set_formula_model_id(model_id: str) -> dict[str, object]:
-    """设置 /function 公式专用模型。空串=跟随全局；否则须是已配置的模型。"""
+    """设置 /function 公式专用模型。空串=跟随全局；否则须是已配置的真实模型。
+
+    旧记录里的 ``local`` 一律按“跟随全局”处理并写回空串，避免把已移除的
+    基础模式入口又固化进配置文件。"""
     normalized = (model_id or "").strip()
+    if normalized == LEGACY_LOCAL_MODEL_ID:
+        normalized = ""
     if normalized:
         catalog = model_catalog()
         valid_ids = {
             str(option["id"])
             for option in catalog["models"]  # type: ignore[index]
-            if str(option["id"]) != "local"
         }
         if normalized not in valid_ids:
             raise ValueError("所选公式模型不存在或未配置")
@@ -342,11 +363,16 @@ def load_model_settings() -> ModelSettings | None:
     )
 
 
-def selected_model_config(
+def resolve_model_config(
     model_id: str | None = None,
 ) -> ModelConnection | None:
-    if model_id == "local":
-        return None
+    """解析模型配置；无任何真实连接时返回 None（不抛错）。
+
+    与 ``selected_model_config`` 的区别：这个函数只回答“当前能不能调用模型”，
+    供健康检查、模型设置和已经明确允许无模型的固化工具使用。需要模型的入口
+    应改用 ``selected_model_config``。
+    """
+    # 旧记录：优先按真实连接解析；没有任何真实连接时才是未配置。
     managed = load_managed_connections()
     if model_id and model_id.startswith("connection:"):
         selected = next(
@@ -358,7 +384,7 @@ def selected_model_config(
             None,
         )
         if selected is None:
-            raise ValueError("所选模型连接不存在")
+            return None
         return ModelConnection(
             base_url=selected.base_url,
             model=selected.model,
@@ -368,7 +394,7 @@ def selected_model_config(
     settings = load_model_settings()
     if settings is None:
         if model_id:
-            raise ValueError("所选模型尚未在本地服务中配置")
+            return None
         if managed:
             selected = managed[0]
             return ModelConnection(
@@ -380,7 +406,86 @@ def selected_model_config(
         return None
     selected_model = model_id or settings.default_model
     if selected_model not in settings.models:
-        raise ValueError(f"模型「{selected_model}」不在服务端允许列表中")
+        return None
+    return ModelConnection(
+        base_url=settings.base_url,
+        model=selected_model,
+        api_key=settings.api_key,
+        supports_vision=settings.supports_vision(selected_model),
+    )
+
+
+def selected_model_config(
+    model_id: str | None = None,
+) -> ModelConnection:
+    """解析可调用的真实模型连接；不可用时抛出稳定错误。
+
+    - 未配置任何真实模型（或旧记录里的 ``local``）：``ModelNotConfiguredError``
+    - 指定了不存在/失效的模型 ID：``ModelNotAvailableError``
+
+    绝不返回 None，也绝不回退到任何规则模式或另一个供应商。
+    """
+    managed = load_managed_connections()
+    settings = load_model_settings()
+    if not managed and settings is None:
+        raise ModelNotConfiguredError(
+            "尚未配置任何模型连接。请填写服务地址、模型 ID 和 API Key 后重试。"
+        )
+    if model_id == LEGACY_LOCAL_MODEL_ID:
+        # 旧版加载项可能仍提交 local。它不是一个真实连接，必须显式失败；
+        # 新前端会在目录加载成功后迁移掉这条记录。
+        raise ModelNotAvailableError(
+            "“基础模式”已移除，请选择一个已配置的模型连接后重试。"
+        )
+    if model_id and model_id.startswith("connection:"):
+        selected = next(
+            (
+                connection
+                for connection in managed
+                if connection.catalog_id == model_id
+            ),
+            None,
+        )
+        if selected is None:
+            raise ModelNotAvailableError("所选模型连接不存在或已被删除。")
+        return ModelConnection(
+            base_url=selected.base_url,
+            model=selected.model,
+            api_key=selected.api_key,
+            supports_vision=selected.supports_vision,
+        )
+    if settings is None:
+        # 只有托管连接可用。空 model_id 时取第一个真实连接，显式指定的
+        # 裸模型名（来自 .env 风格配置）在托管目录里找不到就是不可用。
+        if not model_id:
+            selected = managed[0]
+            return ModelConnection(
+                base_url=selected.base_url,
+                model=selected.model,
+                api_key=selected.api_key,
+                supports_vision=selected.supports_vision,
+            )
+        selected = next(
+            (
+                connection
+                for connection in managed
+                if connection.model.casefold() == model_id.casefold()
+            ),
+            None,
+        )
+        if selected is None:
+            raise ModelNotAvailableError("所选模型尚未在本地服务中配置。")
+        return ModelConnection(
+            base_url=selected.base_url,
+            model=selected.model,
+            api_key=selected.api_key,
+            supports_vision=selected.supports_vision,
+        )
+    selected_model = model_id or settings.default_model
+    if selected_model not in settings.models:
+        raise ModelNotAvailableError(
+            f"模型「{selected_model}」不在服务端允许列表中。"
+        )
     return ModelConnection(
         base_url=settings.base_url,
         model=selected_model,
@@ -391,25 +496,33 @@ def selected_model_config(
 
 def formula_model_config() -> ModelConnection | None:
     """解析 /function 公式专用模型（顶层 formulaModelId）为可调用连接。
-    未设置（空串）则返回 None，调用方据此回退到全局选择逻辑。"""
+
+    未设置（空串）返回 None，调用方据此回退到全局选择逻辑。旧记录指向
+    已移除的 ``local`` 或已删除连接时同样返回 None（按“跟随全局”处理），
+    调用方最终仍会用 ``selected_model_config`` 校验真实连接是否可用。"""
     formula_id = load_formula_model_id()
-    if not formula_id:
+    if not formula_id or formula_id == LEGACY_LOCAL_MODEL_ID:
         return None
-    return selected_model_config(formula_id)
+    managed = load_managed_connections()
+    settings = load_model_settings()
+    if not managed and settings is None:
+        return None
+    try:
+        return selected_model_config(formula_id)
+    except (ModelNotConfiguredError, ModelNotAvailableError):
+        # 公式模型失效不应让 /function 直接失败：按跟随全局处理。
+        return None
 
 
 def model_catalog() -> dict[str, object]:
+    """模型目录：只包含真实配置的模型连接。
+
+    没有任何真实连接时返回 ``models=[]``、``defaultModelId=None``。不得用
+    虚拟的 “基础模式” 选项占位来掩盖“未配置”或“目录读取失败”。
+    """
     settings = load_model_settings()
     managed = load_managed_connections()
-    options: list[dict[str, str | bool]] = [
-        {
-            "id": "local",
-            "label": "基础模式",
-            "provider": "local",
-            "available": True,
-            "supportsVision": False,
-        }
-    ]
+    options: list[dict[str, str | bool]] = []
     if settings is not None:
         options.extend(
             {
@@ -435,12 +548,14 @@ def model_catalog() -> dict[str, object]:
         }
         for connection in managed
     )
+    if settings is not None:
+        default_model_id: str | None = settings.default_model
+    elif managed:
+        default_model_id = managed[0].catalog_id
+    else:
+        default_model_id = None
     return {
-        "defaultModelId": (
-            settings.default_model
-            if settings is not None
-            else managed[0].catalog_id if managed else "local"
-        ),
+        "defaultModelId": default_model_id,
         "models": options,
     }
 
@@ -451,7 +566,7 @@ def model_status() -> dict[str, str | bool | None]:
     if settings is None and not managed:
         return {
             "configured": False,
-            "mode": "local",
+            "mode": "model",
             "model": None,
         }
     return {
