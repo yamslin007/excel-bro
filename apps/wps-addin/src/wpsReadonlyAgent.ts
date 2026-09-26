@@ -3,8 +3,10 @@ import {
   createAssistantResponse,
   type ModelOption
 } from "../../excel-addin/src/api";
+import capabilities from "../../../config/capabilities.json";
 import type {
   AssistantResponse,
+  AnalysisPlan,
   DataToolRequest,
   DataToolResult,
   IntentCheckRequest,
@@ -23,10 +25,11 @@ import {
   authorizeWpsSheets,
   listWpsWorksheets,
   readAuthorizedWpsSheets,
+  readAuthorizedWpsSheetSchemas,
   type WpsSheetReadResult
 } from "./wpsWorkbookReader";
 
-export type WpsReadonlyTurnResult =
+export type WpsTurnResult =
   | {
       kind: "answer";
       message: string;
@@ -38,8 +41,8 @@ export type WpsReadonlyTurnResult =
       response: Extract<IntentCheckResponse, { kind: "clarification" }>;
     }
   | {
-      kind: "blocked";
-      message: string;
+      kind: "plan";
+      plan: AnalysisPlan;
     };
 
 export type WpsReadonlyTurnProgress = {
@@ -64,13 +67,15 @@ type WpsReadonlyAgentDependencies = {
   createAssistantResponse: typeof createAssistantResponse;
   executeQuery: (request: DataToolRequest, sheets: SheetValues[]) => DataToolResult;
   readSheets: typeof readAuthorizedWpsSheets;
+  readSchemas: typeof readAuthorizedWpsSheetSchemas;
 };
 
 const DEFAULT_DEPENDENCIES: WpsReadonlyAgentDependencies = {
   checkIntent,
   createAssistantResponse,
   executeQuery: executeQueryTableData,
-  readSheets: readAuthorizedWpsSheets
+  readSheets: readAuthorizedWpsSheets,
+  readSchemas: readAuthorizedWpsSheetSchemas
 };
 
 function columnName(index: number): string {
@@ -102,13 +107,20 @@ export function buildWpsReadonlyContexts(
     usedRange: usedRangeAddress(result),
     rowCount: result.rowCount,
     columnCount: result.columnCount,
-    headers: detectSheetFields(result.values)
+    headers: detectSheetFields(result.values).slice(0, capabilities.intentContext.maxFieldsPerSheet)
   }));
+  const authorizedNames = new Set(sheets.map((sheet) => sheet.name));
+  const activeWorksheet = authorizedNames.has(probe.activeSheetName)
+    ? probe.activeSheetName
+    : sheets[0]?.name ?? "";
+  const selectedRange = authorizedNames.has(probe.activeSheetName)
+    ? probe.selectionAddress
+    : null;
   const workbook: WorkbookSnapshot = {
     name: metadata.name,
     capturedAt: new Date().toISOString(),
-    activeWorksheet: probe.activeSheetName,
-    selectedRange: probe.selectionAddress,
+    activeWorksheet,
+    selectedRange,
     worksheets: sheets.map((sheet) => ({
       ...sheet,
       dataRows: [],
@@ -119,8 +131,8 @@ export function buildWpsReadonlyContexts(
     workbookName: metadata.name,
     sourceMode: "workbook",
     selectionMode: "manual",
-    activeWorksheet: probe.activeSheetName,
-    selectedRange: probe.selectionAddress,
+    activeWorksheet,
+    selectedRange,
     totalWorksheetCount: metadata.sheets.length,
     // WPS W2 is read-only; unselected names are deliberately not exposed to planning.
     worksheetNames: sheets.map((sheet) => sheet.name),
@@ -147,7 +159,7 @@ function sheetsForRequest(
   }));
 }
 
-function finalizeResponse(response: AssistantResponse): WpsReadonlyTurnResult {
+function finalizeResponse(response: AssistantResponse): WpsTurnResult {
   if (response.kind === "answer") {
     return {
       kind: "answer",
@@ -156,31 +168,21 @@ function finalizeResponse(response: AssistantResponse): WpsReadonlyTurnResult {
       provider: response.provider
     };
   }
-  return {
-    kind: "blocked",
-    message:
-      "模型生成了工作簿写入方案，但 WPS 首期仅开放只读查询；本次没有预览、执行或修改任何工作表。"
-  };
+  return { kind: "plan", plan: response.plan };
 }
 
-export async function runWpsReadonlyTurn(
+export async function runWpsTurn(
   input: WpsReadonlyTurnInput,
   dependencies: WpsReadonlyAgentDependencies = DEFAULT_DEPENDENCIES
-): Promise<WpsReadonlyTurnResult> {
+): Promise<WpsTurnResult> {
   const prompt = input.prompt.trim();
   if (prompt.length < 2) throw new Error("请输入至少两个字符的问题。");
-  input.onProgress?.({ stage: "reading", message: "正在读取本次明确授权的工作表…" });
+  input.onProgress?.({ stage: "reading", message: "正在读取已授权工作表的字段结构…" });
   const authorization = authorizeWpsSheets(input.application, input.selectedSheetIndexes);
-  const results = await dependencies.readSheets(input.application, authorization, {
-    signal: input.signal,
-    onProgress: ({ sheet, rowsRead, totalRows }) => {
-      input.onProgress?.({
-        stage: "reading",
-        message: `正在读取「${sheet.name}」：${rowsRead} / ${totalRows} 行`
-      });
-    }
+  const schemas = await dependencies.readSchemas(input.application, authorization, {
+    signal: input.signal
   });
-  const { scope, workbook } = buildWpsReadonlyContexts(input.application, results);
+  const { scope, workbook } = buildWpsReadonlyContexts(input.application, schemas);
 
   input.onProgress?.({ stage: "intent", message: "正在判断是否需要本地确定性查询…" });
   const intent = await dependencies.checkIntent(
@@ -195,11 +197,24 @@ export async function runWpsReadonlyTurn(
     },
     input.signal
   );
+  if (intent.kind === "conversation") {
+    return { kind: "answer", message: intent.message, provider: intent.provider, resultContext: null };
+  }
   if (intent.kind === "clarification") return { kind: "clarification", response: intent };
 
   let dataResults: DataToolResult[] = [];
   let confirmedPrompt = intent.confirmedPrompt;
   if (intent.kind === "tool_request") {
+    input.onProgress?.({ stage: "reading", message: "正在读取本次查询所需的授权数据…" });
+    const results = await dependencies.readSheets(input.application, authorization, {
+      signal: input.signal,
+      onProgress: ({ sheet, rowsRead, totalRows }) => {
+        input.onProgress?.({
+          stage: "reading",
+          message: `正在读取「${sheet.name}」：${rowsRead} / ${totalRows} 行`
+        });
+      }
+    });
     input.onProgress?.({ stage: "calculating", message: "正在本地计算完整授权数据…" });
     const querySheets = sheetsForRequest(intent.request, results, scope.activeWorksheet);
     dataResults = [dependencies.executeQuery(intent.request, querySheets)];
@@ -219,5 +234,9 @@ export async function runWpsReadonlyTurn(
   );
   return finalizeResponse(response);
 }
+
+/** Compatibility alias for extensions/tests importing the W2 name. */
+export const runWpsReadonlyTurn = runWpsTurn;
+export type WpsReadonlyTurnResult = WpsTurnResult;
 
 export type { ModelOption };

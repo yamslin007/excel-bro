@@ -150,3 +150,17 @@ describe("first-run guide theme", () => {
     expect(pulseSection).not.toContain("rgba(52, 153, 84");
   });
 });
+
+describe("header popup layering", () => {
+  it("raises the header stacking context while a model or more menu is open", () => {
+    const source = css("./styles.css");
+    const component = css("./App.tsx");
+
+    expect(source).toMatch(
+      /\.chat-header\.menu-open\s*\{[\s\S]*?z-index:\s*50;/
+    );
+    expect(component).toContain(
+      'className={`chat-header${modelMenuOpen || moreMenuOpen ? " menu-open" : ""}`}'
+    );
+  });
+});

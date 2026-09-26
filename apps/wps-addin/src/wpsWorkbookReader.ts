@@ -67,7 +67,13 @@ export class WpsReadLimitError extends Error {
   }
 }
 
-function workbookFullName(workbook: WpsWorkbook): string | null {
+const WPS_SYSTEM_SHEETS = new Set(["#EB_RULES", "#EB_RULES_BACKUP"]);
+
+export function isWpsSystemSheet(name: string): boolean {
+  return WPS_SYSTEM_SHEETS.has(name.trim().toUpperCase());
+}
+
+export function workbookFullName(workbook: WpsWorkbook): string | null {
   if (workbook.FullName) return String(workbook.FullName);
   if (workbook.Path) {
     return `${String(workbook.Path).replace(/[\\/]$/, "")}\\${String(workbook.Name)}`;
@@ -127,6 +133,7 @@ export function listWpsWorksheets(application: WpsApplication): WpsWorkbookMetad
   for (let index = 1; index <= count; index += 1) {
     const sheet = workbook.Worksheets.Item(index);
     if (!sheet?.Name) continue;
+    if (isWpsSystemSheet(String(sheet.Name))) continue;
     sheets.push({
       index,
       name: String(sheet.Name),
@@ -158,6 +165,9 @@ export function authorizeWpsSheets(
     }
     const sheet = workbook.Worksheets.Item(index);
     if (!sheet?.Name) throw new WpsAuthorizationError(`无法识别第 ${index} 张工作表。`);
+    if (isWpsSystemSheet(String(sheet.Name))) {
+      throw new WpsAuthorizationError(`工作表「${String(sheet.Name)}」是 Excel Bro 内部系统表，不能授权读取或修改。`);
+    }
     return { index, name: String(sheet.Name) };
   });
 
@@ -170,7 +180,7 @@ export function authorizeWpsSheets(
   };
 }
 
-function assertAuthorization(
+export function assertWpsAuthorization(
   application: WpsApplication,
   authorization: WpsReadAuthorization,
   authorizedSheet: WpsAuthorizedSheet
@@ -197,6 +207,9 @@ function assertAuthorization(
       `已授权工作表「${authorizedSheet.name}」被移动、重命名或删除，已停止读取。`
     );
   }
+  if (isWpsSystemSheet(String(sheet.Name))) {
+    throw new WpsAuthorizationError("Excel Bro 内部系统表不能授权读取或修改。");
+  }
   return sheet;
 }
 
@@ -219,10 +232,11 @@ function defaultYieldControl(): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, 0));
 }
 
-export async function readAuthorizedWpsSheets(
+async function readAuthorizedWpsSheetsInternal(
   application: WpsApplication,
   authorization: WpsReadAuthorization,
-  options: WpsReadOptions = {}
+  options: WpsReadOptions,
+  schemaOnly: boolean
 ): Promise<WpsSheetReadResult[]> {
   const configuredChunkRows = Number(capabilities.wpsRead.chunkRows);
   const requestedChunkRows = Number(options.chunkRows ?? configuredChunkRows);
@@ -232,7 +246,7 @@ export async function readAuthorizedWpsSheets(
 
   for (const authorizedSheet of authorization.sheets) {
     if (options.signal?.aborted) throw new DOMException("读取已取消。", "AbortError");
-    const sheet = assertAuthorization(application, authorization, authorizedSheet);
+    const sheet = assertWpsAuthorization(application, authorization, authorizedSheet);
     const usedRange = sheet.UsedRange;
     if (!usedRange) {
       throw new WpsAuthorizationError(`无法读取工作表「${authorizedSheet.name}」的使用区域。`);
@@ -241,21 +255,27 @@ export async function readAuthorizedWpsSheets(
     const rowCount = Math.max(0, Number(usedRange.Rows?.Count ?? 0));
     const columnCount = Math.max(0, Number(usedRange.Columns?.Count ?? 0));
     const cellCount = rowCount * columnCount;
-    if (rowCount > capabilities.wpsRead.maxRows) {
+    if (!schemaOnly && rowCount > capabilities.wpsRead.maxRows) {
       throw new WpsReadLimitError(`工作表「${authorizedSheet.name}」有 ${rowCount} 行，超过 WPS 只读上限。`);
     }
-    if (columnCount > capabilities.wpsRead.maxColumns) {
+    if (!schemaOnly && columnCount > capabilities.wpsRead.maxColumns) {
       throw new WpsReadLimitError(`工作表「${authorizedSheet.name}」有 ${columnCount} 列，超过 WPS 只读上限。`);
     }
-    if (cellCount > capabilities.wpsRead.maxCells) {
+    if (!schemaOnly && cellCount > capabilities.wpsRead.maxCells) {
       throw new WpsReadLimitError(`工作表「${authorizedSheet.name}」包含 ${cellCount} 个单元格，超过 WPS 只读上限。`);
     }
 
     const values: WpsCellValue[][] = [];
+    const rowsToRead = schemaOnly
+      ? Math.min(rowCount, Number(capabilities.queryTable.headerScanRows))
+      : rowCount;
+    const columnsToRead = schemaOnly
+      ? Math.min(columnCount, Number(capabilities.snapshot.structureColumns))
+      : columnCount;
     let chunksRead = 0;
-    for (let offsetRows = 0; offsetRows < rowCount; offsetRows += chunkRows) {
+    for (let offsetRows = 0; offsetRows < rowsToRead; offsetRows += chunkRows) {
       if (options.signal?.aborted) throw new DOMException("读取已取消。", "AbortError");
-      const currentSheet = assertAuthorization(application, authorization, authorizedSheet);
+      const currentSheet = assertWpsAuthorization(application, authorization, authorizedSheet);
       const currentUsedRange = currentSheet.UsedRange;
       if (!currentUsedRange) {
         throw new WpsAuthorizationError("使用区域在读取期间失效，已停止读取。");
@@ -266,20 +286,20 @@ export async function readAuthorizedWpsSheets(
         throw new WpsAuthorizationError("工作表尺寸在读取期间发生变化，已停止读取；请重新查询。");
       }
 
-      const currentChunkRows = Math.min(chunkRows, rowCount - offsetRows);
+      const currentChunkRows = Math.min(chunkRows, rowsToRead - offsetRows);
       const range = readChunkRange(
         currentSheet,
         currentUsedRange,
         offsetRows,
         currentChunkRows,
-        columnCount
+        columnsToRead
       );
-      values.push(...normalizeWpsMatrix(range.Value2, currentChunkRows, columnCount));
+      values.push(...normalizeWpsMatrix(range.Value2, currentChunkRows, columnsToRead));
       chunksRead += 1;
       options.onProgress?.({
         sheet: authorizedSheet,
         rowsRead: offsetRows + currentChunkRows,
-        totalRows: rowCount,
+        totalRows: rowsToRead,
         chunkIndex: chunksRead
       });
       await yieldControl();
@@ -297,4 +317,21 @@ export async function readAuthorizedWpsSheets(
   }
 
   return results;
+}
+
+/** Read only candidate header rows. The reported dimensions remain the full used range. */
+export async function readAuthorizedWpsSheetSchemas(
+  application: WpsApplication,
+  authorization: WpsReadAuthorization,
+  options: WpsReadOptions = {}
+): Promise<WpsSheetReadResult[]> {
+  return readAuthorizedWpsSheetsInternal(application, authorization, options, true);
+}
+
+export async function readAuthorizedWpsSheets(
+  application: WpsApplication,
+  authorization: WpsReadAuthorization,
+  options: WpsReadOptions = {}
+): Promise<WpsSheetReadResult[]> {
+  return readAuthorizedWpsSheetsInternal(application, authorization, options, false);
 }

@@ -27,12 +27,12 @@ function application(overrides: {
   };
 }
 
-describe("WPS W3 read-only capability probe", () => {
+describe("WPS W3 write capability probe", () => {
   it("checks an authorized local workbook without writing", () => {
     const cell: WpsRange = { Value2: "原值", Formula: "原值", MergeCells: false };
     const result = probeWpsWriteCapabilities(application({ cell }), [1]);
     expect(result.readyForHostValidation).toBe(true);
-    expect(result.writeEnabled).toBe(false);
+    expect(result.writeEnabled).toBe(true);
     expect(result.checks.every((check) => check.passed)).toBe(true);
     expect(cell.Value2).toBe("原值");
   });
@@ -65,7 +65,7 @@ describe("WPS W3 read-only capability probe", () => {
     expect(result.checks.find((check) => check.id === "formula")?.passed).toBe(false);
   });
 
-  it("keeps the WPS write feature flag disabled until real host validation", () => {
-    expect(wpsWriteFeatureFlagEnabled()).toBe(false);
+  it("exposes the WPS write feature flag after the guarded executor is enabled", () => {
+    expect(wpsWriteFeatureFlagEnabled()).toBe(true);
   });
 });

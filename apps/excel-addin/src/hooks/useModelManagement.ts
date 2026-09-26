@@ -37,6 +37,8 @@ export interface ConnectionTestFeedback {
   message: string;
 }
 
+export type ExistingConnectionsStatus = "idle" | "checking" | "ready" | "failed";
+
 interface UseModelManagementOptions {
   /**
    * 刷新服务健康状态的回调
@@ -86,6 +88,9 @@ export function useModelManagement(options: UseModelManagementOptions) {
   const [settingsTesting, setSettingsTesting] = useState(false);
   const [settingsLoading, setSettingsLoading] = useState(false);
   const [settingsFeedback, setSettingsFeedback] = useState("");
+  const [existingConnectionsStatus, setExistingConnectionsStatus] =
+    useState<ExistingConnectionsStatus>("idle");
+  const existingConnectionsRequestRef = useRef(0);
   const [modelGuideDismissed, setModelGuideDismissed] = useState(false);
 
   const setConnectionDraft = useCallback<
@@ -120,6 +125,8 @@ export function useModelManagement(options: UseModelManagementOptions) {
    * 发起真实请求并以本次结果更新状态。
    */
   const openSettings = useCallback(async () => {
+    existingConnectionsRequestRef.current += 1;
+    setExistingConnectionsStatus("idle");
     setShowApiKey(false);
     setSettingsFeedback("");
     setConnectionDraft(null);
@@ -151,13 +158,44 @@ export function useModelManagement(options: UseModelManagementOptions) {
   /**
    * 打开连接创建器
    *
-   * 不等待后台读取成功：即使 openSettings 失败也进入表单。用户填写完
-   * 再点“测试连接”或“添加并使用”时才发起真实请求。
+   * 新建连接不依赖已有设置：立即展示空白表单，不预先读取后台。
+   * 用户点“测试连接”时才验证；保存成功后再刷新模型目录。
    */
-  const openConnectionCreator = useCallback(async () => {
-    await openSettings();
+  const openConnectionCreator = useCallback(() => {
+    existingConnectionsRequestRef.current += 1;
+    setExistingConnectionsStatus("idle");
+    setShowApiKey(false);
+    setSettingsFeedback("");
+    setPendingDeleteConnectionId(null);
+    setSettingsLoading(false);
     setConnectionDraft(emptyModelConnectionDraft());
-  }, [openSettings]);
+  }, [setConnectionDraft]);
+
+  /**
+   * 新建表单打开后异步检查本机已保存的连接，不阻塞填写，也不读取完整 API Key。
+   * 失败与“确实没有连接”分开表达；较早的请求不得覆盖新一轮检查结果。
+   */
+  const checkExistingConnections = useCallback(async () => {
+    const requestId = ++existingConnectionsRequestRef.current;
+    setExistingConnectionsStatus("checking");
+    try {
+      const settings = await getModelSettings();
+      if (requestId !== existingConnectionsRequestRef.current) return false;
+      setModelSettings(settings);
+      setExistingConnectionsStatus("ready");
+      try {
+        await refreshServiceHealth();
+      } catch {
+        // 已保存连接读取成功；目录辅助刷新失败不改变这一结果。
+      }
+      return true;
+    } catch {
+      if (requestId === existingConnectionsRequestRef.current) {
+        setExistingConnectionsStatus("failed");
+      }
+      return false;
+    }
+  }, [refreshServiceHealth]);
 
   /**
    * 刷新模型列表（在保存设置后）
@@ -439,6 +477,7 @@ export function useModelManagement(options: UseModelManagementOptions) {
     settingsTesting,
     settingsLoading,
     settingsFeedback,
+    existingConnectionsStatus,
     connectionTestFeedback,
     connectionVerified:
       connectionTestFeedback?.kind === "success" &&
@@ -450,6 +489,7 @@ export function useModelManagement(options: UseModelManagementOptions) {
     dismissModelGuide,
     openSettings,
     openConnectionCreator,
+    checkExistingConnections,
     saveApiKey,
     editModelConnection,
     verifyConnection,

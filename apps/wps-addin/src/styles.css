@@ -312,6 +312,10 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
   text-align: left;
 }
 .clarification-options small { color: var(--muted); }
+.clarification-custom { display: flex; gap: 8px; margin-top: 10px; }
+.clarification-custom input { min-width: 0; flex: 1; border: 1px solid var(--border); border-radius: 10px; padding: 9px 11px; font: inherit; }
+.clarification-custom button { border: 0; border-radius: 10px; background: var(--brand); color: white; padding: 8px 13px; font: inherit; cursor: pointer; }
+.clarification-custom button:disabled { opacity: 0.5; cursor: not-allowed; }
 
 .agent-progress {
   display: flex;
@@ -505,7 +509,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
   color: #fff;
   font-size: 20px;
 }
-.eb-readonly-note {
+.wps-capability-note {
   margin: -2px 4px 0;
   color: rgba(47, 73, 58, 0.82);
   font-size: 11px;
@@ -547,7 +551,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
   .eb-composer-box { background: rgba(255, 255, 255, 0.98); }
 }
 
-/* Excel Bro 的聊天页和主题面板使用同一套设计令牌。WPS 的只读能力边界不变。 */
+/* Excel Bro 的聊天页和主题面板使用同一套设计令牌；宿主差异只由能力适配器表达。 */
 :root {
   --radius-sm: 4px;
   --radius-md: 8px;
@@ -614,6 +618,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .eb-pet-button { width: 28px; }
 .eb-pet-button svg { width: 16px; height: 16px; }
 .eb-readonly-chip { min-width: 40px; padding: 0 6px; background: var(--color-brand-bg, #edf3ec); }
+.eb-readonly-chip.writable { border-color: #b8d8c2; background: #e7f5eb; color: #216f3d; }
 
 .eb-message-stream { padding: 16px 14px 4px; }
 .eb-message { margin-bottom: 14px; }
@@ -659,7 +664,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .eb-composer-actions > span { color: var(--color-text-tertiary, #9b9a97); font-size: var(--font-size-caption); }
 .composer-send-button { width: 32px; height: 32px; background: var(--color-brand-text, #2f6b47); }
 .composer-image-button { min-height: 28px; border-color: var(--color-border, #e9e9e7); }
-.eb-readonly-note { color: var(--color-text-secondary, #787774); }
+.wps-capability-note { color: var(--color-text-secondary, #787774); }
 
 .theme-panel-backdrop {
   position: fixed;
@@ -875,6 +880,66 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .agent-progress-current > span:nth-of-type(2) { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .agent-progress-current button { flex: 0 0 auto; border: 0; background: transparent; color: var(--color-brand-text, #2f6b47); font-weight: 750; }
 
+.wps-plan-card,
+.wps-undo-card {
+  width: min(100%, 920px);
+  margin: 0 auto 16px;
+  border: 1px solid var(--color-border, #d9e4dc);
+  border-radius: var(--radius-lg, 15px);
+  background: rgba(255, 255, 255, 0.95);
+  color: var(--color-text-primary, #37352f);
+  box-shadow: 0 2px 10px rgba(28, 50, 35, 0.08);
+}
+.wps-plan-card { padding: 14px; }
+.wps-plan-card > strong { display: block; font-size: 15px; }
+.wps-plan-card > p { margin: 6px 0 0; color: var(--color-text-secondary, #787774); line-height: 1.55; }
+.wps-plan-meta { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.wps-plan-meta span {
+  border-radius: 999px;
+  background: var(--color-brand-bg, #edf3ec);
+  color: var(--color-brand-text, #2f6b47);
+  padding: 3px 8px;
+  font-size: 11px;
+  font-weight: 700;
+}
+.wps-plan-actions-list { display: grid; gap: 7px; margin-top: 11px; }
+.wps-plan-actions-list > div {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--color-border, #e9e9e7);
+  border-radius: 9px;
+  padding: 8px 10px;
+  font-size: 12px;
+}
+.wps-plan-actions-list span { min-width: 0; overflow-wrap: anywhere; }
+.wps-plan-actions-list small { color: var(--color-text-secondary, #787774); }
+.wps-plan-warnings { margin: 10px 0 0; padding-left: 20px; color: #9a6328; font-size: 12px; }
+.wps-plan-buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+.wps-plan-buttons button,
+.wps-undo-card button {
+  min-height: 34px;
+  border: 1px solid var(--color-border, #d9e4dc);
+  border-radius: 9px;
+  background: #fff;
+  color: var(--color-brand-text, #2f6b47);
+  padding: 0 12px;
+  font-weight: 750;
+}
+.wps-plan-buttons button.primary { border-color: var(--color-brand-text, #2f6b47); background: var(--color-brand-text, #2f6b47); color: #fff; }
+.wps-plan-buttons button:disabled,
+.wps-undo-card button:disabled { opacity: 0.55; }
+.wps-undo-card { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 12px; }
+.wps-undo-card > div { display: grid; min-width: 0; gap: 2px; }
+.wps-undo-card strong { font-size: 13px; }
+.wps-undo-card span { overflow: hidden; color: var(--color-text-secondary, #787774); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+
+@media (max-width: 430px) {
+  .wps-plan-actions-list > div { grid-template-columns: 1fr; gap: 3px; }
+  .wps-undo-card { align-items: stretch; flex-direction: column; }
+}
+
 @media (max-width: 390px) {
   .eb-header-actions { gap: 4px; }
   .eb-model-trigger { min-width: 56px; }
@@ -1044,8 +1109,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .wps-model-settings-header > div { display: grid; min-width: 0; flex: 1; gap: 2px; }
 .wps-model-settings-header strong { font-size: 20px; line-height: 26px; }
 .wps-model-settings-header span { color: var(--color-text-secondary, #787774); font-size: var(--font-size-caption); }
-.wps-model-settings-header > button,
-.model-editor-title > button {
+.wps-model-settings-header > button {
   display: grid;
   width: 28px;
   height: 28px;
@@ -1152,6 +1216,10 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .model-settings-section input:focus,
 .model-settings-section select:focus { border-color: var(--color-brand-text, #2f6b47); }
 .model-key-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 7px; }
+.model-key-row.no-key-reveal { grid-template-columns: minmax(0, 1fr); }
+.model-saved-key-status { display: grid; gap: 3px; font-weight: 400; line-height: 1.45; }
+.model-saved-key-status strong { color: var(--color-brand-text, #2f6b47); font-size: var(--font-size-caption); }
+.model-saved-key-status small { color: var(--color-text-secondary, #787774); font-size: var(--font-size-caption); }
 .model-primary-action {
   border-color: var(--color-brand-text, #2f6b47) !important;
   background: var(--color-brand-text, #2f6b47) !important;
@@ -1170,6 +1238,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .model-connection-list { display: grid; gap: 8px; }
 .model-connection-card {
   display: flex;
+  flex-wrap: wrap;
   align-items: flex-start;
   justify-content: space-between;
   gap: 10px;
@@ -1179,22 +1248,115 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
   padding: 10px;
 }
 .model-connection-card.current { border-color: var(--color-brand-text, #2f6b47); background: var(--color-brand-bg, #edf3ec); }
+.model-connection-select {
+  min-width: 0;
+  flex: 1;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: inherit;
+  padding: 0;
+  text-align: left;
+  cursor: pointer;
+}
+.model-connection-select:disabled { cursor: default; opacity: 1; }
+.model-connection-select:not(:disabled):hover .model-connection-copy em,
+.model-connection-select:not(:disabled):focus-visible .model-connection-copy em { text-decoration: underline; }
+.model-connection-select:focus-visible { outline: 2px solid var(--color-brand-text, #2f6b47); outline-offset: 3px; }
 .model-connection-copy { display: grid; min-width: 0; flex: 1; gap: 3px; }
-.model-connection-copy > div { display: flex; align-items: center; gap: 6px; }
+.model-connection-name { display: flex; align-items: center; gap: 6px; }
 .model-connection-copy strong,
 .model-connection-copy span,
 .model-connection-copy small { overflow-wrap: anywhere; }
-.model-connection-copy > div b { border-radius: 999px; background: var(--color-brand-bg, #edf3ec); color: var(--color-brand-text, #2f6b47); padding: 2px 6px; font-size: 10px; }
+.model-connection-name b { border-radius: 999px; background: var(--color-brand-bg, #edf3ec); color: var(--color-brand-text, #2f6b47); padding: 2px 6px; font-size: 10px; }
 .model-connection-copy span { font-size: var(--font-size-caption); font-weight: 650; }
 .model-connection-copy small { color: var(--color-text-secondary, #787774); font-size: 11px; }
+.model-connection-copy em { color: var(--color-brand-text, #2f6b47); font-size: var(--font-size-caption); font-style: normal; font-weight: 700; }
 .model-connection-actions { display: flex; flex: 0 0 auto; gap: 6px; }
 .model-connection-actions .danger { border-color: #efc9c4; color: #a34537; }
-.model-connection-editor { display: grid; gap: 10px; border-top: 1px solid var(--color-border, #e9e9e7); padding-top: 12px; }
+.model-connection-editor { display: grid; min-width: 0; gap: 10px; }
+.model-settings-section > .model-connection-editor { border-top: 1px solid var(--color-border, #e9e9e7); padding-top: 12px; }
+.model-connection-card > .model-connection-editor {
+  flex: 0 0 100%;
+  border-top: 1px solid var(--color-border, #e9e9e7);
+  padding-top: 12px;
+}
+.model-connection-discovery,
+.model-existing-match {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 7px;
+  border-radius: var(--radius-md);
+  background: var(--color-surface, #fafaf9);
+  color: var(--color-text-secondary, #787774);
+  padding: 8px 10px;
+  font-size: var(--font-size-caption);
+  line-height: 1.45;
+}
+.model-existing-match { background: var(--color-brand-bg, #edf3ec); color: var(--color-brand-text, #2f6b47); }
+.model-connection-discovery button,
+.model-existing-match button {
+  border: 0;
+  background: transparent;
+  color: var(--color-brand-text, #2f6b47);
+  padding: 2px 0;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
 .model-editor-title { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.model-editor-title > button {
+  border: 1px solid var(--color-border-strong, #d3d2cf);
+  border-radius: var(--radius-md);
+  background: var(--color-background, #fff);
+  color: var(--color-text-secondary, #787774);
+  padding: 4px 9px;
+  font-size: var(--font-size-caption);
+  cursor: pointer;
+}
 .model-connection-editor > p { margin: 0; color: var(--color-text-secondary, #787774); font-size: var(--font-size-caption); line-height: 1.55; }
 .model-checkbox-row { display: flex !important; align-items: flex-start; gap: 7px !important; font-weight: 500 !important; line-height: 1.45; }
 .model-checkbox-row input { width: 16px; min-height: 16px; flex: 0 0 16px; margin: 1px 0 0; accent-color: var(--color-brand-text, #2f6b47); }
 .model-editor-actions { display: flex; justify-content: flex-end; gap: 7px; }
+.model-duplicate-toast {
+  position: absolute;
+  top: 72px;
+  left: 50%;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: max-content;
+  max-width: calc(100% - 28px);
+  padding: 8px 10px 8px 14px;
+  border: 1px solid var(--color-border, #e9e9e7);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.97);
+  box-shadow: 0 8px 24px rgba(28, 45, 34, 0.14);
+  color: var(--color-text-primary, #37352f);
+  font-size: var(--font-size-caption);
+  line-height: 1.45;
+  pointer-events: none;
+  transform: translateX(-50%);
+  animation: model-duplicate-toast-in 180ms ease-out both;
+}
+.model-duplicate-toast button {
+  flex: 0 0 auto;
+  padding: 0 4px;
+  border: 0;
+  background: transparent;
+  color: var(--color-text-secondary, #787774);
+  cursor: pointer;
+  font: inherit;
+  pointer-events: auto;
+}
+.model-duplicate-toast button:hover { color: var(--color-brand-text, #2f6b47); }
+@keyframes model-duplicate-toast-in {
+  from { opacity: 0; transform: translate(-50%, -5px); }
+  to { opacity: 1; transform: translate(-50%, 0); }
+}
 .model-connection-feedback,
 .model-settings-feedback {
   display: flex;
@@ -1217,5 +1379,203 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
   .model-connection-actions { justify-content: flex-end; }
 }
 @media (prefers-reduced-motion: reduce) {
-  .model-settings-loading i { animation: none; }
+  .model-settings-loading i,
+  .model-duplicate-toast { animation: none; }
+}
+
+/*
+ * WPS / Excel 产品壳统一层
+ *
+ * Excel 的 styles.css 作为共同视觉基线先加载；这里仅补 WPS 宿主专属内容，
+ * 并压掉旧版 eb-* 精简页遗留的尺寸差异。不要在这里重新设计第二套任务窗格。
+ */
+.wps-chat-shell.chat-shell {
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  background: var(--color-background, #fff);
+}
+
+.message-stream-shell {
+  z-index: 2;
+}
+
+.composer .wps-scope-dock {
+  display: contents;
+}
+
+.wps-scope-popover {
+  max-height: min(610px, calc(100vh - 124px));
+}
+
+.wps-current-file-card {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-brand-bg);
+  padding: 10px;
+}
+
+.wps-current-file-card > span {
+  display: grid;
+  width: 42px;
+  height: 42px;
+  flex: 0 0 42px;
+  place-items: center;
+  border-radius: var(--radius-sm);
+  background: var(--color-brand-text);
+  color: #fff;
+  font-size: var(--font-size-caption);
+  font-weight: 800;
+}
+
+.wps-current-file-card > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.wps-current-file-card small,
+.wps-current-file-card strong,
+.wps-current-file-card em {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wps-current-file-card small {
+  color: var(--color-text-secondary);
+}
+
+.wps-current-file-card em {
+  color: var(--color-brand-text);
+  font-size: var(--font-size-caption);
+  font-style: normal;
+}
+
+.wps-sheet-picker-options {
+  display: grid;
+  max-height: 210px;
+  gap: 6px;
+  overflow-y: auto;
+  padding: 2px;
+}
+
+.wps-sheet-picker-options > button {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 38px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  color: var(--color-text-primary);
+  padding: 7px 9px;
+  text-align: left;
+}
+
+.wps-sheet-picker-options > button.selected {
+  border-color: var(--color-brand-hover);
+  background: var(--color-brand-bg);
+}
+
+.wps-sheet-picker-options > button i {
+  display: grid;
+  width: 20px;
+  height: 20px;
+  place-items: center;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--color-brand-text);
+  font-style: normal;
+}
+
+.wps-sheet-picker-options > button.selected i {
+  border-color: var(--color-brand-text);
+  background: var(--color-brand-text);
+  color: #fff;
+}
+
+.wps-sheet-picker-options > button span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wps-sheet-picker-options > button small {
+  color: var(--color-text-secondary);
+}
+
+.wps-scope-actions {
+  display: flex;
+  flex: 0 0 auto;
+  justify-content: flex-end;
+  gap: 7px;
+  border-top: 1px solid var(--color-border);
+  padding: 10px var(--spacing-md);
+}
+
+.wps-backup-content {
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--spacing-lg);
+}
+
+.wps-backup-card {
+  display: grid;
+  gap: 7px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  background: var(--color-surface);
+  padding: var(--spacing-lg);
+}
+
+.wps-backup-card > span,
+.wps-backup-card > small {
+  color: var(--color-text-secondary);
+}
+
+.wps-backup-card > button {
+  justify-self: start;
+  min-height: 34px;
+  border: 1px solid var(--color-brand-text);
+  border-radius: var(--radius-md);
+  background: var(--color-brand-text);
+  color: #fff;
+  padding: 6px 12px;
+  font-weight: 750;
+}
+
+@media (max-width: 620px) {
+  .chat-header .brand-copy span {
+    max-width: none;
+    overflow: visible;
+  }
+
+  .chat-header .tools-entry,
+  .chat-header .folder-backup-entry {
+    width: 28px;
+    padding: 0;
+  }
+
+  .chat-header .tools-entry > span,
+  .chat-header .folder-backup-entry > span:not([aria-hidden="true"]) {
+    display: none;
+  }
+
+  .chat-header .new-chat-entry > span:not([aria-hidden="true"]) {
+    display: none;
+  }
+}
+
+@media (max-width: 460px) {
+  .chat-header .brand-copy {
+    display: none;
+  }
+
+  .chat-header .model-picker {
+    margin-left: auto;
+  }
 }

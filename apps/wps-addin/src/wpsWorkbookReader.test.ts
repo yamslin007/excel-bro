@@ -4,6 +4,7 @@ import {
   authorizeWpsSheets,
   listWpsWorksheets,
   normalizeWpsMatrix,
+  readAuthorizedWpsSheetSchemas,
   readAuthorizedWpsSheets,
   WpsAuthorizationError
 } from "./wpsWorkbookReader";
@@ -70,6 +71,21 @@ describe("WPS workbook reader", () => {
     ]);
   });
 
+  it("hides EB system sheets while preserving native WPS indexes", () => {
+    const application = makeApplication([
+      makeSheet("明细", [[1]]),
+      makeSheet("#EB_RULES", [["内部规则"]]),
+      makeSheet("汇总", [[2]]),
+      makeSheet("#eb_rules_backup", [["备份"]])
+    ]);
+    expect(listWpsWorksheets(application).sheets).toEqual([
+      { index: 1, name: "明细", isActive: true },
+      { index: 3, name: "汇总", isActive: false }
+    ]);
+    expect(() => authorizeWpsSheets(application, [2])).toThrow("内部系统表");
+    expect(() => authorizeWpsSheets(application, [4])).toThrow("内部系统表");
+  });
+
   it("does not expand an explicit empty authorization", () => {
     const application = makeApplication([makeSheet("明细", [[1]])]);
     expect(() => authorizeWpsSheets(application, [])).toThrow(WpsAuthorizationError);
@@ -93,6 +109,27 @@ describe("WPS workbook reader", () => {
     expect(results[0].values).toEqual([["标题"], [1], [2], [3], [4]]);
     expect(results[0].chunksRead).toBe(3);
     expect(progress).toEqual([2, 4, 5]);
+  });
+
+  it("reads candidate headers without scanning all data rows", async () => {
+    const values = [["影院", "数量"], ...Array.from({ length: 50 }, (_, index) => [`影院${index}`, index])];
+    const sheet = makeSheet("明细", values);
+    const range = sheet.Range!;
+    const reads: number[] = [];
+    sheet.Range = (first, last) => {
+      reads.push(Number((last as WpsRange).Row ?? 0));
+      return range(first, last);
+    };
+    const application = makeApplication([sheet]);
+    const authorization = authorizeWpsSheets(application, [1]);
+    const results = await readAuthorizedWpsSheetSchemas(application, authorization, {
+      yieldControl: async () => undefined
+    });
+
+    expect(results[0].rowCount).toBe(51);
+    expect(results[0].values[0]).toEqual(["影院", "数量"]);
+    expect(results[0].values.length).toBeLessThan(51);
+    expect(Math.max(...reads)).toBeLessThan(51);
   });
 
   it("stops when the active workbook changes", async () => {

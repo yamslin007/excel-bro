@@ -261,6 +261,10 @@ describe("assertAssistantResponse", () => {
 });
 
 describe("assertIntentCheckResponse", () => {
+  it("accepts a direct conversational reply and rejects an empty one", () => {
+    expect(() => assertIntentCheckResponse({ kind: "conversation", provider: "model", message: "你好！" })).not.toThrow();
+    expect(() => assertIntentCheckResponse({ kind: "conversation", provider: "model", message: "  " })).toThrow("对话回复无效");
+  });
   it("accepts a clarification with mutually exclusive options", () => {
     const response = {
       kind: "clarification",

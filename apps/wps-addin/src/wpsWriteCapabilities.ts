@@ -14,7 +14,7 @@ export type WpsWriteCapabilityProbe = {
   selectedSheetCount: number;
   checks: WpsWriteCapabilityCheck[];
   readyForHostValidation: boolean;
-  writeEnabled: false;
+  writeEnabled: boolean;
 };
 
 function isLocalXlsx(fullName: string): boolean {
@@ -40,9 +40,8 @@ function selectedSheets(
 }
 
 /**
- * Read-only W3 preflight. It never sets a WPS property or sends workbook data to the server.
- * Passing this probe does not authorize writes: host write/restore behavior still needs a
- * separate real-WPS validation before the feature flag can be enabled.
+ * W3 preflight. It never sets a WPS property or sends workbook data to the server.
+ * Passing the probe only makes preview/confirmation available; execution repeats all checks.
  */
 export function probeWpsWriteCapabilities(
   application: WpsApplication,
@@ -56,7 +55,17 @@ export function probeWpsWriteCapabilities(
   };
 
   const fullName = String(workbook?.FullName ?? "").trim();
+  const hostVersion = String(application.Version ?? "").trim();
+  const versionAllowed = capabilities.wpsWrite.verifiedVersionPrefixes.some((prefix) =>
+    hostVersion === prefix || hostVersion.startsWith(`${prefix}.`)
+  );
   add("workbook", "当前工作簿", Boolean(workbook), workbook ? "已连接" : "没有打开的工作簿");
+  add(
+    "hostVersion",
+    "WPS 宿主版本",
+    versionAllowed,
+    versionAllowed ? `已验证版本族 ${hostVersion}` : `当前版本 ${hostVersion || "未知"} 尚未加入写入白名单`
+  );
   add(
     "localXlsx",
     "已保存的本地 .xlsx",
@@ -106,13 +115,12 @@ export function probeWpsWriteCapabilities(
   add("protection", "工作表保护状态", protectionReadable, protectionReadable ? "已选表均明确未保护" : "存在保护表或状态无法确定");
 
   return {
-    hostVersion: application.Version ? String(application.Version) : null,
+    hostVersion: hostVersion || null,
     workbookName: workbook?.Name ? String(workbook.Name) : null,
     selectedSheetCount: selected?.length ?? 0,
     checks,
     readyForHostValidation: checks.every((check) => check.passed),
-    // W3 remains closed until the real host write + restore matrix is recorded.
-    writeEnabled: false
+    writeEnabled: capabilities.wpsWrite.enabled && checks.every((check) => check.passed)
   };
 }
 

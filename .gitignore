@@ -11,6 +11,7 @@ __pycache__/
 server/.pytest_tmp/
 .pytest-tmp/
 .pytest-tmp-*/
+.tmp-pytest/
 *.py[cod]
 .venv/
 server/data/
@@ -19,3 +20,4 @@ outputs/
 apps/excel-addin/request-log.txt
 model-connections.json
 .tmp/
+.workbuddy/

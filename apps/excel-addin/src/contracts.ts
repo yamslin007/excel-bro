@@ -733,6 +733,12 @@ export interface IntentClarification {
 
 export type IntentCheckResponse =
   | {
+      kind: "conversation";
+      message: string;
+      provider: "model" | "local";
+      turnId?: string | null;
+    }
+  | {
       kind: "proceed";
       summary: string;
       confirmedPrompt: string;
@@ -772,6 +778,12 @@ export function assertIntentCheckResponse(
     throw new Error("服务返回的意图判断不是有效对象");
   }
   const response = value as Partial<IntentCheckResponse>;
+  if (response.kind === "conversation") {
+    if (typeof response.message !== "string" || !response.message.trim()) {
+      throw new Error("服务返回的对话回复无效");
+    }
+    return;
+  }
   if (response.kind === "proceed") {
     if (
       !("confirmedPrompt" in response) ||

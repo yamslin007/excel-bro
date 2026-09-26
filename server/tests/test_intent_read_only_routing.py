@@ -158,6 +158,24 @@ def test_explicit_write_request_can_still_proceed(
     assert is_explicit_read_only_query(prompt) is False
 
 
+@pytest.mark.parametrize("prompt", ["你好", "你能做什么？"])
+def test_non_task_conversation_is_answered_without_planning(
+    monkeypatch: pytest.MonkeyPatch, prompt: str
+) -> None:
+    client = _FakeClient([{"kind": "conversation", "message": "你好！我可以帮你查询和分析已授权的工作表。"}])
+    _install_client(monkeypatch, client)
+
+    response = asyncio.run(check_intent(_request(prompt), config=object()))
+
+    assert response.kind == "conversation"
+    assert response.provider == "model"
+    assert "你好" in response.message
+    assert len(client.calls) == 1
+    assert "数据范围结构摘要（不含数据行）" in client.calls[0][1]["content"]
+    assert "影院名称" in client.calls[0][1]["content"]
+    assert "甲" not in client.calls[0][1]["content"]
+
+
 @pytest.mark.parametrize(
     "prompt",
     [

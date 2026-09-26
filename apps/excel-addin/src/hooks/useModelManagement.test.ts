@@ -161,27 +161,73 @@ describe("useModelManagement", () => {
     expect(refreshServiceHealth).toHaveBeenCalledTimes(1);
   });
 
-  it("should open connection creator after loading settings", async () => {
-    const { result } = renderModelManagement();
+  it("opens a new connection form without reading settings or refreshing the catalog", () => {
+    const { result, refreshServiceHealth } = renderModelManagement();
 
-    await act(async () => {
-      await result.current.openConnectionCreator();
-    });
+    act(() => result.current.openConnectionCreator());
 
     expect(result.current.connectionDraft).toEqual(emptyDraft);
+    expect(result.current.settingsLoading).toBe(false);
+    expect(getModelSettingsMock).not.toHaveBeenCalled();
+    expect(refreshServiceHealth).not.toHaveBeenCalled();
   });
 
-  it("still opens the connection form when the backend cannot be read", async () => {
+  it("does not show a premature backend failure while creating a connection", () => {
+    getModelSettingsMock.mockRejectedValue(new Error("Failed to fetch"));
+    const { result } = renderModelManagement();
+
+    act(() => result.current.openConnectionCreator());
+
+    expect(result.current.connectionDraft).toEqual(emptyDraft);
+    expect(result.current.settingsFeedback).toBe("");
+    expect(getModelSettingsMock).not.toHaveBeenCalled();
+  });
+
+  it("checks existing connections without blocking or clearing a new draft", async () => {
+    let resolveSettings!: (value: ModelSettings) => void;
+    getModelSettingsMock.mockImplementationOnce(() => new Promise((resolve) => {
+      resolveSettings = resolve;
+    }));
+    const { result, refreshServiceHealth } = renderModelManagement();
+    let checkPromise!: Promise<boolean>;
+
+    act(() => {
+      result.current.openConnectionCreator();
+      checkPromise = result.current.checkExistingConnections();
+      result.current.setConnectionDraft({ ...emptyDraft, label: "正在填写" });
+    });
+    expect(result.current.existingConnectionsStatus).toBe("checking");
+    expect(result.current.settingsLoading).toBe(false);
+    expect(result.current.connectionDraft?.label).toBe("正在填写");
+
+    await act(async () => {
+      resolveSettings(modelSettings);
+      await checkPromise;
+    });
+    expect(result.current.existingConnectionsStatus).toBe("ready");
+    expect(result.current.modelSettings?.connections).toEqual(modelSettings.connections);
+    expect(result.current.connectionDraft?.label).toBe("正在填写");
+    expect(refreshServiceHealth).toHaveBeenCalledTimes(1);
+  });
+
+  it("distinguishes discovery failure from an empty saved-connection list and allows retry", async () => {
     getModelSettingsMock.mockRejectedValueOnce(new Error("Failed to fetch"));
     const { result } = renderModelManagement();
 
+    act(() => result.current.openConnectionCreator());
     await act(async () => {
-      await result.current.openConnectionCreator();
+      expect(await result.current.checkExistingConnections()).toBe(false);
     });
-
-    // 表单必须能打开：不能因为后台读取失败就把用户挡在门外。
+    expect(result.current.existingConnectionsStatus).toBe("failed");
+    expect(result.current.modelSettings).toBeNull();
     expect(result.current.connectionDraft).toEqual(emptyDraft);
-    expect(result.current.settingsFeedback).toContain("已填写内容仍保留");
+    expect(result.current.settingsFeedback).toBe("");
+
+    await act(async () => {
+      expect(await result.current.checkExistingConnections()).toBe(true);
+    });
+    expect(result.current.existingConnectionsStatus).toBe("ready");
+    expect(result.current.modelSettings?.connections).toEqual(modelSettings.connections);
   });
 
   it("keeps an opened draft when the save request fails", async () => {

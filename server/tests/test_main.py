@@ -17,7 +17,7 @@ import server.app.planner as planner_module
 import server.app.folder_workbooks as folder_workbooks_module
 from server.app.main import app
 from server.app.llm import ModelConnection, selected_model_config
-from server.app.models import AnswerResponse, IntentProceedResponse
+from server.app.models import AnswerResponse, IntentConversationResponse, IntentProceedResponse
 from server.app.turn_state import turn_registry
 
 
@@ -568,7 +568,7 @@ def test_model_connection_can_be_tested_without_saving(
     assert not (llm_config._connection_store_path()).exists()
 
 
-def test_model_connection_edit_can_clear_key_and_reject_duplicates() -> None:
+def test_same_model_connections_keep_distinct_ids_and_keys() -> None:
     client = TestClient(app)
     first = client.post(
         "/api/settings/model/connections",
@@ -606,8 +606,29 @@ def test_model_connection_edit_can_clear_key_and_reject_duplicates() -> None:
             "supportsVision": False,
         },
     )
-    assert duplicate.status_code == 409
-    assert duplicate.json()["detail"]["code"] == "MODEL_CONNECTION_DUPLICATE"
+    assert duplicate.status_code == 200
+    second = duplicate.json()["connections"][1]
+    assert second["id"] != first["id"]
+    assert second["catalogModelId"] != first["catalogModelId"]
+    assert selected_model_config(first["catalogModelId"]).api_key == ""
+    assert selected_model_config(second["catalogModelId"]).api_key == "another-key"
+    labels = [item["label"] for item in client.get("/api/models").json()["models"]]
+    assert labels == ["Primary · test-model (1)", "Duplicate · TEST-MODEL (2)"]
+
+    updated = client.post(
+        "/api/settings/model/connections",
+        json={
+            "id": first["id"],
+            "label": "Primary",
+            "baseUrl": "https://api.example.test/v1",
+            "modelId": "test-model",
+            "apiKey": "first-new-key",
+            "supportsVision": False,
+        },
+    )
+    assert updated.status_code == 200
+    assert selected_model_config(first["catalogModelId"]).api_key == "first-new-key"
+    assert selected_model_config(second["catalogModelId"]).api_key == "another-key"
 
 
 def test_corrupt_model_connection_store_is_reported(
@@ -887,6 +908,26 @@ def _stub_planner_answer(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(planner_module, "create_plan", fake_create_plan)
     monkeypatch.setattr(main_module, "create_plan", fake_create_plan)
     monkeypatch.setattr(main_module, "check_intent", fake_check_intent)
+
+
+def test_turn_endpoint_completes_direct_conversation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_single_model(monkeypatch)
+
+    async def fake_check_intent(_request: object, **_kwargs: object) -> IntentConversationResponse:
+        return IntentConversationResponse(message="你好！", provider="model")
+
+    monkeypatch.setattr(main_module, "check_intent", fake_check_intent)
+    response = TestClient(app).post(
+        "/api/turn",
+        json={**_intent_payload("你好"), "modelId": _CONFIGURED_MODEL_ID},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["kind"] == "conversation"
+    assert response.json()["message"] == "你好！"
+    assert turn_registry.touch(response.json()["turnId"]).stage == "completed"
 
 
 def test_turn_endpoint_preserves_turn_id_across_decisions(

@@ -147,7 +147,7 @@ import {
 } from "./components/WorkDirectoryGuide";
 import type { FolderBackupTarget } from "./hooks/useFolderBackups";
 import { MODEL_REQUIRED_HELP_TEXT } from "./helpCommand";
-import { chooseAvailableModel, isRealModelId } from "./modelSelection";
+import { chooseAvailableModel, connectionModelSuffix, isRealModelId } from "./modelSelection";
 import { useActivityProgress, type ActivityLog, type ActivityProgress } from "./hooks/useActivityProgress";
 import { useMessageAutoFollow } from "./hooks/useMessageAutoFollow";
 import { useConversation } from "./hooks/useConversation";
@@ -808,6 +808,10 @@ function actionLabel(action: AnalysisPlan["actions"][number]): string {
 export default function App() {
   const [workbook, setWorkbook] = useState<WorkbookSnapshot | null>(null);
   const [prompt, setPrompt] = useState("");
+  const [newConversationNotice, setNewConversationNotice] = useState<{
+    id: number;
+    previousSaved: boolean;
+  } | null>(null);
   const [pendingImages, setPendingImages] = useState<PendingImage[]>([]);
   const [imageError, setImageError] = useState("");
   const [clarificationDrafts, setClarificationDrafts] = useState<
@@ -1161,6 +1165,12 @@ export default function App() {
     () => modelOptions.find((option) => option.id === effectiveModelId),
     [modelOptions, effectiveModelId]
   );
+
+  useEffect(() => {
+    if (!newConversationNotice) return;
+    const timer = window.setTimeout(() => setNewConversationNotice(null), 1500);
+    return () => window.clearTimeout(timer);
+  }, [newConversationNotice]);
 
   // 一级斜杠命令定义
   const slashCommands: SlashCommand[] = useMemo(
@@ -2747,23 +2757,10 @@ export default function App() {
     if (busy) return;
     setModelMenuOpen(false);
     setMoreMenuOpen(false);
-    if (
-      activeConversation &&
-      !activeConversation.messages.some(
-        (message) => message.role === "user"
-      )
-    ) {
-      setPrompt("");
-      setPendingImages([]);
-      setImageError("");
-      setContextOpen(false);
-      setHistoryOpen(false);
-      setToolsOpen(false);
-      closeSettings();
-      closeSaveCandidate();
-      return;
-    }
-    conversationHook.newChat();
+    const previousSaved = Boolean(
+      activeConversation?.messages.some((message) => message.role === "user")
+    );
+    if (previousSaved) conversationHook.newChat();
     setPrompt("");
     setPendingImages([]);
     setImageError("");
@@ -2772,6 +2769,8 @@ export default function App() {
     setToolsOpen(false);
     closeSettings();
     closeSaveCandidate();
+    setNewConversationNotice({ id: Date.now(), previousSaved });
+    window.requestAnimationFrame(() => composerInputRef.current?.focus());
   }
 
   function handleOpenConversation(conversationId: string) {
@@ -3805,6 +3804,10 @@ export default function App() {
     correctionAttempt = 0,
     planningReadPolicy: "ifNeeded" | "none" = "ifNeeded"
   ) {
+    if (intent.kind === "conversation") {
+      appendMessage({ role: "assistant", provider: intent.provider, text: intent.message });
+      return;
+    }
     if (intent.kind === "clarification") {
       clarificationImagesRef.current.set(
         intent.clarification.id,
@@ -6141,7 +6144,9 @@ export default function App() {
 
   return (
     <main className="chat-shell">
-      <header className="chat-header">
+      <header
+        className={`chat-header${modelMenuOpen || moreMenuOpen ? " menu-open" : ""}`}
+      >
         <div className="brand-mark">EB</div>
         <div className="brand-copy">
           <strong className="app-logo" {...logoLongPress}>
@@ -6601,7 +6606,7 @@ export default function App() {
                             <b>当前使用</b>
                           )}
                         </div>
-                        <span>{connection.modelId}</span>
+                        <span>{connection.modelId}{connectionModelSuffix(modelSettings?.connections ?? [], connection.id)}</span>
                         <small>{connection.baseUrl}</small>
                         <small>
                           Key：
@@ -7701,7 +7706,12 @@ export default function App() {
         </div>
       )}
 
-      <div className="message-stream-shell">
+      <div className={`message-stream-shell${newConversationNotice ? " conversation-starting" : ""}`}>
+      {newConversationNotice && (
+        <div className="new-conversation-toast" role="status">
+          {newConversationNotice.previousSaved ? "已新建对话" : "当前已是新对话"}
+        </div>
+      )}
       <section
         ref={messageStreamRef}
         className="message-stream"
@@ -7934,7 +7944,7 @@ export default function App() {
                                     key={connection.catalogModelId}
                                     value={connection.catalogModelId}
                                   >
-                                    {connection.label} · {connection.modelId}
+                                    {modelOptions.find((model) => model.id === connection.catalogModelId)?.label ?? `${connection.label} · ${connection.modelId}`}
                                   </option>
                                 )
                               )}

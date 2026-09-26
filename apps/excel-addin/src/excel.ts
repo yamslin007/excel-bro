@@ -30,6 +30,7 @@ import {
   normalizeCellValue
 } from "./cellNormalization";
 import { assertSafeFormula, assertSafeHyperlink } from "./formulaSafety";
+import { assertRectangularValues, parseExplicitA1Rect, writeMatrixShapeIssue } from "./planCore";
 import {
   resolveFilteredRowIndices,
   createQueryTableAccumulator,
@@ -888,14 +889,6 @@ async function getOrCreateWorksheet(
   existing.load("isNullObject");
   await context.sync();
   return existing.isNullObject ? collection.add(sheetName) : existing;
-}
-
-function assertRectangular(values: CellValue[][]): void {
-  if (values.length === 0) return;
-  const width = values[0].length;
-  if (width === 0 || values.some((row) => row.length !== width)) {
-    throw new Error("写入数据必须是非空的规则二维数组");
-  }
 }
 
 function columnNumber(name: string): number {
@@ -2350,30 +2343,7 @@ function normalizedObjectName(value: string): string {
 function explicitA1RangeShape(
   address: string
 ): { rows: number; columns: number } | null {
-  const match = address
-    .trim()
-    .match(
-      /^\$?([A-Z]{1,3})\$?([1-9]\d*)(?::\$?([A-Z]{1,3})\$?([1-9]\d*))?$/i
-    );
-  if (!match) return null;
-  const startColumn = columnNumber(match[1]);
-  const startRow = Number(match[2]);
-  const endColumn = columnNumber(match[3] ?? match[1]);
-  const endRow = Number(match[4] ?? match[2]);
-  if (
-    startColumn > 16_384 ||
-    endColumn > 16_384 ||
-    startRow > 1_048_576 ||
-    endRow > 1_048_576 ||
-    endColumn < startColumn ||
-    endRow < startRow
-  ) {
-    return null;
-  }
-  return {
-    rows: endRow - startRow + 1,
-    columns: endColumn - startColumn + 1
-  };
+  return parseExplicitA1Rect(address);
 }
 
 export function isExplicitA1Address(address: string): boolean {
@@ -2604,15 +2574,11 @@ export function preflightPlanActions(
       }
       const matrix =
         action.type === "writeValues" ? action.values : action.formulas;
-      const shape = explicitA1RangeShape(action.range);
-      if (
-        shape &&
-        (shape.rows !== matrix.length ||
-          shape.columns !== matrix[0]?.length)
-      ) {
+      const shapeIssue = writeMatrixShapeIssue(action.range, matrix);
+      if (shapeIssue) {
         issues.push({
           index,
-          message: `目标区域 ${action.range} 是 ${shape.rows}×${shape.columns}，但写入矩阵是 ${matrix.length}×${matrix[0]?.length ?? 0}`
+          message: shapeIssue
         });
       }
     }
@@ -3163,7 +3129,7 @@ export async function executeAction(
       return;
     case "writeTable": {
       const values = [action.headers, ...action.rows];
-      assertRectangular(values);
+      assertRectangularValues(values);
       const start = sheet.getRange(action.startCell);
       const target = start.getResizedRange(values.length - 1, values[0].length - 1);
       target.values = values;
@@ -3175,7 +3141,7 @@ export async function executeAction(
       return;
     }
     case "writeValues": {
-      assertRectangular(action.values);
+      assertRectangularValues(action.values);
       const target = sheet.getRange(action.range);
       target.values = action.values;
       return;

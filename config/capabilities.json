@@ -22,9 +22,11 @@
     "maxCells": 1000000
   },
   "wpsWrite": {
-    "enabled": false,
+    "enabled": true,
     "maxCells": 1000,
-    "chunkRows": 100
+    "chunkRows": 100,
+    "verifiedVersionPrefixes": ["12.1"],
+    "allowedActions": ["writeValues", "clearRange:contents"]
   },
   "excelExecution": {
     "splitAggregateBatchSheets": 25

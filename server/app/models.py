@@ -1939,6 +1939,13 @@ class IntentProceedResponse(BaseModel):
     turnId: TurnId | None = None
 
 
+class IntentConversationResponse(BaseModel):
+    kind: Literal["conversation"] = "conversation"
+    message: str = Field(min_length=1, max_length=1500)
+    provider: Literal["model", "local"]
+    turnId: TurnId | None = None
+
+
 class IntentClarificationResponse(BaseModel):
     kind: Literal["clarification"] = "clarification"
     clarification: IntentClarification
@@ -1956,7 +1963,7 @@ class IntentToolResponse(BaseModel):
 
 
 IntentCheckResponse = Annotated[
-    IntentProceedResponse | IntentClarificationResponse | IntentToolResponse,
+    IntentProceedResponse | IntentConversationResponse | IntentClarificationResponse | IntentToolResponse,
     Field(discriminator="kind"),
 ]
 
@@ -2195,6 +2202,7 @@ class TaskProgressEvent(BaseModel):
 TurnRequest = IntentCheckRequest | PlanRequest
 TurnResponse = Annotated[
     IntentProceedResponse
+    | IntentConversationResponse
     | IntentClarificationResponse
     | IntentToolResponse
     | PlanResponse

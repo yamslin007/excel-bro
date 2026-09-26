@@ -31,6 +31,13 @@ describe("resolveConfirmedPrompt", () => {
 });
 
 describe("describeIntentDecision", () => {
+  it("labels a greeting as direct conversation without a workbook task", () => {
+    const decision = describeIntentDecision({
+      kind: "conversation", provider: "model", message: "你好！"
+    });
+    expect(decision.label).toContain("普通对话");
+    expect(decision.note).toContain("无需读取工作表数据");
+  });
   it("keeps clarification reasoning concise without duplicating the question or options", () => {
     const response: IntentCheckResponse = {
       kind: "clarification",

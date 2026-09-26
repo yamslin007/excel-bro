@@ -116,6 +116,8 @@ class TurnRegistry:
             state.stage = "awaiting_clarification"
         elif response.kind == "tool_request":
             state.stage = "awaiting_tool"
+        elif response.kind == "conversation":
+            state.stage = "completed"
         else:
             state.stage = "awaiting_completion"
         state.updated_at = time.monotonic()

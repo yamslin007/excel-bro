@@ -1,29 +1,16 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { reportDevProbe } from "./devProbe";
 import { initializeRestoredTaskPaneWidth } from "./ribbon";
 import WpsAgentPanel from "./WpsAgentPanel";
 import { getWpsApplication, readWpsHostProbe, type WpsHostProbe } from "./wpsHost";
 import {
-  authorizeWpsSheets,
   listWpsWorksheets,
-  readAuthorizedWpsSheets,
-  type WpsSheetReadResult,
   type WpsWorkbookMetadata
 } from "./wpsWorkbookReader";
-import {
-  probeWpsWriteCapabilities,
-  type WpsWriteCapabilityProbe
-} from "./wpsWriteCapabilities";
 
 type ProbeState =
   | { status: "loading" }
   | { status: "ready"; value: WpsHostProbe }
-  | { status: "error"; message: string };
-
-type ReadState =
-  | { status: "idle" }
-  | { status: "reading"; message: string }
-  | { status: "ready"; results: WpsSheetReadResult[] }
   | { status: "error"; message: string };
 
 function runProbe(): ProbeState {
@@ -41,10 +28,8 @@ export default function WpsProbePanel() {
   const [probe, setProbe] = useState<ProbeState>({ status: "loading" });
   const [metadata, setMetadata] = useState<WpsWorkbookMetadata | null>(null);
   const [selectedIndexes, setSelectedIndexes] = useState<number[]>([]);
-  const [readState, setReadState] = useState<ReadState>({ status: "idle" });
   const [scopeOpen, setScopeOpen] = useState(false);
-  const [writeProbe, setWriteProbe] = useState<WpsWriteCapabilityProbe | null>(null);
-  const readAbortRef = useRef<AbortController | null>(null);
+  const [scopeMode, setScopeMode] = useState<"auto" | "manual">("auto");
 
   useEffect(() => {
     try {
@@ -67,11 +52,8 @@ export default function WpsProbePanel() {
   }, []);
 
   const refresh = () => {
-    readAbortRef.current?.abort();
     const nextProbe = runProbe();
     setProbe(nextProbe);
-    setReadState({ status: "idle" });
-    setWriteProbe(null);
     if (nextProbe.status !== "ready") {
       setMetadata(null);
       setSelectedIndexes([]);
@@ -79,44 +61,61 @@ export default function WpsProbePanel() {
     }
     const nextMetadata = listWpsWorksheets(getWpsApplication());
     setMetadata(nextMetadata);
-    setSelectedIndexes(nextMetadata.sheets.filter((sheet) => sheet.isActive).map((sheet) => sheet.index));
+    setSelectedIndexes((current) => {
+      if (scopeMode === "auto") {
+        return nextMetadata.sheets
+          .filter((sheet) => sheet.isActive)
+          .map((sheet) => sheet.index);
+      }
+      const available = new Set(nextMetadata.sheets.map((sheet) => sheet.index));
+      return current.filter((index) => available.has(index));
+    });
+  };
+
+  const chooseAutoScope = () => {
+    setScopeMode("auto");
+    setSelectedIndexes(
+      metadata?.sheets.filter((sheet) => sheet.isActive).map((sheet) => sheet.index) ?? []
+    );
+  };
+
+  const chooseManualScope = () => {
+    setScopeMode("manual");
+    if (selectedIndexes.length > 0) return;
+    setSelectedIndexes(
+      metadata?.sheets.filter((sheet) => sheet.isActive).map((sheet) => sheet.index) ?? []
+    );
   };
 
   const toggleSheet = (index: number) => {
     setSelectedIndexes((current) =>
       current.includes(index) ? current.filter((value) => value !== index) : [...current, index]
     );
-    setReadState({ status: "idle" });
-    setWriteProbe(null);
   };
 
-  const readAuthorizedData = async () => {
-    const controller = new AbortController();
-    readAbortRef.current?.abort();
-    readAbortRef.current = controller;
+  const resolveSelectedSheetIndexes = useCallback((): readonly number[] => {
     try {
-      const application = getWpsApplication();
-      const authorization = authorizeWpsSheets(application, selectedIndexes);
-      setReadState({ status: "reading", message: "正在核对授权范围…" });
-      const results = await readAuthorizedWpsSheets(application, authorization, {
-        signal: controller.signal,
-        onProgress: ({ sheet, rowsRead, totalRows }) => {
-          setReadState({
-            status: "reading",
-            message: `正在读取「${sheet.name}」：${rowsRead} / ${totalRows} 行`
-          });
-        }
-      });
-      setReadState({ status: "ready", results });
-    } catch (error) {
-      setReadState({
-        status: "error",
-        message: error instanceof Error ? error.message : "WPS 工作表读取失败。"
-      });
-    } finally {
-      if (readAbortRef.current === controller) readAbortRef.current = null;
+      const nextProbe = runProbe();
+      if (nextProbe.status !== "ready") {
+        setProbe(nextProbe);
+        setMetadata(null);
+        setSelectedIndexes([]);
+        return [];
+      }
+      const nextMetadata = listWpsWorksheets(getWpsApplication());
+      const available = new Set(nextMetadata.sheets.map((sheet) => sheet.index));
+      const nextIndexes = scopeMode === "auto"
+        ? nextMetadata.sheets.filter((sheet) => sheet.isActive).map((sheet) => sheet.index)
+        : selectedIndexes.filter((index) => available.has(index));
+      setProbe(nextProbe);
+      setMetadata(nextMetadata);
+      setSelectedIndexes(nextIndexes);
+      return nextIndexes;
+    } catch {
+      setSelectedIndexes([]);
+      return [];
     }
-  };
+  }, [scopeMode, selectedIndexes]);
 
   if (probe.status === "loading") {
     return (
@@ -140,135 +139,117 @@ export default function WpsProbePanel() {
   const selectedSheets = metadata?.sheets.filter((sheet) => selectedIndexes.includes(sheet.index)) ?? [];
   const scopeLabel = selectedSheets.length === 0
     ? "尚未选择工作表"
-    : selectedSheets.length === 1
+    : scopeMode === "auto" && selectedSheets.length === 1
+      ? `当前表 ${selectedSheets[0].name}`
+      : selectedSheets.length === 1
       ? `${selectedSheets[0].isActive ? "当前表" : "已选"} ${selectedSheets[0].name}`
-      : `已选 ${selectedSheets.length} 张表`;
+      : `已固定 ${selectedSheets.length} 个工作表`;
 
   const scopeDock = (
-    <section className={`eb-scope-dock ${scopeOpen ? "open" : ""}`}>
+    <section className={`wps-scope-dock ${scopeOpen ? "open" : ""}`}>
       {scopeOpen && (
-        <div className="eb-scope-panel">
-          <div className="scope-panel-heading">
+        <section className="scope-popover wps-scope-popover" aria-label="选择数据范围">
+          <div className="scope-popover-scroll">
+          <div className="scope-popover-header">
             <div>
-              <strong>授权读取范围</strong>
-              <p>只读取明确勾选的工作表；取消全部选择不会自动扩大范围。</p>
+              <strong>这次对话使用哪些数据？</strong>
+              <span>默认跟随你当前正在查看的工作表</span>
             </div>
-            <button type="button" onClick={refresh}>刷新结构</button>
+            <button type="button" aria-label="关闭数据范围" onClick={() => setScopeOpen(false)}>×</button>
           </div>
-          <div className="sheet-options">
-            {metadata?.sheets.map((sheet) => (
-              <label className="sheet-option" key={`${sheet.index}:${sheet.name}`}>
-                <input
-                  type="checkbox"
-                  checked={selectedIndexes.includes(sheet.index)}
-                  onChange={() => toggleSheet(sheet.index)}
-                />
-                <span>{sheet.name}</span>
-                {sheet.isActive && <small>当前表</small>}
-              </label>
-            ))}
-          </div>
-          {selectedIndexes.length === 0 && (
-            <p className="authorization-empty">尚未选择工作表，不会读取任何数据。</p>
-          )}
-          <div className="scope-actions">
-            <button
-              className="scope-verify-button"
-              type="button"
-              disabled={selectedIndexes.length === 0 || readState.status === "reading"}
-              onClick={() => void readAuthorizedData()}
-            >
-              {readState.status === "reading" ? "读取中…" : "验证读取"}
-            </button>
-            {readState.status === "reading" && (
-              <button className="scope-stop-button" type="button" onClick={() => readAbortRef.current?.abort()}>
-                停止
-              </button>
-            )}
-          </div>
-          {readState.status === "reading" && <p className="read-status-text">{readState.message}</p>}
-          {readState.status === "error" && <p className="read-error">{readState.message}</p>}
-          {readState.status === "ready" && (
-            <div className="read-results">
-              {readState.results.map((result) => (
-                <details key={`${result.sheet.index}:${result.sheet.name}`}>
-                  <summary>
-                    {result.sheet.name} · {result.rowCount} 行 × {result.columnCount} 列
-                  </summary>
-                  <div className="preview-table-wrap">
-                    <table>
-                      <tbody>
-                        {result.values.slice(0, 5).map((row, rowIndex) => (
-                          <tr key={rowIndex}>
-                            {row.slice(0, 5).map((cell, columnIndex) => (
-                              <td key={columnIndex}>{cell == null ? "" : String(cell)}</td>
-                            ))}
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                </details>
-              ))}
+          <div className="wps-current-file-card">
+            <span aria-hidden="true">XLSX</span>
+            <div>
+              <small>当前文件</small>
+              <strong>{probe.value.workbookName}</strong>
+              <em>当前工作表 {probe.value.activeSheetName}</em>
             </div>
-          )}
-          <details className="scope-diagnostics">
-            <summary>连接信息</summary>
-            <dl>
-              <div><dt>工作簿</dt><dd>{probe.value.workbookName}</dd></div>
-              <div><dt>当前表</dt><dd>{probe.value.activeSheetName}</dd></div>
-              <div><dt>当前选区</dt><dd>{probe.value.selectionAddress ?? "未识别"}</dd></div>
-            </dl>
-          </details>
-          {import.meta.env.DEV && (
-            <details className="scope-diagnostics">
-              <summary>W3 写入能力检查（只读）</summary>
-              <p>仅检查当前工作簿和接口，不会修改单元格。</p>
+          </div>
+          <div className="scope-controls">
+            <div className="scope-mode-list">
               <button
                 type="button"
-                onClick={() => setWriteProbe(
-                  probeWpsWriteCapabilities(getWpsApplication(), selectedIndexes)
-                )}
+                className={scopeMode === "auto" ? "selected" : ""}
+                onClick={chooseAutoScope}
               >
-                检查当前工作簿
+                <i aria-hidden="true">⊙</i>
+                <span><strong>跟随当前</strong><small>发送时自动使用正在查看的工作表</small></span>
               </button>
-              {writeProbe && (
-                <div>
-                  <p>宿主版本：{writeProbe.hostVersion ?? "未提供"}</p>
-                  <p>{writeProbe.readyForHostValidation
-                    ? "只读前置检查通过；仍需真实写入与恢复验收。"
-                    : "前置检查未通过，写入保持关闭。"}</p>
-                  <ul>
-                    {writeProbe.checks.map((check) => (
-                      <li key={check.id}>
-                        {check.passed ? "✓" : "!"} {check.label}：{check.detail}
-                      </li>
-                    ))}
-                  </ul>
-                </div>
-              )}
-            </details>
-          )}
-        </div>
+              <button
+                type="button"
+                className={scopeMode === "manual" ? "selected" : ""}
+                onClick={chooseManualScope}
+              >
+                <i aria-hidden="true">☷</i>
+                <span><strong>选择多个</strong><small>用于跨表查询、比较或汇总</small></span>
+              </button>
+              <button type="button" disabled title="WPS 当前仅支持打开的工作簿">
+                <i aria-hidden="true">▫</i>
+                <span><strong>工作目录</strong><small>WPS 当前仅支持打开的工作簿</small></span>
+              </button>
+            </div>
+
+            {scopeMode === "manual" && (
+              <div className="sheet-picker-options wps-sheet-picker-options">
+                {metadata?.sheets.map((sheet) => (
+                  <button
+                    type="button"
+                    className={selectedIndexes.includes(sheet.index) ? "selected" : ""}
+                    key={`${sheet.index}:${sheet.name}`}
+                    aria-pressed={selectedIndexes.includes(sheet.index)}
+                    onClick={() => toggleSheet(sheet.index)}
+                  >
+                    <i aria-hidden="true">{selectedIndexes.includes(sheet.index) ? "✓" : ""}</i>
+                    <span>{sheet.name}</span>
+                    {sheet.isActive && <small>当前表</small>}
+                  </button>
+                ))}
+                {selectedIndexes.length === 0 && (
+                  <p className="authorization-empty">尚未选择工作表，不会读取或修改任何数据。</p>
+                )}
+              </div>
+            )}
+          </div>
+          </div>
+          <div className="wps-scope-actions">
+            <button type="button" className="scope-refresh" onClick={refresh}>↻ 刷新</button>
+            <button
+              type="button"
+              className="scope-confirm"
+              disabled={selectedIndexes.length === 0}
+              onClick={() => setScopeOpen(false)}
+            >
+              完成
+            </button>
+          </div>
+        </section>
       )}
-      <button
-        className="eb-scope-summary"
-        type="button"
-        aria-expanded={scopeOpen}
-        onClick={() => setScopeOpen((current) => !current)}
-      >
-        <span className="scope-icon" aria-hidden="true">▦</span>
-        <span className="scope-workbook">{probe.value.workbookName}</span>
-        <span className="scope-divider" aria-hidden="true" />
-        <strong>{scopeLabel}</strong>
-        <span className="scope-chevron" aria-hidden="true">{scopeOpen ? "⌄" : "⌃"}</span>
-      </button>
+      <div className="scope-entry-row">
+        <button
+          className={`scope-trigger ${scopeOpen ? "open" : ""}`}
+          type="button"
+          aria-expanded={scopeOpen}
+          onClick={() => setScopeOpen((current) => !current)}
+        >
+          <i aria-hidden="true">▦</i>
+          <span>
+            <small title={probe.value.workbookName}>{probe.value.workbookName}</small>
+            <span className="scope-sep" aria-hidden="true">|</span>
+            <strong>{scopeLabel}</strong>
+          </span>
+          <b>{scopeOpen ? "⌄" : "⌃"}</b>
+        </button>
+      </div>
     </section>
   );
 
   return (
     <main className="probe-shell">
-      <WpsAgentPanel selectedSheetIndexes={selectedIndexes} scopeDock={scopeDock} />
+      <WpsAgentPanel
+        selectedSheetIndexes={selectedIndexes}
+        resolveSelectedSheetIndexes={resolveSelectedSheetIndexes}
+        scopeDock={scopeDock}
+      />
     </main>
   );
 }

@@ -14,6 +14,7 @@ from .models import (
     IntentCheckRequest,
     IntentCheckResponse,
     IntentClarificationResponse,
+    IntentConversationResponse,
     IntentProceedResponse,
     IntentToolResponse,
 )
@@ -21,8 +22,15 @@ from .structural_intent import parse_bulk_worksheet_deletion
 
 
 INTENT_SYSTEM_PROMPT = """
-你是 Excel Bro 的需求确认器。你只判断用户需求是否足够明确，不能分析数据、
-计算结果或生成 Excel 操作计划。
+你是 Excel Bro 的对话路由器。你判断用户是在普通交谈，还是提出了工作簿任务；
+不能分析数据、计算结果或生成 Excel 操作计划。
+
+普通问候、感谢、寒暄、询问你能做什么等不要求操作或读取工作簿的消息，
+返回 conversation，并直接给出自然、简短的回复。不要为这类消息返回澄清卡、
+查询工具或操作计划。介绍能力时只概述可对已授权工作表进行查询与分析，
+写入需先生成预览并经用户确认；不要假装已经读取表格，或承诺未验证的功能。
+用户提出了具体的工作簿任务时，不要用 conversation 敷衍；按下述规则选择
+tool_request、proceed 或真正必要的 clarification。
 
 仅当存在会实质改变答案或写入结果的多种合理解释时，返回 clarification。
 不要因为措辞简短、语气口语化或缺少不影响结果的细节而追问。
@@ -76,6 +84,8 @@ clearRange 动作），不要返回 tool_request。如果不明确，只问一�
 所有内容使用简体中文。
 
 只返回 JSON，不要使用 Markdown。格式：
+{"kind":"conversation","message":"直接给用户的简短回复"}
+或
 {"kind":"proceed","summary":"我理解的需求","confirmedPrompt":"明确化后的完整需求"}
 或
 {"kind":"clarification","clarification":{"id":"短标识","summary":"当前理解",
@@ -207,6 +217,10 @@ def _parse_model_response(
     if start < 0 or end <= start:
         raise ValueError("模型没有返回有效的意图判断")
     payload = json.loads(text[start : end + 1])
+    if payload.get("kind") == "conversation":
+        return IntentConversationResponse.model_validate(
+            {**payload, "provider": "model"}
+        )
     if payload.get("kind") == "proceed":
         return IntentProceedResponse.model_validate(
             {**payload, "provider": "model"}

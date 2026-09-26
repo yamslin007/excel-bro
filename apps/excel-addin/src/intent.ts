@@ -59,6 +59,9 @@ export function describeIntentDecision(intent: IntentCheckResponse): {
   detail?: string;
 } {
   const source = intent.provider === "model" ? "模型" : "本地规则";
+  if (intent.kind === "conversation") {
+    return { label: `${source}判断为普通对话`, note: "无需读取工作表数据或生成操作计划。" };
+  }
   if (intent.kind === "clarification") {
     const clarification = intent.clarification;
     return {

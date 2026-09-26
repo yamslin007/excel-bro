@@ -1,12 +1,26 @@
 import { describe, expect, it } from "vitest";
 import {
   chooseAvailableModel,
+  connectionModelSuffix,
   isRealModelId,
   LEGACY_LOCAL_MODEL_ID,
   NO_MODEL_SELECTED,
   resolveDisplayedModelId,
   shouldPersistSelection
 } from "./modelSelection";
+
+describe("connectionModelSuffix", () => {
+  it("numbers equal model IDs without changing their unique connection IDs", () => {
+    const connections = [
+      { id: "excel", modelId: "deepseek-chat" },
+      { id: "other", modelId: "claude" },
+      { id: "wps", modelId: "DeepSeek-Chat" }
+    ];
+    expect(connectionModelSuffix(connections, "excel")).toBe(" (1)");
+    expect(connectionModelSuffix(connections, "wps")).toBe(" (2)");
+    expect(connectionModelSuffix(connections, "other")).toBe("");
+  });
+});
 
 const models = [
   { id: "connection:first", available: true },

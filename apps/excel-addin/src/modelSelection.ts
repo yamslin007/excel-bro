@@ -10,6 +10,22 @@ export interface SelectableModel {
   available: boolean;
 }
 
+/** 同一模型 ID 的多条连接按保存顺序编号；编号只用于展示，选择仍使用唯一连接 ID。 */
+export function connectionModelSuffix(
+  connections: readonly { id: string; modelId: string }[],
+  connectionId: string
+): string {
+  const target = connections.find((connection) => connection.id === connectionId);
+  if (!target) return "";
+  const key = target.modelId.trim().toLocaleLowerCase();
+  const matching = connections.filter((connection) =>
+    connection.modelId.trim().toLocaleLowerCase() === key
+  );
+  return matching.length > 1
+    ? ` (${matching.findIndex((connection) => connection.id === connectionId) + 1})`
+    : "";
+}
+
 /**
  * 旧版本保存在本地的虚拟模型 ID（“基础模式”）。它不是一个真实连接，
  * 目录加载成功后必须被迁移掉；保留常量只用于识别和清理旧记录。

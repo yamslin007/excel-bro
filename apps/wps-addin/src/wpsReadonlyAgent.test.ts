@@ -94,6 +94,7 @@ describe("WPS readonly agent", () => {
         checkIntent,
         executeQuery,
         createAssistantResponse,
+        readSchemas: vi.fn(async () => [readResult]),
         readSheets: vi.fn(async () => [readResult])
       }
     );
@@ -108,7 +109,7 @@ describe("WPS readonly agent", () => {
     expect(plannerRequest.dataResults?.[0].rows).toEqual([[2]]);
   });
 
-  it("blocks a model-generated write plan", async () => {
+  it("returns a model-generated write plan for guarded preview and confirmation", async () => {
     const result = await runWpsReadonlyTurn(
       {
         application: makeApplication(),
@@ -136,10 +137,35 @@ describe("WPS readonly agent", () => {
             acceptanceCriteria: []
           }
         })),
+        readSchemas: vi.fn(async () => [readResult]),
         readSheets: vi.fn(async () => [readResult])
       }
     );
 
-    expect(result).toEqual(expect.objectContaining({ kind: "blocked" }));
+    expect(result).toEqual(expect.objectContaining({
+      kind: "plan",
+      plan: expect.objectContaining({ id: "p1" })
+    }));
+  });
+
+  it("answers a greeting without reading full rows or invoking the planner", async () => {
+    const readSchemas = vi.fn(async () => [{ ...readResult, values: [readResult.values[0]] }]);
+    const readSheets = vi.fn(async () => [readResult]);
+    const createAssistantResponse = vi.fn();
+    const result = await runWpsReadonlyTurn(
+      { application: makeApplication(), selectedSheetIndexes: [1], prompt: "你好" },
+      {
+        checkIntent: vi.fn(async () => ({ kind: "conversation" as const, message: "你好，有什么需要我帮忙？", provider: "model" as const })),
+        executeQuery: vi.fn(),
+        createAssistantResponse,
+        readSchemas,
+        readSheets
+      }
+    );
+
+    expect(result).toEqual({ kind: "answer", message: "你好，有什么需要我帮忙？", provider: "model", resultContext: null });
+    expect(readSchemas).toHaveBeenCalledOnce();
+    expect(readSheets).not.toHaveBeenCalled();
+    expect(createAssistantResponse).not.toHaveBeenCalled();
   });
 });

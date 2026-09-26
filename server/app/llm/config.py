@@ -220,20 +220,6 @@ def upsert_managed_connection(
         raise ModelConnectionNotFoundError("要编辑的模型连接不存在")
     normalized_base_url = base_url.strip().rstrip("/")
     normalized_model = model.strip()
-    duplicate = next(
-        (
-            connection
-            for connection in current
-            if connection.id != connection_id
-            and connection.base_url.casefold() == normalized_base_url.casefold()
-            and connection.model.casefold() == normalized_model.casefold()
-        ),
-        None,
-    )
-    if duplicate is not None:
-        raise DuplicateModelConnectionError(
-            f"模型「{duplicate.label} · {duplicate.model}」已经使用相同的服务地址"
-        )
     resolved_id = connection_id or f"model-{uuid.uuid4().hex}"
     resolved_api_key = (
         ""
@@ -534,20 +520,27 @@ def model_catalog() -> dict[str, object]:
             }
             for model in settings.models
         )
-    options.extend(
-        {
+    model_counts: dict[str, int] = {}
+    for connection in managed:
+        key = connection.model.casefold()
+        model_counts[key] = model_counts.get(key, 0) + 1
+    model_ordinals: dict[str, int] = {}
+    for connection in managed:
+        key = connection.model.casefold()
+        model_ordinals[key] = model_ordinals.get(key, 0) + 1
+        base_label = (
+            connection.model
+            if connection.label == connection.model
+            else f"{connection.label} · {connection.model}"
+        )
+        suffix = f" ({model_ordinals[key]})" if model_counts[key] > 1 else ""
+        options.append({
             "id": connection.catalog_id,
-            "label": (
-                connection.model
-                if connection.label == connection.model
-                else f"{connection.label} · {connection.model}"
-            ),
+            "label": f"{base_label}{suffix}",
             "provider": "model",
             "available": True,
             "supportsVision": connection.supports_vision,
-        }
-        for connection in managed
-    )
+        })
     if settings is not None:
         default_model_id: str | None = settings.default_model
     elif managed:
