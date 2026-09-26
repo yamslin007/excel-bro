@@ -15,7 +15,11 @@
     "isolatedModules": true,
     "noEmit": true,
     "jsx": "react-jsx",
-    "types": ["office-js", "vite/client"]
+    "types": ["office-js", "vite/client"],
+    "paths": {
+      "@excel-bro/core": ["../../packages/core/src/index.ts"],
+      "@excel-bro/core/*": ["../../packages/core/src/*"]
+    }
   },
   "include": ["src", "vite.config.ts"]
 }

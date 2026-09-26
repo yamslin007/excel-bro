@@ -3,23 +3,26 @@
   "version": "0.1.0",
   "private": true,
   "workspaces": [
-    "apps/excel-addin"
+    "apps/excel-addin",
+    "apps/wps-addin",
+    "packages/*"
   ],
   "scripts": {
     "dev:addin": "npm run dev --workspace @excel-bro/addin",
     "build:addin": "npm run build --workspace @excel-bro/addin",
     "build:installer": "powershell -NoProfile -ExecutionPolicy Bypass -File packaging/build_installer.ps1",
-    "lint": "eslint apps/excel-addin/src --ext .ts,.tsx",
+    "lint": "eslint apps/excel-addin/src apps/wps-addin/src packages/core/src --ext .ts,.tsx",
     "test:addin": "npm run test --workspace @excel-bro/addin",
     "start:excel": "npm run start:desktop --workspace @excel-bro/addin",
     "stop:excel": "npm run stop:desktop --workspace @excel-bro/addin",
-    "dev:wps": "npm --prefix apps/wps-addin run debug",
-    "build:wps": "npm --prefix apps/wps-addin run build",
-    "test:wps": "npm --prefix apps/wps-addin run test",
-    "publish:wps": "npm --prefix apps/wps-addin run publish",
+    "dev:wps": "npm run debug --workspace excel-bro-wps",
+    "build:wps": "npm run build --workspace excel-bro-wps",
+    "test:wps": "npm run test --workspace excel-bro-wps",
+    "publish:wps": "npm run publish --workspace excel-bro-wps",
+    "test:core": "npm run test --workspace @excel-bro/core",
     "dev:server": "python -m uvicorn server.app.main:app --host 127.0.0.1 --port 8765 --reload",
-    "test:server": "python -m pytest server/tests",
-    "test": "npm run test:addin && npm run test:server"
+    "test:server": "python -m pytest server/tests --basetemp=.tmp-pytest",
+    "test": "npm run test:addin && npm run test:wps && npm run test:server"
   },
   "devDependencies": {
     "@typescript-eslint/parser": "^8.67.0",

@@ -1,8 +1,16 @@
+import path from "node:path";
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
 export default defineConfig({
   base: "./",
+  resolve: {
+    alias: {
+      "@excel-bro/core": path.resolve(__dirname, "../../packages/core/src")
+    },
+    // 两端共用 packages/core 的 React hooks，双份 React 会导致 invalid hook call
+    dedupe: ["react", "react-dom"]
+  },
   plugins: [
     react(),
     {

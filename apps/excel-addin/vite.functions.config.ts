@@ -6,6 +6,12 @@ import { defineConfig } from "vite";
  * JavaScript bundle，而不是 functions.html 中的 module script。
  */
 export default defineConfig({
+  resolve: {
+    alias: {
+      "@excel-bro/core": path.resolve(__dirname, "../../packages/core/src")
+    },
+    dedupe: ["react", "react-dom"]
+  },
   build: {
     outDir: "dist",
     emptyOutDir: false,

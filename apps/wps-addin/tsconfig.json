@@ -15,7 +15,13 @@
     "isolatedModules": true,
     "noEmit": true,
     "jsx": "react-jsx",
-    "types": ["vite/client", "vitest/globals", "office-js"]
+    // WPS 自身不用 Office API，但当前仍反向导入 excel-addin 的 contracts.ts / dataTools.ts，
+    // 二者引用了 Excel 命名空间。阶段 6 清掉反向导入后可移除这里的 office-js。
+    "types": ["office-js", "vite/client", "vitest/globals"],
+    "paths": {
+      "@excel-bro/core": ["../../packages/core/src/index.ts"],
+      "@excel-bro/core/*": ["../../packages/core/src/*"]
+    }
   },
   "include": ["src", "vite.config.ts"]
 }
