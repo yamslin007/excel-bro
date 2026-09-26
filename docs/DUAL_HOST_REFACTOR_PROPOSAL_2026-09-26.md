@@ -469,9 +469,32 @@ L3 是全部环境依赖的收口处 —— 网络、存储、宿主、时间都
 
 - 退出:`npm ls react` 只有一个 19.x;两端现有 lint/build/test 全绿;
   阶段 G 记录的预期失败不新增、不改变失败位置
-- 回退:改动只在配置文件,`git revert` 单个提交即可
-- 注意:`apps/wps-addin` 当前**没有**自己的 `node_modules`,也没有独立 lock,
-  所以本阶段不涉及删 lock(v1 写的那步不适用)
+- 回退:改动只在配置文件与 lock,`git revert` 单个提交 + 重装依赖即可
+
+#### 更正:双份 React 是现存事实,不是潜在风险
+
+v2 这里写"`apps/wps-addin` 没有自己的 `node_modules`,也没有独立 lock"。
+**这条是错的**,实测(2026-09-26):
+
+| 位置 | React 版本 | 独立 lock | 独立 `node_modules` |
+|---|---|---|---|
+| 根 | **19.2.8** | 有 | 有 |
+| `apps/wps-addin` | **19.1.1** | **有,且已被 git 跟踪** | **有,237 个包** |
+
+`package.json` 脚本也印证了这一点:`test:wps`/`build:wps`/`dev:wps` 用的是
+`npm --prefix apps/wps-addin`,而不是 `--workspace` —— WPS 从一开始就是独立安装的
+子项目,不在根 workspaces 里。所以 v1 写的"删 lock"这一步**是必要的**,
+v2 把它删掉是基于错误核实。
+
+影响:双份 React 已经在跑,不是"someone runs npm install 才会触发"。
+这使阶段 1 成为 `packages/core` 含 hooks 的**真实前置**,不是预防性整理 ——
+core 一旦被两端同时引入 React hooks,19.2.8 与 19.1.1 两份实例会导致
+invalid hook call。`WpsAgentPanel.test.tsx:35` 的注释正是在绕这个坑。
+
+本阶段因此必须:删 `apps/wps-addin/package-lock.json`(git 中一并删除)、
+删 `apps/wps-addin/node_modules`、把 `apps/wps-addin` 纳入根 workspaces、
+脚本从 `--prefix` 改 `--workspace excel-bro-wps`、根目录重装。
+退出闸 `npm ls react` 必须只剩一个版本。
 
 ### 阶段 2 —— 抽纯核心 + 兼容导出
 
