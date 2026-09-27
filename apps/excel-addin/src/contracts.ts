@@ -1,4 +1,8 @@
-export type CellValue = string | number | boolean | null;
+// CellValue 的权威定义在 packages/core/src/contracts.ts（L0）。
+// 本文件内部大量引用该类型，故 import 后再导出，避免两端各持一份定义后语义漂移。
+import type { CellValue } from "@excel-bro/core/contracts";
+
+export type { CellValue };
 
 // /function 短链：AI 生成原生 Excel 公式（主路径）
 export interface FormulaDictionarySheet {
