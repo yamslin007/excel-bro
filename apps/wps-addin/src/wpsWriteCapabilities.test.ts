@@ -3,6 +3,7 @@ import type { WpsApplication, WpsRange, WpsWorksheet } from "./wpsHost";
 import { probeWpsWriteCapabilities, wpsWriteFeatureFlagEnabled } from "./wpsWriteCapabilities";
 
 function application(overrides: {
+  version?: string;
   fullName?: string;
   readOnly?: boolean;
   protectContents?: boolean;
@@ -14,7 +15,7 @@ function application(overrides: {
     Range: () => overrides.cell ?? { Value2: null, Formula: "", MergeCells: false }
   };
   return {
-    Version: "12.1",
+    Version: overrides.version ?? "12.0",
     PluginStorage: { getItem: () => null, setItem: () => undefined },
     CreateTaskPane: () => ({ ID: 1, Visible: true }),
     GetTaskPane: () => undefined,
@@ -33,6 +34,8 @@ describe("WPS W3 write capability probe", () => {
     const result = probeWpsWriteCapabilities(application({ cell }), [1]);
     expect(result.readyForHostValidation).toBe(true);
     expect(result.writeEnabled).toBe(true);
+    expect(result.versionStatus).toBe("development");
+    expect(result.checks.find((check) => check.id === "hostVersion")?.detail).toContain("开发调试模式");
     expect(result.checks.every((check) => check.passed)).toBe(true);
     expect(cell.Value2).toBe("原值");
   });
@@ -45,6 +48,13 @@ describe("WPS W3 write capability probe", () => {
     expect(result.checks.filter((check) => !check.passed).map((check) => check.id)).toContain("authorization");
     expect(result.checks.filter((check) => !check.passed).map((check) => check.id)).toContain("localXlsx");
     expect(result.checks.filter((check) => !check.passed).map((check) => check.id)).toContain("readOnly");
+  });
+
+  it("rejects an unknown host version even when workbook checks pass", () => {
+    const result = probeWpsWriteCapabilities(application({ version: "11.0" }), [1]);
+    expect(result.versionStatus).toBe("blocked");
+    expect(result.writeEnabled).toBe(false);
+    expect(result.checks.find((check) => check.id === "hostVersion")?.passed).toBe(false);
   });
 
   it("rejects protected sheets and unknown merge behavior", () => {

@@ -147,4 +147,23 @@ export interface ChatConversation {
 export interface ChatHistoryState {
   activeConversationId: string;
   conversations: ChatConversation[];
+  /**
+   * 曾经在原始存储里带过真凭据、已被读取路径脱敏的会话 id。
+   *
+   * 这是一个**独立且可持久化**的标记，用来在脱敏之后继续拦截这些会话的续聊。
+   * 不能用"文本里还能不能匹配到凭据"当判据 —— 脱敏之后永远匹配不到，重开后
+   * 发送闸会自动打开。只有用户明确清除或该会话被替换时才移除。
+   */
+  legacyCredentialConversationIds?: string[];
+  /**
+   * v4 安全记录已经落盘、但 v3 旧键还没能删掉。
+   *
+   * 只表示"存储里可能仍留有含原文的旧键"，是**迁移清理的进度**，不是历史内容。
+   * 它随 v4 一起落盘，所以重开之后界面仍能如实提示"旧键待清理"，而不会因为
+   * 一次成功的内存态就谎报存储已干净。清掉旧键后该字段自然消失。
+   *
+   * 与 `legacyCredentialConversationIds` 刻意分开：后者是"这段会话要拦续聊"，
+   * 前者是"本机存储还有残留待收拾"。两件事可以同时成立，也可以只成立一件。
+   */
+  legacyMigrationCleanupPending?: boolean;
 }

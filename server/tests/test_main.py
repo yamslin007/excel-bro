@@ -17,7 +17,13 @@ import server.app.planner as planner_module
 import server.app.folder_workbooks as folder_workbooks_module
 from server.app.main import app
 from server.app.llm import ModelConnection, selected_model_config
-from server.app.models import AnswerResponse, IntentConversationResponse, IntentProceedResponse
+from server.app.models import (
+    AnswerResponse,
+    IntentConversationResponse,
+    IntentProceedResponse,
+    LocalPlanRuleResponse,
+    PlanRequest,
+)
 from server.app.turn_state import turn_registry
 
 
@@ -984,6 +990,63 @@ def test_turn_completion_is_idempotent(
             "retryable": False,
         }
     }
+
+
+def test_turn_endpoint_returns_local_mapping_rule_without_cell_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """WPS 无行数据请求必须经真实 HTTP 响应校验返回规则，重试仍使用缓存。"""
+
+    calls = 0
+
+    async def fake_create_plan(request: PlanRequest, **_kwargs: object) -> LocalPlanRuleResponse:
+        nonlocal calls
+        calls += 1
+        assert request.planningReadPolicy == "none"
+        assert request.workbook.worksheets[0].dataRows == []
+        return LocalPlanRuleResponse.model_validate(
+            {
+                "rule": {
+                    "sourceSheet": "数据",
+                    "targetSheet": "数据",
+                    "sourceRange": "B2:B2",
+                    "targetRange": "C2:C2",
+                    "mapping": [{"source": "甲", "target": "一类"}],
+                    "blankLabel": "未分类",
+                },
+                "summary": "按给定映射填写目标列",
+                "warnings": [],
+                "assumptions": [],
+                "provider": "model",
+            }
+        )
+
+    monkeypatch.setattr(main_module, "create_plan", fake_create_plan)
+    payload = _turn_completion_payload(
+        "turn-local-rule-response-test", planningReadPolicy="none"
+    )
+    workbook = payload["workbook"]
+    assert isinstance(workbook, dict)
+    worksheets = workbook["worksheets"]
+    assert isinstance(worksheets, list)
+    worksheets[0]["dataRows"] = []
+
+    client = TestClient(app, raise_server_exceptions=False)
+    wps_origin = {"Origin": "http://127.0.0.1:3889"}
+    first = client.post("/api/turn", json=payload, headers=wps_origin)
+    repeated = client.post("/api/turn", json=payload, headers=wps_origin)
+
+    assert first.status_code == 200
+    assert first.headers["access-control-allow-origin"] == wps_origin["Origin"]
+    assert repeated.status_code == 200
+    assert repeated.json() == first.json()
+    assert calls == 1
+    body = first.json()
+    assert body["kind"] == "local_plan_rule"
+    assert body["turnId"] == "turn-local-rule-response-test"
+    assert body["rule"]["mapping"] == [{"source": "甲", "target": "一类"}]
+    assert "values" not in body["rule"]
+    assert "actions" not in body
 
 
 def test_concurrent_turn_completion_only_runs_planner_once(

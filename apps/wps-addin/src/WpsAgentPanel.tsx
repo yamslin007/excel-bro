@@ -1,11 +1,20 @@
-import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { redactCredentials } from "@excel-bro/core";
 import {
+  containsCredentialText,
+  isLegacyCredentialConversation,
+  redactHistoryCredentials,
+  remainingLegacyCredentialConversationIds,
+  replaceRestoredSecrets
+} from "../../excel-addin/src/conversation";
+import {
+  apiErrorCategory,
   listModels,
   validatePlan,
   type ModelCatalogStatus,
   type ModelOption
 } from "../../excel-addin/src/api";
-import type { IntentOption, ResultContext } from "../../excel-addin/src/contracts";
+import { assertEditablePlan, type IntentOption, type ResultContext } from "../../excel-addin/src/contracts";
 import { useTheme } from "../../excel-addin/src/hooks/useTheme";
 import { useLongPress } from "../../excel-addin/src/hooks/useLongPress";
 import { useModelManagement } from "../../excel-addin/src/hooks/useModelManagement";
@@ -25,6 +34,10 @@ import {
   type SavedTool
 } from "../../excel-addin/src/storage";
 import { executeQueryTableData } from "../../excel-addin/src/dataTools";
+import TaskProgressTimeline from "../../excel-addin/src/components/TaskProgressTimeline";
+import type { ActivityLog, ActivityOutcome } from "../../excel-addin/src/hooks/useActivityProgress";
+import { useMessageAutoFollow } from "../../excel-addin/src/hooks/useMessageAutoFollow";
+import { copyTextToClipboard } from "../../excel-addin/src/utils";
 import WpsModelSettingsPanel from "./WpsModelSettingsPanel";
 import {
   PET_VISIBILITY_STORAGE_KEY,
@@ -46,6 +59,14 @@ import {
   type WpsUndoRecord
 } from "./wpsPlanExecutor";
 import {
+  advanceWpsActivity,
+  executionActivityUpdate,
+  finishWpsActivity,
+  readonlyActivityUpdate,
+  startWpsActivity,
+  type WpsActivityUpdate
+} from "./wpsActivityLog";
+import {
   runWpsReadonlyTurn,
   type WpsReadonlyTurnProgress
 } from "./wpsReadonlyAgent";
@@ -55,6 +76,24 @@ type ChatMessage = {
   role: "user" | "assistant" | "system";
   text: string;
   resultContext?: ResultContext | null;
+  activityLog?: ActivityLog;
+  planPreview?: { title: string; status: "pending" | "executed" | "cancelled" };
+  verification?: {
+    executionId: string;
+    actionCount: number;
+    cellCount: number;
+    status: "verified" | "undone";
+    targets: { type: string; sheetName: string; range: string }[];
+  };
+  clarification?: {
+    summary: string;
+    question: string;
+    reason: string;
+    scopeLabel: string;
+    options: { label: string; description: string }[];
+    status: "pending" | "resolved" | "invalidated" | "cancelled";
+    answer?: string;
+  };
   createdAt: string;
 };
 
@@ -69,13 +108,17 @@ type WpsConversation = {
 type WpsChatHistory = {
   activeConversationId: string;
   conversations: WpsConversation[];
+  /**
+   * 旧记录里曾带真凭据、已被读取路径脱敏的会话 id。独立且可持久化，
+   * 用于在脱敏之后继续拦截这些会话的续聊（判据不能是"还能不能匹配密钥"）。
+   */
+  legacyCredentialConversationIds?: string[];
 };
 
 type PendingClarification = {
+  messageId: string;
   originalPrompt: string;
   round: number;
-  question: string;
-  reason: string;
   options: IntentOption[];
 };
 
@@ -89,15 +132,21 @@ const WPS_CHAT_STORAGE_KEY = "excel-bro.wps.chat.v1";
 const LEGACY_MODEL_CATALOG_NOTICE =
   "暂时无法读取模型配置，请点击上方模型菜单里的「重试」。已输入的内容仍保留在输入框中。";
 
-const progressLabels: Record<WpsReadonlyTurnProgress["stage"], string> = {
-  reading: "读取工作表",
-  intent: "理解问题",
-  calculating: "本地统计",
-  answering: "整理回答"
-};
-
 function messageId(): string {
   return `wps-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function turnErrorMessage(error: unknown): string {
+  if (apiErrorCategory(error) === "local_service") {
+    return "无法连接 Excel Bro 后端。请确认本地服务已启动，然后重试；本次未修改工作表。";
+  }
+  // 非连接类错误的 message 会被写进对话历史并随之持久化。服务端错误文本源于
+  // Python 侧 `str(error)`，而请求里带着 apiKey —— 原样透出就等于把凭据存进
+  // 宿主 localStorage。先过共享脱敏，再截断，避免长文把历史撑爆。
+  const raw = error instanceof Error ? error.message : "任务处理失败；本次未修改工作表。";
+  const redacted = redactCredentials(raw).trim();
+  if (!redacted) return "任务处理失败；本次未修改工作表。";
+  return redacted.length > 500 ? `${redacted.slice(0, 500)}…` : redacted;
 }
 
 function conversationTitle(messages: readonly ChatMessage[]): string {
@@ -118,6 +167,26 @@ function createWpsConversation(messages: ChatMessage[] = []): WpsConversation {
   };
 }
 
+function restoreActivityLog(log: ActivityLog | undefined): ActivityLog | undefined {
+  if (!log || !Array.isArray(log.steps)) return undefined;
+  if (log.outcome) return log;
+  return {
+    ...log,
+    outcome: "interrupted",
+    connectionState: "interrupted",
+    connectionMessage: "任务窗格曾被关闭或刷新；此过程未取得终态，请核对工作表和恢复点。",
+    steps: log.steps.map((step) => step.status === "started" || step.status === "progress"
+      ? { ...step, status: "warning" as const }
+      : step)
+  };
+}
+
+function invalidatePendingClarifications(messages: ChatMessage[]): ChatMessage[] {
+  return messages.map((message) => message.clarification?.status === "pending"
+    ? { ...message, clarification: { ...message.clarification, status: "invalidated" as const } }
+    : message);
+}
+
 function loadWpsChatHistory(): WpsChatHistory {
   try {
     const stored = JSON.parse(localStorage.getItem(WPS_CHAT_STORAGE_KEY) ?? "null") as
@@ -132,24 +201,86 @@ function loadWpsChatHistory(): WpsChatHistory {
           )
         ).map((conversation) => ({
           ...conversation,
-          messages: conversation.messages.filter((message) =>
-            !(message.role === "system" && message.text === LEGACY_MODEL_CATALOG_NOTICE)
-          )
+          messages: conversation.messages
+            .filter((message) =>
+              !(message.role === "system" && message.text === LEGACY_MODEL_CATALOG_NOTICE)
+            )
+            .map((message) => ({
+              ...message,
+              activityLog: restoreActivityLog(message.activityLog),
+              clarification: message.clarification?.status === "pending"
+                ? { ...message.clarification, status: "invalidated" as const }
+                : message.clarification
+            }))
         }))
       : [];
     if (conversations.length > 0) {
-      const activeConversationId = conversations.some(
+      // 读取路径与 Excel 侧保持一致：先在原始存储上检测并脱敏，再进入可渲染
+      // 状态（理由详见 conversation.ts 的 `loadChatHistory`）。凡是原始文本里
+      // 检出凭据的会话，都登记到一个**独立且可持久化**的标记里 —— 脱敏之后
+      // 就再也匹配不到密钥了，靠"还能不能匹配"做发送闸会在重开后自动松开。
+      const legacyIds = new Set<string>(
+        Array.isArray(stored?.legacyCredentialConversationIds)
+          ? stored.legacyCredentialConversationIds.filter(
+              (id): id is string => typeof id === "string"
+            )
+          : []
+      );
+      for (const conversation of conversations) {
+        const carriedCredential =
+          containsCredentialText(conversation.title) ||
+          conversation.messages.some((message) =>
+            containsCredentialText(message.text)
+          );
+        if (carriedCredential) legacyIds.add(conversation.id);
+      }
+      const sanitized = redactHistoryCredentials({
+        activeConversationId: String(stored?.activeConversationId ?? ""),
+        conversations,
+        legacyCredentialConversationIds: [...legacyIds]
+      } as never) as unknown as WpsChatHistory;
+
+      // 这里**不做**措辞还原（`replaceRestoredSecrets`）：返回对象会被落盘
+      // effect 再 `redactHistoryCredentials` 一次，若现在把 `【已隐藏】` 换成
+      // 人话，落盘时匹配不到占位符，下一轮读取又会把真凭据渲染出来。措辞还原
+      // 由 `renderWpsRestoredSecrets` 在挂载时做一次。
+      const activeConversationId = sanitized.conversations.some(
         (conversation) => conversation.id === stored?.activeConversationId
       )
         ? String(stored?.activeConversationId)
-        : conversations[0].id;
-      return { activeConversationId, conversations };
+        : sanitized.conversations[0].id;
+      return { ...sanitized, activeConversationId };
     }
   } catch {
     // 损坏或不可用的宿主存储不应阻断任务窗格启动。
   }
   const conversation = createWpsConversation();
-  return { activeConversationId: conversation.id, conversations: [conversation] };
+  return {
+    activeConversationId: conversation.id,
+    conversations: [conversation],
+    legacyCredentialConversationIds: []
+  };
+}
+
+/**
+ * 把「落盘占位符」还原成界面措辞 —— 只做一次，且只在挂载时。
+ *
+ * 与 Excel 端同一考量：落盘 effect 每次都会把 state 重新脱敏写回存储，所以在
+ * 它之前保留原样占位符是安全的；把还原放到读取路径里则会让占位符在落盘时消失，
+ * 脱敏再也匹配不到，真凭据会在下一轮循环里重新渲染。
+ */
+function renderWpsRestoredSecrets(history: WpsChatHistory): WpsChatHistory {
+  return {
+    ...history,
+    conversations: history.conversations.map((conversation) => ({
+      ...conversation,
+      title: replaceRestoredSecrets(conversation.title ?? ""),
+      messages: conversation.messages.map((message) => ({
+        ...message,
+        text: replaceRestoredSecrets(message.text ?? "")
+      }))
+    }))
+  };
 }
 
 function formatConversationTime(value: string): string {
@@ -175,7 +306,9 @@ export default function WpsAgentPanel({
   const [defaultModelId, setDefaultModelId] = useState<string | null>(null);
   const [catalogStatus, setCatalogStatus] = useState<ModelCatalogStatus>("idle");
   const [prompt, setPrompt] = useState("");
-  const [chatHistory, setChatHistory] = useState<WpsChatHistory>(loadWpsChatHistory);
+  const [chatHistory, setChatHistory] = useState<WpsChatHistory>(() =>
+    renderWpsRestoredSecrets(loadWpsChatHistory())
+  );
   const messages = useMemo(
     () =>
       chatHistory.conversations.find(
@@ -183,9 +316,32 @@ export default function WpsAgentPanel({
       )?.messages ?? [],
     [chatHistory]
   );
+  /**
+   * 当前对话是否被标为"旧记录里曾带真凭据"。
+   *
+   * 判据是**持久化标记**（`legacyCredentialConversationIds`），不是"文本里还能
+   * 不能匹配到密钥"。读取路径已经把这些会话脱敏，脱敏后当然匹配不到；拿"匹配
+   * 不到"当"已安全"会让重开之后发送闸自动打开。
+   */
+  const staleCredentials = useMemo(
+    () =>
+      isLegacyCredentialConversation(
+        chatHistory as never,
+        chatHistory.activeConversationId
+      ),
+    [chatHistory]
+  );
   const [progress, setProgress] = useState<WpsReadonlyTurnProgress | null>(null);
+  const [activeActivityMessageId, setActiveActivityMessageId] = useState<string | null>(null);
   const [writeProgress, setWriteProgress] = useState<string | null>(null);
   const [pendingPlan, setPendingPlan] = useState<WpsPreparedPlan | null>(null);
+  const [pendingPlanMessageId, setPendingPlanMessageId] = useState<string | null>(null);
+  const [planEditDraft, setPlanEditDraft] = useState<string | null>(null);
+  const [planEditError, setPlanEditError] = useState<string | null>(null);
+  useEffect(() => {
+    setPlanEditDraft(null);
+    setPlanEditError(null);
+  }, [pendingPlan?.previewRevision]);
   const [undoRecord, setUndoRecord] = useState<WpsUndoRecord | null>(null);
   const [clarification, setClarification] = useState<PendingClarification | null>(null);
   const [clarificationDraft, setClarificationDraft] = useState("");
@@ -207,6 +363,7 @@ export default function WpsAgentPanel({
   const [tools] = useState(loadTools);
   const [queryTools] = useState(loadQueryTools);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
+  const [copyError, setCopyError] = useState(false);
   const [newConversationNotice, setNewConversationNotice] = useState<{
     id: number;
     previousSaved: boolean;
@@ -227,9 +384,26 @@ export default function WpsAgentPanel({
     }
   }, [authorizationKey, selectedSheetIndexes]);
   const canWrite = writeCapability?.writeEnabled === true;
+  const developmentWrite = writeCapability?.versionStatus === "development";
   const writeStatusReason = writeCapability?.checks.find((check) => !check.passed)?.detail
     ?? "确认任务时会检查当前工作簿是否满足写入条件";
-  const messagesEndRef = useRef<HTMLDivElement | null>(null);
+  const latestActivity = [...messages].reverse().find((message) => message.activityLog)?.activityLog;
+  const scrollSignal = [
+    chatHistory.activeConversationId,
+    messages.length,
+    latestActivity?.totalMs ?? 0,
+    latestActivity?.steps.length ?? 0,
+    latestActivity?.steps.at(-1)?.current ?? "",
+    latestActivity?.outcome ?? "",
+    progress?.message ?? "",
+    writeProgress ?? ""
+  ].join(":");
+  const {
+    containerRef: messageStreamRef,
+    hasUnseenProgress,
+    handleScroll: handleMessageStreamScroll,
+    scrollToLatest
+  } = useMessageAutoFollow(scrollSignal);
   const theme = useTheme();
   const logoLongPress = useLongPress(() => setThemeOpen(true));
   const busy = progress !== null || writeProgress !== null;
@@ -312,6 +486,15 @@ export default function WpsAgentPanel({
     if (authorizationKeyRef.current === authorizationKey) return;
     authorizationKeyRef.current = authorizationKey;
     setPendingPlan(null);
+    setPendingPlanMessageId(null);
+    setChatHistory((current) => ({
+      ...current,
+      conversations: current.conversations.map((conversation) =>
+        conversation.id === current.activeConversationId
+          ? { ...conversation, messages: invalidatePendingClarifications(conversation.messages) }
+          : conversation
+      )
+    }));
     setClarification(null);
   }, [authorizationKey]);
 
@@ -332,20 +515,39 @@ export default function WpsAgentPanel({
   ]);
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ block: "end" });
-  }, [messages, progress, clarification]);
-
-  useEffect(() => {
     if (!newConversationNotice) return;
     const timer = window.setTimeout(() => setNewConversationNotice(null), 1500);
     return () => window.clearTimeout(timer);
   }, [newConversationNotice]);
 
   useEffect(() => {
+    if (!copiedMessageId && !copyError) return;
+    const timer = window.setTimeout(() => {
+      setCopiedMessageId(null);
+      setCopyError(false);
+    }, 1600);
+    return () => window.clearTimeout(timer);
+  }, [copiedMessageId, copyError]);
+
+  /**
+   * 落盘失败提示的展示状态。与 Excel 端一致：失败时明确告知用户，不静默降级。
+   *
+   * 用 state 而不是直接 append 系统消息，理由有两条：
+   * 1. 落盘失败本身也是"这条历史不会被保留"，把它写进历史会在下一次落盘时
+   *    又被写丢，自相矛盾；提示应当独立于可持久化的内容存在。
+   * 2. 避免"提示写进历史 → 触发落盘 → 又失败 → 再提示"的循环。
+   */
+  const [historyNotice, setHistoryNotice] = useState<string | null>(null);
+  const storageFailedRef = useRef(false);
+
+  useEffect(() => {
     try {
       const active = chatHistory.activeConversationId;
       const compact: WpsChatHistory = {
         activeConversationId: active,
+        legacyCredentialConversationIds: remainingLegacyCredentialConversationIds(
+          chatHistory as never
+        ) as string[],
         conversations: [...chatHistory.conversations]
           .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
           .slice(0, 30)
@@ -354,10 +556,33 @@ export default function WpsAgentPanel({
             messages: conversation.messages.slice(-120)
           }))
       };
-      localStorage.setItem(WPS_CHAT_STORAGE_KEY, JSON.stringify(compact));
+      // 落盘前统一脱敏：对话文本可能来自服务端错误、模型回答或用户粘贴，
+      // 任何一条都不该把凭据带进 localStorage。与 Excel 端同一实现。
+      // `legacyCredentialConversationIds` 一并写下去：脱敏之后就只能靠这个标记
+      // 判断哪些会话是旧记录，靠它重开后发送闸才仍然有效。
+      localStorage.setItem(
+        WPS_CHAT_STORAGE_KEY,
+        JSON.stringify(redactHistoryCredentials(compact as never))
+      );
     } catch {
-      // 宿主禁用 localStorage 时只影响跨重启历史，不影响当前会话。
+      // 宿主写入失败：内存里的历史在读取路径已经脱敏（原文此时已不存在），
+      // 所以这里要做的不是"再脱一遍原文"，而是明确告知用户本次会话不会被保留。
+      // 关键：**不把错误对象原文写进提示或日志** —— 异常里可能带着写入失败
+      // 的上下文（键名、配额乃至被拒绝的值），一律折叠成固定文案。
+      //
+      // 提示只提示一次；发送闸不受影响（判据是内存里的 `legacyCredentialConversationIds`，
+      // 与是否写进存储无关），所以"落盘失败"不会让旧记录被误当成正常历史续聊。
+      if (!storageFailedRef.current) {
+        storageFailedRef.current = true;
+        setHistoryNotice(
+          "无法把对话历史写入本机存储（宿主可能禁止了本地存储或空间已满）。" +
+            "本次会话仍可继续，但关掉任务窗格后不会被保留。"
+        );
+      }
+      return;
     }
+    storageFailedRef.current = false;
+    setHistoryNotice(null);
   }, [chatHistory]);
 
   useEffect(() => {
@@ -371,12 +596,33 @@ export default function WpsAgentPanel({
     }
   }, [petVisible]);
 
+  /**
+   * 更新当前对话的消息。
+   *
+   * `clearLegacyMark` 决定这次写入是否算"用户明确放弃旧记录拦截"。
+   *
+   * **默认必须为 false。** 起初这里无条件清标记，结果是：用户对一段旧记录
+   * 提问 → 发送闸拦下并追加一条系统提示 → 那条提示本身把标记清掉了 →
+   * 第二次提问就畅通无阻。等于"拦一次就失效"，发送闸形同虚设。
+   *
+   * 只有真正把用户的新提问（`runTurn` 的 `append({role:"user"})`）写进历史时，
+   * 才显式传 true —— 那一刻才是"这段历史已经翻篇，后续是新内容"。
+   */
   const updateMessages = useCallback(
-    (updater: (current: ChatMessage[]) => ChatMessage[]) => {
+    (
+      updater: (current: ChatMessage[]) => ChatMessage[],
+      clearLegacyMark = false
+    ) => {
       setChatHistory((current) => {
         const now = new Date().toISOString();
+        const legacyIds = (current as WpsChatHistory).legacyCredentialConversationIds;
         return {
           ...current,
+          legacyCredentialConversationIds: clearLegacyMark
+            ? (legacyIds ?? []).filter(
+                (id) => id !== current.activeConversationId
+              )
+            : legacyIds,
           conversations: current.conversations.map((conversation) => {
             if (conversation.id !== current.activeConversationId) return conversation;
             const nextMessages = updater(conversation.messages);
@@ -393,11 +639,42 @@ export default function WpsAgentPanel({
     []
   );
 
-  const append = (message: Omit<ChatMessage, "id" | "createdAt">) => {
+  const append = (message: Omit<ChatMessage, "id" | "createdAt">): string => {
+    const id = messageId();
     updateMessages((current) => [
       ...current,
-      { id: messageId(), createdAt: new Date().toISOString(), ...message }
+      { id, createdAt: new Date().toISOString(), ...message }
     ]);
+    return id;
+  };
+
+  const beginActivity = (step: WpsActivityUpdate) => {
+    const startedAt = Date.now();
+    const id = append({ role: "assistant", text: "", activityLog: startWpsActivity(step, startedAt) });
+    setActiveActivityMessageId(id);
+    return { id, startedAt };
+  };
+
+  const updateActivity = (activity: { id: string; startedAt: number }, step: WpsActivityUpdate) => {
+    updateMessages((current) => current.map((message) => message.id === activity.id && message.activityLog
+      ? { ...message, activityLog: advanceWpsActivity(message.activityLog, step, activity.startedAt) }
+      : message));
+  };
+
+  const endActivity = (activity: { id: string; startedAt: number }, outcome: ActivityOutcome) => {
+    updateMessages((current) => current.map((message) => message.id === activity.id && message.activityLog
+      ? { ...message, activityLog: finishWpsActivity(message.activityLog, outcome, activity.startedAt) }
+      : message));
+    setActiveActivityMessageId((current) => current === activity.id ? null : current);
+  };
+
+  const markPlanPreview = (status: "executed" | "cancelled") => {
+    if (!pendingPlanMessageId) return;
+    updateMessages((current) => current.map((message) =>
+      message.id === pendingPlanMessageId && message.planPreview
+        ? { ...message, planPreview: { ...message.planPreview, status } }
+        : message
+    ));
   };
 
   const completeNewConversation = () => {
@@ -406,13 +683,26 @@ export default function WpsAgentPanel({
       const conversation = createWpsConversation();
       setChatHistory((current) => ({
         activeConversationId: conversation.id,
-        conversations: [conversation, ...current.conversations].slice(0, 30)
+        conversations: [
+          conversation,
+          ...current.conversations.map((item) => item.id === current.activeConversationId
+            ? { ...item, messages: invalidatePendingClarifications(item.messages) }
+            : item)
+        ].slice(0, 30),
+        // 标记跟着会话走：只保留切到最后 30 条里仍然存在的那些。
+        legacyCredentialConversationIds: (
+          current.legacyCredentialConversationIds ?? []
+        ).filter((id) =>
+          current.conversations.slice(0, 29).some((item) => item.id === id)
+        )
       }));
     }
     setPrompt("");
     setProgress(null);
+    setActiveActivityMessageId(null);
     setClarification(null);
     setPendingPlan(null);
+    setPendingPlanMessageId(null);
     setCopiedMessageId(null);
     setHistoryOpen(false);
     setToolsOpen(false);
@@ -441,13 +731,22 @@ export default function WpsAgentPanel({
   const openConversation = (conversationId: string) => {
     setChatHistory((current) =>
       current.conversations.some((conversation) => conversation.id === conversationId)
-        ? { ...current, activeConversationId: conversationId }
+        ? {
+            ...current,
+            activeConversationId: conversationId,
+            conversations: current.conversations.map((conversation) =>
+              conversation.id === current.activeConversationId
+                ? { ...conversation, messages: invalidatePendingClarifications(conversation.messages) }
+                : conversation
+            )
+          }
         : current
     );
     setPrompt("");
     setClarification(null);
     setClarificationDraft("");
     setPendingPlan(null);
+    setPendingPlanMessageId(null);
     setCopiedMessageId(null);
     setHistoryOpen(false);
   };
@@ -472,6 +771,7 @@ export default function WpsAgentPanel({
     });
     setClarification(null);
     setPendingPlan(null);
+    setPendingPlanMessageId(null);
   };
 
   const closeHeaderSurfaces = () => {
@@ -483,11 +783,12 @@ export default function WpsAgentPanel({
   };
 
   const copyMessage = async (message: ChatMessage) => {
-    try {
-      await navigator.clipboard.writeText(message.text);
+    const copied = await copyTextToClipboard(message.text);
+    if (copied) {
       setCopiedMessageId(message.id);
-    } catch {
-      append({ role: "system", text: "复制失败，请选中文字后手动复制。" });
+      setCopyError(false);
+    } else {
+      setCopyError(true);
     }
   };
 
@@ -504,14 +805,52 @@ export default function WpsAgentPanel({
       append({ role: "system", text: "请先确认或取消当前写入计划，再开始新的任务。" });
       return;
     }
+    // 续聊前的旧记录闸：与 Excel 端同一判据 —— 查的是读取时登记的持久标记
+    // （`legacyCredentialConversationIds`），不是"文本里还能不能匹配到凭据"。
+    // 这段历史在读取时已被脱敏，真凭据不会进入界面、内存或请求；标记只是为了
+    // 让用户明确知道这是一段旧记录、并据此新开一段对话。
+    if (staleCredentials) {
+      append({
+        role: "system",
+        text:
+          "这段历史里的凭据是在旧版本写进去的，已被拦下，不会随本次提问发送。" +
+          "请点上方「新对话」开始一段干净的对话，或先删除这段历史。"
+      });
+      setPrompt(text);
+      return;
+    }
     // 没有可用模型时必须明确反馈，并保留用户已经输入的任务文本：
     // 不清空输入框、不伪造一次成功回答，也不擅自改用别的连接。
     if (!effectiveModelId) {
       setModelMenuOpen(true);
       return;
     }
-    if (options.showUser !== false) append({ role: "user", text });
+    if (options.showUser !== false) {
+      // 明确放弃"旧记录"拦截：用户真的开始输入新内容了，这段历史翻篇，
+      // 后续是新写的、不再携带原始凭据。**只有这里**会清掉陈旧标记 ——
+      // 系统提示之类的追加写入不能清，否则发送闸被拦一次就失效。
+      updateMessages(
+        (current) => [
+          ...current,
+          { id: messageId(), role: "user", text, createdAt: new Date().toISOString() }
+        ],
+        true
+      );
+    }
+    const activity = beginActivity({
+      id: "read-schemas",
+      label: "读取已授权表结构",
+      phase: "preflight",
+      detail: "只读取字段结构，不向意图模型发送原始数据行。"
+    });
     setPrompt("");
+    if (clarification && options.showUser !== false) {
+      updateMessages((current) => current.map((message) =>
+        message.id === clarification.messageId && message.clarification
+          ? { ...message, clarification: { ...message.clarification, status: "invalidated" } }
+          : message
+      ));
+    }
     setClarification(null);
     const controller = new AbortController();
     controllerRef.current?.abort();
@@ -526,38 +865,77 @@ export default function WpsAgentPanel({
         intentConfirmed: options.intentConfirmed,
         clarificationRound: options.clarificationRound,
         conversation: messages
-          .filter((message) => message.role !== "system")
+          .filter((message) => message.role !== "system" && message.text.trim().length > 0)
           .slice(-6)
           .map((message) => ({
             role: message.role as "user" | "assistant",
             text: message.text.slice(0, 1000)
           })),
         signal: controller.signal,
-        onProgress: setProgress
+        onProgress: (update) => {
+          setProgress(update);
+          updateActivity(activity, readonlyActivityUpdate(update));
+        }
       });
       if (result.kind === "clarification") {
+        endActivity(activity, "awaiting_input");
         setClarificationDraft("");
+        const clarificationMessageId = append({
+          role: "assistant",
+          text: "",
+          clarification: {
+            summary: redactCredentials(result.response.clarification.summary),
+            question: redactCredentials(result.response.clarification.question),
+            reason: redactCredentials(result.response.clarification.reason),
+            scopeLabel: redactCredentials(result.response.clarification.scopeLabel),
+            options: result.response.clarification.options.map((option) => ({
+              label: redactCredentials(option.label),
+              description: redactCredentials(option.description)
+            })),
+            status: "pending"
+          }
+        });
         setClarification({
+          messageId: clarificationMessageId,
           originalPrompt: text,
           round: options.clarificationRound ?? 0,
-          question: result.response.clarification.question,
-          reason: result.response.clarification.reason,
           options: result.response.clarification.options
         });
       } else if (result.kind === "plan") {
         setProgress({ stage: "answering", message: "正在校验写入计划和授权边界…" });
+        updateActivity(activity, {
+          id: "preflight-plan",
+          label: "校验写入计划与授权",
+          phase: "preflight",
+          detail: "准备可供用户检查的计划预览；此时不写入工作簿。"
+        });
         const application = getWpsApplication();
         const metadata = listWpsWorksheets(application);
         const selectedNames = metadata.sheets
           .filter((sheet) => turnSheetIndexes.includes(sheet.index))
           .map((sheet) => sheet.name);
-        const normalizedPlan = await validatePlan(
-          result.plan,
-          selectedNames,
-          metadata.sheets.map((sheet) => sheet.name)
-        );
-        setPendingPlan(prepareWpsPlan(application, turnSheetIndexes, normalizedPlan));
+        // 本端算出的计划不送服务端校验：验收条件里带着完整值矩阵，上传等于
+        // 把刚才刻意留在本地的源值送出去。理由详见 WpsTurnResult.computedLocally。
+        const normalizedPlan = result.computedLocally
+          ? result.plan
+          : await validatePlan(
+              result.plan,
+              selectedNames,
+              metadata.sheets.map((sheet) => sheet.name)
+            );
+        if (result.computedLocally && !result.sourceSnapshots?.length) {
+          throw new Error("本地映射计划缺少源区域快照，不能安全预览写入。");
+        }
+        const prepared = prepareWpsPlan(application, turnSheetIndexes, normalizedPlan, result.sourceSnapshots);
+        endActivity(activity, "awaiting_input");
+        setPendingPlan(prepared);
+        setPendingPlanMessageId(append({
+          role: "assistant",
+          text: "",
+          planPreview: { title: prepared.plan.title, status: "pending" }
+        }));
       } else {
+        endActivity(activity, "completed");
         append({
           role: "assistant",
           text: result.message,
@@ -566,11 +944,14 @@ export default function WpsAgentPanel({
       }
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") {
+        endActivity(activity, "cancelled");
         append({ role: "system", text: "任务已停止；未确认的计划不会修改工作表。" });
       } else {
+        endActivity(activity, "failed");
+        if (apiErrorCategory(error) === "local_service" && options.showUser !== false) setPrompt(text);
         append({
           role: "system",
-          text: error instanceof Error ? error.message : "任务处理失败。"
+          text: turnErrorMessage(error)
         });
       }
     } finally {
@@ -580,29 +961,108 @@ export default function WpsAgentPanel({
   };
 
   const confirmPendingPlan = async () => {
-    if (!pendingPlan || busy) return;
+    if (!pendingPlan || busy || planEditDraft !== null) return;
     const plan = pendingPlan;
+    const activity = beginActivity({
+      id: "preflight",
+      label: "复核计划与授权范围",
+      phase: "preflight",
+      detail: `${plan.actions.length} 个动作，目标 ${plan.totalCells} 个单元格；执行前重新核对工作簿与授权。`
+    });
     setWriteProgress("正在保存执行前恢复点…");
     try {
-      const record = await executeWpsPlan(getWpsApplication(), plan, ({ message }) => {
-        setWriteProgress(message);
+      const currentSheetIndexes = [...(resolveSelectedSheetIndexes?.() ?? selectedSheetIndexes)].sort((a, b) => a - b);
+      const previewSheetIndexes = plan.authorization.sheets.map((sheet) => sheet.index).sort((a, b) => a - b);
+      if (JSON.stringify(currentSheetIndexes) !== JSON.stringify(previewSheetIndexes)) {
+        throw new Error("授权工作表范围在预览后发生变化，请重新预览并确认。");
+      }
+      const record = await executeWpsPlan(getWpsApplication(), plan, (update) => {
+        setWriteProgress(update.message);
+        updateActivity(activity, executionActivityUpdate(update));
       });
+      updateActivity(activity, {
+        id: "verified-result",
+        label: "写入与回读核对完成",
+        phase: "verifying",
+        note: "所有目标均按计划回读匹配；恢复点仅保证当前加载项会话内可用。",
+        facts: [
+          { label: "操作", value: `${record.actions.length} 步` },
+          { label: "已核对", value: `${plan.totalCells} 个单元格` },
+          { label: "恢复", value: "会话内可撤销" }
+        ]
+      });
+      endActivity(activity, "completed");
       setUndoRecord(record);
+      markPlanPreview("executed");
       setPendingPlan(null);
+      setPendingPlanMessageId(null);
       append({
         role: "assistant",
-        text: `已执行「${plan.plan.title}」，并回读确认 ${plan.totalCells} 个单元格。已保存恢复点，可撤销本次执行。`
+        text: `已执行「${plan.plan.title}」，并完成目标区域回读核对。`,
+        verification: {
+          executionId: record.executionId,
+          actionCount: plan.actions.length,
+          cellCount: plan.totalCells,
+          status: "verified",
+          targets: plan.actions.map((action) => ({
+            type: action.type,
+            sheetName: redactCredentials(action.sheetName),
+            range: action.range
+          }))
+        }
       });
     } catch (error) {
+      let latest: WpsUndoRecord | null = null;
       try {
-        setUndoRecord(latestWpsUndo(getWpsApplication()));
+        latest = latestWpsUndo(getWpsApplication());
+        setUndoRecord(latest);
       } catch {
         setUndoRecord(null);
       }
+      const currentRecovery = latest?.planId === plan.plan.id &&
+        Date.parse(latest.createdAt) >= activity.startedAt;
+      const partiallyWritten = currentRecovery && latest?.state === "partial_write_recoverable";
+      endActivity(activity, partiallyWritten ? "warning" : "failed");
       append({
         role: "system",
-        text: error instanceof Error ? error.message : "WPS 写入失败。"
+        text: `${error instanceof Error ? error.message : "WPS 写入失败。"}${partiallyWritten
+          ? " 本次可能已部分写入，恢复资料已保留；请检查执行过程与撤销入口。"
+          : ""}`
       });
+    } finally {
+      setWriteProgress(null);
+    }
+  };
+
+  const applyEditedPlan = async () => {
+    if (!pendingPlan || planEditDraft === null || busy) return;
+    setWriteProgress("正在重新校验修改后的计划…");
+    try {
+      const parsed: unknown = JSON.parse(planEditDraft);
+      assertEditablePlan(parsed);
+      const application = getWpsApplication();
+      const currentSheetIndexes = [...(resolveSelectedSheetIndexes?.() ?? selectedSheetIndexes)];
+      const metadata = listWpsWorksheets(application);
+      const selectedNames = metadata.sheets
+        .filter((sheet) => currentSheetIndexes.includes(sheet.index))
+        .map((sheet) => sheet.name);
+      // Locally computed mapping values must never be sent to plan validation.
+      const validated = pendingPlan.sourceSnapshots.length
+        ? parsed
+        : await validatePlan(parsed, selectedNames, metadata.sheets.map((sheet) => sheet.name));
+      const updated = prepareWpsPlan(application, currentSheetIndexes, validated, pendingPlan.sourceSnapshots);
+      setPendingPlan(updated);
+      if (pendingPlanMessageId) {
+        updateMessages((current) => current.map((message) =>
+          message.id === pendingPlanMessageId && message.planPreview
+            ? { ...message, planPreview: { ...message.planPreview, title: updated.plan.title } }
+            : message
+        ));
+      }
+      setPlanEditDraft(null);
+      setPlanEditError(null);
+    } catch (error) {
+      setPlanEditError(error instanceof Error ? error.message : "计划编辑内容无效。");
     } finally {
       setWriteProgress(null);
     }
@@ -610,14 +1070,34 @@ export default function WpsAgentPanel({
 
   const undoLatestExecution = async () => {
     if (!undoRecord || busy) return;
+    const activity = beginActivity({
+      id: "undo-preflight",
+      label: "核对撤销条件",
+      phase: "preflight",
+      detail: "先确认目标仍是上次写入后的状态，避免覆盖后续人工修改。"
+    });
     setWriteProgress("正在核对撤销条件…");
     try {
-      await undoWpsExecution(getWpsApplication(), undoRecord.executionId, ({ message }) => {
-        setWriteProgress(message);
+      await undoWpsExecution(getWpsApplication(), undoRecord.executionId, (update) => {
+        setWriteProgress(update.message);
+        updateActivity(activity, executionActivityUpdate(update));
       });
+      updateActivity(activity, {
+        id: "undo-verified",
+        label: "恢复结果已回读核对",
+        phase: "verifying",
+        detail: "目标区域与执行前快照一致。"
+      });
+      endActivity(activity, "completed");
       setUndoRecord(null);
+      updateMessages((current) => current.map((message) =>
+        message.verification?.executionId === undoRecord.executionId
+          ? { ...message, verification: { ...message.verification, status: "undone" } }
+          : message
+      ));
       append({ role: "assistant", text: `已撤销「${undoRecord.planTitle}」，并回读确认恢复成功。` });
     } catch (error) {
+      endActivity(activity, "failed");
       try {
         setUndoRecord(latestWpsUndo(getWpsApplication()));
       } catch {
@@ -652,7 +1132,13 @@ export default function WpsAgentPanel({
         selectedNames,
         metadata.sheets.map((sheet) => sheet.name)
       );
-      setPendingPlan(prepareWpsPlan(application, toolSheetIndexes, normalizedPlan));
+      const prepared = prepareWpsPlan(application, toolSheetIndexes, normalizedPlan);
+      setPendingPlan(prepared);
+      setPendingPlanMessageId(append({
+        role: "assistant",
+        text: "",
+        planPreview: { title: prepared.plan.title, status: "pending" }
+      }));
       setToolsOpen(false);
     } catch (error) {
       append({
@@ -678,6 +1164,12 @@ export default function WpsAgentPanel({
     const controller = new AbortController();
     controllerRef.current?.abort();
     controllerRef.current = controller;
+    const activity = beginActivity({
+      id: "saved-query-preflight",
+      label: "检查固化查询的数据范围",
+      phase: "preflight",
+      detail: "只使用本次明确授权的工作表。"
+    });
     try {
       if (tool.sourceMode !== "workbook") {
         throw new Error("这个固化查询来自工作目录；WPS 当前只支持已打开的工作簿");
@@ -701,6 +1193,12 @@ export default function WpsAgentPanel({
         : authorizedSheets
       ).map((sheet) => sheet.index);
       setProgress({ stage: "reading", message: "正在读取固化查询已授权的数据源…" });
+      updateActivity(activity, {
+        id: "saved-query-read",
+        label: "读取授权数据",
+        phase: "preflight",
+        detail: "读取固化查询实际需要的工作表。"
+      });
       const authorization = authorizeWpsSheets(application, targetIndexes);
       const results = await readAuthorizedWpsSheets(application, authorization, {
         signal: controller.signal,
@@ -709,13 +1207,30 @@ export default function WpsAgentPanel({
             stage: "reading",
             message: `正在读取「${sheet.name}」：${rowsRead} / ${totalRows} 行`
           });
+          updateActivity(activity, {
+            id: `saved-query-read:${sheet.name}`,
+            label: `读取「${sheet.name}」`,
+            phase: "preflight",
+            target: { sheet: sheet.name },
+            current: rowsRead,
+            total: totalRows,
+            unit: "rows"
+          });
         }
       });
       setProgress({ stage: "calculating", message: "正在本地确定性执行固化查询…" });
+      updateActivity(activity, {
+        id: "saved-query-calculate",
+        label: "执行固化查询",
+        phase: "executing",
+        toolName: "query_table",
+        detail: "在本机对完整授权数据执行确定性计算。"
+      });
       const result = executeQueryTableData(
         instantiateQueryTool(tool),
         results.map((item) => ({ name: item.sheet.name, values: item.values }))
       );
+      endActivity(activity, "completed");
       append({
         role: "assistant",
         text: `固化查询「${tool.name}」已完成：扫描 ${result.scannedRows.toLocaleString()} 行，返回 ${result.rows.length} 行；模型调用 0 次。`,
@@ -731,8 +1246,10 @@ export default function WpsAgentPanel({
       setToolsOpen(false);
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") {
+        endActivity(activity, "cancelled");
         append({ role: "system", text: "固化查询已停止，没有修改任何工作表。" });
       } else {
+        endActivity(activity, "failed");
         append({
           role: "system",
           text: error instanceof Error ? error.message : "固化查询运行失败。"
@@ -744,8 +1261,15 @@ export default function WpsAgentPanel({
     }
   };
 
-  const resolveClarification = (option: IntentOption) => {
-    if (!clarification) return;
+  const resolveClarification = (optionIndex: number) => {
+    if (!clarification || busy) return;
+    const option = clarification.options[optionIndex];
+    if (!option) return;
+    updateMessages((current) => current.map((message) =>
+      message.id === clarification.messageId && message.clarification
+        ? { ...message, clarification: { ...message.clarification, status: "resolved", answer: redactCredentials(option.label) } }
+        : message
+    ));
     append({ role: "user", text: option.label });
     const resolvedPrompt =
       option.resolutionMode === "replace"
@@ -761,12 +1285,28 @@ export default function WpsAgentPanel({
   const resolveClarificationWithText = () => {
     if (!clarification || !clarificationDraft.trim() || busy) return;
     const answer = clarificationDraft.trim();
+    updateMessages((current) => current.map((message) =>
+      message.id === clarification.messageId && message.clarification
+        ? { ...message, clarification: { ...message.clarification, status: "resolved", answer: redactCredentials(answer) } }
+        : message
+    ));
     append({ role: "user", text: answer });
     void runTurn(`${clarification.originalPrompt}\n补充确认：${answer}`, {
       intentConfirmed: true,
       clarificationRound: clarification.round + 1,
       showUser: false
     });
+  };
+
+  const cancelClarification = () => {
+    if (!clarification || busy) return;
+    updateMessages((current) => current.map((message) =>
+      message.id === clarification.messageId && message.clarification
+        ? { ...message, clarification: { ...message.clarification, status: "cancelled" } }
+        : message
+    ));
+    setClarification(null);
+    setClarificationDraft("");
   };
 
   const closeModelSettings = () => {
@@ -789,6 +1329,90 @@ export default function WpsAgentPanel({
       await modelManagement.openSettings();
     }
   };
+
+  const planCard = pendingPlan && (
+    <section className="wps-plan-card" aria-label="WPS 写入计划预览">
+      <span className="clarification-eyebrow">写入前确认</span>
+      <strong>{pendingPlan.plan.title}</strong>
+      <p>{pendingPlan.plan.summary}</p>
+      {developmentWrite && <p>当前 WPS JSAPI 版本仅在开发调试模式开放写入；请先在独立测试工作簿验收写入与撤销。</p>}
+      <div className="wps-plan-meta">
+        <span>{pendingPlan.actions.length} 个操作</span>
+        <span>{pendingPlan.totalCells} 个单元格</span>
+        <span>可撤销</span>
+      </div>
+      <div className="wps-plan-actions-list">
+        {pendingPlan.actions.map((action) => (
+          <div key={`${action.actionIndex}:${action.sheetName}:${action.range}`}>
+            <strong>{action.type === "clearRange" ? "清空内容" : action.type === "writeFormulas" ? "写入公式" : "写入值"}</strong>
+            <span>{action.sheetName}!{action.range}</span>
+            <small>{action.rowCount} 行 × {action.columnCount} 列</small>
+            <div className="wps-plan-values" aria-label={`${action.sheetName}!${action.range} 待写内容预览`}>
+              <table><tbody>
+                {action.preview.map((row, rowIndex) => (
+                  <tr key={rowIndex}>
+                    <th scope="row">{rowIndex + 1}</th>
+                    {row.map((value, columnIndex) => (
+                      <td key={columnIndex}>{value === null ? "空单元格" : value === "" ? "空字符串" : String(value)}</td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody></table>
+              {(action.rowCount > 5 || action.columnCount > 5) && <small>此处仅显示前 5 行、前 5 列；编辑计划可查看完整矩阵。</small>}
+            </div>
+          </div>
+        ))}
+      </div>
+      {pendingPlan.plan.warnings.length > 0 && (
+        <ul className="wps-plan-warnings">
+          {pendingPlan.plan.warnings.map((warning) => <li key={warning}>{warning}</li>)}
+        </ul>
+      )}
+      {planEditDraft !== null && (
+        <div className="wps-plan-editor">
+          <label htmlFor="wps-plan-edit-json">编辑写入计划 JSON</label>
+          <textarea
+            id="wps-plan-edit-json"
+            aria-label="编辑写入计划 JSON"
+            rows={12}
+            value={planEditDraft}
+            disabled={busy}
+            onChange={(event) => { setPlanEditDraft(event.target.value); setPlanEditError(null); }}
+          />
+          {planEditError && <p role="alert">{planEditError}</p>}
+        </div>
+      )}
+      <div className="wps-plan-buttons">
+        {planEditDraft === null ? (
+          <>
+            <button type="button" disabled={busy} onClick={() => { setPlanEditDraft(JSON.stringify(pendingPlan.plan, null, 2)); setPlanEditError(null); }}>编辑计划</button>
+            <button type="button" disabled={busy} onClick={() => { markPlanPreview("cancelled"); setPendingPlan(null); setPendingPlanMessageId(null); }}>取消</button>
+            <button className="primary" type="button" disabled={busy} onClick={() => void confirmPendingPlan()}>确认写入</button>
+          </>
+        ) : (
+          <>
+            <button type="button" disabled={busy} onClick={() => { setPlanEditDraft(null); setPlanEditError(null); }}>取消编辑</button>
+            <button className="primary" type="button" disabled={busy} onClick={() => void applyEditedPlan()}>应用修改并重新预览</button>
+          </>
+        )}
+      </div>
+    </section>
+  );
+
+  const progressCard = (progress || writeProgress) && (
+    <section className="agent-progress" aria-label="任务执行过程">
+      <div className="agent-progress-heading">
+        <strong>{writeProgress ? "写入过程" : "任务过程"}</strong>
+        <span>{writeProgress ? "可撤销" : "处理中"}</span>
+      </div>
+      <div className="agent-progress-current">
+        <span className="progress-dot" aria-hidden="true" />
+        <strong>{writeProgress ? "执行与校验" : "处理中"}</strong>
+        <span>{writeProgress ?? progress?.message}</span>
+        {!writeProgress && <button type="button" onClick={() => controllerRef.current?.abort()}>停止</button>}
+      </div>
+    </section>
+  );
 
   return (
     <section className="wps-chat-shell chat-shell">
@@ -1108,7 +1732,12 @@ export default function WpsAgentPanel({
           {newConversationNotice.previousSaved ? "已新建对话" : "当前已是新对话"}
         </div>
       )}
-      <main className="message-stream" aria-live="polite">
+      {copyError && (
+        <div className="new-conversation-toast" role="status">
+          复制未成功；可以选中文字后使用 Ctrl+C
+        </div>
+      )}
+      <main ref={messageStreamRef} className="message-stream" aria-live="polite" onScroll={handleMessageStreamScroll}>
         {messages.length === 0 && (
           <article className="message-row assistant welcome">
             <div className="message-content">
@@ -1127,8 +1756,9 @@ export default function WpsAgentPanel({
         )}
 
         {messages.map((message) => (
-          <article className={`message-row ${message.role}`} key={message.id}>
-            <div className="message-content">
+          <Fragment key={message.id}>
+            <article className={`message-row ${message.role}`}>
+              <div className="message-content">
               {message.role === "assistant" && (
                 <div className="message-author">
                   Excel Bro <em>{message.resultContext ? "本地工具" : "Agent"}</em>
@@ -1137,102 +1767,146 @@ export default function WpsAgentPanel({
               {message.resultContext ? (
                 <section className="query-result-card">
                   <p className="message-text">{message.text}</p>
-                <div className="preview-table-wrap">
-                  <table>
-                    <thead>
-                      <tr>
-                        {message.resultContext.headers.map((header) => <th key={header}>{header}</th>)}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {message.resultContext.rows.slice(0, 20).map((row, rowIndex) => (
-                        <tr key={rowIndex}>
-                          {row.map((cell, columnIndex) => (
-                            <td key={columnIndex}>{cell == null ? "" : String(cell)}</td>
-                          ))}
+                  <div className="wps-query-result-meta">
+                    <strong>{message.resultContext.title}</strong>
+                    <span>显示 {Math.min(20, message.resultContext.rows.length)} / {message.resultContext.rows.length} 行</span>
+                    {message.resultContext.sourceSheets.length > 0 && (
+                      <small>数据来源：{message.resultContext.sourceSheets.join("、")}</small>
+                    )}
+                  </div>
+                  <div className="preview-table-wrap">
+                    <table>
+                      <thead>
+                        <tr>
+                          {message.resultContext.headers.map((header) => <th key={header}>{header}</th>)}
                         </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
+                      </thead>
+                      <tbody>
+                        {message.resultContext.rows.slice(0, 20).map((row, rowIndex) => (
+                          <tr key={rowIndex}>
+                            {row.map((cell, columnIndex) => (
+                              <td key={columnIndex}>{cell == null ? "" : String(cell)}</td>
+                            ))}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  {message.resultContext.warnings.length > 0 && (
+                    <ul className="wps-query-result-warnings">
+                      {message.resultContext.warnings.map((warning, index) => <li key={`${index}:${warning}`}>{warning}</li>)}
+                    </ul>
+                  )}
                 </section>
-              ) : (
+              ) : message.text ? (
                 <p className="message-text">{message.text}</p>
+              ) : null}
+              {message.clarification && (
+                <section className={`clarification-card ${message.clarification.status}`} aria-label="需求澄清">
+                  <div className="clarification-heading">
+                    <div>
+                      <span>需要确认</span>
+                      <strong>{message.clarification.summary}</strong>
+                    </div>
+                    <em>{message.clarification.scopeLabel}</em>
+                  </div>
+                  <p className="clarification-question">{message.clarification.question}</p>
+                  <p className="clarification-reason">{message.clarification.reason}</p>
+                  {message.clarification.status === "pending" && clarification?.messageId === message.id ? (
+                    <>
+                      <div className="clarification-options">
+                        {message.clarification.options.map((option, index) => (
+                          <button type="button" key={index} disabled={busy} onClick={() => resolveClarification(index)}>
+                            <strong>{option.label}</strong>
+                            <span>{option.description}</span>
+                          </button>
+                        ))}
+                      </div>
+                      <span className="clarification-custom-hint">其他想法也可以直接说明</span>
+                      <div className="clarification-custom-input">
+                        <textarea
+                          aria-label="其他想法"
+                          value={clarificationDraft}
+                          placeholder="补充你希望我怎么处理…"
+                          onChange={(event) => setClarificationDraft(event.target.value)}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter" && !event.shiftKey) {
+                              event.preventDefault();
+                              resolveClarificationWithText();
+                            }
+                          }}
+                        />
+                        <button type="button" disabled={!clarificationDraft.trim() || busy} onClick={resolveClarificationWithText}>发送</button>
+                      </div>
+                      <div className="clarification-actions">
+                        <button type="button" disabled={busy} onClick={cancelClarification}>取消本次澄清</button>
+                      </div>
+                    </>
+                  ) : (
+                    <div className="clarification-outcome">
+                      {message.clarification.status === "resolved"
+                        ? `已按「${message.clarification.answer ?? "补充说明"}」继续`
+                        : message.clarification.status === "cancelled"
+                          ? "已取消本次澄清，未修改工作表"
+                          : "这张澄清卡已失效；如需继续，请重新发送需求"}
+                    </div>
+                  )}
+                </section>
               )}
-              {message.role === "assistant" && (
-                <button
-                  className={`message-copy-button${copiedMessageId === message.id ? " copied" : ""}`}
-                  type="button"
-                  aria-label={copiedMessageId === message.id ? "消息已复制" : "复制这条消息"}
-                  onClick={() => void copyMessage(message)}
-                >
-                  {copiedMessageId === message.id ? "✓ 已复制" : "复制"}
-                </button>
+              {message.planPreview && (
+                pendingPlan && pendingPlanMessageId === message.id
+                  ? planCard
+                  : <div className="wps-plan-outcome" role="status">
+                      <strong>{message.planPreview.title}</strong>
+                      <span>{message.planPreview.status === "executed"
+                        ? "计划已执行并回读确认"
+                        : message.planPreview.status === "cancelled"
+                          ? "计划已取消，未写入工作表"
+                          : "计划预览已失效；如需写入，请重新提出任务"}</span>
+                    </div>
               )}
-            </div>
-          </article>
-        ))}
-
-        {clarification && (
-          <section className="clarification-card">
-            <span className="clarification-eyebrow">确认你的需求</span>
-            <strong>{clarification.question}</strong>
-            <p>{clarification.reason}</p>
-            <div className="clarification-options">
-              {clarification.options.map((option) => (
-                <button type="button" key={option.id} onClick={() => resolveClarification(option)}>
-                  <span>{option.label}</span>
-                  <small>{option.description}</small>
-                </button>
-              ))}
-            </div>
-            <div className="clarification-custom">
-              <input
-                aria-label="其他想法"
-                value={clarificationDraft}
-                placeholder="其他想法：直接说明你的需求"
-                onChange={(event) => setClarificationDraft(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") resolveClarificationWithText();
-                }}
-              />
-              <button type="button" disabled={!clarificationDraft.trim() || busy} onClick={resolveClarificationWithText}>发送</button>
-            </div>
-          </section>
-        )}
-
-        {pendingPlan && (
-          <section className="wps-plan-card" aria-label="WPS 写入计划预览">
-            <span className="clarification-eyebrow">写入前确认</span>
-            <strong>{pendingPlan.plan.title}</strong>
-            <p>{pendingPlan.plan.summary}</p>
-            <div className="wps-plan-meta">
-              <span>{pendingPlan.actions.length} 个操作</span>
-              <span>{pendingPlan.totalCells} 个单元格</span>
-              <span>可撤销</span>
-            </div>
-            <div className="wps-plan-actions-list">
-              {pendingPlan.actions.map((action) => (
-                <div key={`${action.actionIndex}:${action.sheetName}:${action.range}`}>
-                  <strong>{action.type === "clearRange" ? "清空内容" : "写入值"}</strong>
-                  <span>{action.sheetName}!{action.range}</span>
-                  <small>{action.rowCount} 行 × {action.columnCount} 列</small>
+              {message.verification && (
+                <section className={`verification-card wps-verification-card ${message.verification.status}`} aria-label="写入验证结果">
+                  <strong>{message.verification.status === "undone" ? "已撤销并核对恢复" : "写入验证通过"}</strong>
+                  <span>{message.verification.actionCount} 个动作 · {message.verification.cellCount} 个单元格已回读核对</span>
+                  <ul>
+                    {message.verification.targets.slice(0, 5).map((target, index) => (
+                      <li key={`${message.id}-target-${index}`}>
+                        {target.type === "clearRange" ? "清空内容" : target.type === "writeFormulas" ? "写入公式" : "写入值"} · {target.sheetName}!{target.range}
+                      </li>
+                    ))}
+                  </ul>
+                  {message.verification.targets.length > 5 && (
+                    <small>另有 {message.verification.targets.length - 5} 个目标，详见执行过程。</small>
+                  )}
+                  <small>恢复点仅在当前加载项会话内可用；关闭后不能从此卡片撤销。</small>
+                </section>
+              )}
+              {message.activityLog && message.activityLog.steps.length > 0 && (
+                <TaskProgressTimeline
+                  log={message.activityLog}
+                  live={activeActivityMessageId === message.id}
+                  onStop={activeActivityMessageId === message.id && progress
+                    ? () => controllerRef.current?.abort()
+                    : undefined}
+                />
+              )}
+              {message.text.trim() && (
+                <div className="message-copy-row">
+                  <button
+                    className={`message-copy-button${copiedMessageId === message.id ? " copied" : ""}`}
+                    type="button"
+                    aria-label={copiedMessageId === message.id ? "消息已复制" : "复制这条消息"}
+                    onClick={() => void copyMessage(message)}
+                  >
+                    {copiedMessageId === message.id ? "✓ 已复制" : "复制"}
+                  </button>
                 </div>
-              ))}
-            </div>
-            {pendingPlan.plan.warnings.length > 0 && (
-              <ul className="wps-plan-warnings">
-                {pendingPlan.plan.warnings.map((warning) => <li key={warning}>{warning}</li>)}
-              </ul>
-            )}
-            <div className="wps-plan-buttons">
-              <button type="button" disabled={busy} onClick={() => setPendingPlan(null)}>取消</button>
-              <button className="primary" type="button" disabled={busy} onClick={() => void confirmPendingPlan()}>
-                确认写入
-              </button>
-            </div>
-          </section>
-        )}
+              )}
+              </div>
+            </article>
+          </Fragment>
+        ))}
 
         {undoRecord && (
           <section className="wps-undo-card" aria-label="WPS 撤销恢复点">
@@ -1244,23 +1918,32 @@ export default function WpsAgentPanel({
           </section>
         )}
 
-        {(progress || writeProgress) && (
-          <section className="agent-progress" aria-label="任务执行过程">
-            <div className="agent-progress-heading">
-              <strong>{writeProgress ? "写入过程" : "任务过程"}</strong>
-              <span>{writeProgress ? "可撤销" : "处理中"}</span>
-            </div>
-            <div className="agent-progress-current">
-              <span className="progress-dot" aria-hidden="true" />
-              <strong>{writeProgress ? "执行与校验" : progress ? progressLabels[progress.stage] : "处理中"}</strong>
-              <span>{writeProgress ?? progress?.message}</span>
-              {!writeProgress && <button type="button" onClick={() => controllerRef.current?.abort()}>停止</button>}
-            </div>
-          </section>
-        )}
-        <div ref={messagesEndRef} />
+        {(progress || writeProgress) && !activeActivityMessageId && progressCard}
       </main>
+      {hasUnseenProgress && (
+        <button type="button" className="new-progress-button" onClick={scrollToLatest} aria-label="查看最新执行进度">
+          <span aria-hidden="true">↓</span><span>查看最新进度</span>
+        </button>
+      )}
       </div>
+
+      {historyNotice && (
+        <div className="storage-write-warning" role="alert">
+          <strong>对话历史没能保存到本机</strong>
+          <span>{historyNotice}</span>
+        </div>
+      )}
+
+      {staleCredentials && (
+        <div className="stale-credentials-warning" role="alert">
+          <strong>这段历史来自旧版本，曾包含凭据</strong>
+          <span>
+            凭据已在读取时抹掉，界面里不会再显示原文。为避免把它当作正常历史
+            续聊，发送仍会被拦下；请点上方「新对话」开始一段干净的对话，或删掉
+            这段历史。
+          </span>
+        </div>
+      )}
 
       <footer className="composer">
         {scopeDock}
@@ -1295,21 +1978,36 @@ export default function WpsAgentPanel({
               ▧ 图片
             </button>
             <span className="composer-shortcut-hint">Enter 发送 · Shift + Enter 换行</span>
-            <button
-              className="send-button composer-send-button"
-              type="submit"
-              aria-label="发送"
-              disabled={busy || prompt.trim().length < 2 || selectedSheetIndexes.length === 0}
-            >
-              ↑
-            </button>
+            {progress ? (
+              <button
+                className="send-button composer-send-button wps-stop-button"
+                type="button"
+                aria-label="停止任务"
+                title="停止当前读取或规划任务"
+                onClick={() => controllerRef.current?.abort()}
+              >
+                ■
+              </button>
+            ) : (
+              <button
+                className="send-button composer-send-button"
+                type="submit"
+                aria-label={writeProgress ? "正在执行写入与回读" : "发送"}
+                title={writeProgress ? "写入与回读期间不能中断，以免结果状态不明" : undefined}
+                disabled={Boolean(writeProgress) || prompt.trim().length < 2 || selectedSheetIndexes.length === 0}
+              >
+                {writeProgress ? "…" : "↑"}
+              </button>
+            )}
           </div>
         </form>
-        <p className="wps-capability-note">
-          {canWrite
-            ? "修改会严格限制在已授权工作表，先预览确认、再执行；当前支持写入值、清空内容和撤销。"
-            : `当前仍可查询；写入将在满足条件后开放：${writeStatusReason}`}
-        </p>
+        {(developmentWrite || !canWrite) && (
+          <p className="wps-capability-note">
+            {developmentWrite
+              ? "开发验收模式：仅在独立测试工作簿中确认写入与撤销。"
+              : `当前仍可查询；写入将在满足条件后开放：${writeStatusReason}`}
+          </p>
+        )}
       </footer>
 
       {newConversationConfirmOpen && (

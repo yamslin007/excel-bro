@@ -5309,6 +5309,54 @@ textarea:focus-visible {
   backdrop-filter: blur(10px);
 }
 
+/* 陈旧凭据横幅：历史里还有旧版本落盘的凭据，续聊会被拦下。
+   用警示色而非错误色 —— 它不是失败，是"需要用户先处理一下"。 */
+.stale-credentials-warning {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 6px 10px 0;
+  padding: 8px 10px;
+  border: 1px solid #f0d9a8;
+  border-radius: var(--radius-md);
+  background: #fdf6e7;
+  color: #8a5a12;
+}
+
+.stale-credentials-warning strong {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.stale-credentials-warning span {
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+/* 对话历史写不进本地存储时的提示。与「旧记录」提示同样独立于消息流：
+   它描述的是"这条内容没能落盘"，若写进历史会在下一次落盘时又被写丢。 */
+.storage-write-warning {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 6px 10px 0;
+  padding: 8px 10px;
+  border: 1px solid #f0c2c2;
+  border-radius: var(--radius-md);
+  background: #fdeced;
+  color: #8a2226;
+}
+
+.storage-write-warning strong {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.storage-write-warning span {
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .scope-entry-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;

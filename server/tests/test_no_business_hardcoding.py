@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 
@@ -14,7 +15,9 @@ BUSINESS_TERMS = (
     "电影",
     "影厅",
     "销售额",
-    "客户",
+    # 「客户」指行业字段；「客户端」是软件术语（与服务端相对），不算行业示例。
+    # 用否定环视排除，而不是从清单里删掉「客户」——后者会放过真正的客户字段。
+    "客户(?!端)",
     "学生",
     "姓名",
     "得分",
@@ -34,7 +37,7 @@ def test_production_code_has_no_domain_specific_examples() -> None:
                 continue
             text = path.read_text(encoding="utf-8")
             for term in BUSINESS_TERMS:
-                if term in text:
+                if re.search(term, text):
                     violations.append(f"{path}:{term}")
 
     assert not violations, (

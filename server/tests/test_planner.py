@@ -7,6 +7,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+import server.app.excel_agent as excel_agent
 import server.app.llm.config as llm_config
 import server.app.planner as planner_module
 from server.app.models import PlanRequest
@@ -16,6 +17,9 @@ from server.app.planner import create_plan
 # 测试里反复使用的「用户选了一个模型 id」标记。
 # 注意：它不是在测试环境下真实存在的连接，只是用来表达"请求里带了这个 id"。
 _CONFIGURED_MODEL_ID = "connection:test-primary"
+
+# 只读工具名取自生产定义，新增终局工具时不必同步改测试。
+_READONLY_TOOL_NAMES = excel_agent.READONLY_TOOLS
 
 
 @pytest.fixture(autouse=True)
@@ -789,7 +793,10 @@ def test_model_agent_inspects_fields_before_submitting_formula_plan(
     assert response.provider == "model"
     assert response.plan.actions[0].type == "writeFormulas"
     assert len(requests) == 2
-    assert _tool_names(requests[1]) == {"submit_plan", "submit_answer"}
+    # 断言的是"只读工具已撤下"，不是"终局工具集恰好这两个"——
+    # 后者会在每次新增终局工具时假报回归。
+    assert _READONLY_TOOL_NAMES.isdisjoint(_tool_names(requests[1]))
+    assert {"submit_plan", "submit_answer"} <= _tool_names(requests[1])
     second_messages = requests[1]["messages"]
     assert isinstance(second_messages, list)
     tool_message = next(
@@ -1191,7 +1198,8 @@ def test_confirmed_split_plan_submits_once_without_reading_snapshot_rows(
     assert response.plan.actions[0].metrics[0].ratioOutputName == "占比"
     assert len(call_log) == 1
     names = _tool_names(call_log[0])
-    assert names == {"submit_plan", "submit_answer"}
+    assert _READONLY_TOOL_NAMES.isdisjoint(names)
+    assert {"submit_plan", "submit_answer"} <= names
     user_message = call_log[0]["messages"][1]
     assert isinstance(user_message, dict)
     assert "不得调用工作簿只读工具" in str(user_message["content"])

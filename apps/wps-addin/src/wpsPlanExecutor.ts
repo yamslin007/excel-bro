@@ -1,4 +1,5 @@
 import capabilities from "../../../config/capabilities.json";
+import type { WorkbookLocator } from "@excel-bro/core/contracts";
 import type { AnalysisPlan, CellValue, ExcelAction } from "../../excel-addin/src/contracts";
 import {
   assertRectangularValues,
@@ -6,6 +7,7 @@ import {
   parseExplicitA1Rect,
   writeMatrixShapeIssue
 } from "../../excel-addin/src/planCore";
+import { assertSafeFormula } from "../../excel-addin/src/formulaSafety";
 import type { WpsApplication, WpsRange, WpsWorksheet } from "./wpsHost";
 import {
   assertWpsAuthorization,
@@ -13,11 +15,13 @@ import {
   normalizeWpsMatrix,
   type WpsReadAuthorization
 } from "./wpsWorkbookReader";
+import { wpsWriteVersionStatus } from "./wpsWriteVersionGate";
 
 const STORAGE_KEY = "excel-bro.wps.undo.v1";
 
 type SupportedAction =
   | Extract<ExcelAction, { type: "writeValues" }>
+  | Extract<ExcelAction, { type: "writeFormulas" }>
   | Extract<ExcelAction, { type: "clearRange" }>;
 
 type Rect = {
@@ -29,7 +33,7 @@ type Rect = {
 
 export type WpsPreparedAction = {
   actionIndex: number;
-  type: "writeValues" | "clearRange";
+  type: "writeValues" | "writeFormulas" | "clearRange";
   sheetIndex: number;
   sheetName: string;
   range: string;
@@ -38,16 +42,39 @@ export type WpsPreparedAction = {
   cellCount: number;
   values: CellValue[][];
   preview: CellValue[][];
+  /** Target state when the user was shown this preview. */
+  previewFingerprint: string;
   rect: Rect;
+};
+
+/** Kept in memory only: source values are never sent to the model or persisted as confirmation metadata. */
+export type WpsSourceSnapshot = {
+  sheetName: string;
+  range: string;
+  values: CellValue[][];
+};
+
+type WpsPreparedSource = {
+  sheetIndex: number;
+  sheetName: string;
+  range: string;
+  rowCount: number;
+  columnCount: number;
+  previewFingerprint: string;
 };
 
 export type WpsPreparedPlan = {
   plan: AnalysisPlan;
+  /** In-memory only; needed to recheck the original calculation input after a preview edit. */
+  sourceSnapshots: WpsSourceSnapshot[];
   authorization: WpsReadAuthorization;
   workbookIdentity: string;
   hostVersion: string | null;
   actions: WpsPreparedAction[];
+  sources: WpsPreparedSource[];
   totalCells: number;
+  previewRevision: string;
+  confirmationSnapshot: string;
 };
 
 type StoredAction = WpsPreparedAction & {
@@ -59,7 +86,7 @@ type StoredAction = WpsPreparedAction & {
 };
 
 export type WpsUndoRecord = {
-  version: 1;
+  version: 1 | 2;
   executionId: string;
   planId: string;
   planTitle: string;
@@ -74,6 +101,14 @@ export type WpsUndoRecord = {
 export type WpsExecutionProgress = {
   stage: "snapshot" | "writing" | "verifying" | "undoing";
   message: string;
+  actionIndex?: number;
+  actionType?: WpsPreparedAction["type"];
+  sheetName?: string;
+  range?: string;
+  completedRows?: number;
+  totalRows?: number;
+  actionCount?: number;
+  cellCount?: number;
 };
 
 function columnName(index: number): string {
@@ -118,7 +153,7 @@ function canonicalMatrix(values: readonly (readonly unknown[])[]): CellValue[][]
   return values.map((row) => row.map(canonicalCell));
 }
 
-function matrixFingerprint(values: CellValue[][], formulas: CellValue[][]): string {
+function legacyMatrixFingerprint(values: CellValue[][], formulas: CellValue[][]): string {
   const normalizedValues = canonicalMatrix(values);
   const normalizedFormulas = canonicalMatrix(formulas);
   const logicalCells = normalizedValues.map((row, rowIndex) =>
@@ -138,14 +173,68 @@ function matrixFingerprint(values: CellValue[][], formulas: CellValue[][]): stri
   return `${text.length}:${(hash >>> 0).toString(16).padStart(8, "0")}`;
 }
 
-function readMatrices(range: WpsRange, rows: number, columns: number) {
+function typedCell(value: CellValue): readonly [string, CellValue?] {
+  if (value === null) return ["null"];
+  return [typeof value, value];
+}
+
+/** v2 keeps null and empty string distinct and binds a formula ahead of its displayed value. */
+export function matrixFingerprintV2(values: CellValue[][], formulas: CellValue[][]): string {
+  const logicalCells = values.map((row, rowIndex) =>
+    row.map((value, columnIndex) => {
+      const formula = formulas[rowIndex]?.[columnIndex];
+      return typeof formula === "string" && formula.startsWith("=")
+        ? ["formula", formula]
+        : typedCell(value);
+    })
+  );
+  const text = JSON.stringify(logicalCells);
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return `v2:${text.length}:${(hash >>> 0).toString(16).padStart(8, "0")}`;
+}
+
+function fingerprintForVersion(values: CellValue[][], formulas: CellValue[][], version: 1 | 2): string {
+  return version === 1
+    ? legacyMatrixFingerprint(values, formulas)
+    : matrixFingerprintV2(values, formulas);
+}
+
+function readMatrices(range: WpsRange, rows: number, columns: number, version: 1 | 2 = 2) {
   const values = normalizeWpsMatrix(range.Value2, rows, columns);
   const formulas = normalizeWpsMatrix(range.Formula, rows, columns);
-  return { values, formulas, fingerprint: matrixFingerprint(values, formulas) };
+  return { values, formulas, fingerprint: fingerprintForVersion(values, formulas, version) };
+}
+
+function hasAmbiguousLogicalCell(values: CellValue[][], formulas: CellValue[][]): boolean {
+  return values.some((row, rowIndex) => row.some((value, columnIndex) => {
+    const formula = formulas[rowIndex]?.[columnIndex];
+    return !(typeof formula === "string" && formula.startsWith("=")) && (value === null || value === "");
+  }));
+}
+
+function confirmationSnapshot(prepared: WpsPreparedPlan): string {
+  return JSON.stringify({
+    plan: prepared.plan,
+    sourceSnapshots: prepared.sourceSnapshots,
+    sheets: prepared.authorization.sheets.map(({ index, name }) => ({ index, name })),
+    workbookIdentity: prepared.workbookIdentity,
+    hostVersion: prepared.hostVersion,
+    actions: prepared.actions,
+    sources: prepared.sources,
+    totalCells: prepared.totalCells,
+    previewRevision: prepared.previewRevision
+  });
 }
 
 function matricesEqual(actual: CellValue[][], expected: CellValue[][]): boolean {
-  return JSON.stringify(canonicalMatrix(actual)) === JSON.stringify(canonicalMatrix(expected));
+  // Readback must preserve the plan's cell values. The legacy fingerprint above
+  // intentionally folds empty strings for existing undo records, but that
+  // compatibility rule must not make a failed write look verified.
+  return JSON.stringify(actual) === JSON.stringify(expected);
 }
 
 function overlaps(left: WpsPreparedAction, right: WpsPreparedAction): boolean {
@@ -164,6 +253,22 @@ function workbookIdentity(authorization: WpsReadAuthorization): string {
     throw new Error("WPS 写入只对已保存到本地磁盘的 .xlsx 工作簿开放。请先保存文件。");
   }
   return identity.toLowerCase();
+}
+
+/**
+ * WPS 身份的共享层内部表示（方案 §2.3 第 1 条）。
+ *
+ * 值沿用 `workbookIdentity` 的既有归一（仅小写，**不**把反斜杠转正斜杠）——
+ * 已落盘的 `WpsUndoRecord.workbookIdentity` 就是这个形态，改动会让现有撤销记录
+ * 对不上。core 的 `sameLocator` 比对 wps-path 时对两种分隔符都归一，故不受影响。
+ *
+ * 这个 locator **不会**出网：WPS 恢复按方案 §2.3 第 2 条保持客户端权威，
+ * 服务端不参与，也不存在折叠成 `url:` 字符串的路径。
+ */
+export function wpsWorkbookLocator(
+  authorization: WpsReadAuthorization
+): WorkbookLocator {
+  return { kind: "wps-path", value: workbookIdentity(authorization) };
 }
 
 function selectedSheet(
@@ -186,34 +291,60 @@ function valuesForAction(action: SupportedAction, rows: number, columns: number)
     }
     return blankCellMatrix(rows, columns);
   }
+  if (action.type === "writeFormulas") {
+    if (action.formulaR1C1 !== undefined) {
+      throw new Error("WPS 的 R1C1 铺满公式尚未完成独立回读验收；请使用与目标区域同形的 A1 公式矩阵。");
+    }
+    if (!Array.isArray(action.formulas) || action.formulas.some((row) => !Array.isArray(row))) {
+      throw new Error(`区域「${action.sheet}!${action.range}」的公式不是二维数组。`);
+    }
+    assertRectangularValues(action.formulas);
+    const shapeIssue = writeMatrixShapeIssue(action.range, action.formulas);
+    if (shapeIssue) throw new Error(shapeIssue);
+    action.formulas.forEach((row, rowIndex) => row.forEach((formula, columnIndex) => {
+      if (typeof formula !== "string" || !formula.startsWith("=")) {
+        throw new Error(`区域「${action.sheet}!${action.range}」第 ${rowIndex + 1} 行第 ${columnIndex + 1} 列不是 A1 公式。`);
+      }
+      assertSafeFormula(formula, `${action.sheet}!${action.range} 第 ${rowIndex + 1} 行第 ${columnIndex + 1} 列`);
+    }));
+    return action.formulas.map((row) => [...row]);
+  }
   if (!Array.isArray(action.values) || action.values.some((row) => !Array.isArray(row))) {
     throw new Error(`区域「${action.sheet}!${action.range}」的写入数据不是二维数组。`);
   }
   assertRectangularValues(action.values);
   const shapeIssue = writeMatrixShapeIssue(action.range, action.values);
   if (shapeIssue) throw new Error(shapeIssue);
-  const values = action.values.map((row) => row.map(canonicalCell));
+  const values = action.values.map((row) => row.map((value) =>
+    value === "" ? "" : canonicalCell(value)
+  ));
   if (values.some((row) => row.some((value) => typeof value === "string" && value.startsWith("=")))) {
-    throw new Error("WPS 当前不允许通过 writeValues 注入公式；公式写入将在独立验收后开放。");
+    throw new Error("WPS 不允许通过 writeValues 注入公式；请使用 writeFormulas 动作并预览确认。");
   }
   return values;
 }
 
 function supportedAction(action: ExcelAction): action is SupportedAction {
-  return action.type === "writeValues" || action.type === "clearRange";
+  return action.type === "writeValues" || action.type === "writeFormulas" || action.type === "clearRange";
+}
+
+function assertAllowedAction(action: SupportedAction): void {
+  const key = action.type === "clearRange" ? `${action.type}:${action.applyTo}` : action.type;
+  if (!(capabilities.wpsWrite.allowedActions as readonly string[]).includes(key)) {
+    throw new Error(`WPS 当前未开放「${key}」，已拒绝整份计划。`);
+  }
 }
 
 export function prepareWpsPlan(
   application: WpsApplication,
   selectedSheetIndexes: readonly number[],
-  plan: AnalysisPlan
+  plan: AnalysisPlan,
+  sourceSnapshots: readonly WpsSourceSnapshot[] = []
 ): WpsPreparedPlan {
   if (!capabilities.wpsWrite.enabled) throw new Error("WPS 写入功能当前已由能力开关关闭。");
   const hostVersion = String(application.Version ?? "").trim();
-  if (!capabilities.wpsWrite.verifiedVersionPrefixes.some((prefix) =>
-    hostVersion === prefix || hostVersion.startsWith(`${prefix}.`)
-  )) {
-    throw new Error(`当前 WPS 版本「${hostVersion || "未知"}」尚未通过写入能力验证。`);
+  if (wpsWriteVersionStatus(hostVersion) === "blocked") {
+    throw new Error(`当前 WPS JSAPI 版本「${hostVersion || "未知"}」尚未开放写入。`);
   }
   const workbook = application.ActiveWorkbook;
   if (!workbook || workbook.ReadOnly !== false) throw new Error("当前 WPS 工作簿没有明确处于可编辑状态。");
@@ -222,8 +353,9 @@ export function prepareWpsPlan(
   const identity = workbookIdentity(authorization);
   const actions: WpsPreparedAction[] = plan.actions.map((action, actionIndex) => {
     if (!supportedAction(action)) {
-      throw new Error(`WPS 当前不执行「${action.type}」。可用能力是修改单元格值和清空明确区域内容。`);
+      throw new Error(`WPS 当前不执行「${action.type}」。请使用当前已开放的写入动作。`);
     }
+    assertAllowedAction(action);
     const targetRange = action.range;
     const rect = parseA1Range(targetRange);
     const rowCount = rect.endRow - rect.startRow + 1;
@@ -233,6 +365,7 @@ export function prepareWpsPlan(
     const hostRange = rangeFor(sheet, targetRange);
     if (hostRange.MergeCells !== false) throw new Error(`区域「${action.sheet}!${targetRange}」包含合并单元格或状态未知。`);
     if (hostRange.Formula === undefined) throw new Error(`区域「${action.sheet}!${targetRange}」无法生成公式快照。`);
+    const beforePreview = readMatrices(hostRange, rowCount, columnCount);
     const values = valuesForAction(action, rowCount, columnCount);
     return {
       actionIndex,
@@ -245,7 +378,30 @@ export function prepareWpsPlan(
       cellCount: rowCount * columnCount,
       values,
       preview: values.slice(0, 5).map((row) => row.slice(0, 5)),
+      previewFingerprint: beforePreview.fingerprint,
       rect
+    };
+  });
+  const sources: WpsPreparedSource[] = sourceSnapshots.map((snapshot) => {
+    const rect = parseA1Range(snapshot.range);
+    const rowCount = rect.endRow - rect.startRow + 1;
+    const columnCount = rect.endColumn - rect.startColumn + 1;
+    if (snapshot.values.length !== rowCount || snapshot.values.some((row) => row.length !== columnCount)) {
+      throw new Error(`源区域「${snapshot.sheetName}!${snapshot.range}」的读取矩阵尺寸不符。`);
+    }
+    const { index, sheet } = selectedSheet(application, authorization, snapshot.sheetName);
+    const current = readMatrices(rangeFor(sheet, snapshot.range), rowCount, columnCount);
+    const emptyFormulas = blankCellMatrix(rowCount, columnCount);
+    if (matrixFingerprintV2(current.values, emptyFormulas) !== matrixFingerprintV2(snapshot.values, emptyFormulas)) {
+      throw new Error(`源区域「${snapshot.sheetName}!${snapshot.range}」在计算后发生变化，请重新生成计划。`);
+    }
+    return {
+      sheetIndex: index,
+      sheetName: snapshot.sheetName,
+      range: snapshot.range,
+      rowCount,
+      columnCount,
+      previewFingerprint: current.fingerprint
     };
   });
   for (let left = 0; left < actions.length; left += 1) {
@@ -259,14 +415,24 @@ export function prepareWpsPlan(
   if (totalCells > capabilities.wpsWrite.maxCells) {
     throw new Error(`本次计划涉及 ${totalCells} 个单元格，超过 WPS 单次 ${capabilities.wpsWrite.maxCells} 个单元格的上限。`);
   }
-  return {
+  const prepared: WpsPreparedPlan = {
     plan,
+    sourceSnapshots: sourceSnapshots.map((snapshot) => ({
+      sheetName: snapshot.sheetName,
+      range: snapshot.range,
+      values: snapshot.values.map((row) => [...row])
+    })),
     authorization,
     workbookIdentity: identity,
     hostVersion,
     actions,
-    totalCells
+    sources,
+    totalCells,
+    previewRevision: randomId(),
+    confirmationSnapshot: ""
   };
+  prepared.confirmationSnapshot = confirmationSnapshot(prepared);
+  return prepared;
 }
 
 function randomId(): string {
@@ -333,9 +499,36 @@ export async function executeWpsPlan(
   onProgress?: (progress: WpsExecutionProgress) => void
 ): Promise<WpsUndoRecord> {
   if (!capabilities.wpsWrite.enabled) throw new Error("WPS 写入功能当前已由能力开关关闭。");
+  const hostVersion = String(application.Version ?? "").trim();
+  if (hostVersion !== prepared.hostVersion || wpsWriteVersionStatus(hostVersion) === "blocked") {
+    throw new Error("WPS 宿主版本已变化或不在当前写入范围，未执行写入。");
+  }
+  if (confirmationSnapshot(prepared) !== prepared.confirmationSnapshot) {
+    throw new Error("写入计划或预览已变化，请重新预览并确认后再执行。");
+  }
+  prepared.plan.actions.forEach((action) => {
+    if (!supportedAction(action)) throw new Error(`WPS 当前不执行「${action.type}」。`);
+    assertAllowedAction(action);
+  });
   const workbook = application.ActiveWorkbook;
   if (!workbook || workbook.ReadOnly !== false) throw new Error("当前 WPS 工作簿已不再处于可编辑状态。");
-  onProgress?.({ stage: "snapshot", message: "正在保存执行前恢复点…" });
+  for (const source of prepared.sources) {
+    const authorized = prepared.authorization.sheets.find((sheet) => sheet.index === source.sheetIndex);
+    if (!authorized || authorized.name !== source.sheetName) {
+      throw new Error(`源工作表「${source.sheetName}」不在预览时的授权范围，请重新预览。`);
+    }
+    const sheet = assertWpsAuthorization(application, prepared.authorization, authorized);
+    const current = readMatrices(rangeFor(sheet, source.range), source.rowCount, source.columnCount);
+    if (current.fingerprint !== source.previewFingerprint) {
+      throw new Error(`源区域「${source.sheetName}!${source.range}」在预览后发生变化，请重新预览并确认。`);
+    }
+  }
+  onProgress?.({
+    stage: "snapshot",
+    message: "正在保存执行前恢复点…",
+    actionCount: prepared.actions.length,
+    cellCount: prepared.totalCells
+  });
   const storedActions: StoredAction[] = prepared.actions.map((action) => {
     const authorized = prepared.authorization.sheets.find((sheet) => sheet.index === action.sheetIndex);
     if (!authorized) throw new Error(`工作表「${action.sheetName}」已不在授权范围内。`);
@@ -345,6 +538,9 @@ export async function executeWpsPlan(
     if (range.MergeCells !== false) throw new Error(`区域「${action.sheetName}!${action.range}」的合并状态已变化，未执行写入。`);
     if (range.Formula === undefined) throw new Error(`区域「${action.sheetName}!${action.range}」无法保存恢复快照。`);
     const before = readMatrices(range, action.rowCount, action.columnCount);
+    if (before.fingerprint !== action.previewFingerprint) {
+      throw new Error(`区域「${action.sheetName}!${action.range}」在预览后发生变化，请重新预览并确认。`);
+    }
     return {
       ...action,
       beforeValues: before.values,
@@ -355,7 +551,7 @@ export async function executeWpsPlan(
     };
   });
   const record: WpsUndoRecord = {
-    version: 1,
+    version: 2,
     executionId: randomId(),
     planId: prepared.plan.id,
     planTitle: prepared.plan.title,
@@ -381,20 +577,52 @@ export async function executeWpsPlan(
         const rows = Math.min(capabilities.wpsWrite.chunkRows, action.rowCount - offset);
         onProgress?.({
           stage: "writing",
-          message: `正在写入「${action.sheetName}!${rangeAddress(action.rect, offset, rows)}」…`
+          message: `正在写入「${action.sheetName}!${rangeAddress(action.rect, offset, rows)}」…`,
+          actionIndex: action.actionIndex,
+          actionType: action.type,
+          sheetName: action.sheetName,
+          range: action.range,
+          completedRows: offset,
+          totalRows: action.rowCount,
+          actionCount: record.actions.length,
+          cellCount: action.cellCount
         });
         const chunk = rangeFor(sheet, rangeAddress(action.rect, offset, rows));
-        setRangeValues(chunk, action.values.slice(offset, offset + rows));
+        const chunkValues = action.values.slice(offset, offset + rows);
+        if (action.type === "writeFormulas") setRangeFormulas(chunk, chunkValues);
+        else setRangeValues(chunk, chunkValues);
         action.appliedRows = offset + rows;
         const afterChunk = readMatrices(rangeFor(sheet, action.range), action.rowCount, action.columnCount);
         action.afterFingerprint = afterChunk.fingerprint;
         upsertRecord(application, record);
+        onProgress?.({
+          stage: "writing",
+          message: `已写入「${action.sheetName}!${rangeAddress(action.rect, offset, rows)}」`,
+          actionIndex: action.actionIndex,
+          actionType: action.type,
+          sheetName: action.sheetName,
+          range: action.range,
+          completedRows: action.appliedRows,
+          totalRows: action.rowCount,
+          actionCount: record.actions.length,
+          cellCount: action.cellCount
+        });
         await yieldControl();
       }
-      onProgress?.({ stage: "verifying", message: `正在回读核对「${action.sheetName}!${action.range}」…` });
+      onProgress?.({
+        stage: "verifying",
+        message: `正在回读核对「${action.sheetName}!${action.range}」…`,
+        actionIndex: action.actionIndex,
+        actionType: action.type,
+        sheetName: action.sheetName,
+        range: action.range,
+        actionCount: record.actions.length,
+        cellCount: action.cellCount
+      });
       const after = readMatrices(rangeFor(sheet, action.range), action.rowCount, action.columnCount);
       action.afterFingerprint = after.fingerprint;
-      if (!matricesEqual(after.values, action.values)) {
+      const observed = action.type === "writeFormulas" ? after.formulas : after.values;
+      if (!matricesEqual(observed, action.values)) {
         throw new Error(`区域「${action.sheetName}!${action.range}」回读结果与计划不一致。`);
       }
       upsertRecord(application, record);
@@ -451,7 +679,16 @@ export async function undoWpsExecution(
     if (sheet.ProtectContents !== false) throw new Error(`工作表「${action.sheetName}」已被保护，无法撤销。`);
     const target = rangeFor(sheet, action.range);
     if (target.MergeCells !== false) throw new Error(`区域「${action.sheetName}!${action.range}」的合并状态已变化，无法撤销。`);
-    const current = readMatrices(target, action.rowCount, action.columnCount);
+    const current = readMatrices(target, action.rowCount, action.columnCount, record.version);
+    if (record.version === 1 && (
+      hasAmbiguousLogicalCell(action.beforeValues, action.beforeFormulas) ||
+      hasAmbiguousLogicalCell(current.values, current.formulas)
+    )) {
+      record.state = "undo_conflict";
+      record.error = `旧版恢复点无法区分区域「${action.sheetName}!${action.range}」的空字符串与空单元格，已保留恢复资料并拒绝自动覆盖。`;
+      upsertRecord(application, record);
+      throw new Error(record.error);
+    }
     if (!action.afterFingerprint || current.fingerprint !== action.afterFingerprint) {
       record.state = "undo_conflict";
       record.error = `区域「${action.sheetName}!${action.range}」在执行后又被修改，不能自动覆盖。`;
@@ -464,10 +701,19 @@ export async function undoWpsExecution(
   upsertRecord(application, record);
   for (const action of [...record.actions].reverse()) {
     if (action.appliedRows === 0) continue;
-    onProgress?.({ stage: "undoing", message: `正在恢复「${action.sheetName}!${action.range}」…` });
+    onProgress?.({
+      stage: "undoing",
+      message: `正在恢复「${action.sheetName}!${action.range}」…`,
+      actionIndex: action.actionIndex,
+      actionType: action.type,
+      sheetName: action.sheetName,
+      range: action.range,
+      actionCount: record.actions.length,
+      cellCount: action.cellCount
+    });
     const sheet = getStoredSheet(application, record, action);
     setRangeFormulas(rangeFor(sheet, action.range), restorationMatrix(action));
-    const restored = readMatrices(rangeFor(sheet, action.range), action.rowCount, action.columnCount);
+    const restored = readMatrices(rangeFor(sheet, action.range), action.rowCount, action.columnCount, record.version);
     if (restored.fingerprint !== action.beforeFingerprint) {
       record.state = "undo_conflict";
       record.error = `区域「${action.sheetName}!${action.range}」恢复后校验失败。`;

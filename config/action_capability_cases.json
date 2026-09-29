@@ -1,0 +1,121 @@
+{
+  "_comment": "宿主 × 版本 × 动作 能力上界与交集的跨语言共享夹具。packages/core/src/actionCapability.test.ts 与 server/tests/test_action_capability_shared_cases.py 各自加载，断言同一批值。与 config/column_mapping_cases.json 同一形态：只共享『输入 → 期望输出/期望错误种类』，不共享文案。",
+  "matrix": {
+    "excel-office": {
+      "versions": {
+        "16.0": {
+          "writeValues": { "state": "supported" },
+          "createChart": { "state": "supported" }
+        }
+      }
+    },
+    "wps-et": {
+      "versions": {
+        "12.0": {
+          "writeValues": { "state": "supported" },
+          "writeFormulas": { "state": "unverified", "reason": "未实机验收" },
+          "clearRange:contents": { "state": "supported" },
+          "createChart": { "state": "unsupported", "reason": "宿主无对应 API 证据" }
+        }
+      }
+    },
+    "folder": {
+      "enabled": false,
+      "versions": {
+        "1.0": { "writeValues": { "state": "supported" } }
+      }
+    }
+  },
+  "versionPrefixCases": [
+    { "version": "12.0", "prefix": "12.0", "expected": true },
+    { "version": "12.0.1.28488", "prefix": "12.0", "expected": true },
+    { "version": "12.01", "prefix": "12.0", "expected": false },
+    { "version": "16.0.18025.20000", "prefix": "16", "expected": true },
+    { "version": "16.0", "prefix": "16.0", "expected": true },
+    { "version": "16.00", "prefix": "16.0", "expected": false }
+  ],
+  "hostIdCases": [
+    { "input": "excel-office", "expected": "excel-office" },
+    { "input": "WPS-ET", "expected": "wps-et" },
+    { "input": " wps-et ", "expected": "wps-et" },
+    { "input": "folder", "expected": "folder" },
+    { "input": "excel", "expected": null },
+    { "input": "wps", "expected": null },
+    { "input": "", "expected": null },
+    { "input": null, "expected": null }
+  ],
+  "boundCases": [
+    { "hostId": "wps-et", "hostVersion": "12.0", "expectedActions": ["writeValues", "writeFormulas", "clearRange:contents", "createChart"] },
+    { "hostId": "wps-et", "hostVersion": "12.1", "expectedActions": [] },
+    { "hostId": "wps-et", "hostVersion": null, "expectedActions": [] },
+    { "hostId": "excel-office", "hostVersion": "16.0.18025.20000", "expectedActions": ["writeValues", "createChart"] },
+    { "hostId": "folder", "hostVersion": "1.0", "expectedActions": [] },
+    { "hostId": "unknown-host", "hostVersion": "12.0", "expectedActions": [] }
+  ],
+  "intersectionCases": [
+    {
+      "name": "unverified 动作即便自报也不放开",
+      "hostId": "wps-et",
+      "hostVersion": "12.0",
+      "claimed": ["writeValues", "writeFormulas"],
+      "expectedAllowed": ["writeValues"]
+    },
+    {
+      "name": "unsupported 动作即便自报也不放开",
+      "hostId": "wps-et",
+      "hostVersion": "12.0",
+      "claimed": ["createChart"],
+      "expectedAllowed": []
+    },
+    {
+      "name": "自报为空得到空集，不是全放开",
+      "hostId": "wps-et",
+      "hostVersion": "12.0",
+      "claimed": [],
+      "expectedAllowed": []
+    },
+    {
+      "name": "自报缺失得到空集",
+      "hostId": "wps-et",
+      "hostVersion": "12.0",
+      "claimed": null,
+      "expectedAllowed": []
+    },
+    {
+      "name": "自报含上界之外的动作时被丢弃",
+      "hostId": "wps-et",
+      "hostVersion": "12.0",
+      "claimed": ["writeValues", "createPivotTable", "addImage", "deleteWorksheet"],
+      "expectedAllowed": ["writeValues"]
+    },
+    {
+      "name": "clearRange 变体按精确键匹配",
+      "hostId": "wps-et",
+      "hostVersion": "12.0",
+      "claimed": ["clearRange:contents", "clearRange:formats", "clearRange"],
+      "expectedAllowed": ["clearRange:contents"]
+    },
+    {
+      "name": "未知宿主得到空集",
+      "hostId": "office-online",
+      "hostVersion": "12.0",
+      "claimed": ["writeValues"],
+      "expectedAllowed": []
+    },
+    {
+      "name": "excel 通道上界与自报求交",
+      "hostId": "excel-office",
+      "hostVersion": "16.0.18025.20000",
+      "claimed": ["writeValues", "createChart", "setFill"],
+      "expectedAllowed": ["writeValues", "createChart"]
+    }
+  ],
+  "actionKeyCases": [
+    { "actionType": "clearRange", "variant": "contents", "expected": true },
+    { "actionType": "clearRange", "variant": "formats", "expected": false },
+    { "actionType": "clearRange", "variant": "all", "expected": false },
+    { "actionType": "clearRange", "variant": "hyperlinks", "expected": false },
+    { "actionType": "writeValues", "variant": null, "expected": true },
+    { "actionType": "writeFormulas", "variant": null, "expected": false }
+  ]
+}

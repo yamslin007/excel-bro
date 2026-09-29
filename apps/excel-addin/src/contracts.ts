@@ -773,6 +773,17 @@ export interface PlanRequest {
   dataResults?: DataToolResult[];
   planningReadPolicy?: "ifNeeded" | "none";
   modelId?: string | null;
+  /**
+   * 规划前能力收窄（方案 §4.3）。**这些字段不是授权凭据**：
+   * 服务端按 `hostCapabilities` 算该宿主/版本的动作上界，
+   * 只把 `selfReportedActions` 当收窄条件用（交集 `A ∩ B ⊆ A`）。
+   * 客户端多报不会放开任何动作，少报只会减少自己的功能。
+   *
+   * 未声明 `hostId` 的调用方保持原行为，动作边界由各通道后续校验负责。
+   */
+  hostId?: "excel-office" | "wps-et" | "folder" | null;
+  hostVersion?: string | null;
+  selfReportedActions?: string[];
 }
 
 export function assertIntentCheckResponse(
@@ -1221,6 +1232,35 @@ export function assertOfficeExecutionState(
   }
 }
 
+/**
+ * 与 `server/app/models.py: ColumnMappingPair` 同形。
+ *
+ * 用 `source` / `target` 而不是模型工具参数里的 `from` / `to`：服务端那侧若给
+ * `from` 设别名，别名只在 `by_alias=True` 的序列化路径上出现，而 SSE 路径用的是
+ * 裸 `model_dump`，两条路径会吐出不同的键名，其中一条上的契约校验会静默失败。
+ */
+export interface ColumnMappingPair {
+  source: string;
+  target: string;
+}
+
+/**
+ * 列映射的**规则**，不含任何单元格值。
+ *
+ * 源值不在服务端时（`planningReadPolicy: "none"`），服务端下发规则，
+ * 客户端调 `@excel-bro/core` 的 `buildColumnMappingActions` 就地算出写入计划。
+ * 刻意不带 `values`：单射映射可逆，上传标签列等于上传源列。
+ */
+export interface ColumnMappingRule {
+  kind: "columnMapping";
+  sourceSheet: string;
+  targetSheet: string;
+  sourceRange: string;
+  targetRange: string;
+  mapping: ColumnMappingPair[];
+  blankLabel: string;
+}
+
 export type AssistantResponse =
   | {
       kind: "answer";
@@ -1232,6 +1272,15 @@ export type AssistantResponse =
   | {
       kind: "plan";
       plan: AnalysisPlan;
+      provider: "model" | "local";
+      turnId?: string | null;
+    }
+  | {
+      kind: "local_plan_rule";
+      rule: ColumnMappingRule;
+      summary: string;
+      warnings: string[];
+      assumptions: string[];
       provider: "model" | "local";
       turnId?: string | null;
     };
@@ -1470,10 +1519,59 @@ export function assertAssistantResponse(
     return;
   }
 
+  if (response.kind === "local_plan_rule") {
+    assertColumnMappingRule(response.rule);
+    if (typeof response.summary !== "string" || !response.summary.trim()) {
+      throw new Error("服务返回的本地计算规则缺少 summary");
+    }
+    return;
+  }
+
   if (response.kind !== "plan") {
     throw new Error("服务返回了未知响应类型");
   }
   assertEditablePlan(response.plan);
+}
+
+/**
+ * 校验列映射规则。**不校验区域是否在已授权范围内** —— 那要读宿主，
+ * 属于客户端执行前的授权闸，不是契约层的事。
+ */
+export function assertColumnMappingRule(
+  value: unknown
+): asserts value is ColumnMappingRule {
+  if (!value || typeof value !== "object") {
+    throw new Error("服务返回的映射规则不是有效对象");
+  }
+  const rule = value as Partial<ColumnMappingRule>;
+  if (rule.kind !== "columnMapping") {
+    throw new Error("服务返回了未知的本地计算规则类型");
+  }
+  for (const field of [
+    "sourceSheet",
+    "targetSheet",
+    "sourceRange",
+    "targetRange",
+    "blankLabel"
+  ] as const) {
+    if (typeof rule[field] !== "string" || !rule[field]!.trim()) {
+      throw new Error(`服务返回的映射规则缺少 ${field}`);
+    }
+  }
+  if (!Array.isArray(rule.mapping) || rule.mapping.length === 0) {
+    throw new Error("服务返回的映射规则没有任何映射项");
+  }
+  for (const pair of rule.mapping) {
+    // source 可以是空串（"区分空串与真空格"的合法意图）；target 不行。
+    if (
+      !pair ||
+      typeof pair.source !== "string" ||
+      typeof pair.target !== "string" ||
+      !pair.target.trim()
+    ) {
+      throw new Error("服务返回的映射项不是一对非空字符串");
+    }
+  }
 }
 
 export function assertPlanningPauseResult(

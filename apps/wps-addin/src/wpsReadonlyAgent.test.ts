@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import type { PlanRequest } from "../../excel-addin/src/contracts";
 import type { WpsApplication, WpsRange, WpsWorksheet } from "./wpsHost";
 import { buildWpsReadonlyContexts, runWpsReadonlyTurn } from "./wpsReadonlyAgent";
 import type { WpsSheetReadResult } from "./wpsWorkbookReader";
@@ -146,6 +147,102 @@ describe("WPS readonly agent", () => {
       kind: "plan",
       plan: expect.objectContaining({ id: "p1" })
     }));
+  });
+
+  describe("本地计算的列映射规则", () => {
+    const mappingRule = {
+      kind: "columnMapping" as const,
+      sourceSheet: "明细",
+      targetSheet: "明细",
+      sourceRange: "A2:A3",
+      targetRange: "C2:C3",
+      mapping: [
+        { source: "甲", target: "一号" },
+        { source: "乙", target: "二号" }
+      ],
+      blankLabel: "未分类"
+    };
+
+    function ruleResponse() {
+      return {
+        kind: "local_plan_rule" as const,
+        provider: "model" as const,
+        rule: mappingRule,
+        summary: "按 2 条映射规则写入。",
+        warnings: ["源区域之后再改动，目标列不会自动跟着变。"],
+        assumptions: ["源列空白按「未分类」处理。"]
+      };
+    }
+
+    async function run(overrides: Record<string, unknown> = {}) {
+      return runWpsReadonlyTurn(
+        {
+          application: makeApplication(),
+          selectedSheetIndexes: [1],
+          prompt: "把名称列翻译成编号"
+        },
+        {
+          checkIntent: vi.fn(async () => ({
+            kind: "proceed" as const,
+            summary: "列映射",
+            confirmedPrompt: "把名称列翻译成编号",
+            provider: "model" as const
+          })),
+          executeQuery: vi.fn(),
+          createAssistantResponse: vi.fn(async () => ruleResponse()),
+          readSchemas: vi.fn(async () => [readResult]),
+          readSheets: vi.fn(async () => [readResult]),
+          ...overrides
+        } as never
+      );
+    }
+
+    it("在本端算出目标矩阵并产出计划", async () => {
+      const result = await run();
+      if (result.kind !== "plan") throw new Error(`期望计划，得到 ${result.kind}`);
+      const action = result.plan.actions[0];
+      expect(action).toMatchObject({ type: "writeValues", sheet: "明细", range: "C2:C3" });
+      expect("values" in action ? action.values : null).toEqual([["一号"], ["二号"]]);
+      expect(result.plan.warnings).toEqual(ruleResponse().warnings);
+      expect(result.sourceSnapshots).toEqual([{
+        sheetName: "明细",
+        range: "A2:A3",
+        values: [["甲"], ["乙"]]
+      }]);
+    });
+
+    it("源值不上传：规划请求里既没有 dataRows 也没有算出的矩阵", async () => {
+      // 单射映射可逆 —— 标签列加映射表足以还原源列，回传等于上传源列。
+      const createAssistantResponse = vi.fn(async (request: PlanRequest) => {
+        void request;
+        return ruleResponse();
+      });
+      await run({ createAssistantResponse });
+      expect(createAssistantResponse).toHaveBeenCalledOnce();
+      const request = createAssistantResponse.mock.calls[0][0];
+      expect(request.workbook.worksheets[0].dataRows).toEqual([]);
+      expect(request.dataResults).toEqual([]);
+      expect(request.planningReadPolicy).toBe("none");
+      // 整个请求体里不应出现任何源值。
+      expect(JSON.stringify(request)).not.toContain("甲");
+    });
+
+    it("规则要读的表不在授权范围内时拒绝", async () => {
+      const outsideRule = {
+        ...ruleResponse(),
+        rule: { ...mappingRule, sourceSheet: "未授权" }
+      };
+      await expect(
+        run({ createAssistantResponse: vi.fn(async () => outsideRule) })
+      ).rejects.toThrow(/不在本次已授权的工作表里/);
+    });
+
+    it("只在这一支读取完整数据行", async () => {
+      // 规则分支必须自己去读源列：上面的 schema 扫描只取字段名。
+      const readSheets = vi.fn(async () => [readResult]);
+      await run({ readSheets });
+      expect(readSheets).toHaveBeenCalledOnce();
+    });
   });
 
   it("answers a greeting without reading full rows or invoking the planner", async () => {

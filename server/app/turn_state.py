@@ -11,6 +11,7 @@ from .capabilities import capability_int
 from .models import (
     AnswerResponse,
     IntentCheckResponse,
+    LocalPlanRuleResponse,
     PlanRequest,
     PlanResponse,
 )
@@ -37,7 +38,7 @@ class TurnState:
     stage: TurnStage
     updated_at: float
     completion_fingerprint: str | None = None
-    completion_response: AnswerResponse | PlanResponse | None = None
+    completion_response: AnswerResponse | PlanResponse | LocalPlanRuleResponse | None = None
     completion_lock: asyncio.Lock = field(
         default_factory=asyncio.Lock,
         repr=False,
@@ -96,7 +97,7 @@ class TurnRegistry:
 
     def cached_completion(
         self, turn_id: str, request: PlanRequest
-    ) -> AnswerResponse | PlanResponse | None:
+    ) -> AnswerResponse | PlanResponse | LocalPlanRuleResponse | None:
         state = self.touch(turn_id)
         if state.stage != "completed":
             return None
@@ -126,7 +127,7 @@ class TurnRegistry:
         self,
         turn_id: str,
         request: PlanRequest,
-        response: AnswerResponse | PlanResponse,
+        response: AnswerResponse | PlanResponse | LocalPlanRuleResponse,
     ) -> None:
         state = self.touch(turn_id)
         state.stage = "completed"

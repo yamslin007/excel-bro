@@ -1982,6 +1982,22 @@ class PlanRequest(BaseModel):
         str,
         StringConstraints(strip_whitespace=True, max_length=200),
     ] | None = None
+    # 规划前能力收窄（方案 §4.3）。**这些字段不是授权凭据**：
+    # 服务端按 `hostCapabilities` 算出该宿主/版本的动作上界，
+    # 只把 `selfReportedActions` 当收窄条件用（交集 `A ∩ B ⊆ A`）。
+    # 客户端自报集合不能被当成权威，否则构造过的请求就能让规划器
+    # 生成本不该开放的动作。
+    hostId: Annotated[
+        str,
+        StringConstraints(strip_whitespace=True, max_length=40),
+    ] | None = None
+    hostVersion: Annotated[
+        str,
+        StringConstraints(strip_whitespace=True, max_length=80),
+    ] | None = None
+    selfReportedActions: list[
+        Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=80)]
+    ] = Field(default_factory=list, max_length=200)
 
 
 class PlanningContinueRequest(BaseModel):
@@ -2090,6 +2106,62 @@ class OfficeExecutionStateResponse(BaseModel):
     ownerToken: str | None = None
 
 
+class ColumnMappingPair(BaseModel):
+    """映射表的一项。字段名 `source` / `target`，**不设 `from` / `to` 别名**。
+
+    模型侧的工具参数用的是 `{from, to}`（`from` 在 Python 是关键字，只能靠别名），
+    但**响应模型不跟着用**：别名只在 `by_alias=True` 时才出现在 JSON 里，而本仓库
+    有两条序列化路径 —— `response_model`（FastAPI 默认带 by_alias）与 SSE 里的
+    裸 `model_dump(mode="json")`（不带）。同一个模型在两条路径上吐出不同的键名，
+    客户端契约校验会在其中一条上静默失败。去掉别名让两条路径必然一致。
+
+    `source` 允许空串：把 "" 写进映射表是"区分空串与真空格"的合法意图
+    （`column_mapping.py` 的显式项优先于空白策略）。`target` 不允许 —— 空标签
+    写下去与"未写入"在回读侧不可区分。
+    """
+
+    source: str = Field(max_length=500)
+    target: str = Field(min_length=1, max_length=500)
+
+
+class ColumnMappingRule(BaseModel):
+    """列映射的**规则**，不含任何单元格值。
+
+    源值不在服务端时（`planningReadPolicy == "none"`），服务端把规则原样下发，
+    由客户端调 `packages/core` 的 `buildColumnMappingActions` 就地算出写入计划。
+    两侧算出的值必然相同，由 `config/column_mapping_cases.json` 锁住。
+
+    这里刻意不带 `values`：带了就等于把映射结果上传，而单射映射可逆
+    —— 标签列加映射表足以还原源列，那与"客户端不上传单元格值"是冲突的。
+    """
+
+    kind: Literal["columnMapping"] = "columnMapping"
+    sourceSheet: str = Field(min_length=1, max_length=200)
+    targetSheet: str = Field(min_length=1, max_length=200)
+    sourceRange: str = Field(min_length=2, max_length=50)
+    targetRange: str = Field(min_length=2, max_length=50)
+    # 保持 [{from,to}] 列表形态而不折成 dict：与模型侧的工具 schema 同形，
+    # 且重复键在这一层仍可见（折成 dict 会静默丢掉后者）。
+    mapping: list[ColumnMappingPair] = Field(min_length=1, max_length=500)
+    blankLabel: str = Field(min_length=1, max_length=100)
+
+
+class LocalPlanRuleResponse(BaseModel):
+    """"客户端自己算"的响应：服务端只给规则，不给值。
+
+    不伪装成 `PlanResponse`：它没有可执行的 `actions`，塞个占位动作会让
+    审批 UI 展示一份并不成立的计划。第三种类型是诚实的形状。
+    """
+
+    kind: Literal["local_plan_rule"] = "local_plan_rule"
+    rule: ColumnMappingRule
+    summary: str = Field(min_length=1, max_length=500)
+    warnings: list[str] = Field(default_factory=list, max_length=20)
+    assumptions: list[str] = Field(default_factory=list, max_length=20)
+    provider: Literal["model", "local"]
+    turnId: TurnId | None = None
+
+
 class PlanResponse(BaseModel):
     kind: Literal["plan"] = "plan"
     plan: AnalysisPlan
@@ -2106,7 +2178,7 @@ class AnswerResponse(BaseModel):
 
 
 AssistantResponse = Annotated[
-    PlanResponse | AnswerResponse,
+    PlanResponse | AnswerResponse | LocalPlanRuleResponse,
     Field(discriminator="kind"),
 ]
 
@@ -2206,6 +2278,7 @@ TurnResponse = Annotated[
     | IntentClarificationResponse
     | IntentToolResponse
     | PlanResponse
-    | AnswerResponse,
+    | AnswerResponse
+    | LocalPlanRuleResponse,
     Field(discriminator="kind"),
 ]

@@ -1,5 +1,6 @@
 import capabilities from "../../../config/capabilities.json";
 import type { WpsApplication, WpsWorkbook, WpsWorksheet } from "./wpsHost";
+import { wpsWriteVersionStatus, type WpsWriteVersionStatus } from "./wpsWriteVersionGate";
 
 export type WpsWriteCapabilityCheck = {
   id: string;
@@ -10,6 +11,7 @@ export type WpsWriteCapabilityCheck = {
 
 export type WpsWriteCapabilityProbe = {
   hostVersion: string | null;
+  versionStatus: WpsWriteVersionStatus;
   workbookName: string | null;
   selectedSheetCount: number;
   checks: WpsWriteCapabilityCheck[];
@@ -56,15 +58,18 @@ export function probeWpsWriteCapabilities(
 
   const fullName = String(workbook?.FullName ?? "").trim();
   const hostVersion = String(application.Version ?? "").trim();
-  const versionAllowed = capabilities.wpsWrite.verifiedVersionPrefixes.some((prefix) =>
-    hostVersion === prefix || hostVersion.startsWith(`${prefix}.`)
-  );
+  const versionStatus = wpsWriteVersionStatus(hostVersion);
+  const versionAllowed = versionStatus !== "blocked";
   add("workbook", "当前工作簿", Boolean(workbook), workbook ? "已连接" : "没有打开的工作簿");
   add(
     "hostVersion",
     "WPS 宿主版本",
     versionAllowed,
-    versionAllowed ? `已验证版本族 ${hostVersion}` : `当前版本 ${hostVersion || "未知"} 尚未加入写入白名单`
+    versionStatus === "verified"
+      ? `已验证 JSAPI 版本族 ${hostVersion}`
+      : versionStatus === "development"
+        ? `开发调试模式临时开放 JSAPI 版本 ${hostVersion}，仍需实机写入与撤销验收`
+        : `当前 JSAPI 版本 ${hostVersion || "未知"} 尚未开放写入`
   );
   add(
     "localXlsx",
@@ -116,6 +121,7 @@ export function probeWpsWriteCapabilities(
 
   return {
     hostVersion: hostVersion || null,
+    versionStatus,
     workbookName: workbook?.Name ? String(workbook.Name) : null,
     selectedSheetCount: selected?.length ?? 0,
     checks,

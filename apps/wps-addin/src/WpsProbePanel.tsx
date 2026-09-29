@@ -30,6 +30,7 @@ export default function WpsProbePanel() {
   const [selectedIndexes, setSelectedIndexes] = useState<number[]>([]);
   const [scopeOpen, setScopeOpen] = useState(false);
   const [scopeMode, setScopeMode] = useState<"auto" | "manual">("auto");
+  const [sheetSearch, setSheetSearch] = useState("");
 
   useEffect(() => {
     try {
@@ -137,6 +138,9 @@ export default function WpsProbePanel() {
   }
 
   const selectedSheets = metadata?.sheets.filter((sheet) => selectedIndexes.includes(sheet.index)) ?? [];
+  const filteredSheets = metadata?.sheets.filter((sheet) =>
+    sheet.name.toLocaleLowerCase().includes(sheetSearch.trim().toLocaleLowerCase())
+  ) ?? [];
   const scopeLabel = selectedSheets.length === 0
     ? "尚未选择工作表"
     : scopeMode === "auto" && selectedSheets.length === 1
@@ -190,8 +194,25 @@ export default function WpsProbePanel() {
             </div>
 
             {scopeMode === "manual" && (
-              <div className="sheet-picker-options wps-sheet-picker-options">
-                {metadata?.sheets.map((sheet) => (
+              <div className="wps-manual-sheet-picker">
+                <div className="wps-sheet-search-row">
+                  <input
+                    aria-label="搜索工作表"
+                    placeholder="搜索工作表…"
+                    value={sheetSearch}
+                    onChange={(event) => setSheetSearch(event.target.value)}
+                  />
+                  <span>已选 {selectedIndexes.length}/{metadata?.sheets.length ?? 0}</span>
+                </div>
+                <div className="sheet-picker-toolbar wps-sheet-picker-toolbar">
+                  <button type="button" disabled={filteredSheets.length === 0} onClick={() => {
+                    const visible = filteredSheets.map((sheet) => sheet.index);
+                    setSelectedIndexes((current) => [...new Set([...current, ...visible])]);
+                  }}>全选搜索结果</button>
+                  <button type="button" disabled={selectedIndexes.length === 0} onClick={() => setSelectedIndexes([])}>清空</button>
+                </div>
+                <div className="sheet-picker-options wps-sheet-picker-options">
+                {filteredSheets.map((sheet) => (
                   <button
                     type="button"
                     className={selectedIndexes.includes(sheet.index) ? "selected" : ""}
@@ -204,9 +225,13 @@ export default function WpsProbePanel() {
                     {sheet.isActive && <small>当前表</small>}
                   </button>
                 ))}
+                {filteredSheets.length === 0 && (
+                  <p className="authorization-empty">没有匹配的工作表。</p>
+                )}
                 {selectedIndexes.length === 0 && (
                   <p className="authorization-empty">尚未选择工作表，不会读取或修改任何数据。</p>
                 )}
+                </div>
               </div>
             )}
           </div>

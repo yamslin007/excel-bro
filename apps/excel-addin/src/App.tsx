@@ -105,6 +105,10 @@ import {
 } from "./imageAttachments";
 import { extractWorkbookDataPeriod, workbookFolderFromDocumentUrl } from "./workbookIdentity";
 import {
+  currentOfficeHostVersion,
+  officeHostRequestFields
+} from "./officeHostAdapter";
+import {
   evaluateBulkWorksheetDeletion,
   parseBulkWorksheetDeletion
 } from "./structuralIntent";
@@ -141,6 +145,7 @@ import ThemePanel from "./components/ThemePanel";
 import TaskProgressTimeline from "./components/TaskProgressTimeline";
 import { FolderBackupManager } from "./components/FolderBackupManager";
 import { ScopeSelectionGuidance } from "./components/ScopeSelectionGuidance";
+import HistoryStorageNotice from "./components/HistoryStorageNotice";
 import {
   shouldShowWorkDirectoryGuide,
   WorkDirectoryGuide
@@ -151,7 +156,11 @@ import { chooseAvailableModel, connectionModelSuffix, isRealModelId } from "./mo
 import { useActivityProgress, type ActivityLog, type ActivityProgress } from "./hooks/useActivityProgress";
 import { useMessageAutoFollow } from "./hooks/useMessageAutoFollow";
 import { useConversation } from "./hooks/useConversation";
-import { canAcknowledgeStaleSource } from "./conversation";
+import {
+  canAcknowledgeStaleSource,
+  redactHistoryCredentials,
+  remainingLegacyCredentialConversationIds
+} from "./conversation";
 import {
   insertChatMessage,
   persistActivityMessage
@@ -214,10 +223,7 @@ function animatePet(className: string, duration = 800): void {
 }
 
 const CHAT_STORAGE_KEY = "excel-bro.chat.v4";
-const LEGACY_CHAT_STORAGE_KEY = "excel-bro.chat.v3";
 const MODEL_CONFIG_HELP_SHOWN_KEY = "ebModelConfigHelpShown";
-const MAX_STORED_CONVERSATIONS =
-  capabilities.conversation.maxStoredConversations;
 const MAX_MESSAGES_PER_CONVERSATION =
   capabilities.conversation.maxMessagesPerConversation;
 const PERSISTED_MESSAGES_PER_CONVERSATION =
@@ -268,20 +274,8 @@ function folderExecutionOutcomeText(
   }`;
 }
 
-export function normalizeStoredVerification(
-  report: VerificationReport | undefined
-): VerificationReport | undefined {
-  if (!report) return undefined;
-  return {
-    ...report,
-    status:
-      report.status ??
-      (report.passed ? "verified" : "failed"),
-    unverifiedActions: Array.isArray(report.unverifiedActions)
-      ? report.unverifiedActions
-      : []
-  };
-}
+// 历史归一化（normalizeStoredVerification 等）已收敛到 ./conversation.ts，
+// 由两端加载项共用；这里不再保留副本。
 
 // isAbortError：区分「用户主动打断」和真正的错误。fetch 被 abort 时抛 AbortError，
 // 本地工具取消抛 DataToolExecutionError(code=CANCELLED)。这两种都不该弹错误提示。
@@ -560,16 +554,6 @@ export function normalizeIntentKey(
   });
 }
 
-function welcomeMessage(): ChatMessage {
-  return {
-    id: messageId(),
-    role: "assistant",
-    text:
-      "你好。直接告诉我你想查询、分析或修改什么；涉及写入时，我会先给你预览。",
-    createdAt: new Date().toISOString()
-  };
-}
-
 function conversationTitle(messages: ChatMessage[]): string {
   const firstUserMessage = messages.find(
     (message) => message.role === "user" && message.text?.trim()
@@ -579,148 +563,10 @@ function conversationTitle(messages: ChatMessage[]): string {
   return compact.length > 34 ? `${compact.slice(0, 34)}...` : compact;
 }
 
-function createConversation(messages = [welcomeMessage()]): ChatConversation {
-  const now = new Date().toISOString();
-  return {
-    id: messageId(),
-    title: conversationTitle(messages),
-    messages,
-    createdAt: now,
-    updatedAt: now
-  };
-}
+// 对话历史的纯函数（loadChatHistory / deleteConversationFromHistory / createConversation /
+// welcomeMessage 等）已统一收敛到 ./conversation.ts，两端加载项共用同一份实现。
+// 这里不再保留副本 —— 两份实现会让"读取时是否脱敏"这种安全语义在不同入口上分叉。
 
-export function deleteConversationFromHistory(
-  current: ChatHistoryState,
-  conversationId: string
-): ChatHistoryState {
-  const remaining = current.conversations.filter(
-    (conversation) => conversation.id !== conversationId
-  );
-  if (remaining.length === current.conversations.length) {
-    return current;
-  }
-  if (remaining.length === 0) {
-    const replacement = createConversation();
-    return {
-      activeConversationId: replacement.id,
-      conversations: [replacement]
-    };
-  }
-  return {
-    activeConversationId:
-      current.activeConversationId === conversationId
-        ? remaining[0].id
-        : current.activeConversationId,
-    conversations: remaining
-  };
-}
-
-function loadChatHistory(): ChatHistoryState {
-  try {
-    const stored = JSON.parse(
-      localStorage.getItem(CHAT_STORAGE_KEY) ?? "null"
-    ) as Partial<ChatHistoryState> | null;
-    if (
-      stored &&
-      typeof stored.activeConversationId === "string" &&
-      Array.isArray(stored.conversations) &&
-      stored.conversations.length > 0
-    ) {
-      const conversations = stored.conversations
-        .filter(
-          (conversation): conversation is ChatConversation =>
-            Boolean(
-              conversation &&
-                typeof conversation.id === "string" &&
-                Array.isArray(conversation.messages)
-            )
-        )
-        .map((conversation) => {
-          const now = new Date().toISOString();
-          return {
-            ...conversation,
-            messages: conversation.messages
-              .filter(
-                (message) =>
-                  !message.activityPending ||
-                  Boolean(message.activityLog?.steps.length)
-              )
-              .map((message) => {
-              const normalizedMessage = {
-                ...message,
-                verification: normalizeStoredVerification(
-                  message.verification
-                )
-              };
-              return message.clarification
-                ? {
-                    ...normalizedMessage,
-                    clarification: {
-                      ...message.clarification,
-                      round:
-                        typeof message.clarification.round === "number"
-                          ? message.clarification.round
-                          : 0,
-                      status:
-                        message.clarification.status === "resolving"
-                          ? "pending"
-                          : message.clarification.status
-                    }
-                  }
-                : normalizedMessage;
-              }),
-            title:
-              typeof conversation.title === "string"
-                ? conversation.title
-                : conversationTitle(conversation.messages),
-            createdAt:
-              typeof conversation.createdAt === "string"
-                ? conversation.createdAt
-                : now,
-            updatedAt:
-              typeof conversation.updatedAt === "string"
-                ? conversation.updatedAt
-                : now
-          };
-        });
-      if (conversations.length > 0) {
-        return {
-          activeConversationId: conversations.some(
-            (conversation) =>
-              conversation.id === stored.activeConversationId
-          )
-            ? stored.activeConversationId
-            : conversations[0].id,
-          conversations
-        };
-      }
-    }
-  } catch {
-    // Fall through to legacy migration.
-  }
-
-  try {
-    const legacy = JSON.parse(
-      localStorage.getItem(LEGACY_CHAT_STORAGE_KEY) ?? "[]"
-    );
-    const conversation = createConversation(
-      Array.isArray(legacy) && legacy.length > 0
-        ? (legacy as ChatMessage[])
-        : [welcomeMessage()]
-    );
-    return {
-      activeConversationId: conversation.id,
-      conversations: [conversation]
-    };
-  } catch {
-    const conversation = createConversation();
-    return {
-      activeConversationId: conversation.id,
-      conversations: [conversation]
-    };
-  }
-}
 
 function actionLabel(action: AnalysisPlan["actions"][number]): string {
   switch (action.type) {
@@ -825,6 +671,8 @@ export default function App() {
     chatHistory,
     activeConversation,
     messages,
+    staleCredentials,
+    historyStorageStatus,
     pendingDeleteConversationId: pendingDeleteConvId,
     setMessages,
     newChat,
@@ -1472,28 +1320,68 @@ export default function App() {
     );
   }, [folderCatalog]);
 
+  // 记录"对话历史写不进本地存储"是否已经提示过，避免每次状态变化都重复追加。
+  const storageWriteFailedRef = useRef(false);
+
   useEffect(() => {
-    try {
-      localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(chatHistory));
-    } catch {
-      const compact: ChatHistoryState = {
-        activeConversationId: chatHistory.activeConversationId,
-        conversations: chatHistory.conversations
-          .slice(0, 8)
-          .map((conversation) => ({
-            ...conversation,
-            messages: conversation.messages.slice(
-              -PERSISTED_MESSAGES_PER_CONVERSATION
-            )
-          }))
-      };
+    // 落盘收口。`legacyCredentialConversationIds` 必须跟着历史一起写下去：
+    // 它是"这条旧记录被脱敏过、需要新开会话"的持久标记，靠它才能在重开之后
+    // 继续拦住续聊。用"文本里还能不能匹配到凭据"当判据是不行的——读取路径已经
+    // 脱敏，重开后永远匹配不到，发送闸会不声不响地松开。
+    const persist = (history: ChatHistoryState) => {
       try {
-        localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(compact));
+        localStorage.setItem(
+          CHAT_STORAGE_KEY,
+          JSON.stringify(
+            redactHistoryCredentials({
+              ...history,
+              legacyCredentialConversationIds:
+                remainingLegacyCredentialConversationIds(history)
+            })
+          )
+        );
+        return true;
       } catch {
-        // The current in-memory conversation remains available.
+        return false;
       }
+    };
+    const compact: ChatHistoryState = {
+      activeConversationId: chatHistory.activeConversationId,
+      legacyCredentialConversationIds:
+        remainingLegacyCredentialConversationIds(chatHistory),
+      conversations: chatHistory.conversations
+        .slice(0, 8)
+        .map((conversation) => ({
+          ...conversation,
+          messages: conversation.messages.slice(
+            -PERSISTED_MESSAGES_PER_CONVERSATION
+          )
+        }))
+    };
+    if (!persist(chatHistory) && !persist(compact)) {
+      // 存储改写失败时，**不能**退回"把原文留在内存里照常渲染/发送"的做法。
+      // 内存里的历史在读入阶段已经脱敏过了，所以这里要做的不是"再脱一遍原文"
+      // （原文此刻已不存在），而是明确告知用户：当前会话没有写进本地存储，
+      // 关掉任务窗格后不会被保留。
+      //
+      // 用 ref 去重，避免每次 chatHistory 变化都追加一条同样的系统消息。
+      if (!storageWriteFailedRef.current) {
+        storageWriteFailedRef.current = true;
+        setMessages((current) => [
+          ...current,
+          {
+            id: messageId(),
+            role: "system" as const,
+            text:
+              "无法把对话历史写入本机存储（浏览器或宿主可能禁止了本地存储）。本次会话仍可继续，但关掉任务窗格后不会被保留。",
+            createdAt: new Date().toISOString()
+          }
+        ]);
+      }
+    } else {
+      storageWriteFailedRef.current = false;
     }
-  }, [chatHistory]);
+  }, [chatHistory, setMessages]);
 
   useEffect(
     () => () => {
@@ -2333,6 +2221,11 @@ export default function App() {
         planningResume: undefined
       }));
       return "completed";
+    }
+    if (response.kind === "local_plan_rule") {
+      // 只在 planningReadPolicy: "none" 下产生，本端两条通道都送 "ifNeeded"。
+      // 明确拒绝而不静默丢弃：真收到了说明契约走偏，要看得见。
+      throw new Error("服务返回了需要客户端本地计算的规则，本端不支持该模式。");
     }
     const plan: AnalysisPlan = {
       ...response.plan,
@@ -3335,7 +3228,9 @@ export default function App() {
           })),
           dataResults,
           planningReadPolicy,
-          modelId: effectiveModelId || null
+          modelId: effectiveModelId || null,
+          // 规划前能力收窄（方案 §4.3）：服务端按可信配置算上界，与本端自报求交。
+          ...officeHostRequestFields(isRunningInExcel(), currentOfficeHostVersion())
         },
         {
           signal: turnAbortRef.current?.signal,
@@ -3430,6 +3325,9 @@ export default function App() {
             querySourceSheetIds
           });
         }
+      } else if (response.kind === "local_plan_rule") {
+        // 同上：本端不送 planningReadPolicy: "none"，收到即契约走偏。
+        throw new Error("服务返回了需要客户端本地计算的规则，本端不支持该模式。");
       } else {
         const sourceFingerprint =
           sourceMode === "workbook" && isRunningInExcel()
@@ -4486,6 +4384,21 @@ export default function App() {
         ? "请结合附件图片分析当前工作簿，并说明发现的问题。"
         : "");
     if (!workbook || !text || text.length < 2 || busy) return;
+    // 续聊前的旧记录闸。这条历史在读取时就被脱敏过（真凭据不会进入界面、内存
+    // 或请求），同时被登记进 `legacyCredentialConversationIds`。判据是那个
+    // **持久标记**，不是"文本里还能不能匹配到凭据" —— 后者在脱敏那一刻就永远
+    // 不再成立，靠它做闸门会在重开之后自动松开（这正是上一版的缺陷）。
+    // 只查当前会话，别的历史不该挡住这次提问。
+    if (staleCredentials) {
+      appendMessage({
+        role: "system",
+        text:
+          "这段历史里的凭据是在旧版本写进去的，已被拦下，不会随本次提问发送。" +
+          "请点上方「新对话」开始一段干净的对话，或先删除这段历史。"
+      });
+      setPrompt(enteredText);
+      return;
+    }
     // /function 短链：绕开 planner（checkIntent/streamAssistantResponse），
     // 命中式单发生成原生公式 + 首格真实试算 + 预览卡。
     if (enteredText.startsWith("/function ")) {
@@ -8851,6 +8764,17 @@ export default function App() {
       )}
       </div>
 
+      {staleCredentials && (
+        <div className="stale-credentials-warning" role="alert">
+          <strong>这段历史来自旧版本，曾包含凭据</strong>
+          <span>
+            凭据已在读取时抹掉，界面里不会再显示原文。为避免把它当作正常历史
+            续聊，发送仍会被拦下；请点上方「新对话」开始一段干净的对话，或删掉
+            这段历史。
+          </span>
+        </div>
+      )}
+
       <footer className="composer">
         {showWorkDirectoryGuide && (
           <WorkDirectoryGuide
@@ -9372,6 +9296,14 @@ export default function App() {
           <b>{contextOpen ? "⌄" : "⌃"}</b>
         </button>
         </div>
+
+        {/*
+          对话历史的存储状态提示。四种形态由 `HistoryStorageNotice` 按状态给文案：
+          "保存失败 + 旧记录保留" / "未保存且无旧记录" / "已保存但旧键待清理" / 无提示。
+          不贴异常原文、不含任何历史内容。与"旧记录拦续聊"是两件事，所以不复用
+          上面的 staleCredentials 气泡：那条是针对当前会话能不能续聊。
+        */}
+        <HistoryStorageNotice status={historyStorageStatus} />
 
         <div
           className={`composer-input-region ${

@@ -1,6 +1,8 @@
 // 展示用的格式化纯函数（从 App.tsx 抽出）。
+// SavedTool 取自 core（L0）。原先从 ./storage 取是 L1→L2 反向边，
+// 这是 format.ts 迟迟不能迁入 core 的唯一阻塞点。
+import type { SavedTool } from "@excel-bro/core/tools";
 import type { AnalysisPlan, VerificationReport } from "./contracts";
-import type { SavedTool } from "./storage";
 
 // 生成耗时格式化：<1s 显示毫秒，否则显示秒（保留一位小数）。
 export function formatGenerateMs(ms: number): string {
@@ -14,7 +16,7 @@ export function formatStepElapsed(ms: number): string {
 }
 
 // 工作流工具的展示归类：按动作类型给出标签 / 图标字 / 色板，用于工具箱卡片与说明页。
-export function workflowToolPresentation(tool: SavedTool): {
+export function workflowToolPresentation(tool: SavedTool<AnalysisPlan>): {
   label: string;
   glyph: string;
   tone: string;

@@ -17,6 +17,11 @@ import type {
   WorkbookSnapshot,
   WorksheetSnapshot
 } from "./contracts";
+import type { WorkbookLocator } from "@excel-bro/core/contracts";
+import {
+  locatorFromOfficeIdentity,
+  officeIdentityFromUrl
+} from "@excel-bro/core/locator";
 import capabilities from "../../../config/capabilities.json";
 import { detectSheetFields } from "./tableSchema";
 import {
@@ -3759,11 +3764,29 @@ function loadedRangePostFingerprint(range: Excel.Range): string {
   });
 }
 
+/**
+ * 出网身份字符串。归一规则已下沉到 core 的 `officeIdentityFromUrl`,
+ * 这里不再自行拼接 `url:` 前缀 —— 两份实现一旦漂移,已落盘账本里的旧记录
+ * 就会因身份对不上而失去续跑与撤销入口。
+ */
 export function currentOfficeWorkbookIdentity(): string | undefined {
+  const url = currentOfficeDocumentUrl();
+  if (url === undefined) return undefined;
+  return officeIdentityFromUrl(url) ?? undefined;
+}
+
+/** 共享层内部表示。折叠回字符串只在出网时发生（方案 §2.3 第 1 条）。 */
+export function currentOfficeWorkbookLocator(): WorkbookLocator | undefined {
+  const identity = currentOfficeWorkbookIdentity();
+  if (identity === undefined) return undefined;
+  return locatorFromOfficeIdentity(identity) ?? undefined;
+}
+
+function currentOfficeDocumentUrl(): string | undefined {
   if (typeof Office === "undefined") return undefined;
   const url = (Office as any).context?.document?.url;
   if (typeof url !== "string" || !url.trim()) return undefined;
-  return `url:${url.trim().replace(/\\/g, "/").toLocaleLowerCase()}`;
+  return url;
 }
 
 const OFFICE_RECOVERY_ACTION_TYPES = new Set<ExcelAction["type"]>([

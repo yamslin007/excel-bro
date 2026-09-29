@@ -1,0 +1,176 @@
+{
+  "//": "「捕获原点 + 值矩阵 + 请求区域 → 切片结果」的跨语言共享夹具（阶段 4 §24）。",
+  "//consumers": [
+    "server/tests/test_mapping_slice_shared_cases.py  → _snapshot_region",
+    "apps/wps-addin/src/wpsColumnMappingPlan.slice.test.ts → sliceMappingSource"
+  ],
+  "//schema": {
+    "sheet.startRow/startColumn": "值矩阵左上角在工作表里的 1 基行/列号（= 快照的已用区域原点）",
+    "sheet.columnCount": "宿主报告的**声明宽度**。列边界按它判定，不按各行实际长度",
+    "sheet.values": "值矩阵，允许各行长度不齐（读取侧会裁掉尾部空值）",
+    "sheet.truncated": "快照是否被截断。只影响提示文案，不影响判定",
+    "expected | error": "二者必须恰好给一个"
+  },
+  "cases": [
+    {
+      "name": "整块切出，行内缺项折成 null",
+      "sheet": {
+        "startRow": 1,
+        "startColumn": 1,
+        "columnCount": 3,
+        "values": [["单号", "类别", "归属"], ["X001", "办公用品"], ["X002"]],
+        "truncated": false
+      },
+      "range": "A1:C3",
+      "expected": [
+        ["单号", "类别", "归属"],
+        ["X001", "办公用品", null],
+        ["X002", null, null]
+      ]
+    },
+    {
+      "name": "单列切片",
+      "sheet": {
+        "startRow": 1,
+        "startColumn": 1,
+        "columnCount": 3,
+        "values": [["单号", "类别", "归属"], ["X001", "办公用品", null], ["X002", "电子设备", null]],
+        "truncated": false
+      },
+      "range": "B2:B3",
+      "expected": [["办公用品"], ["电子设备"]]
+    },
+    {
+      "name": "单格切片",
+      "sheet": {
+        "startRow": 1,
+        "startColumn": 1,
+        "columnCount": 2,
+        "values": [["单号", "类别"], ["X001", "办公用品"]],
+        "truncated": false
+      },
+      "range": "B2",
+      "expected": [["办公用品"]]
+    },
+    {
+      "name": "原点不在 A1 时按偏移切片",
+      "sheet": {
+        "startRow": 5,
+        "startColumn": 2,
+        "columnCount": 2,
+        "values": [["类别", "数量"], ["办公用品", 12], ["电子设备", 0]],
+        "truncated": false
+      },
+      "range": "B6:C7",
+      "expected": [["办公用品", 12], ["电子设备", 0]]
+    },
+    {
+      "name": "切片不改变值的类型：数字与布尔原样带出",
+      "sheet": {
+        "startRow": 1,
+        "startColumn": 1,
+        "columnCount": 2,
+        "values": [["数量", "已审"], [0, false], [3.5, true]],
+        "truncated": false
+      },
+      "range": "A2:B3",
+      "expected": [[0, false], [3.5, true]]
+    },
+    {
+      "name": "声明宽度大于实际行长：区域内缺项折成 null",
+      "sheet": {
+        "startRow": 1,
+        "startColumn": 1,
+        "columnCount": 4,
+        "values": [["类别", "归属"]],
+        "truncated": false
+      },
+      "range": "A1:D1",
+      "expected": [["类别", "归属", null, null]]
+    },
+    {
+      "name": "行超出已捕获范围：拒绝，不补 null",
+      "sheet": {
+        "startRow": 1,
+        "startColumn": 1,
+        "columnCount": 2,
+        "values": [["单号", "类别"], ["X001", "办公用品"]],
+        "truncated": false
+      },
+      "range": "B2:B50",
+      "error": "rowBeyondCaptured"
+    },
+    {
+      "name": "行超出且快照已截断：同样拒绝",
+      "sheet": {
+        "startRow": 1,
+        "startColumn": 1,
+        "columnCount": 2,
+        "values": [["单号", "类别"]],
+        "truncated": true
+      },
+      "range": "B1:B4",
+      "error": "rowBeyondCaptured"
+    },
+    {
+      "name": "行早于捕获原点：拒绝",
+      "sheet": {
+        "startRow": 5,
+        "startColumn": 1,
+        "columnCount": 2,
+        "values": [["类别", "数量"], ["办公用品", 1]],
+        "truncated": false
+      },
+      "range": "A4:A6",
+      "error": "rowBeforeOrigin"
+    },
+    {
+      "name": "列早于捕获原点：拒绝，不补 null",
+      "sheet": {
+        "startRow": 1,
+        "startColumn": 3,
+        "columnCount": 2,
+        "values": [["类别", "数量"], ["办公用品", 1]],
+        "truncated": false
+      },
+      "range": "B1:B2",
+      "error": "columnBeforeOrigin"
+    },
+    {
+      "name": "列超出声明宽度：拒绝，不补 null",
+      "sheet": {
+        "startRow": 1,
+        "startColumn": 1,
+        "columnCount": 2,
+        "values": [["单号", "类别"], ["X001", "办公用品"]],
+        "truncated": false
+      },
+      "range": "B1:D2",
+      "error": "columnBeyondCaptured"
+    },
+    {
+      "name": "整列地址无法解析",
+      "sheet": {
+        "startRow": 1,
+        "startColumn": 1,
+        "columnCount": 2,
+        "values": [["单号", "类别"], ["X001", "办公用品"]],
+        "truncated": false
+      },
+      "range": "B:B",
+      "error": "parse"
+    },
+    {
+      "name": "结束位置早于开始位置",
+      "sheet": {
+        "startRow": 1,
+        "startColumn": 1,
+        "columnCount": 3,
+        "values": [["单号", "类别", "归属"], ["X001", "办公用品", null]],
+        "truncated": false
+      },
+      "range": "C2:B1",
+      "error": "reversed"
+    }
+  ]
+}

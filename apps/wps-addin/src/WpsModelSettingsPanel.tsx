@@ -216,14 +216,8 @@ export default function WpsModelSettingsPanel({
 
   return (
     <>
-      <button
-        className="model-settings-backdrop"
-        type="button"
-        aria-label="关闭模型设置"
-        onClick={onClose}
-      />
-      <aside className="wps-model-settings" aria-label="模型设置">
-        <header className="wps-model-settings-header">
+      <aside className="wps-model-settings tool-drawer settings-drawer" aria-label="模型设置">
+        <header className="wps-model-settings-header tool-drawer-header">
           <div>
             <strong>模型设置</strong>
             <span>API Key 安全保存在这台电脑上</span>

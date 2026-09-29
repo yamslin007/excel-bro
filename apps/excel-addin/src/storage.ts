@@ -6,6 +6,17 @@ import {
   type ExcelAction,
   type WorkbookSnapshot
 } from "./contracts";
+import type {
+  FieldToolParameter,
+  OutputWorksheetToolParameter,
+  RangeToolParameter,
+  SavedTool as CoreSavedTool,
+  ToolEligibility,
+  ToolEligibilityIssue,
+  ToolParameter,
+  ToolRiskApproval,
+  WorksheetToolParameter
+} from "@excel-bro/core/tools";
 import capabilities from "../../../config/capabilities.json";
 
 const STORAGE_KEY = "excel-bro.tools.v2";
@@ -14,113 +25,25 @@ const LEGACY_AUTOMATION_STORAGE_KEY = "excel-bro.automations.v1";
 const TOOL_LIMIT = capabilities.savedTools.maxItems;
 const QUERY_TOOL_STORAGE_KEY = "excel-bro.query-tools.v1";
 
-interface ParameterBase {
-  id: string;
-  label: string;
-  defaultValue: string;
-  required: true;
-}
+// 工具 DTO 的权威定义已下沉到 packages/core/src/tools.ts（L0）。
+// 这里 import 后再导出，使现有导入点零改动；同时解除 format.ts（L1）对本文件（L2）的反向类型边。
+// 只写 `export type { X } from` 不会把名字引入本地作用域，而本文件内部大量引用这些类型。
+export type {
+  WorksheetToolParameter,
+  OutputWorksheetToolParameter,
+  FieldToolParameter,
+  RangeToolParameter,
+  ToolParameter,
+  ToolRiskApproval,
+  ToolEligibilityIssue,
+  ToolEligibility
+};
 
-export interface WorksheetToolParameter extends ParameterBase {
-  type: "worksheet";
-  bindings: Array<{
-    actionIndex: number;
-    property: "sheet" | "sourceSheet";
-  }>;
-}
-
-export interface OutputWorksheetToolParameter extends ParameterBase {
-  type: "outputWorksheet";
-  bindings: Array<{
-    actionIndex: number;
-    property: "sheet" | "sourceSheet";
-  }>;
-}
-
-export interface FieldToolParameter extends ParameterBase {
-  type: "field";
-  sourceParameterId: string;
-  bindings: Array<
-    | {
-        actionIndex: number;
-        property: "splitBy";
-      }
-    | {
-        actionIndex: number;
-        property: "groupBy";
-        itemIndex: number;
-      }
-    | {
-        actionIndex: number;
-        property: "metricField";
-        itemIndex: number;
-      }
-    | {
-        actionIndex: number;
-        property: "pivotRowField" | "pivotColumnField";
-        itemIndex: number;
-      }
-    | {
-        actionIndex: number;
-        property: "pivotValueField";
-        itemIndex: number;
-      }
-  >;
-}
-
-export interface RangeToolParameter extends ParameterBase {
-  type: "range";
-  sourceParameterId?: string;
-  bindings: Array<
-    | {
-        actionIndex: number;
-        property: "range";
-      }
-    | {
-        actionIndex: number;
-        property: "sourceRange";
-      }
-  >;
-}
-
-export type ToolParameter =
-  | WorksheetToolParameter
-  | OutputWorksheetToolParameter
-  | FieldToolParameter
-  | RangeToolParameter;
-
-export type ToolRiskApproval = "fixedContent" | "destructive";
-
-export interface ToolEligibilityIssue {
-  code:
-    | "FIXED_CONTENT"
-    | "DESTRUCTIVE_ACTION"
-    | "EMBEDDED_IMAGE"
-    | "SNAPSHOT_VERIFICATION";
-  severity: "approval" | "blocked" | "warning";
-  message: string;
-  actionIndexes: number[];
-  approval?: ToolRiskApproval;
-}
-
-export interface ToolEligibility {
-  issues: ToolEligibilityIssue[];
-  requiredApprovals: ToolRiskApproval[];
-  blocked: boolean;
-}
-
-export interface SavedTool {
-  id: string;
-  version: 2;
-  name: string;
-  description: string;
-  createdAt: string;
-  updatedAt: string;
-  verifiedAt: string;
-  planTemplate: AnalysisPlan;
-  parameters: ToolParameter[];
-  approvals: ToolRiskApproval[];
-}
+/**
+ * core 的 `SavedTool` 把 `planTemplate` 泛型化，以免 L0 依赖挂在 38 成员
+ * `ExcelAction` 联合上的 `AnalysisPlan`。这里绑定具体类型后结构完全一致。
+ */
+export type SavedTool = CoreSavedTool<AnalysisPlan>;
 
 export interface SavedQueryTool extends DeterministicQueryTemplate {
   version: 1;

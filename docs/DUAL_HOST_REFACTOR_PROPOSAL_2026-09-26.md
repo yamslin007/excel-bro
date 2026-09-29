@@ -53,6 +53,10 @@ function matricesEqual(actual: CellValue[][], expected: CellValue[][]): boolean 
 不得将该写入报告为已严格验证;应在预检拒绝,或明确标为未独立验证。
 v1 把指纹兼容性与写后验收混为一谈了。
 
+阶段 4 进展（2026-09-27）：WPS 计划值已保留 `""`，独立回读改为保真比较；
+宿主若回报 `null` 将抛错并保留可恢复记录，不再报告 `verified`。旧指纹算法
+保持不变。指纹 v2 及双读兼容仍未完成。
+
 ---
 
 ## 2. 三套身份与恢复语义(评审第 1 点)
@@ -88,8 +92,8 @@ WPS 的身份是本地磁盘路径,校验规则是 `^[A-Za-z]:\\[^\r\n]+\.xlsx$`
 | 身份 | `url:` + Office document url | 磁盘绝对路径 `.xlsx` | 工作目录内相对路径 |
 | 身份稳定性 | 会话内稳定,另存即失效 | 路径即身份,改名即失效 | 相对路径 + 内容指纹 |
 | 状态位置 | 内存(Excel 持有) | 磁盘(已保存文件) | 磁盘 |
-| 恢复点 | 服务端 SQLite 账本 + 区域写前快照 | WPS `PluginStorage` 完整快照 | `.excel-bro-backups/` 文件级副本 |
-| 权威现场 | 服务端账本 | 客户端 PluginStorage | 服务端 manifest |
+| 恢复点 | 服务端 SQLite 账本 + 区域写前快照 | WPS `PluginStorage` 会话内完整快照；跨关闭耐久存储待建 | `.excel-bro-backups/` 文件级副本 |
+| 权威现场 | 服务端账本 | 当前客户端 `PluginStorage`；正式写入需独立耐久恢复权威 | 服务端 manifest |
 | 撤销粒度 | 区域 | 区域 | 整文件原子替换 |
 | 可续跑动作 | 5 个(`main.py:1109`) | 当前 0(整体重做) | 仅 `splitGroupAggregate`(B1) |
 
@@ -104,7 +108,8 @@ WPS 的身份是本地磁盘路径,校验规则是 `^[A-Za-z]:\\[^\r\n]+\.xlsx$`
    `packages/core` 内部。Office 适配器在出网前把它序列化回原有 `url:` 字符串,
    服务端 `workbookIdentity: str` 与 `models.py:2008` 的校验保持不变。
 2. **恢复接口按通道分开**,不合并成一个通用接口。Office 保持现有
-   `/api/office/...`;WPS 恢复保持客户端权威(`PluginStorage`),服务端不参与。
+   `/api/office/...`;WPS 恢复目前使用客户端 `PluginStorage` 会话现场,不混入 Office
+   服务端账本；跨关闭耐久恢复另按[对齐指导](./WPS_EXCEL_CAPABILITY_PARITY_GUIDE_2026-09-28.md)设计。
 3. **"可续跑"是 宿主 × 动作 的交集,不是动作属性**。Excel 的 5 个可续跑动作
    不自动等于 WPS 可续跑。
 
@@ -145,7 +150,7 @@ Office 适配器在调用 `/api/office/...` 前折叠成 `url:<...>` 字符串�
 
 "支持多少种动作"证明不了重复开发已消除。需要一条**同一份参数化需求、
 同一组期望结果、三条通道各跑一遍**的用例。D→E 只是一组测试输入,
-**不允许在运行时代码、提示词或协议里写死 D/E、`Sheet1` 或示例类别**。
+**不允许在运行时代码、提示词或协议里写死列字母、表名或示例类别**。
 
 首条共用能力是"按用户给出的映射表,把已授权源区域的值映射到目标区域"。
 源工作表、源列/起止行、目标工作表、目标列/起止行、映射表、空值与未匹配值策略
@@ -155,13 +160,15 @@ Office 适配器在调用 `/api/office/...` 前折叠成 `url:<...>` 字符串�
 `AnalysisPlan.writeValues`。原始数据行不进入意图模型,映射规则不进入运行时代码常量。
 预览 → 用户确认 → 执行 → 校验 → 撤销保持同一闭环。
 
-除 D2:D6→E2:E6 外,还需把相同数据移到另一张已授权表的 B2:B6、把目标改为
-H2:H6 跑一组变形测试。两组只改参数与 fixture,不增加分支实现;
+除「订单」表 D2:D6→E2:E6 外,还需把相同数据放在已授权「输入」表的
+B2:B6,映射结果写到另一张已授权「结果」表的 H2:H6,跑一组变形测试。
+两组只改参数与 fixture,不增加分支实现;
 这能防止"测试通过,产品却只会 D→E"。
 
 ### 3.2 用例定义
 
-**固定输入工作簿** `tests/fixtures/golden-column-map.xlsx`,`Sheet1`:
+**固定输入数据**（阶段 G 测试在隔离的 `tmp_path` 中生成等价 `.xlsx`,
+不依赖真实业务文件）,基准工作表名为「订单」:
 
 | | A | B | C | D | E |
 |---|---|---|---|---|---|
@@ -206,7 +213,7 @@ H2:H6 跑一组变形测试。两组只改参数与 fixture,不增加分支实�
 |---|---|
 | A1 意图分类 | 显式规则可进入 `plan`;自动测试用固定模型响应/桩,真实模型另做意图抽检 |
 | A2 模型输入 | 只含授权表结构,不含原始数据行 |
-| A3 计划动作 | 本地计算后生成单个 `writeValues`,目标由参数给出;基准是 `Sheet1!E2:E6`,变形是另一张已授权表的 `H2:H6` |
+| A3 计划动作 | 本地计算后生成单个 `writeValues`,来源与目标均由参数给出;基准是 `订单!E2:E6`,变形是从 `输入!B2:B6` 到 `结果!H2:H6` |
 | A4 授权集合 | 仅本轮明确选择的工作表,不因变形测试扩大 |
 | A5 预览 | 执行前呈现完整 5 行待写值,可编辑 |
 | A6 未确认时 | 不产生任何写入 |
@@ -232,7 +239,7 @@ H2:H6 跑一组变形测试。两组只改参数与 fixture,不增加分支实�
 | 通道 | 执行方式 | 自动化程度 |
 |---|---|---|
 | Excel | Office.js 执行器 | 单测可覆盖计划生成与校验;真实写入需实机 |
-| WPS | JSAPI 执行器 | 同上,实机需 12.1 目标版本 |
+| WPS | JSAPI 执行器 | 同上，实机目标产品版本为 12.1.0.28488；其 `Application.Version` 实测报 `12.0`，两种编号不能混用 |
 | 文件夹模式 | openpyxl | **可全自动**,无需宿主 |
 
 文件夹模式的确定性转换、计划、执行与撤销可全自动,所以它是回归网的主力;
@@ -246,6 +253,7 @@ H2:H6 跑一组变形测试。两组只改参数与 fixture,不增加分支实�
 这些断言用显式 expected-failure/隔离诊断机制记录,并锁定具体失败原因;
 不得简单跳过。意外通过(XPASS)或换一种原因失败都应提示重新审查。
 阶段 1/2 保持既有通过项不退化、已知失败项不新增或变形;
+阶段 4 开始改动写入语义前,必须补齐 Excel/WPS 的临时工作簿实机基线记录。
 阶段 4 移除预期失败标记,要求 A1-A12、变形用例及负向测试
 在对应通道全绿。在此之前不进行大规模编排迁移。
 
@@ -263,11 +271,15 @@ H2:H6 跑一组变形测试。两组只改参数与 fixture,不增加分支实�
 
 ### 4.1 当前状态
 
-`config/capabilities.json` 的 `wpsWrite`:
-`verifiedVersionPrefixes: ["12.1"]`、`allowedActions: ["writeValues", "clearRange:contents"]`、
-`maxCells: 1000`。
+`config/capabilities.json` 的 `wpsWrite` 当前为：
+`verifiedVersionPrefixes: []`、`developmentVersionPrefixes: ["12.0"]`、
+`allowedActions: ["writeValues", "clearRange:contents"]`、`maxCells: 1000`。
+先前的 `verifiedVersionPrefixes: ["12.1"]` 来自安装目录产品版本，
+但代码比较的是实机 `Application.Version="12.0"`，故已移除这一未经证实的正式名单。
+开发调试加载项临时接受 `12.0`，只为完成独立测试工作簿的真实写入与撤销验收；
+生产构建不接受开发名单，开发放行也不等于产品版本验收完成。
 
-问题:12.0 怎么验证、何时开放,文档没写;不支持的动作在**计划生成前**如何排除,
+问题：不支持的动作在**计划生成前**如何排除，
 也没写 —— 现在是生成计划后在执行预检才拒绝(`wpsPlanExecutor.ts:225`)。
 
 ### 4.2 矩阵结构
@@ -288,6 +300,9 @@ hosts.<hostId>.versions.<versionPrefix>.actions.<actionType> =
 | `unverified` | 宿主可能支持,未验收 | **不进计划**,规划阶段即排除 |
 | `unsupported` | 宿主 API 不具备 | 不进计划,且向用户说明原因 |
 
+开发调试版为实机验收临时放行的动作可在当前客户端返回 `supported` 以进入测试流程；
+这不是持久能力矩阵中的正式 `supported` 结论，不能据此开放生产构建。
+
 ### 4.3 排除必须发生在规划前
 
 这是对现状的实质改动。现在 WPS 的动作限制在执行预检(`wpsPlanExecutor.ts:225`),
@@ -306,15 +321,19 @@ hosts.<hostId>.versions.<versionPrefix>.actions.<actionType> =
 按宿主/版本定上界、执行预检兜底实现漂移。服务端规划因此需要识别宿主,
 但**不能**因此继承或放宽 Office 专属的恢复接口语义。
 
-### 4.4 12.0 验收路径
+### 4.4 WPS 实机验收路径
 
-12.0 不自动继承 12.1 的验收结论。开放流程:
+`Application.Version="12.0"` 是目标产品 `12.1.0.28488` 在当前 JSAPI 的实测返回值，
+不能再把它当作另一台“旧产品版本”。开发调试版已临时放行该值以解除验收死锁。
+正式开放流程：
 
 1. 在隔离的临时工作簿和显式开发测试入口中跑第 3 节 A1-A12、变形用例
-   与负向测试;`unverified` 期间不开放普通用户写入,测试入口不得被生产规划调用
+   与负向测试；开发通道不得被生产规划调用
 2. 补 `docs/WPS_W*_VALIDATION_<date>.md` 记录,含版本号与实际读回值
-3. 记录通过后才把 `"12.0"` 加入该动作的 `supported`
-4. 未验收期间 12.0 用户看到明确说明,不看外观相同的空入口
+3. 查明可可靠区分产品版本的宿主字段，按该字段和实机验收结果建立正式能力矩阵；
+   不能仅把 `"12.0"` 放入生产白名单，因为尚不知道它能否区分不同产品版本
+4. 未验收期间生产用户看到明确说明，不看外观相同的空入口；M11 须用真正不同的
+   产品版本实机验收，开发/生产构建差异测试不能冒充版本差异测试
 
 ### 4.5 两条不可动摇的约束
 
@@ -347,8 +366,8 @@ v1 用"App.tsx 里直接出现 Office API 只有约 17 行"推断大段流程可
 
 ```
 L0 contracts        纯类型。零运行时依赖
-L1 pure             planCore / format / range / utils / tableSchema / modelSelection
-                    纯函数,可直接单测
+L1 pure             planCore / range / tableSchema / modelSelection 等经核实的纯模块
+                    format 待 SavedTool DTO 下沉;utils 必须先拆环境和值依赖
 L2 semantics        验收判定 / 指纹 / preflight / planLiveness
                     纯逻辑,但依赖 L0 类型
 L3 ports            HostAdapter / KeyValueStore / ApiClient / Clock 接口定义
@@ -375,14 +394,21 @@ L3 是全部环境依赖的收口处 —— 网络、存储、宿主、时间都
 `PluginStorage` 已核实是同步的(`wpsHost.ts:43-47`),但 `getItem` 返回
 `unknown`,适配器需做字符串强制并处理非字符串返回。
 
-### 5.4 先做可验证的小范围抽取
+### 5.4 第一刀的实际边界(阶段 2 已完成)
 
-不从 `contracts.ts`(1980 行,全仓依赖)开刀。第一刀选 L1:
-`planCore.ts`(61 行,已是共享先例)+ `format.ts`(142)+ `range.ts`(54)+
-`utils.ts`(104)+ `tableSchema.ts`(51)。
+不从 `contracts.ts`(全仓依赖)开刀。阶段 2 逐个核对原定五个模块后,
+只迁入真正可机械移动的 `planCore.ts`(61 行)、`range.ts`(54 行)和
+`tableSchema.ts`(51 行),合计约 166 行。原路径留下再导出 shim,
+并为原本没有测试的 `range.ts` 补了行为基线;
+`planCore`、`tableSchema` 原有测试一并迁入 core。
 
-共约 400 行,零环境依赖,有现成测试。用它验证 workspace 配置、alias、
-测试与构建链路是否真的通,再往上走。
+原清单中“约 400 行、零环境依赖、有现成测试”的判断不成立:
+`format.ts` 以 type-only 边依赖 `storage.ts` 的 `SavedTool`(L1→L2),
+且展示文案部分更接近 L5;先把 `SavedTool` 纯 DTO 提到 L0,
+再决定其拆分与迁入。`utils.ts` 通过运行时 `DataToolExecutionError`
+依赖含 `Excel.run` 的 `dataTools.ts`,还含 DOM 与模块加载副作用;
+须先拆依赖,不能原样进 core。完整证据、测试数量和构建结果见
+[阶段 2 核心抽取记录](./STAGE_2_CORE_EXTRACTION_2026-09-27.md)。
 
 ---
 
@@ -457,24 +483,35 @@ L3 是全部环境依赖的收口处 —— 网络、存储、宿主、时间都
 普通测试套件仍须通过,预期失败诊断单独留下可重现输出。**不动生产代码。**
 
 - 退出:现有通过项仍绿;参数化用例的预期输出与授权边界已冻结;
-  新能力缺口和 `""`/`null` 误判有可重复的失败证据;两宿主实机基线记录归档
+  新能力缺口和 `""`/`null` 误判有可重复的失败证据;两宿主实机清单已固定
 - 回退:纯新增测试,删掉即回退
-- **这是硬关卡;未建立可信基线不得进阶段 1,但不要求尚未修复的断言先变绿**
+- **这是自动化基线硬关卡;通过后可进阶段 1,不要求尚未实现的能力先变绿**
+
+截至 2026-09-27,自动化基线已覆盖真正的换表变形、缺映射规则的意图协议、
+目标模块缺席的精确预期失败和空串缺陷;**阶段 G 已按上述口径退出,
+阶段 1 已由提交 `fb59672` 完成**。两宿主实机记录仍待归档,但它不阻挡
+阶段 1/2 的环境与纯核心抽取;它是阶段 4 改动写入语义前的单独关卡。
+实机基线记录当前版本的入口、授权、既有写入/回读及新映射尚不可用的行为;
+不要求尚未实现的映射先通过。阶段 4 再验收映射的完整实机闭环。
 
 ### 阶段 1 —— 环境前置
 
-根 workspaces 纳入 `apps/wps-addin` 与 `packages/*`;React 声明对齐
-(excel `^19.1.1` / wps 精确 `19.1.1`);`@types/office-js` 统一;
+根 workspaces 纳入 `apps/wps-addin` 与 `packages/*`;React 实际安装对齐为
+单份 `19.2.8`;`@types/office-js` 暂留 WPS,直到阶段 6 清除传递类型依赖;
 两端加 tsconfig paths + vite alias + `resolve.dedupe`;建 `packages/core` 空骨架。
+
+阶段 1 已完成,提交 `fb59672`;验证结果和偏差见
+[阶段 1 workspace 记录](./STAGE_1_WORKSPACE_2026-09-27.md)。
 
 - 退出:`npm ls react` 只有一个 19.x;两端现有 lint/build/test 全绿;
   阶段 G 记录的预期失败不新增、不改变失败位置
 - 回退:改动只在配置文件与 lock,`git revert` 单个提交 + 重装依赖即可
 
-#### 更正:双份 React 是现存事实,不是潜在风险
+#### 阶段 1 实施前的依赖事实与处理
 
 v2 这里写"`apps/wps-addin` 没有自己的 `node_modules`,也没有独立 lock"。
-**这条是错的**,实测(2026-09-26):
+**这条是错的**,下表是阶段 1 实施前的实测状态(2026-09-26),
+不是当前安装状态:
 
 | 位置 | React 版本 | 独立 lock | 独立 `node_modules` |
 |---|---|---|---|
@@ -486,38 +523,55 @@ v2 这里写"`apps/wps-addin` 没有自己的 `node_modules`,也没有独立 loc
 子项目,不在根 workspaces 里。所以 v1 写的"删 lock"这一步**是必要的**,
 v2 把它删掉是基于错误核实。
 
-影响:双份 React 已经在跑,不是"someone runs npm install 才会触发"。
+影响:当时双份 React 已经在跑,不是"someone runs npm install 才会触发"。
 这使阶段 1 成为 `packages/core` 含 hooks 的**真实前置**,不是预防性整理 ——
 core 一旦被两端同时引入 React hooks,19.2.8 与 19.1.1 两份实例会导致
 invalid hook call。`WpsAgentPanel.test.tsx:35` 的注释正是在绕这个坑。
 
-本阶段因此必须:删 `apps/wps-addin/package-lock.json`(git 中一并删除)、
-删 `apps/wps-addin/node_modules`、把 `apps/wps-addin` 纳入根 workspaces、
-脚本从 `--prefix` 改 `--workspace excel-bro-wps`、根目录重装。
-退出闸 `npm ls react` 必须只剩一个版本。
+阶段 1 已据此删除独立 lock 和子项目独立 `node_modules`,把
+`apps/wps-addin` 纳入根 workspaces,脚本由 `--prefix` 改为 `--workspace`,
+并重装依赖。退出闸 `npm ls react` 现只剩一份 `19.2.8`。
 
-### 阶段 2 —— 抽纯核心 + 兼容导出
+### 阶段 2 —— 抽纯核心 + 兼容导出(已完成)
 
-按 5.4 只移 L1 的约 400 行,连同其 `*.test.ts`。原路径留再导出 shim,
-使 App.tsx 与 WPS 的 30 处导入零改动。
+提交 `a4e339f` 按 5.4 的实测边界迁了 `planCore`、`range`、
+`tableSchema` 约 166 行及相应测试;原路径保留再导出 shim,
+App.tsx 与 WPS 的导入点零改动。`format` 与 `utils` 没有在本阶段
+夹带迁移,分别等待 L0 DTO 下沉与 `dataTools` 错误类型拆分。
 
 - 退出:两端现有 build/test 全绿;阶段 G 的通过项不退化、预期失败不扩大;
   shim 全部有对应测试
 - 回退:删 `packages/core` 下的文件、把 shim 换回原实现。单提交可逆
 
-### 阶段 3 —— 定义 L3 端口
+### 阶段 3 —— 定义 L3 端口(已完成)
 
 定义 `HostAdapter`、`KeyValueStore`、`ApiClient` 接口,以及第 2.3 节的
 内部判别式 `WorkbookLocator`。只定接口与适配层,不改现有 Office 恢复协议。
+同期把 `SavedTool` 的纯 DTO 定义下沉到 L0,解除 `format.ts` 对
+`storage.ts` 的反向类型边;迁移 `format.ts` 前仍需判断展示文案部分的 L5 归属。
 
-- 退出:两端适配器和文件夹通道的身份转换通过现有测试;Office 适配器出网仍是
-  `url:` 字符串;现有 Office 账本与旧客户端的恢复回归测试通过。
+本阶段已完成:`WorkbookLocator` 的折叠收口到 `locator.ts` 唯一一处,
+`excel.ts:3762` 的身份构造改为调用它(原先是同一规则的第二份实现);
+`SavedTool` 下沉时 `planTemplate` 泛型化,以免 L0 依赖挂在 38 成员
+`ExcelAction` 联合上的 `AnalysisPlan`;`HostAdapter` **不含撤销成员**,
+因三条通道的撤销机制与粒度全不同(§2.2),合并即是架桥。
+`ports.ts` 只定义阶段 4 需要的四个原语,不预先铺 38 个动作。
+`format.ts` 本阶段未迁入 core —— 反向边已解除,但 `actionLabel` 的 L1/L5
+归属仍未定。完整证据、逐字比对结果与回归数据见
+[阶段 3 端口记录](./STAGE_3_PORTS_2026-09-27.md)。
+
+- 退出:L0 DTO 与 L3 端口类型检查通过;三臂 `WorkbookLocator` 的构造、
+  Office 身份折叠/反向解析及非 Office 拒绝折叠均有测试;
+  Excel 出网身份仍是原有 `url:` 字符串,WPS 撤销记录身份形态不变;
+  现有 Office 账本与旧客户端的恢复回归测试通过。
+  本阶段不要求两端 `HostAdapter` 实现或文件夹通道接线,这些归阶段 4。
   若能力协商新增请求字段,须同步 `contracts.ts` 与 `models.py` 并加拒绝伪造集合测试
 - 回退:接口是新增文件;适配器包装可保留旧函数并存
 
 ### 阶段 4 —— 贯通一条写入能力
 
-只做参数化列映射的本地确定性计算,最终落成现有 `writeValues` 白名单动作;
+先实现并接线两端 `HostAdapter`,然后做参数化列映射的本地确定性计算,
+最终落成现有 `writeValues` 白名单动作;
 让三条通道跑同一套计划语义与验收判定。实现第 3.5 节确认绑定、
 第 1.1 节的空串负向比较修正与第 6.3 节的指纹版本化。
 
@@ -559,13 +613,16 @@ App.tsx 编排段约 3600 行,目前没有独立的编排层测试。
 
 ## 8. 本计划的范围决定与后续议题
 
-1. **WPS 恢复权威维持客户端** —— 本计划不把 WPS `PluginStorage` 现场迁往
-   Office 服务端账本,也不承诺动作级跨重启续跑。若以后需要该能力,
-   先单独定义逐动作快照、幂等领取、在途状态和真实宿主故障注入验收。
-2. **H 批动作逐项验收,不作本期完全对等承诺** —— `createChart`、
-   `createPivotTable`、`addImage`、`addShape` 等在未验收宿主/版本保持
-   `unverified` 或 `unsupported`,规划前排除并说明原因;
-   产品是否要求最终完全对等,另立范围与时间表。
+1. **WPS 恢复不混入 Office 服务端账本** —— 本重构阶段的 WPS `PluginStorage`
+   只覆盖加载项会话，不承诺跨关闭恢复或动作级跨重启续跑。最终完全对齐要求
+   单独建立耐久恢复权威，并定义逐动作快照、幂等领取、在途状态和真实宿主故障注入验收，
+   详见[对齐指导](./WPS_EXCEL_CAPABILITY_PARITY_GUIDE_2026-09-28.md)。
+2. **H 批动作逐项验收，不作本重构阶段的完成承诺** —— 产品目标现已明确为
+   WPS 与 Excel EB 最终完全能力对齐，后续范围与关卡见
+   [完全能力对齐指导](./WPS_EXCEL_CAPABILITY_PARITY_GUIDE_2026-09-28.md)。
+   `createChart`、`createPivotTable`、`addImage`、`addShape` 等在未验收宿主/版本
+   保持 `unverified` 或 `unsupported`，规划前排除并说明原因；不能把本阶段
+   暂未开放误读为永久放弃，也不能为了目标对齐而提前改成 `supported`。
 3. **`capabilities.json` 物理重组独立立项** —— 第 4 节先实现可信的能力解析
    与等价性测试,阶段 6 不顺手改动所有读取点。将来重组时保留旧配置读取兼容、
    迁移失败回退和各宿主有效值一致性测试。

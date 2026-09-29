@@ -1,16 +1,12 @@
 /**
- * 阶段 G 基线：空串写入语义的负向证据。
+ * 阶段 G 的空串负向基线在阶段 4 转为真实行为断言。
  *
- * 本文件只建立可重现的失败证据，不修复缺陷。修复在阶段 4
- * （见 docs/DUAL_HOST_REFACTOR_PROPOSAL_2026-09-26.md 第 1.1 节与第 3 节）。
- *
- * 用 `it.fails` 固定预期失败：断言一旦变为通过，vitest 会报错，
- * 迫使重新审查而不是静默转绿。这对应方案 §3.4 的 XPASS 要求。
+ * 指纹为旧撤销记录继续折叠空串，但计划值与独立回读必须区分 "" 和 null。
  */
 import { describe, expect, it } from "vitest";
 import type { AnalysisPlan, CellValue } from "../../excel-addin/src/contracts";
 import type { WpsApplication, WpsRange, WpsWorksheet } from "./wpsHost";
-import { executeWpsPlan, prepareWpsPlan } from "./wpsPlanExecutor";
+import { executeWpsPlan, latestWpsUndo, prepareWpsPlan } from "./wpsPlanExecutor";
 
 function clone(matrix: CellValue[][]): CellValue[][] {
   return matrix.map((row) => [...row]);
@@ -57,7 +53,7 @@ function host(initial: CellValue[][], collapseEmptyOnWrite = false) {
     Range: () => range
   };
   const application: WpsApplication = {
-    Version: "12.1.0.28488",
+    Version: "12.0",
     ActiveWorkbook: {
       Name: "测试.xlsx",
       FullName: "C:\\Data\\测试.xlsx",
@@ -93,46 +89,28 @@ const emptyStringPlan = plan([
   { type: "writeValues", sheet: "明细", range: "A1:A2", values: [["未分类"], [""]] }
 ]);
 
-describe("阶段 G 基线：空串写入语义（已知缺陷，预期失败）", () => {
-  it.fails(
-    "缺陷 1：prepareWpsPlan 应保留计划中的空串，实际在准备阶段就折成 null",
-    () => {
-      const target = host([["旧值"], ["旧值"]]);
-      const prepared = prepareWpsPlan(target.application, [1], emptyStringPlan);
-      // 失败原因锁定在 wpsPlanExecutor.ts:195 —— valuesForAction 对计划值调用
-      // canonicalCell，"" 在任何宿主交互之前就变成 null，写入意图已丢失。
-      expect(prepared.actions[0].values).toEqual([["未分类"], [""]]);
-    }
-  );
-
-  it.fails(
-    "缺陷 2：无法保真空串的宿主不应报告 verified，实际归一后判定通过",
-    async () => {
-      const target = host([["旧值"], ["旧值"]], true);
-      const prepared = prepareWpsPlan(target.application, [1], emptyStringPlan);
-      const record = await executeWpsPlan(target.application, prepared);
-      // 失败原因锁定在 wpsPlanExecutor.ts:147-149 —— matricesEqual 通过
-      // canonicalMatrix 对 actual 与 expected 双侧折叠，expected="" 与
-      // actual=null 归一后都是 null，回读核对这道最后防线对该差异失明。
-      // 期望行为：拒绝写入，或标记为未独立验证，而不是 verified。
-      expect(record.state).not.toBe("verified");
-    }
-  );
-
-  // 以下两条断言当前实际行为（而非期望行为），用于锁定失败原因。
-  // 阶段 4 修复后它们会开始失败，届时应连同上面的 it.fails 一起更新。
-  it("锁定缺陷 1 的确切表现：空串在准备阶段变成 null", () => {
+describe("WPS 空串写入与独立回读", () => {
+  it("准备阶段保留计划中的空串", () => {
     const target = host([["旧值"], ["旧值"]]);
     const prepared = prepareWpsPlan(target.application, [1], emptyStringPlan);
-    expect(prepared.actions[0].values).toEqual([["未分类"], [null]]);
+    expect(prepared.actions[0].values).toEqual([["未分类"], [""]]);
   });
 
-  it("锁定缺陷 2 的确切表现：宿主折叠空串后仍报告 verified", async () => {
+  it("宿主把空串折成 null 时拒绝报告 verified，仍保留可恢复记录", async () => {
     const target = host([["旧值"], ["旧值"]], true);
+    const prepared = prepareWpsPlan(target.application, [1], emptyStringPlan);
+    await expect(executeWpsPlan(target.application, prepared)).rejects.toThrow("回读结果与计划不一致");
+    const record = latestWpsUndo(target.application);
+    expect(record?.state).toBe("partial_write_recoverable");
+    expect(target.values()).toEqual([["未分类"], [null]]);
+  });
+
+  it("宿主保留空串时回读可以准确通过", async () => {
+    const target = host([["旧值"], ["旧值"]]);
     const prepared = prepareWpsPlan(target.application, [1], emptyStringPlan);
     const record = await executeWpsPlan(target.application, prepared);
     expect(record.state).toBe("verified");
-    expect(target.values()).toEqual([["未分类"], [null]]);
+    expect(target.values()).toEqual([["未分类"], [""]]);
   });
 
   it("参照组：不含空串的写入在同一宿主上正常验证通过", async () => {

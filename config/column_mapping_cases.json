@@ -1,0 +1,279 @@
+{
+  "_comment": [
+    "参数化列映射的跨语言共享夹具。packages/core/src/columnMapping.ts 与",
+    "server/app/column_mapping.py 是镜像实现，两侧各自加载本文件并断言同一批",
+    "期望值 —— 任何单边修改都会让一侧变红。这比人工对读源码可靠，也比抓源码",
+    "文本的 test_safety_mirror.py 更适合锁行为（那种做法只能锁清单，锁不住逻辑）。",
+    "error 取值：unmapped | shape | overlap | parse | blankLabel | sheetName。",
+    "unmapped 用例的 unmappedValues 断言未命中值的完整集合与顺序。"
+  ],
+  "cases": [
+    {
+      "name": "基本映射：命中、空白、重复值",
+      "input": {
+        "sourceSheet": "订单",
+        "targetSheet": "订单",
+        "sourceRange": "B2:B6",
+        "targetRange": "D2:D6",
+        "sourceValues": [["办公用品"], ["电子设备"], ["办公用品"], [null], ["差旅"]],
+        "mapping": { "办公用品": "行政", "电子设备": "资产", "差旅": "费用" },
+        "blankLabel": "未分类"
+      },
+      "expected": [["行政"], ["资产"], ["行政"], ["未分类"], ["费用"]]
+    },
+    {
+      "name": "纯空白字符串按空白处理",
+      "input": {
+        "sourceSheet": "表1",
+        "targetSheet": "表1",
+        "sourceRange": "A1:A3",
+        "targetRange": "C1:C3",
+        "sourceValues": [[""], ["   "], ["\t"]],
+        "mapping": { "甲": "一" },
+        "blankLabel": "空"
+      },
+      "expected": [["空"], ["空"], ["空"]]
+    },
+    {
+      "name": "显式空串映射项优先于空白策略",
+      "input": {
+        "sourceSheet": "表1",
+        "targetSheet": "表1",
+        "sourceRange": "A1:A2",
+        "targetRange": "C1:C2",
+        "sourceValues": [[""], [null]],
+        "mapping": { "": "空串" },
+        "blankLabel": "真空格"
+      },
+      "expected": [["空串"], ["真空格"]]
+    },
+    {
+      "name": "数字 0 与 false 不是空白",
+      "input": {
+        "sourceSheet": "表1",
+        "targetSheet": "表1",
+        "sourceRange": "A1:A2",
+        "targetRange": "C1:C2",
+        "sourceValues": [[0], [false]],
+        "mapping": { "0": "零", "False": "否" },
+        "blankLabel": "空"
+      },
+      "expected": [["零"], ["否"]]
+    },
+    {
+      "name": "布尔真按 Python str() 形态键化",
+      "input": {
+        "sourceSheet": "表1",
+        "targetSheet": "表1",
+        "sourceRange": "A1:A1",
+        "targetRange": "C1:C1",
+        "sourceValues": [[true]],
+        "mapping": { "True": "是" },
+        "blankLabel": "空"
+      },
+      "expected": [["是"]]
+    },
+    {
+      "name": "多行多列逐格映射",
+      "input": {
+        "sourceSheet": "表1",
+        "targetSheet": "表1",
+        "sourceRange": "A1:B2",
+        "targetRange": "D1:E2",
+        "sourceValues": [
+          ["甲", "乙"],
+          ["乙", null]
+        ],
+        "mapping": { "甲": "一", "乙": "二" },
+        "blankLabel": "空"
+      },
+      "expected": [
+        ["一", "二"],
+        ["二", "空"]
+      ]
+    },
+    {
+      "name": "未命中值全部收集后一次抛出，去重且保持首次出现顺序",
+      "input": {
+        "sourceSheet": "表1",
+        "targetSheet": "表1",
+        "sourceRange": "A1:A4",
+        "targetRange": "C1:C4",
+        "sourceValues": [["丙"], ["甲"], ["丁"], ["丙"]],
+        "mapping": { "甲": "一" },
+        "blankLabel": "空"
+      },
+      "error": "unmapped",
+      "unmappedValues": ["丙", "丁"]
+    },
+    {
+      "name": "同表重叠：拒绝",
+      "input": {
+        "sourceSheet": "表1",
+        "targetSheet": "表1",
+        "sourceRange": "A1:A3",
+        "targetRange": "A2:A4",
+        "sourceValues": [["甲"], ["甲"], ["甲"]],
+        "mapping": { "甲": "一" },
+        "blankLabel": "空"
+      },
+      "error": "overlap"
+    },
+    {
+      "name": "同表相邻不算重叠",
+      "input": {
+        "sourceSheet": "表1",
+        "targetSheet": "表1",
+        "sourceRange": "A1:A2",
+        "targetRange": "B1:B2",
+        "sourceValues": [["甲"], ["甲"]],
+        "mapping": { "甲": "一" },
+        "blankLabel": "空"
+      },
+      "expected": [["一"], ["一"]]
+    },
+    {
+      "name": "跨表同地址不算重叠",
+      "input": {
+        "sourceSheet": "表1",
+        "targetSheet": "表2",
+        "sourceRange": "A1:A2",
+        "targetRange": "A1:A2",
+        "sourceValues": [["甲"], ["甲"]],
+        "mapping": { "甲": "一" },
+        "blankLabel": "空"
+      },
+      "expected": [["一"], ["一"]]
+    },
+    {
+      "name": "源值行数与源区域不符",
+      "input": {
+        "sourceSheet": "表1",
+        "targetSheet": "表1",
+        "sourceRange": "A1:A3",
+        "targetRange": "C1:C3",
+        "sourceValues": [["甲"], ["甲"]],
+        "mapping": { "甲": "一" },
+        "blankLabel": "空"
+      },
+      "error": "shape"
+    },
+    {
+      "name": "源值列数参差",
+      "input": {
+        "sourceSheet": "表1",
+        "targetSheet": "表1",
+        "sourceRange": "A1:B2",
+        "targetRange": "D1:E2",
+        "sourceValues": [["甲", "甲"], ["甲"]],
+        "mapping": { "甲": "一" },
+        "blankLabel": "空"
+      },
+      "error": "shape"
+    },
+    {
+      "name": "目标区域比源区域短",
+      "input": {
+        "sourceSheet": "表1",
+        "targetSheet": "表1",
+        "sourceRange": "A1:A3",
+        "targetRange": "C1:C2",
+        "sourceValues": [["甲"], ["甲"], ["甲"]],
+        "mapping": { "甲": "一" },
+        "blankLabel": "空"
+      },
+      "error": "shape"
+    },
+    {
+      "name": "目标区域列数不同",
+      "input": {
+        "sourceSheet": "表1",
+        "targetSheet": "表1",
+        "sourceRange": "A1:A2",
+        "targetRange": "C1:D2",
+        "sourceValues": [["甲"], ["甲"]],
+        "mapping": { "甲": "一" },
+        "blankLabel": "空"
+      },
+      "error": "shape"
+    },
+    {
+      "name": "绝对引用可解析",
+      "input": {
+        "sourceSheet": "表1",
+        "targetSheet": "表1",
+        "sourceRange": "$A$1:$A$2",
+        "targetRange": "$C$1:$C$2",
+        "sourceValues": [["甲"], ["甲"]],
+        "mapping": { "甲": "一" },
+        "blankLabel": "空"
+      },
+      "expected": [["一"], ["一"]]
+    },
+    {
+      "name": "单格区域",
+      "input": {
+        "sourceSheet": "表1",
+        "targetSheet": "表1",
+        "sourceRange": "A1",
+        "targetRange": "C1",
+        "sourceValues": [["甲"]],
+        "mapping": { "甲": "一" },
+        "blankLabel": "空"
+      },
+      "expected": [["一"]]
+    },
+    {
+      "name": "整列引用无法解析",
+      "input": {
+        "sourceSheet": "表1",
+        "targetSheet": "表1",
+        "sourceRange": "A:A",
+        "targetRange": "C1:C1",
+        "sourceValues": [["甲"]],
+        "mapping": { "甲": "一" },
+        "blankLabel": "空"
+      },
+      "error": "parse"
+    },
+    {
+      "name": "起止顺序颠倒",
+      "input": {
+        "sourceSheet": "表1",
+        "targetSheet": "表1",
+        "sourceRange": "A3:A1",
+        "targetRange": "C1:C3",
+        "sourceValues": [["甲"], ["甲"], ["甲"]],
+        "mapping": { "甲": "一" },
+        "blankLabel": "空"
+      },
+      "error": "parse"
+    },
+    {
+      "name": "空白标签为空：拒绝",
+      "input": {
+        "sourceSheet": "表1",
+        "targetSheet": "表1",
+        "sourceRange": "A1:A1",
+        "targetRange": "C1:C1",
+        "sourceValues": [["甲"]],
+        "mapping": { "甲": "一" },
+        "blankLabel": ""
+      },
+      "error": "blankLabel"
+    },
+    {
+      "name": "工作表名为空：拒绝",
+      "input": {
+        "sourceSheet": "表1",
+        "targetSheet": "  ",
+        "sourceRange": "A1:A1",
+        "targetRange": "C1:C1",
+        "sourceValues": [["甲"]],
+        "mapping": { "甲": "一" },
+        "blankLabel": "空"
+      },
+      "error": "sheetName"
+    }
+  ]
+}

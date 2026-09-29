@@ -154,24 +154,69 @@ localhost/127.0.0.1 来源开放 CORS。只读 Agent 的真实验收见
 dataTools.ts 的纯计算入口，但不得调用 executeQueryTableTool 或 Excel.run。
 
 W3 不再要求用户点击“验证读取”。工作表勾选同时构成读取和写入的不可扩大授权边界。
-模型返回写入计划后，前端先调用 `/api/plans/validate`，再执行 WPS 白名单、文件身份、
+模型返回写入计划后，通常先调用 `/api/plans/validate`；WPS 本地计算出的列映射计划
+因验收矩阵含完整源值而不上传此接口，直接进入本地受控预检。随后执行 WPS 白名单、文件身份、
 只读、保护、合并、尺寸、重叠与限额检查；只有预览卡中的“确认写入”会触发宿主写入。
 `config/capabilities.json` 的 `wpsWrite` 控制开关、宿主版本族、单次单元格上限、分块行数和
-动作白名单。当前只允许 `writeValues` 与 `clearRange:contents`；结构删除仍未开放。
-恢复点保存在 WPS `PluginStorage`，任务窗格刷新后仍可读取；撤销会先核对写入后指纹，
-冲突时不得覆盖用户后续修改。目标版本真实宿主测试清单记录在
+动作白名单。开发验收通道当前允许 `writeValues`、同形 A1 公式矩阵 `writeFormulas` 与
+`clearRange:contents`；R1C1 铺满公式和结构删除仍未开放。公式写入后用 `Formula` 回读校验，
+不能用 `Value2` 计算结果代替；正式构建仍须等待独立实机验收。
+实机 WPS 表格 `12.1.0.28488` 的 `Application.Version` 实际报告 `12.0`，并非安装目录的
+产品版本。开发调试加载项允许 `developmentVersionPrefixes: ["12.0"]` 通过版本闸，
+用于独立测试工作簿的写入、回读和撤销验收；先前基于安装路径误设的
+`verifiedVersionPrefixes: ["12.1"]` 已清空，生产构建不使用临时名单。
+这不是把所有报告 `12.0` 的 WPS 版本视为已验收。正式开放前必须找到可靠产品版本信号，
+或完成可区分版本的能力与实机验收；版本缺失、其他版本及任一预检失败仍拒绝写入。
+恢复点暂存于 WPS `PluginStorage`，任务窗格刷新后仍可读取，但关闭加载项后不持久化，
+不能作为跨关闭恢复保证；撤销会先核对写入后指纹，冲突时不得覆盖用户后续修改。
+持久恢复的实施关卡见[双宿主能力对齐指导](./WPS_EXCEL_CAPABILITY_PARITY_GUIDE_2026-09-28.md)。目标版本真实宿主测试清单记录在
 [W3-A 验证记录](./WPS_W3_A_VALIDATION_2026-09-23.md)。
 
 跨宿主能力开发先改共享 `planCore.ts` 与 `AnalysisPlan` 校验，再接 Office.js/WPS
 适配器。当前第一批共用 A1 矩形、写值矩阵形状和清空内容矩阵；对应测试位于
 `apps/excel-addin/src/planCore.test.ts`。下一批应把计划预览描述、动作能力协商与
-回读验收规则逐步移出各自任务窗格，避免重复开发。WPS `12.0` 尚未进入
-`verifiedVersionPrefixes`，不能用共享代码通过单元测试代替真实宿主的写入、撤销验收。
+回读验收规则逐步移出各自任务窗格，避免重复开发。WPS JSAPI `12.0` 尚未进入
+`verifiedVersionPrefixes`；开发模式的临时放行不能用单元测试代替真实宿主的写入、撤销验收。
+
+### 规划前能力交集（已接线）
+
+两端在规划请求里自报 `hostId` / `hostVersion` / `selfReportedActions`，服务端据此把
+未验收动作排除在规划之外。接线点：
+
+| 位置 | 作用 |
+| --- | --- |
+| `config/capabilities.json` → `hostCapabilities` | 可信上界（三宿主 × 版本 × 动作，三态） |
+| `packages/core/src/actionCapability.ts` | TS 侧纯函数（L2） |
+| `server/app/action_capability.py` | Python 侧镜像 |
+| `server/app/excel_agent.py` → `_enforce_action_capabilities` | 计划出口强制（`submit_plan` 与 `_map_column_plan` 两处） |
+| `apps/excel-addin/src/officeActions.ts` | Office 自报清单 |
+| `apps/excel-addin/src/officeHostAdapter.ts` → `officeHostRequestFields` | Office 请求字段组装 |
+| `apps/wps-addin/src/wpsHostAdapter.ts` → `wpsReportedActionTypes` | WPS 自报集合 |
+
+`config/action_capability_cases.json` 是跨语言共享夹具，TS 与 Python 两侧加载同一份文件
+断言同一批值。**这不是** `test_safety_mirror.py` 那种抓源码文本的做法：它抓的是行为，
+单边修改实现会立刻有一侧变红（可直接验证：把 TS 的 `matchesVersionPrefix` 换成裸
+`startsWith`，TS 侧 2 条失败而 Python 侧 15 条仍绿）。
+
+两条维护红线：
+
+- 版本前缀按"相等或后接 `.`"匹配，不用裸 `startsWith`（否则 `"12.0"` 会命中 `"12.01"`）；
+  重叠前缀取最长匹配。
+- 新增动作先落 `excel.ts` 的 `executeAction` 分支，再登记 `officeActions.ts`；
+  `officeActions.test.ts` 会对 `contracts.ts` 联合体与执行分支双向比对，漏报/虚报都会红。
+
+未接线项：两端 `HostAdapter` 仍无生产消费者（阶段 4 前置，尚未替换 `executeAction`）；
+WPS `EB()` 公式的异步语义未核实，不得用表面相似的入口冒充对齐。
 
 WPS 任务窗格直接导入 Excel 端 `styles.css`，产品壳和控件类名应优先与 Excel EB 保持一致；
 `apps/wps-addin/src/styles.css` 只添加 WPS 宿主内容和窄窗适配，不能再维护第二套主题。页面至少
-保持模型、新对话、工具、备份、格仔、更多菜单、历史、范围选择、消息和输入区一致。逻辑复用
-不得突破宿主能力：工作目录与图片输入暂未开放；工作流仍须验证并预览；固化查询必须在当前
+保持模型、新对话、工具、备份、格仔、更多菜单、历史、范围选择、消息和输入区一致。
+过程展示也复用共用组件：WPS 本地读写进度按步骤写进消息历史并交给
+`TaskProgressTimeline` 展示，刷新后未完成记录必须显示中断；只允许记录安全的动作、目标、
+行数和回读状态，不能把原始单元格值写入历史。复制按钮应覆盖用户与助手消息，
+并验证 WPS WebView 拒绝 `navigator.clipboard` 时的降级路径。当前尚未接入服务端
+规划 SSE 的完整事件时间线，不可把本地步骤误称为 Excel 端全部进度能力已对齐。
+逻辑复用不得突破宿主能力：工作目录与图片输入暂未开放；工作流仍须验证并预览；固化查询必须在当前
 授权表内由本地确定性执行器运行。自动范围在每次发送时重新读取活动表，手动多表授权不得自动
 增加工作表。修改这些区域后至少运行 `npm run test:wps` 与 `npm run build:wps`，并在目标 WPS
 版本分别检查窄窗和加宽窗格。

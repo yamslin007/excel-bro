@@ -6,8 +6,13 @@ import { DataToolExecutionError } from "./dataTools";
 export async function copyTextToClipboard(text: string): Promise<boolean> {
   try {
     if (navigator.clipboard?.writeText) {
-      await navigator.clipboard.writeText(text);
-      return true;
+      try {
+        await navigator.clipboard.writeText(text);
+        return true;
+      } catch {
+        // WPS/Office 内嵌 WebView 可能暴露 Clipboard API 却拒绝写入；
+        // 同一次用户点击继续尝试传统复制接口。
+      }
     }
     const textarea = document.createElement("textarea");
     textarea.value = text;
@@ -15,10 +20,12 @@ export async function copyTextToClipboard(text: string): Promise<boolean> {
     textarea.style.position = "fixed";
     textarea.style.opacity = "0";
     document.body.appendChild(textarea);
-    textarea.select();
-    const copied = document.execCommand("copy");
-    textarea.remove();
-    return copied;
+    try {
+      textarea.select();
+      return document.execCommand("copy");
+    } finally {
+      textarea.remove();
+    }
   } catch {
     return false;
   }

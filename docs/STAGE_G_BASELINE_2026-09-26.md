@@ -13,31 +13,43 @@
 - 已知缺陷 → 预期失败,且**当前实际行为被正向断言钉住**
 
 "锁定原因"是关键。仅仅"失败了"不构成基线 —— 必须保证它是因为文档说的那个原因
-失败。因此每条预期失败都配了一条断言当前实际行为的正向测试;缺陷一旦变化,
-正向测试会先报错,而不是让预期失败悄悄换个理由继续红着。
+失败。空串缺陷的预期失败配有断言当前实际行为的正向测试;缺陷一旦变化,
+正向测试会先报错。参数化映射的预期失败只允许专用的「目标模块缺席」异常,
+不能用宽泛的 `ImportError` 吞掉实现里的依赖错误。
 
 ## 2. 自动化基线:文件夹通道(openpyxl)
 
-`server/tests/test_column_mapping_baseline.py`,6 条。
+`server/tests/test_column_mapping_baseline.py`,9 条（含同表/跨表及写前来源/目标改动的参数化用例）。
 
 | 测试 | 覆盖断言 | 结果 |
 |---|---|---|
 | `test_a7_a9_write_and_undo_round_trip[baseline-D-to-E]` | A7 持久化重读一致、A9 撤销回到执行前且源未被触碰 | PASSED |
-| `test_a7_a9_write_and_undo_round_trip[variant-B-to-H]` | 同上,换源列与目标列 | PASSED |
+| `test_a7_a9_write_and_undo_round_trip[cross-sheet-B-to-H]` | 从已授权的「输入」表 B 列读取,写到另一张已授权的「结果」表 H 列;核对写入与撤销 | PASSED |
 | `test_a4_authorization_does_not_expand` | A4 授权集合不含未选表 | PASSED |
-| `test_a12_target_changed_between_preview_and_execute` | A12 预览与执行之间源被改动 → 拒绝且未写入 | PASSED |
-| `test_a3_column_mapping_plan_is_generated_from_parameters` | A3 参数化映射生成单个 `writeValues` | **XFAIL** |
-| `test_b1_unmatched_category_requires_clarification` | B1-B3 未匹配类别必须澄清不猜测 | **XFAIL** |
+| `test_a12_source_or_target_changed_between_preview_and_execute`（两组） | A12 预览与执行之间来源或目标被改动 → 拒绝旧计划且保留第三方改动 | **2 PASSED** |
+| `test_a3_column_mapping_plan_is_generated_from_parameters`（同表与跨表两组） | A3 参数化映射生成单个 `writeValues`,来源表与目标表可不同 | **2 XFAIL** |
+| `test_unmatched_source_value_does_not_get_guessed` | 已提供映射但来源值未命中时不得猜测 | **XFAIL** |
+| `test_b1_b3_missing_mapping_rule_routes_to_clarification_without_data_rows` | B1-B3 未给映射规则时,固定模型响应经真实意图入口返回澄清;发给模型的上下文不含原始行,不生成动作 | PASSED |
 
-两条 XFAIL 用 `strict=True, raises=ImportError`,锁定在
-`server.app.column_mapping` 尚不存在。阶段 4 实现后会 XPASS,
-`strict=True` 使 XPASS 报错,迫使移除标记 —— 不会静默转绿。
+三条 XFAIL 用 `strict=True` 和专用 `_MissingColumnMappingCapability` 锁定
+`server.app.column_mapping` **目标模块本身缺席**。模块一旦出现,函数缺失、
+依赖导入失败或行为不符合断言都会作为真实失败暴露;实现通过时 XPASS
+也会报错,迫使重新审查并移除预期失败标记。
+
+「未给映射规则」与「规则已给但来源值未命中」是两种不同情形,分别测试。
+前者通过固定模型响应验证意图协议和数据最小化,**不声称证明真实模型一定会
+选择澄清**;真实模型语义仍需抽检。后者属于尚未实现的确定性计算层。
 
 ### 2.1 参数化的验证方式
 
-`D→E` 与 `B→H` 是同一实现的两组参数,期望值由 `_expected_for(mapping, blank_label)`
-从映射表推导,不硬编码。映射表、源/目标列、工作表名全部是夹具参数。
-这条约束是为了防止"测试通过,产品却只会 D→E"。
+`D→E` 是「订单」表内写入,`B→H` 是「输入」表到「结果」表的跨表写入。
+两张表均在本轮授权集合中;测试会核对来源表未被改动,目标表写入后可撤销。
+期望值由 `_expected_for(mapping, blank_label)` 从映射表推导,不硬编码。
+源/目标表与列都由夹具参数给出,防止"测试通过,产品却只会 D→E"。
+
+当前通过项仅证明已有 `writeValues` 执行层可写到另一张已授权表;
+参数化映射的**计算入口**仍是预期失败。Python 的拟定入口只固定文件夹
+通道的契约,不能据此宣称 Excel/WPS 已共享同一实现。
 
 ### 2.2 两条断言的修正记录
 
@@ -53,6 +65,10 @@
 ## 3. 已知缺陷基线:空串写入语义(WPS 通道)
 
 `apps/wps-addin/src/wpsEmptyStringBaseline.test.ts`,5 条,全部按预期。
+
+> 后续状态（2026-09-27）：下表保留阶段 G 当时的失败证据，非当前测试结果。
+> 阶段 4 已把该文件改为 4 条正常通过的行为断言：计划保留空串、宿主折叠时
+> 不报告 `verified` 且保留恢复点、正常回读通过、非空串参照组通过。
 
 | 测试 | 性质 |
 |---|---|
@@ -113,25 +129,26 @@
 | M6 | 回读核对 | 通过,记录实际值 | 同 |
 | M7 | 撤销 | 目标回执行前,源未动 | 同 |
 | M8 | 执行后外部改动再撤销 | 拒绝覆盖 | 同 |
-| M9 | 换目标列重跑 M2-M7 | 行为一致 | 同 |
+| M9 | 改为两张均已授权的表,从来源表 B 列映射写到目标表 H 列,重跑 M2-M7 | 行为一致,来源表不变 | 同 |
 | M10 | 不给映射表 | 返回澄清,不生成写入 | 同 |
 
-WPS 侧另需:M11 未验收版本(如 12.0)应明确拒绝并说明原因,不出现外观相同的空入口。
+WPS 侧另需：M11 真正未开放的宿主版本应明确拒绝并说明原因，不出现外观相同的空入口。实机 `Application.Version="12.0"` 已用于开发调试验收，不能再把同一台机器当成“旧产品版本”完成 M11；正式构建拒绝该临时通道仅验证配置隔离，不能替代不同产品版本的实机验收。
 
-## 5. 阶段 G 退出状态
+## 5. 阶段 G 退出状态（自动化基线已通过）
 
 | 退出条件 | 状态 |
 |---|---|
 | 现有通过项仍绿 | 达成,见第 6 节 |
 | 参数化用例预期输出与授权边界已冻结 | 达成 |
-| 新能力缺口有可重复失败证据 | 达成,2 条 strict XFAIL |
+| 新能力缺口有可重复失败证据 | 达成,3 条 strict XFAIL（同表/跨表计算、未命中值） |
 | `""`/`null` 误判有可重复失败证据 | 达成,2 条 `it.fails` + 2 条行为锁定 |
-| 两宿主实机基线记录归档 | **清单已定,实机待执行** |
+| 两宿主实机清单固定 | 达成;实机记录作为阶段 4 改动写入语义前的单独关卡 |
 | 未改动生产代码 | 达成 |
 
-最后一项尚未完成,因为实机验证需要目标版本的 WPS 与 Excel 环境。
-自动化基线已可支撑阶段 1 与阶段 2(它们都不触碰写入语义)。
-**阶段 4 开始前必须补齐实机记录** —— 那一阶段才真正改动写入与验收语义。
+**阶段 G 按自动化基线关卡已退出;阶段 1 已由提交 `fb59672` 完成。**
+Excel/WPS 实机基线记录仍待归档,但不阻挡阶段 1/2 的环境整理和纯核心抽取;
+它是阶段 4 改动写入语义前的单独关卡。届时需记录当前未实现映射时的
+实际行为与宿主版本,再于阶段 4 验收实现后的完整闭环。
 
 ## 6. 全量回归
 
@@ -139,22 +156,24 @@ WPS 侧另需:M11 未验收版本(如 12.0)应明确拒绝并说明原因,不出
 |---|---|
 | `npm run test:addin` | 474 passed |
 | `npm run test:wps` | 57 passed(含新增 5 条) |
-| `python -m pytest server/tests --basetemp=.tmp-pytest` | 455 passed,2 xfailed |
+| `python -m pytest server/tests -q --basetemp=.tmp-pytest-stage-g-all-2` | 本次:457 passed,3 xfailed;另有 pytest 缓存目录拒绝写入警告,不影响测试结果 |
+| `python -m pytest server/tests/test_column_mapping_baseline.py -q --basetemp=.tmp-pytest-stage-g-review-2` | 补充目标改动前:5 passed,3 xfailed;随后已由全量回归覆盖新参数组 |
+| `python -m compileall -q server/app` | 通过 |
 
 ## 7. 阶段 1 的一处方案更正
 
-核实依赖现状时发现方案 v2.1 §阶段 1 的注记有误,已在该文档内更正:
+核实阶段 1 实施前的依赖状态时发现方案 v2.1 §阶段 1 的注记有误,
+已在该文档内更正。下表是 **2026-09-26 的历史状态**,不是当前安装状态:
 
 | 位置 | React | 独立 lock | 独立 `node_modules` |
 |---|---|---|---|
 | 根 | 19.2.8 | 有 | 有 |
 | `apps/wps-addin` | 19.1.1 | 有,且已被 git 跟踪 | 有,237 个包 |
 
-双份 React 是**当前就存在的事实**,不是"someone runs npm install 才触发"的潜在风险。
-`package.json` 的 `test:wps`/`build:wps` 用 `npm --prefix` 而非 `--workspace`,
-印证 WPS 从一开始就是独立安装的子项目。
+双份 React 在阶段 1 前就存在,不是"someone runs npm install 才触发"的潜在风险。
+当时 `package.json` 的 `test:wps`/`build:wps` 使用 `npm --prefix` 而非
+`--workspace`,印证 WPS 原先是独立安装的子项目。
 
-因此 v1 写的"删 `apps/wps-addin/package-lock.json`"这一步**是必要的**,
-v2 删掉它是基于错误核实。阶段 1 必须删该 lock(git 中一并删除)、
-删 `apps/wps-addin/node_modules`、纳入根 workspaces、脚本改 `--workspace`、根目录重装,
-退出闸 `npm ls react` 只剩一个版本。
+因此 v1 写的"删 `apps/wps-addin/package-lock.json`"这一步确有必要,
+v2 删掉它是基于错误核实。阶段 1 已在 `fb59672` 完成对应处理;
+退出闸 `npm ls react` 只剩一份 `19.2.8`,详见阶段 1 workspace 记录。

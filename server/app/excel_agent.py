@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import time
+import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -20,12 +21,28 @@ from .agent_loop_protection import (
     should_stop,
     update_loop_state,
 )
-from .capabilities import capability_float, capability_int
+from .action_capability import (
+    ActionCapability,
+    CapabilityMatrix,
+    HostCapabilityMatrix,
+    intersect_action_capabilities,
+    is_action_allowed_by_keys,
+    parse_host_id,
+    resolve_host_action_bound,
+)
+from .capabilities import capabilities, capability_float, capability_int
+from .column_mapping import (
+    build_column_mapping_actions,
+    validate_column_mapping_shape,
+)
 from .llm import ModelConnection, OpenAICompatibleClient
 from .models import (
     AnalysisPlan,
     AnswerResponse,
     AssistantResponse,
+    ColumnMappingPair,
+    ColumnMappingRule,
+    LocalPlanRuleResponse,
     PlanRequest,
     PlanResponse,
     ResultContext,
@@ -112,6 +129,12 @@ AGENT_SYSTEM_PROMPT = """
 不要把算出来的结果塞进 writeValues.values。那是一张一次性快照：源数据改一格
 结果就过期了，而计划本身无法重算，用户只能重新提问。同样的需求用
 computeValues 表达，改完数据直接重跑就是新结果。
+
+按对应关系把一列翻译成另一列（分类、归类、打标签、编码转名称）时，调用
+map_column_values，**不要**自己逐格抄写再提交 writeValues。你只给映射规则和
+区域，目标值由服务端算出：逐格抄写会漏行，也会把没列出的来源值自行归类，
+而这两种错误在单元格层面都看不出来。用户没说空白单元格写什么，或来源值未
+被规则覆盖时，先问清楚，不要替用户决定。
 
 - 若请求包含“本地数据工具结果”，该结果由 Excel 端对用户授权范围进行确定性
   计算，可以直接引用它的 headers、rows、calculation 和完整性标记来**回答问题**
@@ -235,6 +258,238 @@ def _read_range(request: PlanRequest, sheet_name: str, address: str) -> dict[str
     }
 
 
+def _snapshot_region(
+    request: PlanRequest, sheet_name: str, address: str
+) -> tuple[Any, list[list[Any]]]:
+    """从快照读取区域值，**越界即拒绝，不补 None**。
+
+    `_read_range` 对快照外的格子补 `None`：那对只读查询是合适的降级，模型
+    看到空值会继续追问。但映射结果是要**落盘**的 —— 补出来的 `None` 会被
+    映射成空白标签，写进实际上没有数据的行，用户看到凭空多出来的一列标签。
+
+    行边界按**实际捕获量**（`len(headers) + len(dataRows)`）判定而不是
+    `rowCount`：`rowCount` 是宿主报告的总行数，快照截断时它仍然很大。
+    列边界按**声明宽度** `columnCount` 判定：`dataRows` 的行可能因尾部空值
+    被裁短，此时区域内缺失的项是真实空格，折成 `None` 是正确的。
+
+    行/列 × 早于原点/超出范围，**四个方向都要拒**。共享夹具
+    `config/mapping_slice_cases.json` 与客户端 `sliceMappingSource` 跑同一批
+    用例，此前两侧各漏一个方向（本函数不拦左侧列早于原点、客户端不拦右侧列
+    溢出），各自静默折成空值。
+    """
+    sheet = _sheet(request, sheet_name)
+    match = re.fullmatch(
+        r"\$?([A-Za-z]{1,3})\$?(\d+)(?::\$?([A-Za-z]{1,3})\$?(\d+))?",
+        address.strip(),
+    )
+    if not match:
+        raise ValueError("range 必须是 A1 或 A1:B10 格式")
+    min_column = _column_number(match.group(1))
+    min_row = int(match.group(2))
+    max_column = _column_number(match.group(3) or match.group(1))
+    max_row = int(match.group(4) or match.group(2))
+    if max_column < min_column or max_row < min_row:
+        raise ValueError("range 的结束位置不能早于开始位置")
+    if (
+        max_row - min_row + 1 > MAX_READ_ROWS
+        or max_column - min_column + 1 > MAX_READ_COLUMNS
+    ):
+        raise ValueError(f"单次最多读取 {MAX_READ_ROWS} 行、{MAX_READ_COLUMNS} 列")
+
+    origin_column, origin_row = _used_origin(sheet.usedRange)
+    rows = [sheet.headers, *sheet.dataRows]
+    if min_row < origin_row:
+        raise ValueError(
+            f"区域 {address} 起始于第 {min_row} 行，"
+            f"早于「{sheet.name}」已捕获区域的起点第 {origin_row} 行。"
+        )
+    last_captured_row = origin_row + len(rows) - 1
+    if max_row > last_captured_row:
+        truncation_note = (
+            "（该表快照已截断，请缩小区域或分批处理）" if sheet.truncated else ""
+        )
+        raise ValueError(
+            f"「{sheet.name}」的快照只到第 {last_captured_row} 行，"
+            f"区域 {address} 要到第 {max_row} 行，超出已捕获范围{truncation_note}。"
+            "映射结果会写入工作表，不能对没读到的行补空值。"
+        )
+    if min_column < origin_column:
+        raise ValueError(
+            f"区域 {address} 起始于第 {_column_name(min_column)} 列，"
+            f"早于「{sheet.name}」已捕获区域的起点第 "
+            f"{_column_name(origin_column)} 列。"
+        )
+    last_captured_column = origin_column + max(sheet.columnCount, 1) - 1
+    if max_column > last_captured_column:
+        raise ValueError(
+            f"「{sheet.name}」已用区域只到第 {_column_name(last_captured_column)} 列，"
+            f"区域 {address} 要到第 {_column_name(max_column)} 列，超出该范围。"
+        )
+
+    values: list[list[Any]] = []
+    for row in range(min_row, max_row + 1):
+        source_row = rows[row - origin_row]
+        values.append(
+            [
+                source_row[column - origin_column]
+                if 0 <= column - origin_column < len(source_row)
+                else None
+                for column in range(min_column, max_column + 1)
+            ]
+        )
+    return sheet, values
+
+
+def _mapping_from_pairs(pairs: Any) -> dict[str, str]:
+    """把 `[{from,to}]` 折成映射表。
+
+    用成对列表而不是任意键对象：后者在各家 strict function schema 下的支持
+    参差不齐。重复的 `from` **报错而不是后者覆盖前者** —— 同一来源值给了两个
+    目标标签是需求本身有歧义，静默取一个等于替用户做了没有依据的选择。
+    """
+    if not isinstance(pairs, list) or not pairs:
+        raise ValueError("mapping 至少要有一条「来源值 → 目标标签」。")
+    mapping: dict[str, str] = {}
+    for entry in pairs:
+        if not isinstance(entry, dict):
+            raise ValueError("mapping 的每一项都要是 {from, to} 对象。")
+        source = entry.get("from")
+        target = entry.get("to")
+        if not isinstance(source, str) or not isinstance(target, str) or not target:
+            raise ValueError("mapping 每一项的 from 与 to 都必须是非空字符串。")
+        if source in mapping and mapping[source] != target:
+            raise ValueError(
+                f"mapping 对来源值「{source}」给了两个目标标签"
+                f"（「{mapping[source]}」与「{target}」），请确认后只保留一个。"
+            )
+        mapping[source] = target
+    return mapping
+
+
+def _map_column_plan(
+    request: PlanRequest, arguments: dict[str, Any]
+) -> PlanResponse | LocalPlanRuleResponse:
+    """按模型给定的映射参数产出计划，**值由确定性代码算，模型不经手**。
+
+    分工：模型只决定「哪一列、按哪张映射表、空白叫什么」。模型逐格抄写映射
+    结果时会漏行、会自行归类未列出的值，而这类错误在单元格层面看不出来。
+
+    谁来算，取决于**源值在谁手上**，这由 `planningReadPolicy` 表达：
+
+    - `"ifNeeded"`：快照带值（Office）或服务端能直接读文件（文件夹通道）→
+      服务端算，返回可执行的 `PlanResponse`。
+    - `"none"`：客户端声明「我自己读、值不上传」（WPS）→ 服务端手上没有源值，
+      只下发规则，客户端用 `packages/core` 的同一份实现算，返回
+      `LocalPlanRuleResponse`。
+
+    分叉条件刻意是**读策略而不是宿主**：服务端不认识宿主，也不该认识。
+    任何送 `"none"` 的客户端都走同一条路。
+
+    产出的是 `writeValues`，与系统提示里「不要把算出来的结果塞进
+    writeValues」看似冲突，实则不同：那条针对的是**聚合查询结果**（源数据
+    一变就过期，应改用 computeValues 在执行时重算）；这里写入的是用户给定
+    的分类标签表的查表结果，映射表本身就是固定输入。但它确实仍是一张快照，
+    所以计划里明确写出这一点。
+    """
+    source_sheet_name = str(arguments.get("sourceSheet", ""))
+    # 先只解析表名：`"none"` 时没有源值可读，但「表不存在」仍应立刻拦下。
+    source_sheet = _sheet(request, source_sheet_name)
+    target_sheet_name = str(arguments.get("targetSheet", "")).strip()
+    # 未指定目标表时按源表处理；重叠由 build_column_mapping_actions 拦下。
+    target_sheet = (
+        _sheet(request, target_sheet_name).name
+        if target_sheet_name
+        else source_sheet.name
+    )
+    source_range = str(arguments.get("sourceRange", "")).strip().upper().replace("$", "")
+    target_range = str(arguments.get("targetRange", "")).strip().upper().replace("$", "")
+    mapping = _mapping_from_pairs(arguments.get("mapping"))
+    blank_label = str(arguments.get("blankLabel", "")).strip()
+    if not blank_label:
+        raise ValueError(
+            "blankLabel 不能为空：源列存在空白单元格时，必须先确定它们写入什么。"
+        )
+
+    assumptions = [
+        f"映射规则共 {len(mapping)} 条，全部来自本次需求，未自行补充。",
+        f"源列空白按「{blank_label}」处理。",
+    ]
+    warnings = [
+        f"写入的是按当前源数据查表得到的固定值；"
+        f"「{source_sheet.name}」{source_range} 之后再改动，"
+        f"「{target_sheet}」{target_range} 不会自动跟着变。",
+        f"如果「{target_sheet}」{target_range} 已有内容，执行后会被覆盖。",
+    ]
+
+    if request.planningReadPolicy == "none":
+        # 没有源值，但该拦的仍要拦：范围解析、形状不符、同表重叠三类错误
+        # 不需要值就能判定。留到客户端才发现等于把错误推到模型离开循环之后，
+        # 那时它已经无法修正参数了。
+        rows, columns = validate_column_mapping_shape(
+            source_sheet=source_sheet.name,
+            target_sheet=target_sheet,
+            source_range=source_range,
+            target_range=target_range,
+            blank_label=blank_label,
+        )
+        return LocalPlanRuleResponse(
+            provider="model",
+            rule=ColumnMappingRule(
+                sourceSheet=source_sheet.name,
+                targetSheet=target_sheet,
+                sourceRange=source_range,
+                targetRange=target_range,
+                # 从校验过的映射表回建，而不是原样转发模型给的数组：
+                # 重复键已在 _mapping_from_pairs 里判过，这里输出的是去重结果。
+                mapping=[
+                    ColumnMappingPair(source=source, target=target)
+                    for source, target in mapping.items()
+                ],
+                blankLabel=blank_label,
+            ),
+            summary=(
+                f"按 {len(mapping)} 条映射规则，把「{source_sheet.name}」"
+                f"{source_range}（{rows}×{columns}）写入「{target_sheet}」"
+                f"{target_range}；空白单元格写「{blank_label}」。"
+                "源值不上传，由本端读取并计算。"
+            ),
+            assumptions=assumptions,
+            warnings=warnings,
+        )
+
+    source_sheet, source_values = _snapshot_region(
+        request, source_sheet_name, str(arguments.get("sourceRange", ""))
+    )
+    actions = build_column_mapping_actions(
+        source_sheet=source_sheet.name,
+        target_sheet=target_sheet,
+        source_range=source_range,
+        target_range=target_range,
+        source_values=source_values,
+        mapping=mapping,
+        blank_label=blank_label,
+    )
+    plan = AnalysisPlan.model_validate(
+        {
+            "id": f"map-column-{uuid.uuid4().hex[:10]}",
+            "title": f"按映射表填写 {target_sheet}!{target_range}",
+            "summary": (
+                f"读取「{source_sheet.name}」{source_range} 的 "
+                f"{len(source_values)} 行，按 {len(mapping)} 条映射规则"
+                f"写入「{target_sheet}」{target_range}；"
+                f"空白单元格写「{blank_label}」。"
+            ),
+            "assumptions": assumptions,
+            "warnings": warnings,
+            "actions": actions,
+        }
+    )
+    # 该终局工具也产出计划，同样要过规划出口的能力收窄 ——
+    # 否则它会成为绕过 `submit_plan` 检查的第二条路径。
+    _enforce_action_capabilities(request, plan)
+    return PlanResponse(provider="model", plan=plan)
+
+
 def _find_fields(request: PlanRequest, query: str) -> dict[str, Any]:
     normalized = re.sub(r"[\W_]+", "", query).casefold()
     matches: list[dict[str, Any]] = []
@@ -341,6 +596,83 @@ def _strip_metadata(node: Any) -> Any:
     return result
 
 
+def _capability_matrix() -> CapabilityMatrix:
+    """从 `config/capabilities.json` 的 `hostCapabilities` 构造可信上界矩阵。
+
+    配置缺失或形态不对时返回**空矩阵**：空矩阵 → 空上界 → 空交集 →
+    没有动作可规划。这是保守失败，不是静默放开。
+    """
+    raw = capabilities().get("hostCapabilities")
+    if not isinstance(raw, dict):
+        return CapabilityMatrix()
+    hosts: dict[str, HostCapabilityMatrix] = {}
+    for host_id, entry in raw.items():
+        if not isinstance(entry, dict):
+            continue
+        versions: dict[str, dict[str, ActionCapability]] = {}
+        for prefix, actions in (entry.get("versions") or {}).items():
+            if not isinstance(actions, dict):
+                continue
+            versions[str(prefix)] = {
+                str(action): ActionCapability.model_validate(capability)
+                for action, capability in actions.items()
+                if isinstance(capability, dict)
+            }
+        hosts[str(host_id)] = HostCapabilityMatrix(
+            enabled=bool(entry.get("enabled", True)),
+            versions=versions,
+        )
+    return CapabilityMatrix(hosts=hosts)
+
+
+def _allowed_action_types(request: PlanRequest) -> set[str]:
+    """服务端上界 ∩ 客户端自报（方案 §4.3）。
+
+    请求**没有** `hostId` 时返回空集 —— 那表示调用方没走能力协商这条路，
+    不是"没声明就放开"。现有的 `/api/plan` 兼容入口与文件夹通道都会命中这一支，
+    它们的动作边界由各自的后续校验负责，不在这里被意外放宽。
+    """
+    if not parse_host_id(request.hostId):
+        return set()
+    bound = resolve_host_action_bound(
+        _capability_matrix(), request.hostId, request.hostVersion
+    )
+    return intersect_action_capabilities(bound, request.selfReportedActions)
+
+
+def _enforce_action_capabilities(request: PlanRequest, plan: AnalysisPlan) -> None:
+    """规划出口的能力收窄检查。
+
+    这是第二道防线（客户端收窄 → 服务端定上界 → 执行预检兜底）。
+
+    三种情形的处理必须分开，混为一谈等于开一个口子：
+
+    | 请求 | 处理 | 理由 |
+    | --- | --- | --- |
+    | **未声明** `hostId` | 不检查，保持原行为 | 兼容入口（`/api/plan`、文件夹通道）没走能力协商，动作边界由各通道后续校验负责；在这里顺手拒绝会误伤现有路径 |
+    | 声明了宿主标识 | 按下述规则强制 | 调用方明确要求走能力协商 |
+    | 声明了但**无法识别** | **拒绝** | 未知宿主的上界是空集，不能因为"这个 id 我不认识"就跳过整道闸 —— 那正是构造请求绕过检查的入口 |
+
+    最后一行的判定用"字段有没有值"而不是"能不能解析出宿主"来分流，
+    这两个条件在自报了无法识别标识时结果相反，而后者才是安全的那个。
+    """
+    declared = bool((request.hostId or "").strip())
+    if not declared:
+        return
+    allowed = _allowed_action_types(request)
+    for action in plan.actions:
+        action_type = str(getattr(action, "type", ""))
+        variant = action.applyTo if action_type == "clearRange" else None
+        if is_action_allowed_by_keys(allowed, action_type, variant):
+            continue
+        key = f"{action_type}:{variant}" if variant else action_type
+        raise ValueError(
+            f"动作「{key}」不在当前宿主与版本已验收的能力范围内，已拒绝整份计划。"
+            "未验收的动作不进入规划，也不会被执行；请改用已开放的动作，"
+            "或在完成该动作的实机验收后再启用。"
+        )
+
+
 def _plan_tool_schema() -> dict[str, Any]:
     """Compact submit_plan schema.
 
@@ -430,6 +762,65 @@ def _terminal_tools() -> list[dict[str, Any]]:
                     "type": "object",
                     "properties": {"plan": plan_schema},
                     "required": ["plan"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "map_column_values",
+                "description": (
+                    "按用户给定的对应关系把一列的值翻译成另一列的标签（分类、"
+                    "归类、打标签、编码转名称等）。你只提供映射规则与区域，"
+                    "**目标值由服务端逐格算出**，不要自己抄写结果，也不要改用 "
+                    "writeValues 手填。来源值未列在 mapping 里时会报错并列出"
+                    "缺失的值——补全规则或向用户确认，不要自行归类。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "sourceSheet": {"type": "string", "description": "来源工作表名。"},
+                        "sourceRange": {
+                            "type": "string",
+                            "description": "来源单列区域，如 D2:D200，不含表头。",
+                        },
+                        "targetSheet": {
+                            "type": "string",
+                            "description": "目标工作表名；与来源同表时可省略。",
+                        },
+                        "targetRange": {
+                            "type": "string",
+                            "description": "目标区域，行数须与来源一致，如 E2:E200。",
+                        },
+                        "mapping": {
+                            "type": "array",
+                            "description": "用户给出的全部对应关系，不要自行补充。",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "from": {"type": "string"},
+                                    "to": {"type": "string"},
+                                },
+                                "required": ["from", "to"],
+                                "additionalProperties": False,
+                            },
+                        },
+                        "blankLabel": {
+                            "type": "string",
+                            "description": (
+                                "来源为空白时写入的标签。用户没说就先用 "
+                                "submit_answer 问清楚，不要擅自取值。"
+                            ),
+                        },
+                    },
+                    "required": [
+                        "sourceSheet",
+                        "sourceRange",
+                        "targetRange",
+                        "mapping",
+                        "blankLabel",
+                    ],
                     "additionalProperties": False,
                 },
             },
@@ -570,13 +961,16 @@ def _execute_tool(
             str(arguments.get("sheet", "")),
             str(arguments.get("range", "")),
         )
+    if name == "map_column_values":
+        return _map_column_plan(request, arguments)
     if name == "submit_plan":
-        return PlanResponse(
-            provider="model",
-            plan=AnalysisPlan.model_validate(
-                _normalize_submitted_plan(arguments.get("plan"))
-            ),
+        plan = AnalysisPlan.model_validate(
+            _normalize_submitted_plan(arguments.get("plan"))
         )
+        # 规划出口的能力收窄：未验收的动作在生成计划时就拒绝，
+        # 而不是让用户看到一个生成好的计划之后在执行预检被拒（方案 §4.3）。
+        _enforce_action_capabilities(request, plan)
+        return PlanResponse(provider="model", plan=plan)
     if name == "submit_answer":
         return AnswerResponse(
             provider="model",
@@ -644,6 +1038,22 @@ def _tool_argument_facts(
             [
                 _progress_fact("工作表", arguments.get("sheet", "")),
                 _progress_fact("范围", arguments.get("range", ""), style="code"),
+            ]
+        )
+    elif name == "map_column_values":
+        mapping = arguments.get("mapping")
+        facts.extend(
+            [
+                _progress_fact(
+                    "来源",
+                    f"{arguments.get('sourceSheet', '')}!{arguments.get('sourceRange', '')}",
+                    style="code",
+                ),
+                _progress_fact("目标", arguments.get("targetRange", ""), style="code"),
+                _progress_fact(
+                    "映射规则", len(mapping) if isinstance(mapping, list) else 0
+                ),
+                _progress_fact("空白写作", arguments.get("blankLabel", "")),
             ]
         )
     elif name == "submit_plan":
@@ -1328,7 +1738,9 @@ async def run_excel_agent(
                     arguments = parsed_arguments
                     step_text = _tool_step(name, arguments)
                     if step_text is None:
-                        if name == "submit_plan":
+                        if name == "map_column_values":
+                            step_text = "正在按映射表计算目标列"
+                        elif name == "submit_plan":
                             step_text = "正在校验操作计划"
                         elif name == "submit_answer":
                             step_text = "正在校验回答"
@@ -1372,8 +1784,36 @@ async def run_excel_agent(
                             )
                     else:
                         result = _execute_tool(request, name, arguments)
-                        if isinstance(result, (PlanResponse, AnswerResponse)):
-                            if isinstance(result, PlanResponse):
+                        if isinstance(
+                            result,
+                            (PlanResponse, AnswerResponse, LocalPlanRuleResponse),
+                        ):
+                            if isinstance(result, LocalPlanRuleResponse):
+                                await emit(
+                                    tool_step_id,
+                                    "映射规则已通过结构校验",
+                                    status="completed",
+                                    summary=result.summary,
+                                    tool_name=name,
+                                    facts=[
+                                        fact
+                                        for fact in [
+                                            _progress_fact(
+                                                "计算位置", "由本端读取源值并计算"
+                                            )
+                                        ]
+                                        if fact is not None
+                                    ],
+                                    trace={
+                                        "kind": "decision",
+                                        "summary": result.summary,
+                                        "basis": (
+                                            f"共 {len(result.rule.mapping)} 条映射规则，"
+                                            "源值不上传"
+                                        ),
+                                    },
+                                )
+                            elif isinstance(result, PlanResponse):
                                 action_types = "、".join(
                                     action.type for action in result.plan.actions
                                 )
