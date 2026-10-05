@@ -86,6 +86,7 @@ class OfficeExecutionRecord:
     plan: dict[str, Any]
     authorization: dict[str, Any]
     workbook_identity: str
+    task_id: str | None
     status: OfficeExecutionStatus
     next_action_index: int
     in_flight_action_index: int | None
@@ -271,6 +272,7 @@ class FolderOperationLedger:
                     plan_json TEXT NOT NULL,
                     authorization_json TEXT NOT NULL,
                     workbook_identity TEXT NOT NULL,
+                    task_id TEXT,
                     status TEXT NOT NULL CHECK (
                         status IN ('running', 'needs_reconciliation', 'completed', 'failed')
                     ),
@@ -333,7 +335,17 @@ class FolderOperationLedger:
                 connection.execute(
                     "ALTER TABLE planning_budget_extensions ADD COLUMN model_id TEXT"
                 )
-            connection.execute("PRAGMA user_version = 7")
+            office_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(office_executions)"
+                ).fetchall()
+            }
+            if "task_id" not in office_columns:
+                connection.execute(
+                    "ALTER TABLE office_executions ADD COLUMN task_id TEXT"
+                )
+            connection.execute("PRAGMA user_version = 8")
             self._initialized_paths.add(path)
 
     @staticmethod
@@ -399,6 +411,7 @@ class FolderOperationLedger:
             plan=plan,
             authorization=authorization,
             workbook_identity=str(row["workbook_identity"]),
+            task_id=str(row["task_id"]) if row["task_id"] is not None else None,
             status=str(row["status"]),  # type: ignore[arg-type]
             next_action_index=int(row["next_action_index"]),
             in_flight_action_index=(
@@ -1467,17 +1480,25 @@ class FolderOperationLedger:
         plan: dict[str, Any],
         authorization: dict[str, Any],
         workbook_identity: str,
+        identity_prefix: str = "url:",
+        task_id: str | None = None,
     ) -> tuple[OfficeExecutionRecord, bool]:
-        """Register the durable intent before the first supported Office write."""
+        """Register the durable intent before the first supported host write.
+
+        `identity_prefix` 是宿主身份命名空间：Office 用 ``url:``（绑定
+        ``Office.context.document.url``），WPS 用 ``wps-path:``（绑定已保存工作簿的
+        小写磁盘完整路径）。两种前缀互不冒充 —— 已存在记录的身份按**完整字符串**
+        比较，跨前缀的重放必然命中"属于另一个工作簿"而拒绝，不会借前缀蒙混。
+        """
 
         encoded_plan = self._encode(plan)
         encoded_authorization = self._encode(authorization)
         maximum_size = capability_int("taskRecovery", "maxCheckpointBytes")
         if len(encoded_plan.encode("utf-8")) > maximum_size:
-            raise ValueError("Office 执行计划超过可持久化容量上限")
+            raise ValueError("执行计划超过可持久化容量上限")
         if len(encoded_authorization.encode("utf-8")) > maximum_size:
-            raise ValueError("Office 执行授权现场超过可持久化容量上限")
-        if not workbook_identity.startswith("url:"):
+            raise ValueError("执行授权现场超过可持久化容量上限")
+        if not workbook_identity.startswith(identity_prefix):
             raise ValueError("未保存或无法稳定识别的工作簿不能启用自动断点续跑")
         now = time.time()
         owner_token = uuid.uuid4().hex
@@ -1492,9 +1513,9 @@ class FolderOperationLedger:
                     """
                     INSERT INTO office_executions (
                         operation_id, request_fingerprint, plan_json,
-                        authorization_json, workbook_identity, status,
+                        authorization_json, workbook_identity, task_id, status,
                         owner_token, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?)
                     """,
                     (
                         operation_id,
@@ -1502,6 +1523,7 @@ class FolderOperationLedger:
                         encoded_plan,
                         encoded_authorization,
                         workbook_identity,
+                        task_id,
                         owner_token,
                         now,
                         now,
@@ -1517,9 +1539,11 @@ class FolderOperationLedger:
             connection.commit()
         record = self._office_record(row)
         if record.request_fingerprint != request_fingerprint:
-            raise RuntimeError("该 operationId 已用于另一份 Office 执行请求")
+            raise RuntimeError("该 operationId 已用于另一份执行请求")
         if record.workbook_identity != workbook_identity:
-            raise RuntimeError("该 Office 执行属于另一个工作簿")
+            raise RuntimeError("该执行属于另一个工作簿")
+        if task_id is not None and record.task_id != task_id:
+            raise RuntimeError("该 operationId 已绑定到另一个任务")
         return record, False
 
     def office_execution(self, operation_id: str) -> OfficeExecutionRecord | None:
@@ -1673,6 +1697,7 @@ class FolderOperationLedger:
         operation_id: str,
         *,
         expected_revision: int,
+        require_idle: bool = False,
     ) -> OfficeExecutionRecord:
         """Rotate the owner token; an old task pane can no longer commit receipts."""
 
@@ -1680,6 +1705,8 @@ class FolderOperationLedger:
         owner_token = uuid.uuid4().hex
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            if require_idle:
+                self._assert_wps_idle(connection, operation_id, now)
             changed = connection.execute(
                 """
                 UPDATE office_executions
@@ -1710,6 +1737,7 @@ class FolderOperationLedger:
         action_index: int,
         outcome: Literal["applied", "not_applied"],
         checkpoint: dict[str, Any] | None = None,
+        require_idle: bool = False,
     ) -> OfficeExecutionRecord:
         if outcome == "applied" and checkpoint is None:
             raise ValueError("补记已应用动作必须提供完整检查点")
@@ -1723,6 +1751,8 @@ class FolderOperationLedger:
         next_action_index = action_index + 1 if outcome == "applied" else action_index
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            if require_idle:
+                self._assert_wps_idle(connection, operation_id, now)
             changed = connection.execute(
                 """
                 UPDATE office_executions
@@ -1756,6 +1786,19 @@ class FolderOperationLedger:
             connection.commit()
         assert row is not None
         return self._office_record(row)
+
+    @staticmethod
+    def _assert_wps_idle(connection: sqlite3.Connection, operation_id: str, now: float) -> None:
+        row = connection.execute(
+            "SELECT workbook_identity, status, updated_at FROM office_executions WHERE operation_id = ?",
+            (operation_id,),
+        ).fetchone()
+        if row is None or not str(row["workbook_identity"]).startswith("wps-path:"):
+            raise RuntimeError("未找到这次 WPS 执行记录")
+        if row["status"] == "running" and float(row["updated_at"]) + capability_int(
+            "taskRecovery", "wpsOwnerLeaseSeconds"
+        ) > now:
+            raise RuntimeError("原执行者仍持有 WPS 执行权，请等待或由原执行者挂起后再核对")
 
     def finish_office_execution(
         self,

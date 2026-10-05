@@ -560,3 +560,95 @@ def test_office_execution_refuses_unstable_or_changed_workbook_identity(tmp_path
             authorization={"authorizedSheetNames": ["Sheet1"]},
             workbook_identity="url:c:/other/report.xlsx",
         )
+
+
+def test_wps_execution_registers_with_path_identity_and_task_id(tmp_path) -> None:
+    ledger = FolderOperationLedger(lambda: tmp_path / "state.sqlite3")
+    plan = {
+        "id": "plan-wps",
+        "title": "写入区域",
+        "summary": "写入两个单元格",
+        "assumptions": [],
+        "warnings": [],
+        "actions": [
+            {
+                "type": "writeValues",
+                "sheet": "Sheet1",
+                "range": "A1:A1",
+                "values": [["完成"]],
+            }
+        ],
+    }
+    record, created = ledger.register_office_execution(
+        "wps-execution-0001",
+        "fingerprint-wps",
+        plan=plan,
+        authorization={"authorizedSheetNames": ["Sheet1"]},
+        workbook_identity="wps-path:c:/work/report.xlsx",
+        identity_prefix="wps-path:",
+        task_id="task-keep",
+    )
+    assert created is True
+    assert record.task_id == "task-keep"
+    assert record.workbook_identity.startswith("wps-path:")
+
+    # 同 operationId 重放（身份、指纹、taskId 一致）→ 不新建，返回既有记录。
+    replay, recreated = ledger.register_office_execution(
+        "wps-execution-0001",
+        "fingerprint-wps",
+        plan=plan,
+        authorization={"authorizedSheetNames": ["Sheet1"]},
+        workbook_identity="wps-path:c:/work/report.xlsx",
+        identity_prefix="wps-path:",
+        task_id="task-keep",
+    )
+    assert recreated is False
+    assert replay.operation_id == record.operation_id
+
+    # 同 operationId 但绑定不同 taskId → 拒绝（幂等身份不得翻新）。
+    with pytest.raises(RuntimeError, match="另一个任务"):
+        ledger.register_office_execution(
+            "wps-execution-0001",
+            "fingerprint-wps",
+            plan=plan,
+            authorization={"authorizedSheetNames": ["Sheet1"]},
+            workbook_identity="wps-path:c:/work/report.xlsx",
+            identity_prefix="wps-path:",
+            task_id="task-other",
+        )
+
+
+def test_wps_execution_refuses_unprefixed_or_office_identity(tmp_path) -> None:
+    ledger = FolderOperationLedger(lambda: tmp_path / "state.sqlite3")
+    plan = {"id": "p", "actions": [{"type": "writeValues"}]}
+
+    # WPS 身份没有 wps-path: 前缀 → 拒绝（未保存 / 无法稳定识别）。
+    with pytest.raises(ValueError, match="未保存"):
+        ledger.register_office_execution(
+            "wps-execution-0002",
+            "fingerprint",
+            plan=plan,
+            authorization={"authorizedSheetNames": ["Sheet1"]},
+            workbook_identity="c:/work/report.xlsx",
+            identity_prefix="wps-path:",
+        )
+
+    # 同 operationId 先用 wps-path: 登记，再用 url: 重放 → 身份前缀不同，
+    # 完整字符串比较必然命中"另一个工作簿"，Office 与 WPS 互不冒充。
+    ledger.register_office_execution(
+        "wps-execution-0003",
+        "fingerprint",
+        plan=plan,
+        authorization={"authorizedSheetNames": ["Sheet1"]},
+        workbook_identity="wps-path:c:/work/report.xlsx",
+        identity_prefix="wps-path:",
+    )
+    with pytest.raises(RuntimeError, match="另一个工作簿"):
+        ledger.register_office_execution(
+            "wps-execution-0003",
+            "fingerprint",
+            plan=plan,
+            authorization={"authorizedSheetNames": ["Sheet1"]},
+            workbook_identity="url:c:/work/report.xlsx",
+            identity_prefix="url:",
+        )

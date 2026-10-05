@@ -1,5 +1,7 @@
 """测试 Agent 循环保护机制"""
 
+import pytest
+
 from server.app.agent_loop_protection import (
     LoopConfig,
     LoopState,
@@ -66,12 +68,17 @@ class TestLoopConfig:
         config = LoopConfig()
 
         assert config.max_turns == 8
-        assert config.max_total_tokens == 20_000
+        assert config.max_total_tokens is None
         assert config.max_wall_time_seconds == 60.0
         assert config.max_consecutive_errors == 3
         assert config.max_cache_hits_per_query == 3
         assert config.max_tool_path_loop_length == 4
         assert config.warning_turn == 5
+
+    @pytest.mark.parametrize("value", [0, -1, True, "20000", 3.5])
+    def test_invalid_token_budget_is_not_silently_disabled(self, value):
+        with pytest.raises(ValueError):
+            LoopConfig(max_total_tokens=value)
 
 
 class TestDetectActionConflict:
@@ -265,7 +272,21 @@ class TestBudgetControl:
     def test_should_stop_max_tokens(self):
         state = LoopState(total_tokens=20_000)
 
-        assert should_stop(state, LoopConfig()) == (True, "max_tokens")
+        assert should_stop(state, LoopConfig(max_total_tokens=20_000)) == (True, "max_tokens")
+
+    def test_disabled_token_budget_keeps_accounting_without_stopping(self):
+        state = LoopState(total_tokens=1_000_000)
+        restored = LoopState.from_checkpoint(state.to_checkpoint())
+        assert restored.total_tokens == 1_000_000
+        assert should_stop(restored, LoopConfig()) == (False, None)
+
+    @pytest.mark.parametrize("state, reason", [
+        (LoopState(total_tokens=1_000_000, turn_index=8), "max_turns"),
+        (LoopState(total_tokens=1_000_000, consecutive_errors=3), "consecutive_errors"),
+        (LoopState(total_tokens=1_000_000, elapsed_time=60), "timeout"),
+    ])
+    def test_disabled_tokens_do_not_disable_other_guards(self, state, reason):
+        assert should_stop(state, LoopConfig(max_total_tokens=None)) == (True, reason)
 
     def test_should_stop_timeout(self):
         state = LoopState(elapsed_time=60.0)
@@ -283,7 +304,7 @@ class TestBudgetControl:
     def test_structure_error_is_reported_before_its_token_side_effect(self):
         state = LoopState(consecutive_errors=3, total_tokens=20_000)
 
-        assert should_stop(state, LoopConfig()) == (
+        assert should_stop(state, LoopConfig(max_total_tokens=20_000)) == (
             True,
             "consecutive_errors",
         )

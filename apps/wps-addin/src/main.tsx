@@ -1,6 +1,7 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import WpsProbePanel from "./WpsProbePanel";
+import WideViewPocPanel from "./WideViewPocPanel";
 import { reportDevProbe } from "./devProbe";
 import { ribbon } from "./ribbon";
 // WPS 与 Excel 任务窗格共用同一套视觉基线。宿主差异只留在数据读取和
@@ -18,6 +19,8 @@ reportDevProbe("bootstrap", {
 
 function Root() {
   if (window.location.hash === "#/taskpane") return <WpsProbePanel />;
+  // 宽视图 PoC：独立哈希路由，正式接线前用它做实机能力探针。
+  if (window.location.hash === "#/wide-view-poc") return <WideViewPocPanel />;
   return (
     <main className="bootstrap-shell">
       <span className="probe-logo">EB</span>

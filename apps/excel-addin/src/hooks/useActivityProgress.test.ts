@@ -482,4 +482,43 @@ describe("useActivityProgress", () => {
     expect(clearIntervalSpy).toHaveBeenCalled();
     clearIntervalSpy.mockRestore();
   });
+
+  it("hands preparation to remote planning without leaving an earlier running step", () => {
+    const onPersistLog = vi.fn();
+    const { result } = renderHook(() => useActivityProgress({ onPersistLog }));
+    act(() => result.current.startActivity("正在读取字段", ""));
+    act(() => result.current.advanceActivity("正在理解需求", "", "已识别字段"));
+    act(() => result.current.completeCurrentStep("需求已确认"));
+    act(() => result.current.advanceActivity("正在准备规划请求", "重新核对范围"));
+    act(() => vi.advanceTimersByTime(100));
+    act(() => result.current.completeCurrentStep("已准备规划请求"));
+    act(() => result.current.applyProgressEvent(progressEvent({
+      phase: "planning", stepId: "planning.understand", status: "completed"
+    })));
+    act(() => result.current.applyProgressEvent(progressEvent({
+      sequence: 2, phase: "planning", stepId: "planning.model.1"
+    })));
+    expect(result.current.activity?.steps.slice(0, -1).every(
+      (step) => step.status === "completed"
+    )).toBe(true);
+    expect(result.current.activity?.steps[2]).toMatchObject({ elapsedMs: 100 });
+    act(() => result.current.completeActivity("completed", undefined, "awaiting_input"));
+    expect(onPersistLog.mock.calls[0][0].steps.every(
+      (step: { status: string }) => step.status === "completed"
+    )).toBe(true);
+  });
+
+  it("does not persist orphan running steps or pretend they completed", () => {
+    const onPersistLog = vi.fn();
+    const { result } = renderHook(() => useActivityProgress({ onPersistLog }));
+    act(() => result.current.startActivity("缺少结束事件的步骤", ""));
+    act(() => result.current.applyProgressEvent(progressEvent()));
+    act(() => result.current.completeActivity());
+    const log = onPersistLog.mock.calls[0][0];
+    expect(log.outcome).toBe("warning");
+    expect(log.steps[0]).toMatchObject({ status: "warning" });
+    expect(log.steps[0].note).toContain("未收到结束确认");
+    expect(log.steps.every((step: { status: string }) =>
+      !["started", "progress"].includes(step.status))).toBe(true);
+  });
 });

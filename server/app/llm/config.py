@@ -4,6 +4,7 @@ import os
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 import uuid
 
 from dotenv import set_key
@@ -36,6 +37,9 @@ class ModelNotAvailableError(ValueError):
 # 旧版本前端会在模型选择里保存虚拟的 "local"，它代表“基础模式”而不是一个
 # 真实模型连接。保留这个常量只用于识别和迁移旧记录，不再作为可选项返回。
 LEGACY_LOCAL_MODEL_ID = "local"
+CLAUDE_SDK_CATALOG_ID = "claude-agent-sdk"
+CLAUDE_SDK_MANAGED_PREFIX = f"{CLAUDE_SDK_CATALOG_ID}:"
+DEEPSEEK_ANTHROPIC_URL = "https://api.deepseek.com/anthropic"
 
 
 def _first_env(*names: str) -> str:
@@ -63,6 +67,77 @@ class ModelConnection:
     api_key: str
     supports_vision: bool
     adapter: str = "openai_compatible"
+
+
+def _claude_sdk_connection() -> ModelConnection | None:
+    """The SDK is an explicit, environment-managed model choice.
+
+    It never inherits an OpenAI-compatible connection's endpoint or key.
+    """
+    model = os.getenv("CLAUDE_AGENT_SDK_MODEL", "").strip()
+    key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    # The SDK stores local session transcripts. Never advertise it before the
+    # operator has chosen a dedicated destination outside this repository.
+    if not model or not key or not _claude_sdk_state_ready():
+        return None
+    return ModelConnection(
+        base_url="https://api.anthropic.com",
+        model=model,
+        api_key=key,
+        supports_vision=False,
+        adapter="claude_agent_sdk",
+    )
+
+
+def _claude_sdk_state_ready() -> bool:
+    state_dir = os.getenv("CLAUDE_AGENT_SDK_STATE_DIR", "").strip()
+    if not state_dir:
+        return False
+    state_path = Path(state_dir)
+    repository = Path(__file__).resolve().parents[3]
+    if not state_path.is_absolute():
+        return False
+    state_path = state_path.resolve()
+    if state_path == repository or repository in state_path.parents:
+        return False
+    return True
+
+
+def _deepseek_anthropic_url(base_url: str) -> str | None:
+    """Only translate DeepSeek's known OpenAI endpoint, never arbitrary URLs."""
+    try:
+        parsed = urlsplit(base_url.strip())
+    except ValueError:
+        return None
+    if (
+        parsed.scheme.lower() != "https"
+        or parsed.netloc.lower() != "api.deepseek.com"
+        or parsed.path.rstrip("/") not in ("", "/v1")
+        or parsed.query or parsed.fragment
+    ):
+        return None
+    return DEEPSEEK_ANTHROPIC_URL
+
+
+def _managed_sdk_connection(
+    model_id: str, managed: tuple[ManagedModelConnection, ...]
+) -> ModelConnection | None:
+    if not model_id.startswith(CLAUDE_SDK_MANAGED_PREFIX) or not _claude_sdk_state_ready():
+        return None
+    connection_id = model_id[len(CLAUDE_SDK_MANAGED_PREFIX):]
+    selected = next((item for item in managed if item.id == connection_id), None)
+    if selected is None or not selected.api_key:
+        return None
+    sdk_url = _deepseek_anthropic_url(selected.base_url)
+    if sdk_url is None:
+        return None
+    return ModelConnection(
+        base_url=sdk_url,
+        model=selected.model,
+        api_key=selected.api_key,
+        supports_vision=False,
+        adapter="claude_agent_sdk",
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -359,7 +434,11 @@ def resolve_model_config(
     应改用 ``selected_model_config``。
     """
     # 旧记录：优先按真实连接解析；没有任何真实连接时才是未配置。
+    if model_id == CLAUDE_SDK_CATALOG_ID:
+        return _claude_sdk_connection()
     managed = load_managed_connections()
+    if model_id and model_id.startswith(CLAUDE_SDK_MANAGED_PREFIX):
+        return _managed_sdk_connection(model_id, managed)
     if model_id and model_id.startswith("connection:"):
         selected = next(
             (
@@ -389,7 +468,7 @@ def resolve_model_config(
                 api_key=selected.api_key,
                 supports_vision=selected.supports_vision,
             )
-        return None
+        return _claude_sdk_connection()
     selected_model = model_id or settings.default_model
     if selected_model not in settings.models:
         return None
@@ -411,9 +490,24 @@ def selected_model_config(
 
     绝不返回 None，也绝不回退到任何规则模式或另一个供应商。
     """
+    if model_id == CLAUDE_SDK_CATALOG_ID:
+        connection = _claude_sdk_connection()
+        if connection is None:
+            raise ModelNotAvailableError(
+                "Claude Agent SDK 未配置；请设置模型、API Key，以及仓库外的绝对会话存储目录。"
+            )
+        return connection
     managed = load_managed_connections()
+    if model_id and model_id.startswith(CLAUDE_SDK_MANAGED_PREFIX):
+        connection = _managed_sdk_connection(model_id, managed)
+        if connection is None:
+            raise ModelNotAvailableError(
+                "Agent SDK 对应的模型连接不存在、端点不兼容或会话目录未配置。"
+            )
+        return connection
     settings = load_model_settings()
-    if not managed and settings is None:
+    sdk_connection = _claude_sdk_connection()
+    if not managed and settings is None and sdk_connection is None:
         raise ModelNotConfiguredError(
             "尚未配置任何模型连接。请填写服务地址、模型 ID 和 API Key 后重试。"
         )
@@ -444,6 +538,9 @@ def selected_model_config(
         # 只有托管连接可用。空 model_id 时取第一个真实连接，显式指定的
         # 裸模型名（来自 .env 风格配置）在托管目录里找不到就是不可用。
         if not model_id:
+            if not managed:
+                assert sdk_connection is not None
+                return sdk_connection
             selected = managed[0]
             return ModelConnection(
                 base_url=selected.base_url,
@@ -541,10 +638,30 @@ def model_catalog() -> dict[str, object]:
             "available": True,
             "supportsVision": connection.supports_vision,
         })
+        sdk_id = f"{CLAUDE_SDK_MANAGED_PREFIX}{connection.id}"
+        if _managed_sdk_connection(sdk_id, managed) is not None:
+            options.append({
+                "id": sdk_id,
+                "label": f"Agent SDK · {base_label}{suffix}",
+                "provider": "model",
+                "available": True,
+                "supportsVision": False,
+            })
+    sdk_connection = _claude_sdk_connection()
+    if sdk_connection is not None:
+        options.append({
+            "id": CLAUDE_SDK_CATALOG_ID,
+            "label": f"Claude Agent SDK · {sdk_connection.model}",
+            "provider": "model",
+            "available": True,
+            "supportsVision": False,
+        })
     if settings is not None:
         default_model_id: str | None = settings.default_model
     elif managed:
         default_model_id = managed[0].catalog_id
+    elif sdk_connection is not None:
+        default_model_id = CLAUDE_SDK_CATALOG_ID
     else:
         default_model_id = None
     return {
@@ -556,7 +673,8 @@ def model_catalog() -> dict[str, object]:
 def model_status() -> dict[str, str | bool | None]:
     settings = load_model_settings()
     managed = load_managed_connections()
-    if settings is None and not managed:
+    sdk_connection = _claude_sdk_connection()
+    if settings is None and not managed and sdk_connection is None:
         return {
             "configured": False,
             "mode": "model",
@@ -568,7 +686,7 @@ def model_status() -> dict[str, str | bool | None]:
         "model": (
             settings.default_model
             if settings is not None
-            else managed[0].model
+            else managed[0].model if managed else sdk_connection.model
         ),
     }
 

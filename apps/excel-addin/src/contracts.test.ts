@@ -5,6 +5,20 @@ import {
   parseTaskProgressEvent
 } from "./contracts";
 
+describe("structured planning stop", () => {
+  it("accepts explicit failure and remains compatible with old answers", () => {
+    expect(() => assertAssistantResponse({ kind: "answer", provider: "system", message: "停止",
+      outcome: "failed", stopReason: "max_tokens" })).not.toThrow();
+    expect(() => assertAssistantResponse({ kind: "answer", message: "模型响应被截断",
+      outcome: "failed", stopReason: "output_length" })).not.toThrow();
+    expect(() => assertAssistantResponse({ kind: "answer", provider: "model", message: "回答" })).not.toThrow();
+  });
+  it("rejects invalid outcomes and stop reasons", () => {
+    expect(() => assertAssistantResponse({ kind: "answer", message: "停止", outcome: "success-ish" })).toThrow();
+    expect(() => assertAssistantResponse({ kind: "answer", message: "停止", stopReason: "unknown" })).toThrow();
+  });
+});
+
 describe("parseTaskProgressEvent", () => {
   it("accepts structured progress and keeps auditable trace metadata", () => {
     const event = parseTaskProgressEvent({

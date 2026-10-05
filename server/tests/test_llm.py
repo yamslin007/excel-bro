@@ -183,6 +183,76 @@ def test_openai_compatible_client_sends_temperature_when_provided(
     assert captured["body"]["temperature"] == 0.1
 
 
+def test_provider_default_output_budget_is_absent_from_real_request(monkeypatch):
+    captured = []
+    async def handler(request):
+        captured.append(json.loads(request.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "ok"}}],
+            "usage": {"completion_tokens": 9000, "completion_tokens_details": {"reasoning_tokens": 8500}}})
+    original_client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original_client(transport=httpx.MockTransport(handler), **kwargs))
+    connection = ModelConnection(base_url="https://api.example.test/v1", model="generic", api_key="", supports_vision=False)
+    async def run():
+        async with OpenAICompatibleClient(connection, timeout=12) as client:
+            return await client.chat_completions(messages=[{"role": "user", "content": "hello"}], max_tokens=None)
+    _, usage = asyncio.run(run())
+    assert captured[0]["messages"]  # Not an empty-body privacy/budget assertion.
+    assert "max_tokens" not in captured[0]
+    assert "max_completion_tokens" not in captured[0]
+    assert usage["reasoning_tokens"] == 8500
+
+
+@pytest.mark.parametrize("value", [0, -1, True, "4000", 1.5])
+def test_optional_output_budget_rejects_invalid_configuration(monkeypatch, value):
+    import server.app.capabilities as limits
+    monkeypatch.setattr(limits, "capabilities", lambda: {"agent": {"maxOutputTokens": value}})
+    with pytest.raises(RuntimeError):
+        limits.capability_optional_int("agent", "maxOutputTokens")
+
+
+@pytest.mark.parametrize("value", [None, 8192])
+def test_optional_output_budget_accepts_default_or_positive_integer(monkeypatch, value):
+    import server.app.capabilities as limits
+    monkeypatch.setattr(limits, "capabilities", lambda: {"agent": {"maxOutputTokens": value}})
+    assert limits.capability_optional_int("agent", "maxOutputTokens") == value
+
+
+def test_intent_and_planning_real_requests_omit_output_caps(monkeypatch):
+    from server.app.intent import check_intent
+    from server.app.excel_agent import run_excel_agent
+    from server.app.models import IntentCheckRequest, PlanRequest
+    captured = []
+    async def handler(request):
+        body = json.loads(request.content)
+        captured.append(body)
+        message = ({"content": json.dumps({"kind": "proceed", "summary": "清空授权范围", "confirmedPrompt": "清空 B2"})}
+                   if "tools" not in body else
+                   {"content": None, "tool_calls": [{"id": "answer", "type": "function", "function": {
+                       "name": "submit_answer", "arguments": json.dumps({"message": "需要用户确认，未写入"})}}]})
+        return httpx.Response(200, json={"choices": [{"message": message, "finish_reason": "stop"}]})
+    original_client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: original_client(transport=httpx.MockTransport(handler), **kwargs))
+    connection = ModelConnection(base_url="https://api.example.test/v1", model="generic", api_key="", supports_vision=False)
+    intent = IntentCheckRequest.model_validate({"prompt": "清空 B2", "scope": {
+        "workbookName": "test.xlsx", "sourceMode": "workbook", "selectionMode": "auto",
+        "activeWorksheet": "Sheet1", "totalWorksheetCount": 1, "worksheetNames": ["Sheet1"],
+        "sheets": [{"name": "Sheet1", "rowCount": 2, "columnCount": 2, "headers": ["类别", "结果"]}]}})
+    plan = PlanRequest.model_validate({"prompt": "清空 B2", "planningReadPolicy": "none", "workbook": {
+        "name": "test.xlsx", "capturedAt": "2026-10-03T00:00:00Z", "activeWorksheet": "Sheet1",
+        "worksheets": [{"name": "Sheet1", "usedRange": "A1:B2", "rowCount": 2, "columnCount": 2,
+            "headers": ["类别", "结果"], "dataRows": [["LOCAL_PRIVATE_SENTINEL", 3]], "truncated": False}]}})
+    assert "LOCAL_PRIVATE_SENTINEL" in str(plan.workbook.worksheets[0].dataRows)
+    async def run():
+        assert (await check_intent(intent, config=connection)).kind == "proceed"
+        assert (await run_excel_agent(plan, connection=connection, timeout=5)).kind == "answer"
+    asyncio.run(run())
+    assert len(captured) == 2
+    assert all(body["messages"] for body in captured)
+    assert "tools" not in captured[0] and captured[1]["tools"]
+    assert all("max_tokens" not in body for body in captured)
+    assert "LOCAL_PRIVATE_SENTINEL" not in json.dumps(captured)
+
+
 def test_adapter_normalizes_http_status_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

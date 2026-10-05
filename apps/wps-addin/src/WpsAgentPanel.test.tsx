@@ -5,25 +5,104 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MODEL_STORAGE_KEY } from "../../excel-addin/src/conversation";
 import { useModelManagement } from "../../excel-addin/src/hooks/useModelManagement";
-import { getModelSettings, listModels, validatePlan } from "../../excel-addin/src/api";
+import { getModelSettings, listModels, validatePlan, registerWpsExecution, getWpsExecutionStatus, startWpsAction, completeWpsAction, finishWpsExecution, suspendWpsExecution, claimWpsExecutionResume, reconcileWpsActionReceipt } from "../../excel-addin/src/api";
 import WpsAgentPanel from "./WpsAgentPanel";
+import { matrixFingerprintV2 } from "./wpsPlanExecutor";
 import WpsModelSettingsPanel from "./WpsModelSettingsPanel";
 import { runWpsReadonlyTurn } from "./wpsReadonlyAgent";
 import { getWpsApplication } from "./wpsHost";
+import {
+  COMPOSER_AUTO_GROW_MAX_HEIGHT,
+  COMPOSER_RESIZE_LABEL
+} from "../../excel-addin/src/hooks/useComposerResize";
+import { compareCommittedWpsResultToCopy, stageWpsNativeComparison, WpsFormulaTrialError } from "./wpsNativeComparison";
+import type { AnalysisPlan } from "../../excel-addin/src/contracts";
 
 vi.mock("../../excel-addin/src/api", async (importOriginal) => {
   const actual =
     await importOriginal<typeof import("../../excel-addin/src/api")>();
+  // CAP-03 服务端登记 API：面板测试不测真实网络，返回一个"已授予写入权"的
+  // 成功状态，让写路径能走完动作级检查点。真实登记失败/中止由独立测试覆盖。
+  const wpsRunningState = (
+    operationId: string,
+    revision = 1,
+    overrides: Record<string, unknown> = {}
+  ) => ({
+    operationId,
+    status: "running" as const,
+    revision,
+    workbookIdentity: "wps-path:c:\\data\\测试.xlsx",
+    taskId: "task-test",
+    descriptor: { actions: [] },
+    authorizedSheetNames: ["Sheet1"],
+    nextActionIndex: 0,
+    totalActions: 1,
+    inFlightActionIndex: null,
+    beforeSnapshot: null,
+    checkpoint: null,
+    result: null,
+    error: null,
+    canResume: true,
+    ownerActive: false,
+    requiresReconciliation: false,
+    ownerToken: "owner-token-0123456789abcdef0123456789abcdef",
+    ...overrides
+  });
   return {
     ...actual,
     listModels: vi.fn(),
     getModelSettings: vi.fn(),
-    validatePlan: vi.fn()
+    validatePlan: vi.fn(),
+    registerWpsExecution: vi.fn(async (input: { operationId: string }) =>
+      wpsRunningState(input.operationId)),
+    getWpsExecutionStatus: vi.fn(async (operationId: string) => wpsRunningState(operationId)),
+    startWpsAction: vi.fn(async (operationId: string, input: { expectedRevision: number }) =>
+      wpsRunningState(operationId, input.expectedRevision + 1)),
+    completeWpsAction: vi.fn(async (operationId: string, input: { expectedRevision: number }) =>
+      wpsRunningState(operationId, input.expectedRevision + 1)),
+    suspendWpsExecution: vi.fn(async (operationId: string) => wpsRunningState(operationId)),
+    claimWpsExecutionResume: vi.fn(async (operationId: string) => wpsRunningState(operationId)),
+    reconcileWpsActionReceipt: vi.fn(async (operationId: string) => wpsRunningState(operationId)),
+    finishWpsExecution: vi.fn(async (operationId: string) => ({
+      ...wpsRunningState(operationId),
+      status: "completed" as const
+    }))
   };
 });
 
 vi.mock("./wpsReadonlyAgent", () => ({
   runWpsReadonlyTurn: vi.fn()
+}));
+
+// 面板测试只验证“两次确认”状态机；原生复制、着色及失效检测由
+// wpsNativeComparison.test.ts 的严格宿主替身独立覆盖。
+// 注意：替身必须给全 `WpsNativeComparison` 的**每个**字段。少给字段时
+// `vi.fn` 的类型很宽松、tsc 也放过它，但侧栏一旦真的用到就会在运行期崩
+// —— 这跟宿主替身少给参数是同一类"替身比真实现宽容"的缺口。
+vi.mock("./wpsNativeComparison", () => ({
+  WpsFormulaTrialError: class WpsFormulaTrialError extends Error {},
+  stageWpsNativeComparison: vi.fn((_application: unknown, plan: unknown) => {
+    const prepared = plan as { actions: { values: unknown[][] }[] };
+    return {
+      plan,
+      changedCells: ["A1"],
+      reviews: [],
+      original: { Name: "测试.xlsx" },
+      copy: { Name: "Book1" },
+      copyIdentity: { name: "Book1", fullName: null, path: null },
+      originalBefore: prepared.actions.map(() => ({ values: [[]], formulas: [[]], valuesCaptured: true })),
+      copyFingerprints: prepared.actions.map(() => "copy-fingerprint"),
+      // 真实路径里回读值已与计划校对一致，替身照同一语义给。
+      copyAfter: prepared.actions.map((action) => ({
+        values: action.values,
+        formulas: [],
+        valuesCaptured: true
+      }))
+    };
+  }),
+  compareCommittedWpsResultToCopy: vi.fn(() => "matched"),
+  verifyWpsNativeComparison: vi.fn(),
+  discardWpsNativeComparison: vi.fn()
 }));
 
 vi.mock("./wpsHost", async (importOriginal) => {
@@ -49,8 +128,18 @@ const excelStyles = readFileSync("../excel-addin/src/styles.css", "utf8");
 const listModelsMock = vi.mocked(listModels);
 const getModelSettingsMock = vi.mocked(getModelSettings);
 const validatePlanMock = vi.mocked(validatePlan);
+const registerWpsExecutionMock = vi.mocked(registerWpsExecution);
+const getWpsExecutionStatusMock = vi.mocked(getWpsExecutionStatus);
+const startWpsActionMock = vi.mocked(startWpsAction);
+const completeWpsActionMock = vi.mocked(completeWpsAction);
+const finishWpsExecutionMock = vi.mocked(finishWpsExecution);
+const suspendWpsExecutionMock = vi.mocked(suspendWpsExecution);
+const claimWpsExecutionResumeMock = vi.mocked(claimWpsExecutionResume);
+const reconcileWpsActionReceiptMock = vi.mocked(reconcileWpsActionReceipt);
 const runTurnMock = vi.mocked(runWpsReadonlyTurn);
 const getWpsApplicationMock = vi.mocked(getWpsApplication);
+const stageComparisonMock = vi.mocked(stageWpsNativeComparison);
+const compareCommittedMock = vi.mocked(compareCommittedWpsResultToCopy);
 
 const firstConnection = {
   id: "connection:first",
@@ -128,6 +217,46 @@ async function click(element: Element | null): Promise<void> {
   await settle();
 }
 
+/**
+ * 「备份与恢复」抽屉里的撤销入口。抽屉仍保留这个快捷入口，所以先打开它，
+ * 再按容器限定取按钮 —— 消息流里的执行结果卡现在也有同名按钮，
+ * 只用文本查找会指错对象。
+ */
+async function undoButton(container: HTMLElement): Promise<HTMLButtonElement | null> {
+  if (!container.querySelector(".wps-backup-card")) {
+    await click(
+      container.querySelector<HTMLButtonElement>('button[aria-label="备份与恢复"]')
+    );
+  }
+  return container.querySelector<HTMLButtonElement>(".wps-backup-card button");
+}
+
+/** 执行结果卡里的撤销按钮（抽屉里那个不算）。 */
+function cardUndoButton(container: HTMLElement): HTMLButtonElement | null {
+  return container.querySelector<HTMLButtonElement>(
+    '.wps-verification-card button[aria-label="撤销本次执行"]'
+  );
+}
+
+/**
+ * 消息流里所有名为「撤销本次执行」的按钮（抽屉里的不算）。每一个都必须落在
+ * **某张卡**里 —— 早先那张无条件挂在消息流末尾的全局撤销卡会在这里暴露成
+ * "没有卡片容器的裸按钮"。
+ */
+function flowUndoButtons(container: HTMLElement): HTMLButtonElement[] {
+  return Array.from(container.querySelectorAll<HTMLButtonElement>("button")).filter(
+    (item) =>
+      (item.textContent ?? "").trim() === "↶ 撤销本次执行" &&
+      !item.closest(".tool-drawer")
+  );
+}
+
+async function stageAndSave(container: HTMLElement): Promise<void> {
+  await click(findButton(container, "生成右侧副本并排审阅"));
+  expect(findButton(container, "确认写回原表")).not.toBeNull();
+  await click(findButton(container, "确认写回原表"));
+}
+
 /** 受控输入必须走原生 value setter，否则 React 收不到这次变更。 */
 async function type(
   element: HTMLTextAreaElement | null,
@@ -162,6 +291,175 @@ function panel() {
   );
 }
 
+/**
+ * 最小可用宿主：只提供**澄清复核**需要的东西 —— 一个稳定的工作簿对象、
+ * 一张稳定的工作表对象、以及一个结构不变的已用区域。
+ *
+ * 澄清复核现在额外要求"能证明还是建卡时那个对象"（见 `wpsObjectIdentity`），
+ * 所以凡是要走完澄清作答的用例都得先有一个真实宿主：给 `{}` 会 fail-closed。
+ * 这里刻意把同一份 `sheet`/`workbook` 对象复用于每次读取，模拟真宿主
+ * "同一张表始终是同一个包装对象"的行为。
+ */
+function clarificationHost(options: { sheetNames?: string[]; workbookName?: string } = {}) {
+  const sheetNames = options.sheetNames ?? ["Sheet1"];
+  const usedRange = { Rows: { Count: 3 }, Columns: { Count: 2 }, Row: 1, Column: 1 } as Record<
+    string,
+    unknown
+  >;
+  Object.defineProperties(usedRange, {
+    Value2: { get: () => [["类别", "归属"], ["甲", "华东"], ["乙", "华南"]] },
+    Item: { value: () => usedRange },
+    MergeCells: { value: false }
+  });
+  const range = { Rows: { Count: 1 }, Columns: { Count: 2 }, MergeCells: false } as Record<
+    string,
+    unknown
+  >;
+  Object.defineProperties(range, {
+    Value2: { get: () => [["类别", "归属"]] }
+  });
+  const sheets = sheetNames.map((Name, position) => ({
+    Name,
+    Index: position + 1,
+    CodeName: `SheetCode${position + 1}`,
+    ProtectContents: false,
+    UsedRange: usedRange,
+    Range: () => range
+  }));
+  const workbook = {
+    Name: options.workbookName ?? "测试.xlsx",
+    FullName: `C:\\Data\\${options.workbookName ?? "测试.xlsx"}`,
+    Path: "C:\\Data",
+    ReadOnly: false,
+    Worksheets: { Count: sheets.length, Item: (index: number) => sheets[Number(index) - 1] },
+    ActiveSheet: sheets[0]
+  };
+  const storage = new Map<string, unknown>();
+  return {
+    Version: "12.0",
+    ActiveWorkbook: workbook,
+    ActiveSheet: sheets[0],
+    PluginStorage: {
+      getItem: (key: string) => storage.get(key),
+      setItem: (key: string, item: unknown) => { storage.set(key, item); }
+    },
+    CreateTaskPane: () => ({ ID: 1, Visible: true }),
+    GetTaskPane: () => undefined
+  } as never;
+}
+
+/**
+ * 一块替身单元格。默认写入生效（执行器据此判定回读一致）；
+ * `staleWrite` 时写入不落盘，于是回读核对**真的**失败 ——
+ * 这样才能断言界面在失败时不谎报"验证通过"，而不是靠 mock 抛错绕开真实链路。
+ */function writeRangeHost(options: {
+  staleWrite?: boolean;
+  /** 每次宿主写入后回调（参数是累计写入次数），用来在"第一次写入发生的那一刻"取证。 */
+  onWrite?: (writes: number) => void;
+  /** 写入一旦发生就让 `PluginStorage.getItem` 抛错：模拟恢复点读取失败。 */
+  breakStorageReadsAfterWrite?: boolean;
+} = {}) {
+  let value = "旧值";
+  let formula = "旧值";
+  let writes = 0;
+  const range = { Rows: { Count: 1 }, Columns: { Count: 1 }, MergeCells: false } as Record<string, unknown>;
+  Object.defineProperties(range, {
+    Value2: {
+      get: () => value,
+      set: (next: string) => {
+        writes += 1;
+        if (!options.staleWrite) {
+          value = next;
+          formula = next;
+        }
+        options.onWrite?.(writes);
+      },
+      enumerable: true
+    },
+    Formula: {
+      get: () => formula,
+      set: (next: string) => {
+        writes += 1;
+        if (!options.staleWrite) {
+          formula = next;
+          value = next;
+        }
+        options.onWrite?.(writes);
+      },
+      enumerable: true
+    }
+  });
+  const sheet = { Name: "Sheet1", ProtectContents: false, Range: () => range };
+  const storage = new Map<string, unknown>();
+  getWpsApplicationMock.mockReturnValue({
+    Version: "12.0",
+    ActiveWorkbook: {
+      Name: "测试.xlsx",
+      FullName: "C:\\Data\\测试.xlsx",
+      Path: "C:\\Data",
+      ReadOnly: false,
+      Worksheets: { Count: 1, Item: () => sheet },
+      ActiveSheet: sheet
+    },
+    ActiveSheet: sheet,
+    PluginStorage: {
+      getItem: (key: string) => {
+        if (options.breakStorageReadsAfterWrite && writes > 0) {
+          throw new Error("PluginStorage 读取失败");
+        }
+        return storage.get(key);
+      },
+      setItem: (key: string, item: unknown) => { storage.set(key, item); }
+    },
+    CreateTaskPane: () => ({ ID: 1, Visible: true }),
+    GetTaskPane: () => undefined
+  } as never);
+  return {
+    writes: () => writes,
+    cellValue: () => value,
+    /** 模拟"执行之后用户又手工改了这块区域"：撤销前指纹复核必须能识别出来。 */
+    setCell: (next: string) => {
+      value = next;
+      formula = next;
+    }
+  };
+}
+
+/** 走到"写入前确认"这一步：两端对照用的同一任务状态。 */
+async function mountPlanPreview(plan: AnalysisPlan, task: string) {
+  listModelsMock.mockResolvedValue({ defaultModelId: firstConnection.id, models: [firstConnection] });
+  runTurnMock.mockResolvedValue({ kind: "plan", plan, turnId: "turn-preview-1" });
+  validatePlanMock.mockImplementation(async (submitted) => submitted);
+  const { container } = await mount(panel());
+  await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "应加载模型目录");
+  const textarea = container.querySelector("textarea");
+  await type(textarea, task);
+  await submit(textarea);
+  await until(() => textOf(container).includes("写入前确认"), "应展示写入计划预览");
+  return { container, unmount: () => unmountMounted(container) };
+}
+
+/**
+ * 卸载历史里挂载过的某个面板，并从 `mounted` 里摘掉它 —— `mount` 的清理是
+ * 按数组走的，重复卸载同一个 root 会报错。供"面板重开"这类用例使用。
+ */
+function unmountMounted(container: HTMLElement): void {
+  const entry = mounted.find((item) => item.container === container);
+  if (!entry) return;
+  entry.unmount();
+  mounted = mounted.filter((item) => item !== entry);
+}
+
+const singleWritePlan: AnalysisPlan = {
+  id: "plan-single-write",
+  title: "更新 A1",
+  summary: "把 A1 更新为新值",
+  assumptions: [],
+  warnings: [],
+  actions: [{ type: "writeValues", sheet: "Sheet1", range: "A1", values: [["90"]] }],
+  acceptanceCriteria: []
+};
+
 beforeEach(() => {
   localStorage.clear();
   vi.clearAllMocks();
@@ -175,6 +473,70 @@ afterEach(() => {
 });
 
 describe("WPS Excel Bro chat UI", () => {
+  it("shows a structured planning stop as failure, not completed or a write preview", async () => {
+    listModelsMock.mockResolvedValue({ defaultModelId: firstConnection.id, models: [firstConnection] });
+    runTurnMock.mockResolvedValue({ kind: "answer", provider: "system", outcome: "failed", message: "规划预算已用完" });
+    const { container } = await mount(panel());
+    await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "模型加载");
+    const textarea = container.querySelector("textarea");
+    await type(textarea, "生成预览");
+    await submit(textarea);
+    await until(() => textOf(container).includes("规划预算已用完"), "失败提示");
+    expect(textOf(container)).toContain("执行失败");
+    expect(textOf(container)).not.toContain("已完成");
+    expect(textOf(container)).not.toContain("生成右侧副本并排审阅");
+    expect(validatePlanMock).not.toHaveBeenCalled();
+  });
+  it("launches the read-only wide-window probe from the real chat pane without replacing the conversation", async () => {
+    const showDialog = vi.fn((..._args: unknown[]) => true);
+    getWpsApplicationMock.mockReturnValue({
+      Version: "12.0",
+      ShowDialog: showDialog
+    } as never);
+    listModelsMock.mockResolvedValue({ defaultModelId: null, models: [] });
+
+    const { container } = await mount(panel());
+    const textarea = container.querySelector("textarea");
+    await type(textarea, "当前对话仍在这里");
+    await click(container.querySelector('[aria-label="更多"]'));
+    const probeEntry = Array.from(container.querySelectorAll('[role="menuitem"]'))
+      .find((item) => item.textContent?.includes("探测独立宽窗口"));
+    await click(probeEntry ?? null);
+
+    expect(showDialog).toHaveBeenCalledTimes(1);
+    expect(showDialog.mock.calls[0][4]).toBe(false);
+    expect(container.querySelector('[aria-label="宽窗口探测结果"]')).not.toBeNull();
+    expect(container.querySelector("textarea")?.value).toBe("当前对话仍在这里");
+    expect(container.querySelector(".wps-chat-shell")).not.toBeNull();
+  });
+
+  it("keeps header actions icon-only, named and connected to their existing surfaces", async () => {
+    listModelsMock.mockResolvedValue({ defaultModelId: firstConnection.id, models: [firstConnection] });
+    const { container } = await mount(panel());
+    await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "模型加载完成");
+    expect(container.querySelector(".brand-copy")?.textContent?.trim()).toBe("Excel Bro");
+    for (const [selector, glyph] of [
+      [".model-picker-trigger", ""],
+      [".new-chat-entry", "＋"],
+      [".tools-entry", ""],
+      [".folder-backup-entry", "↶"]
+    ]) {
+      const button = container.querySelector<HTMLButtonElement>(selector);
+      expect(button?.textContent).toBe(glyph);
+      expect(button?.getAttribute("aria-label")).toBeTruthy();
+      expect(button?.title).toBeTruthy();
+      expect(button?.querySelector('svg, [aria-hidden="true"]')).not.toBeNull();
+    }
+    await click(container.querySelector(".model-picker-trigger"));
+    expect(container.querySelector('.model-menu[role="menu"]')).not.toBeNull();
+    expect(container.querySelector('[role="menuitemradio"][aria-checked="true"]')?.textContent).toContain("第一个连接");
+    await click(container.querySelector(".tools-entry"));
+    expect(container.querySelector('aside[aria-label="我的工具"]')).not.toBeNull();
+    await click(container.querySelector(".folder-backup-entry"));
+    expect(container.querySelector('aside[aria-label="备份与恢复"]')).not.toBeNull();
+    expect(runTurnMock).not.toHaveBeenCalled();
+  });
+
   it("shows the Excel-style chat shell and keeps guarded write boundaries visible", () => {
     const markup = renderToStaticMarkup(panel());
 
@@ -210,7 +572,7 @@ describe("WPS Excel Bro chat UI", () => {
       "目录加载成功后应显示未配置状态"
     );
 
-    expect(textOf(container)).toContain("添加模型");
+    expect(container.querySelector('.model-picker-trigger')?.getAttribute("aria-label")).toBe("添加模型");
     expect(textOf(container)).not.toContain("基础模式");
   });
 
@@ -238,7 +600,7 @@ describe("WPS Excel Bro chat UI", () => {
     listModelsMock.mockResolvedValue({ defaultModelId: firstConnection.id, models: [firstConnection] });
     runTurnMock.mockRejectedValue(new TypeError("Failed to fetch"));
     const { container } = await mount(panel());
-    await until(() => textOf(container).includes("模型：第一个连接"), "应加载模型");
+    await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "应加载模型");
 
     const textarea = container.querySelector<HTMLTextAreaElement>(".composer textarea");
     await type(textarea, "按部门统计平均分");
@@ -267,7 +629,7 @@ describe("WPS Excel Bro chat UI", () => {
     const { container } = await mount(panel());
     expect(textOf(container)).toContain("计划预览已失效");
     expect(container.querySelector(".wps-plan-card")).toBeNull();
-    expect(findButton(container, "确认写入")).toBeNull();
+    expect(findButton(container, "生成右侧副本并排审阅")).toBeNull();
   });
 
   it("does not present a refreshed in-flight WPS activity as still running", async () => {
@@ -297,7 +659,7 @@ describe("WPS Excel Bro chat UI", () => {
       return new Promise((resolve) => { finishTurn = resolve; });
     });
     const { container } = await mount(panel());
-    await until(() => textOf(container).includes("模型：第一个连接"), "应加载模型");
+    await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "应加载模型");
 
     const textarea = container.querySelector<HTMLTextAreaElement>(".composer textarea");
     await type(textarea, "统计当前表");
@@ -306,6 +668,7 @@ describe("WPS Excel Bro chat UI", () => {
       .find((item) => item.textContent?.includes("统计当前表"));
     const processMessage = question?.nextElementSibling;
     expect(processMessage?.classList.contains("message-row")).toBe(true);
+    expect(processMessage?.querySelector(".message-author")?.textContent?.trim()).toBe("Excel Bro");
     expect(processMessage?.querySelector(".task-progress-timeline.is-live")).not.toBeNull();
     expect(processMessage?.textContent).toContain("理解需求");
 
@@ -331,18 +694,26 @@ describe("WPS Excel Bro chat UI", () => {
       listModelsMock.mockResolvedValue({ defaultModelId: firstConnection.id, models: [firstConnection] });
       runTurnMock.mockResolvedValue({ kind: "answer", message: "这是一条回答", resultContext: null, provider: "model" });
       const { container } = await mount(panel());
-      await until(() => textOf(container).includes("模型：第一个连接"), "应加载模型");
+      await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "应加载模型");
       const textarea = container.querySelector<HTMLTextAreaElement>(".composer textarea");
       await type(textarea, "这是一条提问");
       await submit(textarea);
       await until(() => textOf(container).includes("这是一条回答"), "应收到回答");
 
-      await click(container.querySelector(".message-row.user .message-copy-button"));
+      const userCopy = container.querySelector<HTMLButtonElement>(".message-row.user .message-copy-button");
+      expect(userCopy?.getAttribute("aria-label")).toBe("复制这条消息");
+      expect(userCopy?.title).toBe("复制这条消息");
+      expect(userCopy?.querySelector("svg rect")).not.toBeNull();
+      expect(userCopy?.textContent).toBe("");
+      await click(userCopy);
       expect(legacyCopy).toHaveBeenCalledTimes(1);
       expect(container.querySelector(".message-row.user .message-copy-button")?.textContent).toContain("已复制");
       const answer = Array.from(container.querySelectorAll(".message-row.assistant"))
         .find((item) => item.textContent?.includes("这是一条回答"));
-      await click(answer?.querySelector(".message-copy-button") ?? null);
+      const answerCopy = answer?.querySelector<HTMLButtonElement>(".message-copy-button");
+      expect(answerCopy?.querySelector("svg rect")).not.toBeNull();
+      expect(answerCopy?.textContent).toBe("");
+      await click(answerCopy ?? null);
       expect(writeText).toHaveBeenCalledTimes(2);
       expect(legacyCopy).toHaveBeenCalledTimes(2);
       expect(answer?.querySelector(".message-copy-button")?.textContent).toContain("已复制");
@@ -364,7 +735,7 @@ describe("WPS Excel Bro chat UI", () => {
       }
     });
     const { container } = await mount(panel());
-    await until(() => textOf(container).includes("模型：第一个连接"), "应加载模型");
+    await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "应加载模型");
     const textarea = container.querySelector<HTMLTextAreaElement>(".composer textarea");
     await type(textarea, "统计类别");
     await submit(textarea);
@@ -390,7 +761,7 @@ describe("WPS Excel Bro chat UI", () => {
 
     const { container } = await mount(panel());
     await until(
-      () => textOf(container).includes("模型：第二个连接"),
+      () => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第二个连接") ?? false,
       "应解析出服务端声明的默认真实连接"
     );
 
@@ -411,27 +782,31 @@ describe("WPS Excel Bro chat UI", () => {
 
   it("shows no card for ordinary chat and accepts free text only when clarification is needed", async () => {
     listModelsMock.mockResolvedValue({ defaultModelId: firstConnection.id, models: [firstConnection] });
+    // 澄清复核要能证明"还是建卡时那个对象"，所以这里必须给一个真实宿主。
+    getWpsApplicationMock.mockReturnValue(clarificationHost());
     runTurnMock
       .mockResolvedValueOnce({ kind: "answer", message: "你好！", resultContext: null, provider: "model" })
       .mockResolvedValueOnce({
         kind: "clarification",
-        response: {
-          kind: "clarification",
-          provider: "model",
-          clarification: {
-            id: "clarify-1", summary: "需要明确目标", question: "想怎样处理？",
-            reason: "不同操作结果不同", scopeLabel: "当前表",
-            options: [
-              { id: "read", label: "查询", description: "只读分析", resolution: "查询数据" },
-              { id: "write", label: "修改", description: "预览后修改", resolution: "修改数据" }
-            ]
+        clarification: {
+          response: {
+            kind: "clarification",
+            provider: "model",
+            clarification: {
+              id: "clarify-1", summary: "需要明确目标", question: "想怎样处理？",
+              reason: "不同操作结果不同", scopeLabel: "当前表",
+              options: [
+                { id: "read", label: "查询", description: "只读分析", resolution: "查询数据" },
+                { id: "write", label: "修改", description: "预览后修改", resolution: "修改数据" }
+              ]
+            }
           }
         }
       })
       .mockResolvedValueOnce({ kind: "answer", message: "我来按你的补充说明处理。", resultContext: null, provider: "model" });
 
     const { container } = await mount(panel());
-    await until(() => textOf(container).includes("模型：第一个连接"), "应加载模型");
+    await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "应加载模型");
     const textarea = container.querySelector("textarea");
     await type(textarea, "你好");
     await submit(textarea);
@@ -456,25 +831,62 @@ describe("WPS Excel Bro chat UI", () => {
     expect(JSON.stringify(stored)).not.toContain("修改数据");
   });
 
+  it("renders separate fields and continues the original request with all answers, without executing", async () => {
+    listModelsMock.mockResolvedValue({ models: [firstConnection], defaultModelId: firstConnection.id });
+    getWpsApplicationMock.mockReturnValue(clarificationHost());
+    runTurnMock.mockResolvedValueOnce({ kind: "clarification", clarification: { response: {
+      kind: "clarification", provider: "model", clarification: {
+        id: "fields-1", summary: "补充口径", question: "请填写两项信息", reason: "尚缺口径",
+        scopeLabel: "Sheet1", options: [], fields: [
+          { id: "period", label: "时间范围", placeholder: "说明时间范围" }, { id: "unit", label: "统计单位" }
+        ]
+      }
+    } } }).mockResolvedValueOnce({ kind: "answer", message: "收到补充，准备预览", provider: "model" });
+    const { container } = await mount(panel());
+    await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "模型应就绪");
+    const prompt = container.querySelector("textarea");
+    await type(prompt, "按已选表统计并预览");
+    await submit(prompt);
+    await until(() => !!container.querySelector(".clarification-fields"), "规划追问应显示表单");
+    const button = findButton(container, "提交补充并生成预览");
+    if (!button) throw new Error("缺少表单提交按钮");
+    expect(button.disabled).toBe(true);
+    await type(container.querySelector('[aria-label="时间范围"]'), "本季度");
+    expect(button.disabled).toBe(true);
+    await type(container.querySelector('[aria-label="统计单位"]'), "件");
+    expect(button.disabled).toBe(false);
+    await click(button);
+    await until(() => runTurnMock.mock.calls.length === 2, "提交应继续原任务");
+    expect(runTurnMock.mock.calls[1][0]).toMatchObject({
+      prompt: "按已选表统计并预览\n补充确认：时间范围：本季度\n统计单位：件", intentConfirmed: true
+    });
+    expect(stageComparisonMock).not.toHaveBeenCalled();
+    expect(validatePlanMock).not.toHaveBeenCalled();
+    expect(container.querySelector(".clarification-card.resolved")).not.toBeNull();
+  });
+
   it("keeps a cancelled clarification in history without leaving live choices", async () => {
     listModelsMock.mockResolvedValue({ defaultModelId: firstConnection.id, models: [firstConnection] });
+    getWpsApplicationMock.mockReturnValue(clarificationHost());
     runTurnMock.mockResolvedValue({
       kind: "clarification",
-      response: {
-        kind: "clarification",
-        provider: "model",
-        clarification: {
-          id: "clarify-cancel",
-          summary: "需要明确目标",
-          question: "要查询还是修改？",
-          reason: "两种操作不同",
-          scopeLabel: "当前表",
-          options: [{ id: "read", label: "查询", description: "只读", resolution: "查询数据" }]
+      clarification: {
+        response: {
+          kind: "clarification",
+          provider: "model",
+          clarification: {
+            id: "clarify-cancel",
+            summary: "需要明确目标",
+            question: "要查询还是修改？",
+            reason: "两种操作不同",
+            scopeLabel: "当前表",
+            options: [{ id: "read", label: "查询", description: "只读", resolution: "查询数据" }]
+          }
         }
       }
     });
     const { container } = await mount(panel());
-    await until(() => textOf(container).includes("模型：第一个连接"), "应加载模型");
+    await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "应加载模型");
     const composer = container.querySelector<HTMLTextAreaElement>(".composer textarea");
     await type(composer, "帮我处理表格");
     await submit(composer);
@@ -495,7 +907,7 @@ describe("WPS Excel Bro chat UI", () => {
       signal?.addEventListener("abort", () => reject(new DOMException("stopped", "AbortError")));
     }));
     const { container } = await mount(panel());
-    await until(() => textOf(container).includes("模型：第一个连接"), "应加载模型");
+    await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "应加载模型");
     const composer = container.querySelector<HTMLTextAreaElement>(".composer textarea");
     await type(composer, "统计当前表");
     await submit(composer);
@@ -525,7 +937,7 @@ describe("WPS Excel Bro chat UI", () => {
         scopeDock={<div>当前表 Sheet1</div>}
       />
     );
-    await until(() => textOf(container).includes("模型：第一个连接"), "应加载模型");
+    await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "应加载模型");
     const textarea = container.querySelector("textarea");
     await type(textarea, "统计当前表");
     await submit(textarea);
@@ -548,7 +960,7 @@ describe("WPS Excel Bro chat UI", () => {
     });
 
     const { container } = await mount(panel());
-    await until(() => textOf(container).includes("模型：第一个连接"), "应加载模型");
+    await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "应加载模型");
     const textarea = container.querySelector("textarea");
     await type(textarea, "历史问题");
     await submit(textarea);
@@ -626,7 +1038,7 @@ describe("WPS Excel Bro chat UI", () => {
     validatePlanMock.mockImplementation(async (submitted) => submitted);
 
     const { container } = await mount(panel());
-    await until(() => textOf(container).includes("模型：第一个连接"), "应加载模型");
+    await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "应加载模型");
     const textarea = container.querySelector("textarea");
     await type(textarea, "把 A1 改成新值");
     await submit(textarea);
@@ -647,20 +1059,25 @@ describe("WPS Excel Bro chat UI", () => {
     await click(findButton(container, "继续当前对话"));
     expect(textOf(container)).toContain("写入前确认");
     await click(findButton(container, "编辑计划"));
-    expect(findButton(container, "确认写入")).toBeNull();
+    expect(findButton(container, "生成右侧副本并排审阅")).toBeNull();
     const editBox = container.querySelector<HTMLTextAreaElement>('[aria-label="编辑写入计划 JSON"]');
     await type(editBox, JSON.stringify({
       ...writePlan,
       actions: [{ type: "writeValues", sheet: "Sheet1", range: "A1", values: [["修订值"]] }]
     }));
     await click(findButton(container, "应用修改并重新预览"));
-    await until(() => textOf(container).includes("修订值") && findButton(container, "确认写入") !== null, "编辑后应重新预览最终值");
+    await until(() => textOf(container).includes("修订值") && findButton(container, "生成右侧副本并排审阅") !== null, "编辑后应重新预览最终值");
     expect(writes).toBe(0);
-    await click(findButton(container, "确认写入"));
-    await until(() => textOf(container).includes("已保存恢复点"), "确认后应完成写入并提供撤销");
+    await stageAndSave(container);
+    await until(
+      () => Boolean(container.querySelector('button[aria-label="备份与恢复"] b')),
+      "确认后应完成写入并提供恢复入口"
+    );
     expect(writes).toBe(1);
     expect(value).toBe("修订值");
     expect(textOf(container)).toContain("计划已执行并回读确认");
+    const resultMessage = container.querySelector(".wps-verification-card.verified")?.closest(".message-row.assistant");
+    expect(resultMessage?.querySelector(".message-author")?.textContent?.trim()).toBe("Excel Bro");
     expect(container.querySelector(".wps-verification-card.verified")?.textContent).toContain("1 个动作 · 1 个单元格已回读核对");
     expect(container.querySelector(".wps-verification-card.verified")?.textContent).toContain("Sheet1!A1");
     expect(textOf(container)).toContain("保存写前恢复点");
@@ -728,7 +1145,7 @@ describe("WPS Excel Bro chat UI", () => {
     });
 
     const { container } = await mount(panel());
-    await until(() => textOf(container).includes("模型：第一个连接"), "应加载模型");
+    await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "应加载模型");
     const textarea = container.querySelector("textarea");
     await type(textarea, "把类别列翻译成归属");
     await submit(textarea);
@@ -738,7 +1155,7 @@ describe("WPS Excel Bro chat UI", () => {
     expect(textOf(container)).toContain("Sheet1!A1");
     await click(findButton(container, "编辑计划"));
     await click(findButton(container, "应用修改并重新预览"));
-    await until(() => findButton(container, "确认写入") !== null, "本地计划编辑后应重新预览");
+    await until(() => findButton(container, "生成右侧副本并排审阅") !== null, "本地计划编辑后应重新预览");
     expect(validatePlanMock).not.toHaveBeenCalled();
   });
 
@@ -753,7 +1170,7 @@ describe("WPS Excel Bro chat UI", () => {
       new Error(`模型连接校验失败：上游拒绝 Authorization: Bearer ${secret}`)
     );
     const { container } = await mount(panel());
-    await until(() => textOf(container).includes("模型：第一个连接"), "应加载模型");
+    await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "应加载模型");
     const textarea = container.querySelector<HTMLTextAreaElement>(".composer textarea");
     await type(textarea, "统计订单金额");
     await submit(textarea);
@@ -1066,7 +1483,7 @@ describe("WPS Excel Bro chat UI", () => {
       kind: "answer", message: "统计完成", provider: "model", resultContext: null
     });
     const { container } = await mount(panel());
-    await until(() => textOf(container).includes("模型：第一个连接"), "应加载模型");
+    await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "应加载模型");
     const textarea = container.querySelector<HTMLTextAreaElement>(".composer textarea");
     await type(textarea, "统计订单金额");
     await submit(textarea);
@@ -1090,7 +1507,7 @@ describe("WPS Excel Bro chat UI", () => {
       kind: "answer", message: "已统计。", provider: "model", resultContext: null
     });
     const { container } = await mount(panel());
-    await until(() => textOf(container).includes("模型：第一个连接"), "应加载模型");
+    await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "应加载模型");
     const textarea = container.querySelector<HTMLTextAreaElement>(".composer textarea");
     await type(textarea, `用 ${secret} 统计订单金额`);
     await submit(textarea);
@@ -1119,7 +1536,7 @@ describe("WPS Excel Bro chat UI", () => {
       provider: "model", resultContext: null
     });
     const { container } = await mount(panel());
-    await until(() => textOf(container).includes("模型：第一个连接"), "应加载模型");
+    await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "应加载模型");
     const textarea = container.querySelector<HTMLTextAreaElement>(".composer textarea");
     await type(textarea, `按 {'api_key': '${secret}'} 统计订单金额`);
     await submit(textarea);
@@ -1186,7 +1603,7 @@ describe("WPS Excel Bro chat UI", () => {
     });
 
     const { container } = await mount(panel());
-    await until(() => textOf(container).includes("模型：第一个连接"), "应加载模型");
+    await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "应加载模型");
     const textarea = container.querySelector<HTMLTextAreaElement>(".composer textarea");
     await type(textarea, "把类别列翻译成归属");
     await submit(textarea);
@@ -1213,7 +1630,7 @@ describe("WPS Excel Bro chat UI", () => {
     // 尚未配置与暂时无法取得目录是两种不同状态，首次打开不能抛出失败卡。
     expect(textOf(container)).not.toContain("尚未配置模型");
     expect(textOf(container)).not.toContain("Failed to fetch");
-    expect(textOf(container)).toContain("点击上方「添加模型」开始连接");
+    expect(textOf(container)).toContain("点击上方模型图标开始连接");
     expect(container.querySelector(".message-row.system")).toBeNull();
     expect(timeoutSpy.mock.calls.some(([, delay]) => delay === 5000)).toBe(false);
     timeoutSpy.mockRestore();
@@ -1239,7 +1656,7 @@ describe("WPS Excel Bro chat UI", () => {
     await click(findButton(container, "重试读取模型配置"));
 
     await until(
-      () => textOf(container).includes("模型：第二个连接"),
+      () => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第二个连接") ?? false,
       "重试成功后应显示真实连接"
     );
     expect(listModelsMock).toHaveBeenCalledTimes(2);
@@ -1659,5 +2076,1532 @@ describe("WPS Excel Bro chat UI", () => {
     expect(styles).toMatch(
       /@media \(max-width: 620px\)[\s\S]*?\.chat-header \.new-chat-entry > span:not\(\[aria-hidden="true"\]\)\s*\{[\s\S]*?display:\s*none;/
     );
+  });
+
+  it("mirrors the Excel plan card hierarchy for the same pending task", async () => {
+    // Excel 用「采用的信息」/「补充说明」两个区块承载服务端下发的口径；WPS
+    // 拿到的是同一个 AnalysisPlan，这两个前提不该在预览里丢掉。
+    writeRangeHost();
+    const { container } = await mountPlanPreview({
+      ...singleWritePlan,
+      id: "plan-notes",
+      assumptions: ["源列空白按「未分类」处理。"],
+      warnings: ["汇总表已有数据，写入会覆盖原值。"]
+    }, "按部门汇总平均分");
+
+    const notes = Array.from(
+      container.querySelector(".wps-plan-card")?.querySelectorAll(".wps-plan-notes") ?? []
+    );
+    expect(notes.map((note) => note.querySelector("strong")?.textContent?.trim()))
+      .toEqual(["采用的信息", "补充说明"]);
+    expect(notes[0]?.textContent).toContain("源列空白按「未分类」处理。");
+    expect(notes[1]?.textContent).toContain("汇总表已有数据，写入会覆盖原值。");
+    // 恢复能力必须写成"会话内"，不能给人永久可撤销的错觉。
+    const meta = Array.from(container.querySelectorAll(".wps-plan-meta span"))
+      .map((item) => item.textContent?.trim());
+    expect(meta).toContain("会话内可撤销");
+    // 还没确认，就不得出现任何执行结果。
+    expect(container.querySelector(".wps-verification-card")).toBeNull();
+    expect(textOf(container)).not.toContain("写入验证通过");
+  });
+
+  it("hides both note blocks when the plan states neither", async () => {
+    writeRangeHost();
+    const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
+
+    expect(container.querySelector(".wps-plan-assumptions")).toBeNull();
+    expect(container.querySelector(".wps-plan-warnings")).toBeNull();
+    expect(textOf(container)).not.toContain("采用的信息");
+  });
+
+  it("marks the preview as edited only after the user rewrote the plan", async () => {
+    const host = writeRangeHost();
+    const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
+
+    expect(textOf(container)).not.toContain("已按你的修改更新");
+    await click(findButton(container, "编辑计划"));
+    const editBox = container.querySelector<HTMLTextAreaElement>('[aria-label="编辑写入计划 JSON"]');
+    await type(editBox, JSON.stringify({ ...singleWritePlan, summary: "改成最大值" }));
+    await click(findButton(container, "应用修改并重新预览"));
+    await until(() => textOf(container).includes("已按你的修改更新"), "编辑后重新预览必须有可见标识");
+
+    expect(container.querySelector(".wps-plan-card")?.textContent).toContain("写入前请重新核对");
+    expect(host.writes()).toBe(0);
+    // 标识跟着消息持久化：重新载入面板后仍能知道这份计划被改过。
+    const saved = JSON.parse(localStorage.getItem("excel-bro.wps.chat.v1") ?? "null");
+    const savedPreview = saved.conversations[0].messages.find(
+      (message: { planPreview?: { revised?: boolean } }) => message.planPreview
+    );
+    expect(savedPreview.planPreview.revised).toBe(true);
+  });
+
+  it("keeps the original untouched during native review and discards the copy without committing", async () => {
+    const host = writeRangeHost();
+    const { container } = await mountPlanPreview(singleWritePlan, "先并排审阅结果");
+    await click(findButton(container, "生成右侧副本并排审阅"));
+    expect(host.writes()).toBe(0);
+    expect(host.cellValue()).toBe("旧值");
+    expect(findButton(container, "确认写回原表")).not.toBeNull();
+    expect(textOf(container)).toContain("左侧原表尚未写入");
+    await click(findButton(container, "放弃副本"));
+    expect(host.writes()).toBe(0);
+    expect(host.cellValue()).toBe("旧值");
+    expect(findButton(container, "确认写回原表")).toBeNull();
+    expect(textOf(container)).toContain("已放弃右侧审阅副本");
+  });
+
+  it("公式副本计算值不符时重新预览固定值副本，原表仍待用户确认", async () => {
+    const host = writeRangeHost();
+    const formulaPlan: AnalysisPlan = {
+      ...singleWritePlan,
+      id: "wps-map-column-test",
+      actions: [{ type: "writeFormulas", sheet: "Sheet1", range: "A1", formulas: [["=1+1"]] }],
+      acceptanceCriteria: [{ type: "rangeEquals", sheet: "Sheet1", range: "A1", expected: [["2"]] }]
+    };
+    const { container } = await mountPlanPreview(formulaPlan, "用公式计算 A1");
+    stageComparisonMock.mockImplementationOnce(() => { throw new WpsFormulaTrialError("计算不符"); });
+    await click(findButton(container, "生成右侧副本并排审阅"));
+    expect(stageComparisonMock).toHaveBeenCalledTimes(2);
+    const secondPrepared = stageComparisonMock.mock.calls[1][1];
+    expect(secondPrepared.plan.actions[0]).toEqual({
+      type: "writeValues", sheet: "Sheet1", range: "A1", values: [["2"]]
+    });
+    expect(textOf(container)).toContain("改用固定值重新生成");
+    expect(findButton(container, "确认写回原表")).not.toBeNull();
+    expect(host.writes()).toBe(0);
+  });
+
+  it("回读不符时不谎报验证通过，但确有恢复点的部分写入仍必须给出卡与撤销入口", async () => {
+    // 写入不落盘 → 回读与计划不同。执行器据此判定为「可恢复的部分写入」，
+    // 界面要如实说"写入未完成、恢复资料已保留"，**绝不**说验证通过；
+    // 也不能因为"不是干净成功"就把恢复点藏起来。
+    const host = writeRangeHost({ staleWrite: true });
+    const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
+
+    await stageAndSave(container);
+    await until(() => container.querySelector(".message-row.system") !== null, "失败应给出系统反馈");
+
+    // 负向断言必须先有正向锚点，否则只是"什么都没渲染"的空过。
+    expect(textOf(container)).not.toContain("写入验证通过");
+    expect(container.querySelector(".wps-verification-card.verified")).toBeNull();
+    expect(container.querySelector(".wps-verification-card.unverified")).toBeNull();
+
+    const card = container.querySelector(".wps-verification-card.partial");
+    expect(card).not.toBeNull();
+    expect(card?.textContent).toContain("恢复资料已保留");
+    expect(cardUndoButton(container)).not.toBeNull();
+
+    expect(container.querySelector(".message-row.system")?.textContent)
+      .toContain("回读结果与计划不一致");
+    // 计划仍在等待确认：可以修正后重试，界面不能假装已经写完了。
+    expect(container.querySelector(".wps-plan-card")).not.toBeNull();
+    expect(textOf(container)).toContain("写入前确认");
+    expect(host.writes()).toBeGreaterThan(0);
+  });
+
+  it("写回后计算值与副本不同，不发验证通过卡但结果卡内保留撤销入口", async () => {
+    const host = writeRangeHost();
+    compareCommittedMock.mockReturnValueOnce("different");
+    const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
+    await stageAndSave(container);
+    expect(host.writes()).toBeGreaterThan(0);
+    expect(textOf(container)).toContain("计算结果与右侧副本不同");
+    expect(textOf(container)).toContain("最终计算值未获证实");
+    // 它不是 verified，但**是**一张带恢复点的结果卡 —— 入口必须在这张卡里。
+    expect(container.querySelector(".wps-verification-card.verified")).toBeNull();
+    const card = container.querySelector(".wps-verification-card.unverified");
+    expect(card).not.toBeNull();
+    expect(card?.textContent).not.toContain("写入验证通过");
+    expect(cardUndoButton(container)).not.toBeNull();
+    expect(await undoButton(container)).not.toBeNull();
+  });
+
+  it("switches the verified card to restored and keeps recovery session-scoped", async () => {
+    const host = writeRangeHost();
+    const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
+
+    await stageAndSave(container);
+    await until(
+      () => container.querySelector(".wps-verification-card.verified") !== null,
+      "写入成功应给出回读核对结果"
+    );
+    expect(container.querySelector(".wps-verification-card")?.textContent)
+      .toContain("1 个动作 · 1 个单元格已回读核对");
+
+    await click(await undoButton(container));
+    await until(() => textOf(container).includes("已撤销并核对恢复"), "撤销后应给出核对过的恢复结果");
+
+    const undone = container.querySelector(".wps-verification-card.undone");
+    expect(undone).not.toBeNull();
+    expect(undone?.textContent).not.toContain("写入验证通过");
+    expect(undone?.textContent).toContain("恢复点仅在当前加载项会话内可用");
+    expect(container.querySelector(".wps-verification-card.verified")).toBeNull();
+    expect(host.cellValue()).toBe("旧值");
+  });
+
+  it("uses native review before commit, then keeps only the verified result and undo summary", async () => {
+    const host = writeRangeHost();
+    const { container } = await mountPlanPreview(singleWritePlan, "按计划更新 A1");
+
+    await stageAndSave(container);
+    await until(
+      () => container.querySelector(".wps-verification-card.verified") !== null,
+      "写入成功应给出回读核对结果"
+    );
+
+    // Successful WPS writes no longer reopen the obsolete narrow HTML grid.
+    expect(container.querySelector(".change-review-summary")).toBeNull();
+    expect(container.querySelector(".change-review-table")).toBeNull();
+    expect(container.querySelector(".wps-chat-shell")).not.toBeNull();
+
+    // 明细不进聊天历史：持久化下来的只有定位与计数，没有单元格内容。
+    const saved = JSON.parse(localStorage.getItem("excel-bro.wps.chat.v1") ?? "null");
+    expect(saved).not.toBeNull();
+    // "旧值"是单元格内容，不该出现在被持久化的对话里（时间戳之类的数字串不适合
+    // 做这类断言，故另设哨兵用例，见下一条）。
+    expect(JSON.stringify(saved)).not.toContain("旧值");
+
+    await click(await undoButton(container));
+    await until(() => textOf(container).includes("已撤销并核对恢复"), "撤销后应给出核对过的恢复结果");
+    // 区域已回到执行前，不能继续挂着过期的变更明细。
+    expect(container.querySelector(".change-review-summary")).toBeNull();
+    expect(host.cellValue()).toBe("旧值");
+    // 但"这次确实改过、后来撤销了"是操作记录，不该跟着明细一起被抹掉；
+    // 留下来的形态只有定位与计数，不含任何单元格内容。
+    const note = container.querySelector(".change-review-undo-note");
+    expect(note).not.toBeNull();
+    expect(note?.textContent).toContain("Sheet1!A1");
+    expect(note?.textContent).toContain("改动 1 / 1");
+    expect(note?.textContent).not.toContain("旧值");
+    expect(note?.textContent).not.toContain("90");
+  });
+
+  it("keeps the 'changed then undone' note free of cell values in the UI and in history", async () => {
+    const SENTINEL = "私密撤销值-Q7W2";
+    writeRangeHost();
+    const { container } = await mountPlanPreview({
+      ...singleWritePlan,
+      id: "plan-undo-sentinel",
+      actions: [{ type: "writeValues", sheet: "Sheet1", range: "A1", values: [[SENTINEL]] }]
+    }, "按计划更新 A1");
+
+    await stageAndSave(container);
+    await until(
+      () => container.querySelector(".wps-verification-card.verified") !== null,
+      "写入成功应给出回读核对结果"
+    );
+    expect(container.querySelector(".change-review-summary")).toBeNull();
+
+    await click(await undoButton(container));
+    await until(
+      () => container.querySelector(".change-review-undo-note") !== null,
+      "撤销后应留下「曾修改、现已撤销」的摘要"
+    );
+    // 明细已释放，摘要里也不该有单元格内容。
+    expect(container.querySelector(".change-review-summary")).toBeNull();
+    expect(container.querySelector(".change-review-undo-note")?.textContent).not.toContain(SENTINEL);
+    const saved = JSON.parse(localStorage.getItem("excel-bro.wps.chat.v1") ?? "null");
+    expect(JSON.stringify(saved)).not.toContain(SENTINEL);
+  });
+
+  it("attaches the change review to the failure message and never claims success", async () => {
+    writeRangeHost({ staleWrite: true });
+    const { container } = await mountPlanPreview(singleWritePlan, "按计划更新 A1");
+
+    await stageAndSave(container);
+    await until(() => container.querySelector(".message-row.system") !== null, "失败应给出系统反馈");
+
+    const summary = container.querySelector(".message-row.system .change-review-summary");
+    expect(summary).not.toBeNull();
+    expect(summary!.textContent).toContain("回读与预期不一致");
+    expect(summary!.querySelector("button")).toBeNull();
+    expect(container.textContent).not.toContain("打开全幅双视图");
+    expect(container.querySelector(".wps-review-shell")).toBeNull();
+    expect(summary!.textContent).not.toContain("写入验证通过");
+  });
+
+  it("keeps cell values out of the persisted conversation even when a review was delivered", async () => {
+    // 哨兵只存在于工作簿单元格与回读矩阵里：用户提示、计划标题、活动日志都不含它。
+    // 这样才能证明"明细不进历史"是真的，而不是碰巧没撞上子串。
+    const SENTINEL = "单元格私密值-K9Z3";
+    writeRangeHost();
+    const { container } = await mountPlanPreview({
+      ...singleWritePlan,
+      id: "plan-sentinel",
+      actions: [{ type: "writeValues", sheet: "Sheet1", range: "A1", values: [[SENTINEL]] }]
+    }, "按计划更新 A1");
+
+    await stageAndSave(container);
+    await until(
+      () => container.querySelector(".wps-verification-card.verified") !== null,
+      "写入成功应给出回读核对结果"
+    );
+    // 成功结果不再提供旧的窄 HTML 对照；副本逐格审阅由严格原生宿主用例覆盖。
+    expect(container.querySelector(".change-review-summary")).toBeNull();
+
+    const saved = JSON.parse(localStorage.getItem("excel-bro.wps.chat.v1") ?? "null");
+    expect(saved).not.toBeNull();
+    expect(JSON.stringify(saved)).not.toContain(SENTINEL);
+  });
+
+  describe("待答澄清的授权身份", () => {
+    /**
+     * 造一台可切换工作表身份的宿主。
+     *
+     * 澄清卡只有在**授权身份没变**时才允许继续回答。索引只是"第几张表"，
+     * 重排/替换之后同一个索引会指向另一张表 —— 那时用户对着旧表回答的问题
+     * 会被拿去算新表，授权边界形同虚设。所以这里的判据是**名称**，不是索引。
+     */
+    function ambiguityHost(sheetNames: string[]) {
+      const sheets = sheetNames.map((name) => ({ Name: name, ProtectContents: false }));
+      const storage = new Map<string, unknown>();
+      const application = {
+        Version: "12.0",
+        ActiveWorkbook: {
+          Name: "测试.xlsx",
+          FullName: "C:\\Data\\测试.xlsx",
+          Path: "C:\\Data",
+          ReadOnly: false,
+          Worksheets: {
+            Count: sheets.length,
+            Item: (index: number) => sheets[Number(index) - 1]
+          },
+          ActiveSheet: sheets[0]
+        },
+        ActiveSheet: sheets[0],
+        PluginStorage: {
+          getItem: (key: string) => storage.get(key),
+          setItem: (key: string, item: unknown) => { storage.set(key, item); }
+        },
+        CreateTaskPane: () => ({ ID: 1, Visible: true }),
+        GetTaskPane: () => undefined
+      } as never;
+      return {
+        application,
+        rename: (position: number, name: string) => { sheets[position].Name = name; },
+        reorder: (next: string[]) => {
+          const byName = new Map(sheets.map((sheet) => [sheet.Name, sheet]));
+          next.forEach((name, position) => {
+            const sheet = byName.get(name);
+            if (sheet) sheets[position] = sheet;
+          });
+        }
+      };
+    }
+
+    /** 让这一轮返回一张**需求澄清**卡（与列映射归因无关，专测范围失效判定）。 */
+    function ambiguityCard() {
+      runTurnMock.mockResolvedValue({
+        kind: "clarification",
+        clarification: {
+          response: {
+            kind: "clarification",
+            provider: "model",
+            clarification: {
+              id: `clarify-${Math.random().toString(16).slice(2)}`,
+              summary: "需要明确目标",
+              question: "要查询还是修改？",
+              reason: "两种操作不同",
+              scopeLabel: "当前表",
+              options: [
+                { id: "read", label: "查询", description: "只读", resolution: "查询数据" }
+              ]
+            }
+          }
+        }
+      });
+    }
+
+    /** 走到待答澄清卡为止。 */
+    async function pendingClarification() {
+      const { container } = await mount(panel());
+      await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "应加载模型");
+      const composer = container.querySelector<HTMLTextAreaElement>(".composer textarea");
+      await type(composer, "帮我处理表格");
+      await submit(composer);
+      await until(
+        () => Boolean(container.querySelector(".clarification-card")),
+        "应显示澄清卡"
+      );
+      await until(() => runTurnMock.mock.calls.length === 1, "应完成这一轮");
+      return container;
+    }
+
+    /** 卡片上的选项按钮 —— 与"取消本次澄清"区分开。 */
+    function clarificationOptions(container: HTMLElement): HTMLButtonElement[] {
+      return Array.from(
+        container.querySelectorAll<HTMLButtonElement>(
+          ".clarification-options button"
+        )
+      );
+    }
+
+    it("同索引换成另一张表：待答澄清失效，不拿旧答案继续算", async () => {
+      listModelsMock.mockResolvedValue({
+        defaultModelId: firstConnection.id,
+        models: [firstConnection]
+      });
+      ambiguityCard();
+      const host = ambiguityHost(["订单", "明细"]);
+      getWpsApplicationMock.mockReturnValue(host.application);
+
+      const container = await pendingClarification();
+      expect(clarificationOptions(container)).toHaveLength(1);
+      // 授权身份变了：第 1 张表从「订单」换成「客户」。
+      host.rename(0, "客户");
+
+      await click(clarificationOptions(container)[0]);
+      await until(
+        () => container.querySelector(".clarification-card.invalidated") !== null,
+        "同索引换表后待答澄清必须失效"
+      );
+      // 没有第二轮：失效的澄清不能带着旧上下文继续跑。
+      expect(runTurnMock).toHaveBeenCalledTimes(1);
+      expect(textOf(container)).toContain("数据范围已经变化");
+      // 原需求回到输入框，由用户重新确认范围后再发。
+      expect(
+        container.querySelector<HTMLTextAreaElement>(".composer textarea")?.value
+      ).toContain("帮我处理表格");
+    });
+
+    it("工作表重排：索引指向了另一张表，待答澄清失效", async () => {
+      listModelsMock.mockResolvedValue({
+        defaultModelId: firstConnection.id,
+        models: [firstConnection]
+      });
+      ambiguityCard();
+      const host = ambiguityHost(["订单", "明细"]);
+      getWpsApplicationMock.mockReturnValue(host.application);
+
+      const container = await pendingClarification();
+      // 重排：原第 2 张「明细」挪到第 1 位，索引 1 现在指向另一张表。
+      host.reorder(["明细", "订单"]);
+
+      await click(clarificationOptions(container)[0]);
+      await until(
+        () => container.querySelector(".clarification-card.invalidated") !== null,
+        "重排后待答澄清必须失效"
+      );
+      expect(runTurnMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("已授权表改名（顺序与集合都不变）：待答澄清失效并要求重新授权", async () => {
+      listModelsMock.mockResolvedValue({
+        defaultModelId: firstConnection.id,
+        models: [firstConnection]
+      });
+      ambiguityCard();
+      const host = ambiguityHost(["订单", "明细"]);
+      getWpsApplicationMock.mockReturnValue(host.application);
+
+      const container = await pendingClarification();
+      host.rename(0, "订单（新）");
+
+      await click(clarificationOptions(container)[0]);
+      await until(
+        () => container.querySelector(".clarification-card.invalidated") !== null,
+        "改名会让授权身份变化，待答澄清必须失效"
+      );
+      expect(runTurnMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("授权范围与身份都没变：澄清可以正常继续", async () => {
+      listModelsMock.mockResolvedValue({
+        defaultModelId: firstConnection.id,
+        models: [firstConnection]
+      });
+      runTurnMock
+        .mockResolvedValueOnce({
+          kind: "clarification",
+          clarification: {
+            response: {
+              kind: "clarification",
+              provider: "model",
+              clarification: {
+                id: "clarify-keep",
+                summary: "需要明确目标",
+                question: "要查询还是修改？",
+                reason: "两种操作不同",
+                scopeLabel: "当前表",
+                options: [
+                  { id: "read", label: "查询", description: "只读", resolution: "查询数据" }
+                ]
+              }
+            }
+          }
+        })
+        .mockResolvedValueOnce({
+          kind: "answer",
+          message: "已按补充说明处理。",
+          resultContext: null,
+          provider: "model"
+        });
+      const host = ambiguityHost(["订单", "明细"]);
+      getWpsApplicationMock.mockReturnValue(host.application);
+
+      const container = await pendingClarification();
+      // 只做一次**无副作用**的读取类调用：身份不变，卡片必须保留。
+      await click(clarificationOptions(container)[0]);
+      await until(() => runTurnMock.mock.calls.length === 2, "身份未变时应继续原任务");
+      expect(container.querySelector(".clarification-card.resolved")).not.toBeNull();
+      expect(textOf(container)).not.toContain("数据范围已经变化");
+    });
+  });
+
+  /**
+   * 侧栏信息层级的**结构与状态**断言。
+   *
+   * 这里能覆盖的是"哪些元素在哪、什么时候出现、按钮叫什么"，**不是布局**：
+   * jsdom 不计算真实排版，`.wps-native-review-actions` 里的 DOM 断言无法证明
+   * 按钮在 350/430/700 CSS px 下没有被挤压。CSS 契约只锁住"声明本身还在"，
+   * 真机视口表现必须另外用 WPS 截图验收（见
+   * `docs/WPS_NATIVE_REVIEW_UI_GUIDE_2026-09-30.md` 第 4 节）。
+   */
+describe("撤销按钮归属：执行结果卡内，按 executionId 绑定", () => {
+    /** 再跑一轮同样的计划（同一容器、同一宿主），用于"连续执行"的用例。 */
+    async function runAnotherPlan(container: HTMLElement, task: string) {
+      const textarea = container.querySelector("textarea");
+      await type(textarea, task);
+      await submit(textarea);
+      await until(
+        () => findButton(container, "生成右侧副本并排审阅") !== null,
+        "应展示新一轮计划预览"
+      );
+      await stageAndSave(container);
+    }
+
+    it("写入成功后：按钮在对应结果卡内，消息流末尾不再有全局撤销节点", async () => {
+      writeRangeHost();
+      const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
+      await stageAndSave(container);
+      await until(
+        () => container.querySelector(".wps-verification-card") !== null,
+        "确认写入后应给出执行结果卡"
+      );
+
+      // 正向锚点：按钮确实在产生恢复点的那张卡里，并且卡上写明状态。
+      const card = container.querySelector(".wps-verification-card");
+      expect(cardUndoButton(container)).not.toBeNull();
+      expect(card?.querySelector(".wps-undo-inline")?.textContent).toContain("可撤销");
+
+      // 负向：那张无条件挂在消息流末尾的全局撤销卡不许回来……
+      expect(container.querySelector(".wps-undo-card")).toBeNull();
+      // ……而且消息流里任何同文案按钮都必须落在某张卡（结果卡/备份卡）里面，
+      // 不允许存在"没有卡片容器的裸按钮"。
+      const buttons = flowUndoButtons(container);
+      expect(buttons.length).toBeGreaterThan(0);
+      for (const button of buttons) {
+        expect(button.closest(".wps-verification-card, .wps-backup-card")).not.toBeNull();
+      }
+
+      // 抽屉仍保留快捷入口，并标明它属于哪一次执行。
+      const opener = container.querySelector<HTMLButtonElement>('button[aria-label="备份与恢复"]');
+      await click(opener);
+      expect(await undoButton(container)).not.toBeNull();
+      expect(container.querySelector(".wps-backup-card")?.textContent).toContain("所属执行");
+    });
+
+    it("之后来一条无关回复，按钮仍留在旧结果卡里，不会被赶到最新回复下面", async () => {
+      writeRangeHost();
+      const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
+      await stageAndSave(container);
+      await until(
+        () => container.querySelector(".wps-verification-card") !== null,
+        "确认写入后应给出执行结果卡"
+      );
+      const card = container.querySelector(".wps-verification-card")!;
+
+      runTurnMock.mockResolvedValue({
+        kind: "answer",
+        message: "好的，还有什么需要处理的？",
+        provider: "model",
+        resultContext: null
+      });
+      const textarea = container.querySelector("textarea");
+      await type(textarea, "随便聊聊");
+      await submit(textarea);
+      await until(() => textOf(container).includes("还有什么需要处理的"), "应显示新的普通回复");
+
+      // 旧卡（同一个 DOM 节点）连同按钮一起按时间顺序往上走，没有被重建或挪走。
+      expect(container.contains(card)).toBe(true);
+      expect(cardUndoButton(container)).not.toBeNull();
+
+      // 最新那条普通回复里没有任何撤销入口。
+      const rows = Array.from(container.querySelectorAll<HTMLElement>(".message-row"));
+      const last = rows[rows.length - 1];
+      expect(last.textContent).toContain("还有什么需要处理的");
+      expect(last.querySelector(".wps-undo-inline")).toBeNull();
+      expect(container.querySelector(".wps-undo-card")).toBeNull();
+    });
+
+    it("连续两次执行：只有当前活跃恢复点那一次可点，旧卡降级为「恢复点已不可用」", async () => {
+      writeRangeHost();
+      const { container } = await mountPlanPreview(singleWritePlan, "第一次更新 A1");
+      await stageAndSave(container);
+      await until(
+        () => container.querySelectorAll(".wps-verification-card").length === 1,
+        "第一次执行应给出一张结果卡"
+      );
+
+      await runAnotherPlan(container, "第二次更新 A1");
+      await until(
+        () => container.querySelectorAll(".wps-verification-card").length === 2,
+        "第二次执行后应有两张结果卡"
+      );
+
+      const cards = Array.from(container.querySelectorAll<HTMLElement>(".wps-verification-card"));
+      // 旧卡在前、新卡在后：它是按时间顺序待在自己那条消息里的。
+      expect(cards[0].querySelector(".wps-undo-inline")?.textContent).toContain("恢复点已不可用");
+      expect(cards[0].querySelector('button[aria-label="撤销本次执行"]')).toBeNull();
+      expect(cards[1].querySelector(".wps-undo-inline")?.textContent).toContain("可撤销");
+      expect(cards[1].querySelector('button[aria-label="撤销本次执行"]')).not.toBeNull();
+      // 全局节点依旧不存在。
+      expect(container.querySelector(".wps-undo-card")).toBeNull();
+    });
+
+    it("撤销冲突：执行后区域又被改动时，卡片改为「撤销冲突」且不再可点", async () => {
+      const host = writeRangeHost();
+      const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
+      await stageAndSave(container);
+      await until(
+        () => container.querySelector(".wps-verification-card") !== null,
+        "确认写入后应给出执行结果卡"
+      );
+      expect(cardUndoButton(container)).not.toBeNull();
+
+      // 模拟用户在执行之后手工改了这块区域。
+      host.setCell("人工改过的值");
+
+      await click(cardUndoButton(container));
+      await until(() => textOf(container).includes("又被修改"), "应给出冲突提示");
+
+      const card = container.querySelector(".wps-verification-card")!;
+      expect(card.querySelector(".wps-undo-inline")?.textContent).toContain("撤销冲突");
+      expect(card.querySelector('button[aria-label="撤销本次执行"]')).toBeNull();
+      // 冲突不等于"已经被撤销"：区域里是用户后来写的内容，不能被覆盖。
+      expect(card.className).not.toContain("undone");
+      expect(host.cellValue()).toBe("人工改过的值");
+    });
+
+    it("面板重开（新的加载项会话）：旧结果卡只显示「恢复点已不可用」，没有可点的假按钮", async () => {
+      writeRangeHost();
+      const first = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
+      await stageAndSave(first.container);
+      await until(
+        () => cardUndoButton(first.container) !== null,
+        "第一次会话里应给出可点的撤销入口"
+      );
+      first.unmount();
+      mounted = mounted.filter((entry) => entry !== first);
+
+      // 重开：聊天历史（localStorage）还在，但当前加载项会话里已没有恢复点。
+      writeRangeHost();
+      const second = await mount(panel());
+      await until(
+        () => second.container.querySelector(".wps-verification-card") !== null,
+        "历史里的执行结果卡仍应显示"
+      );
+
+      const card = second.container.querySelector(".wps-verification-card")!;
+      expect(card.querySelector(".wps-undo-inline")?.textContent).toContain("恢复点已不可用");
+      expect(cardUndoButton(second.container)).toBeNull();
+      // 也不能靠抽屉里的残留入口变相提供一个可点的假按钮。
+      expect(await undoButton(second.container)).toBeNull();
+    });
+
+    it("新建独立对话：旧执行卡留在旧对话，不会移到新对话的消息末尾", async () => {
+      writeRangeHost();
+      const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
+      await stageAndSave(container);
+      await until(
+        () => container.querySelector(".wps-verification-card") !== null,
+        "确认写入后应给出执行结果卡"
+      );
+
+      await click(container.querySelector('button[aria-label="新对话"]'));
+      await until(() => textOf(container).includes("已新建对话"), "应新建对话");
+
+      // 新对话里既没有那张卡，也没有任何撤销入口。
+      expect(container.querySelector(".wps-verification-card")).toBeNull();
+      expect(flowUndoButtons(container).length).toBe(0);
+      expect(container.querySelector(".wps-undo-card")).toBeNull();
+
+      // 旧执行卡留在旧对话：切回去还在，入口仍在卡里。
+      await click(container.querySelector('[aria-label="更多"]'));
+      await click(container.querySelector('button[aria-label="历史对话"]'));
+      const entry = Array.from(container.querySelectorAll<HTMLElement>(".history-open-button")).find(
+        (item) => item.textContent?.includes("把 A1 改成 90")
+      );
+      await click(entry ?? null);
+      await until(
+        () => container.querySelector(".wps-verification-card") !== null,
+        "旧对话里的执行结果卡应保留"
+      );
+      expect(cardUndoButton(container)).not.toBeNull();
+      expect(container.querySelector(".wps-undo-card")).toBeNull();
+    });
+
+    it("成功撤销后：所属执行卡变为「已撤销」，且不再残留可点按钮", async () => {
+      const host = writeRangeHost();
+      const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
+      await stageAndSave(container);
+      await until(
+        () => container.querySelector(".wps-verification-card.verified") !== null,
+        "写入成功应给出回读核对结果"
+      );
+
+      await click(cardUndoButton(container));
+      await until(
+        () => container.querySelector(".wps-verification-card.undone") !== null,
+        "撤销后所属执行卡应变为已撤销"
+      );
+
+      const card = container.querySelector(".wps-verification-card")!;
+      expect(card.querySelector(".wps-undo-inline")?.textContent).toContain("已撤销");
+      expect(cardUndoButton(container)).toBeNull();
+      expect(container.querySelector(".wps-verification-card.verified")).toBeNull();
+      expect(host.cellValue()).toBe("旧值");
+      // 抽屉也不该再提供入口。
+      expect(await undoButton(container)).toBeNull();
+    });
+  });
+
+  describe("审阅侧栏的信息层级", () => {
+    it("keeps the long review status out of the action row so buttons never fight it for width", async () => {
+      writeRangeHost();
+      const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
+      await click(findButton(container, "生成右侧副本并排审阅"));
+
+      const status = container.querySelector(".wps-native-review-status");
+      const actions = container.querySelector(".wps-native-review-actions");
+      expect(status).not.toBeNull();
+      expect(actions).not.toBeNull();
+      // 正向锚点：状态说明确实渲染出来了，否则下面的负向断言就是空过。
+      expect(status?.textContent).toContain("尚未写入");
+      expect(textOf(container)).toContain("副本回读");
+      // 负向：操作区里除 button 外不许有别的元素。长说明一旦搬回按钮容器，
+      // 单行 flex 就会把按钮压窄到逐字折行 —— 真机竖排的直接原因。
+      expect(
+        Array.from(actions!.children).every((child) => child.tagName === "BUTTON")
+      ).toBe(true);
+      expect(actions!.querySelector("span, p")).toBeNull();
+      // 用户先读状态，再决定点哪个：状态区必须排在操作区之前。
+      expect(
+        (status!.compareDocumentPosition(actions!) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0
+      ).toBe(true);
+    });
+
+    it("names the two commit actions unambiguously and hides them before staging", async () => {
+      writeRangeHost();
+      const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
+      // 尚未试算：不得出现可写回的入口。
+      expect(findButton(container, "确认写回原表")).toBeNull();
+      expect(findButton(container, "放弃副本")).toBeNull();
+
+      await click(findButton(container, "生成右侧副本并排审阅"));
+      const actions = container.querySelector(".wps-native-review-actions")!;
+      const names = Array.from(actions.querySelectorAll("button")).map(
+        (item) => (item.textContent ?? "").trim()
+      );
+      expect(names).toEqual(["放弃副本", "确认写回原表"]);
+      // 文案要说清"写回的是原表"，而不是含糊的"保存"。
+      expect(findButton(container, "确认写回原表")?.getAttribute("class")).toContain("primary");
+    });
+
+    it("disables both commit actions while the commit is in flight", async () => {
+      const host = writeRangeHost();
+      const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
+      await click(findButton(container, "生成右侧副本并排审阅"));
+
+      // 不用 `click()` 助手：它会 settle 掉整条异步链，捕捉不到在途状态。
+      // `busy` 由 `writeProgress` 驱动，而写回第一步就同步置位。
+      act(() => {
+        findButton(container, "确认写回原表")!.dispatchEvent(
+          new MouseEvent("click", { bubbles: true })
+        );
+      });
+      expect(findButton(container, "放弃副本")?.disabled).toBe(true);
+      expect(findButton(container, "确认写回原表")?.disabled).toBe(true);
+      await settle();
+      expect(host.writes()).toBeGreaterThan(0);
+    });
+
+    it("collapses the long body by default while keeping summary and actions on screen", async () => {
+      writeRangeHost();
+      const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
+
+      const disclosures = Array.from(container.querySelectorAll<HTMLDetailsElement>(".wps-plan-disclosure"));
+      expect(disclosures.length).toBeGreaterThanOrEqual(2);
+      // 默认全部收起；收起不等于删除，内容仍在 DOM 里可展开。
+      expect(disclosures.every((item) => item.open === false)).toBe(true);
+      const summaries = disclosures.map((item) => item.querySelector("summary")?.textContent ?? "");
+      expect(summaries.some((text) => text.includes("查看预计结果"))).toBe(true);
+      expect(summaries.some((text) => text.includes("查看公式与完整计划"))).toBe(true);
+      // 首屏（details 之外）必须已经能看到目标、规模与操作按钮。
+      const card = container.querySelector(".wps-plan-card")!;
+      expect(card.querySelector(".wps-plan-target")?.textContent).toContain("Sheet1!A1");
+      expect(findButton(container, "生成右侧副本并排审阅")).not.toBeNull();
+    });
+
+    it("labels expected values and copy read-back as different things", async () => {
+      writeRangeHost();
+      const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
+      // 试算前只有"预计"，绝不允许出现任何"已回读"的表述。
+      const beforeStaging = textOf(container);
+      expect(beforeStaging).toContain("尚未生成副本");
+      expect(beforeStaging).toContain("预计");
+      expect(beforeStaging).not.toContain("副本回读");
+
+      await click(findButton(container, "生成右侧副本并排审阅"));
+      const afterStaging = textOf(container);
+      expect(afterStaging).toContain("副本回读");
+      expect(afterStaging).toContain("不是预计值");
+      const summaries = Array.from(container.querySelectorAll(".wps-plan-disclosure summary"))
+        .map((item) => item.textContent ?? "");
+      // 预计与回读各自有独立入口，标签不同。
+      expect(summaries.some((text) => text.includes("查看预计结果（尚未写入）"))).toBe(true);
+      expect(summaries.some((text) => text.includes("查看副本回读结果"))).toBe(true);
+    });
+
+    it("states formula trial and fixed-value fallback with different wording", async () => {
+      writeRangeHost();
+      const valuesPreview = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
+      await click(findButton(valuesPreview.container, "生成右侧副本并排审阅"));
+      expect(textOf(valuesPreview.container)).toContain("副本已写入固定值并回读");
+      expect(textOf(valuesPreview.container)).not.toContain("副本已试算公式");
+
+      writeRangeHost();
+      const formulaPlan: AnalysisPlan = {
+        ...singleWritePlan,
+        id: "wps-map-column-test",
+        actions: [{ type: "writeFormulas", sheet: "Sheet1", range: "A1", formulas: [["=1+1"]] }],
+        acceptanceCriteria: [{ type: "rangeEquals", sheet: "Sheet1", range: "A1", expected: [["2"]] }]
+      };
+      const formulaPreview = await mountPlanPreview(formulaPlan, "用公式计算 A1");
+      await click(findButton(formulaPreview.container, "生成右侧副本并排审阅"));
+      expect(textOf(formulaPreview.container)).toContain("副本已试算公式并回读计算值");
+      expect(textOf(formulaPreview.container)).not.toContain("副本已写入固定值");
+    });
+
+    it("keeps the CSS contract that two buttons stay readable at narrow and wide widths", () => {
+      // 再次强调：这些是**声明层面**的契约，不能替代真机视口验收。
+      // 真机 350/430 px 下"按钮没有逐字折行"只能靠 WPS 截图证明。
+      //
+      // 正则必须用 `[^}]*`（**不许跨 `}`**）：用 `[\s\S]*?` 会一路匹配到
+      // 后面别的规则里的同名声明，断言就变成恒真的假绿灯 —— 这一点用一个
+      // 删掉 `white-space: nowrap` 的反向变异验过。
+      expect(styles).toMatch(/\.wps-native-review-actions button\s*\{[^}]*white-space:\s*nowrap;/);
+      expect(styles).toMatch(/\.wps-native-review-actions button\s*\{[^}]*min-height:\s*44px;/);
+      // 窄窗格整行纵排。
+      expect(styles).toMatch(/@media \(max-width:\s*559px\)\s*\{[^}]*flex-basis:\s*100%/);
+      // 旧的单行 flex 容器不得复活：说明和按钮再同排就会重现真机竖排。
+      expect(styles).not.toMatch(/\.wps-plan-buttons\s*\{/);
+      // 长公式走等宽 + 横向滚动，不再任意折断。
+      expect(styles).toMatch(
+        /\.wps-plan-values th,\s*\.wps-plan-values td\s*\{[^}]*white-space:\s*nowrap;/
+      );
+      expect(styles).not.toMatch(
+        /\.wps-plan-values th,\s*\.wps-plan-values td\s*\{[^}]*overflow-wrap:\s*anywhere/
+      );
+    });
+  });
+});
+
+/**
+ * 输入框的「上拉」：与 Excel 端共用 `useComposerResize`。
+ *
+ * 这里能覆盖的是"把手在哪、叫什么、高度和滚动怎么变"；jsdom 不排版，所以
+ * 真实的拖动手感与窄窗格表现仍须在 WPS 真机里验收。
+ */
+describe("输入框上拉：与 Excel 端同一套行为", () => {  it("把手挂在输入框**外面**的 region 上，文案来自共享常量", async () => {
+    listModelsMock.mockResolvedValue({
+      defaultModelId: firstConnection.id,
+      models: [firstConnection]
+    });
+    const { container } = await mount(panel());
+    await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "应加载模型目录");
+
+    const handle = container.querySelector<HTMLElement>(".composer-resize-handle");
+    expect(handle).not.toBeNull();
+    expect(handle?.getAttribute("role")).toBe("separator");
+    expect(handle?.getAttribute("aria-label")).toBe(COMPOSER_RESIZE_LABEL);
+    expect(handle?.getAttribute("aria-orientation")).toBe("horizontal");
+    expect(handle?.getAttribute("tabindex")).toBe("0");
+    // 必须待在 region 的上内边距里：挪进 composer-box 会盖住文本区、抢走光标。
+    expect(handle?.closest(".composer-input-region")).not.toBeNull();
+    expect(handle?.closest(".composer-box")).toBeNull();
+  });
+
+  it("内容超过上限时改为可滚动查看，而不是把多余的行切掉", async () => {
+    listModelsMock.mockResolvedValue({
+      defaultModelId: firstConnection.id,
+      models: [firstConnection]
+    });
+    const { container } = await mount(panel());
+    await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "应加载模型目录");
+    const textarea = container.querySelector<HTMLTextAreaElement>("textarea")!;
+
+    // jsdom 不排版：直接给一个"内容很高"的宿主输入，等价于真机里输入了很多行。
+    Object.defineProperty(textarea, "scrollHeight", { configurable: true, get: () => 900 });
+    await type(textarea, "需要填很长的一段说明，长到超过输入框的自动高度上限为止……");
+
+    // 正向前提：确实超过了上限，否则下面的断言就没意义。
+    expect(textarea.scrollHeight).toBeGreaterThan(COMPOSER_AUTO_GROW_MAX_HEIGHT);
+    expect(textarea.style.height).toBe(`${COMPOSER_AUTO_GROW_MAX_HEIGHT}px`);
+    // 核心：溢出改为可滚动，而不是 `hidden` 把文字切掉。
+    expect(textarea.style.overflowY).toBe("auto");
+  });
+
+  it("CSS 契约：不再依赖 WPS WebView 里拖不动的原生 resize 把手", () => {
+    const block = styles.match(/\.wps-chat-shell \.composer-box textarea\s*\{[^}]*\}/)?.[0] ?? "";
+    expect(block).not.toBe("");
+    expect(block).not.toContain("resize: vertical");
+    // 下限与 hook 的 `minHeight: 56` 一致，拖到底和实际渲染高度才对得上。
+    expect(block).toContain("min-height: 56px");
+  });
+});
+
+/**
+ * 任务恢复记录里"原表写入状态"的生命周期。
+ *
+ * 这一段最容易说假话：任务在写入途中被打断时，记录里如果没有留下任何痕迹，
+ * 卡片就会对用户说"原表未写入" —— 而原表可能已经被改过了。所以判据是：
+ *  - **写前**先记 `unknown`（宁可说未知，也不假装没写）；
+ *  - 写成功 → `confirmed_result` + 终态（已完成的任务不再兜售"继续"）；
+ *  - 部分写入/回读失败 → `needs_review`，下次只能核对；
+ *  - 用户显式放弃 → 终态，且如实写"未写入"（确实一个格子都没碰）。
+ */
+/**
+ * 从落盘的对话历史里取出所有任务恢复记录。
+ *
+ * 读的是 **localStorage**（真正的持久面），不是组件 state —— 这样断言的是
+ * "重开之后还能看到什么"，而不是"内存里现在是什么"。
+ */
+function storedRecords(): Array<Record<string, unknown>> {
+  const saved = JSON.parse(localStorage.getItem("excel-bro.wps.chat.v1") ?? "null") as {
+    conversations?: Array<{ messages?: Array<{ taskResume?: Record<string, unknown> }> }>;
+  } | null;
+  return (saved?.conversations ?? [])
+    .flatMap((conversation) => conversation.messages ?? [])
+    .map((message) => message.taskResume)
+    .filter(Boolean) as Array<Record<string, unknown>>;
+}
+
+describe("任务恢复记录：写前/写后状态与终态", () => {
+
+  it("预览阶段就有记录：写前状态如实是「未写入」", async () => {
+    writeRangeHost();
+    const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
+    expect(container.querySelector(".wps-plan-card")).not.toBeNull();
+
+    const records = storedRecords();
+    expect(records.length).toBeGreaterThan(0);
+    const record = records[records.length - 1];
+    expect(record.writeState).toBe("not_written");
+    expect(record.phase).toBe("preview_ready");
+    expect(record.originalPrompt).toBe("把 A1 改成 90");
+    // 规划身份要跟着记录走：断线后靠它查真实状态，而不是重发一遍需求。
+    expect(record.turnId).toBe("turn-preview-1");
+  });
+
+  it("写入成功后：记录为「已确认写入结果」且是终态，不再出现可继续入口", async () => {
+    writeRangeHost();
+    const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
+    await stageAndSave(container);
+    await until(
+      () => container.querySelector(".wps-verification-card") !== null,
+      "写入成功应给出结果卡"
+    );
+
+    const record = storedRecords().find((item) => item.writeState === "confirmed_result");
+    expect(record).toBeDefined();
+    expect(record?.resumability).toBe("unavailable");
+    // 已完成的任务不能重新被摆成"可以继续"。
+    expect(container.querySelector(".clarification-recovery-actions")).toBeNull();
+    expect(findButton(container, "继续任务")).toBeNull();
+  });
+
+  it("部分写入失败后：记录为「需要核对原表」，不得谎报未写入", async () => {
+    // 写入不落盘 → 回读与计划不符 → 执行器判定为可恢复的部分写入。
+    const host = writeRangeHost({ staleWrite: true });
+    const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
+    await stageAndSave(container);
+    await until(
+      () => container.querySelector(".message-row.system") !== null,
+      "失败应给出系统反馈"
+    );
+    expect(host.writes()).toBeGreaterThan(0);
+
+    const record = storedRecords().find((item) => item.phase === "executing");
+    expect(record).toBeDefined();
+    expect(record?.writeState).toBe("needs_review");
+    expect(record?.blocker).toBe("execution_unknown");
+    expect(record?.resumability).toBe("reconcile");
+    // 关键负向：绝不能是"未写入"——那时原表可能已经被改过。
+    expect(record?.writeState).not.toBe("not_written");
+  });
+
+  it("用户显式放弃副本：终态，且如实记录「未写入」", async () => {
+    writeRangeHost();
+    const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
+    await click(findButton(container, "生成右侧副本并排审阅"));
+    await click(findButton(container, "放弃副本"));
+    await until(() => textOf(container).includes("已放弃右侧审阅副本"), "应确认已放弃");
+
+    const record = storedRecords().find((item) => item.resumability === "unavailable");
+    expect(record).toBeDefined();
+    // 一个格子都没写过，这里说"未写入"是真的。
+    expect(record?.writeState).toBe("not_written");
+    expect(container.querySelector(".clarification-recovery-actions")).toBeNull();
+  });
+
+  it("第一次宿主写入发生的那一刻，落盘记录已经是「未知」", async () => {
+    let atFirstWrite: Array<Record<string, unknown>> = [];
+    writeRangeHost({
+      onWrite: (count) => {
+        // 在写入**发生的那一刻**取证：读的是 localStorage，不是组件 state。
+        if (count === 1) atFirstWrite = storedRecords();
+      }
+    });
+    const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
+    await stageAndSave(container);
+    await until(
+      () => container.querySelector(".wps-verification-card") !== null,
+      "写入应完成"
+    );
+
+    expect(atFirstWrite.length).toBeGreaterThan(0);
+    const record = atFirstWrite[atFirstWrite.length - 1];
+    // 顺序保证：登记必须早于第一次写入，否则写入途中断线就没人知道原表动过。
+    expect(record.writeState).toBe("unknown");
+    expect(record.phase).toBe("executing");
+  });
+
+  it("执行前恢复标记写不进存储时：取消写入，原表写入次数为 0", async () => {
+    const host = writeRangeHost();
+    const original = Storage.prototype.setItem;
+    const spy = vi
+      .spyOn(Storage.prototype, "setItem")
+      .mockImplementation(function (this: Storage, key: string, value: string) {
+        if (key === "excel-bro.wps.chat.v1") throw new Error("QuotaExceededError");
+        return original.call(this, key, value);
+      });
+    try {
+      const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
+      await click(findButton(container, "生成右侧副本并排审阅"));
+      await click(findButton(container, "确认写回原表"));
+      await until(
+        () => textOf(container).includes("已取消本次写入"),
+        "存不下标记时应明确取消写入"
+      );
+
+      // 核心：没有持久证据就**一个单元格都不写**。
+      expect(host.writes()).toBe(0);
+      expect(host.cellValue()).toBe("旧值");
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("写入之后恢复点读取失败：不得显示「原表未写入」", async () => {
+    const host = writeRangeHost({ staleWrite: true, breakStorageReadsAfterWrite: true });
+    const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
+    await stageAndSave(container);
+    await until(
+      () => container.querySelector(".message-row.system") !== null,
+      "失败应给出系统反馈"
+    );
+    expect(host.writes()).toBeGreaterThan(0);
+
+    const record = storedRecords().find((item) => item.phase === "executing");
+    expect(record).toBeDefined();
+    /*
+     * 读取失败 ≠ 没写过。这里必须保持"未知"——把它折成 `not_written`，
+     * 就是对着可能已被改过的原表说"原表未写入"。
+     */
+    expect(record?.writeState).toBe("unknown");
+    expect(record?.writeState).not.toBe("not_written");
+    expect(textOf(container)).not.toContain("原表未写入");
+    expect(textOf(container)).toContain("无法确认");
+  });
+});
+
+describe("WPS 写入耐久恢复（CAP-03）", () => {
+  it("服务端登记失败：取消写入，原表写入次数为 0", async () => {
+    const host = writeRangeHost();
+    registerWpsExecutionMock.mockRejectedValueOnce(new Error("服务端不可用"));
+    const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
+    await stageAndSave(container);
+    await until(
+      () => textOf(container).includes("无法持久登记本次写入现场"),
+      "登记失败应中止写入"
+    );
+
+    // 核心：拿不到持久证据就一个单元格都不写。
+    expect(host.writes()).toBe(0);
+    expect(host.cellValue()).toBe("旧值");
+  });
+
+  it("服务端未授予写入权（无 ownerToken）：取消写入", async () => {
+    const host = writeRangeHost();
+    registerWpsExecutionMock.mockResolvedValueOnce({
+      operationId: "wps-execution-test",
+      status: "running",
+      revision: 1,
+      workbookIdentity: "wps-path:c:\\data\\测试.xlsx",
+      taskId: "task-test",
+      descriptor: { actions: [] },
+      authorizedSheetNames: ["Sheet1"],
+      nextActionIndex: 0,
+      totalActions: 1,
+      inFlightActionIndex: null,
+      beforeSnapshot: null,
+      checkpoint: null,
+      result: null,
+      error: null,
+      canResume: true,
+      ownerActive: false,
+      requiresReconciliation: false,
+      ownerToken: null
+    });
+    const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
+    await stageAndSave(container);
+    await until(
+      () => textOf(container).includes("没有授予本次 WPS 写入权"),
+      "无写入权应中止"
+    );
+
+    expect(host.writes()).toBe(0);
+  });
+
+  it("写成功并提交动作级检查点与完成回执", async () => {
+    const host = writeRangeHost();
+    const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
+    await stageAndSave(container);
+    await until(
+      () => container.querySelector(".wps-verification-card") !== null,
+      "写入应完成"
+    );
+
+    expect(host.writes()).toBeGreaterThan(0);
+    expect(startWpsActionMock).toHaveBeenCalled();
+    expect(completeWpsActionMock).toHaveBeenCalled();
+    expect(finishWpsExecutionMock).toHaveBeenCalled();
+  });
+
+  it("本地发现索引只存白名单字段，不含计划、授权或矩阵", async () => {
+    const host = writeRangeHost();
+    registerWpsExecutionMock.mockResolvedValueOnce({
+      operationId: "wps-execution-test",
+      status: "running",
+      revision: 1,
+      workbookIdentity: "wps-path:c:\\data\\测试.xlsx",
+      taskId: "task-test",
+      descriptor: { actions: [] },
+      authorizedSheetNames: ["Sheet1"],
+      nextActionIndex: 0,
+      totalActions: 1,
+      inFlightActionIndex: null,
+      beforeSnapshot: null,
+      checkpoint: null,
+      result: null,
+      error: null,
+      canResume: true,
+      ownerActive: false,
+      requiresReconciliation: false,
+      ownerToken: "owner-token-0123456789abcdef0123456789abcdef"
+    });
+    const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
+    await stageAndSave(container);
+    await until(
+      () => container.querySelector(".wps-verification-card") !== null,
+      "写入应完成"
+    );
+
+    const raw = localStorage.getItem("excel-bro.pending-wps-execution.v1");
+    // 写成功后索引已被清除（完成回执释放）。
+    expect(raw).toBeNull();
+    void host;
+  });
+
+  /*
+   * 重开面板后的恢复卡：**点真实按钮、看真实 API 调用与宿主写入次数**。
+   * 不只看徽标文案 —— 上一轮的缺陷正是"显示可以继续却没有按钮"。
+   */
+  const PENDING_KEY = "excel-bro.pending-wps-execution.v1";
+
+  function recoveryState(overrides: Record<string, unknown> = {}) {
+    const total = Number(overrides.totalActions ?? 1);
+    const fingerprint = matrixFingerprintV2([["旧值"]], [["旧值"]]);
+    return {
+      operationId: "wps-execution-test",
+      status: "running" as const,
+      revision: 7,
+      workbookIdentity: "wps-path:c:\\data\\测试.xlsx",
+      taskId: "task-test",
+      descriptor: { actions: Array.from({ length: total }, (_, actionIndex) => ({
+        actionIndex, type: "writeValues", sheet: "Sheet1", range: `A${actionIndex + 1}`,
+        rowCount: 1, columnCount: 1, cellCount: 1,
+        previewFingerprint: fingerprint, expectedFingerprint: fingerprint
+      })) },
+      authorizedSheetNames: ["Sheet1"],
+      nextActionIndex: 0,
+      totalActions: 1,
+      inFlightActionIndex: null,
+      beforeSnapshot: null,
+      checkpoint: null,
+      result: null,
+      error: null,
+      canResume: true,
+      ownerActive: false,
+      requiresReconciliation: false,
+      ownerToken: null,
+      ...overrides
+    };
+  }
+
+  /** 带 `taskResume` 的历史消息：重新预览要靠它找回原始需求。 */
+  function historyWithTaskResume(): unknown[] {
+    return [
+      {
+        id: "msg-resume",
+        role: "assistant",
+        text: "写入未完成",
+        createdAt: new Date().toISOString(),
+        taskResume: {
+          schemaVersion: 1,
+          taskId: "task-test",
+          phase: "executing",
+          blocker: "execution_unknown",
+          resumability: "reconcile",
+          writeState: "unknown",
+          originalPrompt: "把 A1 改成 90",
+          confirmations: [],
+          authorizationRevision: 1,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        }
+      }
+    ];
+  }
+
+  async function mountRecoveryCard(options: {
+    state?: Record<string, unknown>;
+    fullName?: string;
+    withHistory?: boolean;
+    /** 在挂载**之前**塞一条现场冲突的恢复点，让只读核对拿到 conflict。 */
+    seedUndo?: "conflict";
+  } = {}) {
+    const host = writeRangeHost();
+    if (options.seedUndo === "conflict") {
+      seedConflictingUndoRecord("wps-execution-test");
+      host.setCell("人工修改");
+    }
+    if (options.withHistory) {
+      localStorage.setItem(
+        "excel-bro.wps.chat.v1",
+        JSON.stringify({
+          activeConversationId: "conv-1",
+          conversations: [
+            {
+              id: "conv-1",
+              title: "历史",
+              messages: historyWithTaskResume(),
+              createdAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString()
+            }
+          ]
+        })
+      );
+    }
+    if (options.fullName !== undefined) {
+      const application = getWpsApplicationMock() as unknown as {
+        ActiveWorkbook: { FullName: string };
+      };
+      application.ActiveWorkbook.FullName = options.fullName;
+    }
+    localStorage.setItem(
+      PENDING_KEY,
+      JSON.stringify({
+        schemaVersion: 1,
+        operationId: "wps-execution-test",
+        conversationId: "conv-1",
+        activityMessageId: "msg-1",
+        workbookIdentity: "wps-path:c:\\data\\测试.xlsx",
+        taskId: "task-test",
+        createdAt: new Date().toISOString()
+      })
+    );
+    getWpsExecutionStatusMock.mockResolvedValue(recoveryState(options.state) as never);
+    listModelsMock.mockResolvedValue({ defaultModelId: firstConnection.id, models: [firstConnection] });
+    const { container } = await mount(panel());
+    await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "应加载模型目录");
+    await until(
+      () => container.querySelector(".wps-write-recovery") !== null,
+      "重载后应出现恢复核对卡"
+    );
+    await until(
+      () => !textOf(container).includes("正在查询服务端写入现场"),
+      "应查完服务端状态"
+    );
+    return { container, host };
+  }
+
+  function recoveryButtons(container: HTMLElement): string[] {
+    const card = container.querySelector(".wps-write-recovery");
+    if (!card) return [];
+    // Only mutation/dismiss actions; the separate refresh button is read-only.
+    return Array.from(card.querySelectorAll(".wps-recovery-action")).map((item) =>
+      (item.textContent ?? "").trim()
+    );
+  }
+
+  it("零写入证据的锚点：纯测试替身计数包含 Value2 和 Formula 两种 setter", () => {
+    const host = writeRangeHost();
+    // getWpsApplicationMock was explicitly replaced by writeRangeHost; this is
+    // only a JS fixture, never the real WPS application or a runtime write path.
+    const fixture = getWpsApplicationMock();
+    const range = fixture.ActiveWorkbook!.Worksheets.Item(1).Range!("A1");
+    expect(host.writes()).toBe(0);
+    range.Value2 = "TEST_VALUE";
+    expect(host.writes()).toBe(1);
+    range.Formula = "=1+1";
+    expect(host.writes()).toBe(2);
+  });
+
+  it("全部动作已完成、只丢最终回执：点补记完成 → 领取执行权 + 提交完成回执，宿主写入 0", async () => {
+    const { container, host } = await mountRecoveryCard({
+      state: { nextActionIndex: 2, totalActions: 2 }
+    });
+    claimWpsExecutionResumeMock.mockResolvedValueOnce(recoveryState({ nextActionIndex: 2,
+      totalActions: 2, ownerToken: "claimed-owner", revision: 8 }) as never);
+
+    expect(recoveryButtons(container)).toEqual([
+      "补记完成（不重写原表）",
+      "清除这条恢复提示"
+    ]);
+
+    await click(findButton(container, "补记完成（不重写原表）"));
+    await until(
+      () => textOf(container).includes("已补记这次写入的完成回执"),
+      "补记应成功"
+    );
+
+    expect(claimWpsExecutionResumeMock).toHaveBeenCalledWith("wps-execution-test", 7);
+    expect(finishWpsExecutionMock).toHaveBeenCalledTimes(1);
+    expect(finishWpsExecutionMock).toHaveBeenCalledWith("wps-execution-test", {
+      expectedRevision: 8, ownerToken: "claimed-owner", result: { backfilled: true, actionCount: 2 }
+    });
+    // 补记只改账本：一次宿主写入都没有。
+    expect(host.writes()).toBe(0);
+    expect(localStorage.getItem(PENDING_KEY)).toBeNull();
+    expect(container.querySelector(".wps-write-recovery")).toBeNull();
+  });
+
+  it("还有动作没写：只给「重新读取并生成预览」，不给任何继续/写入按钮", async () => {
+    const { container } = await mountRecoveryCard({
+      state: { nextActionIndex: 1, totalActions: 3 }
+    });
+
+    const buttons = recoveryButtons(container);
+    expect(buttons).toEqual(["重新读取并生成预览", "清除这条恢复提示"]);
+    // 关键：不许出现"可以继续"这类冒充断点续跑的入口。
+    expect(buttons.some((name) => name.includes("继续"))).toBe(false);
+    expect(textOf(container)).toContain("无法精确续跑剩余动作");
+  });
+
+  it("点「重新读取并生成预览」→ 用原需求重新发起一轮，不是续跑", async () => {
+    const { container, host } = await mountRecoveryCard({
+      state: { nextActionIndex: 1, totalActions: 3 },
+      withHistory: true
+    });
+    runTurnMock.mockResolvedValue({ kind: "plan", plan: singleWritePlan, turnId: "turn-replan" });
+    expect(findButton(container, "重新读取并生成预览")?.disabled).toBe(true);
+    await click(container.querySelector('.wps-write-recovery input[type="checkbox"]') as HTMLInputElement);
+    await click(findButton(container, "重新读取并生成预览"));
+    await until(
+      () => textOf(container).includes("重新读取并生成预览 —— 那是新的一轮"),
+      "应说明这是新的一轮"
+    );
+
+    // 重新走一轮规划，且**没有**对原表做任何写入。
+    expect(runTurnMock).toHaveBeenCalled();
+    expect(host.writes()).toBe(0);
+    expect(reconcileWpsActionReceiptMock).not.toHaveBeenCalled();
+    expect(finishWpsExecutionMock).not.toHaveBeenCalled();
+    expect(claimWpsExecutionResumeMock).toHaveBeenCalled();
+    expect(suspendWpsExecutionMock).toHaveBeenCalled();
+    expect(localStorage.getItem(PENDING_KEY)).not.toBeNull();
+  });
+
+  it.each([
+    ["canResume 变 false", { canResume: false }],
+    ["另一个执行者领取", { ownerActive: true }],
+    ["剩余动作重新出现", { nextActionIndex: 0 }]
+  ])("点补记前重新查询：%s 不调用领取或完成", async (_label, patch) => {
+    const { container, host } = await mountRecoveryCard({ state: { nextActionIndex: 1 } });
+    getWpsExecutionStatusMock.mockResolvedValue(recoveryState({ nextActionIndex: 1, ...patch }) as never);
+    await click(findButton(container, "补记完成（不重写原表）"));
+    await until(() => getWpsExecutionStatusMock.mock.calls.length >= 2, "必须重新查询");
+    expect(claimWpsExecutionResumeMock).not.toHaveBeenCalled();
+    expect(finishWpsExecutionMock).not.toHaveBeenCalled();
+    expect(host.writes()).toBe(0);
+  });
+
+  it("卡片显示后人工改值：点补记重新读现场，拦住回执", async () => {
+    const { container, host } = await mountRecoveryCard({ state: { nextActionIndex: 1 } });
+    host.setCell("人工修改后");
+    await click(findButton(container, "补记完成（不重写原表）"));
+    await until(() => textOf(container).includes("疑似人工修改"), "应识别现场冲突");
+    expect(claimWpsExecutionResumeMock).not.toHaveBeenCalled();
+    expect(finishWpsExecutionMock).not.toHaveBeenCalled();
+    expect(host.writes()).toBe(0);
+  });
+
+  it("领取期间人工改值：第二次现场核对仍拦住完成回执", async () => {
+    const { container, host } = await mountRecoveryCard({ state: { nextActionIndex: 1 } });
+    claimWpsExecutionResumeMock.mockImplementationOnce(async () => {
+      host.setCell("领取期间修改");
+      return recoveryState({ nextActionIndex: 1, ownerToken: "new-owner", revision: 8 }) as never;
+    });
+    await click(findButton(container, "补记完成（不重写原表）"));
+    await until(() => textOf(container).includes("领取执行权后现场发生变化"), "第二次核对应拦截");
+    expect(finishWpsExecutionMock).not.toHaveBeenCalled();
+    expect(suspendWpsExecutionMock).toHaveBeenCalled();
+    expect(host.writes()).toBe(0);
+  });
+
+  it("最后动作回执丢失：点击核对提交指纹后只补记完成，零宿主写入", async () => {
+    const { container, host } = await mountRecoveryCard({ state: {
+      status: "needs_reconciliation", requiresReconciliation: true, inFlightActionIndex: 0
+    }});
+    reconcileWpsActionReceiptMock.mockResolvedValueOnce(recoveryState({ nextActionIndex: 1,
+      ownerToken: "new-owner", revision: 8 }) as never);
+    await click(findButton(container, "核对在途动作"));
+    await until(() => textOf(container).includes("已核对最后一个动作并补记完成"), "应只补记");
+    expect(reconcileWpsActionReceiptMock).toHaveBeenCalledWith("wps-execution-test", expect.objectContaining({
+      outcome: "applied", checkpoint: expect.objectContaining({ type: "writeValues",
+        sheetName: "Sheet1", range: "A1", afterFingerprint: expect.any(String) })
+    }));
+    expect(finishWpsExecutionMock).toHaveBeenCalledTimes(1);
+    expect(runTurnMock).not.toHaveBeenCalled();
+    expect(host.writes()).toBe(0);
+  });
+
+  it("canResume=false：只给清除提示，不给补记或核对按钮", async () => {
+    const { container } = await mountRecoveryCard({
+      state: { canResume: false, nextActionIndex: 2, totalActions: 2 }
+    });
+    expect(recoveryButtons(container)).toEqual(["清除这条恢复提示"]);
+  });
+
+  it("执行权仍活跃时仅只读刷新，释放后才出现补记入口", async () => {
+    const { container, host } = await mountRecoveryCard({ state: { nextActionIndex: 1, ownerActive: true } });
+    expect(recoveryButtons(container)).toEqual(["清除这条恢复提示"]);
+    getWpsExecutionStatusMock.mockResolvedValue(recoveryState({ nextActionIndex: 1 }) as never);
+    await click(findButton(container, "重新核对（只读）"));
+    await until(() => recoveryButtons(container).includes("补记完成（不重写原表）"), "刷新后才开放补记");
+    expect(claimWpsExecutionResumeMock).not.toHaveBeenCalled();
+    expect(finishWpsExecutionMock).not.toHaveBeenCalled();
+    expect(host.writes()).toBe(0);
+  });
+
+  it("身份不一致（另一个工作簿）：只给清除提示，不给写入按钮", async () => {
+    const { container } = await mountRecoveryCard({
+      state: { nextActionIndex: 2, totalActions: 2 },
+      fullName: "C:\\other\\测试.xlsx"
+    });
+    expect(recoveryButtons(container)).toEqual(["清除这条恢复提示"]);
+    expect(textOf(container)).toContain("不是同一个文件");
+  });
+
+  /**
+   * 往 PluginStorage 塞一条**现场与写前、写后都不一致**的恢复点。
+   * 指纹故意用不可能匹配上的值，让只读核对必然得出 `conflict`。
+   */
+  function seedConflictingUndoRecord(executionId: string) {
+    const application = getWpsApplicationMock() as unknown as {
+      PluginStorage: { setItem: (key: string, value: unknown) => void };
+    };
+    application.PluginStorage.setItem(
+      "excel-bro.wps.undo.v1",
+      JSON.stringify([
+        {
+          version: 2,
+          executionId,
+          planId: "plan-old",
+          planTitle: "旧计划",
+          createdAt: new Date().toISOString(),
+          workbookIdentity: "c:\\data\\测试.xlsx",
+          authorizedSheetNames: ["Sheet1"],
+          state: "applying",
+          actions: [
+            {
+              actionIndex: 0,
+              type: "writeValues",
+              sheetIndex: 1,
+              sheetName: "Sheet1",
+              range: "A1",
+              rowCount: 1,
+              columnCount: 1,
+              cellCount: 1,
+              values: [["90"]],
+              preview: [["90"]],
+              previewFingerprint: "1:00000000",
+              rect: { startRow: 1, startColumn: 1, endRow: 1, endColumn: 1 },
+              beforeValues: [["旧值"]],
+              beforeFormulas: [["旧值"]],
+              beforeFingerprint: "1:aaaaaaaa",
+              afterFingerprint: "1:bbbbbbbb",
+              appliedRows: 1
+            }
+          ],
+          error: null
+        }
+      ])
+    );
+  }
+
+  it("现场冲突（疑似人工修改）：不给补记/核对按钮，也不提交任何回执", async () => {
+    const { container } = await mountRecoveryCard({
+      state: {
+        status: "needs_reconciliation",
+        requiresReconciliation: true,
+        inFlightActionIndex: 0
+      },
+      seedUndo: "conflict"
+    });
+    expect(textOf(container)).toContain("疑似人工修改或部分写入");
+    expect(recoveryButtons(container)).toEqual(["清除这条恢复提示"]);
+
+    await click(findButton(container, "清除这条恢复提示"));
+    expect(reconcileWpsActionReceiptMock).not.toHaveBeenCalled();
+    expect(claimWpsExecutionResumeMock).not.toHaveBeenCalled();
+    expect(finishWpsExecutionMock).not.toHaveBeenCalled();
+  });
+
+  it("全部动作已完成但本机现场是写前（两者矛盾）：不给补记按钮", async () => {
+    const { container } = await mountRecoveryCard({
+      state: { nextActionIndex: 2, totalActions: 2 },
+      seedUndo: "conflict"
+    });
+    // 服务端说写完了、本机却与写后不一致 → 矛盾，挂起等人工核对。
+    expect(recoveryButtons(container)).toEqual(["清除这条恢复提示"]);
+  });
+
+  it("旧描述缺少写后指纹：不给核对按钮，也不提交回执", async () => {
+    const { container } = await mountRecoveryCard({
+      state: {
+        status: "needs_reconciliation",
+        requiresReconciliation: true,
+        inFlightActionIndex: 0,
+        descriptor: { actions: [{ actionIndex: 0, type: "writeValues", sheet: "Sheet1",
+          range: "A1", rowCount: 1, columnCount: 1, cellCount: 1, previewFingerprint: "legacy" }] }
+      }
+    });
+    expect(recoveryButtons(container)).toEqual(["清除这条恢复提示"]);
+    await click(findButton(container, "清除这条恢复提示"));
+    expect(reconcileWpsActionReceiptMock).not.toHaveBeenCalled();
+    expect(container.querySelector(".wps-write-recovery")).toBeNull();
   });
 });

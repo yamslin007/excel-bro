@@ -1,4 +1,9 @@
 import { describe, expect, it } from "vitest";
+import {
+  canClaimWriteSuccess,
+  cellDisplayText,
+  type RangeChangeReview
+} from "@excel-bro/core/changeReview";
 import type { AnalysisPlan, CellValue } from "../../excel-addin/src/contracts";
 import type { WpsApplication, WpsRange, WpsWorksheet } from "./wpsHost";
 import type { WpsReadAuthorization } from "./wpsWorkbookReader";
@@ -7,8 +12,11 @@ import {
   latestWpsUndo,
   matrixFingerprintV2,
   prepareWpsPlan,
+  toChangeFormulas,
   undoWpsExecution,
-  wpsWorkbookLocator
+  wpsActionChangeReview,
+  wpsWorkbookLocator,
+  type StoredAction
 } from "./wpsPlanExecutor";
 
 function clone(matrix: CellValue[][]): CellValue[][] {
@@ -210,6 +218,39 @@ describe("WPS guarded plan executor", () => {
     expect(target.storedRecords()).toEqual([]);
   });
 
+  it("同一份计划执行过一次后，再点一次确认也不会二次写入（预览指纹守卫拦在写入之前）", async () => {
+    const target = host([["旧值"]]);
+    const prepared = prepareWpsPlan(target.application, [1], plan([
+      { type: "writeValues", sheet: "明细", range: "A1", values: [["新值"]] }
+    ]));
+    const first = await executeWpsPlan(target.application, prepared);
+    expect(target.values()).toEqual([["新值"]]);
+
+    // 计划对象本身没被动过（confirmationSnapshot 依然匹配），能挡住第二次的是
+    // 「目标区域已不是预览那一刻的样子」这条复核 —— 见 wpsPlanExecutor 保存恢复点前
+    // 对每个动作 previewFingerprint 的比对。
+    await expect(executeWpsPlan(target.application, prepared)).rejects.toThrow("重新预览");
+    expect(target.values()).toEqual([["新值"]]);
+    // 被拦下来的第二次没有留下新的恢复点，撤销入口仍指向真正写入的那一次。
+    expect(target.storedRecords()).toHaveLength(1);
+    expect(latestWpsUndo(target.application)?.executionId).toBe(first.executionId);
+  });
+
+  it("回读不一致失败后，同一份计划同样不允许直接重跑", async () => {
+    const target = host([["旧值"]], undefined, (formula) => (formula === "=1+1" ? "=1+2" : formula));
+    const prepared = prepareWpsPlan(target.application, [1], plan([
+      { type: "writeFormulas", sheet: "明细", range: "A1", formulas: [["=1+1"]] }
+    ]));
+    await expect(executeWpsPlan(target.application, prepared)).rejects.toThrow("回读结果与计划不一致");
+    const afterFirstFailure = target.values();
+
+    // 第一次已经写进去了（只是与计划不符），区域指纹因此不再是预览时的样子，
+    // 第二次执行必须被拒绝，而不是"再写一遍盖上去"。
+    await expect(executeWpsPlan(target.application, prepared)).rejects.toThrow("重新预览");
+    expect(target.values()).toEqual(afterFirstFailure);
+    expect(target.storedRecords()).toHaveLength(1);
+  });
+
   it("binds a locally computed mapping to its source values from computation through execution", async () => {
     const target = hostWithSource();
     const mappingPlan = plan([
@@ -300,6 +341,216 @@ describe("WPS guarded plan executor", () => {
   });
 });
 
+/** 直接把某个格子写成公式，用来造"修改前是公式"的现场。 */
+function seedFormula(target: ReturnType<typeof host>, address: string, formula: string): void {
+  const sheet = target.application.ActiveWorkbook!.Worksheets.Item(1);
+  const range = sheet.Range!(address);
+  range.Formula = formula;
+}
+
+function storedAction(partial: Partial<StoredAction> & Pick<StoredAction, "range">): StoredAction {
+  const rows = partial.beforeValues?.length ?? 1;
+  const columns = partial.beforeValues?.[0]?.length ?? 1;
+  return {
+    actionIndex: 0,
+    type: "writeValues",
+    sheetIndex: 1,
+    sheetName: "明细",
+    rowCount: rows,
+    columnCount: columns,
+    cellCount: rows * columns,
+    values: [],
+    preview: [],
+    previewFingerprint: "preview",
+    rect: { startRow: 1, startColumn: 1, endRow: rows, endColumn: columns },
+    beforeValues: [[null]],
+    beforeFormulas: [[null]],
+    beforeFingerprint: "before",
+    afterFingerprint: null,
+    appliedRows: rows,
+    ...partial
+  };
+}
+
+describe("WPS 双栏变更对照（实际变更）", () => {
+  it("写入核对通过后给出实际变更：phase=actual、status=applied、前后取自本次读写", async () => {
+    const target = host([["旧值"]]);
+    const prepared = prepareWpsPlan(target.application, [1], plan([
+      { type: "writeValues", sheet: "明细", range: "A1", values: [["新值"]] }
+    ]));
+    let delivered: { reviews: RangeChangeReview[]; executionId: string } | null = null;
+
+    const record = await executeWpsPlan(target.application, prepared, undefined, (reviews, executionId) => {
+      delivered = { reviews, executionId };
+    });
+
+    expect(delivered).not.toBeNull();
+    const { reviews, executionId } = delivered!;
+    expect(executionId).toBe(record.executionId);
+    expect(reviews).toHaveLength(1);
+    const [review] = reviews;
+    expect(review.phase).toBe("actual");
+    expect(review.status).toBe("applied");
+    expect(canClaimWriteSuccess(review.status)).toBe(true);
+    expect(review.rows[0].address).toBe("A1");
+    expect(cellDisplayText(review.rows[0].before).text).toBe("旧值");
+    expect(cellDisplayText(review.rows[0].after).text).toBe("新值");
+    expect(review.changedCount).toBe(1);
+  });
+
+  it("空单元格与空字符串是两个状态，互转都要算一次改动", async () => {
+    const target = host([[null]]);
+    const prepared = prepareWpsPlan(target.application, [1], plan([
+      { type: "writeValues", sheet: "明细", range: "A1", values: [[""]] }
+    ]));
+    let delivered: { reviews: RangeChangeReview[] } | null = null;
+    await executeWpsPlan(target.application, prepared, undefined, (reviews) => {
+      delivered = { reviews };
+    });
+
+    const row = delivered!.reviews[0].rows[0];
+    expect(row.changed).toBe(true);
+    expect(cellDisplayText(row.before).text).toBe("（空）");
+    expect(cellDisplayText(row.after).text).toBe("（空字符串）");
+  });
+
+  it("修改前是公式且被本次覆盖时，标记覆盖并保留原公式与计算值", async () => {
+    const target = host([["旧值"]], (formula) => (formula === "=1+1" ? 2 : formula));
+    seedFormula(target, "A1", "=1+1");
+    const prepared = prepareWpsPlan(target.application, [1], plan([
+      { type: "writeValues", sheet: "明细", range: "A1", values: [["新值"]] }
+    ]));
+    let delivered: { reviews: RangeChangeReview[] } | null = null;
+    await executeWpsPlan(target.application, prepared, undefined, (reviews) => {
+      delivered = { reviews };
+    });
+
+    const row = delivered!.reviews[0].rows[0];
+    expect(row.overwritesFormula).toBe(true);
+    expect(row.kind).toBe("formula");
+    // 值栏是计算值，公式原文另起一行 —— 不许拿公式顶替值。
+    expect(cellDisplayText(row.before).text).toBe("2");
+    expect(cellDisplayText(row.before).formula).toBe("=1+1");
+    expect(cellDisplayText(row.after).formula).toBeNull();
+  });
+
+  it("回读与计划不一致时照样交付对照，且不得宣称写入成功；回读矩阵不落 PluginStorage", async () => {
+    const target = host([["旧值"]], undefined, (formula) => (formula === "=1+1" ? "=1+2" : formula));
+    const prepared = prepareWpsPlan(target.application, [1], plan([
+      { type: "writeFormulas", sheet: "明细", range: "A1", formulas: [["=1+1"]] }
+    ]));
+    let delivered: { reviews: RangeChangeReview[]; executionId: string } | null = null;
+
+    await expect(
+      executeWpsPlan(target.application, prepared, undefined, (reviews, executionId) => {
+        delivered = { reviews, executionId };
+      })
+    ).rejects.toThrow("回读结果与计划不一致");
+
+    // §6.5：失败也要先给对照，不能只丢一句错误。
+    expect(delivered).not.toBeNull();
+    const review = delivered!.reviews[0];
+    expect(review.status).toBe("readback_mismatch");
+    expect(canClaimWriteSuccess(review.status)).toBe(false);
+    // 现场如实展示：回读到的就是 =1+2，不是计划里的 =1+1。
+    expect(cellDisplayText(review.rows[0].after).formula).toBe("=1+2");
+    // 回读矩阵只活在内存里，落盘记录里不该出现它（计划值 =1+1 本来就在记录里）。
+    expect(JSON.stringify(target.storedRecords())).not.toContain("=1+2");
+  });
+
+  it("清空也要渲染成一行改动，不被当成无变化过滤掉", async () => {
+    const target = host([["需要清空"]]);
+    const prepared = prepareWpsPlan(target.application, [1], plan([
+      { type: "clearRange", sheet: "明细", range: "A1", applyTo: "contents" }
+    ]));
+    let delivered: { reviews: RangeChangeReview[] } | null = null;
+    await executeWpsPlan(target.application, prepared, undefined, (reviews) => {
+      delivered = { reviews };
+    });
+
+    const row = delivered!.reviews[0].rows[0];
+    expect(row.kind).toBe("empty");
+    expect(row.changed).toBe(true);
+    expect(cellDisplayText(row.before).text).toBe("需要清空");
+    expect(cellDisplayText(row.after).text).toBe("（空）");
+  });
+
+  it("一个动作都没写时整块标未执行，修改后不给假内容", () => {
+    const action = storedAction({
+      range: "A1:A2",
+      beforeValues: [["甲"], ["乙"]],
+      beforeFormulas: [[null], [null]],
+      appliedRows: 0
+    });
+    const review = wpsActionChangeReview(action, null, null);
+    expect(review.status).toBe("not_executed");
+    expect(review.rows.every((row) => row.kind === "not_executed")).toBe(true);
+    expect(review.changedCount).toBe(0);
+    // 没回读过就说没回读过，不能拿空矩阵冒充"写成了空"。
+    expect(cellDisplayText(review.rows[0].after).unresolved).toBe(true);
+  });
+
+  it("部分写入：已写的行照常比对，未写的行标未执行且不进改动计数", () => {
+    const action = storedAction({
+      range: "A1:A2",
+      beforeValues: [["甲"], ["乙"]],
+      beforeFormulas: [[null], [null]],
+      appliedRows: 1
+    });
+    const review = wpsActionChangeReview(action, { values: [["丙"], ["乙"]], formulas: [[null], [null]], valuesCaptured: true }, true);
+    expect(review.rows[0].kind).toBe("value");
+    expect(review.rows[1].kind).toBe("not_executed");
+    expect(review.changedCount).toBe(1);
+  });
+
+  it("宿主没采到显示值时只给占位，公式原文照常展示，不冒充值", () => {
+    const action = storedAction({
+      range: "A1",
+      beforeValues: [["甲"]],
+      beforeFormulas: [[null]]
+    });
+    const review = wpsActionChangeReview(
+      action,
+      { values: [[null]], formulas: [["=SUM(B:B)"]], valuesCaptured: false },
+      true
+    );
+    const display = cellDisplayText(review.rows[0].after);
+    expect(display.unresolved).toBe(true);
+    expect(display.text).toBe("显示值未采集");
+    expect(display.formula).toBe("=SUM(B:B)");
+    expect(display.text).not.toContain("=SUM");
+  });
+
+  it("range.Formula 对常量返回常量本身，只有 = 开头才算公式", () => {
+    expect(toChangeFormulas([["=A1+B1", "123", "abc", null, 7]])).toEqual([["=A1+B1", null, null, null, null]]);
+  });
+
+  it("明细条数超过配置上限时截断，但改动计数仍是全量", () => {
+    const total = 260;
+    const action = storedAction({
+      range: `A1:A${total}`,
+      rowCount: total,
+      beforeValues: Array.from({ length: total }, () => [null]),
+      beforeFormulas: Array.from({ length: total }, () => [null]),
+      appliedRows: total
+    });
+    const review = wpsActionChangeReview(
+      action,
+      {
+        values: Array.from({ length: total }, () => ["新值"]),
+        formulas: Array.from({ length: total }, () => [null]),
+        valuesCaptured: true
+      },
+      true
+    );
+    expect(review.truncated).toBe(true);
+    expect(review.rows.length).toBeLessThan(total);
+    // 计数走全量，不因为截断就少报。
+    expect(review.changedCount).toBe(total);
+    expect(review.totalCount).toBe(total);
+  });
+});
+
 describe("WPS versioned undo fingerprints", () => {
   it("locks typed v2 vectors and prioritizes formulas", () => {
     expect(matrixFingerprintV2([[null], [""]], [[null], [null]])).toBe("v2:28:c7b970ff");
@@ -355,5 +606,53 @@ describe("wpsWorkbookLocator", () => {
     expect(() => wpsWorkbookLocator(authorization("C:\\a\\b.et"))).toThrow(
       "已保存到本地磁盘"
     );
+  });
+});
+
+/**
+ * 旧计划不能直接写入：预览之后**身份**换了，计划就该作废。
+ *
+ * 与"源区域变了所以拒绝"是两件事 —— 后者是数据层面的指纹比对，这里钉的是
+ * 更靠外的一层：换了个工作簿、或同一索引上的表被换掉，即使单元格内容一字
+ * 未动，也不允许拿旧计划去写。少了这一层，"重新确认范围"就成了走过场。
+ */
+describe("预览之后的身份变化：旧计划不得写入", () => {
+  const writePlan = () => plan([
+    { type: "writeValues", sheet: "明细", range: "A1", values: [["新值"]] }
+  ]);
+
+  it("切换到另一个工作簿：拒绝执行，原表一格都不动", async () => {
+    const target = host([["旧值"]]);
+    const prepared = prepareWpsPlan(target.application, [1], writePlan());
+    // 内容一字未动，只有工作簿身份变了 —— 指纹比对救不了这种情况。
+    (target.application.ActiveWorkbook as { FullName: string }).FullName =
+      "C:\\Data\\另一个.xlsx";
+    (target.application.ActiveWorkbook as { Name: string }).Name = "另一个.xlsx";
+    await expect(executeWpsPlan(target.application, prepared)).rejects.toThrow(
+      "工作簿身份发生变化"
+    );
+    expect(target.values()).toEqual([["旧值"]]);
+  });
+
+  it("同一索引上的表被换掉：拒绝执行，原表一格都不动", async () => {
+    const target = host([["旧值"]]);
+    const prepared = prepareWpsPlan(target.application, [1], writePlan());
+    const sheet = target.application.ActiveWorkbook!.Worksheets.Item(1);
+    (sheet as { Name: string }).Name = "换过来的表";
+    await expect(executeWpsPlan(target.application, prepared)).rejects.toThrow(
+      "被移动、重命名或删除"
+    );
+    expect(target.values()).toEqual([["旧值"]]);
+  });
+
+  it("工作表被保护：拒绝执行，不先写后报", async () => {
+    const target = host([["旧值"]]);
+    const prepared = prepareWpsPlan(target.application, [1], writePlan());
+    const sheet = target.application.ActiveWorkbook!.Worksheets.Item(1);
+    (sheet as { ProtectContents: boolean }).ProtectContents = true;
+    await expect(executeWpsPlan(target.application, prepared)).rejects.toThrow(
+      "已被保护"
+    );
+    expect(target.values()).toEqual([["旧值"]]);
   });
 });

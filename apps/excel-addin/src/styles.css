@@ -114,6 +114,7 @@ textarea:focus-visible {
 .chat-shell {
   position: relative;
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   grid-template-rows: auto minmax(0, 1fr) auto;
   width: 100%;
   height: 100%;
@@ -4113,6 +4114,57 @@ textarea:focus-visible {
   color: #8a5d57;
 }
 
+.local-mapping-resolution {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  margin-top: 12px;
+}
+.local-mapping-resolution p { margin: 0; }
+.local-mapping-resolution label.editable {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(150px, 1fr);
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.local-mapping-resolution label.editable span { overflow-wrap: anywhere; }
+.local-mapping-resolution input[type="text"] {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  font: inherit;
+}
+.local-mapping-priority {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  background: var(--color-brand-bg);
+}
+.local-mapping-priority-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.local-mapping-priority-item span {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.local-mapping-priority-item button { flex: none; }
+.local-mapping-priority label { display: flex; align-items: flex-start; gap: 8px; }
+.local-mapping-error { color: #a43d31; }
+@media (max-width: 540px) {
+  .local-mapping-resolution label.editable { grid-template-columns: 1fr; }
+}
+
 .clarification-outcome {
   border-radius: 8px;
   background: var(--color-brand-bg);
@@ -4131,6 +4183,91 @@ textarea:focus-visible {
 .clarification-card.invalidated .clarification-outcome {
   background: #fff4e8;
   color: #8c5a2f;
+}
+
+/*
+ * 「任务中断后继续」的中断卡。
+ *
+ * 布局纪律与原生审阅侧栏一致：状态说明（.clarification-recovery-facts /
+ * -detail / -scope）与操作区（.clarification-recovery-actions）**分开**，
+ * 操作区只放 <button>，且按钮 white-space: nowrap + min-height 44px ——
+ * 混进同一个单行 flex 容器会把按钮压到逐字折行（真机竖排的直接原因）。
+ * 窄任务窗格里按钮整行纵排，不靠缩小字号或截断文案塞进一行。
+ */
+.clarification-recovery {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  margin-top: 10px;
+}
+
+.clarification-recovery-facts {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 8px;
+  border-radius: 8px;
+  background: var(--color-background-subtle);
+  font-size: var(--font-size-caption);
+}
+
+.clarification-recovery-facts > div {
+  display: flex;
+  gap: 8px;
+  min-width: 0;
+}
+
+.clarification-recovery-facts dt {
+  flex: none;
+  color: var(--color-brand-text);
+  font-weight: 600;
+}
+
+.clarification-recovery-facts dd {
+  margin: 0;
+  min-width: 0;
+  color: var(--color-brand-text);
+}
+
+.clarification-recovery-detail,
+.clarification-recovery-scope,
+.clarification-recovery-hint {
+  margin: 0;
+  color: var(--color-brand-text);
+  font-size: var(--font-size-caption);
+}
+
+.clarification-recovery-scope {
+  font-weight: 600;
+  overflow-wrap: break-word;
+}
+
+.clarification-recovery-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.clarification-recovery-actions button {
+  flex: 1 1 auto;
+  min-height: 44px;
+  white-space: nowrap;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: var(--color-background);
+  color: var(--color-brand-text);
+  padding: 0 14px;
+  font-size: var(--font-size-caption);
+}
+
+.clarification-recovery-actions button:disabled {
+  opacity: 0.55;
+}
+
+@media (max-width: 560px) {
+  .clarification-recovery-actions button {
+    flex-basis: 100%;
+  }
 }
 
 .activity-card {
@@ -4908,6 +5045,42 @@ textarea:focus-visible {
   padding-left: 16px;
 }
 
+/* 侧栏摘要卡：只放定位、计数与回读状态，不提供网页对比入口。 */
+.change-review-summary {
+  margin-top: 7px;
+  border: 1px solid var(--color-border);
+  border-radius: 14px;
+  background: var(--color-background);
+  padding: 12px;
+  box-shadow: 0 8px 22px rgba(39, 63, 46, 0.055);
+}
+
+.change-review-summary-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.change-review-summary-count {
+  color: var(--color-text-secondary);
+  font-size: 12px;
+}
+
+.change-review-summary-where {
+  margin: 6px 0 4px;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.change-review-summary-statuses {
+  margin: 0 0 8px;
+  padding-left: 18px;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+}
+
 .inline-plan {
   width: 100%;
   margin-top: 7px;
@@ -5512,7 +5685,7 @@ textarea:focus-visible {
   justify-self: start;
 }
 
-/* 备份入口在顶部栏，基础样式由 .header-button/.labeled-header-button 提供，
+/* 备份入口在顶部栏，基础样式由 .header-button 提供，
    这里只补图标配色和可撤销数徽标。 */
 .folder-backup-entry > span[aria-hidden="true"] {
   color: var(--color-brand-text);
@@ -8984,4 +9157,126 @@ button.selected > .sheet-checkbox {
   display: flex;
   justify-content: flex-end;
   gap: 10px;
+}
+
+.clarification-fields { display: grid; gap: 12px; margin-top: 14px; }
+.clarification-fields label { display: grid; gap: 6px; font-weight: 600; }
+.clarification-fields textarea {
+  box-sizing: border-box; width: 100%; min-height: 64px; padding: 10px;
+  border: 1px solid var(--color-border); border-radius: 8px;
+  color: inherit; background: transparent; font: inherit; resize: vertical;
+}
+.clarification-fields small { opacity: .75; }
+.clarification-fields button { justify-self: start; padding: 10px 14px; }
+.excel-native-review {
+  padding: 12px;
+  border: 1px solid var(--border-color, #dce4df);
+  border-radius: 10px;
+  margin: 12px 0;
+}
+.excel-native-review p { margin: 8px 0; font-size: 13px; line-height: 1.5; }
+.excel-native-review-buttons { display: flex; flex-wrap: wrap; gap: 8px; }
+.excel-native-review button { white-space: nowrap; min-height: 40px; }
+.excel-manual-review-confirm { display: flex; align-items: flex-start; gap: 8px; margin: 12px 0; font-size: 13px; line-height: 1.5; }
+.excel-manual-review-confirm input { flex: 0 0 auto; margin-top: 3px; }
+
+/* Task-pane width containment */
+.chat-shell > *,
+.message-stream-shell,
+.message-stream,
+.message-row,
+.clarification-card,
+.clarification-heading > div,
+.activity-step-trace {
+  min-width: 0;
+  max-width: 100%;
+}
+.clarification-card,
+.activity-step-trace {
+  grid-template-columns: minmax(0, 1fr);
+  overflow-wrap: anywhere;
+}
+.chat-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.chat-header .brand-copy {
+  display: grid;
+  flex: 1 1 0;
+  min-width: min-content;
+  max-width: none;
+}
+.chat-header .brand-copy span {
+  min-width: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.chat-header .brand-copy strong { min-width: max-content; }
+.chat-header .model-picker { flex: 0 0 auto; margin-left: 0; }
+.chat-header .header-actions {
+  display: flex;
+  flex: 0 1 auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  min-width: 0;
+  margin-left: auto;
+  gap: 6px;
+}
+.clarification-heading { flex-wrap: wrap; }
+.clarification-heading > div { flex: 1 1 160px; }
+.clarification-heading em { overflow-wrap: anywhere; }
+
+@media (max-width: 700px) {
+  .chat-header .brand-copy span { display: flex; }
+  .clarification-custom-input { grid-template-columns: minmax(0, 1fr); }
+  .clarification-actions button {
+    max-width: 100%;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    min-height: 32px;
+  }
+}
+
+/* Compact icon-only header: labels remain in title / aria-label, not in layout. */
+.chat-header .model-picker {
+  width: 32px;
+  max-width: 32px;
+  flex: 0 0 32px;
+}
+.chat-header .header-button,
+.chat-header .model-picker-trigger {
+  width: 32px;
+  height: 32px;
+  min-height: 32px;
+  flex: 0 0 32px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+}
+.chat-header .model-picker-trigger svg {
+  width: 18px;
+  height: 18px;
+}
+.chat-header .model-picker-trigger {
+  justify-content: center;
+  align-content: center;
+}
+.chat-header .model-picker-trigger > svg {
+  justify-self: center;
+  align-self: center;
+}
+.chat-header .model-menu {
+  left: 0;
+  right: auto;
+  max-width: calc(100vw - 24px);
+}
+.chat-header .folder-backup-entry { position: relative; }
+.chat-header .folder-backup-entry > b {
+  position: absolute;
+  top: -5px;
+  right: -5px;
+  padding: 0 3px;
+  pointer-events: none;
 }

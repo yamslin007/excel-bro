@@ -20,6 +20,7 @@ from server.app.llm import ModelConnection, selected_model_config
 from server.app.models import (
     AnswerResponse,
     IntentConversationResponse,
+    IntentClarificationResponse,
     IntentProceedResponse,
     LocalPlanRuleResponse,
     PlanRequest,
@@ -322,10 +323,13 @@ def test_capabilities_are_loaded_from_shared_project_config() -> None:
     assert value["intentContext"] == {
         "maxFieldsPerSheet": 30,
         "maxPriorResultRows": 20,
+        "maxOutputTokens": None,
     }
     assert value["savedTools"]["maxItems"] == 50
     assert value["agent"]["maxConsecutiveErrors"] == 2
-    assert value["agent"]["repairMaxOutputTokens"] == 2000
+    assert value["agent"]["maxOutputTokens"] is None
+    assert value["agent"]["repairMaxOutputTokens"] is None
+    assert value["agent"]["maxTotalTokens"] is None
 
 
 def test_health_reports_model_without_exposing_key(
@@ -992,6 +996,40 @@ def test_turn_completion_is_idempotent(
     }
 
 
+def test_planning_clarification_is_cached_but_keeps_the_turn_open_for_answers(monkeypatch):
+    _configure_single_model(monkeypatch)
+    calls = []
+
+    async def planner(request, **_kwargs):
+        calls.append(request)
+        if len(calls) == 1:
+            return IntentClarificationResponse.model_validate({
+                "provider": "model", "clarification": {
+                    "id": "unit", "summary": "补充口径", "question": "请填写单位", "reason": "单位未知",
+                    "scopeLabel": "Sheet1", "options": [], "fields": [{"id": "unit", "label": "统计单位"}],
+                },
+            })
+        return AnswerResponse(provider="model", message="已收到单位，尚未执行写入。")
+
+    monkeypatch.setattr(main_module, "create_plan", planner)
+    client = TestClient(app)
+    payload = _turn_completion_payload("turn-form-test", modelId=_CONFIGURED_MODEL_ID)
+    first = client.post("/api/turn", json=payload)
+    repeated = client.post("/api/turn", json=payload)
+    assert first.status_code == repeated.status_code == 200
+    assert first.json() == repeated.json()
+    assert first.json()["kind"] == "clarification"
+    assert first.json()["clarification"]["fields"][0]["id"] == "unit"
+    assert len(calls) == 1
+    assert turn_registry.touch("turn-form-test").stage == "awaiting_clarification"
+    turn_registry.ensure_decision_allowed("turn-form-test")
+    answered = client.post("/api/turn", json={**payload, "prompt": "统计已选表，补充确认：单位为件"})
+    assert answered.status_code == 200
+    assert answered.json()["kind"] == "answer"
+    assert len(calls) == 2
+    assert turn_registry.touch("turn-form-test").stage == "completed"
+
+
 def test_turn_endpoint_returns_local_mapping_rule_without_cell_values(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1159,6 +1197,28 @@ def test_turn_stream_emits_steps_then_result(
     assert len(result_events) == 1
     assert result_events[0]["kind"] == "answer"
     assert result_events[0]["turnId"] == "turn-stream-test"
+
+
+def test_turn_stream_persists_budget_stop_as_failed_not_completed(monkeypatch):
+    async def stopped(_request, **_kwargs):
+        return AnswerResponse(message="规划预算已用完", provider="system", outcome="failed", stopReason="max_tokens")
+    monkeypatch.setattr(main_module, "create_plan", stopped)
+    client = TestClient(app)
+    payload = {**_STREAM_PAYLOAD, "turnId": "turn-stopped-test"}
+    response = client.post("/api/turn/stream", json=payload)
+    result = next(value for name, value in _parse_sse(response.text) if name == "result")
+    assert result["outcome"] == "failed"
+    assert result["stopReason"] == "max_tokens"
+    record = main_module._folder_operation_ledger.planning_task("turn-stopped-test")
+    assert record.status == "failed"
+    assert record.result["outcome"] == "failed"
+    assert main_module.turn_registry.touch("turn-stopped-test").stage == "failed"
+    status = client.get("/api/turn/turn-stopped-test/status").json()
+    assert status["status"] == "failed"
+    assert status["canContinue"] is False
+    assert status["error"]["code"] == "PLANNING_STOPPED"
+    replay = client.post("/api/turn/stream", json=payload)
+    assert all(name != "result" or value.get("outcome") == "failed" for name, value in _parse_sse(replay.text))
 
 
 def test_folder_execute_stream_reuses_operation_without_writing_twice(

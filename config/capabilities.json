@@ -1,5 +1,25 @@
 {
   "version": 1,
+  "excelNativeComparison": {
+    "maxCells": 20000,
+    "maxBytes": 8388608
+  },
+  "excelWindowLayout": {
+    "ticketTtlSeconds": 120,
+    "maxTickets": 20,
+    "copyWaitSeconds": 12,
+    "pollIntervalMs": 250,
+    "requestTimeoutMs": 20000,
+    "originalWidthFraction": 0.6,
+    "reviewTaskPaneWidthFraction": 0.4,
+    "reviewTaskPaneMinWidthCssPx": 320,
+    "reviewPaneMeasureIntervalMs": 1500,
+    "reviewPaneResizeDebounceMs": 200,
+    "taskPaneWidthToleranceCssPx": 8,
+    "windowGapDip": 0,
+    "maxFrameInsetDip": 32,
+    "positionTolerancePixels": 4
+  },
   "snapshot": {
     "dataRows": 200,
     "dataColumns": 30,
@@ -28,6 +48,13 @@
     "verifiedVersionPrefixes": [],
     "developmentVersionPrefixes": ["12.0"],
     "allowedActions": ["writeValues", "writeFormulas", "clearRange:contents"]
+  },
+  "columnMappingFormula": {
+    "maxCases": 32,
+    "maxCharactersPerCell": 2000
+  },
+  "columnMapping": {
+    "maxSplitActions": 64
   },
   "hostCapabilities": {
     "excel-office": {
@@ -172,6 +199,13 @@
   "excelExecution": {
     "splitAggregateBatchSheets": 25
   },
+  "changeReview": {
+    "maxRows": 200,
+    "maxTotalCells": 20000,
+    "captureMaxCells": 20000,
+    "previewMaxRows": 5,
+    "previewMaxColumns": 5
+  },
   "undo": {
     "maxEntries": 5,
     "maxTotalCells": 400000,
@@ -203,14 +237,16 @@
   },
   "intentContext": {
     "maxFieldsPerSheet": 30,
-    "maxPriorResultRows": 20
+    "maxPriorResultRows": 20,
+    "maxOutputTokens": null
   },
   "savedTools": {
     "maxItems": 50
   },
   "agent": {
     "maxTurns": 8,
-    "maxTotalTokens": 20000,
+    "claudeSdkMaxBudgetUsd": 1.0,
+    "maxTotalTokens": null,
     "maxWallTimeSeconds": 60.0,
     "maxConsecutiveErrors": 2,
     "maxCacheHitsPerQuery": 3,
@@ -218,8 +254,8 @@
     "warningTurn": 5,
     "maxReadRows": 200,
     "maxReadColumns": 30,
-    "maxOutputTokens": 4000,
-    "repairMaxOutputTokens": 2000
+    "maxOutputTokens": null,
+    "repairMaxOutputTokens": null
   },
   "formula": {
     "maxOutputTokens": 8000
@@ -231,7 +267,7 @@
     "maxRetries": 5,
     "retryBaseDelaySeconds": 1.5,
     "retryMaxDelaySeconds": 45.0,
-    "timeoutSeconds": 60.0
+    "timeoutSeconds": 180.0
   },
   "turns": {
     "maxActive": 500,
@@ -246,6 +282,7 @@
     "folderMaxPendingOperations": 100
   },
   "taskRecovery": {
+    "wpsOwnerLeaseSeconds": 120,
     "maxRegisteredDirectories": 50,
     "operationRetentionDays": 30,
     "maxCheckpointBytes": 67108864,

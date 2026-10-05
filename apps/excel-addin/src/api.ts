@@ -1,3 +1,4 @@
+import capabilities from "../../../config/capabilities.json";
 import {
   assertTestModelConnectionResponse,
   assertIntentCheckResponse,
@@ -6,6 +7,10 @@ import {
   assertDataToolResult,
   assertModelSettings,
   assertOfficeExecutionState,
+  assertWpsExecutionState,
+  assertWpsExecutionResult,
+  assertWpsRecoveryDescriptor,
+  assertWpsEvidence,
   parseTaskProgressEvent,
   parseTurnStepEvent,
   type AssistantResponse,
@@ -35,6 +40,8 @@ import {
   type IntentCheckResponse,
   type ModelSettings,
   type OfficeExecutionState,
+  type WpsExecutionState,
+  type WpsRecoveryDescriptor,
   type PlanExecutionResult,
   type ExecutionUndoSnapshot,
   type UndoRangeSnapshot,
@@ -48,6 +55,7 @@ import {
   type GenerateFormulaRequest,
   type GenerateFormulaResponse
 } from "./contracts";
+import type { ExcelReviewLayoutPrepareRequest, ExcelReviewLayoutTicket, ExcelReviewLayoutResult, ExcelReviewPaneMeasurement } from "./contracts";
 import { recordModelCall } from "./diagnostics";
 
 export interface PlanChatRequest {
@@ -63,6 +71,56 @@ export interface PlanChatResponse {
 
 const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8765";
+
+export class ExcelReviewLayoutVersionError extends Error {
+  constructor() {
+    super('本地窗口排列服务版本过旧，请重启 Python 服务、刷新加载项并重新生成副本。');
+    this.name = 'ExcelReviewLayoutVersionError';
+  }
+}
+
+async function reviewLayoutRequest(path: "prepare" | "arrange" | "measure", body: ExcelReviewLayoutPrepareRequest | Pick<ExcelReviewLayoutTicket, 'token'>): Promise<unknown> {
+  const endpoint = new URL(API_BASE_URL);
+  if (!['localhost', '127.0.0.1', '[::1]'].includes(endpoint.hostname) || !['http:', 'https:'].includes(endpoint.protocol)) {
+    throw new Error('自动窗口排列仅能连接本机服务，请手动并排查看。');
+  }
+  const response = await fetch(`${API_BASE_URL}/api/office/review-layout/${path}`, {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
+    signal: AbortSignal.timeout(capabilities.excelWindowLayout.requestTimeoutMs), redirect: 'error'
+  });
+  if (!response.ok) throw new Error('自动窗口排列未完成，请重启新版本地服务或手动并排查看。');
+  return response.json();
+}
+export async function measureExcelReviewPane(request: ExcelReviewLayoutPrepareRequest): Promise<ExcelReviewPaneMeasurement> {
+  const value = await reviewLayoutRequest('measure', {workbookPathHash: request.workbookPathHash,
+    worksheetNameHash: request.worksheetNameHash, copySheetName: request.copySheetName});
+  if (!value || typeof value !== 'object' || Object.keys(value).length !== 1 ||
+    !('clientWidthCssPx' in value) || typeof value.clientWidthCssPx !== 'number' ||
+    !Number.isFinite(value.clientWidthCssPx) || value.clientWidthCssPx <= 0 || value.clientWidthCssPx > 32768)
+    throw new Error('审阅窗口宽度未核实，请手动调整。');
+  return value as ExcelReviewPaneMeasurement;
+}
+
+export async function prepareExcelReviewLayout(request: ExcelReviewLayoutPrepareRequest): Promise<ExcelReviewLayoutTicket> {
+  // Explicit projection, not a spread: extra runtime plan/value/path fields never leave the pane.
+  const value = await reviewLayoutRequest('prepare', {workbookPathHash: request.workbookPathHash,
+    worksheetNameHash: request.worksheetNameHash, copySheetName: request.copySheetName});
+    if (value && typeof value === 'object' && (!('layoutVersion' in value) || value.layoutVersion !== 3)) throw new ExcelReviewLayoutVersionError();
+  if (!value || typeof value !== 'object' || Object.keys(value).length !== 2 ||
+      !('token' in value) || typeof value.token !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(value.token)) throw new Error('窗口排列凭据无效，请手动并排查看。');
+  return value as ExcelReviewLayoutTicket;
+}
+export async function arrangeExcelReviewLayout(ticket: ExcelReviewLayoutTicket): Promise<ExcelReviewLayoutResult> {
+  if (ticket.layoutVersion !== 3) throw new ExcelReviewLayoutVersionError();
+  const value = await reviewLayoutRequest('arrange', {token: ticket.token});
+  if (value && typeof value === 'object' && (!('layoutVersion' in value) || value.layoutVersion !== 3)) throw new ExcelReviewLayoutVersionError();
+  if (!value || typeof value !== 'object' || Object.keys(value).length !== 5 ||
+      !('status' in value) || value.status !== 'arranged' ||
+      !('copySide' in value) || value.copySide !== 'left' ||
+      !('originalSide' in value) || value.originalSide !== 'right' ||
+      !('synchronousScrolling' in value) || typeof value.synchronousScrolling !== 'string' || !['enabled', 'different_instance', 'unavailable'].includes(value.synchronousScrolling)) throw new Error('窗口排列结果未核实，请手动并排查看。');
+  return value as ExcelReviewLayoutResult;
+}
 
 export interface ServiceHealth {
   status: "ok";
@@ -676,6 +734,174 @@ export async function finishOfficeExecution(
     }
   );
   return officeExecutionResponse(response, "无法提交 Office 任务完成回执");
+}
+
+async function wpsExecutionResponse(
+  response: Response,
+  fallback: string
+): Promise<WpsExecutionState> {
+  if (!response.ok) throw await requestError(response, fallback);
+  const payload: unknown = await response.json();
+  assertWpsExecutionState(payload);
+  return payload;
+}
+
+/**
+ * WPS 首次原表写入前，把**执行身份、授权与恢复描述**持久登记到服务端账本。
+ *
+ * 载荷刻意只带 `WpsRecoveryDescriptor`（动作类型 / 范围 / 形状 / 目标指纹），
+ * **不带 `AnalysisPlan`** —— 后者含 `writeValues` 的目标值矩阵，一旦随登记请求
+ * 出站就会落进服务端账本。这里只接受描述类型，是类型层面的出站闸：
+ * 想传整份计划在编译期就过不去。
+ */
+export async function registerWpsExecution(input: {
+  operationId: string;
+  descriptor: WpsRecoveryDescriptor;
+  authorizedSheetNames: string[];
+  workbookIdentity: string;
+  taskId: string;
+}): Promise<WpsExecutionState> {
+  assertWpsRecoveryDescriptor(input.descriptor);
+  const response = await fetch(`${API_BASE_URL}/api/wps/executions/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ operationId: input.operationId, descriptor: input.descriptor,
+      authorizedSheetNames: input.authorizedSheetNames, workbookIdentity: input.workbookIdentity,
+      taskId: input.taskId, confirmed: true })
+  });
+  return wpsExecutionResponse(response, "无法登记 WPS 写入现场");
+}
+
+export async function getWpsExecutionStatus(
+  operationId: string
+): Promise<WpsExecutionState> {
+  const response = await fetch(
+    `${API_BASE_URL}/api/wps/executions/${encodeURIComponent(operationId)}`
+  );
+  return wpsExecutionResponse(response, "无法读取 WPS 写入现场");
+}
+
+export async function startWpsAction(
+  operationId: string,
+  input: {
+    expectedRevision: number;
+    ownerToken: string;
+    actionIndex: number;
+    beforeSnapshot: Record<string, unknown>;
+  }
+): Promise<WpsExecutionState> {
+  assertWpsEvidence(input.beforeSnapshot);
+  const response = await fetch(
+    `${API_BASE_URL}/api/wps/executions/${encodeURIComponent(operationId)}/actions/start`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expectedRevision: input.expectedRevision, ownerToken: input.ownerToken,
+        actionIndex: input.actionIndex, beforeSnapshot: input.beforeSnapshot })
+    }
+  );
+  return wpsExecutionResponse(response, "无法登记 WPS 动作写前状态");
+}
+
+export async function completeWpsAction(
+  operationId: string,
+  input: {
+    expectedRevision: number;
+    ownerToken: string;
+    actionIndex: number;
+    checkpoint: Record<string, unknown>;
+  }
+): Promise<WpsExecutionState> {
+  assertWpsEvidence(input.checkpoint);
+  const response = await fetch(
+    `${API_BASE_URL}/api/wps/executions/${encodeURIComponent(operationId)}/actions/complete`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expectedRevision: input.expectedRevision, ownerToken: input.ownerToken,
+        actionIndex: input.actionIndex, checkpoint: input.checkpoint })
+    }
+  );
+  return wpsExecutionResponse(response, "无法提交 WPS 动作完成回执");
+}
+
+export async function suspendWpsExecution(
+  operationId: string,
+  input: {
+    expectedRevision: number;
+    ownerToken: string;
+    code: string;
+    message: string;
+  }
+): Promise<WpsExecutionState> {
+  const response = await fetch(
+    `${API_BASE_URL}/api/wps/executions/${encodeURIComponent(operationId)}/suspend`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expectedRevision: input.expectedRevision, ownerToken: input.ownerToken,
+        code: "WPS_WRITE_INTERRUPTED", message: "WPS 写入中断，需要核对现场。" })
+    }
+  );
+  return wpsExecutionResponse(response, "无法挂起 WPS 写入现场");
+}
+
+export async function claimWpsExecutionResume(
+  operationId: string,
+  expectedRevision: number
+): Promise<WpsExecutionState> {
+  const response = await fetch(
+    `${API_BASE_URL}/api/wps/executions/${encodeURIComponent(operationId)}/resume`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expectedRevision, confirmed: true })
+    }
+  );
+  return wpsExecutionResponse(response, "无法领取 WPS 恢复处置权");
+}
+
+export async function reconcileWpsActionReceipt(
+  operationId: string,
+  input: {
+    expectedRevision: number;
+    actionIndex: number;
+    outcome: "applied" | "not_applied";
+    checkpoint?: Record<string, unknown>;
+  }
+): Promise<WpsExecutionState> {
+  if (input.checkpoint) assertWpsEvidence(input.checkpoint);
+  const response = await fetch(
+    `${API_BASE_URL}/api/wps/executions/${encodeURIComponent(operationId)}/actions/reconcile`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expectedRevision: input.expectedRevision, actionIndex: input.actionIndex,
+        outcome: input.outcome, checkpoint: input.checkpoint, confirmed: true })
+    }
+  );
+  return wpsExecutionResponse(response, "无法核对 WPS 在途动作");
+}
+
+export async function finishWpsExecution(
+  operationId: string,
+  input: {
+    expectedRevision: number;
+    ownerToken: string;
+    result: Record<string, unknown>;
+  }
+): Promise<WpsExecutionState> {
+  assertWpsExecutionResult(input.result);
+  const response = await fetch(
+    `${API_BASE_URL}/api/wps/executions/${encodeURIComponent(operationId)}/complete`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ expectedRevision: input.expectedRevision, ownerToken: input.ownerToken,
+        result: input.result })
+    }
+  );
+  return wpsExecutionResponse(response, "无法提交 WPS 任务完成回执");
 }
 
 export async function selectFolder(): Promise<FolderCatalog | null> {

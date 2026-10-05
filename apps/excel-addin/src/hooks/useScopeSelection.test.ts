@@ -306,3 +306,85 @@ describe("useScopeSelection", () => {
     expect(result.current.selectedSheetNames).toEqual([]);
   });
 });
+
+describe("useScopeSelection：草稿与已提交授权分开", () => {
+  it("勾选只改草稿：取消勾选再选回，已提交授权一字未动", () => {
+    const { result } = renderHook(() => useScopeSelection());
+
+    act(() => result.current.chooseAutomaticScope(workbook));
+    expect(result.current.committedSheetNames).toEqual(["Sheet1"]);
+    expect(result.current.scopeDraftDirty).toBe(false);
+
+    // 用户"顺手点一下另一张表看看" —— 这不该被当成改了授权。
+    act(() => result.current.toggleSheet("Sheet2"));
+    expect(result.current.selectedSheetNames).toEqual(["Sheet1", "Sheet2"]);
+    expect(result.current.committedSheetNames).toEqual(["Sheet1"]);
+    expect(result.current.scopeDraftDirty).toBe(true);
+
+    // 取消选回：草稿回到已提交范围，且重新算成"没有未确认修改"。
+    act(() => result.current.toggleSheet("Sheet2"));
+    expect(result.current.selectedSheetNames).toEqual(["Sheet1"]);
+    expect(result.current.committedSheetNames).toEqual(["Sheet1"]);
+    expect(result.current.scopeDraftDirty).toBe(false);
+  });
+
+  it("取消范围编辑把草稿放回已提交授权", () => {
+    const { result } = renderHook(() => useScopeSelection());
+
+    act(() => result.current.chooseAutomaticScope(workbook));
+    act(() => result.current.toggleSheet("Sheet2"));
+    expect(result.current.scopeDraftDirty).toBe(true);
+
+    act(() => result.current.cancelScopeEdit());
+    expect(result.current.selectedSheetNames).toEqual(["Sheet1"]);
+    expect(result.current.committedSheetNames).toEqual(["Sheet1"]);
+    expect(result.current.scopeDraftDirty).toBe(false);
+    expect(result.current.selectionConfirmed).toBe(true);
+  });
+
+  it("确认范围按当前真实工作簿复核：已经不存在的工作表不会被提交成授权", () => {
+    const { result } = renderHook(() => useScopeSelection());
+
+    act(() => result.current.chooseAutomaticScope(workbook));
+    act(() => result.current.setSelectedSheetNames(["Sheet1", "Gone"]));
+    act(() => {
+      // 弹层可能开了很久：确认时按**当前**工作簿清单复核，而不是开弹层时的快照。
+      const committed = result.current.confirmScopeSelection(workbook);
+      expect(committed).toEqual(["Sheet1"]);
+    });
+
+    expect(result.current.committedSheetNames).toEqual(["Sheet1"]);
+    expect(result.current.selectedSheetNames).toEqual(["Sheet1"]);
+    expect(result.current.scopeDraftDirty).toBe(false);
+  });
+
+  it("确认范围时草稿里的表全部不存在则回落到活动工作表", () => {
+    const { result } = renderHook(() => useScopeSelection());
+
+    act(() => result.current.setSelectedSheetNames(["Gone", "AlsoGone"]));
+    act(() => {
+      expect(result.current.confirmScopeSelection(workbook)).toEqual([
+        "Sheet1"
+      ]);
+    });
+
+    expect(result.current.committedSheetNames).toEqual(["Sheet1"]);
+    expect(result.current.selectionConfirmed).toBe(true);
+  });
+
+  it("确认范围不带快照时原样提交草稿", () => {
+    const { result } = renderHook(() => useScopeSelection());
+
+    act(() => result.current.chooseManualScope(workbook));
+    act(() => result.current.toggleSheet("Sheet2"));
+    act(() => {
+      expect(result.current.confirmScopeSelection()).toEqual([
+        "Sheet1",
+        "Sheet2"
+      ]);
+    });
+
+    expect(result.current.committedSheetNames).toEqual(["Sheet1", "Sheet2"]);
+    expect(result.current.scopeDraftDirty).toBe(false);
+  });
+});

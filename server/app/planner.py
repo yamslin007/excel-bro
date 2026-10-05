@@ -425,6 +425,16 @@ async def create_plan(
             f"模型「{config.model}」未配置图片能力；请在「模型设置」里为该连接"
             "勾选「支持图片输入」（用 .env 配置时改为把它加进 AI_VISION_MODELS）"
         )
+    if config.adapter == "claude_agent_sdk":
+        if resume_checkpoint is not None:
+            from .llm import ModelNotAvailableError
+
+            raise ModelNotAvailableError(
+                "Claude Agent SDK 不能恢复另一规划后端的检查点，请重新发起预览。"
+            )
+        from .claude_sdk_agent import run_sdk_plan
+
+        return await run_sdk_plan(request, config, on_event=on_event)
     timeout = model_timeout_seconds()
     try:
         return await run_excel_agent(

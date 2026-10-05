@@ -1,0 +1,8 @@
+-r requirements.txt
+
+# Windows platform wheel includes the native Claude Code CLI. Keep MCP's
+# transitive Starlette dependency compatible with the project's FastAPI pin.
+claude-agent-sdk==0.2.159
+mcp==1.23.0
+sse-starlette==2.4.1
+starlette==0.47.3

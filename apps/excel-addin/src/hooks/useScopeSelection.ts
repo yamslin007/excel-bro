@@ -82,7 +82,18 @@ export function resolveFolderViewAfterFileClear(
 export function useScopeSelection() {
   const [toolName, setToolName] = useState("");
   const [toolDescription, setToolDescription] = useState("");
+  /**
+   * 当前草稿里的工作表选择。勾选、取消勾选、全选/清空都只改它 ——
+   * 这些动作**不构成授权**，所以它们不该顺手作废一件正在等待回答的任务。
+   */
   const [selectedSheetNames, setSelectedSheetNames] = useState<string[]>([]);
+  /**
+   * **已提交**的数据授权。只有点「确认范围」或明确选用某个范围时才变。
+   *
+   * 它与草稿刻意分开：用户为了看一眼别的表而勾上又取消，不该被当成
+   * "他改了授权"。真正的授权变更必须有一个人明确的确认动作。
+   */
+  const [committedSheetNames, setCommittedSheetNames] = useState<string[]>([]);
   const [selectionConfirmed, setSelectionConfirmed] = useState(false);
   const [sourceMode, setSourceMode] = useState<SourceMode>("workbook");
   const [workbookScopeMode, setWorkbookScopeMode] =
@@ -147,12 +158,72 @@ export function useScopeSelection() {
     [sourceMode, workbookScopeMode]
   );
 
+  /**
+   * 显式**提交**当前草稿为这一版数据授权。
+   *
+   * 给出 `snapshot` 时按**当前真实工作表清单**复核草稿：已经不存在的工作表
+   * 不会被提交成授权（弹层可能开了很久，期间用户可能删过表或换了工作簿）。
+   * 返回真正被提交的名称，调用方据此展示"这次用的是哪些表"。
+   */
+  const confirmScopeSelection = useCallback(
+    (snapshot?: WorkbookSnapshot | null): string[] => {
+      let next = selectedSheetNames;
+      if (snapshot) {
+        const available = new Set(snapshot.worksheets.map((sheet) => sheet.name));
+        const preserved = selectedSheetNames.filter((name) => available.has(name));
+        next =
+          preserved.length > 0
+            ? preserved
+            : snapshot.activeWorksheet
+              ? [snapshot.activeWorksheet]
+              : [];
+        if (next !== selectedSheetNames) setSelectedSheetNames(next);
+      }
+      setCommittedSheetNames(next);
+      setSelectionConfirmed(next.length > 0);
+      return next;
+    },
+    [selectedSheetNames]
+  );
+
+  /**
+   * 放弃本次范围编辑：草稿回到已提交授权，**已提交授权一字不改**。
+   *
+   * 这是"我点开只是想看看"的出口 —— 它不该把任何正在等待回答的任务打掉。
+   */
+  const cancelScopeEdit = useCallback(() => {
+    setSelectedSheetNames(committedSheetNames);
+    setSelectionConfirmed(committedSheetNames.length > 0);
+  }, [committedSheetNames]);
+
+  /**
+   * 草稿与已提交授权是否已经不一致。
+   *
+   * 界面据此提示"还有未确认的范围修改"，而不是让用户以为改了就已经生效。
+   */
+  const scopeDraftDirty =
+    selectedSheetNames.length !== committedSheetNames.length ||
+    [...selectedSheetNames].sort().join("\u0000") !==
+      [...committedSheetNames].sort().join("\u0000");
+
+  /**
+   * 凡是把范围标成"已确认"的路径，都同步把当前选择记成**已提交授权**。
+   *
+   * 这样既有行为（选自动范围 / 采用当前工作簿 / 选文件夹）都自动获得
+   * "已提交"的语义，不必逐个回调去改；而只改草稿的路径（toggleSheet 等）
+   * 会把 `selectionConfirmed` 置回 false，因此不会走到这里。
+   */
+  useEffect(() => {
+    if (selectionConfirmed) setCommittedSheetNames(selectedSheetNames);
+  }, [selectionConfirmed, selectedSheetNames]);
+
   const toggleSheet = useCallback((sheetName: string) => {
     setSelectedSheetNames((current) =>
       current.includes(sheetName)
         ? current.filter((name) => name !== sheetName)
         : [...current, sheetName]
     );
+    // 只改草稿：`committedSheetNames` 不动，重新确认前它仍是原来的授权。
     setSelectionConfirmed(false);
   }, []);
 
@@ -303,6 +374,12 @@ export function useScopeSelection() {
     setFolderCatalog,
     folderSheetKeys,
     setFolderSheetKeys,
+
+    // 已提交授权与显式确认
+    committedSheetNames,
+    scopeDraftDirty,
+    confirmScopeSelection,
+    cancelScopeEdit,
 
     // 操作
     applyWorkbookSnapshotSelection,

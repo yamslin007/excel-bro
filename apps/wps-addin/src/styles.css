@@ -303,6 +303,61 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
   cursor: wait;
   opacity: 0.6;
 }
+.wps-local-mapping-values {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+.wps-local-mapping-values label {
+  display: grid;
+  grid-template-columns: 1fr;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.wps-local-mapping-values label.editable {
+  grid-template-columns: minmax(0, 1fr) minmax(140px, 1fr);
+}
+.wps-local-mapping-values label span {
+  overflow-wrap: anywhere;
+}
+.wps-local-mapping-values input {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid #cbdacf;
+  border-radius: 8px;
+  font: inherit;
+}
+.local-mapping-resolution p { margin: 0; }
+.local-mapping-priority {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid #d8e3dc;
+  border-radius: 10px;
+  background: #f6faf7;
+}
+.local-mapping-priority-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.local-mapping-priority-item span {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.local-mapping-priority-item button { flex: none; }
+.local-mapping-priority label { display: flex; align-items: flex-start; gap: 8px; }
+.local-mapping-priority label input { width: auto; margin-top: 4px; }
+.local-mapping-error { color: #a43d31; }
+@media (max-width: 540px) {
+  .wps-local-mapping-values label.editable { grid-template-columns: 1fr; }
+}
 
 .agent-progress {
   display: flex;
@@ -918,18 +973,91 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 }
 .wps-plan-actions-list span { min-width: 0; overflow-wrap: anywhere; }
 .wps-plan-actions-list small { color: var(--color-text-secondary, #787774); }
-.wps-plan-values { grid-column: 1 / -1; min-width: 0; max-height: 220px; overflow: auto; }
-.wps-plan-values table { border-collapse: collapse; width: 100%; font-size: 12px; }
-.wps-plan-values th, .wps-plan-values td { border: 1px solid var(--color-border, #e9e9e7); padding: 4px 7px; text-align: left; overflow-wrap: anywhere; }
+/*
+ * 公式与长值一律**等宽 + 横向滚动**，不再用 `overflow-wrap: anywhere` 在窄列里
+ * 任意折断 —— 那会让一条长公式占掉多屏高度（真机截图的直接观感问题）。
+ */
+.wps-plan-values { grid-column: 1 / -1; min-width: 0; max-height: 260px; overflow: auto; }
+.wps-plan-values table { border-collapse: collapse; width: 100%; font: 12px/1.5 Consolas, "Courier New", monospace; }
+.wps-plan-values th, .wps-plan-values td { border: 1px solid var(--color-border, #e9e9e7); padding: 4px 7px; text-align: left; white-space: nowrap; }
 .wps-plan-values th { width: 30px; color: var(--color-text-secondary, #787774); font-weight: 500; }
-.wps-plan-values > small { display: block; margin-top: 5px; }
+.wps-plan-values > small { display: block; margin-top: 5px; white-space: normal; }
 .wps-plan-editor { display: grid; gap: 7px; margin-top: 12px; }
 .wps-plan-editor label { font-weight: 700; font-size: 12px; }
 .wps-plan-editor textarea { width: 100%; box-sizing: border-box; resize: vertical; font: 12px/1.45 Consolas, monospace; border: 1px solid var(--color-border, #d9e4dc); border-radius: 9px; padding: 9px; }
 .wps-plan-editor p { color: #a33f34; font-size: 12px; }
-.wps-plan-warnings { margin: 10px 0 0; padding-left: 20px; color: #9a6328; font-size: 12px; }
-.wps-plan-buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
-.wps-plan-buttons button,
+.wps-plan-notes { display: grid; gap: 4px; margin-top: 10px; }
+.wps-plan-notes > strong { font-size: 12px; font-weight: 750; }
+.wps-plan-notes ul { margin: 0; padding-left: 20px; font-size: 12px; }
+.wps-plan-notes ul > li { margin-top: 2px; }
+.wps-plan-assumptions { color: var(--color-text-secondary, #787774); }
+.wps-plan-notes.warning > strong,
+.wps-plan-warnings { color: #9a6328; }
+.wps-plan-card p.wps-plan-revised {
+  margin: 8px 0 0;
+  padding: 5px 8px;
+  border: 1px dashed var(--color-border, #d9e4dc);
+  border-radius: 8px;
+  background: var(--color-brand-bg, #edf3ec);
+  color: var(--color-brand-text, #2f6b47);
+  font-size: 12px;
+}
+/*
+ * 状态区：长说明独占整行，**不与按钮同排争宽**。
+ * 真机上按钮被压到逐字折行，直接原因就是说明和按钮同在 `.wps-plan-buttons`
+ * 的单行 flex 里。
+ */
+.wps-native-review-status {
+  display: grid;
+  gap: 4px;
+  margin-top: 11px;
+  padding: 9px 10px;
+  border: 1px solid var(--color-border, #e9e9e7);
+  border-radius: 9px;
+  background: var(--color-brand-bg, #edf3ec);
+}
+.wps-review-outcome { font-size: 12.5px; }
+.wps-review-line { margin: 0; font-size: 12px; line-height: 1.5; overflow-wrap: break-word; }
+/* 长工作簿名可省略，但 JSX 上带了 title，全名仍可查看。 */
+.wps-review-name {
+  display: inline-block;
+  max-width: 12em;
+  overflow: hidden;
+  vertical-align: bottom;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.wps-plan-target { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; margin-top: 10px; }
+.wps-plan-target > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 700; }
+.wps-plan-target > small { color: var(--color-text-secondary, #787774); font-size: 11px; }
+
+/*
+ * 操作区**只放按钮**。窄窗格整行纵排，且按钮文字**绝不逐字折行**
+ * （`white-space: nowrap`），不靠缩小字号或截断文案来塞进一行。
+ * 44px 是可点中的下限，同时保留原生 `disabled` 态防连点。
+ */
+.wps-native-review-actions { display: flex; flex-wrap: wrap; align-items: stretch; gap: 8px; margin-top: 12px; }
+.wps-native-review-actions button {
+  flex: 1 1 auto;
+  min-height: 44px;
+  min-width: 0;
+  border: 1px solid var(--color-border, #d9e4dc);
+  border-radius: 9px;
+  background: #fff;
+  color: var(--color-brand-text, #2f6b47);
+  padding: 0 12px;
+  font-weight: 750;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+@media (max-width: 559px) {
+  /* 窄窗格（含真机 350/430 CSS px）：两枚按钮各自占满整行，纵向排列。 */
+  .wps-native-review-actions button { flex-basis: 100%; }
+}
+.wps-native-review-actions button.primary { border-color: var(--color-brand-text, #2f6b47); background: var(--color-brand-text, #2f6b47); color: #fff; }
+.wps-native-review-actions button:disabled,
+.wps-undo-card button:disabled { opacity: 0.55; }
 .wps-undo-card button {
   min-height: 34px;
   border: 1px solid var(--color-border, #d9e4dc);
@@ -939,9 +1067,17 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
   padding: 0 12px;
   font-weight: 750;
 }
-.wps-plan-buttons button.primary { border-color: var(--color-brand-text, #2f6b47); background: var(--color-brand-text, #2f6b47); color: #fff; }
-.wps-plan-buttons button:disabled,
-.wps-undo-card button:disabled { opacity: 0.55; }
+
+/*
+ * 默认收起的长内容。收起不等于删除：授权范围、覆盖风险、未知类别策略与
+ * 实际写入类型都能从这些分区里查到。
+ */
+.wps-plan-disclosure { margin-top: 10px; border-top: 1px dashed var(--color-border, #e9e9e7); padding-top: 8px; }
+.wps-plan-disclosure > summary { cursor: pointer; font-size: 12px; font-weight: 700; color: var(--color-brand-text, #2f6b47); }
+.wps-plan-disclosure-note { margin: 7px 0 0; color: var(--color-text-secondary, #787774); font-size: 11.5px; }
+.wps-plan-preview { display: grid; gap: 9px; margin-top: 8px; }
+.wps-plan-preview > div { display: grid; gap: 5px; }
+.wps-plan-preview strong { font-size: 12px; }
 .wps-undo-card { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 12px; }
 .wps-undo-card > div { display: grid; min-width: 0; gap: 2px; }
 .wps-undo-card strong { font-size: 13px; }
@@ -950,6 +1086,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 @media (max-width: 430px) {
   .wps-plan-actions-list > div { grid-template-columns: 1fr; gap: 3px; }
   .wps-undo-card { align-items: stretch; flex-direction: column; }
+  .wps-plan-notes ul { padding-left: 16px; }
 }
 
 @media (max-width: 390px) {
@@ -1401,7 +1538,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
   z-index: 2;
 }
 
-/* WPS 内嵌网页允许直接选中文字复制；触屏上复制入口也始终可见。 */
+/* WPS 内嵌网页允许直接选中文字复制。复制入口沿用 Excel 的鼠标悬停／触屏规则。 */
 .wps-chat-shell .message-text,
 .wps-chat-shell .task-progress-content,
 .wps-chat-shell .preview-table-wrap {
@@ -1409,18 +1546,26 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
   -webkit-user-select: text;
 }
 
-.wps-chat-shell .message-copy-button:not(.copied) {
-  opacity: 1;
-}
-
+/*
+ * 输入框高度由共享的 `useComposerResize` 写进 textarea 的 `style`：内容变多时自动
+ * 长高，长到上限后改为可滚动。这里只声明下限（与 hook 的 `minHeight: 56` 一致）。
+ *
+ * **不要再写 `resize: vertical`**：WPS 的 WebView 里那个原生把手拖不动，而且它和
+ * 从共享 CSS 继承来的 `overflow-y: hidden` 凑在一起，会把超出高度的几行直接切掉。
+ */
 .wps-chat-shell .composer-box textarea {
   min-height: 56px;
-  max-height: min(36vh, 280px);
-  resize: vertical;
+  max-height: none;
+  resize: none;
 }
 
+/*
+ * 「停止」与「发送」是同一个圆钮的两种状态，颜色必须一致 —— 此前这里用了
+ * `--color-warning-text`（褐色），看起来像另一个功能的按钮。停止语义由
+ * 图标（■）与 `aria-label` 表达，不靠换色。
+ */
 .wps-chat-shell .wps-stop-button {
-  background: var(--color-warning-text, #925f2d);
+  background: var(--color-brand-text, #2f6b47);
   font-size: 14px;
   cursor: pointer;
 }
@@ -1444,6 +1589,71 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
   color: var(--color-text-secondary);
 }
 
+/*
+ * 「未获证实 / 部分写入」的结果卡不能被看成"验证通过"。
+ * 色调只是辅助：真正的判据在 `WPS_EXECUTION_OUTCOME_LABEL` 的文案上。
+ */
+.wps-chat-shell .wps-verification-card.unverified,
+.wps-chat-shell .wps-verification-card.partial {
+  border-color: var(--color-warning-border, #d9bb7d);
+  background: var(--color-warning-bg, #fffbf3);
+}
+
+/*
+ * 执行结果卡**内部**的撤销行。
+ *
+ * 它必须待在自己那张卡里：早先那张无条件挂在消息流末尾的全局撤销卡，会让
+ * 上一轮写入留下的恢复点看起来像本轮唯一能做的下一步。这个类名存在的意义
+ * 就是让"按钮属于哪张卡"在 DOM 上可断言。
+ */
+.wps-chat-shell .wps-verification-card .wps-undo-inline {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 10px;
+  padding-top: 9px;
+  border-top: 1px dashed var(--color-border, #e9e9e7);
+}
+
+.wps-chat-shell .wps-verification-card .wps-undo-inline > span {
+  min-width: 0;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-caption);
+  font-weight: 700;
+}
+
+.wps-chat-shell .wps-verification-card .wps-undo-inline button {
+  min-height: 34px;
+  flex: 0 0 auto;
+  border: 1px solid var(--color-border, #e9e9e7);
+  border-radius: 9px;
+  background: #fff;
+  color: var(--color-brand-text, #2f6b47);
+  padding: 0 12px;
+  font-weight: 750;
+  /* 窄窗格里也保持整句，不靠截断文案或缩小字号塞进一行。 */
+  white-space: nowrap;
+}
+
+.wps-chat-shell .wps-verification-card .wps-undo-inline button:disabled {
+  opacity: 0.55;
+}
+
+.wps-chat-shell .wps-verification-card .wps-undo-inline.conflict > span,
+.wps-chat-shell .wps-verification-card .wps-undo-inline.unavailable > span {
+  color: var(--color-warning-text, #805f21);
+}
+
+/* 窄窗格（含真机 350/430 CSS px）：状态与按钮各占整行。 */
+@media (max-width: 430px) {
+  .wps-chat-shell .wps-verification-card .wps-undo-inline {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 7px;
+  }
+}
+
 .wps-query-result-meta {
   display: flex;
   flex-wrap: wrap;
@@ -1452,14 +1662,57 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
   padding: 0 16px 10px;
   color: var(--color-text-secondary);
   font-size: var(--font-size-caption);
-}
-.wps-query-result-meta strong { color: var(--color-text-primary); }
+}.wps-query-result-meta strong { color: var(--color-text-primary); }
 .wps-query-result-meta small { flex-basis: 100%; overflow-wrap: anywhere; }
 .wps-query-result-warnings {
   margin: 0;
   padding: 10px 16px 12px 32px;
   color: var(--color-warning-text, #925f2d);
   font-size: var(--font-size-caption);
+}
+
+/* CAP-03 重载恢复卡：挂在消息流顶部（不是末尾），如实区分四态，不给假按钮。 */
+.wps-write-recovery {
+  margin: 10px 16px;
+  padding: 12px 14px;
+  border: 1px solid var(--color-border, #e9e9e7);
+  border-radius: 12px;
+  background: var(--color-surface-soft, #fbfcfa);
+}
+.wps-write-recovery-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+.wps-write-recovery-head strong { font-weight: 750; }
+.wps-write-recovery-badge {
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: var(--font-size-caption);
+  font-weight: 700;
+  white-space: nowrap;
+}
+.wps-write-recovery-completed { background: #e3f1e8; color: #2f6b47; }
+.wps-write-recovery-reconcile { background: #e8f0fa; color: #2c5c9e; }
+.wps-write-recovery-replan { background: #e8eef8; color: #3a4a6b; }
+.wps-write-recovery-blocked { background: #fbf0df; color: #925f2d; }
+.wps-write-recovery-insufficient { background: #f3eeee; color: #8a3b31; }
+.wps-write-recovery-detail {
+  margin: 0 0 8px;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-caption);
+}
+.wps-write-recovery-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.wps-write-recovery-actions button {
+  min-height: 34px;
+  border: 1px solid var(--color-border, #e9e9e7);
+  border-radius: 9px;
+  background: #fff;
+  color: var(--color-brand-text, #2f6b47);
+  padding: 0 12px;
+  font-weight: 750;
 }
 
 .composer .wps-scope-dock {
@@ -1651,12 +1904,6 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
     overflow: visible;
   }
 
-  .chat-header .tools-entry,
-  .chat-header .folder-backup-entry {
-    width: 28px;
-    padding: 0;
-  }
-
   .chat-header .tools-entry > span,
   .chat-header .folder-backup-entry > span:not([aria-hidden="true"]) {
     display: none;
@@ -1667,12 +1914,115 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
   }
 }
 
-@media (max-width: 460px) {
-  .chat-header .brand-copy {
-    display: none;
-  }
-
-  .chat-header .model-picker {
-    margin-left: auto;
-  }
+/* 撤销后留下的"曾修改"摘要：只有定位与计数，没有单元格内容。 */
+.change-review-undo-note {
+  margin: 6px 0 0;
+  padding: 5px 8px;
+  border-left: 3px solid var(--color-border, #e9e9e7);
+  border-radius: 6px;
+  background: var(--brand-soft, #e3f1e8);
+  color: var(--color-text-secondary, #787774);
+  font-size: var(--font-size-caption);
+  overflow-wrap: anywhere;
 }
+
+/* ── 宽幅审阅 PoC：能力探针与只读测试页（正式接线前的临时样式） ── */
+.poc-panel-shell,
+.poc-dialog-shell {
+  display: grid;
+  align-content: start;
+  gap: 12px;
+  min-width: 0;
+  padding: 16px;
+}
+
+.poc-panel-shell > header,
+.poc-dialog-shell > header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.poc-panel-shell > header p { margin: 2px 0 0; color: var(--muted); }
+
+.poc-panel-result {
+  display: grid;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  padding: 12px;
+}
+
+.poc-panel-result.requested { border-color: var(--brand); background: var(--brand-soft); }
+.poc-panel-result.missing,
+.poc-panel-result.error { border-color: var(--danger); }
+
+.wps-chat-shell > .poc-panel-result {
+  position: absolute;
+  top: 80px;
+  left: 16px;
+  right: 16px;
+  z-index: 50;
+  max-height: min(260px, 45vh);
+  overflow: auto;
+  box-shadow: var(--shadow-md);
+}
+
+.poc-probe-result-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.poc-probe-result-header button {
+  border: 0;
+  background: none;
+  color: inherit;
+  cursor: pointer;
+  font-size: 20px;
+}
+
+.poc-panel-error,
+.poc-panel-error-detail {
+  margin: 0;
+  border-left: 3px solid var(--danger);
+  border-radius: 6px;
+  background: rgba(163, 69, 55, 0.08);
+  padding: 6px 10px;
+  color: var(--danger);
+  overflow-wrap: anywhere;
+}
+
+.poc-panel-note { margin: 0; color: var(--muted); }
+
+.poc-dialog-facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 8px;
+  margin: 0;
+}
+
+.poc-dialog-facts > div {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-soft);
+  padding: 8px 10px;
+}
+
+.poc-dialog-facts dt { color: var(--muted); }
+.poc-dialog-facts dd { margin: 2px 0 0; font-weight: 650; overflow-wrap: anywhere; }
+
+.poc-dialog-shell { min-width: 720px; }
+.poc-dialog-hint { color: var(--muted); }
+
+.clarification-fields { display: grid; gap: 12px; margin-top: 14px; }
+.clarification-fields label { display: grid; gap: 6px; font-weight: 600; }
+.clarification-fields textarea {
+  box-sizing: border-box; width: 100%; min-height: 64px; padding: 10px;
+  border: 1px solid var(--border); border-radius: 8px;
+  color: inherit; background: transparent; font: inherit; resize: vertical;
+}
+.clarification-fields small { color: var(--muted); }
+.clarification-fields button { justify-self: start; padding: 10px 14px; }

@@ -796,7 +796,7 @@ def test_model_agent_inspects_fields_before_submitting_formula_plan(
     # 断言的是"只读工具已撤下"，不是"终局工具集恰好这两个"——
     # 后者会在每次新增终局工具时假报回归。
     assert _READONLY_TOOL_NAMES.isdisjoint(_tool_names(requests[1]))
-    assert {"submit_plan", "submit_answer"} <= _tool_names(requests[1])
+    assert {"select_plan_actions", "submit_answer"} <= _tool_names(requests[1])
     second_messages = requests[1]["messages"]
     assert isinstance(second_messages, list)
     tool_message = next(
@@ -1094,7 +1094,7 @@ def test_agent_drops_readonly_tools_when_data_results_present(
     assert "get_workbook_context" not in names
     assert "find_fields" not in names
     assert "read_range" not in names
-    assert {"submit_answer", "submit_plan"} <= names
+    assert {"submit_answer", "select_plan_actions"} <= names
 
 
 def test_confirmed_split_plan_submits_once_without_reading_snapshot_rows(
@@ -1199,7 +1199,7 @@ def test_confirmed_split_plan_submits_once_without_reading_snapshot_rows(
     assert len(call_log) == 1
     names = _tool_names(call_log[0])
     assert _READONLY_TOOL_NAMES.isdisjoint(names)
-    assert {"submit_plan", "submit_answer"} <= names
+    assert {"select_plan_actions", "submit_answer"} <= names
     user_message = call_log[0]["messages"][1]
     assert isinstance(user_message, dict)
     assert "不得调用工作簿只读工具" in str(user_message["content"])
@@ -1221,6 +1221,6 @@ def test_agent_keeps_readonly_tools_without_data_results(
         "find_fields",
         "read_range",
         "submit_answer",
-        "submit_plan",
+        "select_plan_actions",
     } <= names
 

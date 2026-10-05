@@ -12,7 +12,7 @@ import pytest
 import server.app.excel_agent as excel_agent
 from server.app.agent_loop_protection import LoopConfig
 from server.app.llm import ModelConnection
-from server.app.models import PlanRequest
+from server.app.models import PlanRequest, ResultContext
 
 
 def _request() -> PlanRequest:
@@ -134,6 +134,31 @@ class _FakeClient:
         return self.responder(self.call_count)
 
 
+@pytest.mark.parametrize("use_tool", [True, False])
+def test_planner_returns_interactive_clarification_for_both_model_submission_paths(monkeypatch, use_tool):
+    clarification = {
+        "id": "statistics-unit", "summary": "需要统计单位", "question": "请选择统计单位",
+        "reason": "单位会改变结果", "scopeLabel": "Sheet1", "options": [],
+        "fields": [{"id": "unit", "label": "统计单位", "placeholder": "请说明单位"}],
+    }
+    payload = _tool_payload("submit_clarification", {"clarification": clarification}, "c1") if use_tool else _content_payload(
+        json.dumps({"kind": "clarification", "clarification": clarification}, ensure_ascii=False)
+    )
+    client = _FakeClient(lambda _turn: (payload, _usage()))
+    _install_client(monkeypatch, client)
+    events = []
+
+    async def on_event(event):
+        events.append(event)
+
+    result = asyncio.run(excel_agent.run_excel_agent(_request(), connection=_connection(), timeout=5, on_event=on_event))
+    assert result.kind == "clarification"
+    assert result.clarification.fields[0].label == "统计单位"
+    assert client.call_count == 1
+    assert any(event["title"] == "等待补充信息" for event in events)
+    assert not hasattr(result, "plan")
+
+
 def _install_client(
     monkeypatch: pytest.MonkeyPatch, client: _FakeClient
 ) -> None:
@@ -142,6 +167,113 @@ def _install_client(
         "OpenAICompatibleClient",
         lambda *_args, **_kwargs: client,
     )
+
+
+def test_compact_mapping_does_not_carry_all_action_schemas(monkeypatch):
+    request = _request().model_copy(update={"planningReadPolicy": "none"})
+    request.workbook.worksheets[0].dataRows[0][0] = "LOCAL_PRIVATE_SENTINEL"
+    request.lastResult = ResultContext(kind="table", title="上轮结果", headers=["标签"], rows=[["PRIVATE_PREVIOUS_SENTINEL"]], sourceSheets=["Sheet1"])
+    assert request.workbook.worksheets[0].dataRows[0][0] == "LOCAL_PRIVATE_SENTINEL"
+    assert request.lastResult.rows[0][0] == "PRIVATE_PREVIOUS_SENTINEL"
+    args = {"sourceSheet": "Sheet1", "sourceRange": "A2:A3", "targetRange": "B2:B3",
+            "mapping": [{"from": "甲", "to": "第一类"}, {"from": "乙", "to": "第二类"}]}
+    client = _FakeClient(lambda _: (_tool_payload("map_column_values", args, "mapping"), _usage(100)))
+    _install_client(monkeypatch, client)
+    result = asyncio.run(excel_agent.run_excel_agent(request, connection=_connection(), timeout=5))
+    assert result.kind == "local_plan_rule"
+    assert client.call_count == 1
+    tools = client.call_kwargs[0]["tools"]
+    names = {tool["function"]["name"] for tool in tools}
+    assert "map_column_values" in names
+    assert "select_plan_actions" in names
+    assert "submit_plan" not in names
+    assert "read_range" not in names
+    assert len(json.dumps(tools, ensure_ascii=False)) < len(json.dumps(excel_agent.AGENT_TOOLS_WITH_DATA, ensure_ascii=False)) / 2
+    # Local sentinels exist, but never enter the model's initial context.
+    assert "LOCAL_PRIVATE_SENTINEL" not in json.dumps(client.message_snapshots, ensure_ascii=False)
+    assert "PRIVATE_PREVIOUS_SENTINEL" not in json.dumps(client.message_snapshots, ensure_ascii=False)
+
+
+def test_schema_selection_loads_only_selected_types_and_survives_checkpoint(monkeypatch):
+    plan = {"id": "compact-plan", "title": "清空内容", "summary": "清空已授权区域", "actions": [
+        {"type": "clearRange", "sheet": "Sheet1", "range": "B2:B3", "applyTo": "contents"}
+    ]}
+    client = _FakeClient(lambda turn: (
+        _tool_payload("select_plan_actions", {"actionTypes": ["clearRange"]}, "select") if turn == 1
+        else _tool_payload("submit_plan", {"plan": plan}, "plan"), _usage()))
+    _install_client(monkeypatch, client)
+    checkpoints = []
+    async def save(checkpoint):
+        checkpoints.append(copy.deepcopy(checkpoint))
+    result = asyncio.run(excel_agent.run_excel_agent(_request(), connection=_connection(), timeout=5, on_checkpoint=save))
+    assert result.kind == "plan"
+    tool = next(tool for tool in client.call_kwargs[1]["tools"] if tool["function"]["name"] == "submit_plan")
+    variants = tool["function"]["parameters"]["properties"]["plan"]["properties"]["actions"]["items"]["anyOf"]
+    assert [variant["properties"]["type"]["const"] for variant in variants] == ["clearRange"]
+    assert "applyTo" in variants[0]["properties"]
+    assert any(checkpoint["selectedActionTypes"] == ["clearRange"] for checkpoint in checkpoints)
+    resumed_client = _FakeClient(lambda _: (_tool_payload("submit_plan", {"plan": plan}, "resumed"), _usage()))
+    _install_client(monkeypatch, resumed_client)
+    boundary = next(checkpoint for checkpoint in checkpoints if checkpoint["stage"] == "tool_batch_completed")
+    resumed = asyncio.run(excel_agent.run_excel_agent(_request(), connection=_connection(), timeout=5, resume_checkpoint=boundary))
+    assert resumed.kind == "plan"
+    assert resumed_client.call_kwargs[0]["tools"] == client.call_kwargs[1]["tools"]
+
+
+def test_schema_selection_rejects_unknown_or_unavailable_actions():
+    with pytest.raises(ValueError):
+        excel_agent._select_plan_actions(_request(), {"actionTypes": ["arbitraryScript"]})
+    request = _request().model_copy(update={"hostId": "unrecognized-host"})
+    with pytest.raises(ValueError):
+        excel_agent._select_plan_actions(request, {"actionTypes": ["writeValues"]})
+
+
+def test_no_data_policy_also_rejects_unadvertised_read_tool():
+    request = _request().model_copy(update={"planningReadPolicy": "none"})
+    with pytest.raises(ValueError, match="不允许"):
+        excel_agent._execute_tool(request, "read_range", {"sheet": "Sheet1", "range": "A1:B3"})
+
+
+def test_truncated_even_valid_tool_output_is_not_executed(monkeypatch):
+    payload = _tool_payload("submit_answer", {"message": "不该被接受"}, "incomplete")
+    payload["choices"][0]["finish_reason"] = "length"
+    client = _FakeClient(lambda _: (payload, _usage()))
+    _install_client(monkeypatch, client)
+    result = asyncio.run(excel_agent.run_excel_agent(_request(), connection=_connection(), timeout=5))
+    assert result.kind == "answer"
+    assert result.outcome == "failed"
+    assert result.stopReason == "output_length"
+    assert "模型响应被截断" in result.message
+    assert "格式要求" not in result.message
+    assert "简化需求" not in result.message
+    assert client.call_count == 1
+    assert client.call_kwargs[0]["max_tokens"] is None
+
+
+def test_production_output_budgets_use_provider_defaults():
+    from server.app.capabilities import capability_optional_int
+    assert excel_agent.MAX_OUTPUT_TOKENS is None
+    assert excel_agent.REPAIR_MAX_OUTPUT_TOKENS is None
+    assert capability_optional_int("intentContext", "maxOutputTokens") is None
+    assert excel_agent._default_loop_config().max_total_tokens is None
+
+
+@pytest.mark.parametrize("first_total", [40_000, 1_000_000])
+def test_large_reasoning_response_can_select_actions_then_submit_plan(monkeypatch, first_total):
+    plan = {"id": "long-reasoning", "title": "清空", "summary": "清空授权区域",
+            "actions": [{"type": "clearRange", "sheet": "Sheet1", "range": "B2:B3", "applyTo": "contents"}]}
+    def responder(call_count):
+        if call_count == 1:
+            return (_tool_payload("select_plan_actions", {"actionTypes": ["clearRange"]}, "select"),
+                    {"prompt_tokens": first_total - 35000, "completion_tokens": 35000, "total_tokens": first_total, "reasoning_tokens": 34000})
+        return _tool_payload("submit_plan", {"plan": plan}, "plan"), _usage(1000)
+    client = _FakeClient(responder)
+    _install_client(monkeypatch, client)
+    result = asyncio.run(excel_agent.run_excel_agent(_request(), connection=_connection(), timeout=5))
+    assert result.kind == "plan"
+    assert result.plan.id == "long-reasoning"
+    assert client.call_count == 2
+    assert all(call["max_tokens"] is None for call in client.call_kwargs)
 
 
 def test_progress_events_summarize_tools_without_exposing_raw_rows(
@@ -223,7 +355,7 @@ def test_budget_pause_resumes_complete_model_response_without_repeating_tool(
                     {"sheet": "Sheet1", "range": "A1:B3"},
                     "read-after-resume",
                 ),
-                _usage(),
+                _usage(1_000_000),
             )
         return (
             _tool_payload(
@@ -270,6 +402,7 @@ def test_budget_pause_resumes_complete_model_response_without_repeating_tool(
 
     checkpoint = paused.value.checkpoint
     assert checkpoint["stage"] == "model_response_saved"
+    assert checkpoint["loopState"]["totalTokens"] == 1_000_000
     assert checkpoint["pendingAssistantMessage"]["tool_calls"][0]["function"][
         "name"
     ] == "read_range"
@@ -479,7 +612,7 @@ def test_total_token_budget_triggers_safe_degradation(
             _request(),
             connection=_connection(),
             timeout=10,
-            config=LoopConfig(max_wall_time_seconds=3600),
+            config=LoopConfig(max_total_tokens=20_000, max_wall_time_seconds=3600),
         )
     )
 

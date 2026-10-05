@@ -54,6 +54,7 @@ from .folder_workbooks import (
 )
 from .models import (
     AnalysisPlan,
+    AnswerResponse,
     AssistantResponse,
     DataToolResult,
     FolderBackupCleanupRequest,
@@ -88,6 +89,15 @@ from .models import (
     OfficeExecutionResumeRequest,
     OfficeExecutionStateResponse,
     OfficeExecutionSuspendRequest,
+    WpsActionCompleteRequest,
+    WpsActionReconcileRequest,
+    WpsActionStartRequest,
+    WpsExecutionFinishRequest,
+    WpsExecutionRegisterRequest,
+    WpsExecutionResumeRequest,
+    WpsExecutionStateResponse,
+    WpsExecutionSuspendRequest,
+    WpsRecoveryDescriptor,
     PlanRequest,
     PlanningContinueRequest,
     PlanValidateRequest,
@@ -141,6 +151,8 @@ from .rule_generator import (
     generate_formula,
 )
 from .turn_state import TurnStateError, turn_registry
+from .excel_window_layout import excel_window_layout, WindowLayoutError
+from .models import ExcelReviewLayoutPrepareRequest, ExcelReviewLayoutTicket, ExcelReviewLayoutResult, ExcelReviewLayoutArrangeRequest, ExcelReviewPaneMeasurement
 
 load_dotenv("server/.env")
 logger = logging.getLogger(__name__)
@@ -189,6 +201,49 @@ app.add_middleware(
     allow_methods=["DELETE", "GET", "POST", "PUT"],
     allow_headers=["Content-Type"],
 )
+
+
+def _review_layout_origin(request: Request) -> str:
+    # This desktop action is narrower than the general planning API: localhost
+    # only, explicit Excel task-pane Origin, no no-Origin CLI / folder / WPS use.
+    origin = request.headers.get("origin", "")
+    if (not request.client or request.client.host not in {"127.0.0.1", "::1"}
+        or request.url.hostname not in {"127.0.0.1", "localhost", "::1"}
+        or origin not in ALLOWED_ORIGINS[:4]
+        or request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json"):
+        raise HTTPException(403, detail={"code": "LAYOUT_FORBIDDEN", "message": "仅允许本机 Excel 任务窗格请求窗口排列。", "retryable": False})
+    return origin
+
+
+@app.post("/api/office/review-layout/prepare", response_model=ExcelReviewLayoutTicket)
+async def prepare_excel_review_layout(payload: ExcelReviewLayoutPrepareRequest, request: Request):
+    origin = _review_layout_origin(request)
+    try:
+        token = await run_in_threadpool(excel_window_layout.prepare, payload, origin)
+        return ExcelReviewLayoutTicket(token=token, layoutVersion=3)
+    except Exception as exc:
+        code = exc.code if isinstance(exc, WindowLayoutError) else "LAYOUT_UNAVAILABLE"
+        raise HTTPException(409, detail={"code": code, "message": "无法确认原表窗口；请先激活原表，或手动并排查看。", "retryable": False}) from None
+
+
+@app.post("/api/office/review-layout/measure", response_model=ExcelReviewPaneMeasurement)
+async def measure_excel_review_pane(payload: ExcelReviewLayoutPrepareRequest, request: Request):
+    _review_layout_origin(request)
+    try:
+        return await run_in_threadpool(excel_window_layout.measure, payload)
+    except Exception as exc:
+        code = exc.code if isinstance(exc, WindowLayoutError) else "LAYOUT_UNAVAILABLE"
+        raise HTTPException(409, detail={"code": code, "message": "无法确认本次审阅窗口宽度，请手动调整 AI 分隔线。", "retryable": False}) from None
+
+
+@app.post("/api/office/review-layout/arrange", response_model=ExcelReviewLayoutResult)
+async def arrange_excel_review_layout(payload: ExcelReviewLayoutArrangeRequest, request: Request):
+    origin = _review_layout_origin(request)
+    try:
+        return await run_in_threadpool(excel_window_layout.arrange, payload.token, origin)
+    except Exception as exc:
+        code = exc.code if isinstance(exc, WindowLayoutError) else "LAYOUT_UNAVAILABLE"
+        raise HTTPException(409, detail={"code": code, "message": "自动窗口排列未完成；请手动并排查看。原表未因此写入。", "retryable": False}) from None
 
 
 @app.middleware("http")
@@ -1114,6 +1169,13 @@ _OFFICE_RECOVERABLE_ACTION_TYPES = {
     "setNumberFormat",
 }
 
+# WPS 当前只开放这三类，且 clearRange 只认 contents；R1C1 与结构动作一律拒绝。
+_WPS_RECOVERABLE_ACTION_TYPES = {
+    "writeValues",
+    "writeFormulas",
+    "clearRange",
+}
+
 
 def _office_request_fingerprint(request: OfficeExecutionRegisterRequest) -> str:
     payload = request.model_dump(mode="json", exclude={"operationId", "confirmed"})
@@ -1181,6 +1243,122 @@ def _office_state_payload(
         requiresReconciliation=record.in_flight_action_index is not None,
         ownerToken=record.owner_token if include_owner else None,
     )
+
+
+def _wps_request_fingerprint(request: WpsExecutionRegisterRequest) -> str:
+    payload = request.model_dump(mode="json", exclude={"operationId", "confirmed"})
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_wps_recovery_descriptor(request: WpsExecutionRegisterRequest) -> None:
+    authorized = {name.casefold() for name in request.authorizedSheetNames}
+    if sum(action.cellCount for action in request.descriptor.actions) > capability_int("wpsWrite", "maxCells"):
+        raise service_error(422, "WPS_RECOVERY_INVALID", "恢复目标超过 WPS 写入单元格限额。", retryable=False)
+    for index, action in enumerate(request.descriptor.actions):
+        if action.actionIndex != index or action.cellCount != action.rowCount * action.columnCount:
+            raise service_error(422, "WPS_RECOVERY_INVALID", "恢复动作序号或矩形尺寸不一致。", retryable=False)
+        if action.type not in _WPS_RECOVERABLE_ACTION_TYPES:
+            raise service_error(
+                422,
+                "WPS_RECOVERY_UNSUPPORTED_ACTION",
+                f"第 {index + 1} 步 {action.type} 暂不支持 WPS 跨重启自动续跑。",
+                retryable=False,
+            )
+        if action.sheet.casefold() not in authorized:
+            raise service_error(
+                403,
+                "WPS_RECOVERY_SCOPE_MISMATCH",
+                f"第 {index + 1} 步目标工作表「{action.sheet}」不在本次授权范围内。",
+                retryable=False,
+            )
+        if action.type == "clearRange" and action.applyTo != "contents":
+            raise service_error(
+                422,
+                "WPS_RECOVERY_UNSUPPORTED_ACTION",
+                "WPS 只支持清空明确区域的内容（applyTo=contents）。",
+                retryable=False,
+            )
+        if action.type == "writeFormulas" and action.formulaR1C1:
+            raise service_error(
+                422,
+                "WPS_RECOVERY_UNSUPPORTED_ACTION",
+                "R1C1 铺满公式暂不支持 WPS 跨重启效果核对。",
+                retryable=False,
+            )
+
+
+def _wps_state_payload(
+    record: OfficeExecutionRecord, *, include_owner: bool = False
+) -> WpsExecutionStateResponse:
+    authorized = record.authorization.get("authorizedSheetNames", [])
+    descriptor = WpsRecoveryDescriptor.model_validate(record.plan)
+    owner_active = record.status == "running" and record.updated_at + capability_int(
+        "taskRecovery", "wpsOwnerLeaseSeconds"
+    ) > time.time()
+    return WpsExecutionStateResponse(
+        operationId=record.operation_id,
+        status=record.status,
+        revision=record.revision,
+        workbookIdentity=record.workbook_identity,
+        taskId=record.task_id or "",
+        # 账本里存的是恢复描述，不是完整计划；下发状态因此也不含单元格矩阵。
+        descriptor=descriptor,
+        authorizedSheetNames=[str(value) for value in authorized],
+        nextActionIndex=record.next_action_index,
+        totalActions=len(descriptor.actions),
+        inFlightActionIndex=record.in_flight_action_index,
+        beforeSnapshot=record.before_snapshot,
+        checkpoint=record.checkpoint,
+        result=record.result,
+        error={"code": "WPS_WRITE_INTERRUPTED", "message": "WPS 写入中断，需要核对现场。"} if record.error else None,
+        canResume=not owner_active and record.status in {"running", "failed", "needs_reconciliation"},
+        requiresReconciliation=record.in_flight_action_index is not None,
+        ownerActive=owner_active,
+        ownerToken=record.owner_token if include_owner else None,
+    )
+
+
+def _wps_conflict(error: Exception) -> HTTPException:
+    if isinstance(error, ValueError):
+        return service_error(422, "WPS_RECOVERY_INVALID", str(error), retryable=False)
+    if isinstance(error, RuntimeError):
+        return service_error(409, "WPS_RECOVERY_CONFLICT", str(error), retryable=True)
+    return _task_state_error(error)
+
+
+def _wps_record(operation_id: str) -> OfficeExecutionRecord:
+    record = _folder_operation_ledger.office_execution(operation_id)
+    if record is None or not record.workbook_identity.startswith("wps-path:"):
+        raise RuntimeError("未找到这次 WPS 执行记录")
+    # Old full-plan records cannot be resumed or disclosed via the new protocol.
+    try:
+        WpsRecoveryDescriptor.model_validate(record.plan)
+        _wps_state_payload(record)
+    except (ValueError, TypeError):
+        # Never stringify validation errors containing a legacy plan/matrix.
+        raise ValueError("旧执行记录不符合无矩阵恢复协议，不能下发或接管；请重新核对并预览。") from None
+    return record
+
+
+def _wps_evidence(operation_id: str, action_index: int, evidence: Any, *, after: bool = False) -> dict[str, Any]:
+    record = _wps_record(operation_id)
+    actions = record.plan["actions"]
+    if action_index >= len(actions):
+        raise ValueError("WPS 动作位置超出登记范围")
+    action = actions[action_index]
+    payload = evidence.model_dump(mode="json", exclude_none=True)
+    if (payload["sheetName"], payload["range"], payload["type"], payload["beforeFingerprint"]) != (
+        action["sheet"], action["range"], action["type"], action["previewFingerprint"]
+    ):
+        raise ValueError("WPS 动作证据与登记的范围或写前状态不一致")
+    if after and (not payload.get("afterFingerprint") or (
+        action.get("expectedFingerprint") and payload["afterFingerprint"] != action["expectedFingerprint"]
+    )):
+        raise ValueError("WPS 写后证据与登记的目标指纹不一致")
+    return payload
 
 
 def _planning_pause_payload(
@@ -1391,8 +1569,10 @@ async def _planning_task_stream(
             result = response.model_copy(update={"turnId": turn_id})
             current_record = _folder_operation_ledger.finish_planning_task(
                 turn_id,
-                status="completed",
+                status="failed" if isinstance(result, AnswerResponse) and result.outcome == "failed" else "completed",
                 result=result.model_dump(mode="json"),
+                error=({"status": 422, "code": "PLANNING_STOPPED", "message": result.message, "retryable": False}
+                       if isinstance(result, AnswerResponse) and result.outcome == "failed" else None),
             )
             turn_registry.record_completion(turn_id, request, response)
             yield _sse_frame("result", current_record.result or result.model_dump(mode="json"))
@@ -1761,6 +1941,12 @@ def _office_conflict(error: Exception) -> HTTPException:
     return _task_state_error(error)
 
 
+def _require_office_namespace(operation_id: str) -> None:
+    record = _folder_operation_ledger.office_execution(operation_id)
+    if record is None or not record.workbook_identity.startswith("url:"):
+        raise RuntimeError("未找到这次 Office 执行记录，不能跨宿主接管")
+
+
 @app.post(
     "/api/office/executions/register",
     response_model=OfficeExecutionStateResponse,
@@ -1797,7 +1983,7 @@ async def office_execution_status(operation_id: str) -> OfficeExecutionStateResp
         )
     except Exception as error:
         raise _task_state_error(error) from error
-    if record is None:
+    if record is None or not record.workbook_identity.startswith("url:"):
         raise service_error(
             404,
             "OFFICE_EXECUTION_NOT_FOUND",
@@ -1815,6 +2001,7 @@ async def start_office_action(
     operation_id: str, request: OfficeActionStartRequest
 ) -> OfficeExecutionStateResponse:
     try:
+        await run_in_threadpool(_require_office_namespace, operation_id)
         record = await run_in_threadpool(
             _folder_operation_ledger.begin_office_action,
             operation_id,
@@ -1836,6 +2023,7 @@ async def complete_office_action(
     operation_id: str, request: OfficeActionCompleteRequest
 ) -> OfficeExecutionStateResponse:
     try:
+        await run_in_threadpool(_require_office_namespace, operation_id)
         record = await run_in_threadpool(
             _folder_operation_ledger.complete_office_action,
             operation_id,
@@ -1857,6 +2045,7 @@ async def suspend_office_execution(
     operation_id: str, request: OfficeExecutionSuspendRequest
 ) -> OfficeExecutionStateResponse:
     try:
+        await run_in_threadpool(_require_office_namespace, operation_id)
         record = await run_in_threadpool(
             _folder_operation_ledger.suspend_office_execution,
             operation_id,
@@ -1877,6 +2066,7 @@ async def resume_office_execution(
     operation_id: str, request: OfficeExecutionResumeRequest
 ) -> OfficeExecutionStateResponse:
     try:
+        await run_in_threadpool(_require_office_namespace, operation_id)
         record = await run_in_threadpool(
             _folder_operation_ledger.claim_office_resume,
             operation_id,
@@ -1895,6 +2085,7 @@ async def reconcile_office_action(
     operation_id: str, request: OfficeActionReconcileRequest
 ) -> OfficeExecutionStateResponse:
     try:
+        await run_in_threadpool(_require_office_namespace, operation_id)
         record = await run_in_threadpool(
             _folder_operation_ledger.reconcile_office_action,
             operation_id,
@@ -1916,6 +2107,7 @@ async def finish_office_execution(
     operation_id: str, request: OfficeExecutionFinishRequest
 ) -> OfficeExecutionStateResponse:
     try:
+        await run_in_threadpool(_require_office_namespace, operation_id)
         record = await run_in_threadpool(
             _folder_operation_ledger.finish_office_execution,
             operation_id,
@@ -1926,6 +2118,193 @@ async def finish_office_execution(
     except Exception as error:
         raise _office_conflict(error) from error
     return _office_state_payload(record)
+
+
+@app.post(
+    "/api/wps/executions/register",
+    response_model=WpsExecutionStateResponse,
+)
+async def register_wps_execution(
+    request: WpsExecutionRegisterRequest,
+) -> WpsExecutionStateResponse:
+    _validate_wps_recovery_descriptor(request)
+    try:
+        record, _created = await run_in_threadpool(
+            _folder_operation_ledger.register_office_execution,
+            request.operationId,
+            _wps_request_fingerprint(request),
+            plan=request.descriptor.model_dump(mode="json"),
+            authorization={
+                "authorizedSheetNames": request.authorizedSheetNames,
+                "allowedExternalFiles": [],
+            },
+            workbook_identity=request.workbookIdentity,
+            identity_prefix="wps-path:",
+            task_id=request.taskId,
+        )
+    except Exception as error:
+        raise _wps_conflict(error) from error
+    return _wps_state_payload(record, include_owner=_created and record.status == "running")
+
+
+@app.get(
+    "/api/wps/executions/{operation_id}",
+    response_model=WpsExecutionStateResponse,
+)
+async def wps_execution_status(operation_id: str) -> WpsExecutionStateResponse:
+    try:
+        record = await run_in_threadpool(
+            _folder_operation_ledger.office_execution, operation_id
+        )
+    except Exception as error:
+        raise _task_state_error(error) from error
+    if record is None or not record.workbook_identity.startswith("wps-path:"):
+        raise service_error(
+            404,
+            "WPS_EXECUTION_NOT_FOUND",
+            "未找到这次 WPS 执行记录；查询不会创建新的写入任务。",
+            retryable=False,
+        )
+    try:
+        return _wps_state_payload(await run_in_threadpool(_wps_record, operation_id))
+    except Exception as error:
+        raise _wps_conflict(error) from error
+
+
+@app.post(
+    "/api/wps/executions/{operation_id}/actions/start",
+    response_model=WpsExecutionStateResponse,
+)
+async def start_wps_action(
+    operation_id: str, request: WpsActionStartRequest
+) -> WpsExecutionStateResponse:
+    try:
+        evidence = _wps_evidence(operation_id, request.actionIndex, request.beforeSnapshot)
+        record = await run_in_threadpool(
+            _folder_operation_ledger.begin_office_action,
+            operation_id,
+            expected_revision=request.expectedRevision,
+            owner_token=request.ownerToken,
+            action_index=request.actionIndex,
+            before_snapshot=evidence,
+        )
+    except Exception as error:
+        raise _wps_conflict(error) from error
+    return _wps_state_payload(record, include_owner=True)
+
+
+@app.post(
+    "/api/wps/executions/{operation_id}/actions/complete",
+    response_model=WpsExecutionStateResponse,
+)
+async def complete_wps_action(
+    operation_id: str, request: WpsActionCompleteRequest
+) -> WpsExecutionStateResponse:
+    try:
+        evidence = _wps_evidence(operation_id, request.actionIndex, request.checkpoint, after=True)
+        record = await run_in_threadpool(
+            _folder_operation_ledger.complete_office_action,
+            operation_id,
+            expected_revision=request.expectedRevision,
+            owner_token=request.ownerToken,
+            action_index=request.actionIndex,
+            checkpoint=evidence,
+        )
+    except Exception as error:
+        raise _wps_conflict(error) from error
+    return _wps_state_payload(record, include_owner=True)
+
+
+@app.post(
+    "/api/wps/executions/{operation_id}/suspend",
+    response_model=WpsExecutionStateResponse,
+)
+async def suspend_wps_execution(
+    operation_id: str, request: WpsExecutionSuspendRequest
+) -> WpsExecutionStateResponse:
+    try:
+        _wps_record(operation_id)
+        record = await run_in_threadpool(
+            _folder_operation_ledger.suspend_office_execution,
+            operation_id,
+            expected_revision=request.expectedRevision,
+            owner_token=request.ownerToken,
+            error={"code": "WPS_WRITE_INTERRUPTED", "message": "WPS 写入中断，需要核对现场。"},
+        )
+    except Exception as error:
+        raise _wps_conflict(error) from error
+    return _wps_state_payload(record)
+
+
+@app.post(
+    "/api/wps/executions/{operation_id}/resume",
+    response_model=WpsExecutionStateResponse,
+)
+async def resume_wps_execution(
+    operation_id: str, request: WpsExecutionResumeRequest
+) -> WpsExecutionStateResponse:
+    try:
+        await run_in_threadpool(_wps_record, operation_id)
+        record = await run_in_threadpool(
+            _folder_operation_ledger.claim_office_resume,
+            operation_id,
+            expected_revision=request.expectedRevision,
+            require_idle=True,
+        )
+    except Exception as error:
+        raise _wps_conflict(error) from error
+    return _wps_state_payload(record, include_owner=True)
+
+
+@app.post(
+    "/api/wps/executions/{operation_id}/actions/reconcile",
+    response_model=WpsExecutionStateResponse,
+)
+async def reconcile_wps_action(
+    operation_id: str, request: WpsActionReconcileRequest
+) -> WpsExecutionStateResponse:
+    try:
+        _wps_record(operation_id)
+        evidence = _wps_evidence(operation_id, request.actionIndex, request.checkpoint, after=True) if request.checkpoint else None
+        record = await run_in_threadpool(
+            _folder_operation_ledger.reconcile_office_action,
+            operation_id,
+            expected_revision=request.expectedRevision,
+            action_index=request.actionIndex,
+            outcome=request.outcome,
+            checkpoint=evidence,
+            require_idle=True,
+        )
+    except Exception as error:
+        raise _wps_conflict(error) from error
+    return _wps_state_payload(record, include_owner=True)
+
+
+@app.post(
+    "/api/wps/executions/{operation_id}/complete",
+    response_model=WpsExecutionStateResponse,
+)
+async def finish_wps_execution(
+    operation_id: str, request: WpsExecutionFinishRequest
+) -> WpsExecutionStateResponse:
+    try:
+        previous = _wps_record(operation_id)
+        if request.result.actionCount != len(previous.plan["actions"]) or (
+            request.result.cellCount is not None and request.result.cellCount != sum(
+                action["cellCount"] for action in previous.plan["actions"]
+            )
+        ):
+            raise ValueError("完成回执的动作或单元格计数与登记不一致")
+        record = await run_in_threadpool(
+            _folder_operation_ledger.finish_office_execution,
+            operation_id,
+            expected_revision=request.expectedRevision,
+            owner_token=request.ownerToken,
+            result=request.result.model_dump(mode="json", exclude_none=True),
+        )
+    except Exception as error:
+        raise _wps_conflict(error) from error
+    return _wps_state_payload(record)
 
 
 @app.post("/api/folders/select", response_model=FolderCatalog | None)

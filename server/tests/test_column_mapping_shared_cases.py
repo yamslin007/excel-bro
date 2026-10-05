@@ -20,7 +20,9 @@ from typing import Any
 import pytest
 
 from server.app.column_mapping import (
+    BlankPolicyNeededError,
     ColumnMappingError,
+    NeedsClarificationError,
     OverlappingRangeError,
     ShapeMismatchError,
     UnmappedCategoryError,
@@ -32,12 +34,20 @@ _CASES_PATH = (
 )
 
 # 错误种类 → (类, 消息片段)。与 TS 侧 `EXPECTATIONS` 逐项对应。
+#
+# `categoriesUnknown` 与 `needsClarification` 是**两种不同的归因**，刻意分成
+# 两个 key：前者补救动作单一（补类别映射），后者有两个可能（补分隔符 / 补映射），
+# 不能互相冒充。把它们合成一个错误种类会让调用方把「要用户选」误当成
+# 「补映射表就行」。
 _EXPECTATIONS: dict[str, tuple[type[ColumnMappingError], str]] = {
     "unmapped": (UnmappedCategoryError, "不在映射表内"),
+    "categoriesUnknown": (UnmappedCategoryError, "不在映射表内"),
+    "needsClarification": (NeedsClarificationError, "无法归类"),
     "shape": (ShapeMismatchError, "形状"),
     "overlap": (OverlappingRangeError, "重叠"),
     "parse": (ColumnMappingError, "区域"),
-    "blankLabel": (ColumnMappingError, "空白标签"),
+    # 「读到真实空白但策略未定」是**待澄清**，不是报错：实现不替用户挑默认值。
+    "blankPolicy": (BlankPolicyNeededError, "空白"),
     "sheetName": (ColumnMappingError, "工作表名"),
 }
 
@@ -59,19 +69,25 @@ def _invoke(case: dict[str, Any]) -> list[dict[str, Any]]:
         target_range=data["targetRange"],
         source_values=data["sourceValues"],
         mapping=data["mapping"],
-        blank_label=data["blankLabel"],
+        blank_label=data.get("blankLabel"),
+        blank_policy=data.get("blankPolicy"),
+        delimiters=data.get("delimiters"),
+        value_rank=data.get("valueRank"),
+        undeclared_separators=data.get("undeclaredSeparators"),
     )
 
 
 def test_fixture_is_non_empty_and_well_formed() -> None:
     assert _CASES
     for case in _CASES:
-        has_expected = "expected" in case
-        has_error = "error" in case
-        assert has_expected != has_error, (
-            f"用例「{case['name']}」既没有期望值也没有期望错误，或两者都给了"
+        declared = sum(
+            1 for key in ("expected", "expectedActions", "error") if key in case
         )
-        if has_error:
+        assert declared == 1, (
+            f"用例「{case['name']}」必须且只能声明 "
+            "expected / expectedActions / error 之一"
+        )
+        if "error" in case:
             assert case["error"] in _EXPECTATIONS
 
 
@@ -86,9 +102,27 @@ def test_shared_case(case: dict[str, Any]) -> None:
         assert actions[0]["values"] == case["expected"]
         return
 
+    if "expectedActions" in case:
+        # 需要跳过/清空位置时，只断言"值的形状"是不够的 —— 必须钉住
+        # 被跳过的位置根本没出现在任何 range 里。
+        actions = _invoke(case)
+        assert len(actions) == len(case["expectedActions"])
+        for index, expected in enumerate(case["expectedActions"]):
+            actual = actions[index]
+            assert actual["sheet"] == case["input"]["targetSheet"]
+            for key, value in expected.items():
+                assert actual[key] == value, (
+                    f"第 {index + 1} 个动作的 {key} 与期望不一致"
+                )
+        return
+
     error_class, fragment = _EXPECTATIONS[case["error"]]
     with pytest.raises(error_class) as excinfo:
         _invoke(case)
     assert fragment in str(excinfo.value)
     if "unmappedValues" in case:
         assert excinfo.value.values == case["unmappedValues"]
+    if "unmatchedItems" in case:
+        assert excinfo.value.values == case["unmatchedItems"]
+    if "unresolvedCells" in case:
+        assert excinfo.value.cells == case["unresolvedCells"]

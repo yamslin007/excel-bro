@@ -9,6 +9,7 @@ export type WpsRange = {
   Value2?: unknown;
   Formula?: unknown;
   MergeCells?: unknown;
+  Interior?: { Color?: number };
   Row?: number;
   Column?: number;
   Rows?: { Count: number };
@@ -19,9 +20,46 @@ export type WpsRange = {
 export type WpsWorksheet = {
   Name: string;
   Index?: number;
+  /**
+   * 宿主提供的稳定工作表标识 —— **文档写了但本项目未实机验证**，所以一律标可选，
+   * 读不到就回退到"对象引用 + 结构"判据，不得凭空造 ID。
+   *
+   * - `CodeName`：WPS 基础接口文档写明其**只读**、**改名不影响**、**运行期不可改**，
+   *   是桌面 ET 上与表名解耦的标识。
+   * - `SId`：WPS 内核分配的**静态** ID（与"同一工作表在不同会话可能不同"的动态
+   *   `Id` 区分）。
+   */
+  CodeName?: unknown;
+  SId?: unknown;
   ProtectContents?: boolean;
   UsedRange?: WpsRange;
+  /**
+   * 取一个矩形区域。
+   *
+   * **只接受两个参数。** 真宿主（WPS ET）对多余实参不宽容：传第 3 个参数会
+   * 直接抛 `Too many parameters.`（2026-09-30 真机证据，曾因假设"真宿主会忽略
+   * 多余实参"而把本加载项自有的 `purpose` 标签塞进这里，结构扫描第一步就失败）。
+   *
+   * "读表结构 vs 读数据"的区分**不能**靠给宿主传标签：测试替身按替身收到的
+   * 矩形坐标与 `Value2` 访问面自行记账（`wpsWorkbookReader.test.ts`）。
+   */
   Range?(cell1: WpsRange | string, cell2?: WpsRange | string): WpsRange;
+  /** 无参数复制到新的未保存工作簿；原生并排审阅仅在实机确认支持时使用。 */
+  Copy?(): void;
+};
+
+export type WpsNativeWindow = {
+  Caption?: string;
+  Visible?: boolean;
+  Activate?(): void;
+  Close?(saveChanges?: boolean): boolean | void;
+};
+
+export type WpsNativeWindows = WpsCollection<WpsNativeWindow> & {
+  CompareSideBySideWith?(windowName: string): boolean;
+  SyncScrollingSideBySide?: boolean;
+  BreakSideBySide?(): boolean;
+  ResetPositionsSideBySide?(): void;
 };
 
 export type WpsWorkbook = {
@@ -31,6 +69,9 @@ export type WpsWorkbook = {
   ReadOnly?: boolean;
   Worksheets: WpsCollection<WpsWorksheet>;
   ActiveSheet?: WpsWorksheet;
+  Windows?: WpsCollection<WpsNativeWindow>;
+  Activate?(): void;
+  Close?(saveChanges?: boolean): boolean | void;
 };
 
 export type WpsTaskPane = {
@@ -46,14 +87,48 @@ export type WpsPluginStorage = {
   removeItem?(key: string): void;
 };
 
+/**
+ * Web 对话框句柄。字段按 WPS 开放平台「Web对话框」文档保守声明：
+ * 当前项目只依赖 `Close`，其余全部标可选 —— 未实机验证过的成员不得当成已有能力。
+ */
+export type WpsWebDialog = {
+  ID?: string | number;
+  Close?: () => void;
+  Show?: () => void;
+  Visible?: boolean;
+  Url?: string;
+  Width?: number;
+  Height?: number;
+};
+
+/**
+ * `ShowDialog(url, caption, width, height, bModal)` —— 参数顺序取自
+ * WPS 开放平台 Application.ShowDialog 文档。当前文档的宽高是**逻辑像素**、
+ * 返回值为 boolean；保留句柄联合类型只为兼容可能存在的旧版宿主实现。
+ */
+export type WpsShowDialog = (
+  url: string,
+  caption: string,
+  width: number,
+  height: number,
+  bModal: boolean,
+  hasCaption?: boolean,
+  resizeEdge?: number
+) => boolean | WpsWebDialog | undefined;
+
 export type WpsApplication = {
   Version?: string;
   ActiveWorkbook?: WpsWorkbook;
   ActiveSheet?: WpsWorksheet;
+  Windows?: WpsNativeWindows;
   Selection?: WpsRange;
   PluginStorage: WpsPluginStorage;
   CreateTaskPane(url: string, title?: string): WpsTaskPane;
   GetTaskPane(id: string | number): WpsTaskPane | undefined;
+  /** 可能不存在 —— 是否可用必须实机探测，不能因为类型里写了就认为有。 */
+  ShowDialog?: WpsShowDialog;
+  CreateWebDialog?: WpsShowDialog;
+  GetWebDialog?: (id: string | number) => WpsWebDialog | undefined;
   ribbonUI?: object;
 };
 

@@ -152,6 +152,28 @@ describe("first-run guide theme", () => {
 });
 
 describe("header popup layering", () => {
+  it("keeps both hosts' header labels accessible without taking layout space", () => {
+    for (const name of ["./App.tsx", "../../wps-addin/src/WpsAgentPanel.tsx"]) {
+      const component = css(name);
+      expect(component).toContain("<ModelPickerIcon />");
+      expect(component).toContain('aria-label="新对话"');
+      expect(component).toContain('aria-label="我的工具"');
+      expect(component).toContain('aria-label="备份与恢复"');
+      expect(component).not.toContain('className="header-button labeled-header-button');
+      expect(component).not.toContain('<span>新对话</span>');
+      expect(component).not.toContain('<span>备份</span>');
+    }
+    const source = css("./styles.css");
+    const compact = source.slice(source.indexOf("/* Compact icon-only header:"));
+    expect(compact).toContain("width: 32px");
+    expect(compact).toContain("height: 32px");
+    expect(compact).toContain("justify-content: center");
+    expect(compact).toContain("align-content: center");
+    expect(compact).toContain(".chat-header .model-picker-trigger > svg");
+    expect(compact).toContain(".chat-header .folder-backup-entry > b");
+    expect(compact).toContain("position: absolute");
+  });
+
   it("raises the header stacking context while a model or more menu is open", () => {
     const source = css("./styles.css");
     const component = css("./App.tsx");
@@ -161,6 +183,36 @@ describe("header popup layering", () => {
     );
     expect(component).toContain(
       'className={`chat-header${modelMenuOpen || moreMenuOpen ? " menu-open" : ""}`}'
+    );
+  });
+});
+
+describe("narrow task pane", () => {
+  it("constrains grid tracks rather than clipping an oversized layout", () => {
+    const source = css("./styles.css");
+    expect(source.match(/\.chat-shell \{([^}]*)\}/s)?.[1]).toContain(
+      "grid-template-columns: minmax(0, 1fr)"
+    );
+    expect(source).toContain("/* Task-pane width containment */");
+    expect(source).not.toContain('grid-template-areas: "mark brand model" "actions actions actions"');
+    const containment = source.slice(source.indexOf("/* Task-pane width containment */"));
+    expect(containment).toMatch(/\.chat-header\s*\{[^}]*display: flex;[^}]*flex-wrap: wrap;/s);
+    expect(containment).toContain("min-width: min-content");
+    expect(css("../../wps-addin/src/styles.css")).not.toMatch(/\.chat-header \.brand-copy\s*\{\s*display: none;/);
+    expect(source).toContain(".chat-header .header-actions");
+    expect(source).toContain("overflow-wrap: anywhere");
+  });
+
+  it("finishes real request preparation before consuming remote progress", () => {
+    const component = css("./App.tsx");
+    const start = component.indexOf("async function analyzeConfirmedIntent(");
+    const end = component.indexOf("markServerOnline();", start);
+    const planning = component.slice(start, end);
+    expect(planning).not.toContain('"正在生成操作预览"');
+    expect(planning).toContain('"正在准备规划请求"');
+    expect(planning.indexOf('completeCurrentStep("已准备规划请求"')).toBeGreaterThan(0);
+    expect(planning.indexOf('completeCurrentStep("已准备规划请求"')).toBeLessThan(
+      planning.indexOf("await streamAssistantResponse(")
     );
   });
 });

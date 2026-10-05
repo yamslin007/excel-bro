@@ -13,7 +13,10 @@ export type Status = "idle" | "scanning" | "planning" | "tooling" | "executing";
 export type MessageRole = "assistant" | "user" | "system";
 
 export interface MessageClarification extends IntentClarification {
+  /** 本地源值澄清的标记。原始值与规则草稿只在任务窗格内存中。 */
+  localMapping?: true;
   turnId?: string;
+  planningReadPolicy?: "ifNeeded" | "none";
   originalPrompt: string;
   scopeFingerprint: string;
   hadImages?: boolean;
@@ -99,6 +102,8 @@ export interface ChatMessage {
   /** 规划达到本轮安全时长边界后保存的现场；刷新后仍可由用户明确继续。 */
   planningResume?: {
     turnId: string;
+    /** Retain the full request when a resumed planner asks for user input. */
+    originalPrompt?: string;
     /** 原规划任务的过程消息，用于续跑时复用同一张时间线卡片。 */
     activityMessageId?: string;
     /** 前端最后实际收到并归并的服务端事件序号。 */

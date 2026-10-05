@@ -90,6 +90,17 @@ function sseStreamResponse(chunks: string[]): Response {
   });
 }
 
+it("preserves interactive fields in a streamed planning clarification", async () => {
+  const response = { kind: "clarification", turnId: "turn-stream-test", provider: "model", clarification: {
+    id: "more-info", summary: "补充统计口径", question: "请说明单位", reason: "尚未明确",
+    scopeLabel: "Sheet1", options: [], fields: [{ id: "unit", label: "统计单位" }]
+  } };
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(sseStreamResponse([
+    `event: result\ndata: ${JSON.stringify(response)}\n\n`
+  ])));
+  await expect(streamAssistantResponse(streamPlanRequest)).resolves.toEqual(response);
+});
+
 describe("service discovery", () => {
   it("distinguishes local connectivity failures from model responses", () => {
     expect(apiErrorCategory(new TypeError("Failed to fetch"))).toBe(

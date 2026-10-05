@@ -35,6 +35,14 @@ export const LEGACY_LOCAL_MODEL_ID = "local";
 /** 没有任何可用模型时使用的显式空选择状态。 */
 export const NO_MODEL_SELECTED = "";
 
+/** The SDK adapter currently supports header-only planning, including free-text continuation. */
+export function planningReadPolicyForModel(
+  modelId: string | null | undefined, requested: "ifNeeded" | "none"
+): "ifNeeded" | "none" {
+  return modelId === "claude-agent-sdk" || modelId?.startsWith("claude-agent-sdk:")
+    ? "none" : requested;
+}
+
 export function isRealModelId(modelId: string | null | undefined): boolean {
   const value = (modelId ?? "").trim();
   return value !== "" && value !== LEGACY_LOCAL_MODEL_ID;

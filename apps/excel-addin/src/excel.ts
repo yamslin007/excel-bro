@@ -18,6 +18,11 @@ import type {
   WorksheetSnapshot
 } from "./contracts";
 import type { WorkbookLocator } from "@excel-bro/core/contracts";
+import type {
+  ChangeReviewStatus,
+  RangeChangeReview
+} from "@excel-bro/core/changeReview";
+import { buildRangeChangeReview } from "@excel-bro/core/changeReview";
 import {
   locatorFromOfficeIdentity,
   officeIdentityFromUrl
@@ -57,6 +62,14 @@ const SPLIT_AGGREGATE_BATCH_SHEETS =
 // 超过此规模的区域跳过完整格式捕获：逐格读边框会让整表操作的执行耗时显著上升。
 const UNDO_FORMAT_CAPTURE_MAX_CELLS =
   capabilities.undo.formatCaptureMaxCells;
+// 双栏对照的规模上限：只影响"展示与采集"，不影响写入与撤销的正确性。
+// 超过 captureMaxCells 的区域不再采集显示值（valuesCaptured=false，界面显示"显示值未采集"），
+// 但仍保留 formulas 用于判定改动。
+const CHANGE_REVIEW_CAPTURE_MAX_CELLS = capabilities.changeReview.captureMaxCells;
+const CHANGE_REVIEW_LIMIT = {
+  maxRows: capabilities.changeReview.maxRows,
+  maxTotalCells: capabilities.changeReview.maxTotalCells
+};
 // EB 规则系统早期把规则存进这两张隐藏工作表（见 README「EB 函数」）。
 // 现已改为纯内置规则，代码不再读写它们，但用户的旧文件里可能残留。
 // 用精确名单过滤，避免误伤用户自己以 # 开头命名的正常表。
@@ -468,6 +481,78 @@ function updateFingerprint(seed: number, text: string): number {
     hash = Math.imul(hash, 0x01000193);
   }
   return hash >>> 0;
+}
+
+/**
+ * 读取**规则指定**的源区域，供本地列映射计算用。
+ *
+ * 与 `captureWorkbookSourceFingerprint` 的区别：那只算指纹（不保留值），
+ * 这个保留值矩阵 —— 因为调用方要拿它逐格算目标列。**值只留在本端**：
+ * 算完的矩阵不回传服务端（单射映射可逆，上传标签列等于上传源列）。
+ *
+ * 边界取"声明的已用区域"（`usedRange`）而不是区域本身：映射规则里的区域
+ * 可能超界，越界必须在 `sliceMappingSource` 按**真实**已用边界拒绝，而不是
+ * 让 `getRange` 直接抛宿主错误（那样用户看不到"超出已读取范围"的可读原因）。
+ * 因此这里读**整张表的已用区域**，交给切片函数按声明宽度判界。
+ *
+ * 读取上限沿用 `snapshot` 的 `dataRows`/`dataColumns`：源列映射的输入本来就是
+ * "一列"，行上限与既有快照一致即可。
+ */
+export async function readSheetUsedRange(
+  sheetName: string
+): Promise<{
+  name: string;
+  startRow: number;
+  startColumn: number;
+  columnCount: number;
+  rowCount: number;
+  values: CellValue[][];
+} | null> {
+  return Excel.run(async (context) => {
+    const worksheets = context.workbook.worksheets;
+    worksheets.load("items/name");
+    await context.sync();
+    const worksheet = worksheets.items.find((item) => item.name === sheetName);
+    if (!worksheet) {
+      throw new Error(`来源工作表「${sheetName}」不存在，请重新生成预览`);
+    }
+    const usedRange = worksheet.getUsedRangeOrNullObject(true);
+    usedRange.load(
+      "isNullObject,rowIndex,columnIndex,rowCount,columnCount"
+    );
+    await context.sync();
+    if (usedRange.isNullObject) return null;
+
+    // 只读一列宽也没用：列越界要按声明宽度判定，得拿到整块已用区域。
+    const rowCount = Math.min(usedRange.rowCount, DATA_ROW_LIMIT + 1);
+    const columnCount = Math.min(usedRange.columnCount, DATA_COLUMN_LIMIT);
+    const range = worksheet.getRangeByIndexes(
+      usedRange.rowIndex,
+      usedRange.columnIndex,
+      rowCount,
+      columnCount
+    );
+    range.load("values,text,numberFormat");
+    await context.sync();
+    const values = range.values.map((row, rowIndex) =>
+      row.map((value, columnIndex) =>
+        normalizeCellValue(
+          value,
+          range.text[rowIndex]?.[columnIndex] ?? "",
+          range.numberFormat[rowIndex]?.[columnIndex] ?? "General"
+        )
+      )
+    );
+    return {
+      name: worksheet.name,
+      // Office.js 的 rowIndex/columnIndex 是 0 基；映射切片用 1 基。
+      startRow: usedRange.rowIndex + 1,
+      startColumn: usedRange.columnIndex + 1,
+      columnCount: usedRange.columnCount,
+      rowCount: usedRange.rowCount,
+      values
+    };
+  });
 }
 
 export async function captureWorkbookSourceFingerprint(
@@ -3673,34 +3758,181 @@ async function captureRangeFormat(
   };
 }
 
-async function captureUndoRange(
+/**
+ * 双栏对照用的"单元格此刻的样子"。
+ *
+ * values 与 formulas 分开存：展示看 values，判定写入成败看 formulas
+ * （计算值会因重算时机漂移，不能拿它当验收依据）。
+ * valuesCaptured=false 表示这次没采到显示值（区域过大），此时 values 是与
+ * formulas 同形的 null 占位 —— 界面必须显示"显示值未采集"，不许拿公式顶替。
+ */
+type RangeChangeSnapshot = {
+  values: CellValue[][];
+  formulas: (string | null)[][];
+  valuesCaptured: boolean;
+};
+
+/**
+ * 独立验收的三种结论映射到双栏状态。
+ *
+ * 抽成纯函数是为了能被单测锁住：只要验收没走到 verified，
+ * 双栏就不许落到 applied（core 的 canClaimWriteSuccess 只对 applied 放行）。
+ */
+export function changeReviewStatusFromVerification(
+  verification: VerificationReport["status"]
+): ChangeReviewStatus {
+  if (verification === "failed") return "readback_mismatch";
+  if (verification === "executed_unverified") return "executed_unverified";
+  return "applied";
+}
+
+/**
+ * 撤销快照里的 formulas 对非公式单元格存的其实是值（"abc"/5）。
+ * 双栏的"原公式"只认以 = 开头的那些，其余一律 null —— 与 WPS 侧
+ * `hasAmbiguousLogicalCell` 的判定口径一致。
+ */
+export function toChangeFormulas(matrix: CellValue[][]): (string | null)[][] {
+  return matrix.map((row) =>
+    row.map((value) =>
+      typeof value === "string" && value.startsWith("=") ? value : null
+    )
+  );
+}
+
+function formulaMatrix(raw: unknown[][]): (string | null)[][] {
+  return raw.map((row) =>
+    row.map((value) => {
+      if (value === null || value === undefined) return null;
+      return typeof value === "string" ? value : String(value);
+    })
+  );
+}
+
+/**
+ * 读一个区域当前的值与公式矩阵，用于"修改前｜修改后"对照。
+ *
+ * 只读本次已经（或即将）写入的授权区域，不做全簿扫描、不做轮询；
+ * 区域超过 captureMaxCells 时放弃采集值，只保留公式。
+ */
+async function readRangeChangeSnapshot(
   context: Excel.RequestContext,
-  action: ExcelAction,
-  actionIndex: number
-): Promise<ExecutionUndoSnapshot["ranges"][number] | null> {
-  const address = recoverableActionRange(action);
-  if (!address) return null;
-  const sheet = context.workbook.worksheets.getItemOrNullObject(action.sheet);
+  sheetName: string,
+  address: string
+): Promise<RangeChangeSnapshot | null> {
+  const sheet = context.workbook.worksheets.getItemOrNullObject(sheetName);
   sheet.load("isNullObject");
   await context.sync();
   if (sheet.isNullObject) return null;
   const range = sheet.getRange(address);
+  range.load("values,formulas");
+  await context.sync();
+  const formulas = formulaMatrix(range.formulas as unknown[][]);
+  const cellCount = formulas.length * (formulas[0]?.length ?? 0);
+  if (cellCount > CHANGE_REVIEW_CAPTURE_MAX_CELLS) {
+    return {
+      values: formulas.map((row) => row.map(() => null)),
+      formulas,
+      valuesCaptured: false
+    };
+  }
+  return {
+    values: (range.values as unknown[][]).map((row) => row.map(normalizeValue)),
+    formulas,
+    valuesCaptured: true
+  };
+}
+
+/**
+ * 汇总本次执行的"实际变更"：逐格拿（写前快照 + 写后回读）交给共用层比对。
+ *
+ * 关键点：after 必须是**这一次**回读出来的，不能用计划值顶替。
+ * 读不到整块区域时该区域的 status 落到 readback_failed，绝不假装成功。
+ */
+async function collectChangeReviews(
+  context: Excel.RequestContext,
+  ranges: ExecutionUndoSnapshot["ranges"],
+  beforeByAction: Map<number, RangeChangeSnapshot>
+): Promise<RangeChangeReview[]> {
+  const reviews: RangeChangeReview[] = [];
+  if (!ranges.length) return reviews;
+  for (const saved of ranges) {
+    const before = beforeByAction.get(saved.actionIndex);
+    if (!before) continue;
+    let after: RangeChangeSnapshot | null = null;
+    try {
+      after = await readRangeChangeSnapshot(context, saved.sheet, saved.range);
+    } catch {
+      after = null;
+    }
+    if (!after) {
+      reviews.push({
+        sheet: saved.sheet,
+        range: saved.range,
+        phase: "actual",
+        status: "readback_failed",
+        rows: [],
+        changedCount: 0,
+        totalCount: 0,
+        truncated: false
+      });
+      continue;
+    }
+    reviews.push(
+      buildRangeChangeReview({
+        sheet: saved.sheet,
+        range: saved.range,
+        phase: "actual",
+        status: "applied",
+        before,
+        after,
+        limit: CHANGE_REVIEW_LIMIT
+      })
+    );
+  }
+  return reviews;
+}
+
+async function captureUndoRange(
+  context: Excel.RequestContext,
+  action: ExcelAction,
+  actionIndex: number
+): Promise<{
+  snapshot: ExecutionUndoSnapshot["ranges"][number] | null;
+  /** 写前显示值；null 表示区域过大未采集。与 snapshot 分开，避免把矩阵塞进持久化快照。 */
+  beforeValues: CellValue[][] | null;
+}> {
+  const address = recoverableActionRange(action);
+  if (!address) return { snapshot: null, beforeValues: null };
+  const sheet = context.workbook.worksheets.getItemOrNullObject(action.sheet);
+  sheet.load("isNullObject");
+  await context.sync();
+  if (sheet.isNullObject) return { snapshot: null, beforeValues: null };
+  const range = sheet.getRange(address);
+  // values 只在双栏对照里用（展示"修改前"到底是什么值），
+  // 与 formulas 同一批 load，不额外增加一次 sync。
   range.load(
-    "formulas,numberFormat,format/fill/color,format/font/bold,format/font/color"
+    "values,formulas,numberFormat,format/fill/color,format/font/bold,format/font/color"
   );
   await context.sync();
   const cellCount = range.formulas.length * (range.formulas[0]?.length ?? 0);
   const format = await captureRangeFormat(context, range, cellCount);
+  const beforeValues =
+    cellCount > CHANGE_REVIEW_CAPTURE_MAX_CELLS
+      ? null
+      : (range.values as unknown[][]).map((row) => row.map(normalizeValue));
   return {
-    actionIndex,
-    sheet: action.sheet,
-    range: address,
-    formulas: range.formulas.map((row) => row.map(normalizeValue)),
-    numberFormat: range.numberFormat,
-    fillColor: range.format.fill.color,
-    fontBold: range.format.font.bold,
-    fontColor: range.format.font.color,
-    format
+    snapshot: {
+      actionIndex,
+      sheet: action.sheet,
+      range: address,
+      formulas: range.formulas.map((row) => row.map(normalizeValue)),
+      numberFormat: range.numberFormat,
+      fillColor: range.format.fill.color,
+      fontBold: range.format.font.bold,
+      fontColor: range.format.font.color,
+      format
+    },
+    beforeValues
   };
 }
 
@@ -4292,6 +4524,8 @@ export async function undoExecution(
 }
 
 export interface ExecutePlanOptions {
+  /** Read-only native review guard, after durable callbacks and immediately before first mutation. */
+  beforeFirstWrite?: (context: Excel.RequestContext) => Promise<void>;
   /** 用户本次明确授权的现有工作表名称；新输出表可由计划创建。 */
   authorizedSheetNames: readonly string[];
   /** 本次会话已勾选的外部工作簿文件名集合，用于放行跨文件公式引用。 */
@@ -4323,6 +4557,13 @@ export interface ExecutePlanOptions {
       checkpoint: ExecutionUndoSnapshot;
     }) => Promise<void>;
   };
+  /**
+   * 拿到本次执行的"实际变更"对照。
+   *
+   * 走回调而不是塞进 PlanExecutionResult：结果会被服务端持久化，
+   * 而完整前后矩阵按隐私边界只允许停留在会话内内存。
+   */
+  onChangeReview?: (reviews: RangeChangeReview[]) => void;
 }
 
 export async function executePlan(
@@ -4523,6 +4764,9 @@ export async function executePlan(
     const undoRanges: ExecutionUndoSnapshot["ranges"] = [
       ...(options.recovery?.undoSnapshot?.ranges ?? [])
     ];
+    // 双栏对照的"修改前"矩阵。只活在本次执行的内存里，不进撤销快照、
+    // 不进任何持久化或出站结构（隐私边界见指导文件 §7）。
+    const changeBefore = new Map<number, RangeChangeSnapshot>();
     const createdWorksheets: string[] = [];
     const deletedWorksheets: UndoWorksheetSnapshot[] = [];
     const skippedWorksheets: string[] = [];
@@ -4548,7 +4792,19 @@ export async function executePlan(
           actionType: action.type,
           target: { sheet: action.sheet }
         });
-        undoRange = await captureUndoRange(context, action, index);
+        const captured = await captureUndoRange(context, action, index);
+        undoRange = captured.snapshot;
+        if (captured.snapshot) {
+          // 双栏的"修改前"：值是单独采的，公式沿用撤销快照，两者都留，
+          // 但不进持久化快照（beforeValues 与 snapshot 分开）。
+          changeBefore.set(index, {
+            values:
+              captured.beforeValues ??
+              captured.snapshot.formulas.map((row) => row.map(() => null)),
+            formulas: toChangeFormulas(captured.snapshot.formulas),
+            valuesCaptured: captured.beforeValues !== null
+          });
+        }
         deletedCapture =
           action.type === "deleteWorksheet"
             ? await captureDeletedWorksheet(
@@ -4596,6 +4852,7 @@ export async function executePlan(
           actionType: action.type,
           target: { sheet: action.sheet }
         });
+        if (index === startActionIndex) await options.beforeFirstWrite?.(context);
         const actionCriteria = await executeAction(
           context,
           action,
@@ -4749,6 +5006,10 @@ export async function executePlan(
       deletedWorksheets,
       skippedWorksheets
     });
+    // 事件点补读：写入刚完成、还在同一个 RequestContext 里，按本次真正写过的
+    // 区域读一次"修改后"矩阵。只对这些区域读，不做全簿扫描，也不轮询。
+    // 回读本身失败**不阻断**主流程，但会把状态标记成 readback_failed。
+    const changeReviews = await collectChangeReviews(context, undoRanges, changeBefore);
     const verificationStartedAt = performance.now();
     const executionMs = verificationStartedAt - executionStartedAt;
     emitProgress({
@@ -4790,6 +5051,16 @@ export async function executePlan(
         basis: "执行后重新读取工作簿并按计划验收条件比较"
       }
     });
+    // 双栏的成败口径跟随独立验收：验收判失败就是不一致，验收没核完就是
+    // executed_unverified —— 两种情况都不许让界面宣称成功（core 的
+    // canClaimWriteSuccess 只对 applied 返回 true）。
+    const reviewStatus = changeReviewStatusFromVerification(verification.status);
+    const finalReviews = changeReviews.map((review) =>
+      review.status === "readback_failed"
+        ? review
+        : { ...review, status: reviewStatus }
+    );
+    options.onChangeReview?.(finalReviews);
     return {
       actionResults,
       verification,

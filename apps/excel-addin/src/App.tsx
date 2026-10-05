@@ -31,8 +31,12 @@ import {
   startOfficeAction,
   suspendOfficeExecution,
 } from "./api";
+import { ClarificationFields } from "./components/ClarificationFields";
+import { ModelPickerIcon } from "./components/ModelPickerIcon";
 import type {
   AnalysisPlan,
+  AssistantResponse,
+  ColumnMappingRule,
   FolderCatalog,
   FolderExecuteResult,
   FolderSelection,
@@ -58,6 +62,16 @@ import type {
   Status
 } from "./types/chat";
 import type { SourceMode, WorkbookScopeMode } from "./types/workbook";
+// 计划卡/结果卡的口径与 WPS 端共用同一份字面量，避免两端各写各的中文后悄悄漂移。
+import {
+  BlankPolicyNeededError,
+  NeedsClarificationError,
+  PLAN_NOTE_SECTIONS,
+  UnmappedCategoryError,
+  VERIFICATION_PASSED_LABEL
+} from "@excel-bro/core";
+import type { CellValue } from "@excel-bro/core";
+import type { RangeChangeReview } from "@excel-bro/core/changeReview";
 import { demoWorkbook } from "./demo";
 import {
   captureSelectionContext,
@@ -71,6 +85,7 @@ import {
   isEBSystemSheet,
   isRunningInExcel,
   readSelectedRange,
+  readSheetUsedRange,
   previewFormulaFirstCell,
   PlanExecutionError,
   officeRecoverySupport,
@@ -109,6 +124,15 @@ import {
   officeHostRequestFields
 } from "./officeHostAdapter";
 import {
+  buildColumnMappingPlan,
+  stripDataRows as stripDataRowsForLocalMapping
+} from "./columnMappingPlan";
+import { columnMappingClarificationMessage } from "./columnMappingClarification";
+import {
+  shouldFinishActivityAsCompleted,
+  type TurnPlanningOutcome
+} from "./turnPlanningOutcome";
+import {
   evaluateBulkWorksheetDeletion,
   parseBulkWorksheetDeletion
 } from "./structuralIntent";
@@ -143,6 +167,12 @@ import { RuleManager } from "./RuleManager";
 import { SlashCommandAutocomplete, type SlashCommand } from "./SlashCommandAutocomplete";
 import ThemePanel from "./components/ThemePanel";
 import TaskProgressTimeline from "./components/TaskProgressTimeline";
+import ChangeReviewSummaryCard from "./components/ChangeReviewSummaryCard";
+import { ExcelNativeReviewActions } from "./components/ExcelNativeReviewActions";
+import { useExcelNativeComparison } from "./hooks/useExcelNativeComparison";
+import { assertExcelNativeComparisonUnchanged, compareExcelNativeCommittedResult, nativeComparisonPlanIssue, type ExcelNativeComparison } from "./excelNativeComparison";
+import { LocalMappingResolution } from "./components/LocalMappingResolution";
+import MessageCopyButton from "./components/MessageCopyButton";
 import { FolderBackupManager } from "./components/FolderBackupManager";
 import { ScopeSelectionGuidance } from "./components/ScopeSelectionGuidance";
 import HistoryStorageNotice from "./components/HistoryStorageNotice";
@@ -152,9 +182,10 @@ import {
 } from "./components/WorkDirectoryGuide";
 import type { FolderBackupTarget } from "./hooks/useFolderBackups";
 import { MODEL_REQUIRED_HELP_TEXT } from "./helpCommand";
-import { chooseAvailableModel, connectionModelSuffix, isRealModelId } from "./modelSelection";
+import { chooseAvailableModel, connectionModelSuffix, isRealModelId, planningReadPolicyForModel } from "./modelSelection";
 import { useActivityProgress, type ActivityLog, type ActivityProgress } from "./hooks/useActivityProgress";
 import { useMessageAutoFollow } from "./hooks/useMessageAutoFollow";
+import { useComposerResize } from "./hooks/useComposerResize";
 import { useConversation } from "./hooks/useConversation";
 import {
   canAcknowledgeStaleSource,
@@ -237,8 +268,6 @@ const MAX_CLARIFICATION_ROUNDS =
 const INTENT_MAX_FIELDS = capabilities.intentContext.maxFieldsPerSheet;
 const INTENT_MAX_PRIOR_RESULT_ROWS =
   capabilities.intentContext.maxPriorResultRows;
-const COMPOSER_MAX_HEIGHT = 156;
-const COMPOSER_MIN_HEIGHT = 44;
 
 function verificationSummary(report: VerificationReport): string {
   if (report.status === "verified") return "并通过独立验证";
@@ -663,6 +692,9 @@ export default function App() {
   const [clarificationDrafts, setClarificationDrafts] = useState<
     Record<string, string>
   >({});
+  const [clarificationFieldDrafts, setClarificationFieldDrafts] = useState<
+    Record<string, Record<string, string>>
+  >({});
   const [draggingImage, setDraggingImage] = useState(false);
 
   // 对话管理（使用自定义 Hook）
@@ -686,7 +718,11 @@ export default function App() {
 
   const [status, setStatus] = useState<Status>("idle");
   const [activePlanId, setActivePlanId] = useState<string | null>(null);
+  const nativeComparison = useExcelNativeComparison();
   const activeActivityMessageIdRef = useRef<string | null>(null);
+  // 双栏变更对照的完整前后矩阵只活在这里（按 executionId 索引的会话内内存）。
+  // 刻意不挂到 ChatMessage 上：消息会被持久化，矩阵不许进历史、也不许出站。
+  const changeReviewsRef = useRef(new Map<string, RangeChangeReview[]>());
   // 活动进度管理（自定义 Hook）
   const activityHook = useActivityProgress({
     onPersistLog: (log, persistenceKey) => {
@@ -852,8 +888,9 @@ export default function App() {
     widenStepDone, setWidenStepDone,
     workDirectoryGuideDismissed, dismissWorkDirectoryGuide,
     composerHeight, setComposerHeight,
+    comparisonPaneNeedsResize,
     togglePetVisibility
-  } = useUIState();
+  } = useUIState(Boolean(nativeComparison.review) || nativeComparison.pending, nativeComparison.review?.session);
 
   const themeApi = useTheme();
   const logoLongPress = useLongPress(() => setThemePanelOpen(true));
@@ -950,6 +987,20 @@ export default function App() {
   const clarificationImagesRef = useRef<Map<string, PendingImage[]>>(
     new Map()
   );
+  const localMappingDraftsRef = useRef(new Map<string, {
+    rule: ColumnMappingRule;
+    context: { summary: string; warnings: string[]; assumptions: string[]; provider: "model" | "local" };
+    values: readonly CellValue[];
+    allowExactMapping: boolean;
+    /** 停在哪种缺口上。`"blank"` 是**读到真实空白之后**才出现的。 */
+    reason?: "unmapped" | "separator_or_mapping" | "blank";
+    /** `reason === "blank"` 时真实读到的空白格数量。 */
+    blankCount?: number;
+    scopeFingerprint: string;
+    authorizedSheets: string[];
+    workbookIdentity: string | undefined;
+    revision: number;
+  }>());
   const activityScrollSignal = [
     messages.length,
     messages.length > 0 ? messages[messages.length - 1]?.id ?? "" : "",
@@ -966,11 +1017,6 @@ export default function App() {
     handleScroll: handleMessageStreamScroll,
     scrollToLatest
   } = useMessageAutoFollow(activityScrollSignal);
-  const composerResizeRef = useRef<{
-    pointerId: number;
-    startY: number;
-    startHeight: number;
-  } | null>(null);
   const focusDialogRef = useRef<Office.Dialog | null>(null);
   const planEditorDialogRef = useRef<Office.Dialog | null>(null);
   const queryAbortRef = useRef<AbortController | null>(null);
@@ -1057,7 +1103,7 @@ export default function App() {
     [modelOptions, effectiveModelId]
   );
 
-  const busy = status !== "idle";
+  const busy = status !== "idle" || nativeComparison.pending;
 
   // 目录成功加载后迁移旧的 local 记录和已删除连接；目录读取失败时必须保留
   // 原有选择，不能依据空列表删掉仍然有效的记录。
@@ -1174,7 +1220,7 @@ export default function App() {
         ? "正在读取模型配置"
         : modelNotConfigured
           ? "尚未配置模型"
-          : `模型：${selectedModel?.label ?? effectiveModelId}`;
+          : "";
   const showFirstModelGuide =
     serverOnline &&
     modelCatalogStatus === "ready" &&
@@ -1393,21 +1439,20 @@ export default function App() {
     []
   );
 
-  useLayoutEffect(() => {
-    const input = composerInputRef.current;
-    if (!input) return;
-    if (composerHeight !== null) {
-      input.style.height = `${composerHeight}px`;
-      input.style.overflowY =
-        input.scrollHeight > composerHeight ? "auto" : "hidden";
-      return;
-    }
-    input.style.height = "auto";
-    const nextHeight = Math.min(input.scrollHeight, COMPOSER_MAX_HEIGHT);
-    input.style.height = `${nextHeight}px`;
-    input.style.overflowY =
-      input.scrollHeight > COMPOSER_MAX_HEIGHT ? "auto" : "hidden";
-  }, [prompt, composerHeight]);
+  /*
+   * 输入框的「上拉」：拖动上方把手调高度、内容变多时自动长高，长到上限之后
+   * **可以滚动查看**（而不是把多出来的行切掉）。
+   *
+   * 这段逻辑原先只内联在这里，WPS 侧只好另写一套原生 `resize: vertical` —— 在
+   * WPS 的 WebView 里既拖不动，又因为继承来的 `overflow-y: hidden` 看不到超出
+   * 高度的那几行。现在两端共用同一个 hook，行为不会再各自漂移。
+   */
+  const { handleProps: composerResizeHandleProps } = useComposerResize({
+    inputRef: composerInputRef,
+    height: composerHeight,
+    setHeight: setComposerHeight,
+    value: prompt
+  });
 
   useEffect(() => {
     if (folderRecoveryAttachStartedRef.current) return;
@@ -2174,11 +2219,11 @@ export default function App() {
     }
   }
 
-  function applyPlanningContinuationResult(
+  async function applyPlanningContinuationResult(
     message: ChatMessage,
     response: PlanningStreamResult,
     baseline: NonNullable<ChatMessage["planningResume"]>
-  ): "paused" | "completed" {
+  ): Promise<"paused" | "completed" | "awaiting_input" | "failed"> {
     if (response.kind === "planning_pause") {
       updateFolderResumeMessage(message.id, (current) => ({
         ...current,
@@ -2212,6 +2257,16 @@ export default function App() {
       }));
       return "paused";
     }
+    if (response.kind === "clarification") {
+      if (!workbook) throw new Error("工作簿范围不可用，请重新发起需求。");
+      const originalPrompt = baseline.originalPrompt ?? message.intentMemory?.confirmedPrompt;
+      if (!originalPrompt) throw new Error("旧规划记录缺少原需求，请重新发送需求后补充信息。");
+      await continueIntentDecision({ ...response, turnId: undefined }, originalPrompt, [],
+        intentScopeFingerprint(buildIntentScope(workbook,
+          baseline.sourceFingerprintSheets?.length ? baseline.sourceFingerprintSheets : selectedNamesFor(workbook))));
+      updateFolderResumeMessage(message.id, (current) => ({ ...current, planningResume: undefined }));
+      return "awaiting_input";
+    }
     if (response.kind === "answer") {
       updateFolderResumeMessage(message.id, (current) => ({
         ...current,
@@ -2220,12 +2275,26 @@ export default function App() {
         provider: response.provider,
         planningResume: undefined
       }));
-      return "completed";
+      return response.outcome === "failed" ? "failed" : "completed";
     }
     if (response.kind === "local_plan_rule") {
-      // 只在 planningReadPolicy: "none" 下产生，本端两条通道都送 "ifNeeded"。
-      // 明确拒绝而不静默丢弃：真收到了说明契约走偏，要看得见。
-      throw new Error("服务返回了需要客户端本地计算的规则，本端不支持该模式。");
+      // 续跑通道同样要支持本地映射规则：与主路径共用同一个解析函数，
+      // 免得"重新规划能算、续跑却报不支持"这种同功能两态。
+      // 源表范围取续跑基线里已记录的工作表，不重新扩大授权。
+      const plan = await localMappingPlanFromRule(
+        response,
+        baseline.sourceFingerprintSheets?.length
+          ? baseline.sourceFingerprintSheets
+          : selectedNamesFor(workbook!)
+      );
+      updateFolderResumeMessage(message.id, (current) => ({
+        ...current,
+        text: plan.summary,
+        plan,
+        provider: response.provider,
+        planningResume: undefined
+      }));
+      return "completed";
     }
     const plan: AnalysisPlan = {
       ...response.plan,
@@ -2307,9 +2376,17 @@ export default function App() {
         turnController.signal
       );
       if (taskStatus.status === "completed") {
-        applyPlanningContinuationResult(message, taskStatus.result, resume);
+        const outcome = await applyPlanningContinuationResult(
+          message,
+          taskStatus.result,
+          resume
+        );
         markServerOnline();
-        finishActivity("completed", "已找回任务的完成结果");
+        finishActivity(
+          outcome === "failed" ? "failed" : outcome === "completed" ? "completed" : "warning",
+          outcome === "failed" ? "规划已停止" : outcome === "completed" ? "已找回任务的完成结果" : "进度已保存，等待你继续",
+          outcome === "failed" ? "failed" : undefined
+        );
         return;
       }
       if (taskStatus.status === "failed" || taskStatus.status === "cancelled") {
@@ -2477,13 +2554,17 @@ export default function App() {
         }
       );
       markServerOnline();
-      const outcome = applyPlanningContinuationResult(message, result, baseline);
+      const outcome = await applyPlanningContinuationResult(
+        message,
+        result,
+        baseline
+      );
       finishActivity(
-        outcome === "completed" ? "completed" : "warning",
+        outcome === "failed" ? "failed" : outcome === "completed" ? "completed" : "warning",
         outcome === "completed"
           ? "已从保存的进度完成任务"
-          : "进度已再次保存，等待你继续",
-        outcome === "paused" ? "awaiting_input" : undefined
+          : outcome === "failed" ? "规划已停止，未生成可执行预览" : outcome === "awaiting_input" ? "等待你补充信息；本次没有写入" : "进度已再次保存，等待你继续",
+        outcome === "failed" ? "failed" : outcome !== "completed" ? "awaiting_input" : undefined
       );
     } catch (reason) {
       if (isAbortError(reason)) {
@@ -2648,6 +2729,7 @@ export default function App() {
   // UI 协调包装函数（调用 Hook 的方法并处理 UI 状态）
   function handleNewChat() {
     if (busy) return;
+    localMappingDraftsRef.current.clear();
     setModelMenuOpen(false);
     setMoreMenuOpen(false);
     const previousSaved = Boolean(
@@ -2668,6 +2750,7 @@ export default function App() {
 
   function handleOpenConversation(conversationId: string) {
     if (busy) return;
+    localMappingDraftsRef.current.clear();
     conversationHook.openConversation(conversationId);
     setPrompt("");
     setPendingImages([]);
@@ -2680,6 +2763,7 @@ export default function App() {
 
   function handleDeleteConversation(conversationId: string) {
     if (busy) return;
+    localMappingDraftsRef.current.clear();
     conversationHook.deleteConversation(conversationId);
   }
 
@@ -3112,6 +3196,228 @@ export default function App() {
     };
   }
 
+  /**
+   * 服务端下发列映射**规则**时，在本端读出授权源列、算成受白名单约束的计划。
+   *
+   * 为什么 Excel 也走这条：服务端只在 `planningReadPolicy: "none"` 时下发规则
+   * （它手上没有源值）。此前的 Excel 分发直接抛"本端不支持该模式"，于是同一个
+   * `map_column_values` 需求在 WPS 能用、在 Excel 报错。现在两端复用共享 core
+   * 的同一套计算（`buildColumnMappingPlan` → `buildColumnMappingActions`）。
+   *
+   * 三条不变量：
+   * - **只读授权工作表**：源表不在本次已勾选范围内就拒绝，不自动扩大授权；
+   * - **源值不外发**：读出的值只在本端计算，算好的矩阵不回传服务端；
+   * - **不放宽写入闸门**：产出的仍是普通 `AnalysisPlan`，照常进预览卡、
+   *   等用户点"执行到 Excel"才写入，并沿用既有的回读与撤销。
+   */
+  async function localMappingPlanFromRule(
+    response: Extract<AssistantResponse, { kind: "local_plan_rule" }>,
+    effectiveSheetNames: readonly string[]
+  ): Promise<AnalysisPlan> {
+    const rule = response.rule;
+    if (!isRunningInExcel()) {
+      throw new Error(
+        "本地列映射需要读取真实工作簿，浏览器演示模式不支持。请在 Excel 中打开任务窗格。"
+      );
+    }
+    if (
+      !effectiveSheetNames.some(
+        (name) => name.toLocaleLowerCase() === rule.sourceSheet.toLocaleLowerCase()
+      )
+    ) {
+      throw new Error(
+        `映射规则要读取「${rule.sourceSheet}」，但它不在本次已授权的工作表里。`
+      );
+    }
+    advanceActivity(
+      "正在读取授权源列",
+      "只在已勾选的工作表内读取映射源值，源值留在本机，不上传服务端。"
+    );
+    const sheet = await readSheetUsedRange(rule.sourceSheet);
+    if (!sheet) {
+      throw new Error(`来源工作表「${rule.sourceSheet}」当前没有可用区域。`);
+    }
+    advanceActivity(
+      "正在按规则计算目标列",
+      "使用与 WPS、服务端同一套确定性映射实现，在本机逐格计算。"
+    );
+    return buildColumnMappingPlan(rule, sheet, {
+      summary: response.summary,
+      warnings: response.warnings ?? [],
+      assumptions: response.assumptions ?? []
+    });
+  }
+
+  /** 空白策略未定且**真读到空白**：结构化澄清，不是报错，也不替用户挑默认值。 */
+  function recordExcelBlankPolicyGap(
+    input: {
+      response: Extract<AssistantResponse, { kind: "local_plan_rule" }>;
+      originalPrompt: string;
+      authorizedSheets: string[];
+      scopeFingerprint: string;
+      messageId?: string;
+    },
+    blankCount: number
+  ): boolean {
+    const workbookIdentity = currentOfficeWorkbookIdentity();
+    if (!workbookIdentity) {
+      if (input.messageId) {
+        localMappingDraftsRef.current.delete(input.messageId);
+        setMessages((current) => current.map((message) =>
+          message.id === input.messageId && message.clarification
+            ? { ...message, clarification: { ...message.clarification, status: "invalidated" } }
+            : message
+        ));
+      }
+      appendMessage({
+        role: "system",
+        text: "当前工作簿没有可验证的身份，无法安全保留本地映射草稿。请先保存工作簿、确认授权范围，再重新发送需求；原表未写入。"
+      });
+      setPrompt(input.originalPrompt);
+      return true;
+    }
+    const question =
+      `源区域读出来有 ${blankCount} 个空白格，但这些位置的目标格应当怎么处理还没定。` +
+      "请选择：保留目标原值 / 清空目标内容 / 写入指定值 / 写入空字符串。";
+    const id = input.messageId ?? appendMessage({
+      role: "assistant",
+      text: "",
+      clarification: {
+        id: `local-mapping-${Date.now().toString(36)}`,
+        localMapping: true,
+        summary: "源区域有空白，要先定空白怎么处理",
+        question,
+        reason: "空白策略只在本机决定，不会送到模型；选定后会重新读取并生成预览，原表尚未写入。",
+        scopeLabel: `${input.response.rule.sourceSheet}!${input.response.rule.sourceRange}`,
+        options: [],
+        originalPrompt: input.originalPrompt,
+        scopeFingerprint: input.scopeFingerprint,
+        round: 0,
+        status: "pending"
+      },
+      provider: "local"
+    });
+    const revision = (localMappingDraftsRef.current.get(id)?.revision ?? 0) + 1;
+    localMappingDraftsRef.current.set(id, {
+      rule: input.response.rule,
+      context: {
+        summary: input.response.summary,
+        warnings: input.response.warnings,
+        assumptions: input.response.assumptions,
+        provider: input.response.provider
+      },
+      // 空白格没有值可带；带值只会违反"源值只留本端"。
+      values: [],
+      allowExactMapping: false,
+      reason: "blank",
+      blankCount,
+      scopeFingerprint: input.scopeFingerprint,
+      authorizedSheets: [...input.authorizedSheets],
+      workbookIdentity,
+      revision
+    });
+    if (input.messageId) {
+      setMessages((current) => current.map((message) =>
+        message.id === id && message.clarification
+          ? { ...message, clarification: {
+              ...message.clarification, question, summary: "源区域有空白，要先定空白怎么处理", status: "pending"
+            } }
+          : message
+      ));
+    }
+    return true;
+  }
+
+  function recordExcelLocalMappingGap(input: {
+    error: unknown;
+    response: Extract<AssistantResponse, { kind: "local_plan_rule" }>;
+    originalPrompt: string;
+    authorizedSheets: string[];
+    scopeFingerprint: string;
+    messageId?: string;
+  }): boolean {
+    if (input.error instanceof BlankPolicyNeededError) {
+      return recordExcelBlankPolicyGap(input, input.error.blankCount);
+    }
+    if (!(input.error instanceof UnmappedCategoryError) &&
+        !(input.error instanceof NeedsClarificationError)) return false;
+    const values = input.error instanceof UnmappedCategoryError
+      ? input.error.values : input.error.cells;
+    const allowExactMapping = input.error instanceof NeedsClarificationError ||
+      !input.response.rule.delimiters?.length;
+    const workbookIdentity = currentOfficeWorkbookIdentity();
+    if (!workbookIdentity) {
+      // 没有可验证的工作簿身份时，展示可填写却永远过不了续答复核的卡片是死路。
+      // 明确请用户先保存并重发；不把旧源值或补充映射带到下一轮。
+      if (input.messageId) {
+        localMappingDraftsRef.current.delete(input.messageId);
+        setMessages((current) => current.map((message) =>
+          message.id === input.messageId && message.clarification
+            ? { ...message, clarification: { ...message.clarification, status: "invalidated" } }
+            : message
+        ));
+      }
+      appendMessage({
+        role: "system",
+        text: "当前工作簿没有可验证的身份，无法安全保留本地映射草稿。请先保存工作簿、确认授权范围，再重新发送需求；原表未写入。"
+      });
+      setPrompt(input.originalPrompt);
+      return true;
+    }
+    const question = allowExactMapping
+      ? `源区域有 ${values.length} 个不同来源值未能按现有规则归类。请选择整格映射，或确认拆分符与优先顺序。`
+      : `源区域有 ${values.length} 个拆分项未被规则覆盖。请补齐映射并确认多个类别的优先顺序。`;
+    const id = input.messageId ?? appendMessage({
+      role: "assistant",
+      text: "",
+      clarification: {
+        id: `local-mapping-${Date.now().toString(36)}`,
+        localMapping: true,
+        summary: "本地映射需要你决定",
+        question,
+        reason: "来源值只在本机展示，不会送到模型；确认后会重新读取并生成预览，原表尚未写入。",
+        scopeLabel: `${input.response.rule.sourceSheet}!${input.response.rule.sourceRange}`,
+        options: [],
+        originalPrompt: input.originalPrompt,
+        scopeFingerprint: input.scopeFingerprint,
+        round: 0,
+        status: "pending"
+      },
+      provider: "local"
+    });
+    const revision = (localMappingDraftsRef.current.get(id)?.revision ?? 0) + 1;
+    localMappingDraftsRef.current.set(id, {
+      rule: input.response.rule,
+      context: {
+        summary: input.response.summary,
+        warnings: input.response.warnings,
+        assumptions: input.response.assumptions,
+        provider: input.response.provider
+      },
+      values,
+      allowExactMapping,
+      // 归因按**错误类型**定，不按 allowExactMapping 反推 —— 后者在
+      // "未命中且没有分隔符"时也是 true，会把它错认成分隔符问题。
+      reason: input.error instanceof UnmappedCategoryError
+        ? "unmapped"
+        : "separator_or_mapping",
+      scopeFingerprint: input.scopeFingerprint,
+      authorizedSheets: [...input.authorizedSheets],
+      workbookIdentity,
+      revision
+    });
+    if (input.messageId) {
+      setMessages((current) => current.map((message) =>
+        message.id === id && message.clarification
+          ? { ...message, clarification: {
+              ...message.clarification, question, status: "pending"
+            } }
+          : message
+      ));
+    }
+    return true;
+  }
+
   async function analyzeConfirmedIntent(
     confirmedPrompt: string,
     sentImages: PendingImage[],
@@ -3121,9 +3427,13 @@ export default function App() {
     preparedWorkbook?: WorkbookSnapshot,
     intentMemory?: IntentMemory,
     turnId?: string | null,
-    planningReadPolicy: "ifNeeded" | "none" = "ifNeeded"
-  ) {
-    if (!workbook) return;
+    planningReadPolicy: "ifNeeded" | "none" = sourceMode === "workbook" ? "none" : "ifNeeded",
+    /** 这一轮的澄清轮次。列映射的澄清卡要沿用同一个计数，不能各自从 0 起。 */
+    clarificationRound = 0
+  ): Promise<TurnPlanningOutcome> {
+    if (!workbook) return "skipped";
+    let activityOutcome: TurnPlanningOutcome = "planned";
+    planningReadPolicy = planningReadPolicyForModel(effectiveModelId, planningReadPolicy);
     setStatus("planning");
     if (turnId) bindActivityOperation(turnId);
     if (dataResults.length > 0) {
@@ -3132,14 +3442,14 @@ export default function App() {
         0
       );
       advanceActivity(
-        "正在生成回答",
-        "模型只接收本地工具返回的紧凑结果，不接收完整工作表数据。",
+        "正在准备规划请求",
+        "整理本地紧凑结果与授权范围，不接收完整工作表数据。",
         `本地计算完成，共扫描 ${scannedRows.toLocaleString()} 行`
       );
     } else {
       advanceActivity(
-        "正在生成操作预览",
-        "正在根据已确认需求生成受约束的 Excel 操作计划。"
+        "正在准备规划请求",
+        "正在重新核对授权范围并准备受约束的规划请求。"
       );
     }
     try {
@@ -3187,7 +3497,7 @@ export default function App() {
           role: "system",
           text: "确认期间数据范围发生了变化。本次没有继续分析，请检查上方数据范围后重新发送。"
         });
-        return;
+        return "skipped";
       }
 
       const selected = new Set(effectiveSheetNames);
@@ -3215,12 +3525,25 @@ export default function App() {
         [...messages]
           .reverse()
           .find((message) => message.resultContext)?.resultContext ?? null;
+      // 本地列映射通道（`planningReadPolicy: "none"`）：本端声明"源值不外发"，
+      // 规划请求也必须**剥掉数据行** —— 否则服务端手里其实有源值，就轮不到
+      // 下发规则这条通道，"本地算"会退化成一个说辞。表头/区域/行列数保留，
+      // 服务端据此判越界并产出规则；源值只在 `localMappingPlanFromRule` 里读。
+      const plannedWorkbook: WorkbookSnapshot =
+        planningReadPolicy === "none"
+          ? stripDataRowsForLocalMapping(requestWorkbook)
+          : requestWorkbook;
+      // This local preparation ends here; remote generation has its own steps.
+      // Do not leave an umbrella "generating preview" row running beside them.
+      completeCurrentStep("已准备规划请求", {
+        detail: "已核对本轮授权范围并整理请求；尚未生成预览或写入工作表。"
+      });
       const response = await streamAssistantResponse(
         {
           turnId,
           prompt: confirmedPrompt,
-          workbook: requestWorkbook,
-          lastResult,
+          workbook: plannedWorkbook,
+          lastResult: planningReadPolicy === "none" && dataResults.length === 0 ? null : lastResult,
           images: sentImages.map(({ name, mediaType, data }) => ({
             name,
             mediaType,
@@ -3249,6 +3572,7 @@ export default function App() {
           querySourceSheetNames: effectiveSheetNames,
           planningResume: {
             turnId: response.turnId,
+            originalPrompt: confirmedPrompt,
             activityMessageId:
               planningActivity?.persistenceKey ??
               activeActivityMessageIdRef.current ??
@@ -3276,9 +3600,24 @@ export default function App() {
           }
         });
         finishActivity("warning", "进度已保存，等待你继续", "awaiting_input");
-        return;
+        activityOutcome = "skipped";
+        return "skipped";
+      }
+      if (response.kind === "clarification") {
+        // A completed planning invocation has an immutable request fingerprint.
+        // The user's answers start a fresh invocation with the full original request.
+        await continueIntentDecision({ ...response, turnId: undefined }, confirmedPrompt, sentImages,
+          intentScopeFingerprint(latestScope), clarificationMessageId, clarificationRound + 1, 0, planningReadPolicy);
+        finishActivity("completed", "等待你补充信息；本次没有写入", "awaiting_input");
+        activityOutcome = "skipped";
+        return activityOutcome;
       }
       if (response.kind === "answer") {
+        if (response.outcome === "failed") {
+          appendMessage({ role: "system", text: response.message, provider: response.provider });
+          finishActivity("failed", "规划已停止，未生成可执行预览", "failed");
+          return "failed";
+        }
         const querySourceSheetIds = currentWorksheets
           .map((sheet) => sheet.sourceSheetId)
           .filter((value): value is string => Boolean(value));
@@ -3326,8 +3665,54 @@ export default function App() {
           });
         }
       } else if (response.kind === "local_plan_rule") {
-        // 同上：本端不送 planningReadPolicy: "none"，收到即契约走偏。
-        throw new Error("服务返回了需要客户端本地计算的规则，本端不支持该模式。");
+        // 服务端已经判定"这条规则还缺参数/缺类别，算不出正确答案"。
+        // 这时**不要**读源值、更不要算：算出来的矩阵必然是猜的，
+        // 而猜错在单元格层面看不出来。把归因接进澄清卡，让用户补完再跑。
+        if (response.rule.clarification) {
+          appendMessage({
+            role: "assistant",
+            text: response.summary,
+            intentMemory,
+            clarification: columnMappingClarificationMessage({
+              clarification: response.rule.clarification,
+              scopeLabel: `${response.rule.sourceSheet}!${response.rule.sourceRange}`,
+              originalPrompt: confirmedPrompt,
+              scopeFingerprint: intentScopeFingerprint(latestScope),
+              round: clarificationRound + 1
+            }),
+            provider: response.provider
+          });
+          activityOutcome = "skipped";
+          return activityOutcome;
+        }
+        // 服务端手上没有源值，只下发了规则。在本端读授权源列、算出计划：
+        // 与 WPS 复用同一套确定性实现，源值不外发，写入仍走预览确认。
+        let plan: AnalysisPlan;
+        try {
+          plan = await localMappingPlanFromRule(response, effectiveSheetNames);
+        } catch (error) {
+          if (recordExcelLocalMappingGap({
+            error,
+            response,
+            originalPrompt: confirmedPrompt,
+            authorizedSheets: effectiveSheetNames,
+            scopeFingerprint: intentScopeFingerprint(latestScope)
+          })) {
+            finishActivity("completed", undefined, "awaiting_input");
+            activityOutcome = "skipped";
+            return activityOutcome;
+          }
+          throw error;
+        }
+        plan.sourceFingerprintSheets = [...effectiveSheetNames];
+        plan.sourceFingerprint = await captureWorkbookSourceFingerprint(effectiveSheetNames);
+        appendMessage({
+          role: "assistant",
+          text: plan.summary,
+          plan,
+          intentMemory,
+          provider: response.provider
+        });
       } else {
         const sourceFingerprint =
           sourceMode === "workbook" && isRunningInExcel()
@@ -3349,8 +3734,9 @@ export default function App() {
     } catch (reason) {
       // 用户在生成方案途中打断：静默退出，已吐出的 step 留作上下文。
       if (isAbortError(reason)) {
+        activityOutcome = "aborted";
         setStatus("idle");
-        return;
+        return "aborted";
       }
       setPendingImages(sentImages);
       if (isLocalServiceConnectionError(reason)) {
@@ -3380,6 +3766,7 @@ export default function App() {
             lastSequence: Math.max(0, planningActivity?.sequence ?? 0),
             status: "pending",
             reason: "连接中断，等待恢复后核对任务状态。",
+            originalPrompt: confirmedPrompt,
             extensionSeconds: 0,
             activeElapsedSeconds: 0,
             pauseType: "interrupted",
@@ -3393,6 +3780,7 @@ export default function App() {
           "连接中断，执行结果待确认。",
           "interrupted"
         );
+        activityOutcome = "failed";
       } else {
         appendMessage({
           role: "system",
@@ -3401,10 +3789,14 @@ export default function App() {
               ? reason.message
               : "没有连接到本地 AI 服务，请确认服务已经启动。"
         });
+        // 规划没能产出计划：确保活动以失败收尾，绝不落到默认的「已完成」。
+        finishActivity("failed", "规划未完成，本次没有写入", "failed");
+        activityOutcome = "failed";
       }
     } finally {
       setStatus("idle");
     }
+    return activityOutcome;
   }
 
   async function executeRequestedDataTool(
@@ -3413,11 +3805,10 @@ export default function App() {
     expectedScopeFingerprint: string,
     clarificationMessageId?: string,
     correctionAttempt = 0
-  ) {
-    if (!workbook) return;
+  ): Promise<TurnPlanningOutcome> {
+    if (!workbook) return "skipped";
     if (sourceMode === "folder") {
-      if (!folderCatalog) return;
-      setStatus("tooling");
+      if (!folderCatalog) return "skipped";      setStatus("tooling");
       advanceActivity(
         "正在读取文件夹完整数据",
         "pandas 只会读取本次已选择的文件和工作表。"
@@ -3427,7 +3818,7 @@ export default function App() {
           folderCatalog.sessionId,
           intent.request
         );
-        await analyzeConfirmedIntent(
+        return await analyzeConfirmedIntent(
           intent.confirmedPrompt,
           sentImages,
           undefined,
@@ -3449,12 +3840,12 @@ export default function App() {
               : "文件夹数据工具未完成"
         });
         setStatus("idle");
-        finishActivity();
+        finishActivity("failed", "规划未完成，本次没有写入", "failed");
+        return "failed";
       }
-      return;
     }
     if (sourceMode !== "workbook" || !isRunningInExcel()) {
-      await analyzeConfirmedIntent(
+      return await analyzeConfirmedIntent(
         intent.confirmedPrompt,
         sentImages,
         expectedScopeFingerprint,
@@ -3467,7 +3858,6 @@ export default function App() {
         },
         intent.turnId
       );
-      return;
     }
     setStatus("tooling");
     const diagnosticStartedAt = performance.now();
@@ -3540,7 +3930,8 @@ export default function App() {
           role: "system",
           text: "数据范围已经变化，本地工具没有运行。请确认上方范围后重新发送。"
         });
-        return;
+        finishActivity("warning", "数据范围已变化，本次没有继续", "warning");
+        return "skipped";
       }
       // 二级命中：结构化意图相同且数据未变时，跳过本地全表扫描直接复用结论。
       if (!forceRecomputeRef.current) {
@@ -3552,7 +3943,7 @@ export default function App() {
         if (hit) {
           reuseCachedConclusion(hit);
           setStatus("idle");
-          return;
+          return "skipped";
         }
       }
       // 本地取数复用 turn 级 controller：打断整个 turn 时它也会一起停。
@@ -3589,7 +3980,7 @@ export default function App() {
       setWorkbook(liveWorkbook);
       setSelectedSheetNames(effectiveSheetNames);
       setStatus("idle");
-      await analyzeConfirmedIntent(
+      return await analyzeConfirmedIntent(
         intent.confirmedPrompt,
         sentImages,
         undefined,
@@ -3619,7 +4010,7 @@ export default function App() {
       // 用户主动打断：不做自纠重试，直接静默收尾。
       if (isAbortError(reason)) {
         setStatus("idle");
-        return;
+        return "skipped";
       }
       if (correctionAttempt < 1 && correctionScope) {
         try {
@@ -3665,7 +4056,7 @@ export default function App() {
             },
             modelId: effectiveModelId || null
           }, turnAbortRef.current?.signal);
-          await continueIntentDecision(
+          return await continueIntentDecision(
             corrected,
             intent.confirmedPrompt,
             sentImages,
@@ -3674,7 +4065,6 @@ export default function App() {
             1,
             correctionAttempt + 1
           );
-          return;
         } catch {
           // Fall through to the user-facing tool error below.
         }
@@ -3687,6 +4077,8 @@ export default function App() {
             ? `本地数据工具未完成：${reason.message}`
             : "本地数据工具未完成"
       });
+      finishActivity("failed", "本地计算未完成，本次没有写入", "failed");
+      return "failed";
     } finally {
       setStatus("idle");
     }
@@ -3700,11 +4092,11 @@ export default function App() {
     clarificationMessageId?: string,
     clarificationRound = 0,
     correctionAttempt = 0,
-    planningReadPolicy: "ifNeeded" | "none" = "ifNeeded"
-  ) {
+    planningReadPolicy: "ifNeeded" | "none" = sourceMode === "workbook" ? "none" : "ifNeeded"
+  ): Promise<TurnPlanningOutcome> {
     if (intent.kind === "conversation") {
       appendMessage({ role: "assistant", provider: intent.provider, text: intent.message });
-      return;
+      return "skipped";
     }
     if (intent.kind === "clarification") {
       clarificationImagesRef.current.set(
@@ -3717,6 +4109,7 @@ export default function App() {
         clarification: {
           ...intent.clarification,
           turnId: intent.turnId ?? undefined,
+          planningReadPolicy: planningReadPolicyForModel(effectiveModelId, planningReadPolicy),
           originalPrompt,
           scopeFingerprint,
           hadImages: sentImages.length > 0,
@@ -3724,19 +4117,18 @@ export default function App() {
           status: "pending"
         }
       });
-      return;
+      return "skipped";
     }
     if (intent.kind === "tool_request") {
-      await executeRequestedDataTool(
+      return executeRequestedDataTool(
         intent,
         sentImages,
         scopeFingerprint,
         clarificationMessageId,
         correctionAttempt
       );
-      return;
     }
-    await analyzeConfirmedIntent(
+    return analyzeConfirmedIntent(
       intent.confirmedPrompt,
       sentImages,
       scopeFingerprint,
@@ -3747,8 +4139,82 @@ export default function App() {
         confirmedPrompt: intent.confirmedPrompt
       },
       intent.turnId,
-      planningReadPolicy
+      planningReadPolicy,
+      clarificationRound
     );
+  }
+
+  async function resolveExcelLocalMapping(
+    message: ChatMessage,
+    rule: ColumnMappingRule
+  ): Promise<void> {
+    const draft = localMappingDraftsRef.current.get(message.id);
+    if (!draft || busy || !workbook || message.clarification?.status !== "pending") return;
+    const currentSheets = selectedNamesFor(workbook);
+    const currentScope = intentScopeFingerprint(buildIntentScope(workbook, currentSheets));
+    const currentIdentity = currentOfficeWorkbookIdentity();
+    if (
+      currentScope !== draft.scopeFingerprint ||
+      JSON.stringify(currentSheets) !== JSON.stringify(draft.authorizedSheets) ||
+      !draft.workbookIdentity || currentIdentity !== draft.workbookIdentity
+    ) {
+      setMessages((current) => current.map((item) =>
+        item.id === message.id && item.clarification
+          ? { ...item, clarification: { ...item.clarification, status: "invalidated" } }
+          : item
+      ));
+      localMappingDraftsRef.current.delete(message.id);
+      setPrompt(message.clarification.originalPrompt);
+      appendMessage({
+        role: "system",
+        text: "无法确认当前仍是原工作簿与授权范围。请重新确认数据范围并发送需求；不会沿用旧源值或旧计划。"
+      });
+      return;
+    }
+    setStatus("planning");
+    beginActivity("重新读取授权源列", "按你确认的本地规则重新计算；不向模型发送源值。");
+    const response: Extract<AssistantResponse, { kind: "local_plan_rule" }> = {
+      kind: "local_plan_rule",
+      rule,
+      ...draft.context
+    };
+    try {
+      let plan: AnalysisPlan;
+      try {
+        plan = await localMappingPlanFromRule(response, draft.authorizedSheets);
+      } catch (error) {
+        if (recordExcelLocalMappingGap({
+          error,
+          response,
+          originalPrompt: message.clarification.originalPrompt,
+          authorizedSheets: draft.authorizedSheets,
+          scopeFingerprint: draft.scopeFingerprint,
+          messageId: message.id
+        })) {
+          finishActivity("completed", undefined, "awaiting_input");
+          return;
+        }
+        throw error;
+      }
+      plan.sourceFingerprintSheets = [...draft.authorizedSheets];
+      plan.sourceFingerprint = await captureWorkbookSourceFingerprint(draft.authorizedSheets);
+      localMappingDraftsRef.current.delete(message.id);
+      setMessages((current) => current.map((item) =>
+        item.id === message.id && item.clarification
+          ? { ...item, clarification: {
+              ...item.clarification, status: "resolved", resolvedLabel: "已补全映射并重新预览"
+            } }
+          : item
+      ));
+      appendMessage({ role: "assistant", text: plan.summary, plan, provider: "local" });
+      finishActivity("completed", undefined, "awaiting_input");
+    } catch {
+      // Office.js 异常可能含单元格原文；不把异常原文持久化进消息历史。
+      appendMessage({ role: "system", text: "重新读取或生成预览失败，原表未写入。请检查授权范围后重试。" });
+      finishActivity("failed", "本地映射预览未生成", "failed");
+    } finally {
+      setStatus("idle");
+    }
   }
 
   async function resolveClarification(
@@ -3760,6 +4226,7 @@ export default function App() {
   ) {
     const clarification = message.clarification;
     if (!clarification || clarification.status !== "pending" || busy) return;
+    if (clarification.localMapping) return; // 只走本地结构化补全，绝不把源值送进模型澄清。
     if (!resolution.trim()) return;
     const rememberedImages =
       clarificationImagesRef.current.get(clarification.id) ?? [];
@@ -3913,7 +4380,7 @@ export default function App() {
             clarification.round + 1
           ),
           0,
-          finalSelection ? "none" : "ifNeeded"
+          clarification.planningReadPolicy ?? (finalSelection ? "none" : "ifNeeded")
         );
       } else {
         advanceActivity(
@@ -3922,7 +4389,7 @@ export default function App() {
           decision.label,
           { note: decision.note, detail: decision.detail }
         );
-        await continueIntentDecision(
+        const outcome = await continueIntentDecision(
           intent,
           confirmedPrompt,
           sentImages,
@@ -3933,9 +4400,12 @@ export default function App() {
             clarification.round + 1
           ),
           0,
-          finalSelection ? "none" : "ifNeeded"
+          clarification.planningReadPolicy ?? (finalSelection ? "none" : "ifNeeded")
         );
-        finishActivity();
+        // 规划失败时已在内部以失败收尾，这里不再覆盖成「已完成」。
+        if (shouldFinishActivityAsCompleted(outcome)) {
+          finishActivity();
+        }
       }
       setStatus("idle");
     } catch (reason) {
@@ -3990,6 +4460,7 @@ export default function App() {
 
   function cancelClarification(message: ChatMessage) {
     if (!message.clarification || busy) return;
+    localMappingDraftsRef.current.delete(message.id);
     clarificationImagesRef.current.delete(message.clarification.id);
     setClarificationDrafts((current) => {
       const next = { ...current };
@@ -4428,11 +4899,23 @@ export default function App() {
       return;
     }
 
+    const pendingLocalMapping = [...messages]
+      .reverse()
+      .find((message) => message.clarification?.status === "pending" && message.clarification.localMapping);
+    if (pendingLocalMapping && enteredText) {
+      // 自由文本是用户发起的新请求；不能误走通用澄清，把本地来源值带入模型。
+      localMappingDraftsRef.current.delete(pendingLocalMapping.id);
+      setMessages((current) => current.map((message) =>
+        message.id === pendingLocalMapping.id && message.clarification
+          ? { ...message, clarification: { ...message.clarification, status: "cancelled" } }
+          : message
+      ));
+    }
     const pendingClarification = [...messages]
       .reverse()
       .find(
         (message) =>
-          message.clarification?.status === "pending"
+          message.clarification?.status === "pending" && !message.clarification.localMapping
       );
     if (pendingClarification && enteredText) {
       await resolveClarification(
@@ -4650,13 +5133,17 @@ export default function App() {
           decision.label,
           { note: decision.note, detail: decision.detail }
         );
-        await continueIntentDecision(
+        const outcome = await continueIntentDecision(
           intent,
           intentText,
           sentImages,
           scopeFingerprint
         );
-        finishActivity();
+        // 规划没产出计划（含本地列映射读取/计算失败）时已经以失败收尾，
+        // 这里不能再补一次默认的 finishActivity()，否则会把失败标成「已完成」。
+        if (shouldFinishActivityAsCompleted(outcome)) {
+          finishActivity();
+        }
       }
       setStatus("idle");
     } catch (reason) {
@@ -4695,8 +5182,13 @@ export default function App() {
     allowedExternalFiles?: ReadonlySet<string>,
     forceLocal?: boolean,
     /** 用户在「数据已变」二次确认里点了「仍要执行」。 */
-    acknowledgeStaleSource?: boolean
+    acknowledgeStaleSource?: boolean,
+    nativeReview?: ExcelNativeComparison
   ): Promise<boolean> {
+    if (nativeReview && sourceMode !== "workbook") {
+      appendMessage({ role: "system", text: "数据来源模式已变化，不能把原生审阅用于其他数据来源。" });
+      return false;
+    }
     if (sourceMode === "folder" && !forceLocal) {
       if (!folderCatalog) return false;
       const operationId = `execution-${messageId()}`;
@@ -4837,6 +5329,7 @@ export default function App() {
       "completed";
     let workbookActivitySummary: string | undefined;
     try {
+      if (nativeReview) await Excel.run(context => assertExcelNativeComparisonUnchanged(context, nativeReview, authorizedSheetNames, plan));
       if (recoverySupport.supported) {
         if (!workbookIdentity) {
           recoveryLimitation =
@@ -4869,11 +5362,17 @@ export default function App() {
         recoveryLimitation = `${recoverySupport.reason ?? "该计划包含复杂对象操作"}；本次不承诺跨重启自动续跑。`;
       }
       const result = await executePlan(plan, {
+        beforeFirstWrite: nativeReview ? context => assertExcelNativeComparisonUnchanged(context, nativeReview, authorizedSheetNames, plan) : undefined,
         authorizedSheetNames,
         allowedExternalFiles,
         acknowledgeStaleSource,
         operationId,
         onProgress: applyProgressEvent,
+        onChangeReview: (reviews) => {
+          if (reviews.length > 0) {
+            changeReviewsRef.current.set(operationId, reviews);
+          }
+        },
         ...(officeState
           ? {
               recovery: {
@@ -4905,6 +5404,21 @@ export default function App() {
             }
           : {})
       });
+      let nativeResultNotice = "";
+      if (nativeReview?.mode === "manual") {
+        nativeResultNotice = "兼容副本未自动回读；上述验证仅针对原表执行结果，不代表已核对原表与副本的计算值一致。";
+      } else if (nativeReview) {
+        const comparison = await compareExcelNativeCommittedResult(nativeReview);
+        nativeResultNotice = comparison === "matched" ? "原表目标回读与审阅副本一致。" : comparison === "different" ? "原表已写入，但目标计算值或公式与审阅副本不同，请核对执行结果与恢复点。" : "原表已写入，但无法独立核对其结果与审阅副本是否一致，请核对执行结果与恢复点。";
+        if (comparison !== "matched") {
+          result.verification = { ...result.verification, passed: false,
+            status: comparison === "different" || result.verification.status === "failed" ? "failed" : "executed_unverified",
+            unverifiedActions: [...result.verification.unverifiedActions, ...plan.actions.map((action, index) => ({ index, type: action.type, sheet: action.sheet, message: nativeResultNotice }))]
+          };
+          const reviews = changeReviewsRef.current.get(operationId);
+          if (reviews) changeReviewsRef.current.set(operationId, reviews.map(review => ({ ...review, status: comparison === "different" ? "readback_mismatch" : "readback_failed" })));
+        }
+      }
       if (officeState) {
         if (!officeState.ownerToken) throw new Error("Office 写入权已经失效");
         officeState = await finishOfficeExecution(operationId, {
@@ -4937,7 +5451,7 @@ export default function App() {
               ? `已记录 ${result.undoSnapshot.ranges.length} 项本次执行撤销数据，并已核对执行后状态。`
               : "已保留本次执行捕获的数据，但执行后状态未能完整核对，暂不能直接撤销。"
             : ""
-        }${recoveryLimitation ? `${recoveryLimitation}` : ""}原始工作表没有被删除或清空。`,
+        }${recoveryLimitation ? `${recoveryLimitation}` : ""}${nativeResultNotice}原始工作表没有被删除或清空。`,
         verification: result.verification,
         executedPlanId: plan.id,
         executedExecutionId: result.undoSnapshot?.executionId
@@ -4967,6 +5481,10 @@ export default function App() {
       if (reason instanceof StaleSourceError) {
         workbookActivityStatus = "warning";
         workbookActivitySummary = reason.message;
+        if (nativeReview) {
+          appendMessage({ role: "system", text: `${reason.message}原生审阅已失效，请关闭副本并重新生成预览；不能跳过并排审阅直接写入旧结果。` });
+          return false;
+        }
         // 数据变了但计划本身仍可执行：给出二次确认，而不是像字段缺失那样堵死。
         appendMessage({
           role: "system",
@@ -5998,63 +6516,6 @@ export default function App() {
     }
   }
 
-  function maximumComposerHeight(): number {
-    return Math.max(
-      COMPOSER_MIN_HEIGHT,
-      Math.min(360, Math.floor(window.innerHeight * 0.45))
-    );
-  }
-
-  function startComposerResize(event: React.PointerEvent<HTMLDivElement>) {
-    const input = composerInputRef.current;
-    if (!input) return;
-    event.preventDefault();
-    event.currentTarget.setPointerCapture(event.pointerId);
-    composerResizeRef.current = {
-      pointerId: event.pointerId,
-      startY: event.clientY,
-      startHeight: input.getBoundingClientRect().height
-    };
-  }
-
-  function moveComposerResize(event: React.PointerEvent<HTMLDivElement>) {
-    const resize = composerResizeRef.current;
-    if (!resize || resize.pointerId !== event.pointerId) return;
-    const nextHeight = resize.startHeight + resize.startY - event.clientY;
-    setComposerHeight(
-      Math.max(
-        COMPOSER_MIN_HEIGHT,
-        Math.min(maximumComposerHeight(), Math.round(nextHeight))
-      )
-    );
-  }
-
-  function finishComposerResize(event: React.PointerEvent<HTMLDivElement>) {
-    if (composerResizeRef.current?.pointerId !== event.pointerId) return;
-    composerResizeRef.current = null;
-    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-      event.currentTarget.releasePointerCapture(event.pointerId);
-    }
-  }
-
-  function resizeComposerWithKeyboard(
-    event: React.KeyboardEvent<HTMLDivElement>
-  ) {
-    if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
-    event.preventDefault();
-    const current =
-      composerHeight ??
-      composerInputRef.current?.getBoundingClientRect().height ??
-      COMPOSER_MIN_HEIGHT;
-    const direction = event.key === "ArrowUp" ? 20 : -20;
-    setComposerHeight(
-      Math.max(
-        COMPOSER_MIN_HEIGHT,
-        Math.min(maximumComposerHeight(), Math.round(current + direction))
-      )
-    );
-  }
-
   return (
     <main className="chat-shell">
       <header
@@ -6065,7 +6526,7 @@ export default function App() {
           <strong className="app-logo" {...logoLongPress}>
             Excel Bro
           </strong>
-          <span className={headerStatusClassName}>
+          {headerStatusText && <span className={headerStatusClassName}>
             <i />
             {serverOnline && modelNotConfigured && (
               <svg
@@ -6094,8 +6555,9 @@ export default function App() {
                 </svg>
               </button>
             )}
-          </span>
+          </span>}
         </div>
+        <div className="header-actions">
         <div
           className={`model-picker${showModelGuide ? " needs-model" : ""}`}
         >
@@ -6105,7 +6567,8 @@ export default function App() {
             disabled={!serverOnline || busy}
             aria-haspopup="menu"
             aria-expanded={modelMenuOpen}
-            title="选择或添加模型"
+            aria-label={hasConfiguredModel ? "选择或添加模型" : "添加模型"}
+            title={selectedModel ? `选择或添加模型 · 当前模型：${selectedModel.label}` : "选择或添加模型"}
             onClick={() => {
               setHistoryOpen(false);
               setToolsOpen(false);
@@ -6114,10 +6577,7 @@ export default function App() {
               setModelMenuOpen((current) => !current);
             }}
           >
-            <span>{hasConfiguredModel ? "模型" : "添加模型"}</span>
-            <svg viewBox="0 0 16 16" aria-hidden="true">
-              <path d="m4 6 4 4 4-4" />
-            </svg>
+            <ModelPickerIcon />
           </button>
           {modelMenuOpen && (
             <div className="model-menu" role="menu" aria-label="模型">
@@ -6188,19 +6648,17 @@ export default function App() {
             </section>
           )}
         </div>
-        <div className="header-actions">
           <button
-            className="header-button labeled-header-button new-chat-entry"
+            className="header-button new-chat-entry"
             onClick={handleNewChat}
             disabled={busy}
             title="新对话"
             aria-label="新对话"
           >
             <span aria-hidden="true">＋</span>
-            <span>新对话</span>
           </button>
           <button
-            className="header-button labeled-header-button tools-entry"
+            className="header-button tools-entry"
             onClick={openTools}
             disabled={busy}
             title="我的工具"
@@ -6211,10 +6669,9 @@ export default function App() {
               <rect x="3" y="7" width="18" height="12.5" rx="2.5" />
               <path d="M3.5 11.5h17M10 11.5v2h4v-2" />
             </svg>
-            <span>工具</span>
           </button>
           <button
-            className="header-button labeled-header-button folder-backup-entry"
+            className="header-button folder-backup-entry"
             onClick={() => {
               closeAllDrawers();
               closeAllMenus();
@@ -6229,7 +6686,6 @@ export default function App() {
             aria-label="备份与恢复"
           >
             <span aria-hidden="true">↶</span>
-            <span>备份</span>
             {undoStack.length + folderUndoStack.length > 0 && (
               <b>{undoStack.length + folderUndoStack.length}</b>
             )}
@@ -7956,7 +8412,21 @@ export default function App() {
                   </span>
 
                   {message.clarification.status === "pending" ? (
-                    <>
+                    message.clarification.localMapping ? (
+                      localMappingDraftsRef.current.get(message.id) ? (
+                        <LocalMappingResolution
+                          key={`${message.id}:${localMappingDraftsRef.current.get(message.id)!.revision}`}
+                          rule={localMappingDraftsRef.current.get(message.id)!.rule}
+                          values={localMappingDraftsRef.current.get(message.id)!.values}
+                          allowExactMapping={localMappingDraftsRef.current.get(message.id)!.allowExactMapping}
+                          reason={localMappingDraftsRef.current.get(message.id)!.reason}
+                          blankCount={localMappingDraftsRef.current.get(message.id)!.blankCount}
+                          busy={busy}
+                          onResolve={(rule) => resolveExcelLocalMapping(message, rule)}
+                          onCancel={() => cancelClarification(message)}
+                        />
+                      ) : <p>本地规则草稿已失效，请重新发送需求。</p>
+                    ) : <>
                       <div className="clarification-options">
                         {message.clarification.options.map(
                           (option: IntentOption) => (
@@ -7983,6 +8453,12 @@ export default function App() {
                           )
                         )}
                       </div>
+                      {message.clarification.fields?.length ? (
+                        <ClarificationFields fields={message.clarification.fields}
+                          values={clarificationFieldDrafts[message.id] ?? {}} busy={busy}
+                          onChange={(values) => setClarificationFieldDrafts((current) => ({ ...current, [message.id]: values }))}
+                          onSubmit={(answer) => void resolveClarification(message, answer, answer)} />
+                      ) : <>
                       <span className="clarification-custom-hint">
                         都不符合？请直接写下你的想法。
                       </span>
@@ -8029,6 +8505,7 @@ export default function App() {
                           提交补充
                         </button>
                       </div>
+                      </>}
                       <div className="clarification-actions">
                         <button
                           disabled={busy}
@@ -8036,7 +8513,7 @@ export default function App() {
                         >
                           修改数据范围
                         </button>
-                        <button
+                        {!message.clarification.fields?.length && <button
                           disabled={busy}
                           onClick={() =>
                             void resolveClarification(
@@ -8048,7 +8525,7 @@ export default function App() {
                           }
                         >
                           按原话继续
-                        </button>
+                        </button>}
                         <button
                           disabled={busy}
                           onClick={() => cancelClarification(message)}
@@ -8076,7 +8553,7 @@ export default function App() {
                 >
                   <strong>
                     {message.verification.status === "verified"
-                      ? "验证通过"
+                      ? VERIFICATION_PASSED_LABEL
                       : message.verification.status === "executed_unverified"
                         ? "已执行，部分操作未独立验证"
                         : "执行完成，但验证未通过"}
@@ -8118,6 +8595,16 @@ export default function App() {
                   )}
                 </div>
               )}
+              {message.executedExecutionId &&
+                changeReviewsRef.current.has(message.executedExecutionId) && (
+                  <ChangeReviewSummaryCard
+                    reviews={
+                      changeReviewsRef.current.get(
+                        message.executedExecutionId
+                      ) ?? []
+                    }
+                  />
+                )}
               {message.executedPlanId &&
                 (() => {
                   const workbookIndex = undoStack.findIndex((entry) =>
@@ -8591,7 +9078,7 @@ export default function App() {
                         ? "保存为工具"
                         : "验证后保存"}
                     </button>
-                    {!message.staleSourceConfirm && (
+                    {!message.staleSourceConfirm && nativeComparison.review?.messageId !== message.id && (sourceMode !== "workbook" || !workbook || nativeComparisonPlanIssue(message.plan, selectedNamesFor(workbook)) !== null) && (
                       <button
                         className="primary-button"
                         disabled={busy}
@@ -8604,6 +9091,14 @@ export default function App() {
                     )}
                   </div>
 
+                  {!message.staleSourceConfirm && (nativeComparison.review?.messageId === message.id ||
+                    (sourceMode === "workbook" && workbook && nativeComparisonPlanIssue(message.plan, selectedNamesFor(workbook)) === null)) && (
+                    <ExcelNativeReviewActions messageId={message.id} plan={message.plan}
+                      paneNeedsResize={comparisonPaneNeedsResize}
+                      authorization={workbook ? selectedNamesFor(workbook) : []} controller={nativeComparison} disabled={busy}
+                      commit={session => runPlan(message.plan!, undefined, false, false, session)} />
+                  )}
+
                   <details
                     className="plan-details"
                     open={Boolean(message.staleSourceConfirm)}
@@ -8615,7 +9110,7 @@ export default function App() {
 
                     {message.plan.assumptions.length > 0 && (
                       <div className="inline-notes">
-                        <strong>采用的信息</strong>
+                        <strong>{PLAN_NOTE_SECTIONS.assumptions}</strong>
                         <ul>
                           {message.plan.assumptions.map((item) => (
                             <li key={item}>{item}</li>
@@ -8626,7 +9121,7 @@ export default function App() {
 
                     {message.plan.warnings.length > 0 && (
                       <div className="inline-notes warning">
-                        <strong>补充说明</strong>
+                        <strong>{PLAN_NOTE_SECTIONS.warnings}</strong>
                         <ul>
                           {message.plan.warnings.map((item) => (
                             <li key={item}>{item}</li>
@@ -8696,47 +9191,12 @@ export default function App() {
                 ))}
               {message.text && !message.staleSourceConfirm && (
                 <div className="message-copy-row">
-                  <button
-                    className={`message-copy-button ${
-                      copiedMessageId === message.id ? "copied" : ""
-                    }`}
-                    type="button"
-                    title={
-                      copiedMessageId === message.id
-                        ? "已复制"
-                        : "复制这条消息"
-                    }
-                    aria-label={
-                      copiedMessageId === message.id
-                        ? "消息已复制"
-                        : "复制这条消息"
-                    }
+                  <MessageCopyButton
+                    copied={copiedMessageId === message.id}
                     onClick={() =>
                       void copyMessageText(message.id, message.text?.trim() ?? "")
                     }
-                  >
-                    {copiedMessageId === message.id ? (
-                      <>
-                        <svg
-                          viewBox="0 0 24 24"
-                          aria-hidden="true"
-                          focusable="false"
-                        >
-                          <path d="m5 12 4 4L19 6" />
-                        </svg>
-                        <span>已复制</span>
-                      </>
-                    ) : (
-                      <svg
-                        viewBox="0 0 24 24"
-                        aria-hidden="true"
-                        focusable="false"
-                      >
-                        <rect x="8" y="8" width="11" height="11" rx="2" />
-                        <path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2" />
-                      </svg>
-                    )}
-                  </button>
+                  />
                 </div>
               )}
             </div>
@@ -9321,19 +9781,7 @@ export default function App() {
           }}
           onDrop={handleImageDrop}
         >
-          <div
-            className="composer-resize-handle"
-            role="separator"
-            aria-label="上下拖动调整输入框高度，双击恢复自动高度"
-            aria-orientation="horizontal"
-            tabIndex={0}
-            onPointerDown={startComposerResize}
-            onPointerMove={moveComposerResize}
-            onPointerUp={finishComposerResize}
-            onPointerCancel={finishComposerResize}
-            onDoubleClick={() => setComposerHeight(null)}
-            onKeyDown={resizeComposerWithKeyboard}
-          >
+          <div className="composer-resize-handle" {...composerResizeHandleProps}>
             <i />
           </div>
           <div className="composer-box">

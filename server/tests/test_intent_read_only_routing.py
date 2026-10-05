@@ -136,6 +136,21 @@ def test_repeated_invalid_read_only_routing_fails_closed(
     assert "不会写入 Excel" in response.clarification.summary
 
 
+def test_intent_rejects_parseable_but_truncated_response_without_format_retry(monkeypatch):
+    class TruncatedClient(_FakeClient):
+        async def chat_completions(self, *, messages, **kwargs):
+            self.calls.append(messages)
+            assert kwargs["max_tokens"] is None
+            return {"choices": [{"finish_reason": "length", "message": {"content": json.dumps({
+                "kind": "conversation", "message": "不得接受截断回复"})}}]}, {}
+    client = TruncatedClient([])
+    _install_client(monkeypatch, client)
+    response = asyncio.run(check_intent(_request("统计记录数量"), config=object()))
+    assert response.kind == "clarification"
+    assert response.provider == "local"
+    assert len(client.calls) == 1
+
+
 def test_explicit_write_request_can_still_proceed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

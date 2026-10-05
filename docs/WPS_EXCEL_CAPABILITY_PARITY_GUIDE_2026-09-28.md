@@ -231,6 +231,10 @@ WPS 的列映射走的是 `local_plan_rule` 响应类型：服务端只下发
 | P5 功能体验 | 模型/查询/固化工具/工作目录/图片/历史/进度/备份 UI 与行为逐项对照 | 同一场景的双宿主用户任务测试通过，无空入口或误导性成功 |
 | P6 `EB()` 与发布 | 解决 WPS 异步自定义函数机制；版本/格式矩阵、安装与升级 | 公式内语义实机等价且重算通过，否则明确列为阻塞，不能宣称完全对齐 |
 
+P5 中下一批任务窗格界面实施、同状态截图方法和可判定验收见
+[WPS / Excel EB 界面对齐指导](./WPS_EXCEL_UI_PARITY_GUIDE_2026-09-29.md)。
+该指导只处理 UI 与可见交互，不代替 P1 恢复、P2–P4 动作或 P6 `EB()` 验收。
+
 批次可按真实使用频率在同一安全等级内调整，但 P0/P1 不能被一次性打开
 `allowedActions` 跳过。`config/capabilities.json` 管限额和有效能力；矩阵物理重组
 可独立做，迁移时必须保持已有有效能力不扩大。每批次允许小步提交和回退，
@@ -486,8 +490,12 @@ Excel 侧追加一条系统消息告知"本次会话不会被保留"；WPS 侧�
 - StrictMode 幂等性用例覆盖的是"不丢历史 / 不泄漏 / 不提前删 v3 / 不松闸"这四条结果不变量，
   **不**（也刻意不）把"`loadChatHistory` 调用次数"作为正确性标准；StrictMode 的重放次数
   本身（实测 2 次）是 React 的实现细节，未作断言。
-- 出站用例覆盖的是 WPS 的 `local_plan_rule` 三条路径；Excel 侧的本地计划
-  出站断言尚未以同口径补齐。
+- 出站用例覆盖的是 WPS 的 `local_plan_rule` 三条路径（`fetch` 层拦截真实请求体）；
+  Excel 侧改由 `apps/excel-addin/src/localMappingOutbound.test.ts` 在**构造出站快照**
+  这一层覆盖（`planningReadPolicy: "none"` 时 `stripDataRows` 剥掉全部数据行、保留
+  表头/区域/行列数；私有哨兵不出站、表头合法出站作正向锚点）。**边界**：Excel 尚未补
+  WPS 那种"挂载整棵面板、在 `fetch` 层抓真实字节"的端到端出站用例 —— 这与 `App.tsx`
+  整棵组件树未做端到端渲染是同一条未覆盖项。
 - 读取路径的脱敏只覆盖 `title` 与 `message.text`；`legacyCredentialConversationIds` 由
   读取时检测登记，尚未处理"同一会话在内存里被整体替换（如删除重建）时标记残留"之外
   更复杂的边界。

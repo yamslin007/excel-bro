@@ -218,13 +218,58 @@ function readChunkRange(
   usedRange: WpsRange,
   offsetRows: number,
   chunkRowCount: number,
-  columnCount: number
+  columnsToRead: number,
+  /**
+   * 这次读取的**目的**。
+   *
+   * 它不只是个标签：取值面的构造方式据此不同 —— 结构扫描只取**第 1 行**
+   * （见下面 `first`/`last` 的分支），所以"结构扫描没有读到数据行"是可以
+   * 被証伪的事实，而不是调用方的自我声明。
+   */
+  purpose: "schema" | "values"
 ): WpsRange {
   if (typeof usedRange.Item !== "function" || typeof sheet.Range !== "function") {
     throw new WpsAuthorizationError("当前 WPS 版本没有提供所需的分块读取接口。");
   }
-  const first = usedRange.Item(offsetRows + 1, 1);
-  const last = usedRange.Item(offsetRows + chunkRowCount, columnCount);
+  /**
+   * 结构扫描用 `UsedRange.Item(1, columns)` 取**一整行**，而不是 `Item(row, col)`
+   * 那样的单格 —— 后者取到的对象本身就是一个只含一格的区域，拼出来的矩形列数
+   * 会退化成 1，表头字段被丢掉。
+   *
+   * 为什么整行不会越界：`UsedRange` 的 `rowIndex`/`columnIndex` 未必是 1，
+   * 但 `Item(1, N)` 走的正是 `UsedRange.Rows.Item(1).Cells(1, N)`，
+   * 由宿主自己按**绝对**行列解释，所以从第 1 列起取满宽度是安全的。
+   * 它只到第 1 行，不碰数据行。
+   */
+  const headerScanRows = Math.max(1, Number(capabilities.queryTable.headerScanRows));
+  const first = purpose === "schema" && offsetRows === 0
+    ? usedRange.Item(1, 1)
+    : usedRange.Item(offsetRows + 1, 1);
+  const last = purpose === "schema" && offsetRows === 0
+    ? usedRange.Item(1, columnsToRead)
+    : usedRange.Item(offsetRows + chunkRowCount, columnsToRead);
+  /**
+   * 第二道防线：即使传参被改坏，结构扫描的终点也不得越过表头扫描行。
+   * 这里只做断言，不改写 `first`/`last` —— 取值面由上面两行的构造决定。
+   */
+  if (purpose === "schema") {
+    const requestedEnd = offsetRows + chunkRowCount;
+    if (requestedEnd > headerScanRows || offsetRows > headerScanRows) {
+      throw new WpsAuthorizationError(
+        `结构扫描请求了第 ${requestedEnd} 行，超过表头扫描上限 ${headerScanRows} 行。`
+      );
+    }
+  }
+  /**
+   * 只传两个参数 —— 真宿主的 `Worksheet.Range` 只接受 `cell1`/`cell2`，
+   * 多传任何自有实参都会直接抛 `Too many parameters.`（2026-09-30 真机证据，
+   * 曾因假设"真宿主会忽略多余实参"而把 `purpose` 塞进这里，导致结构扫描
+   * 在真机上第一步就失败）。
+   *
+   * "读表结构 vs 读数据"的区分**不靠给宿主传标签**：`purpose` 只在本函数内
+   * 决定取值面的构造与断言（见上），测试替身按替身收到的矩形坐标与
+   * `Value2` 访问面自行记账。
+   */
   return sheet.Range(first, last);
 }
 
@@ -243,6 +288,19 @@ async function readAuthorizedWpsSheetsInternal(
   const chunkRows = Math.max(1, Math.min(configuredChunkRows, requestedChunkRows));
   const yieldControl = options.yieldControl ?? defaultYieldControl;
   const results: WpsSheetReadResult[] = [];
+
+  /**
+   * 标记"当前这次读取的**目的**"。
+   *
+   * - `"schema"`：只取**表头行**判字段类型/结构。真实取值范围 = 第 1 行 ×
+   *   前 `structureColumns` 列，**不覆盖任何数据行**；尺寸另行报告为整块已用区域。
+   * - `"values"`：取完整授权数据，用于本地确定性计算。
+   *
+   * 两者的隐私含义完全不同，所以既要在宿主侧可区分（宿主实现据此收窄取值面），
+   * 也要在测试里按**真实 `Value2` 访问范围**取证 —— 只看这个标记是不够的。
+   */
+  const readPurpose = schemaOnly ? "schema" : "values";
+  const headerRows = Math.max(1, Number(capabilities.queryTable.headerScanRows));
 
   for (const authorizedSheet of authorization.sheets) {
     if (options.signal?.aborted) throw new DOMException("读取已取消。", "AbortError");
@@ -266,12 +324,15 @@ async function readAuthorizedWpsSheetsInternal(
     }
 
     const values: WpsCellValue[][] = [];
-    const rowsToRead = schemaOnly
-      ? Math.min(rowCount, Number(capabilities.queryTable.headerScanRows))
-      : rowCount;
-    const columnsToRead = schemaOnly
-      ? Math.min(columnCount, Number(capabilities.snapshot.structureColumns))
-      : columnCount;
+    const rowsToRead = schemaOnly ? Math.min(rowCount, headerRows) : rowCount;
+    // 结构扫描可以按 `structureColumns` 取宽（表可能很宽，字段也很多）；
+    // 数据读取必须严守授权上限。
+    const columnsToRead = Math.min(
+      columnCount,
+      Number(
+        schemaOnly ? capabilities.snapshot.structureColumns : capabilities.wpsRead.maxColumns
+      )
+    );
     let chunksRead = 0;
     for (let offsetRows = 0; offsetRows < rowsToRead; offsetRows += chunkRows) {
       if (options.signal?.aborted) throw new DOMException("读取已取消。", "AbortError");
@@ -292,7 +353,8 @@ async function readAuthorizedWpsSheetsInternal(
         currentUsedRange,
         offsetRows,
         currentChunkRows,
-        columnsToRead
+        columnsToRead,
+        readPurpose
       );
       values.push(...normalizeWpsMatrix(range.Value2, currentChunkRows, columnsToRead));
       chunksRead += 1;

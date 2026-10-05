@@ -1,5 +1,11 @@
 import capabilities from "../../../config/capabilities.json";
 import type { WorkbookLocator } from "@excel-bro/core/contracts";
+import {
+  buildRangeChangeReview,
+  type ChangeReviewStatus,
+  type ChangeSnapshot,
+  type RangeChangeReview
+} from "@excel-bro/core/changeReview";
 import type { AnalysisPlan, CellValue, ExcelAction } from "../../excel-addin/src/contracts";
 import {
   assertRectangularValues,
@@ -18,6 +24,15 @@ import {
 import { wpsWriteVersionStatus } from "./wpsWriteVersionGate";
 
 const STORAGE_KEY = "excel-bro.wps.undo.v1";
+
+// 双栏对照的规模上限只影响"展示与采集"，不影响写入与撤销的正确性。
+// WPS 自有 wpsWrite.maxCells（当前 1000，见 prepareWpsPlan）远小于此处，
+// 这里是配置被调大之后的第二道闸：超限就不再采集显示值，只留公式判定改动。
+const CHANGE_REVIEW_CAPTURE_MAX_CELLS = capabilities.changeReview.captureMaxCells;
+const CHANGE_REVIEW_LIMIT = {
+  maxRows: capabilities.changeReview.maxRows,
+  maxTotalCells: capabilities.changeReview.maxTotalCells
+};
 
 type SupportedAction =
   | Extract<ExcelAction, { type: "writeValues" }>
@@ -77,12 +92,20 @@ export type WpsPreparedPlan = {
   confirmationSnapshot: string;
 };
 
-type StoredAction = WpsPreparedAction & {
+export type StoredAction = WpsPreparedAction & {
   beforeValues: CellValue[][];
   beforeFormulas: CellValue[][];
   beforeFingerprint: string;
   afterFingerprint: string | null;
   appliedRows: number;
+};
+
+/** 一次动作写完之后回读到的整块结果。只活在内存里 —— 不进 `WpsUndoRecord`（那个会落 PluginStorage）。 */
+export type WpsActionAfter = {
+  values: CellValue[][];
+  formulas: CellValue[][];
+  /** false = 宿主这次没把 Value2 暴露出来，双栏只能显示"显示值未采集"。 */
+  valuesCaptured: boolean;
 };
 
 export type WpsUndoRecord = {
@@ -206,7 +229,74 @@ function fingerprintForVersion(values: CellValue[][], formulas: CellValue[][], v
 function readMatrices(range: WpsRange, rows: number, columns: number, version: 1 | 2 = 2) {
   const values = normalizeWpsMatrix(range.Value2, rows, columns);
   const formulas = normalizeWpsMatrix(range.Formula, rows, columns);
-  return { values, formulas, fingerprint: fingerprintForVersion(values, formulas, version) };
+  return {
+    values,
+    formulas,
+    fingerprint: fingerprintForVersion(values, formulas, version),
+    // 宿主没把 Value2 交出来时不能拿公式顶替：`normalizeWpsMatrix` 会把 undefined
+    // 归一成 null，看上去跟"空单元格"一模一样。这里如实记一笔，交给双栏显示。
+    valuesCaptured: range.Value2 !== undefined && range.Value2 !== null
+  };
+}
+
+/**
+ * `range.Formula` 对常量单元格返回的是常量本身（"123"、"abc"），只有 `=` 开头才是
+ * 真公式 —— 与 `legacyMatrixFingerprint` / `matrixFingerprintV2` 的口径一致，
+ * 双栏不得另立一套，否则同一格在两处会有不同身份。
+ */
+export function toChangeFormulas(matrix: CellValue[][]): (string | null)[][] {
+  return matrix.map((row) =>
+    row.map((cell) => (typeof cell === "string" && cell.startsWith("=") ? cell : null))
+  );
+}
+
+/**
+ * 由「本次写前快照 + 本次写后回读」生成一份双栏对照。纯函数，不碰宿主。
+ *
+ * `matched` 三态：true = 回读与计划一致；false = 不一致；null = 根本没走到比对
+ * （写了但中途抛错）。三者都不能算"已核对通过"，只有 true 能得到 `applied`。
+ */
+export function wpsActionChangeReview(
+  action: StoredAction,
+  after: WpsActionAfter | null,
+  matched: boolean | null
+): RangeChangeReview {
+  const status: ChangeReviewStatus =
+    action.appliedRows === 0
+      ? "not_executed"
+      : matched === true
+        ? "applied"
+        : matched === false
+          ? "readback_mismatch"
+          : "readback_failed";
+  const capture = action.rowCount * action.columnCount <= CHANGE_REVIEW_CAPTURE_MAX_CELLS;
+  const before: ChangeSnapshot = {
+    values: capture
+      ? action.beforeValues
+      : action.beforeValues.map((row) => row.map(() => null)),
+    formulas: toChangeFormulas(action.beforeFormulas),
+    valuesCaptured: capture
+  };
+  // 没有 after（压根没写、或没读成）时**不**用空矩阵冒充"写成了空"：
+  // 整块标成未采集，界面只会看到"显示值未采集"。
+  const afterSnapshot: ChangeSnapshot =
+    after && capture
+      ? {
+          values: after.values,
+          formulas: toChangeFormulas(after.formulas),
+          valuesCaptured: after.valuesCaptured
+        }
+      : { values: [], formulas: [], valuesCaptured: false };
+  return buildRangeChangeReview({
+    sheet: action.sheetName,
+    range: action.range,
+    phase: "actual",
+    status,
+    before,
+    after: afterSnapshot,
+    appliedRows: action.appliedRows,
+    limit: CHANGE_REVIEW_LIMIT
+  });
 }
 
 function hasAmbiguousLogicalCell(values: CellValue[][], formulas: CellValue[][]): boolean {
@@ -228,6 +318,13 @@ function confirmationSnapshot(prepared: WpsPreparedPlan): string {
     totalCells: prepared.totalCells,
     previewRevision: prepared.previewRevision
   });
+}
+
+/** A staged native comparison must not bypass the preview's immutable confirmation snapshot. */
+export function assertWpsPreparedPlanUnchanged(prepared: WpsPreparedPlan): void {
+  if (confirmationSnapshot(prepared) !== prepared.confirmationSnapshot) {
+    throw new Error("写入计划或预览已变化，请重新预览并确认后再执行。");
+  }
 }
 
 function matricesEqual(actual: CellValue[][], expected: CellValue[][]): boolean {
@@ -493,19 +590,57 @@ function yieldControl(): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, 0));
 }
 
+/**
+ * 动作级检查点 —— 交给调用方（面板）提交到服务端持久账本。
+ *
+ * **只含指纹与动作元数据，不含单元格值矩阵**：`beforeFingerprint`/`afterFingerprint`
+ * 是服务端恢复时比对现场的证据，重放矩阵既不必要也不允许出站。恢复时用指纹判断
+ * "现场是写前、写后还是两者都不是"，而不是把值矩阵存进账本。
+ */
+export type WpsActionCheckpoint = {
+  actionIndex: number;
+  sheetName: string;
+  range: string;
+  type: "writeValues" | "writeFormulas" | "clearRange";
+  beforeFingerprint: string;
+  afterFingerprint: string | null;
+};
+
+export type WpsActionCheckpointHook = (
+  phase: "before" | "after",
+  checkpoint: WpsActionCheckpoint
+) => Promise<void>;
+
 export async function executeWpsPlan(
   application: WpsApplication,
   prepared: WpsPreparedPlan,
-  onProgress?: (progress: WpsExecutionProgress) => void
+  onProgress?: (progress: WpsExecutionProgress) => void,
+  /**
+   * 双栏变更对照只走回调交出去，**不写进 `WpsUndoRecord`** —— record 会落 PluginStorage，
+   * 而前后矩阵按 §7 只许停在会话内内存。
+   *
+   * 一并回传 `executionId`：失败路径同样会回调一次（失败后必须先给对照，再由用户决定
+   * 撤销还是重做），那时调用方拿不到 record。
+   */
+  onChangeReview?: (reviews: RangeChangeReview[], executionId: string) => void,
+  /**
+   * 动作级持久检查点。写前/写后各触发一次，供调用方提交服务端账本（CAP-03）。
+   * 回调抛错会**中止后续写入** —— 拿不到持久动作回执就不继续写，宁可不写也不留
+   * "写了一半却没有恢复证据"的现场。
+   */
+  onActionCheckpoint?: WpsActionCheckpointHook,
+  /**
+   * 覆盖默认随机生成的 `executionId`。CAP-03 用它把 PluginStorage 恢复点与服务端
+   * 账本的 `operationId` 对齐，使撤销、核对、续跑都指向同一份执行身份。
+   */
+  executionIdOverride?: string
 ): Promise<WpsUndoRecord> {
   if (!capabilities.wpsWrite.enabled) throw new Error("WPS 写入功能当前已由能力开关关闭。");
   const hostVersion = String(application.Version ?? "").trim();
   if (hostVersion !== prepared.hostVersion || wpsWriteVersionStatus(hostVersion) === "blocked") {
     throw new Error("WPS 宿主版本已变化或不在当前写入范围，未执行写入。");
   }
-  if (confirmationSnapshot(prepared) !== prepared.confirmationSnapshot) {
-    throw new Error("写入计划或预览已变化，请重新预览并确认后再执行。");
-  }
+  assertWpsPreparedPlanUnchanged(prepared);
   prepared.plan.actions.forEach((action) => {
     if (!supportedAction(action)) throw new Error(`WPS 当前不执行「${action.type}」。`);
     assertAllowedAction(action);
@@ -552,7 +687,7 @@ export async function executeWpsPlan(
   });
   const record: WpsUndoRecord = {
     version: 2,
-    executionId: randomId(),
+    executionId: executionIdOverride ?? randomId(),
     planId: prepared.plan.id,
     planTitle: prepared.plan.title,
     createdAt: new Date().toISOString(),
@@ -564,6 +699,22 @@ export async function executeWpsPlan(
   };
   upsertRecord(application, record);
 
+  // 回读矩阵按 actionIndex 存，只活在这次调用的闭包里。
+  const afterByIndex = new Map<number, WpsActionAfter>();
+  const matchByIndex = new Map<number, boolean>();
+  const emitReviews = () => {
+    onChangeReview?.(
+      record.actions.map((action) =>
+        wpsActionChangeReview(
+          action,
+          afterByIndex.get(action.actionIndex) ?? null,
+          matchByIndex.get(action.actionIndex) ?? null
+        )
+      ),
+      record.executionId
+    );
+  };
+
   try {
     record.state = "applying";
     upsertRecord(application, record);
@@ -572,6 +723,17 @@ export async function executeWpsPlan(
       const current = readMatrices(rangeFor(sheet, action.range), action.rowCount, action.columnCount);
       if (current.fingerprint !== action.beforeFingerprint) {
         throw new Error(`区域「${action.sheetName}!${action.range}」在确认后发生变化，未执行写入。`);
+      }
+      // 动作写前检查点：把写前指纹登记到服务端账本，之后才允许动这块区域。
+      if (onActionCheckpoint) {
+        await onActionCheckpoint("before", {
+          actionIndex: action.actionIndex,
+          sheetName: action.sheetName,
+          range: action.range,
+          type: action.type,
+          beforeFingerprint: action.beforeFingerprint,
+          afterFingerprint: null
+        });
       }
       for (let offset = 0; offset < action.rowCount; offset += capabilities.wpsWrite.chunkRows) {
         const rows = Math.min(capabilities.wpsWrite.chunkRows, action.rowCount - offset);
@@ -594,6 +756,13 @@ export async function executeWpsPlan(
         action.appliedRows = offset + rows;
         const afterChunk = readMatrices(rangeFor(sheet, action.range), action.rowCount, action.columnCount);
         action.afterFingerprint = afterChunk.fingerprint;
+        // 这一读本来就有（分块进度 + 指纹），矩阵随即丢弃；这里顺手留一份，
+        // 分块中途失败时它就是最后一块真实的现场。不新增任何宿主调用。
+        afterByIndex.set(action.actionIndex, {
+          values: afterChunk.values,
+          formulas: afterChunk.formulas,
+          valuesCaptured: afterChunk.valuesCaptured
+        });
         upsertRecord(application, record);
         onProgress?.({
           stage: "writing",
@@ -621,20 +790,48 @@ export async function executeWpsPlan(
       });
       const after = readMatrices(rangeFor(sheet, action.range), action.rowCount, action.columnCount);
       action.afterFingerprint = after.fingerprint;
+      afterByIndex.set(action.actionIndex, {
+        values: after.values,
+        formulas: after.formulas,
+        valuesCaptured: after.valuesCaptured
+      });
       const observed = action.type === "writeFormulas" ? after.formulas : after.values;
-      if (!matricesEqual(observed, action.values)) {
+      const matched = matricesEqual(observed, action.values);
+      matchByIndex.set(action.actionIndex, matched);
+      if (!matched) {
         throw new Error(`区域「${action.sheetName}!${action.range}」回读结果与计划不一致。`);
+      }
+      // 动作写后检查点：回读一致后才提交完成回执，账本据此推进 nextActionIndex。
+      if (onActionCheckpoint) {
+        await onActionCheckpoint("after", {
+          actionIndex: action.actionIndex,
+          sheetName: action.sheetName,
+          range: action.range,
+          type: action.type,
+          beforeFingerprint: action.beforeFingerprint,
+          afterFingerprint: action.afterFingerprint
+        });
       }
       upsertRecord(application, record);
     }
     record.state = "verified";
     upsertRecord(application, record);
+    emitReviews();
     return record;
   } catch (error) {
     for (const action of record.actions) {
       try {
         const sheet = getStoredSheet(application, record, action);
         const current = readMatrices(rangeFor(sheet, action.range), action.rowCount, action.columnCount);
+        // 只为"已经写过但没留下回读矩阵"的动作补一份现场（例如第一块写入就抛错）。
+        // 没写过的动作不补：它的"修改后"就该是未采集，不能拿"跟修改前一样"糊过去。
+        if (action.appliedRows > 0 && !afterByIndex.has(action.actionIndex)) {
+          afterByIndex.set(action.actionIndex, {
+            values: current.values,
+            formulas: current.formulas,
+            valuesCaptured: current.valuesCaptured
+          });
+        }
         if (current.fingerprint !== action.beforeFingerprint) {
           action.appliedRows = action.rowCount;
           action.afterFingerprint = current.fingerprint;
@@ -648,6 +845,8 @@ export async function executeWpsPlan(
       : "restored";
     record.error = error instanceof Error ? error.message : "WPS 写入失败。";
     upsertRecord(application, record);
+    // §6.5：失败后先给实际变更对照（哪些步写了、哪些没写），再让用户决定撤销还是重做。
+    emitReviews();
     throw error;
   }
 }
@@ -661,8 +860,103 @@ export function latestWpsUndo(application: WpsApplication): WpsUndoRecord | null
   ) ?? null;
 }
 
-export async function undoWpsExecution(
+/**
+ * 按 `executionId` 读**原始**记录 —— **不**过滤可撤销性。
+ *
+ * 判断"这次写入到底有没有发生"时不能只看 `latestWpsUndo`：它只返回当前**还能撤销**
+ * 的那一条，会漏掉 `restored`（执行器已把区域放回写前）与 `ready`/`applying` 等中间态。
+ * 核对写前/写后状态需要看到记录的真实 state，所以单独开这个读口。
+ *
+ * 读不到时返回 `null`；**调用方不得把 `null` 解读成"没写过"** ——
+ * 存储被清空、键损坏、宿主拒绝读取都会得到 `null`，那时只能说"未知"。
+ */
+export function wpsUndoRecordFor(
   application: WpsApplication,
+  executionId: string
+): WpsUndoRecord | null {
+  return readRecords(application).find((record) => record.executionId === executionId) ?? null;
+}
+
+/**
+ * 一次写入尝试的**只读**核对结果。
+ *
+ * `conflict` 同时覆盖"被人工改过"和"只写了一部分"：两者的下一步都是"先核对、
+ * 不覆盖"，`detail` 里说清是哪一种。
+ */
+export type WpsUndoInspection =
+  | { kind: "completed" }
+  | { kind: "not_started" }
+  | { kind: "conflict"; detail: string }
+  | { kind: "unknown"; detail: string };
+
+/**
+ * 只读核对：现场到底是"已写完"、"仍是写前"还是"两者都不是"。
+ *
+ * **不写任何单元格**，也不改恢复记录 —— 只读目标区域并与记录里的写前/写后指纹比。
+ * `undoWpsExecution` 也会做同样的比对，但它比对通过之后就开始写回；核对阶段
+ * 需要的是"先看清楚再决定"，所以单独开这个只读入口。
+ *
+ * 判据只认正面证据：
+ * - 每个**报过写入**的动作都与 `afterFingerprint` 一致 → 已完成；
+ * - 都与 `beforeFingerprint` 一致 → 确实没开始；
+ * - 混合、或与两者都不一致 → 冲突（需要人工看）；
+ * - 没有动作报过写入、记录缺失、读取抛错 → **未知**（不得当成"没写过"）。
+ */
+export function inspectWpsUndoRecord(
+  application: WpsApplication,
+  executionId: string
+): WpsUndoInspection {
+  const record = readRecords(application).find((item) => item.executionId === executionId);
+  if (!record) {
+    return { kind: "unknown", detail: "找不到这次执行的恢复记录。" };
+  }
+  const applicable = record.actions.filter((action) => action.appliedRows > 0);
+  if (applicable.length === 0) {
+    // 一个动作都没报过写入：执行器若明确说区域已回到写前，才敢说"未开始"。
+    if (record.state === "restored") return { kind: "not_started" };
+    return { kind: "unknown", detail: "执行记录里没有任何已写入的动作，无法判断现场。" };
+  }
+  let atAfter = 0;
+  let atBefore = 0;
+  for (const action of applicable) {
+    let fingerprint: string;
+    try {
+      const sheet = getStoredSheet(application, record, action);
+      const current = readMatrices(
+        rangeFor(sheet, action.range),
+        action.rowCount,
+        action.columnCount,
+        record.version
+      );
+      fingerprint = current.fingerprint;
+    } catch (error) {
+      return {
+        kind: "unknown",
+        detail: error instanceof Error ? error.message : "读取原表现场失败。"
+      };
+    }
+    if (action.afterFingerprint && fingerprint === action.afterFingerprint) {
+      atAfter += 1;
+      continue;
+    }
+    if (fingerprint === action.beforeFingerprint) {
+      atBefore += 1;
+      continue;
+    }
+    return {
+      kind: "conflict",
+      detail: `区域「${action.sheetName}!${action.range}」与写前、写后都不一致。`
+    };
+  }
+  if (atAfter === applicable.length) return { kind: "completed" };
+  if (atBefore === applicable.length) return { kind: "not_started" };
+  return {
+    kind: "conflict",
+    detail: "一部分区域与写后一致、一部分仍是写前，属于只写了一部分的现场。"
+  };
+}
+
+export async function undoWpsExecution(  application: WpsApplication,
   executionId: string,
   onProgress?: (progress: WpsExecutionProgress) => void
 ): Promise<WpsUndoRecord> {

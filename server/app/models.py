@@ -5,7 +5,14 @@ import binascii
 import re
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, StringConstraints, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
 
 from .capabilities import capability_int
 from .safety import (
@@ -16,6 +23,40 @@ from .safety import (
 )
 
 CellValue = str | int | float | bool | None
+
+
+class ExcelReviewLayoutPrepareRequest(BaseModel):
+    """Window metadata only. Never accept paths, plans, values or window handles."""
+    model_config = ConfigDict(extra="forbid")
+    workbookPathHash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    worksheetNameHash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    copySheetName: str = Field(pattern=r"^EB_[0-9a-f]{20}$")
+
+
+class ExcelReviewPaneMeasurement(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    clientWidthCssPx: float = Field(gt=0, le=32768, allow_inf_nan=False)
+
+
+class ExcelReviewLayoutTicket(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    token: str = Field(pattern=r"^[A-Za-z0-9_-]{43}$")
+    layoutVersion: Literal[3]
+
+
+class ExcelReviewLayoutArrangeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    token: str = Field(pattern=r"^[A-Za-z0-9_-]{43}$")
+
+
+class ExcelReviewLayoutResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    status: Literal["arranged"]
+    layoutVersion: Literal[3]
+    copySide: Literal["left"]
+    originalSide: Literal["right"]
+    synchronousScrolling: Literal["enabled", "different_instance", "unavailable"]
+
 SheetName = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=500)]
 RangeAddress = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=80)]
 TurnId = Annotated[
@@ -1922,13 +1963,28 @@ class TestModelConnectionResponse(BaseModel):
     message: str
 
 
+class ClarificationField(BaseModel):
+    id: str = Field(min_length=1, max_length=100)
+    label: str = Field(min_length=1, max_length=300)
+    placeholder: str = Field(default="", max_length=300)
+
+
 class IntentClarification(BaseModel):
     id: str = Field(min_length=1, max_length=100)
     summary: str = Field(min_length=1, max_length=300)
     question: str = Field(min_length=1, max_length=300)
     reason: str = Field(min_length=1, max_length=300)
     scopeLabel: str = Field(min_length=1, max_length=300)
-    options: list[IntentOption] = Field(min_length=2, max_length=4)
+    options: list[IntentOption] = Field(default_factory=list, max_length=4)
+    fields: list[ClarificationField] = Field(default_factory=list, max_length=4)
+
+    @model_validator(mode="after")
+    def validate_interaction(self) -> "IntentClarification":
+        if not self.fields and len(self.options) < 2:
+            raise ValueError("澄清必须提供至少两个选项或至少一个填写字段")
+        if len({field.id for field in self.fields}) != len(self.fields):
+            raise ValueError("澄清字段 id 不能重复")
+        return self
 
 
 class IntentProceedResponse(BaseModel):
@@ -2106,6 +2162,167 @@ class OfficeExecutionStateResponse(BaseModel):
     ownerToken: str | None = None
 
 
+class WpsRecoveryActionDescriptor(BaseModel):
+    """WPS 恢复描述里的单个动作。
+
+    **只含元数据，不含 ``values`` / ``formulas`` 矩阵**。``previewFingerprint`` 是
+    写前状态的校验指纹；``expectedFingerprint`` 表示写后逻辑内容。
+    校验指纹不是加密，不声称能抵御低熵内容的枚举推测。
+
+    ``extra="forbid"`` 是出站闸的服务端一侧：任何矩阵字段（``values`` /
+    ``formulas`` / ``preview``）一旦出现在请求里就直接 422，不会"忽略后照常登记"。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    actionIndex: int = Field(ge=0)
+    type: str = Field(min_length=1, max_length=64)
+    sheet: str = Field(min_length=1, max_length=200)
+    range: str = Field(min_length=1, max_length=200)
+    rowCount: int = Field(ge=1)
+    columnCount: int = Field(ge=1)
+    cellCount: int = Field(ge=1)
+    previewFingerprint: str = Field(min_length=1, max_length=200)
+    expectedFingerprint: str | None = Field(default=None, max_length=200)
+    applyTo: str | None = None
+    formulaR1C1: bool = False
+
+
+class WpsRecoveryDescriptor(BaseModel):
+    """WPS 写入的**恢复描述**：服务端账本里关于"要写什么"的全部内容。
+
+    早期版本直接上传整个 ``AnalysisPlan``，``writeValues`` 的目标值矩阵因此会出站
+    并落进 ``office_executions.plan_json``。这里改成只保存恢复判定必需的元数据：
+    动作类型、目标工作表与区域、目标形状、目标指纹，以及动作序列（进度基准）。
+
+    恢复功能**不得**为"能精确续跑"而放宽这条约束 —— 值矩阵只停在本机内存，
+    宁可让续跑能力受限，也不让单元格内容落盘。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    actions: list[WpsRecoveryActionDescriptor] = Field(min_length=1, max_length=500)
+
+
+class WpsExecutionRegisterRequest(BaseModel):
+    """WPS 首次原表写入前的持久执行登记。身份用 ``wps-path:`` 前缀。
+
+    与 ``OfficeExecutionRegisterRequest`` 分开：WPS 没有 ``Office.context.document.url``，
+    用已保存工作簿的小写磁盘完整路径作为跨关闭身份；两者是不同命名空间，不得互相冒充。
+
+    载荷是 ``descriptor`` 而不是 ``plan``：登记请求不携带单元格值矩阵。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    operationId: str = Field(
+        min_length=8,
+        max_length=100,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+    )
+    descriptor: WpsRecoveryDescriptor
+    authorizedSheetNames: list[str] = Field(min_length=1, max_length=200)
+    workbookIdentity: str = Field(min_length=5, max_length=4000)
+    taskId: str = Field(min_length=1, max_length=100)
+    confirmed: Literal[True]
+
+    @field_validator("workbookIdentity")
+    @classmethod
+    def validate_workbook_identity(cls, value: str) -> str:
+        if not value.startswith("wps-path:"):
+            raise ValueError("WPS 工作簿身份必须以 wps-path: 前缀表示已保存的磁盘路径")
+        return value
+
+
+class WpsActionEvidence(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    sheetName: str = Field(min_length=1, max_length=200)
+    range: str = Field(min_length=1, max_length=200)
+    type: Literal["writeValues", "writeFormulas", "clearRange"]
+    beforeFingerprint: str = Field(min_length=1, max_length=200)
+    afterFingerprint: str | None = Field(default=None, max_length=200)
+
+
+class WpsActionStartRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expectedRevision: int = Field(ge=1)
+    ownerToken: str = Field(min_length=32, max_length=100)
+    actionIndex: int = Field(ge=0)
+    beforeSnapshot: WpsActionEvidence
+
+
+class WpsActionCompleteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expectedRevision: int = Field(ge=1)
+    ownerToken: str = Field(min_length=32, max_length=100)
+    actionIndex: int = Field(ge=0)
+    checkpoint: WpsActionEvidence
+
+
+class WpsExecutionSuspendRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expectedRevision: int = Field(ge=1)
+    ownerToken: str = Field(min_length=32, max_length=100)
+    code: str = Field(min_length=1, max_length=100)
+    message: str = Field(min_length=1, max_length=2000)
+
+
+class WpsExecutionResumeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expectedRevision: int = Field(ge=1)
+    confirmed: Literal[True]
+
+
+class WpsActionReconcileRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expectedRevision: int = Field(ge=1)
+    actionIndex: int = Field(ge=0)
+    outcome: Literal["applied", "not_applied"]
+    checkpoint: WpsActionEvidence | None = None
+    confirmed: Literal[True]
+
+    @model_validator(mode="after")
+    def validate_checkpoint(self) -> "WpsActionReconcileRequest":
+        if self.outcome == "applied" and self.checkpoint is None:
+            raise ValueError("补记已应用动作必须提供完整检查点")
+        return self
+
+
+class WpsExecutionResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    actionCount: int = Field(ge=0)
+    cellCount: int | None = Field(default=None, ge=0)
+    backfilled: bool = False
+
+
+class WpsExecutionFinishRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expectedRevision: int = Field(ge=1)
+    ownerToken: str = Field(min_length=32, max_length=100)
+    result: WpsExecutionResult
+
+
+class WpsExecutionStateResponse(BaseModel):
+    operationId: str
+    status: Literal["running", "needs_reconciliation", "completed", "failed"]
+    revision: int = Field(ge=1)
+    workbookIdentity: str
+    taskId: str
+    descriptor: WpsRecoveryDescriptor
+    authorizedSheetNames: list[str]
+    nextActionIndex: int = Field(ge=0)
+    totalActions: int = Field(ge=0)
+    inFlightActionIndex: int | None = Field(default=None, ge=0)
+    beforeSnapshot: WpsActionEvidence | None = None
+    checkpoint: WpsActionEvidence | None = None
+    result: WpsExecutionResult | None = None
+    error: dict[str, Any] | None = None
+    canResume: bool
+    requiresReconciliation: bool
+    ownerActive: bool
+    ownerToken: str | None = None
+
+
 class ColumnMappingPair(BaseModel):
     """映射表的一项。字段名 `source` / `target`，**不设 `from` / `to` 别名**。
 
@@ -2124,6 +2341,83 @@ class ColumnMappingPair(BaseModel):
     target: str = Field(min_length=1, max_length=500)
 
 
+class ColumnMappingRankEntry(BaseModel):
+    """拆分后取最高级时的一条次序声明。`rank` 大者优先。
+
+    等级**由规则数据给出**，服务端与 core 都不认识任何具体等级名 ——
+    在意的只有数值大小，以及"没声明时按 `mapping` 声明顺序"这条确定性兜底。
+    """
+
+    value: str = Field(min_length=1, max_length=500)
+    rank: int
+
+
+class BlankPolicy(BaseModel):
+    """来源格为**空白**时的结构化处理策略。
+
+    与 `packages/core/src/blankPolicy.ts` 同名同义，四种形态：
+
+    - `keep`：保留目标原值 —— 这个位置**根本不进入写入范围**，不是"读回原值
+      再写回"（后者是一次真实写入，会改公式与格式）。
+    - `clear`：清空目标内容 —— 走 `clearRange:contents`，不是"写空串"。
+    - `value`：写入指定值，`value` **允许是空串**（显式写空字符串常量）。
+    - `undecided`：还没决定。**不是错误** —— 只有真的读到空白格时才需要决定。
+
+    为什么不再只用一个 `blankLabel: str`：它表达不了 `keep`，也分不清
+    `clear` 与"写空串"。用工具能力缺陷去逼用户回答，是把实现问题转嫁给用户。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["keep", "clear", "value", "undecided"]
+    # 仅 `kind="value"` 时有意义，且**允许空串**（"显式写空字符串"是明确意图）。
+    value: str | None = Field(default=None, max_length=100)
+
+    @model_validator(mode="after")
+    def _value_matches_kind(self) -> "BlankPolicy":
+        if self.kind == "value" and self.value is None:
+            raise ValueError('空白策略 kind="value" 必须带 value')
+        if self.kind != "value" and self.value is not None:
+            raise ValueError('只有 kind="value" 的空白策略才能带 value')
+        return self
+
+
+class ColumnMappingClarification(BaseModel):
+    """待澄清卡片的内容。**不含来源格的原始内容**。
+
+    原始内容留在客户端，由界面就地展示；下发/回传的只有归因与统计
+    —— 否则"客户端不上传单元格值"这条会被澄清流程从侧门绕开。
+    """
+
+    reason: Literal[
+        "matchedDelimiterMissingCategories",
+        "unresolvedSeparatorOrMapping",
+        # 「读到源区域确实有空白格，但空白怎么处理还没定」。
+        # 没读到空白就不该出现 —— 那是凭空提问。
+        "blankPolicyNeeded",
+    ]
+    message: str = Field(min_length=1, max_length=1000)
+    # 未覆盖的类别（已去重），供界面列出"要补哪些"。
+    missingCategories: list[str] = Field(default_factory=list, max_length=500)
+    # 归因不确定时，无法处理的整格**数量**（不回传原文）。
+    unresolvedCellCount: int = Field(default=0, ge=0)
+    # `blankPolicyNeeded` 时**真实读到**的空白格数量。必须来自一次真实读取。
+    blankCellCount: int = Field(default=0, ge=0)
+    resolvedBy: list[
+        Literal[
+            "addCategories",
+            "specifyOtherDelimiter",
+            "treatWholeCellAsCategory",
+            # 空白的四种处理。与上面那组**不混用**：空白卡片上出现
+            # 「补充分隔符」只会让用户以为那也能解决空白。
+            "keepTarget",
+            "clearTarget",
+            "writeBlankValue",
+            "writeEmptyString",
+        ]
+    ] = Field(default_factory=list, max_length=4)
+
+
 class ColumnMappingRule(BaseModel):
     """列映射的**规则**，不含任何单元格值。
 
@@ -2133,6 +2427,11 @@ class ColumnMappingRule(BaseModel):
 
     这里刻意不带 `values`：带了就等于把映射结果上传，而单射映射可逆
     —— 标签列加映射表足以还原源列，那与"客户端不上传单元格值"是冲突的。
+
+    多值语义的三组参数（`delimiters` / `valueRank` / `undeclaredSeparators`）
+    与 `packages/core` 的 `ColumnMappingInput` **逐字同名**：规则是平的，
+    折一层子对象会让"夹具里有、运行时没有"这种错在类型检查下隐形。
+    三组都可省略，省略即"一个来源格只当一个值"，与扩展前行为一致。
     """
 
     kind: Literal["columnMapping"] = "columnMapping"
@@ -2143,7 +2442,26 @@ class ColumnMappingRule(BaseModel):
     # 保持 [{from,to}] 列表形态而不折成 dict：与模型侧的工具 schema 同形，
     # 且重复键在这一层仍可见（折成 dict 会静默丢掉后者）。
     mapping: list[ColumnMappingPair] = Field(min_length=1, max_length=500)
-    blankLabel: str = Field(min_length=1, max_length=100)
+    # 空白来源格的处理策略。省略 = 未定，只有真的读到空白时才需要决定。
+    #
+    # 表达「保留目标原值」只有这一种方式：旧字段 `blankLabel` 只能表达
+    # "写一个什么标签"，而"保留"意味着这个位置**根本不进入写入范围**，
+    # 不是"读回原值再写回"。
+    blankPolicy: BlankPolicy | None = None
+    # 旧协议的"空白标签"，保留只为兼容旧数据。
+    # 非空串等价于 `blankPolicy: {kind:"value", value: 同值}`，语义一点没动；
+    # 旧协议里空串本来就被拒绝，所以"空串 = 未定"不会改变任何合法旧计划。
+    blankLabel: str | None = Field(default=None, max_length=100)
+    # 候选分隔符。拆分时取**出现位置最靠前**的那个。空列表 = 不拆分。
+    delimiters: list[str] = Field(default_factory=list, max_length=50)
+    # 拆分后取最高级用的次序。空列表 = 按 `mapping` 声明顺序。
+    valueRank: list[ColumnMappingRankEntry] = Field(
+        default_factory=list, max_length=500
+    )
+    # 规则明示为分隔符候选、但尚未确认可用来切分的字符。
+    undeclaredSeparators: list[str] = Field(default_factory=list, max_length=50)
+    # 服务端已判定"缺参数/缺类别、不能算"时带上；带上时客户端只展示澄清卡片。
+    clarification: ColumnMappingClarification | None = None
 
 
 class LocalPlanRuleResponse(BaseModel):
@@ -2173,12 +2491,14 @@ class AnswerResponse(BaseModel):
     kind: Literal["answer"] = "answer"
     message: str = Field(min_length=1, max_length=4000)
     provider: Literal["model", "local", "system"]
+    outcome: Literal["completed", "failed"] = "completed"
+    stopReason: Literal["max_turns", "max_tokens", "timeout", "consecutive_errors", "output_length"] | None = None
     resultContext: ResultContext | None = None
     turnId: TurnId | None = None
 
 
 AssistantResponse = Annotated[
-    PlanResponse | AnswerResponse | LocalPlanRuleResponse,
+    PlanResponse | AnswerResponse | LocalPlanRuleResponse | IntentClarificationResponse,
     Field(discriminator="kind"),
 ]
 

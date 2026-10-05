@@ -10,6 +10,7 @@ from typing import Any, Literal
 from .capabilities import capability_int
 from .models import (
     AnswerResponse,
+    AssistantResponse,
     IntentCheckResponse,
     LocalPlanRuleResponse,
     PlanRequest,
@@ -23,6 +24,7 @@ TurnStage = Literal[
     "awaiting_tool",
     "awaiting_completion",
     "completed",
+    "failed",
 ]
 
 
@@ -38,7 +40,7 @@ class TurnState:
     stage: TurnStage
     updated_at: float
     completion_fingerprint: str | None = None
-    completion_response: AnswerResponse | PlanResponse | LocalPlanRuleResponse | None = None
+    completion_response: AssistantResponse | None = None
     completion_lock: asyncio.Lock = field(
         default_factory=asyncio.Lock,
         repr=False,
@@ -83,7 +85,7 @@ class TurnRegistry:
 
     def ensure_decision_allowed(self, turn_id: str) -> TurnState:
         state = self.touch(turn_id)
-        if state.stage == "completed":
+        if state.stage in ("completed", "failed"):
             raise TurnStateError(
                 "TURN_ALREADY_COMPLETED",
                 "该轮次已经完成，请开始新的请求。",
@@ -97,12 +99,14 @@ class TurnRegistry:
 
     def cached_completion(
         self, turn_id: str, request: PlanRequest
-    ) -> AnswerResponse | PlanResponse | LocalPlanRuleResponse | None:
+    ) -> AssistantResponse | None:
         state = self.touch(turn_id)
-        if state.stage != "completed":
+        if state.stage not in ("completed", "failed", "awaiting_clarification") or state.completion_response is None:
             return None
         fingerprint = self.completion_fingerprint(request)
         if fingerprint != state.completion_fingerprint:
+            if state.stage == "awaiting_clarification":
+                return None
             raise TurnStateError(
                 "TURN_ALREADY_COMPLETED",
                 "该轮次已经用另一组参数完成，请开始新的请求。",
@@ -127,10 +131,11 @@ class TurnRegistry:
         self,
         turn_id: str,
         request: PlanRequest,
-        response: AnswerResponse | PlanResponse | LocalPlanRuleResponse,
+        response: AssistantResponse,
     ) -> None:
         state = self.touch(turn_id)
-        state.stage = "completed"
+        state.stage = ("awaiting_clarification" if response.kind == "clarification" else
+                       "failed" if isinstance(response, AnswerResponse) and response.outcome == "failed" else "completed")
         state.completion_fingerprint = self.completion_fingerprint(request)
         state.completion_response = response
         state.updated_at = time.monotonic()

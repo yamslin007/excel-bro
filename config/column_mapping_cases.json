@@ -4,8 +4,13 @@
     "server/app/column_mapping.py 是镜像实现，两侧各自加载本文件并断言同一批",
     "期望值 —— 任何单边修改都会让一侧变红。这比人工对读源码可靠，也比抓源码",
     "文本的 test_safety_mirror.py 更适合锁行为（那种做法只能锁清单，锁不住逻辑）。",
-    "error 取值：unmapped | shape | overlap | parse | blankLabel | sheetName。",
-    "unmapped 用例的 unmappedValues 断言未命中值的完整集合与顺序。"
+    "error 取值：unmapped | shape | overlap | parse | blankPolicy | sheetName | splitAmbiguous。",
+    "unmapped 用例的 unmappedValues 断言未命中值的完整集合与顺序；",
+    "splitAmbiguous 用例的 ambiguousCells 断言需要澄清的整格原文与首次出现顺序。",
+    "blankPolicy 用例断言「读到真实空白但策略未定」必须要求澄清，而不是替用户挑默认值；",
+    "expectedActions 用例断言需要跳过/清空位置时动作序列的精确形状。",
+    "多值相关用例一律通过 input.delimiters / input.valueRank 提供规则数据，",
+    "本文件里出现的具体分隔符与等级名只是测试取样，不构成对实现的约束。"
   ],
   "cases": [
     {
@@ -15,11 +20,47 @@
         "targetSheet": "订单",
         "sourceRange": "B2:B6",
         "targetRange": "D2:D6",
-        "sourceValues": [["办公用品"], ["电子设备"], ["办公用品"], [null], ["差旅"]],
-        "mapping": { "办公用品": "行政", "电子设备": "资产", "差旅": "费用" },
+        "sourceValues": [
+          [
+            "办公用品"
+          ],
+          [
+            "电子设备"
+          ],
+          [
+            "办公用品"
+          ],
+          [
+            null
+          ],
+          [
+            "差旅"
+          ]
+        ],
+        "mapping": {
+          "办公用品": "行政",
+          "电子设备": "资产",
+          "差旅": "费用"
+        },
         "blankLabel": "未分类"
       },
-      "expected": [["行政"], ["资产"], ["行政"], ["未分类"], ["费用"]]
+      "expected": [
+        [
+          "行政"
+        ],
+        [
+          "资产"
+        ],
+        [
+          "行政"
+        ],
+        [
+          "未分类"
+        ],
+        [
+          "费用"
+        ]
+      ]
     },
     {
       "name": "纯空白字符串按空白处理",
@@ -28,11 +69,33 @@
         "targetSheet": "表1",
         "sourceRange": "A1:A3",
         "targetRange": "C1:C3",
-        "sourceValues": [[""], ["   "], ["\t"]],
-        "mapping": { "甲": "一" },
+        "sourceValues": [
+          [
+            ""
+          ],
+          [
+            "   "
+          ],
+          [
+            "\t"
+          ]
+        ],
+        "mapping": {
+          "甲": "一"
+        },
         "blankLabel": "空"
       },
-      "expected": [["空"], ["空"], ["空"]]
+      "expected": [
+        [
+          "空"
+        ],
+        [
+          "空"
+        ],
+        [
+          "空"
+        ]
+      ]
     },
     {
       "name": "显式空串映射项优先于空白策略",
@@ -41,11 +104,27 @@
         "targetSheet": "表1",
         "sourceRange": "A1:A2",
         "targetRange": "C1:C2",
-        "sourceValues": [[""], [null]],
-        "mapping": { "": "空串" },
+        "sourceValues": [
+          [
+            ""
+          ],
+          [
+            null
+          ]
+        ],
+        "mapping": {
+          "": "空串"
+        },
         "blankLabel": "真空格"
       },
-      "expected": [["空串"], ["真空格"]]
+      "expected": [
+        [
+          "空串"
+        ],
+        [
+          "真空格"
+        ]
+      ]
     },
     {
       "name": "数字 0 与 false 不是空白",
@@ -54,11 +133,28 @@
         "targetSheet": "表1",
         "sourceRange": "A1:A2",
         "targetRange": "C1:C2",
-        "sourceValues": [[0], [false]],
-        "mapping": { "0": "零", "False": "否" },
+        "sourceValues": [
+          [
+            0
+          ],
+          [
+            false
+          ]
+        ],
+        "mapping": {
+          "0": "零",
+          "False": "否"
+        },
         "blankLabel": "空"
       },
-      "expected": [["零"], ["否"]]
+      "expected": [
+        [
+          "零"
+        ],
+        [
+          "否"
+        ]
+      ]
     },
     {
       "name": "布尔真按 Python str() 形态键化",
@@ -67,11 +163,21 @@
         "targetSheet": "表1",
         "sourceRange": "A1:A1",
         "targetRange": "C1:C1",
-        "sourceValues": [[true]],
-        "mapping": { "True": "是" },
+        "sourceValues": [
+          [
+            true
+          ]
+        ],
+        "mapping": {
+          "True": "是"
+        },
         "blankLabel": "空"
       },
-      "expected": [["是"]]
+      "expected": [
+        [
+          "是"
+        ]
+      ]
     },
     {
       "name": "多行多列逐格映射",
@@ -81,15 +187,30 @@
         "sourceRange": "A1:B2",
         "targetRange": "D1:E2",
         "sourceValues": [
-          ["甲", "乙"],
-          ["乙", null]
+          [
+            "甲",
+            "乙"
+          ],
+          [
+            "乙",
+            null
+          ]
         ],
-        "mapping": { "甲": "一", "乙": "二" },
+        "mapping": {
+          "甲": "一",
+          "乙": "二"
+        },
         "blankLabel": "空"
       },
       "expected": [
-        ["一", "二"],
-        ["二", "空"]
+        [
+          "一",
+          "二"
+        ],
+        [
+          "二",
+          "空"
+        ]
       ]
     },
     {
@@ -99,12 +220,30 @@
         "targetSheet": "表1",
         "sourceRange": "A1:A4",
         "targetRange": "C1:C4",
-        "sourceValues": [["丙"], ["甲"], ["丁"], ["丙"]],
-        "mapping": { "甲": "一" },
+        "sourceValues": [
+          [
+            "丙"
+          ],
+          [
+            "甲"
+          ],
+          [
+            "丁"
+          ],
+          [
+            "丙"
+          ]
+        ],
+        "mapping": {
+          "甲": "一"
+        },
         "blankLabel": "空"
       },
       "error": "unmapped",
-      "unmappedValues": ["丙", "丁"]
+      "unmappedValues": [
+        "丙",
+        "丁"
+      ]
     },
     {
       "name": "同表重叠：拒绝",
@@ -113,8 +252,20 @@
         "targetSheet": "表1",
         "sourceRange": "A1:A3",
         "targetRange": "A2:A4",
-        "sourceValues": [["甲"], ["甲"], ["甲"]],
-        "mapping": { "甲": "一" },
+        "sourceValues": [
+          [
+            "甲"
+          ],
+          [
+            "甲"
+          ],
+          [
+            "甲"
+          ]
+        ],
+        "mapping": {
+          "甲": "一"
+        },
         "blankLabel": "空"
       },
       "error": "overlap"
@@ -126,11 +277,27 @@
         "targetSheet": "表1",
         "sourceRange": "A1:A2",
         "targetRange": "B1:B2",
-        "sourceValues": [["甲"], ["甲"]],
-        "mapping": { "甲": "一" },
+        "sourceValues": [
+          [
+            "甲"
+          ],
+          [
+            "甲"
+          ]
+        ],
+        "mapping": {
+          "甲": "一"
+        },
         "blankLabel": "空"
       },
-      "expected": [["一"], ["一"]]
+      "expected": [
+        [
+          "一"
+        ],
+        [
+          "一"
+        ]
+      ]
     },
     {
       "name": "跨表同地址不算重叠",
@@ -139,11 +306,27 @@
         "targetSheet": "表2",
         "sourceRange": "A1:A2",
         "targetRange": "A1:A2",
-        "sourceValues": [["甲"], ["甲"]],
-        "mapping": { "甲": "一" },
+        "sourceValues": [
+          [
+            "甲"
+          ],
+          [
+            "甲"
+          ]
+        ],
+        "mapping": {
+          "甲": "一"
+        },
         "blankLabel": "空"
       },
-      "expected": [["一"], ["一"]]
+      "expected": [
+        [
+          "一"
+        ],
+        [
+          "一"
+        ]
+      ]
     },
     {
       "name": "源值行数与源区域不符",
@@ -152,8 +335,17 @@
         "targetSheet": "表1",
         "sourceRange": "A1:A3",
         "targetRange": "C1:C3",
-        "sourceValues": [["甲"], ["甲"]],
-        "mapping": { "甲": "一" },
+        "sourceValues": [
+          [
+            "甲"
+          ],
+          [
+            "甲"
+          ]
+        ],
+        "mapping": {
+          "甲": "一"
+        },
         "blankLabel": "空"
       },
       "error": "shape"
@@ -165,8 +357,18 @@
         "targetSheet": "表1",
         "sourceRange": "A1:B2",
         "targetRange": "D1:E2",
-        "sourceValues": [["甲", "甲"], ["甲"]],
-        "mapping": { "甲": "一" },
+        "sourceValues": [
+          [
+            "甲",
+            "甲"
+          ],
+          [
+            "甲"
+          ]
+        ],
+        "mapping": {
+          "甲": "一"
+        },
         "blankLabel": "空"
       },
       "error": "shape"
@@ -178,8 +380,20 @@
         "targetSheet": "表1",
         "sourceRange": "A1:A3",
         "targetRange": "C1:C2",
-        "sourceValues": [["甲"], ["甲"], ["甲"]],
-        "mapping": { "甲": "一" },
+        "sourceValues": [
+          [
+            "甲"
+          ],
+          [
+            "甲"
+          ],
+          [
+            "甲"
+          ]
+        ],
+        "mapping": {
+          "甲": "一"
+        },
         "blankLabel": "空"
       },
       "error": "shape"
@@ -191,8 +405,17 @@
         "targetSheet": "表1",
         "sourceRange": "A1:A2",
         "targetRange": "C1:D2",
-        "sourceValues": [["甲"], ["甲"]],
-        "mapping": { "甲": "一" },
+        "sourceValues": [
+          [
+            "甲"
+          ],
+          [
+            "甲"
+          ]
+        ],
+        "mapping": {
+          "甲": "一"
+        },
         "blankLabel": "空"
       },
       "error": "shape"
@@ -204,11 +427,27 @@
         "targetSheet": "表1",
         "sourceRange": "$A$1:$A$2",
         "targetRange": "$C$1:$C$2",
-        "sourceValues": [["甲"], ["甲"]],
-        "mapping": { "甲": "一" },
+        "sourceValues": [
+          [
+            "甲"
+          ],
+          [
+            "甲"
+          ]
+        ],
+        "mapping": {
+          "甲": "一"
+        },
         "blankLabel": "空"
       },
-      "expected": [["一"], ["一"]]
+      "expected": [
+        [
+          "一"
+        ],
+        [
+          "一"
+        ]
+      ]
     },
     {
       "name": "单格区域",
@@ -217,11 +456,21 @@
         "targetSheet": "表1",
         "sourceRange": "A1",
         "targetRange": "C1",
-        "sourceValues": [["甲"]],
-        "mapping": { "甲": "一" },
+        "sourceValues": [
+          [
+            "甲"
+          ]
+        ],
+        "mapping": {
+          "甲": "一"
+        },
         "blankLabel": "空"
       },
-      "expected": [["一"]]
+      "expected": [
+        [
+          "一"
+        ]
+      ]
     },
     {
       "name": "整列引用无法解析",
@@ -230,8 +479,14 @@
         "targetSheet": "表1",
         "sourceRange": "A:A",
         "targetRange": "C1:C1",
-        "sourceValues": [["甲"]],
-        "mapping": { "甲": "一" },
+        "sourceValues": [
+          [
+            "甲"
+          ]
+        ],
+        "mapping": {
+          "甲": "一"
+        },
         "blankLabel": "空"
       },
       "error": "parse"
@@ -243,24 +498,46 @@
         "targetSheet": "表1",
         "sourceRange": "A3:A1",
         "targetRange": "C1:C3",
-        "sourceValues": [["甲"], ["甲"], ["甲"]],
-        "mapping": { "甲": "一" },
+        "sourceValues": [
+          [
+            "甲"
+          ],
+          [
+            "甲"
+          ],
+          [
+            "甲"
+          ]
+        ],
+        "mapping": {
+          "甲": "一"
+        },
         "blankLabel": "空"
       },
       "error": "parse"
     },
     {
-      "name": "空白标签为空：拒绝",
+      "name": "未指定空白策略但源区域没有空白：不挡预览",
       "input": {
         "sourceSheet": "表1",
         "targetSheet": "表1",
         "sourceRange": "A1:A1",
         "targetRange": "C1:C1",
-        "sourceValues": [["甲"]],
-        "mapping": { "甲": "一" },
+        "sourceValues": [
+          [
+            "甲"
+          ]
+        ],
+        "mapping": {
+          "甲": "一"
+        },
         "blankLabel": ""
       },
-      "error": "blankLabel"
+      "expected": [
+        [
+          "一"
+        ]
+      ]
     },
     {
       "name": "工作表名为空：拒绝",
@@ -269,11 +546,762 @@
         "targetSheet": "  ",
         "sourceRange": "A1:A1",
         "targetRange": "C1:C1",
-        "sourceValues": [["甲"]],
-        "mapping": { "甲": "一" },
+        "sourceValues": [
+          [
+            "甲"
+          ]
+        ],
+        "mapping": {
+          "甲": "一"
+        },
         "blankLabel": "空"
       },
       "error": "sheetName"
+    },
+    {
+      "name": "未声明分隔符：整格含分隔形式仍按整格匹配，拒绝猜测",
+      "input": {
+        "sourceSheet": "表1",
+        "targetSheet": "表1",
+        "sourceRange": "A1:A2",
+        "targetRange": "C1:C2",
+        "sourceValues": [
+          [
+            "甲"
+          ],
+          [
+            "乙"
+          ]
+        ],
+        "mapping": {
+          "甲": "一",
+          "乙": "二"
+        },
+        "blankLabel": "空",
+        "delimiters": [],
+        "valueRank": []
+      },
+      "expected": [
+        [
+          "一"
+        ],
+        [
+          "二"
+        ]
+      ]
+    },
+    {
+      "name": "无分隔符声明时，含候选分隔符的整格原样按整格匹配（不自行拆分）",
+      "input": {
+        "sourceSheet": "表1",
+        "targetSheet": "表1",
+        "sourceRange": "A1:A1",
+        "targetRange": "C1:C1",
+        "sourceValues": [
+          [
+            "甲 乙"
+          ]
+        ],
+        "mapping": {
+          "甲 乙": "合"
+        },
+        "blankLabel": "空",
+        "delimiters": [],
+        "valueRank": []
+      },
+      "expected": [
+        [
+          "合"
+        ]
+      ]
+    },
+    {
+      "name": "声明分隔符后逐项精确匹配，并取规则指定的最高级",
+      "input": {
+        "sourceSheet": "表1",
+        "targetSheet": "表1",
+        "sourceRange": "A1:A3",
+        "targetRange": "C1:C3",
+        "sourceValues": [
+          [
+            "乙"
+          ],
+          [
+            "甲"
+          ],
+          [
+            "甲 乙"
+          ]
+        ],
+        "mapping": {
+          "甲": "壹",
+          "乙": "贰"
+        },
+        "blankLabel": "空",
+        "delimiters": [
+          " "
+        ],
+        "valueRank": [
+          {
+            "value": "甲",
+            "rank": 1
+          },
+          {
+            "value": "乙",
+            "rank": 0
+          }
+        ]
+      },
+      "expected": [
+        [
+          "贰"
+        ],
+        [
+          "壹"
+        ],
+        [
+          "壹"
+        ]
+      ]
+    },
+    {
+      "name": "拆分项去首尾空格后仍按完整名称精确匹配，不做子串匹配",
+      "input": {
+        "sourceSheet": "表1",
+        "targetSheet": "表1",
+        "sourceRange": "A1:A2",
+        "targetRange": "C1:C2",
+        "sourceValues": [
+          [
+            "  甲  "
+          ],
+          [
+            "甲乙"
+          ]
+        ],
+        "mapping": {
+          "甲": "壹",
+          "甲乙": "合"
+        },
+        "blankLabel": "空",
+        "delimiters": [
+          " "
+        ],
+        "valueRank": [
+          {
+            "value": "甲",
+            "rank": 1
+          },
+          {
+            "value": "甲乙",
+            "rank": 0
+          }
+        ]
+      },
+      "expected": [
+        [
+          "壹"
+        ],
+        [
+          "合"
+        ]
+      ]
+    },
+    {
+      "name": "等级优先级由规则给出：反过来声明则取另一个",
+      "input": {
+        "sourceSheet": "表1",
+        "targetSheet": "表1",
+        "sourceRange": "A1:A1",
+        "targetRange": "C1:C1",
+        "sourceValues": [
+          [
+            "甲 乙"
+          ]
+        ],
+        "mapping": {
+          "甲": "壹",
+          "乙": "贰"
+        },
+        "blankLabel": "空",
+        "delimiters": [
+          " "
+        ],
+        "valueRank": [
+          {
+            "value": "乙",
+            "rank": 1
+          },
+          {
+            "value": "甲",
+            "rank": 0
+          }
+        ]
+      },
+      "expected": [
+        [
+          "贰"
+        ]
+      ]
+    },
+    {
+      "name": "未声明等级时按映射表声明顺序取先者",
+      "input": {
+        "sourceSheet": "表1",
+        "targetSheet": "表1",
+        "sourceRange": "A1:A1",
+        "targetRange": "C1:C1",
+        "sourceValues": [
+          [
+            "乙 甲"
+          ]
+        ],
+        "mapping": {
+          "甲": "壹",
+          "乙": "贰"
+        },
+        "blankLabel": "空",
+        "delimiters": [
+          " "
+        ],
+        "valueRank": []
+      },
+      "expected": [
+        [
+          "壹"
+        ]
+      ]
+    },
+    {
+      "name": "多个声明分隔符并存时，取最先出现的那个切分",
+      "input": {
+        "sourceSheet": "表1",
+        "targetSheet": "表1",
+        "sourceRange": "A1:A1",
+        "targetRange": "C1:C1",
+        "sourceValues": [
+          [
+            "甲-乙|丙"
+          ]
+        ],
+        "mapping": {
+          "甲": "壹",
+          "乙": "贰",
+          "丙": "叁",
+          "乙|丙": "合"
+        },
+        "blankLabel": "空",
+        "delimiters": [
+          "|",
+          "-"
+        ],
+        "valueRank": [
+          {
+            "value": "丙",
+            "rank": 2
+          },
+          {
+            "value": "乙",
+            "rank": 1
+          },
+          {
+            "value": "甲",
+            "rank": 0
+          }
+        ]
+      },
+      "expected": [
+        [
+          "壹"
+        ]
+      ],
+      "_note": "切分取最先出现的分隔符；未声明 rank 的项低于已声明 rank 的项。"
+    },
+    {
+      "name": "候选分隔符只认声明过的写法：全角写法未被声明，不当作切分点",
+      "input": {
+        "sourceSheet": "表1",
+        "targetSheet": "表1",
+        "sourceRange": "A1:A1",
+        "targetRange": "C1:C1",
+        "sourceValues": [
+          [
+            "甲；乙"
+          ]
+        ],
+        "mapping": {
+          "甲": "壹",
+          "乙": "贰",
+          "甲；乙": "联"
+        },
+        "blankLabel": "空",
+        "delimiters": [
+          ";"
+        ],
+        "valueRank": [
+          {
+            "value": "乙",
+            "rank": 1
+          },
+          {
+            "value": "甲",
+            "rank": 0
+          }
+        ],
+        "undeclaredSeparators": [
+          "；"
+        ]
+      },
+      "expected": [
+        [
+          "联"
+        ]
+      ]
+    },
+    {
+      "name": "拆出的空项被忽略，不当作空白也不当作未知",
+      "input": {
+        "sourceSheet": "表1",
+        "targetSheet": "表1",
+        "sourceRange": "A1:A1",
+        "targetRange": "C1:C1",
+        "sourceValues": [
+          [
+            "甲  乙"
+          ]
+        ],
+        "mapping": {
+          "甲": "壹",
+          "乙": "贰"
+        },
+        "blankLabel": "空",
+        "delimiters": [
+          " "
+        ],
+        "valueRank": [
+          {
+            "value": "甲",
+            "rank": 1
+          },
+          {
+            "value": "乙",
+            "rank": 0
+          }
+        ]
+      },
+      "expected": [
+        [
+          "壹"
+        ]
+      ]
+    },
+    {
+      "name": "整格真空白仍走空白策略，不因声明了分隔符而改变",
+      "input": {
+        "sourceSheet": "表1",
+        "targetSheet": "表1",
+        "sourceRange": "A1:A2",
+        "targetRange": "C1:C2",
+        "sourceValues": [
+          [
+            null
+          ],
+          [
+            ""
+          ]
+        ],
+        "mapping": {
+          "甲": "壹"
+        },
+        "blankLabel": "空",
+        "delimiters": [
+          " "
+        ],
+        "valueRank": [
+          {
+            "value": "甲",
+            "rank": 1
+          }
+        ]
+      },
+      "expected": [
+        [
+          "空"
+        ],
+        [
+          "空"
+        ]
+      ]
+    },
+    {
+      "name": "显式映射项优先于拆分：整格原文直接命中时不拆",
+      "input": {
+        "sourceSheet": "表1",
+        "targetSheet": "表1",
+        "sourceRange": "A1:A1",
+        "targetRange": "C1:C1",
+        "sourceValues": [
+          [
+            "甲 乙"
+          ]
+        ],
+        "mapping": {
+          "甲 乙": "合",
+          "甲": "壹",
+          "乙": "贰"
+        },
+        "blankLabel": "空",
+        "delimiters": [
+          " "
+        ],
+        "valueRank": [
+          {
+            "value": "甲",
+            "rank": 1
+          },
+          {
+            "value": "乙",
+            "rank": 0
+          }
+        ]
+      },
+      "expected": [
+        [
+          "合"
+        ]
+      ]
+    },
+    {
+      "name": "已声明分隔符拆开后出现未覆盖项：归因于类别映射缺口",
+      "input": {
+        "sourceSheet": "表1",
+        "targetSheet": "表1",
+        "sourceRange": "A1:A1",
+        "targetRange": "C1:C1",
+        "sourceValues": [
+          [
+            "甲 丙"
+          ]
+        ],
+        "mapping": {
+          "甲": "壹"
+        },
+        "blankLabel": "空",
+        "delimiters": [
+          " "
+        ],
+        "valueRank": [
+          {
+            "value": "甲",
+            "rank": 1
+          }
+        ]
+      },
+      "error": "categoriesUnknown",
+      "unmatchedItems": [
+        "丙"
+      ]
+    },
+    {
+      "name": "已声明分隔符拆开后各项都未覆盖：仍归因于类别映射缺口，未覆盖项列全",
+      "input": {
+        "sourceSheet": "表1",
+        "targetSheet": "表1",
+        "sourceRange": "A1:A1",
+        "targetRange": "C1:C1",
+        "sourceValues": [
+          [
+            "丙 丁"
+          ]
+        ],
+        "mapping": {
+          "甲": "壹"
+        },
+        "blankLabel": "空",
+        "delimiters": [
+          " "
+        ],
+        "valueRank": [
+          {
+            "value": "甲",
+            "rank": 1
+          }
+        ]
+      },
+      "error": "categoriesUnknown",
+      "unmatchedItems": [
+        "丙",
+        "丁"
+      ]
+    },
+    {
+      "name": "未命中且疑似用了其他分隔符：提示可能是分隔符或映射缺口，不自行切分",
+      "input": {
+        "sourceSheet": "表1",
+        "targetSheet": "表1",
+        "sourceRange": "A1:A2",
+        "targetRange": "C1:C2",
+        "sourceValues": [
+          [
+            "甲/乙"
+          ],
+          [
+            "甲"
+          ]
+        ],
+        "mapping": {
+          "甲": "壹",
+          "乙": "贰"
+        },
+        "blankLabel": "空",
+        "delimiters": [
+          " "
+        ],
+        "valueRank": [
+          {
+            "value": "甲",
+            "rank": 1
+          },
+          {
+            "value": "乙",
+            "rank": 0
+          }
+        ],
+        "undeclaredSeparators": [
+          "/"
+        ]
+      },
+      "error": "needsClarification",
+      "unresolvedCells": [
+        "甲/乙"
+      ]
+    },
+    {
+      "name": "未命中且不含任何分隔形式：归因于类别映射缺口",
+      "input": {
+        "sourceSheet": "表1",
+        "targetSheet": "表1",
+        "sourceRange": "A1:A1",
+        "targetRange": "C1:C1",
+        "sourceValues": [
+          [
+            "丙"
+          ]
+        ],
+        "mapping": {
+          "甲": "壹"
+        },
+        "blankLabel": "空",
+        "delimiters": [
+          " "
+        ],
+        "valueRank": [
+          {
+            "value": "甲",
+            "rank": 1
+          }
+        ]
+      },
+      "error": "categoriesUnknown",
+      "unmatchedItems": [
+        "丙"
+      ]
+    },
+    {
+      "name": "源区域真的有空白且未指定策略：要求澄清，不替用户挑默认标签",
+      "input": {
+        "sourceSheet": "表1",
+        "targetSheet": "表1",
+        "sourceRange": "A1:A2",
+        "targetRange": "C1:C2",
+        "sourceValues": [
+          [
+            "甲"
+          ],
+          [
+            null
+          ]
+        ],
+        "mapping": {
+          "甲": "一"
+        },
+        "blankLabel": ""
+      },
+      "error": "blankPolicy"
+    },
+    {
+      "name": "保留目标原值：空白位置被排除出写入范围，不是写空值",
+      "input": {
+        "sourceSheet": "表1",
+        "targetSheet": "表1",
+        "sourceRange": "A1:A3",
+        "targetRange": "C1:C3",
+        "sourceValues": [
+          [
+            "甲"
+          ],
+          [
+            null
+          ],
+          [
+            "乙"
+          ]
+        ],
+        "mapping": {
+          "甲": "一",
+          "乙": "二"
+        },
+        "blankLabel": "",
+        "blankPolicy": {
+          "kind": "keep"
+        }
+      },
+      "expectedActions": [
+        {
+          "type": "writeValues",
+          "range": "C1:C1",
+          "values": [
+            [
+              "一"
+            ]
+          ]
+        },
+        {
+          "type": "writeValues",
+          "range": "C3:C3",
+          "values": [
+            [
+              "二"
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "name": "清空目标：空白位置走 clearRange:contents，不是写空串",
+      "input": {
+        "sourceSheet": "表1",
+        "targetSheet": "表1",
+        "sourceRange": "A1:A3",
+        "targetRange": "C1:C3",
+        "sourceValues": [
+          [
+            "甲"
+          ],
+          [
+            null
+          ],
+          [
+            "乙"
+          ]
+        ],
+        "mapping": {
+          "甲": "一",
+          "乙": "二"
+        },
+        "blankLabel": "",
+        "blankPolicy": {
+          "kind": "clear"
+        }
+      },
+      "expectedActions": [
+        {
+          "type": "writeValues",
+          "range": "C1:C1",
+          "values": [
+            [
+              "一"
+            ]
+          ]
+        },
+        {
+          "type": "clearRange",
+          "range": "C2:C2",
+          "applyTo": "contents"
+        },
+        {
+          "type": "writeValues",
+          "range": "C3:C3",
+          "values": [
+            [
+              "二"
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "name": "显式写空字符串：与清空、跳过三者互不相同",
+      "input": {
+        "sourceSheet": "表1",
+        "targetSheet": "表1",
+        "sourceRange": "A1:A3",
+        "targetRange": "C1:C3",
+        "sourceValues": [
+          [
+            "甲"
+          ],
+          [
+            null
+          ],
+          [
+            "乙"
+          ]
+        ],
+        "mapping": {
+          "甲": "一",
+          "乙": "二"
+        },
+        "blankLabel": "",
+        "blankPolicy": {
+          "kind": "value",
+          "value": ""
+        }
+      },
+      "expected": [
+        [
+          "一"
+        ],
+        [
+          ""
+        ],
+        [
+          "二"
+        ]
+      ]
+    },
+    {
+      "name": "空白策略写指定值：与旧 blankLabel 语义一致",
+      "input": {
+        "sourceSheet": "表1",
+        "targetSheet": "表1",
+        "sourceRange": "A1:A2",
+        "targetRange": "C1:C2",
+        "sourceValues": [
+          [
+            "甲"
+          ],
+          [
+            null
+          ]
+        ],
+        "mapping": {
+          "甲": "一"
+        },
+        "blankLabel": "",
+        "blankPolicy": {
+          "kind": "value",
+          "value": "未分类"
+        }
+      },
+      "expected": [
+        [
+          "一"
+        ],
+        [
+          "未分类"
+        ]
+      ]
     }
   ]
 }

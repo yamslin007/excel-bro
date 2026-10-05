@@ -7,6 +7,7 @@ import re
 import time
 import uuid
 from collections.abc import Awaitable, Callable
+from functools import lru_cache
 from typing import Any
 
 from pydantic import ValidationError
@@ -30,8 +31,12 @@ from .action_capability import (
     parse_host_id,
     resolve_host_action_bound,
 )
-from .capabilities import capabilities, capability_float, capability_int
+from .capabilities import capabilities, capability_float, capability_int, capability_optional_int
 from .column_mapping import (
+    BlankPolicyNeededError,
+    DEFAULT_MAX_MAPPING_ACTIONS,
+    NeedsClarificationError,
+    UnmappedCategoryError,
     build_column_mapping_actions,
     validate_column_mapping_shape,
 )
@@ -40,18 +45,34 @@ from .models import (
     AnalysisPlan,
     AnswerResponse,
     AssistantResponse,
+    BlankPolicy,
+    ColumnMappingClarification,
     ColumnMappingPair,
     ColumnMappingRule,
+    IntentClarification,
+    IntentClarificationResponse,
     LocalPlanRuleResponse,
     PlanRequest,
     PlanResponse,
     ResultContext,
 )
 
+MAX_MAPPING_SPLIT_ACTIONS = capability_int("columnMapping", "maxSplitActions")
+
+
+def _max_mapping_split_actions() -> int:
+    """单次列映射预览允许拆成的最大写入段数。
+
+    配置读不到时退回 `DEFAULT_MAX_MAPPING_ACTIONS`，而不是"不限" ——
+    不设上限会让"保留原值"把一列拆成几百个动作，验收与撤销都不可控。
+    """
+    return MAX_MAPPING_SPLIT_ACTIONS or DEFAULT_MAX_MAPPING_ACTIONS
+
+
 MAX_READ_ROWS = capability_int("agent", "maxReadRows")
 MAX_READ_COLUMNS = capability_int("agent", "maxReadColumns")
-MAX_OUTPUT_TOKENS = capability_int("agent", "maxOutputTokens")
-REPAIR_MAX_OUTPUT_TOKENS = capability_int("agent", "repairMaxOutputTokens")
+MAX_OUTPUT_TOKENS = capability_optional_int("agent", "maxOutputTokens")
+REPAIR_MAX_OUTPUT_TOKENS = capability_optional_int("agent", "repairMaxOutputTokens")
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +81,7 @@ def _default_loop_config() -> LoopConfig:
     """从共享能力配置构造生产环境 Agent 循环限额。"""
     return LoopConfig(
         max_turns=capability_int("agent", "maxTurns"),
-        max_total_tokens=capability_int("agent", "maxTotalTokens"),
+        max_total_tokens=capability_optional_int("agent", "maxTotalTokens"),
         max_wall_time_seconds=capability_float(
             "taskRecovery", "planningHardWallTimeSeconds"
         ),
@@ -136,13 +157,47 @@ map_column_values，**不要**自己逐格抄写再提交 writeValues。你只�
 而这两种错误在单元格层面都看不出来。用户没说空白单元格写什么，或来源值未
 被规则覆盖时，先问清楚，不要替用户决定。
 
+map_column_values 的匹配顺序是**先整格、后拆分**：
+
+1. 整格精确匹配优先：来源单元格整体是一个已知值（无论它看起来是否含分隔符），
+   就直接用这条映射，不拆分。"甲 乙"整格就是映射表里的键时，结果取它。
+2. 整格没命中、且规则声明了分隔符时，只按**已声明的**分隔符拆分（多个候选时
+   按在格中出现位置最靠前者切分），逐项去首尾空格后**按完整名称精确匹配**，
+   命中项之间取规则指定的**最高级**（`valueRank` 里 rank 最大者）。
+   注意 `rank` 表达的是**优先级**，不是等级名的字面数字：用户说更严重/更优先的
+   等级必须给更大的 rank。等级名里带数字时（命名习惯常与严重程度反向），
+   千万不要照抄成 rank —— 填反了不会报错，只会安静地取到较低的那个等级。
+3. 拆出来的项在映射表里找不到 → 归因**确定**是"类别没覆盖"：让用户
+   **补充类别映射**即可，不要说成"分隔形式没声明"去混淆。
+4. 整格没命中、又看得出格子里像有别的分隔写法（`undeclaredSeparators` 里
+   登记过的那种）→ 归因**不确定**：只能说"可能需要补充分隔符、或补充映射"，
+   **不要**替用户判定到底是哪一种，更**不要**自己拿一个没声明过的写法去拆。
+
+也就是说：`delimiters` 与 `valueRank` 必须**成对**给出。只声明分隔符、不说拆分后
+取哪一个，本工具会判定规则不完整并返回澄清，而不按映射表顺序硬排一个顺序
+（那个顺序是给模型的声明顺序，不代表用户说的优先级）。
+
+- 用户没讲清楚"格子里的多个值怎么处理"时，先 submit_clarification 问清楚
+  （是否按分隔符拆分、按哪个分隔符、拆分后取哪一个），拿到确切答复后再调用；
+  不要用未经确认的假设直接产出映射计划，也不要自行决定拆分后写哪一个
+  （例如全部写出、取其一、取某种"最高级"）。
+- 澄清要**一次说清**：把未命中的项合并成一条问题抛出，不要逐行、逐格地反复问。
+- "某个具体来源值 → 某个具体目标标签"这类显式对应项照常工作，不要因为这条
+  提示就把已经明确的单值映射也一并拿去澄清。
+
 - 若请求包含“本地数据工具结果”，该结果由 Excel 端对用户授权范围进行确定性
   计算，可以直接引用它的 headers、rows、calculation 和完整性标记来**回答问题**
   （submit_answer），不必再调 read_range 重复读取，也不要自行改变计算口径。
   但要**写回工作表**时，不要把这些 rows 当静态值塞进 writeValues —— 改用
   computeValues 复述同一套查询条件，让 Excel 在执行时重算。
 
-完成分析后优先调用 submit_plan 或 submit_answer。若模型不支持工具调用，也可以
+缺少用户决定时必须调用 submit_clarification，不要把问题写进 submit_answer。
+fields 为每项必须补充的信息提供一个独立输入框（id、label、placeholder）；
+有明确可选方案时提供 options，否则 options 用空数组。只问影响当前结果的关键
+缺口，不重复询问用户已说明的内容，不为尚未观察到的假想异常阻塞全部任务。
+submit_answer 仅用于无需用户补充信息的最终回答；澄清不会写入或执行任何计划。
+
+完成分析后优先调用 submit_plan、submit_clarification 或 submit_answer。若模型不支持工具调用，也可以
 直接返回符合 AssistantResponse JSON Schema 的 JSON。
 """.strip()
 
@@ -340,6 +395,25 @@ def _snapshot_region(
     return sheet, values
 
 
+def _round_trip_display(value: str) -> str:
+    """把 JSON 式转义还原成用户能读的原文（`\\n` → 换行、`\\t` → 制表符）。
+
+    为什么需要这一步：快照里的字符串来自 Excel/WPS 的 JSON 通道，换行会被
+    转义成字面量 `\\n`。映射**匹配**用的必须是原样字符串（否则拆分与精确
+    匹配都会错位），但报给用户看的必须是真换行 —— 否则澄清卡里会出现
+    `"甲\n乙"` 这种给人读的 JSON，用户看不出那几个字符是什么。
+    """
+    if "\\" not in value:
+        return value
+    try:
+        # `unicode_escape` 会把非 ASCII 也一并转走，所以先按 latin-1 往返
+        # 保住原有码点，再只让转义序列生效。
+        return value.encode("latin-1", "backslashreplace").decode("unicode_escape")
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        # 还原失败不是错误路径：原文照旧展示即可，绝不因为展示而改变匹配结果。
+        return value
+
+
 def _mapping_from_pairs(pairs: Any) -> dict[str, str]:
     """把 `[{from,to}]` 折成映射表。
 
@@ -364,6 +438,151 @@ def _mapping_from_pairs(pairs: Any) -> dict[str, str]:
             )
         mapping[source] = target
     return mapping
+
+
+def _string_list(value: Any) -> list[str]:
+    """把模型给的字符串列表归一：非列表/含非字符串项一律报错，不做宽容转换。
+
+    静默丢掉一个类型不对的项（比如把 `[1, "、"]` 里的数字忽略）会让规则
+    与模型的原意不一致，而这种不一致在单元格层面看不出来。
+    """
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("分隔符参数必须是字符串列表。")
+    items: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item:
+            raise ValueError("分隔符参数里每一项都必须是非空字符串。")
+        items.append(item)
+    return items
+
+
+def _rank_entries(value: Any) -> list[dict[str, Any]]:
+    """把 `[{value, rank}]` 归一。`rank` 只要求是数字，不约束取值范围。
+
+    等级**由规则数据给出**，服务端不认识任何具体等级名，也不该给数值
+    附加含义（越大越优先是 core 的约定，规则只需一致地提供它）。
+    """
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("等级次序参数必须是 {value, rank} 列表。")
+    entries: list[dict[str, Any]] = []
+    for entry in value:
+        if not isinstance(entry, dict):
+            raise ValueError("等级次序的每一项都要是 {value, rank} 对象。")
+        item = entry.get("value")
+        rank = entry.get("rank")
+        if not isinstance(item, str) or not item:
+            raise ValueError("等级次序每一项的 value 都必须是非空字符串。")
+        if isinstance(rank, bool) or not isinstance(rank, (int, float)):
+            raise ValueError("等级次序每一项的 rank 都必须是数字。")
+        entries.append({"value": item, "rank": rank})
+    return entries
+
+
+def _blank_policy_argument(
+    raw: Any, blank_label: str
+) -> dict[str, Any] | None:
+    """空白策略参数归一。
+
+    `blankPolicy` 优先；没给时才按旧字段 `blankLabel` 折 —— 非空串等价于
+    `{kind:"value"}`，语义与旧版逐格一致。**两者都没有时返回 None（未定）**，
+    不是错误。
+    """
+    if isinstance(raw, dict):
+        return BlankPolicy.model_validate(raw).model_dump(mode="json")
+    if blank_label:
+        return {"kind": "value", "value": blank_label}
+    return None
+
+
+def _blank_policy_summary(policy: dict[str, Any] | None) -> str:
+    """给 `assumptions` 用的一句话。**未定时不写任何"空白按 X 处理"。**"""
+    if not policy:
+        return "源列空白的处理方式尚未确定（本次未读到空白，或等用户选择）。"
+    kind = policy.get("kind")
+    if kind == "keep":
+        return "源列空白：保留目标原值，那个位置不写入。"
+    if kind == "clear":
+        return "源列空白：清空目标内容。"
+    if kind == "value":
+        rendered = policy.get("value", "")
+        if rendered == "":
+            return "源列空白：显式写入空字符串。"
+        return f"源列空白写入「{rendered}」。"
+    return "源列空白的处理方式尚未确定。"
+
+
+def _clarification_rule_response(
+    *,
+    model_arguments: dict[str, Any],
+    source_sheet_name: str,
+    target_sheet_name: str,
+    source_range: str,
+    target_range: str,
+    mapping: dict[str, str],
+    blank_label: str | None,
+    reason: str,
+    message: str,
+    unresolved_count: int,
+    resolved_by: list[str],
+    missing_categories: list[str] | None = None,
+    blank_policy: dict[str, Any] | None = None,
+    blank_cell_count: int = 0,
+    delimiters: list[str] | None = None,
+    undeclared_separators: list[str] | None = None,
+    value_rank: list[dict[str, Any]] | None = None,
+    display_values: bool = False,
+) -> LocalPlanRuleResponse:
+    """"规则不全"时的响应：下发规则 + `clarification`，**不下发任何计划**。
+
+    不返回可执行计划是刻意的：归因已经确定"现在算不出正确答案"，
+    返回一份建立在猜测之上的矩阵，等于把猜测伪装成结果 —— 用户会以为
+    它是对的，而分歧已经静默流进下游统计。
+
+    `message` 里**不嵌入来源格的原始内容**：那属于客户端本地数据，
+    走到这里就破坏了"源值不上传"。界面要展示原文，从本端读。
+
+    `display_values=True` 只用在**已经生成本地提示文案**的场合：
+    此时 `missing_categories` 只是写入 `clarification`、给客户端界面
+    列"还要补哪些类别"用的，不参与任何匹配，所以转义序列可以还原成
+    可读原文。未覆盖项**参与匹配时**一律保持原样字符串。
+    """
+    rendered_missing = [
+        _round_trip_display(item) if display_values else item
+        for item in (missing_categories or [])
+    ]
+    return LocalPlanRuleResponse(
+        provider="model",
+        rule=ColumnMappingRule(
+            sourceSheet=source_sheet_name,
+            targetSheet=target_sheet_name,
+            sourceRange=source_range,
+            targetRange=target_range,
+            mapping=[
+                ColumnMappingPair(source=source, target=target)
+                for source, target in mapping.items()
+            ],
+            blankLabel=blank_label,
+            blankPolicy=blank_policy,
+            delimiters=delimiters or [],
+            valueRank=value_rank or [],
+            undeclaredSeparators=undeclared_separators or [],
+            clarification=ColumnMappingClarification(
+                reason=reason,
+                message=message,
+                missingCategories=rendered_missing,
+                unresolvedCellCount=unresolved_count,
+                blankCellCount=blank_cell_count,
+                resolvedBy=resolved_by,
+            ),
+        ),
+        summary=message,
+        warnings=["本次没有生成计划，工作表未被改动。"],
+        assumptions=[],
+    )
 
 
 def _map_column_plan(
@@ -404,15 +623,51 @@ def _map_column_plan(
     source_range = str(arguments.get("sourceRange", "")).strip().upper().replace("$", "")
     target_range = str(arguments.get("targetRange", "")).strip().upper().replace("$", "")
     mapping = _mapping_from_pairs(arguments.get("mapping"))
-    blank_label = str(arguments.get("blankLabel", "")).strip()
-    if not blank_label:
-        raise ValueError(
-            "blankLabel 不能为空：源列存在空白单元格时，必须先确定它们写入什么。"
+    blank_label = str(arguments.get("blankLabel") or "").strip()
+    # **不再**因为没给空白标签就直接拒：那是"还没读源值就先问空白怎么办"的根源。
+    # 策略未定时，只有真的读到空白格才升级为一次澄清（见下方 BlankPolicyNeededError）。
+    blank_policy = _blank_policy_argument(arguments.get("blankPolicy"), blank_label)
+    # 多值语义的三组参数都是**规则数据**，服务端只做类型归一与去空，
+    # 不在这里判断"该用哪个分隔符、哪个等级更高"——那是规则的语义。
+    # 服务端不认识任何具体分隔符字面量，也不认识任何等级名。
+    delimiters = _string_list(arguments.get("delimiters"))
+    undeclared_separators = _string_list(arguments.get("undeclaredSeparators"))
+    value_rank = _rank_entries(arguments.get("valueRank"))
+    # 声明了分隔符却没有任何等级次序时，拆分后"取哪一个"没有确定答案。
+    # 这是**规则不全**，不是计算能兜的：交给模型回去问清楚，
+    # 而不是在这里按 mapping 顺序硬排一个 —— 那个顺序是模型给的，
+    # 不代表用户说的优先级。
+    #
+    # 这条检查必须排在 `planningReadPolicy` 分叉**之前**：两个分支用的是
+    # 同一份 core 实现，规则不全时**两侧都算不出来**。若只在 `ifNeeded`
+    # 分支拦，`"none"` 分支会把残缺规则原样下发，客户端拿到后按 mapping
+    # 顺序硬排 —— 同一个错误在一条通道上被拦、在另一条上被静默执行。
+    if delimiters and not value_rank:
+        return _clarification_rule_response(
+            model_arguments=arguments,
+            source_sheet_name=source_sheet.name,
+            target_sheet_name=target_sheet,
+            source_range=source_range,
+            target_range=target_range,
+            mapping=mapping,
+            blank_label=blank_label,
+            blank_policy=blank_policy,
+            reason="unresolvedSeparatorOrMapping",
+            message=(
+                "这条规则声明了分隔符，但没有说明拆分后应当取哪一个，"
+                "无法确定多值单元格的结果。请先向用户确认："
+                "同一格里的多个值按哪个分隔符拆分、拆分后取哪一个"
+                "（或按什么顺序判断哪一个优先）。"
+            ),
+            unresolved_count=0,
+            resolved_by=["specifyOtherDelimiter", "addCategories"],
+            delimiters=delimiters,
+            undeclared_separators=undeclared_separators,
         )
 
     assumptions = [
         f"映射规则共 {len(mapping)} 条，全部来自本次需求，未自行补充。",
-        f"源列空白按「{blank_label}」处理。",
+        _blank_policy_summary(blank_policy),
     ]
     warnings = [
         f"写入的是按当前源数据查表得到的固定值；"
@@ -445,30 +700,123 @@ def _map_column_plan(
                     ColumnMappingPair(source=source, target=target)
                     for source, target in mapping.items()
                 ],
-                blankLabel=blank_label,
+                blankLabel=blank_label or None,
+                blankPolicy=blank_policy,
+                delimiters=delimiters,
+                valueRank=value_rank,
+                undeclaredSeparators=undeclared_separators,
             ),
             summary=(
                 f"按 {len(mapping)} 条映射规则，把「{source_sheet.name}」"
                 f"{source_range}（{rows}×{columns}）写入「{target_sheet}」"
-                f"{target_range}；空白单元格写「{blank_label}」。"
+                f"{target_range}。"
+                f"{_blank_policy_summary(blank_policy)}"
                 "源值不上传，由本端读取并计算。"
             ),
             assumptions=assumptions,
-            warnings=warnings,
+            # 客户端还未读取源值，也未决定能否安全试算公式；此时不能宣称一定写固定值。
+            warnings=warnings[1:],
         )
 
     source_sheet, source_values = _snapshot_region(
         request, source_sheet_name, str(arguments.get("sourceRange", ""))
     )
-    actions = build_column_mapping_actions(
-        source_sheet=source_sheet.name,
-        target_sheet=target_sheet,
-        source_range=source_range,
-        target_range=target_range,
+    try:
+        actions = build_column_mapping_actions(
+            source_sheet=source_sheet.name,
+            target_sheet=target_sheet,
+            source_range=source_range,
+            target_range=target_range,
         source_values=source_values,
         mapping=mapping,
         blank_label=blank_label,
+        blank_policy=blank_policy,
+        delimiters=delimiters,
+        value_rank=value_rank,
+        undeclared_separators=undeclared_separators,
+        max_split_actions=_max_mapping_split_actions(),
     )
+    except BlankPolicyNeededError as error:
+        # **读到源值之后**才确认"确实有空白"，且策略未定 → 结构化澄清。
+        # 四个选项由客户端按 `reason` 推导，服务端不替用户挑默认值。
+        return _clarification_rule_response(
+            model_arguments=arguments,
+            source_sheet_name=source_sheet.name,
+            target_sheet_name=target_sheet,
+            source_range=source_range,
+            target_range=target_range,
+            mapping=mapping,
+            blank_label=None,
+            blank_policy=None,
+            blank_cell_count=error.blank_count,
+            reason="blankPolicyNeeded",
+            message=(
+                f"源区域读出来有 {error.blank_count} 个空白格，"
+                "但你还没说这些位置的目标格应当怎么处理。请选择一种做法："
+                "保留目标原值（这些位置不写入）/ 清空目标内容 / 写入指定值 / "
+                "显式写入空字符串。"
+            ),
+            unresolved_count=0,
+            resolved_by=[
+                "keepTarget",
+                "clearTarget",
+                "writeBlankValue",
+                "writeEmptyString",
+            ],
+            delimiters=delimiters,
+            undeclared_separators=undeclared_separators,
+            value_rank=value_rank,
+        )
+    except NeedsClarificationError as error:
+        # 归因**不确定**（可能是分隔符没声明全，也可能是缺类别）：
+        # 不返回计划，把归因与候选动作交给客户端，让用户选。
+        # 原文留在服务端这边也不下发 —— 客户端有自己的源值，能就地展示。
+        return _clarification_rule_response(
+            model_arguments=arguments,
+            source_sheet_name=source_sheet.name,
+            target_sheet_name=target_sheet,
+            source_range=source_range,
+            target_range=target_range,
+            mapping=mapping,
+            blank_label=blank_label,
+            reason="unresolvedSeparatorOrMapping",
+            message=error.args[0] if error.args else "有单元格无法归类，需要先澄清。",
+            unresolved_count=len(error.cells),
+            resolved_by=[
+                "specifyOtherDelimiter",
+                "addCategories",
+                "treatWholeCellAsCategory",
+            ],
+            delimiters=delimiters,
+            undeclared_separators=undeclared_separators,
+            value_rank=value_rank,
+            display_values=True,
+        )
+    except UnmappedCategoryError as error:
+        # 归因**确定**是类别缺口（已按声明的分隔符拆开）。给确定的那一条
+        # 补救动作，不把"补充分隔符"这类无关选项塞进去误导用户。
+        missing = [_round_trip_display(str(item)) for item in error.values]
+        return _clarification_rule_response(
+            model_arguments=arguments,
+            source_sheet_name=source_sheet.name,
+            target_sheet_name=target_sheet,
+            source_range=source_range,
+            target_range=target_range,
+            mapping=mapping,
+            blank_label=blank_label,
+            reason="matchedDelimiterMissingCategories",
+            message=(
+                "以下类别不在映射表内，已按规则声明的分隔符拆分后仍未找到对应标签："
+                f"{'、'.join(missing)}。请补充这些类别的映射后重试。"
+            ),
+            unresolved_count=0,
+            resolved_by=["addCategories"],
+            missing_categories=missing,
+            delimiters=delimiters,
+            undeclared_separators=undeclared_separators,
+            value_rank=value_rank,
+            display_values=True,
+        )
     plan = AnalysisPlan.model_validate(
         {
             "id": f"map-column-{uuid.uuid4().hex[:10]}",
@@ -476,8 +824,8 @@ def _map_column_plan(
             "summary": (
                 f"读取「{source_sheet.name}」{source_range} 的 "
                 f"{len(source_values)} 行，按 {len(mapping)} 条映射规则"
-                f"写入「{target_sheet}」{target_range}；"
-                f"空白单元格写「{blank_label}」。"
+                f"写入「{target_sheet}」{target_range}。"
+                f"{_blank_policy_summary(blank_policy)}"
             ),
             "assumptions": assumptions,
             "warnings": warnings,
@@ -773,9 +1121,18 @@ def _terminal_tools() -> list[dict[str, Any]]:
                 "description": (
                     "按用户给定的对应关系把一列的值翻译成另一列的标签（分类、"
                     "归类、打标签、编码转名称等）。你只提供映射规则与区域，"
-                    "**目标值由服务端逐格算出**，不要自己抄写结果，也不要改用 "
-                    "writeValues 手填。来源值未列在 mapping 里时会报错并列出"
-                    "缺失的值——补全规则或向用户确认，不要自行归类。"
+                    "**目标值由确定性代码逐格算出**，不要自己抄写结果，也不要改用 "
+                    "writeValues 手填。"
+                    "来源格默认按**整格**匹配。只有当同一格确实可能含多个值、"
+                    "且用户已经讲清楚怎么处理时，才填 delimiters 与 valueRank："
+                    "delimiters 是用户确认过的分隔符写法（按出现位置切分），"
+                    "valueRank 说明拆分后取哪一个（rank 大者优先）。"
+                    "两者必须**同时**给出，只给 delimiters 表达不了'取哪一个'，"
+                    "本条规则会被判为不完整并要求先澄清。"
+                    "undeclaredSeparators 用来登记'用户提到过、但还没确认能用来"
+                    "拆分'的写法；拆分后仍有未覆盖的类别、或整格看不出分隔方式时，"
+                    "本条工具会返回澄清而不是猜测的结果。"
+                    "遇到说不清的地方先用 submit_clarification 问，不要自行假设。"
                 ),
                 "parameters": {
                     "type": "object",
@@ -795,7 +1152,10 @@ def _terminal_tools() -> list[dict[str, Any]]:
                         },
                         "mapping": {
                             "type": "array",
-                            "description": "用户给出的全部对应关系，不要自行补充。",
+                            "description": (
+                                "用户给出的全部对应关系，不要自行补充。每项把一个"
+                                "来源值（整格或拆分后的单项）映射到一个目标标签。"
+                            ),
                             "items": {
                                 "type": "object",
                                 "properties": {
@@ -809,18 +1169,106 @@ def _terminal_tools() -> list[dict[str, Any]]:
                         "blankLabel": {
                             "type": "string",
                             "description": (
-                                "来源为空白时写入的标签。用户没说就先用 "
-                                "submit_answer 问清楚，不要擅自取值。"
+                                "（旧字段，优先用 blankPolicy）来源为空白时写入的标签。"
+                                "**不要为了填它而先去问用户**：源列到底有没有空白，"
+                                "工具读到源值之后才知道。没有空白时它用不上；"
+                                "真有空白且你不知道该写什么，就省略它，工具会返回"
+                                "一张结构化的空白处理澄清卡让用户自己选。"
+                            ),
+                        },
+                        "blankPolicy": {
+                            "type": "object",
+                            "description": (
+                                "来源为空白时怎么处理。四种取值："
+                                '{"kind":"keep"} = 保留目标原值（那个位置不写入）；'
+                                '{"kind":"clear"} = 清空目标内容；'
+                                '{"kind":"value","value":"…"} = 写入指定值'
+                                "（value 可以是空串，表示显式写空字符串）；"
+                                '{"kind":"undecided"} = 还没定。'
+                                "**用户没提空白就整个省略这个字段**，不要替他猜；"
+                                "源列真有空白且策略未定时，工具会返回澄清卡让他选，"
+                                "不会静默写任何默认值。"
+                            ),
+                            "properties": {
+                                "kind": {
+                                    "type": "string",
+                                    "enum": ["keep", "clear", "value", "undecided"]
+                                },
+                                "value": {"type": "string"}
+                            },
+                            "required": ["kind"],
+                            "additionalProperties": False,
+                        },
+                        "delimiters": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": (
+                                "用户确认过的分隔符写法，按出现位置取最靠前的那个"
+                                "切分。**必须与 valueRank 一起给**。不要自行编造"
+                                "分隔符；用户没提过就省略或用 submit_clarification 问。"
+                            ),
+                        },
+                        "valueRank": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "value": {"type": "string"},
+                                    "rank": {
+                                        "type": "number",
+                                        "description": (
+                                            "优先级数值，**越大越优先**。"
+                                            "用户说更严重/更高级/更优先的那个等级，"
+                                            "rank 必须给得更大。"
+                                        ),
+                                    },
+                                },
+                                "required": ["value", "rank"],
+                                "additionalProperties": False,
+                            },
+                            "description": (
+                                "拆分后取哪一个：rank 越大的越优先。等级名称与"
+                                "数值都由用户给出，不要自己发明顺序。"
+                                "**方向极易填反，务必按用户的优先级而不是按等级名**："
+                                "等级名里若带数字，那个数字的大小与优先级方向**可能相反**"
+                                "（名字里的 0 未必是 rank 0），不要拿它当 rank。"
+                                "例：用户说「甲比乙严重」，正确写法是 "
+                                '[{"value":"甲","rank":1},{"value":"乙","rank":0}]；'
+                                "写成反过来就会取到乙。"
+                            ),
+                        },
+                        "undeclaredSeparators": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": (
+                                "用户提到过、但尚未确认能否用来拆分的分隔写法。"
+                                "登记它们能让'这格到底算不算多值'变成一次明确的"
+                                "澄清，而不是由实现去猜。"
                             ),
                         },
                     },
+                    # `blankLabel` / `blankPolicy` **都不在必填里**：
+                    # 把它们列为必填，会逼模型在读到源值之前先去问用户
+                    # "空白怎么办" —— 而多数源列根本没有空白。
                     "required": [
                         "sourceSheet",
                         "sourceRange",
                         "targetRange",
                         "mapping",
-                        "blankLabel",
                     ],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "submit_clarification",
+                "description": "缺少用户决定时提交可填写的澄清卡，不是普通文字回答。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"clarification": _strip_metadata(_inline_json_schema(IntentClarification.model_json_schema()))},
+                    "required": ["clarification"],
                     "additionalProperties": False,
                 },
             },
@@ -857,6 +1305,49 @@ PLAN_ONLY_TOOLS = [
     for tool in AGENT_TOOLS_WITH_DATA
     if tool.get("function", {}).get("name") == "submit_plan"
 ]
+
+
+@lru_cache(maxsize=1)
+def _action_schemas() -> dict[str, dict[str, Any]]:
+    items = _plan_tool_schema()["properties"]["actions"]["items"]
+    return {variant["properties"]["type"]["const"]: variant for variant in items["oneOf"]}
+
+
+def _select_plan_actions(request: PlanRequest, arguments: dict[str, Any]) -> list[str]:
+    selected = arguments.get("actionTypes")
+    available = set(_action_schemas())
+    if request.hostId:
+        available &= _allowed_action_types(request)
+    if (not isinstance(selected, list) or not selected or
+            any(not isinstance(item, str) or item not in available for item in selected)):
+        raise ValueError("必须选择当前宿主允许的动作类型")
+    return list(dict.fromkeys(selected))
+
+
+def _planning_tools(request: PlanRequest, template: list[dict[str, Any]], selected: list[str]) -> list[dict[str, Any]]:
+    """Model selects action types, not business fields. Backend plan validation stays complete."""
+    variants = _action_schemas()
+    available = sorted(set(variants) & _allowed_action_types(request)) if request.hostId else sorted(variants)
+    result = []
+    for tool in template:
+        if tool["function"]["name"] != "submit_plan":
+            result.append(tool)
+        elif selected or template is PLAN_ONLY_TOOLS:
+            projected = copy.deepcopy(tool)
+            projected["function"]["parameters"]["properties"]["plan"]["properties"]["actions"]["items"] = {
+                "anyOf": [variants[name] for name in selected] if selected else list(variants.values())
+            }
+            result.append(projected)
+    if template is not PLAN_ONLY_TOOLS and available:
+        result.append({"type": "function", "function": {
+            "name": "select_plan_actions",
+            "description": "仅在需要通用操作计划时选择动作类型，下一轮获得这些动作的完整参数。列映射优先直接用 map_column_values，不要先读源数据或选 writeValues。选择类型不执行、不授权任何写入。",
+            "parameters": {"type": "object", "properties": {"actionTypes": {
+                "type": "array", "minItems": 1, "maxItems": len(available),
+                "items": {"type": "string", "enum": available}
+            }}, "required": ["actionTypes"], "additionalProperties": False}
+        }})
+    return result
 
 
 def _normalize_submitted_plan(value: Any) -> Any:
@@ -937,6 +1428,8 @@ def _parse_content(content: str) -> AssistantResponse:
     payload = json.loads(text[start : end + 1])
     if payload.get("kind") == "answer":
         return AnswerResponse.model_validate({**payload, "provider": "model"})
+    if payload.get("kind") == "clarification":
+        return IntentClarificationResponse.model_validate({**payload, "provider": "model"})
     if payload.get("kind") == "plan":
         return PlanResponse.model_validate(
             {
@@ -951,6 +1444,10 @@ def _parse_content(content: str) -> AssistantResponse:
 def _execute_tool(
     request: PlanRequest, name: str, arguments: dict[str, Any]
 ) -> AssistantResponse | dict[str, Any]:
+    if name == "select_plan_actions":
+        return {"selectedActionTypes": _select_plan_actions(request, arguments), "next": "submit_plan"}
+    if request.planningReadPolicy == "none" and name in READONLY_TOOLS:
+        raise ValueError("本轮源值仅在客户端读取，不允许调用规划只读工具")
     if name == "get_workbook_context":
         return _workbook_context(request)
     if name == "find_fields":
@@ -976,6 +1473,11 @@ def _execute_tool(
             provider="model",
             message=str(arguments.get("message", "")),
             resultContext=arguments.get("resultContext"),
+        )
+    if name == "submit_clarification":
+        return IntentClarificationResponse(
+            provider="model", turnId=request.turnId,
+            clarification=IntentClarification.model_validate(arguments.get("clarification")),
         )
     raise ValueError(f"未知工具：{name}")
 
@@ -1074,7 +1576,7 @@ def _readonly_tool_facts(
 ) -> list[dict[str, str]]:
     payload = result if isinstance(result, dict) else {}
     facts: list[dict[str, str] | None] = [
-        _progress_fact("读取方式", "复用本轮结果" if cached else "实时读取")
+        _progress_fact("读取方式", "复用本轮快照结果" if cached else "读取请求快照（非宿主实时读取）")
     ]
     if name == "get_workbook_context":
         worksheets = payload.get("worksheets")
@@ -1346,12 +1848,14 @@ async def run_excel_agent(
         f"初始工作簿上下文：\n"
         f"{json.dumps(_workbook_context(request), ensure_ascii=False)}\n\n"
         f"上一轮结构化结果：\n"
-        f"{request.lastResult.model_dump_json() if request.lastResult else 'null'}\n\n"
+        f"{request.lastResult.model_dump_json() if request.lastResult and not (request.planningReadPolicy == 'none' and not request.dataResults) else 'null'}\n\n"
         f"本地数据工具结果：\n"
         f"{json.dumps([result.model_dump() for result in request.dataResults], ensure_ascii=False)}\n\n"
         + (
-            "用户已经从结构化确认选项中确定了最终口径；现有准确表头足以生成计划。"
-            "不得调用工作簿只读工具，直接提交计划。"
+            "本轮只发送表结构，源值留在客户端。列映射直接用 map_column_values 提交规则，"
+            "不得调用工作簿只读工具。"
+            "由客户端读取和计算；未知实际来源值与空白由本地工具发现后澄清，不要预先猜测。"
+            "通用动作先 select_plan_actions 获取所需参数，再 submit_plan。信息不足用 submit_clarification。"
             if request.planningReadPolicy == "none"
             else "请按需调用工具，不要猜测数据地址。"
         )
@@ -1413,6 +1917,10 @@ async def run_excel_agent(
         if resume_checkpoint is not None
         else False
     )
+    selected_action_types = (
+        _select_plan_actions(request, {"actionTypes": resume_checkpoint["selectedActionTypes"]})
+        if resume_checkpoint and resume_checkpoint.get("selectedActionTypes") else []
+    )
     next_turn_index = max(
         int(resume_checkpoint.get("nextTurnIndex", 0) or 0)
         if resume_checkpoint is not None
@@ -1466,6 +1974,7 @@ async def run_excel_agent(
             "loopState": state.to_checkpoint(),
             "toolMode": current_tool_mode(),
             "repairingSubmission": repairing_submission,
+            "selectedActionTypes": selected_action_types,
             "nextTurnIndex": upcoming_turn,
             "pendingAssistantMessage": pending_message,
             "nextToolIndex": upcoming_tool,
@@ -1584,7 +2093,7 @@ async def run_excel_agent(
                 )
                 payload, usage = await client.chat_completions(
                     messages=messages,
-                    tools=tools,
+                    tools=_planning_tools(request, tools, selected_action_types),
                     tool_choice="auto",
                     max_tokens=(
                         REPAIR_MAX_OUTPUT_TOKENS
@@ -1593,7 +2102,18 @@ async def run_excel_agent(
                     ),
                 )
                 state.total_tokens += usage.get("total_tokens", 0)
-                message = payload["choices"][0]["message"]
+                choice = payload["choices"][0]
+                message = dict(choice["message"])
+                finish_reason = choice.get("finish_reason")
+                logger.info("Planning response: round=%s mode=%s finish=%s input=%s output=%s total=%s reasoning=%s output_cap=%s",
+                            turn_index + 1, current_tool_mode(),
+                            finish_reason if finish_reason in {"stop", "tool_calls", "length", "content_filter"} else "other",
+                            usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0), usage.get("total_tokens", 0),
+                            usage.get("reasoning_tokens", "unavailable"),
+                            (REPAIR_MAX_OUTPUT_TOKENS if repairing_submission else MAX_OUTPUT_TOKENS) or "provider_default")
+                if finish_reason in {"length", "content_filter"}:
+                    # Do not execute even syntactically valid calls from an incomplete response.
+                    message = {"role": "assistant", "content": "", "_incomplete": finish_reason}
             assistant_message = dict(message)
             assistant_message.setdefault("role", "assistant")
             await pause_if_needed(
@@ -1606,11 +2126,22 @@ async def run_excel_agent(
                 ),
             )
             tool_calls = assistant_message.get("tool_calls") or []
+            if assistant_message.get("_incomplete") == "length":
+                # A truncated response is not a schema error. Retrying it with a
+                # smaller repair allowance cannot fix the provider/context limit.
+                # This also handles an incomplete response restored from a checkpoint.
+                update_loop_state(state, None, None, error_occurred=False)
+                await emit(model_step_id, "模型响应被截断", status="failed",
+                           summary="未执行截断响应中的任何工具；请检查模型或网关输出与上下文额度。")
+                return safe_degradation(state, "output_length")
             if not tool_calls:
                 content = assistant_message.get("content") or ""
                 try:
+                    if assistant_message.get("_incomplete"):
+                        raise ValueError("模型输出达到长度限制" if assistant_message["_incomplete"] == "length" else "模型输出被上游拦截")
                     parsed = _parse_content(content)
                     if isinstance(parsed, PlanResponse):
+                        _enforce_action_capabilities(request, parsed.plan)
                         action_types = "、".join(
                             action.type for action in parsed.plan.actions
                         )
@@ -1625,6 +2156,11 @@ async def run_excel_agent(
                                 "basis": f"共 {len(parsed.plan.actions)} 步：{action_types}",
                             },
                         )
+                    elif isinstance(parsed, IntentClarificationResponse):
+                        await emit(
+                            model_step_id, "等待补充信息", status="completed",
+                            summary=parsed.clarification.question,
+                        )
                     else:
                         await emit(
                             model_step_id,
@@ -1635,6 +2171,8 @@ async def run_excel_agent(
                     return parsed
                 except (ValueError, ValidationError, json.JSONDecodeError) as error:
                     repairing_submission = True
+                    if tools is AGENT_TOOLS:
+                        tools = AGENT_TOOLS_WITH_DATA
                     state.last_error_message = str(error)[:200]
                     update_loop_state(
                         state,
@@ -1655,8 +2193,8 @@ async def run_excel_agent(
                             "role": "user",
                             "content": (
                                 f"你的提交没有通过结构校验：{error}。"
-                                "请检查工具返回内容，并使用 submit_plan 或 "
-                                "submit_answer 重新提交。"
+                                "请检查工具返回内容，并使用 submit_plan、"
+                                "submit_clarification 或 submit_answer 重新提交。"
                             ),
                         }
                     )
@@ -1744,6 +2282,8 @@ async def run_excel_agent(
                             step_text = "正在校验操作计划"
                         elif name == "submit_answer":
                             step_text = "正在校验回答"
+                        elif name == "submit_clarification":
+                            step_text = "正在准备补充信息表单"
                         else:
                             step_text = "正在调用受控工具"
                     await emit(
@@ -1784,9 +2324,11 @@ async def run_excel_agent(
                             )
                     else:
                         result = _execute_tool(request, name, arguments)
+                        if name == "select_plan_actions" and isinstance(result, dict):
+                            selected_action_types = list(result["selectedActionTypes"])
                         if isinstance(
                             result,
-                            (PlanResponse, AnswerResponse, LocalPlanRuleResponse),
+                            (PlanResponse, AnswerResponse, LocalPlanRuleResponse, IntentClarificationResponse),
                         ):
                             if isinstance(result, LocalPlanRuleResponse):
                                 await emit(
@@ -1831,6 +2373,11 @@ async def run_excel_agent(
                                             f"共 {len(result.plan.actions)} 步：{action_types}"
                                         ),
                                     },
+                                )
+                            elif isinstance(result, IntentClarificationResponse):
+                                await emit(
+                                    tool_step_id, "等待补充信息", status="completed",
+                                    summary=result.clarification.question, tool_name=name,
                                 )
                             else:
                                 await emit(
@@ -1903,6 +2450,12 @@ async def run_excel_agent(
                     if name in READONLY_TOOLS:
                         readonly_batch_had_error = True
                     if name == "submit_plan":
+                        failed_actions = (arguments.get("plan") or {}).get("actions", []) if isinstance(arguments.get("plan"), dict) else []
+                        candidates = [action.get("type") for action in failed_actions if isinstance(action, dict)]
+                        try:
+                            selected_action_types = _select_plan_actions(request, {"actionTypes": candidates})
+                        except ValueError:
+                            pass
                         # 失败的工具参数可能接近输出上限。保留完整原文会让下一轮
                         # 再次携带数千 token；工具错误已经包含校验原因，因此把历史
                         # 调用压缩为合法的最小占位，并只暴露 submit_plan 供定向修复。
@@ -1978,7 +2531,7 @@ async def run_excel_agent(
                 _append_warning_to_last_user_message(
                     messages,
                     "工作簿只读探索已完成。下一轮必须基于现有工作簿上下文和"
-                    "工具结果直接调用 submit_plan 或 submit_answer；不要继续读取数据。",
+                    "工具结果直接调用 submit_plan、submit_clarification 或 submit_answer；不要继续读取数据。",
                 )
             await pause_if_needed(
                 "tool_batch_completed", upcoming_turn=turn_index + 1

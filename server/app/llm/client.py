@@ -8,7 +8,7 @@ from typing import Any
 import httpx
 
 from ..capabilities import capabilities, capability_float
-from .config import ModelConnection
+from .config import ModelConnection, ModelNotAvailableError
 from .errors import (
     LLMConnectError,
     LLMError,
@@ -49,6 +49,10 @@ class OpenAICompatibleClient:
         retry_base_delay: float | None = None,
         retry_max_delay: float | None = None,
     ) -> None:
+        if connection.adapter != "openai_compatible":
+            raise ModelNotAvailableError(
+                "当前功能尚未接入所选 SDK 后端；请切换到 OpenAI 兼容模型连接。"
+            )
         self.connection = connection
         self.timeout = timeout
         self.max_retries = (
@@ -144,11 +148,17 @@ class OpenAICompatibleClient:
                 return 0
             return value
 
-        return {
+        result = {
             "prompt_tokens": token_count("prompt_tokens"),
             "completion_tokens": token_count("completion_tokens"),
             "total_tokens": token_count("total_tokens"),
         }
+        details = raw_usage.get("completion_tokens_details")
+        if isinstance(details, dict):
+            reasoning = details.get("reasoning_tokens")
+            if isinstance(reasoning, int) and not isinstance(reasoning, bool) and reasoning >= 0:
+                result["reasoning_tokens"] = reasoning
+        return result
 
     async def _request_once(self, payload: dict[str, Any]) -> dict[str, Any]:
         assert self._client is not None

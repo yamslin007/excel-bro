@@ -9,6 +9,7 @@ from __future__ import annotations
 import pytest
 
 from server.app.column_mapping import (
+    BlankPolicyNeededError,
     OverlappingRangeError,
     ShapeMismatchError,
     UnmappedCategoryError,
@@ -108,10 +109,61 @@ def test_unparsable_range_is_rejected_before_mapping() -> None:
         _build(target_range="这不是区域")
 
 
-def test_empty_blank_label_is_rejected() -> None:
-    # 空标签会让空白单元格写入空串，与"未写入"在回读侧不可区分。
-    with pytest.raises(ValueError, match="空白标签"):
+def test_unspecified_blank_policy_does_not_block_when_source_has_no_blank() -> None:
+    """源区域**一格空白都没有**时，没说空白怎么办也不该拦住预览。
+
+    这是"还没读源数据就先问空白怎么办"的正面反例：旧实现在入口处直接以
+    「空白标签为空」拒绝，于是调用方只能在读到源值之前先去问用户 ——
+    而多数源列根本没有空白，用户被问的是一个不存在的问题。
+    """
+    actions = _build(blank_label="", source_values=[["甲"], ["乙"], ["甲"]])
+    assert actions == [
+        {
+            "type": "writeValues",
+            "sheet": "目标表",
+            "range": "H2:H4",
+            "values": [["一类"], ["二类"], ["一类"]],
+        }
+    ]
+
+
+def test_blank_cell_without_policy_asks_instead_of_picking_a_default() -> None:
+    """**读到**空白且策略未定 → 待澄清，不替用户挑默认标签。
+
+    静默挑一个（历史上就是空白一律写「未分类」）会让用户在单元格层面
+    看不出那是实现替他选的。计数必须来自真实读取。
+    """
+    with pytest.raises(BlankPolicyNeededError) as excinfo:
         _build(blank_label="")
+    assert excinfo.value.blank_count == 1
+
+
+def test_keep_policy_excludes_blank_position_from_the_write_range() -> None:
+    """保留目标原值 = 该位置**不出现在任何 range 里**，不是写个空值。"""
+    actions = _build(blank_policy={"kind": "keep"})
+    assert [action["range"] for action in actions] == ["H2:H3"]
+    assert actions[0]["values"] == [["一类"], ["二类"]]
+
+
+def test_clear_policy_emits_clear_range_not_an_empty_string() -> None:
+    """清空走 `clearRange:contents`：写空串会留下常量空字符串，不是真空单元格。"""
+    actions = _build(blank_policy={"kind": "clear"})
+    assert [action["type"] for action in actions] == [
+        "writeValues",
+        "clearRange",
+    ]
+    assert actions[1] == {
+        "type": "clearRange",
+        "sheet": "目标表",
+        "range": "H4:H4",
+        "applyTo": "contents",
+    }
+
+
+def test_explicit_empty_string_is_written_as_a_value_not_skipped() -> None:
+    """显式写空字符串：整块区域照写，`""` 是内容而不是"跳过"的记号。"""
+    actions = _build(blank_policy={"kind": "value", "value": ""})
+    assert actions[0]["values"] == [["一类"], ["二类"], [""]]
 
 
 def test_single_cell_range_is_accepted() -> None:

@@ -1,8 +1,27 @@
 // CellValue 的权威定义在 packages/core/src/contracts.ts（L0）。
 // 本文件内部大量引用该类型，故 import 后再导出，避免两端各持一份定义后语义漂移。
 import type { CellValue } from "@excel-bro/core/contracts";
+// 空白策略的权威定义在 packages/core/src/blankPolicy.ts（L2）。协议层只是转发，
+// 不另起一份 —— 四种意图一旦在两处各写一遍，就会悄悄漂移。
+import type { BlankPolicy } from "@excel-bro/core";
 
-export type { CellValue };
+export type { CellValue, BlankPolicy };
+
+// Local Windows layout bridge. No workbook paths, cell data, plans or HWNDs.
+export interface ExcelReviewLayoutPrepareRequest {
+  workbookPathHash: string;
+  worksheetNameHash: string;
+  copySheetName: string;
+}
+export interface ExcelReviewLayoutTicket { token: string; layoutVersion: 3 }
+export interface ExcelReviewPaneMeasurement { clientWidthCssPx: number }
+export interface ExcelReviewLayoutResult {
+  status: "arranged";
+  layoutVersion: 3;
+  copySide: "left";
+  originalSide: "right";
+  synchronousScrolling: "enabled" | "different_instance" | "unavailable";
+}
 
 // /function 短链：AI 生成原生 Excel 公式（主路径）
 export interface FormulaDictionarySheet {
@@ -726,6 +745,12 @@ export function assertDataToolResult(
   }
 }
 
+export interface ClarificationField {
+  id: string;
+  label: string;
+  placeholder?: string;
+}
+
 export interface IntentClarification {
   id: string;
   summary: string;
@@ -733,6 +758,7 @@ export interface IntentClarification {
   reason: string;
   scopeLabel: string;
   options: IntentOption[];
+  fields?: ClarificationField[];
 }
 
 export type IntentCheckResponse =
@@ -829,7 +855,15 @@ export function assertIntentCheckResponse(
     !clarification ||
     typeof clarification.question !== "string" ||
     !Array.isArray(clarification.options) ||
-    clarification.options.length < 2 ||
+    clarification.options.length > 4 ||
+    (clarification.options.length < 2 && !clarification.fields?.length) ||
+    (clarification.fields !== undefined && (
+      !Array.isArray(clarification.fields) || clarification.fields.length > 4 ||
+      clarification.fields.some((field) => !field || typeof field.id !== "string" || !field.id.trim() ||
+        typeof field.label !== "string" || !field.label.trim() ||
+        (field.placeholder !== undefined && typeof field.placeholder !== "string")) ||
+      new Set(clarification.fields.map((field) => field.id)).size !== clarification.fields.length
+    )) ||
     clarification.options.some(
       (option) =>
         !option ||
@@ -1233,6 +1267,170 @@ export function assertOfficeExecutionState(
 }
 
 /**
+ * WPS 恢复描述里的**单个动作**。与 `server/app/models.py: WpsRecoveryActionDescriptor` 同形。
+ *
+ * 只带恢复判定必需的元数据：动作类型、目标工作表与区域、目标形状、目标指纹，
+ * 以及 `clearRange` 的 `applyTo` / `writeFormulas` 的 `formulaR1C1`（服务端据此
+ * 拒绝不支持的变体）。**不含 `values` / `formulas` 矩阵** —— 目标值只停在本机内存。
+ */
+export interface WpsRecoveryActionDescriptor {
+  actionIndex: number;
+  type: string;
+  sheet: string;
+  range: string;
+  rowCount: number;
+  columnCount: number;
+  cellCount: number;
+  /** 写前逻辑指纹（WpsPreparedAction.previewFingerprint）；校验不是加密，不保证抵御枚举。 */
+  previewFingerprint: string;
+  applyTo?: string | null;
+  expectedFingerprint?: string | null;
+  formulaR1C1?: boolean;
+}
+
+/**
+ * WPS 写入的**恢复描述**。与 `server/app/models.py: WpsRecoveryDescriptor` 同形。
+ *
+ * 这是持久账本里关于"这次要写什么"的**全部**内容。它替代了早期直接上传整个
+ * `AnalysisPlan` 的做法 —— 那个做法会把 `writeValues` 的目标值矩阵带出站并落盘。
+ * 恢复功能不得为"能续跑"而放宽这条约束：宁可续跑能力受限，也不让单元格内容出站。
+ */
+export interface WpsRecoveryDescriptor {
+  actions: WpsRecoveryActionDescriptor[];
+}
+
+export function assertWpsEvidence(value: unknown): void {
+  if (!value || typeof value !== "object" ||
+      Object.keys(value).some((key) => !["sheetName", "range", "type", "beforeFingerprint", "afterFingerprint"].includes(key)))
+    throw new Error("WPS 动作证据含未知字段或单元格矩阵");
+  const evidence = value as Record<string, unknown>;
+  if (["sheetName", "range", "type", "beforeFingerprint"].some((key) => typeof evidence[key] !== "string") ||
+      (evidence.afterFingerprint != null && typeof evidence.afterFingerprint !== "string"))
+    throw new Error("WPS 动作证据必须只含定位和指纹文本");
+}
+
+export function assertWpsExecutionResult(value: unknown): void {
+  if (!value || typeof value !== "object") throw new Error("WPS 完成回执无效");
+  const result = value as Record<string, unknown>;
+  if (Object.keys(result).some((key) => !["actionCount", "cellCount", "backfilled"].includes(key)) ||
+      !Number.isInteger(result.actionCount) || Number(result.actionCount) < 0 ||
+      (result.cellCount != null && (!Number.isInteger(result.cellCount) || Number(result.cellCount) < 0)) ||
+      (result.backfilled != null && typeof result.backfilled !== "boolean"))
+    throw new Error("WPS 完成回执只允许进度计数，不允许单元格内容");
+}
+
+export function assertWpsRecoveryDescriptor(value: unknown): asserts value is WpsRecoveryDescriptor {
+  if (!value || typeof value !== "object" || Object.keys(value).some((key) => key !== "actions") ||
+      !Array.isArray((value as WpsRecoveryDescriptor).actions) || !(value as WpsRecoveryDescriptor).actions.length)
+    throw new Error("WPS 恢复描述无效");
+  const keys = ["actionIndex", "type", "sheet", "range", "rowCount", "columnCount", "cellCount",
+    "previewFingerprint", "expectedFingerprint", "applyTo", "formulaR1C1"];
+  for (const [index, action] of (value as WpsRecoveryDescriptor).actions.entries()) {
+    if (!action || Object.keys(action).some((key) => !keys.includes(key)))
+      throw new Error("WPS 恢复描述含未知字段或单元格矩阵，已拒绝接收");
+    if (action.actionIndex !== index || !["writeValues", "writeFormulas", "clearRange"].includes(action.type) ||
+        typeof action.sheet !== "string" || typeof action.range !== "string" ||
+        !Number.isInteger(action.rowCount) || action.rowCount < 1 ||
+        !Number.isInteger(action.columnCount) || action.columnCount < 1 ||
+        action.cellCount !== action.rowCount * action.columnCount || typeof action.previewFingerprint !== "string" ||
+        (action.expectedFingerprint != null && typeof action.expectedFingerprint !== "string") ||
+        (action.applyTo != null && typeof action.applyTo !== "string") ||
+        (action.formulaR1C1 != null && typeof action.formulaR1C1 !== "boolean"))
+      throw new Error("WPS 恢复描述的动作定位或形状无效");
+  }
+}
+
+/**
+ * WPS 执行恢复状态，与 `server/app/models.py: WpsExecutionStateResponse` 同形。
+ *
+ * 与 Office 的区别：没有 `allowedExternalFiles`（WPS 不支持外部文件写入），
+ * 多一个 `taskId`（加载项侧任务稳定身份，重载后继续时用来定位同一任务）；
+ * 载荷是 `descriptor` 而不是 `plan` —— 服务端账本不存单元格值矩阵，
+ * 所以下发的状态里也不会带回它们。
+ * 身份用 `wps-path:` 前缀（已保存工作簿的小写磁盘完整路径），不与 Office 的
+ * `url:` 前缀共享命名空间。
+ */
+export interface WpsExecutionState {
+  operationId: string;
+  status: "running" | "needs_reconciliation" | "completed" | "failed";
+  revision: number;
+  workbookIdentity: string;
+  taskId: string;
+  descriptor: WpsRecoveryDescriptor;
+  authorizedSheetNames: string[];
+  nextActionIndex: number;
+  /** 动作总数。客户端据此算"剩余动作是否为空"，不能拿矩阵长度或内存进度代替。 */
+  totalActions: number;
+  inFlightActionIndex?: number | null;
+  beforeSnapshot?: Record<string, unknown> | null;
+  checkpoint?: Record<string, unknown> | null;
+  result?: Record<string, unknown> | null;
+  error?: { code?: string; message?: string } | null;
+  canResume: boolean;
+  /** True while another executor's durable lease is active; recovery cannot steal it. */
+  ownerActive: boolean;
+  requiresReconciliation: boolean;
+  ownerToken?: string | null;
+}
+
+export function assertWpsExecutionState(
+  value: unknown
+): asserts value is WpsExecutionState {
+  if (!value || typeof value !== "object") {
+    throw new Error("服务返回的 WPS 恢复状态不是有效对象");
+  }
+  const state = value as Partial<WpsExecutionState>;
+  if (
+    typeof state.operationId !== "string" ||
+    !["running", "needs_reconciliation", "completed", "failed"].includes(
+      String(state.status)
+    ) ||
+    typeof state.revision !== "number" ||
+    typeof state.workbookIdentity !== "string" ||
+    !state.workbookIdentity.startsWith("wps-path:") ||
+    typeof state.taskId !== "string" ||
+    !state.descriptor ||
+    !Array.isArray(state.descriptor.actions) ||
+    !Array.isArray(state.authorizedSheetNames) ||
+    typeof state.nextActionIndex !== "number" ||
+    typeof state.totalActions !== "number" ||
+    typeof state.canResume !== "boolean" ||
+    typeof state.ownerActive !== "boolean" ||
+    typeof state.requiresReconciliation !== "boolean"
+  ) {
+    throw new Error("服务返回的 WPS 恢复状态缺少必要字段");
+  }
+  if (
+    state.inFlightActionIndex !== undefined &&
+    state.inFlightActionIndex !== null &&
+    typeof state.inFlightActionIndex !== "number"
+  ) {
+    throw new Error("服务返回的 WPS 在途动作位置无效");
+  }
+  /*
+   * 出站闸的第二道：服务端若（因版本错配或改动失误）把单元格矩阵塞回状态里，
+   * 客户端**拒绝接受**而不是照单收下再渲染。恢复功能只允许指纹级信息往返。
+   */
+  assertWpsRecoveryDescriptor(state.descriptor);
+  if (state.totalActions !== state.descriptor.actions.length || !Number.isInteger(state.revision) || state.revision! < 1 ||
+      !Number.isInteger(state.nextActionIndex) || state.nextActionIndex! < 0 || state.nextActionIndex! > state.totalActions!)
+    throw new Error("WPS 恢复进度无效");
+  if ("plan" in value) throw new Error("WPS 恢复状态含完整计划，已拒绝接收");
+  if (state.beforeSnapshot) assertWpsEvidence(state.beforeSnapshot);
+  if (state.checkpoint) assertWpsEvidence(state.checkpoint);
+  if (state.result) assertWpsExecutionResult(state.result);
+  for (const action of state.descriptor.actions) {
+    if (!action || typeof action !== "object") {
+      throw new Error("服务返回的 WPS 恢复描述含无效动作");
+    }
+    const candidate = action as unknown as Record<string, unknown>;
+    if ("values" in candidate || "formulas" in candidate || "preview" in candidate) {
+      throw new Error("服务返回的 WPS 恢复描述含单元格矩阵，已拒绝接收");
+    }
+  }
+}
+
+/**
  * 与 `server/app/models.py: ColumnMappingPair` 同形。
  *
  * 用 `source` / `target` 而不是模型工具参数里的 `from` / `to`：服务端那侧若给
@@ -1245,11 +1443,79 @@ export interface ColumnMappingPair {
 }
 
 /**
+ * 拆分后取最高级时的一条次序声明。与 `@excel-bro/core` 的
+ * `ColumnMappingRankEntry` 同形。`rank` 大者优先。
+ */
+export interface ColumnMappingRankEntry {
+  value: string;
+  rank: number;
+}
+
+/**
+ * 待澄清的**归因**。用户界面据此给出**具体选项**，而不是只弹一句
+ * "请补充信息" —— 归因不同，能做的补救动作不同。
+ */
+export type ColumnMappingClarificationReason =
+  | "matchedDelimiterMissingCategories"
+  | "unresolvedSeparatorOrMapping"
+  /** 读到源区域**确实有空白格**，而空白怎么处理还没定。没读到就不该出现。 */
+  | "blankPolicyNeeded";
+
+/**
+ * 澄清卡片上可以给用户选的动作。
+ *
+ * - `addCategories`：补类别映射
+ * - `specifyOtherDelimiter`：指定其他分隔符
+ * - `treatWholeCellAsCategory`：把整格视为一个类别
+ * - `keepTarget` / `clearTarget` / `writeBlankValue` / `writeEmptyString`：
+ *   空白的四种处理。**与上面那组不混用** —— 空白卡片上出现"补充分隔符"
+ *   只会让用户以为那也能解决空白。
+ *
+ * 归因决定哪些动作有意义：分隔符已经对上的情形给出"补充分隔符"
+ * 只会误导用户去改一个没问题的设置。
+ */
+export type ColumnMappingResolution =
+  | "addCategories"
+  | "specifyOtherDelimiter"
+  | "treatWholeCellAsCategory"
+  | "keepTarget"
+  | "clearTarget"
+  | "writeBlankValue"
+  | "writeEmptyString";
+
+/**
+ * 待澄清卡片的内容。**不含来源格的原始内容** —— 原始内容留在客户端，
+ * 由 UI 就地展示；这里只有归因与统计。
+ */
+export interface ColumnMappingClarification {
+  reason: ColumnMappingClarificationReason;
+  message: string;
+  /** 未覆盖的类别（已去重），供界面列出"要补哪些"。 */
+  missingCategories: string[];
+  /** 归因不确定时，无法处理的整格数量（不回传原文）。 */
+  unresolvedCellCount: number;
+  /**
+   * `blankPolicyNeeded` 时**真实读到**的空白格数量。
+   *
+   * 必须来自一次真实读取。没有读证据就不许声称"源区域有空白" ——
+   * 那是凭空提问。
+   */
+  blankCellCount?: number;
+  /** 界面应当提供的动作。顺序即推荐顺序。 */
+  resolvedBy: ColumnMappingResolution[];
+}
+
+/**
  * 列映射的**规则**，不含任何单元格值。
  *
  * 源值不在服务端时（`planningReadPolicy: "none"`），服务端下发规则，
  * 客户端调 `@excel-bro/core` 的 `buildColumnMappingActions` 就地算出写入计划。
  * 刻意不带 `values`：单射映射可逆，上传标签列等于上传源列。
+ *
+ * 多值语义的三组参数（`delimiters` / `valueRank` / `undeclaredSeparators`）
+ * 与 `@excel-bro/core` 的 `ColumnMappingInput` **逐字同名**：规则是平的，
+ * 折一层子对象会让"夹具里有、运行时没有"这种错在类型检查下隐形。
+ * 三组都可省略，省略即"一个来源格只当一个值"，与扩展前行为一致。
  */
 export interface ColumnMappingRule {
   kind: "columnMapping";
@@ -1258,14 +1524,49 @@ export interface ColumnMappingRule {
   sourceRange: string;
   targetRange: string;
   mapping: ColumnMappingPair[];
-  blankLabel: string;
+  /**
+   * 空白来源格的处理策略。**省略 = 未定**，只有真的读到空白时才需要决定。
+   *
+   * 表达"保留目标原值"只有这一种方式：旧字段 `blankLabel` 只能表达
+   * "写一个什么标签"，而"保留"意味着这个位置**根本不进入写入范围**，
+   * 不是"读回原值再写回"。
+   */
+  blankPolicy?: BlankPolicy;
+  /**
+   * 旧协议的"空白标签"。**保留只为兼容旧数据**，新规则一律用 `blankPolicy`。
+   *
+   * 兼容口径：非空串等价于 `blankPolicy: {kind:"value", value: 同值}`，
+   * 语义一点没动。旧协议里空串本来就被拒绝，所以"空串 = 未定"这条折法
+   * 不会改变任何一条曾经合法的旧计划。
+   */
+  blankLabel?: string;
+  /**
+   * 候选分隔符。拆分时取**出现位置最靠前**的那个。
+   * 空数组（或省略）= 不拆分。
+   */
+  delimiters?: string[];
+  /** 拆分后取最高级用的次序，`rank` 大者优先。省略 = 按 `mapping` 声明顺序。 */
+  valueRank?: ColumnMappingRankEntry[];
+  /**
+   * 规则**明示为分隔符候选、但尚未确认可用来切分**的字符。
+   * 整格没命中却含有这里的字符时，归因不确定，走澄清。
+   */
+  undeclaredSeparators?: string[];
+  /**
+   * 服务端已判定"这条需求缺参数/缺类别、不能算"时带上的澄清内容。
+   * 带上时客户端只展示澄清卡片，不算、不写。
+   */
+  clarification?: ColumnMappingClarification;
 }
 
 export type AssistantResponse =
+  | Extract<IntentCheckResponse, { kind: "clarification" }>
   | {
       kind: "answer";
       message: string;
       provider: "model" | "local" | "system";
+      outcome?: "completed" | "failed";
+      stopReason?: "max_turns" | "max_tokens" | "timeout" | "consecutive_errors" | "output_length" | null;
       resultContext?: ResultContext | null;
       turnId?: string | null;
     }
@@ -1503,7 +1804,17 @@ export function assertAssistantResponse(
   }
 
   const response = value as Partial<AssistantResponse>;
+  if (response.kind === "clarification") {
+    assertIntentCheckResponse(value);
+    return;
+  }
   if (response.kind === "answer") {
+    if (response.outcome !== undefined && response.outcome !== "completed" && response.outcome !== "failed") {
+      throw new Error("服务返回的规划终态无效");
+    }
+    if (response.stopReason != null && !["max_turns", "max_tokens", "timeout", "consecutive_errors", "output_length"].includes(response.stopReason)) {
+      throw new Error("服务返回的规划停止原因无效");
+    }
     if (!("message" in response) || typeof response.message !== "string") {
       throw new Error("服务返回的回答缺少 message");
     }
@@ -1534,6 +1845,34 @@ export function assertAssistantResponse(
 }
 
 /**
+ * 校验可选的空白策略。
+ *
+ * `undefined` 合法（未定）；给了就必须是四种已知形态之一，且 `kind:"value"`
+ * 必须带字符串 `value` —— 空串是合法的（"显式写空字符串"是一种明确意图），
+ * 缺字段或未知 kind 都要拒。
+ */
+function assertOptionalBlankPolicy(value: unknown): void {
+  if (value === undefined || value === null) return;
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("服务返回的空白策略不是有效对象");
+  }
+  const policy = value as Record<string, unknown>;
+  switch (policy.kind) {
+    case "keep":
+    case "clear":
+    case "undecided":
+      return;
+    case "value":
+      if (typeof policy.value !== "string") {
+        throw new Error("服务返回的空白策略缺少字符串类型的 value");
+      }
+      return;
+    default:
+      throw new Error(`服务返回了无法识别的空白策略：${String(policy.kind)}`);
+  }
+}
+
+/**
  * 校验列映射规则。**不校验区域是否在已授权范围内** —— 那要读宿主，
  * 属于客户端执行前的授权闸，不是契约层的事。
  */
@@ -1551,13 +1890,20 @@ export function assertColumnMappingRule(
     "sourceSheet",
     "targetSheet",
     "sourceRange",
-    "targetRange",
-    "blankLabel"
+    "targetRange"
   ] as const) {
     if (typeof rule[field] !== "string" || !rule[field]!.trim()) {
       throw new Error(`服务返回的映射规则缺少 ${field}`);
     }
   }
+  /*
+   * 空白策略：**给了就必须认得出来，没给就不算错**。
+   *
+   * 没给 = 未定，只在真的读到空白时才升级为一次澄清 —— 若这里直接拒，
+   * 等于把"还没读源数据就先问空白怎么办"这条老路又开回来。
+   * 给了却认不出来则必须拒：静默折成"未定"会让用户答过的问题被重问一遍。
+   */
+  assertOptionalBlankPolicy(rule.blankPolicy);
   if (!Array.isArray(rule.mapping) || rule.mapping.length === 0) {
     throw new Error("服务返回的映射规则没有任何映射项");
   }
@@ -1570,6 +1916,86 @@ export function assertColumnMappingRule(
       !pair.target.trim()
     ) {
       throw new Error("服务返回的映射项不是一对非空字符串");
+    }
+  }
+  // 多值语义参数都是可选的，但**给了就必须是字符串数组**：
+  // 静默忽略一个类型不对的 delimiters 会让客户端按"不拆分"算，
+  // 与服务端（若它算得出）不一致，而这种不一致在单元格层面看不出来。
+  for (const field of ["delimiters", "undeclaredSeparators"] as const) {
+    const items = rule[field];
+    if (items === undefined) continue;
+    if (
+      !Array.isArray(items) ||
+      items.some((item) => typeof item !== "string" || item.length === 0)
+    ) {
+      throw new Error(`服务返回的映射规则里 ${field} 不是非空字符串数组`);
+    }
+  }
+  if (rule.valueRank !== undefined) {
+    if (!Array.isArray(rule.valueRank)) {
+      throw new Error("服务返回的映射规则里 valueRank 不是数组");
+    }
+    for (const entry of rule.valueRank) {
+      if (
+        !entry ||
+        typeof entry.value !== "string" ||
+        !entry.value.trim() ||
+        typeof entry.rank !== "number"
+      ) {
+        throw new Error("服务返回的映射规则里 valueRank 项无效");
+      }
+    }
+  }
+  if (rule.clarification !== undefined && rule.clarification !== null) {
+    assertColumnMappingClarification(rule.clarification);
+  }
+}
+
+/**
+ * 校验澄清卡片。**不校验原文** —— 原文根本不在协议里（留在客户端），
+ * 这里能查的只有归因、计数与候选动作。
+ */
+export function assertColumnMappingClarification(
+  value: unknown
+): asserts value is ColumnMappingClarification {
+  if (!value || typeof value !== "object") {
+    throw new Error("服务返回的澄清内容不是有效对象");
+  }
+  const clarification = value as Partial<ColumnMappingClarification>;
+  if (
+    clarification.reason !== "matchedDelimiterMissingCategories" &&
+    clarification.reason !== "unresolvedSeparatorOrMapping"
+  ) {
+    throw new Error("服务返回的澄清内容缺少有效归因");
+  }
+  if (
+    typeof clarification.message !== "string" ||
+    !clarification.message.trim()
+  ) {
+    throw new Error("服务返回的澄清内容缺少说明");
+  }
+  if (
+    !Array.isArray(clarification.missingCategories) ||
+    clarification.missingCategories.some((item) => typeof item !== "string")
+  ) {
+    throw new Error("服务返回的澄清内容里 missingCategories 无效");
+  }
+  if (
+    typeof clarification.unresolvedCellCount !== "number" ||
+    clarification.unresolvedCellCount < 0
+  ) {
+    throw new Error("服务返回的澄清内容里 unresolvedCellCount 无效");
+  }
+  if (!Array.isArray(clarification.resolvedBy)) {
+    throw new Error("服务返回的澄清内容里 resolvedBy 无效");
+  }
+  for (const option of clarification.resolvedBy) {
+    if (
+      option !== "addCategories" &&
+      option !== "specifyOtherDelimiter" &&
+      option !== "treatWholeCellAsCategory"
+    ) {
+      throw new Error("服务返回的澄清内容里有未知的可选动作");
     }
   }
 }

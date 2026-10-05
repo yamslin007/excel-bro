@@ -4,6 +4,7 @@ import {
   normalizePetVisibility
 } from "../conversation";
 import { PANE_WIDEN_THRESHOLD } from "../utils";
+import { useReviewPaneRatio, type ReviewPaneScope } from './useReviewPaneRatio';
 
 const MAX_PREFERRED_TASK_PANE_WIDTH = 4096;
 export const TASK_PANE_WIDTH_STORAGE_KEY =
@@ -56,7 +57,9 @@ function storePreferredTaskPaneWidth(width: number | null): void {
  * - 管理菜单状态（模型菜单、更多菜单、规则管理器）
  * - 管理 UI 辅助状态（宠物可见性、窗格宽度、引导步骤、输入框高度）
  */
-export function useUIState() {
+export function useUIState(comparisonActive = false, reviewScope?: ReviewPaneScope) {
+  const ratioNeedsResize = useReviewPaneRatio(reviewScope);
+  const hasReviewScope = Boolean(reviewScope);
   const [initialPreferredTaskPaneWidth] = useState(
     readPreferredTaskPaneWidth
   );
@@ -112,6 +115,7 @@ export function useUIState() {
     const restorePreferredWidth = () => {
       const preferredWidth = preferredTaskPaneWidthRef.current;
       if (
+        comparisonActive ||
         !canManageTaskPaneWidth ||
         preferredWidth === null ||
         Math.abs(window.innerWidth - preferredWidth) < 2
@@ -133,6 +137,9 @@ export function useUIState() {
       const wide = window.innerWidth >= PANE_WIDEN_THRESHOLD;
       setIsNarrowPane(!wide);
       if (wide) setWidenStepDone(true);
+      // Review resizing is temporary. Never overwrite the normal chat preference
+      // with a programmatic resize or reapply it on focus during comparison.
+      if (comparisonActive) return;
       if (!canManageTaskPaneWidth) return;
 
       const preferredWidth = normalizePreferredTaskPaneWidth(
@@ -159,7 +166,8 @@ export function useUIState() {
         }
 
         if (canManageTaskPaneWidth) {
-          restorePreferredWidth();
+          // Wait for a verified review scope: no preliminary fixed-width jump.
+          if (!comparisonActive) restorePreferredWidth();
           if (canManageTaskPaneWidth) {
             window.addEventListener("focus", handleFocus);
             document.addEventListener(
@@ -180,7 +188,7 @@ export function useUIState() {
       window.removeEventListener("focus", handleFocus);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
-  }, []);
+  }, [comparisonActive]);
 
   // 关闭所有抽屉
   const closeAllDrawers = useCallback(() => {
@@ -236,6 +244,7 @@ export function useUIState() {
     widenStepDone,
     workDirectoryGuideDismissed,
     composerHeight,
+    comparisonPaneNeedsResize: hasReviewScope ? ratioNeedsResize : comparisonActive,
     togglePetVisibility,
     setFocusOpening,
     setIsNarrowPane,

@@ -37,6 +37,31 @@ const readResult: WpsSheetReadResult = {
 };
 
 describe("WPS readonly agent", () => {
+  it("preserves a structured planner failure rather than returning a successful answer", async () => {
+    const result = await runWpsReadonlyTurn({ application: makeApplication(), selectedSheetIndexes: [1], prompt: "生成预览" }, {
+      checkIntent: vi.fn(async () => ({ kind: "proceed" as const, summary: "预览", confirmedPrompt: "生成预览", provider: "model" as const })),
+      createAssistantResponse: vi.fn(async () => ({ kind: "answer" as const, provider: "system" as const, message: "规划已停止", outcome: "failed" as const, stopReason: "max_tokens" as const })),
+      readSchemas: vi.fn(async () => [readResult]), readSheets: vi.fn(), executeQuery: vi.fn()
+    });
+    expect(result).toMatchObject({ kind: "answer", outcome: "failed" });
+    expect(result).not.toHaveProperty("plan");
+  });
+  it("routes a planning-stage form to clarification before any data-row read or execution", async () => {
+    const readSheets = vi.fn();
+    const response = { kind: "clarification" as const, provider: "model" as const, clarification: {
+      id: "planning-input", summary: "需要补充统计口径", question: "按什么单位？",
+      reason: "结果取决于单位", scopeLabel: "明细", options: [],
+      fields: [{ id: "unit", label: "统计单位" }]
+    } };
+    const result = await runWpsReadonlyTurn({ application: makeApplication(), selectedSheetIndexes: [1], prompt: "请生成统计预览" }, {
+      checkIntent: vi.fn(async () => ({ kind: "proceed" as const, summary: "统计", confirmedPrompt: "请生成统计预览", provider: "model" as const })),
+      createAssistantResponse: vi.fn(async () => response),
+      readSchemas: vi.fn(async () => [readResult]), readSheets, executeQuery: vi.fn()
+    });
+    expect(result).toMatchObject({ kind: "clarification", clarification: { response }, headerRows: [["影院", "数量"]] });
+    expect(readSheets).not.toHaveBeenCalled();
+    expect(result).not.toHaveProperty("plan");
+  });
   it("builds structure-only contexts without raw data rows", () => {
     const { scope, workbook } = buildWpsReadonlyContexts(makeApplication(), [readResult]);
     expect(scope.sheets[0].headers).toEqual(["影院", "数量"]);
@@ -128,6 +153,7 @@ describe("WPS readonly agent", () => {
         createAssistantResponse: vi.fn(async () => ({
           kind: "plan" as const,
           provider: "model" as const,
+          turnId: "turn-plan-1",
           plan: {
             id: "p1",
             title: "删除",
@@ -145,7 +171,9 @@ describe("WPS readonly agent", () => {
 
     expect(result).toEqual(expect.objectContaining({
       kind: "plan",
-      plan: expect.objectContaining({ id: "p1" })
+      plan: expect.objectContaining({ id: "p1" }),
+      // 规划身份必须带出来：断线后先拿它查真实状态，而不是重发一遍需求。
+      turnId: "turn-plan-1"
     }));
   });
 
@@ -169,7 +197,7 @@ describe("WPS readonly agent", () => {
         provider: "model" as const,
         rule: mappingRule,
         summary: "按 2 条映射规则写入。",
-        warnings: ["源区域之后再改动，目标列不会自动跟着变。"],
+        warnings: ["目标区域已有内容会被覆盖。"],
         assumptions: ["源列空白按「未分类」处理。"]
       };
     }
@@ -201,9 +229,15 @@ describe("WPS readonly agent", () => {
       const result = await run();
       if (result.kind !== "plan") throw new Error(`期望计划，得到 ${result.kind}`);
       const action = result.plan.actions[0];
-      expect(action).toMatchObject({ type: "writeValues", sheet: "明细", range: "C2:C3" });
-      expect("values" in action ? action.values : null).toEqual([["一号"], ["二号"]]);
-      expect(result.plan.warnings).toEqual(ruleResponse().warnings);
+      expect(action).toMatchObject({ type: "writeFormulas", sheet: "明细", range: "C2:C3" });
+      expect("formulas" in action ? action.formulas : null).toEqual(expect.arrayContaining([
+        [expect.stringContaining('EXACT(A2,"甲")')],
+        [expect.stringContaining('EXACT(A3,"乙")')]
+      ]));
+      expect(result.plan.acceptanceCriteria).toEqual([{
+        type: "rangeEquals", sheet: "明细", range: "C2:C3", expected: [["一号"], ["二号"]]
+      }]);
+      expect(result.plan.warnings).toEqual(expect.arrayContaining(ruleResponse().warnings));
       expect(result.sourceSnapshots).toEqual([{
         sheetName: "明细",
         range: "A2:A3",
@@ -242,6 +276,145 @@ describe("WPS readonly agent", () => {
       const readSheets = vi.fn(async () => [readResult]);
       await run({ readSheets });
       expect(readSheets).toHaveBeenCalledOnce();
+    });
+
+    describe("空白：只有真读到空白才拦，四种处理互不冒充", () => {
+      // 与 readResult 只差一格：A3 是空的（0 与 false 不算空白，这里用真空格）。
+      const blankRead: WpsSheetReadResult = {
+        ...readResult,
+        values: [["影院", "数量"], ["甲", 2], ["", 3]]
+      };
+
+      async function runRule(rule: Record<string, unknown>, read: WpsSheetReadResult = blankRead) {
+        return run({
+          createAssistantResponse: vi.fn(async () => ({
+            ...ruleResponse(),
+            rule: { ...mappingRule, ...rule }
+          })),
+          readSheets: vi.fn(async () => [read]),
+          readSchemas: vi.fn(async () => [read])
+        });
+      }
+
+      /**
+       * 计划里实际会落到目标区域的矩阵（公式通道时用试算期望值）。
+       *
+       * 这里刻意不引入 `AnalysisPlan` 的窄类型：`actions` 是联合体，逐个
+       * 收窄会让测试代码比被测行为还长；断言值本身才是要钉的东西。
+       */
+      function targetMatrix(plan: { actions: readonly unknown[] }): unknown {
+        const action = plan.actions[0] as { type?: string; values?: unknown } | undefined;
+        if (action?.type === "writeValues") return action.values;
+        const criterion = (
+          plan as { acceptanceCriteria?: readonly { type?: string; expected?: unknown }[] }
+        ).acceptanceCriteria?.[0];
+        return criterion?.type === "rangeEquals" ? criterion.expected : null;
+      }
+
+      it("源区域真的有空白、没给策略：走结构化澄清，不是一条报错文案", async () => {
+        const result = await runRule({ blankLabel: undefined });
+        if (result.kind !== "clarification") throw new Error(`期望澄清，得到 ${result.kind}`);
+        const local = result.clarification.localMapping;
+        expect(local?.reason).toBe("blank");
+        expect(local?.blankCount).toBe(1);
+        // 澄清卡不带任何源值：源值只留本端，"有几格空白"足够判断规模。
+        expect(local?.values).toEqual([]);
+        expect(local?.rule).toMatchObject({ sourceRange: "A2:A3", targetRange: "C2:C3" });
+        expect(result).not.toHaveProperty("plan");
+      });
+
+      it("同一条规则、源区域一格空白都没有：不挡预览", async () => {
+        const result = await runRule({ blankLabel: undefined }, readResult);
+        expect(result.kind).toBe("plan");
+      });
+
+      it("选了保留目标原值：那一格根本不进任何写入范围", async () => {
+        const result = await runRule({ blankLabel: undefined, blankPolicy: { kind: "keep" } });
+        if (result.kind !== "plan") throw new Error(`期望计划，得到 ${result.kind}`);
+        expect(result.plan.actions.map((action) => (action as { range: string }).range))
+          .toEqual(["C2:C2"]);
+        // 不是"读回原值再写回"：C3 不出现在任何动作里。
+        expect(JSON.stringify(result.plan.actions)).not.toContain("C3");
+      });
+
+      it("清空与写空串不是一回事", async () => {
+        const cleared = await runRule({ blankLabel: undefined, blankPolicy: { kind: "clear" } });
+        if (cleared.kind !== "plan") throw new Error(`期望计划，得到 ${cleared.kind}`);
+        expect(cleared.plan.actions).toEqual([
+          { type: "writeValues", sheet: "明细", range: "C2:C2", values: [["一号"]] },
+          { type: "clearRange", sheet: "明细", range: "C3:C3", applyTo: "contents" }
+        ]);
+
+        const emptyString = await runRule({ blankLabel: undefined, blankPolicy: { kind: "value", value: "" } });
+        if (emptyString.kind !== "plan") throw new Error(`期望计划，得到 ${emptyString.kind}`);
+        expect(emptyString.plan.actions).toHaveLength(1);
+        expect(emptyString.plan.actions[0]).toMatchObject({ sheet: "明细", range: "C2:C3" });
+        expect(emptyString.plan.actions.some((action) => action.type === "clearRange")).toBe(false);
+        expect(targetMatrix(emptyString.plan)).toEqual([["一号"], [""]]);
+      });
+
+      it("未覆盖类别 / 分隔符归因 / 空白 三条路各自归因，不互相冒充", async () => {
+        const compositeRead: WpsSheetReadResult = {
+          ...readResult,
+          values: [["影院", "数量"], ["甲，乙", 2], ["乙", 3]]
+        };
+        const blank = await runRule({ blankLabel: undefined });
+        const unmapped = await runRule(
+          { blankLabel: undefined, mapping: [{ source: "甲", target: "一号" }] },
+          readResult
+        );
+        // 声明了「、」，可这一格里是「，」：分隔符没声明全，还是这格本身就缺
+        // 映射？归因不确定 —— 报上去让用户选，不替他猜成"补映射表"。
+        const separator = await runRule(
+          {
+            blankLabel: undefined,
+            delimiters: ["、"],
+            undeclaredSeparators: ["，"],
+            mapping: [{ source: "甲", target: "一号" }, { source: "乙", target: "二号" }]
+          },
+          compositeRead
+        );
+        for (const item of [blank, unmapped, separator]) {
+          if (item.kind !== "clarification") throw new Error(`期望澄清，得到 ${item.kind}`);
+        }
+        const reasons = [blank, unmapped, separator].map(
+          (item) => (item as { clarification: { localMapping?: { reason: string } } }).clarification.localMapping?.reason
+        );
+        expect(reasons).toEqual(["blank", "unmapped", "separator_or_mapping"]);
+        // 三条路各自带自己的证据：空白带计数，另两条带具体值。
+        expect(unmapped).toHaveProperty("clarification.localMapping.values", ["乙"]);
+        expect(separator).toHaveProperty("clarification.localMapping.values", ["甲，乙"]);
+        expect(blank).toHaveProperty("clarification.localMapping.blankCount", 1);
+      });
+
+      it("归因不确定的规则在读源值之前就分流：不白读一次源列", async () => {
+        const readSheets = vi.fn(async () => [readResult]);
+        const result = await run({
+          createAssistantResponse: vi.fn(async () => ({
+            ...ruleResponse(),
+            rule: {
+              ...mappingRule,
+              clarification: { reason: "unresolvedSeparatorOrMapping", missingCategories: ["丙"] }
+            }
+          })),
+          readSheets
+        });
+        expect(result.kind).toBe("clarification");
+        expect(readSheets).not.toHaveBeenCalled();
+      });
+
+      it("没有读到源值就不许声称有空白", async () => {
+        // 同一条规则，源区域一格都没读到：报的是"没读到"，**不是**"发现 N
+        // 格空白"。事实只能来自真实读取 —— 反过来（没读就先说有空白）正是
+        // 旧实现拦住预览的那条路。
+        const outcome: unknown = await runRule(
+          { blankLabel: undefined },
+          { ...blankRead, values: [] }
+        ).catch((thrown: unknown) => thrown);
+        expect(outcome).toBeInstanceOf(Error);
+        expect((outcome as Error).message).toContain("已读入到第 0 行");
+        expect((outcome as Error).message).not.toContain("空白");
+      });
     });
   });
 

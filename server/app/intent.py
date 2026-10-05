@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import uuid
@@ -8,7 +9,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from .capabilities import capability_int, model_timeout_seconds
+from .capabilities import capability_int, capability_optional_int, model_timeout_seconds
 from .llm import ModelConnection, ModelNotConfiguredError, OpenAICompatibleClient
 from .models import (
     IntentCheckRequest,
@@ -19,6 +20,8 @@ from .models import (
     IntentToolResponse,
 )
 from .structural_intent import parse_bulk_worksheet_deletion
+
+logger = logging.getLogger(__name__)
 
 
 INTENT_SYSTEM_PROMPT = """
@@ -260,6 +263,11 @@ async def check_intent(
             "填写服务地址、模型 ID 和 API Key 后重试。"
         )
 
+    if getattr(config, "adapter", "openai_compatible") == "claude_agent_sdk":
+        from .claude_sdk_agent import check_sdk_intent
+
+        return await check_sdk_intent(request, config)
+
     scope_payload: dict[str, Any] = request.scope.model_dump()
     user_content = (
         f"用户需求：{request.prompt}\n"
@@ -277,7 +285,7 @@ async def check_intent(
     timeout = float(
         os.getenv(
             "AI_INTENT_TIMEOUT_SECONDS",
-            str(max(10.0, min(full_timeout, 60.0))),
+            str(max(10.0, full_timeout)),
         )
     )
     async with OpenAICompatibleClient(config, timeout=timeout) as client:
@@ -291,12 +299,18 @@ async def check_intent(
                         "content": f"{user_content}{repair_note}",
                     },
                 ],
-                max_tokens=1200,
+                max_tokens=capability_optional_int("intentContext", "maxOutputTokens"),
             )
             content = ""
             try:
+                choice = payload["choices"][0]
+                if choice.get("finish_reason") == "length":
+                    # Never trust even parseable JSON from an incomplete response.
+                    # A length limit is not fixed by a schema-repair prompt.
+                    logger.warning("Intent response truncated; using safe routing fallback")
+                    break
                 content = (
-                    payload["choices"][0]["message"].get("content")
+                    choice["message"].get("content")
                     or ""
                 )
                 parsed = _parse_model_response(content, request)

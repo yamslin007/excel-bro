@@ -27,9 +27,19 @@ function runProbe(): ProbeState {
 export default function WpsProbePanel() {
   const [probe, setProbe] = useState<ProbeState>({ status: "loading" });
   const [metadata, setMetadata] = useState<WpsWorkbookMetadata | null>(null);
+  /**
+   * **已提交**的授权范围 —— 这次对话真正的数据边界。
+   *
+   * 它只在用户点「确认范围」时改变。勾选、取消勾选、切换"跟随当前/选择多个"
+   * 都只改下面的草稿：否则用户每取消一次勾选，就会把正在等回答的任务一起打掉，
+   * 而他本来只是想看一眼另一张表。
+   */
   const [selectedIndexes, setSelectedIndexes] = useState<number[]>([]);
-  const [scopeOpen, setScopeOpen] = useState(false);
   const [scopeMode, setScopeMode] = useState<"auto" | "manual">("auto");
+  /** 勾选中的**草稿**。打开面板时从已提交范围复制；取消编辑即丢弃。 */
+  const [draftIndexes, setDraftIndexes] = useState<number[]>([]);
+  const [draftMode, setDraftMode] = useState<"auto" | "manual">("auto");
+  const [scopeOpen, setScopeOpen] = useState(false);
   const [sheetSearch, setSheetSearch] = useState("");
 
   useEffect(() => {
@@ -62,6 +72,10 @@ export default function WpsProbePanel() {
     }
     const nextMetadata = listWpsWorksheets(getWpsApplication());
     setMetadata(nextMetadata);
+    /*
+     * 刷新只对齐**已提交**范围，不碰草稿：用户正在弹层里勾的表不该被一次刷新
+     * 悄悄改掉，那会让他"确认"出一份自己没勾过的范围。
+     */
     setSelectedIndexes((current) => {
       if (scopeMode === "auto") {
         return nextMetadata.sheets
@@ -73,25 +87,82 @@ export default function WpsProbePanel() {
     });
   };
 
+  /**
+   * 打开范围面板：把**已提交**范围复制成草稿。
+   *
+   * 每次打开都从已提交范围起稿 —— 上次看了一半就关掉的草稿不会被当成授权。
+   */
+  const openScope = () => {
+    setDraftIndexes(selectedIndexes);
+    setDraftMode(scopeMode);
+    setSheetSearch("");
+    setScopeOpen(true);
+  };
+
+  /** 关闭而不提交：草稿丢弃，已提交授权**一字不改**。 */
+  const discardScopeEdit = () => {
+    setDraftIndexes(selectedIndexes);
+    setDraftMode(scopeMode);
+    setScopeOpen(false);
+  };
+
   const chooseAutoScope = () => {
-    setScopeMode("auto");
-    setSelectedIndexes(
+    setDraftMode("auto");
+    setDraftIndexes(
       metadata?.sheets.filter((sheet) => sheet.isActive).map((sheet) => sheet.index) ?? []
     );
   };
 
   const chooseManualScope = () => {
-    setScopeMode("manual");
-    if (selectedIndexes.length > 0) return;
-    setSelectedIndexes(
+    setDraftMode("manual");
+    if (draftIndexes.length > 0) return;
+    setDraftIndexes(
       metadata?.sheets.filter((sheet) => sheet.isActive).map((sheet) => sheet.index) ?? []
     );
   };
 
+  const scopeDraftDirty =
+    draftMode !== scopeMode ||
+    [...draftIndexes].sort((a, b) => a - b).join(",") !==
+      [...selectedIndexes].sort((a, b) => a - b).join(",");
+
   const toggleSheet = (index: number) => {
-    setSelectedIndexes((current) =>
+    setDraftIndexes((current) =>
       current.includes(index) ? current.filter((value) => value !== index) : [...current, index]
     );
+  };
+
+  /**
+   * 提交草稿为**新一版授权**。
+   *
+   * 关键：点击时**重新读取真实宿主元数据**再解析范围 —— 不能拿弹层刚打开时
+   * 的那份快照提交。弹层可能开了很久，期间用户可能已经删表、关本子或换了文件。
+   */
+  const commitScope = () => {
+    const nextProbe = runProbe();
+    if (nextProbe.status !== "ready") {
+      setProbe(nextProbe);
+      setMetadata(null);
+      setSelectedIndexes([]);
+      setDraftIndexes([]);
+      setScopeOpen(false);
+      return;
+    }
+    const nextMetadata = listWpsWorksheets(getWpsApplication());
+    const available = new Set(nextMetadata.sheets.map((sheet) => sheet.index));
+    const activeIndexes = nextMetadata.sheets
+      .filter((sheet) => sheet.isActive)
+      .map((sheet) => sheet.index);
+    const nextIndexes =
+      draftMode === "auto"
+        ? activeIndexes
+        : draftIndexes.filter((index) => available.has(index));
+    setProbe(nextProbe);
+    setMetadata(nextMetadata);
+    setScopeMode(draftMode);
+    setSelectedIndexes(nextIndexes);
+    setDraftIndexes(nextIndexes);
+    setScopeOpen(false);
   };
 
   const resolveSelectedSheetIndexes = useCallback((): readonly number[] => {
@@ -159,7 +230,7 @@ export default function WpsProbePanel() {
               <strong>这次对话使用哪些数据？</strong>
               <span>默认跟随你当前正在查看的工作表</span>
             </div>
-            <button type="button" aria-label="关闭数据范围" onClick={() => setScopeOpen(false)}>×</button>
+            <button type="button" aria-label="关闭数据范围" onClick={discardScopeEdit}>×</button>
           </div>
           <div className="wps-current-file-card">
             <span aria-hidden="true">XLSX</span>
@@ -173,7 +244,7 @@ export default function WpsProbePanel() {
             <div className="scope-mode-list">
               <button
                 type="button"
-                className={scopeMode === "auto" ? "selected" : ""}
+                className={draftMode === "auto" ? "selected" : ""}
                 onClick={chooseAutoScope}
               >
                 <i aria-hidden="true">⊙</i>
@@ -181,7 +252,7 @@ export default function WpsProbePanel() {
               </button>
               <button
                 type="button"
-                className={scopeMode === "manual" ? "selected" : ""}
+                className={draftMode === "manual" ? "selected" : ""}
                 onClick={chooseManualScope}
               >
                 <i aria-hidden="true">☷</i>
@@ -193,7 +264,7 @@ export default function WpsProbePanel() {
               </button>
             </div>
 
-            {scopeMode === "manual" && (
+            {draftMode === "manual" && (
               <div className="wps-manual-sheet-picker">
                 <div className="wps-sheet-search-row">
                   <input
@@ -202,25 +273,25 @@ export default function WpsProbePanel() {
                     value={sheetSearch}
                     onChange={(event) => setSheetSearch(event.target.value)}
                   />
-                  <span>已选 {selectedIndexes.length}/{metadata?.sheets.length ?? 0}</span>
+                  <span>已选 {draftIndexes.length}/{metadata?.sheets.length ?? 0}</span>
                 </div>
                 <div className="sheet-picker-toolbar wps-sheet-picker-toolbar">
                   <button type="button" disabled={filteredSheets.length === 0} onClick={() => {
                     const visible = filteredSheets.map((sheet) => sheet.index);
-                    setSelectedIndexes((current) => [...new Set([...current, ...visible])]);
+                    setDraftIndexes((current) => [...new Set([...current, ...visible])]);
                   }}>全选搜索结果</button>
-                  <button type="button" disabled={selectedIndexes.length === 0} onClick={() => setSelectedIndexes([])}>清空</button>
+                  <button type="button" disabled={draftIndexes.length === 0} onClick={() => setDraftIndexes([])}>清空</button>
                 </div>
                 <div className="sheet-picker-options wps-sheet-picker-options">
                 {filteredSheets.map((sheet) => (
                   <button
                     type="button"
-                    className={selectedIndexes.includes(sheet.index) ? "selected" : ""}
+                    className={draftIndexes.includes(sheet.index) ? "selected" : ""}
                     key={`${sheet.index}:${sheet.name}`}
-                    aria-pressed={selectedIndexes.includes(sheet.index)}
+                    aria-pressed={draftIndexes.includes(sheet.index)}
                     onClick={() => toggleSheet(sheet.index)}
                   >
-                    <i aria-hidden="true">{selectedIndexes.includes(sheet.index) ? "✓" : ""}</i>
+                    <i aria-hidden="true">{draftIndexes.includes(sheet.index) ? "✓" : ""}</i>
                     <span>{sheet.name}</span>
                     {sheet.isActive && <small>当前表</small>}
                   </button>
@@ -228,7 +299,7 @@ export default function WpsProbePanel() {
                 {filteredSheets.length === 0 && (
                   <p className="authorization-empty">没有匹配的工作表。</p>
                 )}
-                {selectedIndexes.length === 0 && (
+                {draftIndexes.length === 0 && (
                   <p className="authorization-empty">尚未选择工作表，不会读取或修改任何数据。</p>
                 )}
                 </div>
@@ -241,12 +312,23 @@ export default function WpsProbePanel() {
             <button
               type="button"
               className="scope-confirm"
-              disabled={selectedIndexes.length === 0}
-              onClick={() => setScopeOpen(false)}
+              disabled={draftMode === "manual" && draftIndexes.length === 0}
+              onClick={commitScope}
             >
-              完成
+              确认范围
             </button>
+            {scopeDraftDirty && (
+              <button type="button" className="scope-discard" onClick={discardScopeEdit}>
+                放弃修改
+              </button>
+            )}
           </div>
+          {scopeDraftDirty && (
+            <p className="wps-scope-draft-hint" role="status">
+              勾选还只是草稿：点「确认范围」才会把它作为这次对话的数据边界提交；
+              放弃修改不会改变已确认的范围。
+            </p>
+          )}
         </section>
       )}
       <div className="scope-entry-row">
@@ -254,7 +336,7 @@ export default function WpsProbePanel() {
           className={`scope-trigger ${scopeOpen ? "open" : ""}`}
           type="button"
           aria-expanded={scopeOpen}
-          onClick={() => setScopeOpen((current) => !current)}
+          onClick={() => (scopeOpen ? discardScopeEdit() : openScope())}
         >
           <i aria-hidden="true">▦</i>
           <span>

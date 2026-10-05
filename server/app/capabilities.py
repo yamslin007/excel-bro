@@ -34,6 +34,19 @@ def capability_float(section: str, key: str) -> float:
     return float(value)
 
 
+def capability_optional_int(section: str, key: str) -> int | None:
+    """null uses the provider default; explicit caps must be positive integers.
+
+    Missing/invalid configuration is an error, not an accidental unlimited setting.
+    """
+    value = capabilities()[section][key]
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise RuntimeError(f"能力配置 {section}.{key} 必须是 null 或正整数")
+    return value
+
+
 def capability_text(section: str, key: str) -> str:
     value = capabilities()[section][key]
     if not isinstance(value, str) or not value:

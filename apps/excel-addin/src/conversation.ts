@@ -169,9 +169,12 @@ export function normalizeStoredMessage(message: ChatMessage): ChatMessage {
           ? message.clarification.round
           : 0,
       status:
-        message.clarification.status === "resolving"
-          ? "pending"
-          : message.clarification.status
+        message.clarification.localMapping &&
+        (message.clarification.status === "pending" || message.clarification.status === "resolving")
+          ? "invalidated"
+          : message.clarification.status === "resolving"
+            ? "pending"
+            : message.clarification.status
     }
   };
 }

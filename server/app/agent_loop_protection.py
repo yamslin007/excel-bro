@@ -103,12 +103,20 @@ class LoopConfig:
     """Agent 循环预算和异常检测配置。"""
 
     max_turns: int = 8
-    max_total_tokens: int = 20_000
+    max_total_tokens: int | None = None
     max_wall_time_seconds: float = 60.0
     max_consecutive_errors: int = 3
     max_cache_hits_per_query: int = 3
     max_tool_path_loop_length: int = 4
     warning_turn: int = 5
+
+    def __post_init__(self) -> None:
+        # None explicitly disables the cumulative token stop; accounting remains.
+        value = self.max_total_tokens
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        ):
+            raise ValueError("max_total_tokens 必须是 None 或正整数")
 
 
 def detect_action_conflict(
@@ -177,7 +185,7 @@ def should_stop(
     # 当连续结构错误同时推高了 token，用根因而不是伴随结果向用户解释停止原因。
     if state.consecutive_errors >= config.max_consecutive_errors:
         return True, "consecutive_errors"
-    if state.total_tokens >= config.max_total_tokens:
+    if config.max_total_tokens is not None and state.total_tokens >= config.max_total_tokens:
         return True, "max_tokens"
     if state.elapsed_time >= config.max_wall_time_seconds:
         return True, "timeout"
@@ -208,6 +216,7 @@ def safe_degradation(state: LoopState, stop_reason: str) -> AnswerResponse:
             f"累计消耗 token 达到预算上限（{state.total_tokens} tokens）"
         ),
         "timeout": f"规划时间超过 {state.elapsed_time:.1f} 秒",
+        "output_length": "模型响应被截断（达到输出额度或上下文长度限制），未接受不完整的计划",
         "consecutive_errors": (
             f"连续 {state.consecutive_errors} 次提交的计划不符合格式要求"
         ),
@@ -227,11 +236,17 @@ def safe_degradation(state: LoopState, stop_reason: str) -> AnswerResponse:
         "**建议：**\n"
         f"{suggestions}"
     )
-    return AnswerResponse(provider="system", message=message)
+    return AnswerResponse(provider="system", message=message, outcome="failed", stopReason=stop_reason)
 
 
 def _generate_suggestions(state: LoopState, stop_reason: str) -> str:
     """根据数据完整性和熔断原因生成可操作建议。"""
+    if stop_reason == "output_length":
+        return (
+            "- 检查 config/capabilities.json 的单次输出配置；null 表示使用供应商默认额度\n"
+            "- 若已使用默认额度，请检查模型或网关的输出上限与上下文容量\n"
+            "- 未执行此次截断响应中的工具，不需要改写原需求"
+        )
     if state.encountered_truncation:
         return (
             "- 数据预览超过快照容量（200 行），但这不代表 Excel 无法处理完整数据\n"

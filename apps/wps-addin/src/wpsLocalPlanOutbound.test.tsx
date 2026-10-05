@@ -15,10 +15,8 @@
 // ---------------------------------------------------------------------------
 // 本文件分两条**语义互斥**的用例，各自对应一种真实产物（必须分开写，不能合并）：
 //
-//   A. 未知私有值 —— 源区域里存在一个**规则没有列进映射表**的非空值。
-//      共享的 `mapColumnValues` 刻意"拒绝而非兜底"（抛 `UnmappedCategoryError`），
-//      `blankLabel` 只对**真空格**生效。所以本地计划整体失败、**没有写入预览**。
-//      这条路径要钉的是"失败时的出站面"：连一个"算不出来"的值都不会被送出去。
+//   A. 未知私有值 —— 先停止并本地询问，绝不兜底；用户逐项明确映射后
+//      重新读源、生成新预览。整个过程不把来源值或目标矩阵发给服务端。
 //
 //   B. 已知映射值 —— 规则列出了源区域里**全部**非空来源类别，本地计划算出并
 //      生成两行预览。这条路径要钉的是"成功时的出站面"：算好的目标矩阵、源快照
@@ -171,6 +169,15 @@ async function type(element: HTMLTextAreaElement | null, value: string): Promise
   });
 }
 
+async function typeInput(element: HTMLInputElement | null, value: string): Promise<void> {
+  if (!element) throw new Error("没有找到映射输入框");
+  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+  await act(async () => {
+    setter?.call(element, value);
+    element.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+}
+
 async function submit(element: HTMLTextAreaElement | null): Promise<void> {
   const form = element?.closest("form");
   if (!form) throw new Error("没有找到输入区表单");
@@ -204,8 +211,23 @@ function jsonResponse(payload: unknown): Response {
  * - `sheet.Range(first, last)`：取矩形。
  * 三者缺一，读取器会抛"没有提供所需的分块读取接口"。
  */
-function makeApplication(row3Value: string) {
+function makeApplication(initialRow3Value: string) {
+  let row3Value = initialRow3Value;
   const headerRow = ["类别", "归属"];
+  /**
+   * 真实取值面的记账：**谁被取过值就记谁**，不看调用方贴的 `purpose` 标签。
+   *
+   * 为什么不能按目的记账：`purpose` 只是 `readChunkRange` 传下来的标记，
+   * 它不改变 `Value2` 取到哪块矩形。按"取数据目的才算"记数，就会得到
+   * "数据读取 = 0"这种与真实访问范围不符的结论 —— 那是**假证据**。
+   *
+   * - `headerValues` —— 第 1 行（表头）被取过值的格。
+   * - `dataValues` —— 第 2 行及以后（数据行）被取过值的格。这条必须为空。
+   * - `sourceColumnWholeReads` —— 整片源列（跨表头与数据行）被一次性取走。
+   */
+  const headerValues = new Set<string>();
+  const dataValues = new Set<string>();
+  const sourceColumnWholeReads: string[] = [];
   const cellAt = (row: number, col: number): string => {
     if (row === 1) return headerRow[col - 1] ?? "";
     // 第 2 行：已知类别，目标列读取时为空。
@@ -248,8 +270,12 @@ function makeApplication(row3Value: string) {
      */
     Range: (
       first: { __cell?: [number, number] } | string,
-      last?: { __cell?: [number, number] }
+      last?: { __cell?: [number, number] },
+      // 真宿主签名契约：`Worksheet.Range` 只接受两个参数，多传抛
+      // `Too many parameters.`（2026-09-30 真机证据）。
+      ...extra: unknown[]
     ) => {
+      if (extra.length > 0) throw new Error("Too many parameters.");
       if (typeof first === "string") {
         const rect = parseA1Rect(first);
         if (!rect) throw new Error(`替身无法解析区域「${first}」`);
@@ -257,6 +283,15 @@ function makeApplication(row3Value: string) {
       }
       const [sr, sc] = first?.__cell ?? [1, 1];
       const [er, ec] = last?.__cell ?? [sr, sc];
+      // 逐格扫一遍 —— 与真实 `Value2` 矩阵等价：取到哪块，那块的值就进了内存。
+      // 记账**只看坐标**：第 1 行是表头，第 2 行及以后是数据行。
+      for (let row = sr; row <= er; row += 1) {
+        for (let col = sc; col <= ec; col += 1) {
+          if (row === 1) headerValues.add(`${row},${col}`);
+          else dataValues.add(`${row},${col}`);
+        }
+      }
+      if (er > 1) sourceColumnWholeReads.push(`${sr},${sc}:${er},${ec}`);
       return makeRange(sr, sc, er, ec);
     }
   } as Record<string, unknown> & { Name: string };
@@ -292,7 +327,14 @@ function makeApplication(row3Value: string) {
       },
       CreateTaskPane: () => ({ ID: 1, Visible: true }),
       GetTaskPane: () => undefined
-    } as never
+    } as never,
+    /** 表头行（第 1 行）被取过值的格数 —— 结构扫描确实生效的正向锚点。 */
+    headerValueCount: () => headerValues.size,
+    /** 数据行（第 2 行及以后）被取过值的格数 —— 必须为 0。 */
+    dataValueCount: () => dataValues.size,
+    /** 一次性跨过表头与数据行的读取次数 —— 必须为 0（没有整片源列读取）。 */
+    wholeReads: () => sourceColumnWholeReads.length,
+    setRow3Value: (value: string) => { row3Value = value; }
   };
 }
 
@@ -435,20 +477,19 @@ describe("local_plan_rule 的真实出站请求体", () => {
         localRuleTurnResponse(PRIVATE_SENTINEL, false);
     });
 
-    it("拒绝映射、不生成写入预览，且请求体里没有该值也没有源快照", async () => {
-      const { application } = makeApplication(PRIVATE_SENTINEL);
-      getWpsApplicationMock.mockReturnValue(application);
+    it("主动询问未知值；补全后重新预览，全程不把源值或目标矩阵出站/落盘", async () => {
+      const host = makeApplication(PRIVATE_SENTINEL);
+      getWpsApplicationMock.mockReturnValue(host.application);
 
       const { container } = await mount(panel());
-      await until(() => textOf(container).includes("模型：第一个连接"), "应加载模型");
+      await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "应加载模型");
 
       // prompt 里**不含**私有值：它只能从 A3 读出来。
       await ask(container);
-      // 失败路径的锚点：等错误提示出现。`mapColumnValues` 对未命中值抛
-      // `UnmappedCategoryError`，面板把它转成系统消息。
+      // 本地计算发现缺口后必须成为可操作的澄清卡，而不是终止错误。
       await until(
-        () => textOf(container).includes("不在映射表内"),
-        "未知来源值应被拒绝并给出提示"
+        () => textOf(container).includes("本地映射需要你决定"),
+        "未知来源值应触发本地澄清"
       );
 
       // 正向锚点 1：确实发生过出站（意图 + 规划），否则下面的负向断言是空过。
@@ -456,21 +497,35 @@ describe("local_plan_rule 的真实出站请求体", () => {
       const turnRequests = captured.filter((item) => item.url.includes("/api/turn"));
       expect(turnRequests.length).toBeGreaterThanOrEqual(2);
 
-      // 正向锚点 2：**没有任何写入预览**（没有"确认写入"按钮，也没有目标区域）。
+      // 正向锚点 2：**没有任何写入预览**（没有"生成右侧副本并排审阅"按钮，也没有目标区域）。
       // 这正是"拒绝而非兜底"的可观测后果 —— 若生产代码把未命中值兜成 blankLabel，
       // 这里会冒出一个预览，用例立刻变红。
-      expect(findButton(container, "确认写入")).toBeNull();
+      expect(findButton(container, "生成右侧副本并排审阅")).toBeNull();
       expect(textOf(container)).not.toContain(RULE_TARGET_RANGE);
       expect(textOf(container)).not.toContain(TARGET_VALUE);
       expect(textOf(container)).not.toContain("已按映射处理");
-      // 错误文案本身提及未命中的来源值（这是要让用户知道去补映射表），
-      // 但那只发生在**界面**上；下面的负向断言针对的是出站字节。
+      // 只在当前 DOM 展示，不能跟消息历史一起落盘。
       expect(textOf(container)).toContain(PRIVATE_SENTINEL);
+      expect(localStorage.getItem("excel-bro.wps.chat.v1") ?? "").not.toContain(PRIVATE_SENTINEL);
+
+      const target = "用户明确目标-8L2P";
+      const fetchesBeforeAnswer = captured.length;
+      const sourceReadsBeforeAnswer = host.wholeReads();
+      await typeInput(container.querySelector<HTMLInputElement>(`.wps-local-mapping-values input`), target);
+      await click(findButton(container, "按补充映射重新生成预览"));
+      await until(() => textOf(container).includes("写入前确认"), "补充后应生成新的写入预览");
+      expect(textOf(container)).toContain(target);
+      expect(findButton(container, "生成右侧副本并排审阅")).not.toBeNull();
+      expect(host.wholeReads()).toBeGreaterThan(sourceReadsBeforeAnswer);
+      expect(captured.length).toBe(fetchesBeforeAnswer);
+      expect(localStorage.getItem("excel-bro.wps.chat.v1") ?? "").not.toContain(PRIVATE_SENTINEL);
+      expect(localStorage.getItem("excel-bro.wps.chat.v1") ?? "").not.toContain(target);
 
       const outbound = allBodies();
       // 1) 私有值不出站 —— 规则/响应/提示都不知道它，所以这是真断言。
       expect(outbound).not.toContain(PRIVATE_SENTINEL);
       expect(outbound).not.toContain("7Q4X");
+      expect(outbound).not.toContain(target);
       // 2) 源快照（A2:A3 的完整值，含那行私有值）不能上传。
       expect(outbound).not.toContain("sourceSnapshots");
       // 3) 本地计划**不上传校验接口** —— 在 URL 层面确认，比"函数没被调用"更硬。
@@ -482,6 +537,75 @@ describe("local_plan_rule 的真实出站请求体", () => {
       // 5) 表头合法出站这件事本身也在断言范围内：`类别` 是字段名，允许上传。
       //    这样才能证明第 1 条不是「整个请求体为空」造成的空过。
       expect(turnRequests[0].body).toContain("类别");
+    });
+
+    it("回答期间源值变化时重新读取并继续询问，不拿旧值生成预览", async () => {
+      const host = makeApplication(PRIVATE_SENTINEL);
+      getWpsApplicationMock.mockReturnValue(host.application);
+      const { container } = await mount(panel());
+      await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "应加载模型");
+      await ask(container);
+      await until(() => textOf(container).includes(PRIVATE_SENTINEL), "应展示首个未知值");
+
+      host.setRow3Value("新出现的本地值-5D8T");
+      await typeInput(container.querySelector<HTMLInputElement>(".wps-local-mapping-values input"), "原值的目标");
+      await click(findButton(container, "按补充映射重新生成预览"));
+      await until(() => textOf(container).includes("新出现的本地值-5D8T"), "应询问重新读取后发现的新值");
+      expect(findButton(container, "生成右侧副本并排审阅")).toBeNull();
+      expect(allBodies()).not.toContain("新出现的本地值-5D8T");
+      expect(localStorage.getItem("excel-bro.wps.chat.v1") ?? "").not.toContain("新出现的本地值-5D8T");
+    });
+
+    it("未声明分隔符时留在原卡补全规则，不取消卡片或重启模型", async () => {
+      const compound = "甲，乙-仅本地";
+      const host = makeApplication(compound);
+      getWpsApplicationMock.mockReturnValue(host.application);
+      planResponseFactory = () => {
+        const response = localRuleTurnResponse(compound, false);
+        return { ...response, rule: { ...response.rule, delimiters: ["；"], undeclaredSeparators: ["，"] } };
+      };
+      const { container } = await mount(panel());
+      await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "应加载模型");
+      await ask(container);
+      await until(() => textOf(container).includes(compound), "应展示无法归因的整格值");
+      expect(findButton(container, "生成右侧副本并排审阅")).toBeNull();
+      const fetchesBefore = captured.length;
+      await click(findButton(container, "改为说明拆分规则"));
+      expect(container.querySelector<HTMLInputElement>('input[aria-label="拆分符"]')?.value).toBe("，");
+      expect(textOf(container)).toContain("多个类别同时出现时");
+      expect(container.querySelector(".clarification-card.pending")).not.toBeNull();
+      expect(container.querySelector<HTMLTextAreaElement>(".composer textarea")?.value).toBe("");
+      expect(captured.length).toBe(fetchesBefore);
+      expect(allBodies()).not.toContain(compound);
+    });
+
+    it("已拆分但缺类别时需显式确认优先级，补全后本地重读生成预览", async () => {
+      const compound = `${KNOWN_CATEGORY}；${PRIVATE_SENTINEL}`;
+      const host = makeApplication(compound);
+      getWpsApplicationMock.mockReturnValue(host.application);
+      planResponseFactory = () => {
+        const response = localRuleTurnResponse(compound, false);
+        return { ...response, rule: { ...response.rule, delimiters: ["；"] } };
+      };
+      const { container } = await mount(panel());
+      await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "应加载模型");
+      await ask(container);
+      await until(() => textOf(container).includes("拆分项未被规则覆盖"), "应主动询问缺失拆分项");
+      expect(textOf(container)).toContain(PRIVATE_SENTINEL);
+      expect(findButton(container, "按补充映射重新生成预览")?.hasAttribute("disabled")).toBe(true);
+      const fetchesBefore = captured.length;
+      const target = "补充目标-8P2L";
+      await typeInput(container.querySelector<HTMLInputElement>(`input[aria-label="拆分项 ${PRIVATE_SENTINEL} 的目标值"]`), target);
+      await act(async () => {
+        container.querySelector<HTMLInputElement>('.local-mapping-priority input[type="checkbox"]')?.click();
+      });
+      await click(findButton(container, "按补充映射重新生成预览"));
+      await until(() => textOf(container).includes("写入前确认"), "补全优先级后应生成新预览");
+      expect(captured.length).toBe(fetchesBefore);
+      expect(allBodies()).not.toContain(target);
+      expect(localStorage.getItem("excel-bro.wps.chat.v1") ?? "").not.toContain(target);
+      expect(findButton(container, "生成右侧副本并排审阅")).not.toBeNull();
+      expect(allBodies()).not.toContain(PRIVATE_SENTINEL);
     });
   });
 
@@ -497,7 +621,7 @@ describe("local_plan_rule 的真实出站请求体", () => {
       getWpsApplicationMock.mockReturnValue(application);
 
       const { container } = await mount(panel());
-      await until(() => textOf(container).includes("模型：第一个连接"), "应加载模型");
+      await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "应加载模型");
 
       await ask(container);
       await until(() => textOf(container).includes("写入前确认"), "应展示写入计划");
@@ -545,7 +669,7 @@ describe("local_plan_rule 的真实出站请求体", () => {
       getWpsApplicationMock.mockReturnValue(application);
 
       const { container } = await mount(panel());
-      await until(() => textOf(container).includes("模型：第一个连接"), "应加载模型");
+      await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "应加载模型");
 
       await ask(container);
       await until(() => textOf(container).includes("写入前确认"), "应展示写入计划");
@@ -575,7 +699,7 @@ describe("local_plan_rule 的真实出站请求体", () => {
       await type(editBox, JSON.stringify(editedPlan));
       await click(findButton(container, "应用修改并重新预览"));
       await until(
-        () => findButton(container, "确认写入") !== null,
+        () => findButton(container, "生成右侧副本并排审阅") !== null,
         "编辑后应重新预览"
       );
 
@@ -596,7 +720,7 @@ describe("local_plan_rule 的真实出站请求体", () => {
       // 锚点 2：预览确实被重建了（否则上面一条会因为"什么都没做"而空过）。
       // 覆盖范围刻意**从规则里取**而不是写死：这样"源范围退回 A2:A2"这类变异
       // 会在这里一并变红，而不是被一个恰好匹配的硬编码字符串糊过去。
-      expect(findButton(container, "确认写入")).not.toBeNull();
+      expect(findButton(container, "生成右侧副本并排审阅")).not.toBeNull();
       expect(textOf(container)).toContain(`${SOURCE_SHEET}!${RULE_TARGET_RANGE}`);
       expect(textOf(container)).toContain(TARGET_VALUE);
       expect(textOf(container)).toContain(SECOND_TARGET_VALUE);
@@ -621,5 +745,204 @@ describe("local_plan_rule 的真实出站请求体", () => {
       expect(editOutbound).not.toContain(TARGET_VALUE);
       expect(editOutbound).not.toContain(SECOND_TARGET_VALUE);
     });
+
+    it("算得档必须真的读映射源列 —— 对照锚点，证明澄清档的零读取是收敛结果", async () => {
+      // 这条与澄清档的 `dataValueCount() === 0` 成对：同一个工作簿、同一份规则形状，
+      // 只差"服务端有没有下发 clarification"。算得档需要源值，所以**必须**读到
+      // A2:A3；澄清档不需要，所以**一格都不该**读到。
+      //
+      // 少了这条对照，澄清档的零读取断言可能因为"整条链路压根没接读取器"而空过。
+      const { application, headerValueCount, dataValueCount, wholeReads } =
+        makeApplication(SECOND_CATEGORY);
+      getWpsApplicationMock.mockReturnValue(application);
+
+      const { container } = await mount(panel());
+      await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "应加载模型");
+
+      await ask(container);
+      await until(() => textOf(container).includes("写入前确认"), "应展示写入计划");
+
+      expect(headerValueCount()).toBeGreaterThan(0);
+      expect(dataValueCount()).toBeGreaterThan(0);
+      expect(wholeReads()).toBeGreaterThan(0);
+      // 读取过 ≠ 出站过：源值与算好的目标矩阵都不离开本机。
+      const outbound = allBodies();
+      expect(outbound).not.toContain(KNOWN_CATEGORY);
+      expect(outbound).not.toContain(SECOND_CATEGORY);
+      expect(outbound).not.toContain(TARGET_VALUE);
+      expect(outbound).not.toContain(SECOND_TARGET_VALUE);
+      expect(outbound).not.toContain("sourceSnapshots");
+    });
+  });
+
+  describe("规则自带澄清：缺类别时必须先问，且不许读源值", () => {
+    beforeEach(() => {
+      // 服务端在规则上挂了 `clarification`：它已判定"这条规则还缺类别，算不出正确答案"。
+      planResponseFactory = () => ({
+        ...localRuleTurnResponse(SECOND_CATEGORY, false),
+        rule: {
+          ...localRuleTurnResponse(SECOND_CATEGORY, false).rule,
+          clarification: {
+            reason: "matchedDelimiterMissingCategories",
+            message: "有 2 个来源格拆出的类别不在映射表里。",
+            missingCategories: [SECOND_CATEGORY],
+            unresolvedCellCount: 0,
+            resolvedBy: ["addCategories"]
+          }
+        }
+      });
+    });
+
+    it("展示澄清卡、不生成预览，且没有整片源列读取、数据行值不出站", async () => {
+      const { application, headerValueCount, dataValueCount, wholeReads } =
+        makeApplication(SECOND_CATEGORY);
+      getWpsApplicationMock.mockReturnValue(application);
+
+      const { container } = await mount(panel());
+      await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "应加载模型");
+
+      await ask(container);
+      await until(
+        () => Boolean(container.querySelector(".clarification-card.pending")),
+        "缺类别时应先弹澄清卡，而不是算出一个猜的矩阵"
+      );
+
+      // 正向锚点 1：确实发生过出站（意图 + 规划）。
+      const turnRequests = captured.filter((item) => item.url.includes("/api/turn"));
+      expect(turnRequests.length).toBeGreaterThanOrEqual(2);
+      // 正向锚点 2：选项是"补充类别映射"（归因确定 → 只有这一条路），
+      // 且缺哪个类别写进了选项文案 —— 与 Excel 端走同一个
+      // `columnMappingClarificationMessage`，所以这里钉的是"WPS 确实复用了同一份
+      // 卡片翻译"。类别名在 `choices[].resolution` 里（`summary` 只是标题、
+      // `question` 是规则给的 message），所以按**动作原文链路**断言。
+      const stored = JSON.parse(localStorage.getItem("excel-bro.wps.chat.v1") ?? "null");
+      const cardMessage = stored?.conversations?.[0]?.messages?.find(
+        (message: { clarification?: { status?: string } }) =>
+          message.clarification?.status === "pending"
+      );
+      expect(cardMessage).toBeTruthy();
+      expect(cardMessage.clarification.summary).toBe("映射表缺这几个类别");
+      // 选项文案（含缺失类别）持久化在卡片的 `answer` 之外的原始选项里，
+      // 通过 pending 澄清的 options 校验"补充类别映射"存在。
+      expect(
+        (cardMessage.clarification.options as { label: string }[]).map((option) => option.label)
+      ).toContain("补充类别映射");
+
+      // ---- 真实读取面（本地）：按 `Value2` 访问范围取证，不认 purpose 标签 ----
+      //
+      // 正向锚点 3：结构扫描确实取到了表头 —— 否则下面的负向断言是空过。
+      expect(headerValueCount()).toBeGreaterThan(0);
+      // 判据 1：数据行（第 2 行及以后）的值**一格都没进内存**。
+      // 澄清档排在 `readMappingSource` 之前，所以除结构扫描外没有任何源列读取；
+      // 而结构扫描的矩形也必须止步于表头行。
+      expect(dataValueCount()).toBe(0);
+      // 判据 2：没有一次读取跨过表头与数据行 —— 没有整片源列读取。
+      expect(wholeReads()).toBe(0);
+
+      // ---- 出站面（向模型/服务端发送）与本地读取是两个独立证据面 ----
+      // 表头会合法出站（字段名），所以先确认请求体非空，负向断言才不是空过。
+      expect(turnRequests[0].body).toContain("类别");
+      const outbound = allBodies();
+      expect(outbound).not.toContain("sourceSnapshots");
+      expect(outbound).not.toContain(PRIVATE_SENTINEL);
+      expect(outbound).not.toContain(SECOND_CATEGORY);
+      expect(outbound).not.toContain(TARGET_VALUE);
+      // 映射源列地址与规则本体都不该离开本机。
+      expect(outbound).not.toContain(RULE_SOURCE_RANGE);
+      expect(outbound).not.toContain('"mapping"');
+      // 零写入：没有预览、没有确认按钮、也不走校验接口。
+      expect(findButton(container, "生成右侧副本并排审阅")).toBeNull();
+      expect(captured.some((item) => item.url.includes("/api/plans/validate"))).toBe(false);
+    });
+  });
+
+  describe("空白：真读到空白才问，选完就地重算新预览，全程零新增出站", () => {
+    beforeEach(() => {
+      // A3 是**空的**；规则只列了 A2 的已知类别，并且**没有**给空白策略 ——
+      // 组合起来正是旧实现会"还没读就先问空白怎么办"的那条路。
+      planResponseFactory = () => {
+        const response = localRuleTurnResponse("", false);
+        return { ...response, rule: { ...response.rule, blankLabel: undefined } };
+      };
+    });
+
+    /** 打开编辑框读出当前预览计划的真实 JSON —— 断言的是**将要写入的动作**。 */
+    async function planUnderPreview(container: HTMLElement) {
+      await click(findButton(container, "编辑计划"));
+      const raw = container.querySelector<HTMLTextAreaElement>(
+        '[aria-label="编辑写入计划 JSON"]'
+      )?.value;
+      if (!raw) throw new Error("没有取到预览计划 JSON");
+      return JSON.parse(raw) as {
+        actions: { type: string; range: string; applyTo?: string }[];
+      };
+    }
+
+    async function reachBlankCard(container: HTMLElement, host: ReturnType<typeof makeApplication>) {
+      await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "应加载模型");
+      await ask(container);
+      await until(() => textOf(container).includes("个空白格"), "应展示空白处理卡");
+      // 计数来自真实读取，不是一句"可能有空白"：源列确实被读过。
+      expect(host.wholeReads()).toBeGreaterThan(0);
+      // 停在澄清卡上：没有预览、没有确认写入的入口。
+      expect(findButton(container, "生成右侧副本并排审阅")).toBeNull();
+    }
+
+    it("保留目标原值：那一格不进任何写入动作，且全程零新增出站", async () => {
+      const host = makeApplication("");
+      getWpsApplicationMock.mockReturnValue(host.application);
+      const { container } = await mount(panel());
+      await reachBlankCard(container, host);
+
+      const fetchesBefore = captured.length;
+      await click(findButton(container, "按选定的空白处理重新生成预览"));
+      await until(() => textOf(container).includes("写入前确认"), "选定后应生成新预览");
+
+      const plan = await planUnderPreview(container);
+      // B3 一次都不写：公式、值、数字格式、条件格式都不动 —— 它不是"读回原值
+      // 再写回"，而是压根不在动作里。
+      expect(plan.actions.map((action) => action.range)).toEqual(["B2:B2"]);
+      expect(JSON.stringify(plan.actions)).not.toContain("B3");
+
+      // 重算在本机完成：没有再打一次模型/服务端。
+      expect(captured.length).toBe(fetchesBefore);
+      // 持久化与出站都不含源值或算好的目标矩阵。
+      const stored = localStorage.getItem("excel-bro.wps.chat.v1") ?? "";
+      expect(stored).not.toContain(TARGET_VALUE);
+      expect(stored).not.toContain("3B8Z");
+      const outbound = allBodies();
+      expect(outbound).not.toContain(TARGET_VALUE);
+      expect(outbound).not.toContain("sourceSnapshots");
+      // 卡片与预览都不落盘源值：A3 是空的，A2 的已知类别也不该进历史。
+      expect(stored).not.toContain(KNOWN_CATEGORY);
+    });
+
+    it("清空目标内容：走 clearRange 而不是写空串", async () => {
+      const host = makeApplication("");
+      getWpsApplicationMock.mockReturnValue(host.application);
+      const { container } = await mount(panel());
+      await reachBlankCard(container, host);
+
+      await click(
+        screen$ByLabelText(container, "清空目标内容 —— 清成真空单元格，不是写一个空字符串")
+      );
+      await click(findButton(container, "按选定的空白处理重新生成预览"));
+      await until(() => textOf(container).includes("写入前确认"), "选定后应生成新预览");
+
+      const plan = await planUnderPreview(container);
+      const cleared = plan.actions.find((action) => action.type === "clearRange");
+      expect(cleared).toMatchObject({ range: "B3:B3", applyTo: "contents" });
+      // 写空串是**另一种**意图，不会在这里出现：B3 上只有 clearRange。
+      expect(plan.actions.filter((action) => action.range === "B3:B3")).toHaveLength(1);
+    });
   });
 });
+
+/** 按 label 文本找元素（本文件用原生 DOM，不走 testing-library）。 */
+function screen$ByLabelText(container: HTMLElement, label: string): HTMLElement {
+  const match = Array.from(container.querySelectorAll("label")).find((item) =>
+    (item.textContent ?? "").includes(label)
+  );
+  if (!match) throw new Error(`没有找到标签为「${label}」的选项`);
+  return match.querySelector("input") ?? match;
+}

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   chooseAvailableModel,
+  planningReadPolicyForModel,
   connectionModelSuffix,
   isRealModelId,
   LEGACY_LOCAL_MODEL_ID,
@@ -8,6 +9,18 @@ import {
   resolveDisplayedModelId,
   shouldPersistSelection
 } from "./modelSelection";
+
+describe("planningReadPolicyForModel", () => {
+  it("keeps SDK free-text continuation header-only for standalone and saved connections", () => {
+    expect(planningReadPolicyForModel("claude-agent-sdk", "ifNeeded")).toBe("none");
+    expect(planningReadPolicyForModel("claude-agent-sdk:connection-id", "ifNeeded")).toBe("none");
+  });
+  it("does not change the original backend's requested policy", () => {
+    expect(planningReadPolicyForModel("connection:id", "ifNeeded")).toBe("ifNeeded");
+    expect(planningReadPolicyForModel("connection:id", "none")).toBe("none");
+    expect(planningReadPolicyForModel(null, "ifNeeded")).toBe("ifNeeded");
+  });
+});
 
 describe("connectionModelSuffix", () => {
   it("numbers equal model IDs without changing their unique connection IDs", () => {

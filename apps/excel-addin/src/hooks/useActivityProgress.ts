@@ -590,6 +590,10 @@ export function useActivityProgress({
         finalStatus === "completed"
           ? "warning"
           : finalStatus;
+      const hasUnfinishedEarlierStep = current.steps.some((step) =>
+        step.id !== current.stepId &&
+        !TERMINAL_STATUSES.has(step.status ?? "progress")
+      );
       const effectiveOutcome =
         outcome ??
         (current.connectionState === "interrupted"
@@ -598,14 +602,16 @@ export function useActivityProgress({
               effectiveStatus === "failed" ||
               effectiveStatus === "cancelled"
             ? effectiveStatus
-            : "completed");
+            : hasUnfinishedEarlierStep ? "warning" : "completed");
       const steps = current.steps.map((step) =>
-        step.id === current.stepId &&
         !TERMINAL_STATUSES.has(step.status ?? "progress")
           ? {
               ...step,
-              status: effectiveStatus,
-              note: finalSummary ?? step.note,
+              status: step.id === current.stepId ? effectiveStatus :
+                effectiveStatus === "failed" || effectiveStatus === "cancelled"
+                  ? effectiveStatus : "warning" as const,
+              note: step.id === current.stepId ? finalSummary ?? step.note :
+                "此步骤未收到结束确认；活动已停止，不代表该步骤已完成。",
               elapsedMs: Math.max(0, now - (step.startedAt ?? now))
             }
           : step

@@ -10,6 +10,7 @@ import { describe, expect, it } from "vitest";
 import type { ColumnMappingRule } from "../../excel-addin/src/contracts";
 import {
   buildWpsColumnMappingPlan,
+  fixedValueFallbackFromFormula,
   sliceMappingSource,
   type MappingSourceSheet
 } from "./wpsColumnMappingPlan";
@@ -29,7 +30,7 @@ const RULE: ColumnMappingRule = {
 
 const CONTEXT = {
   summary: "按 2 条映射规则写入。",
-  warnings: ["源区域之后再改动，目标列不会自动跟着变。"],
+  warnings: ["目标区域已有内容会被覆盖。"],
   assumptions: ["源列空白按「未分类」处理。"]
 };
 
@@ -112,10 +113,32 @@ describe("buildWpsColumnMappingPlan", () => {
     ]);
   });
 
+  it("纯文本同表映射优先给公式与逐格计算值验收，回退仍是确定性固定值", () => {
+    const source = sheet({ values: [
+      ["单号", "类别", "归属"],
+      ["X001", "办公用品", null],
+      ["X002", "电子设备", null],
+      ["X003", "办公用品", null]
+    ] });
+    const plan = buildWpsColumnMappingPlan(RULE, source, CONTEXT);
+    expect(plan.actions[0].type).toBe("writeFormulas");
+    expect(plan.actions[0]).toMatchObject({ sheet: "订单", range: "C2:C4" });
+    expect(plan.acceptanceCriteria).toEqual([{
+      type: "rangeEquals", sheet: "订单", range: "C2:C4", expected: [["行政"], ["资产"], ["行政"]]
+    }]);
+    const fixed = fixedValueFallbackFromFormula(plan);
+    expect(fixed?.actions).toEqual([{
+      type: "writeValues", sheet: "订单", range: "C2:C4", values: [["行政"], ["资产"], ["行政"]]
+    }]);
+    expect(fixed?.warnings.join(" ")).toContain("试算或结果回读不符合计划");
+    expect(fixedValueFallbackFromFormula(fixed!)).toBeNull();
+  });
+
   it("保留服务端下发的告知与前提", () => {
     // 换了计算位置不改变"这是一张快照"的事实。
     const plan = buildWpsColumnMappingPlan(RULE, sheet(), CONTEXT);
-    expect(plan.warnings).toEqual(CONTEXT.warnings);
+    expect(plan.warnings).toEqual(expect.arrayContaining(CONTEXT.warnings));
+    expect(plan.warnings.join(" ")).toContain("固定值");
     expect(plan.assumptions).toEqual(CONTEXT.assumptions);
     expect(plan.summary).toBe(CONTEXT.summary);
   });

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, renderHook, waitFor } from "@testing-library/react";
+import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import {
   PET_VISIBILITY_STORAGE_KEY,
   normalizePetVisibility
@@ -42,6 +42,7 @@ describe("useUIState", () => {
   });
 
   afterEach(() => {
+    cleanup();
     vi.unstubAllGlobals();
   });
 
@@ -65,6 +66,55 @@ describe("useUIState", () => {
 
     await waitFor(() => expect(setWidth).toHaveBeenCalledWith(720));
     expect(result.current.widenStepDone).toBe(true);
+  });
+
+  it("waits for verified host measurement and never restores the wide chat preference on focus", () => {
+    localStorage.setItem(TASK_PANE_WIDTH_STORAGE_KEY,"720");
+    const setWidth = stubTaskPaneApi();
+    const {result, rerender} = renderHook(({review}) => useUIState(review), {initialProps:{review:false}});
+    setWidth.mockClear();
+    rerender({review:true});
+    expect(setWidth).not.toHaveBeenCalled();
+    expect(result.current.comparisonPaneNeedsResize).toBe(true); // request isn't proof
+    window.innerWidth = 360;
+    act(() => window.dispatchEvent(new Event('resize')));
+    expect(result.current.comparisonPaneNeedsResize).toBe(true); // iframe width cannot prove host ratio
+    expect(localStorage.getItem(TASK_PANE_WIDTH_STORAGE_KEY)).toBe('720');
+    setWidth.mockClear();
+    act(() => {
+      window.dispatchEvent(new Event('focus'));
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    expect(setWidth).not.toHaveBeenCalled();
+    rerender({review:false});
+    expect(setWidth).toHaveBeenCalledWith(720); // normal preference remains available
+  });
+
+  it.each(['unsupported','silent','throw'] as const)("keeps manual width guidance when the host is %s", reason => {
+    localStorage.setItem(TASK_PANE_WIDTH_STORAGE_KEY,'720');
+    const setWidth = stubTaskPaneApi(reason !== 'unsupported');
+    if(reason === 'throw') setWidth.mockImplementation(() => {throw new Error('unsupported runtime');});
+    const {result} = renderHook(() => useUIState(true));
+    expect(result.current.comparisonPaneNeedsResize).toBe(true);
+    expect(localStorage.getItem(TASK_PANE_WIDTH_STORAGE_KEY)).toBe('720');
+    expect(setWidth).not.toHaveBeenCalled(); // no scope, no speculative width
+    window.innerWidth = 350;
+    act(() => window.dispatchEvent(new Event('resize')));
+    expect(result.current.comparisonPaneNeedsResize).toBe(true);
+    expect(localStorage.getItem(TASK_PANE_WIDTH_STORAGE_KEY)).toBe('720');
+  });
+
+  it("does not widen a narrow review pane or fight subsequent manual dragging", () => {
+    window.innerWidth = 320;
+    const setWidth = stubTaskPaneApi();
+    const {result} = renderHook(() => useUIState(true));
+    expect(setWidth).not.toHaveBeenCalled();
+    expect(result.current.comparisonPaneNeedsResize).toBe(true);
+    window.innerWidth = 430;
+    act(() => window.dispatchEvent(new Event('resize')));
+    act(() => window.dispatchEvent(new Event('focus')));
+    expect(setWidth).not.toHaveBeenCalled();
+    expect(result.current.comparisonPaneNeedsResize).toBe(true);
   });
 
   it("should remember the actual width after the user widens the pane", () => {
