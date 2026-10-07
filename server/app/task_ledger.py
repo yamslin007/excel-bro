@@ -14,6 +14,63 @@ from typing import Any, Callable, Literal
 from .app_data import task_state_path
 from .capabilities import capability_int
 
+_READONLY_RETRY_ATTEMPTS = 6
+# 当前 schema 版本（与 _initialize_schema 里的 PRAGMA user_version 一致）。
+_SCHEMA_VERSION = 8
+# SQLite 只读相关错误码（用于按**准确类别**判定重试，而非匹配错误字符串）。
+# 见 https://www.sqlite.org/rescode.html ：SQLITE_READONLY(8) 及其扩展码。
+_SQLITE_READONLY_CODES = {8, 8 | (1 << 8), 8 | (2 << 8), 8 | (3 << 8)}
+
+
+def _is_readonly_error(error: sqlite3.Error) -> bool:
+    """按**准确错误类别**判断是否为只读错误（不依赖错误字符串）。
+
+    优先读取 CPython 在 SQLite 异常上暴露的 ``sqlite_errorcode`` /
+    ``sqlite_errorname``（3.11+）：``SQLITE_READONLY`` 扩展码归为只读。
+    """
+    code = getattr(error, "sqlite_errorcode", None)
+    if isinstance(code, int) and code in _SQLITE_READONLY_CODES:
+        return True
+    name = getattr(error, "sqlite_errorname", None)
+    if isinstance(name, str) and name.startswith("SQLITE_READONLY"):
+        return True
+    # 兜底：极旧 SQLite/CPython 未暴露诊断属性时，退回字符串匹配。
+    return "readonly" in str(error).lower()
+
+
+def _schema_is_current(path: Path) -> bool:
+    """判断已有库是否已达当前 schema 版本（避免重跑 bootstrap 与迁移）。
+
+    库不存在、不是 SQLite 库或读取失败 → 返回 False（走完整 bootstrap，
+    由 bootstrap 自己失败关闭）。
+    """
+    if not path.exists():
+        return False
+    try:
+        with sqlite3.connect(path, timeout=5) as connection:
+            row = connection.execute("PRAGMA user_version").fetchone()
+    except sqlite3.Error:
+        return False
+    return bool(row) and int(row[0]) >= _SCHEMA_VERSION
+
+
+def _connection_is_writable(connection: sqlite3.Connection) -> bool:
+    """探测连接是否可写，用于识别 Windows 上 WAL 短暂只读句柄。
+
+    只用来决定是否重开连接；不改变任何业务写入路径，也不把只读当成功。
+    注意：此探测会取写锁，**只能用于可写连接**，绝不能用于纯读取路径
+    （否则纯读也会被串行到写锁，见第十批 F4）。
+    """
+
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute("ROLLBACK")
+        return True
+    except sqlite3.OperationalError as error:
+        if _is_readonly_error(error):
+            return False
+        raise
+
 
 FolderOperationStatus = Literal[
     "running", "completed", "failed", "needs_reconciliation"
@@ -142,211 +199,281 @@ class FolderOperationLedger:
         return self._path_provider().resolve()
 
     def _connect(self) -> sqlite3.Connection:
+        """打开**可写**连接（用于写入/迁移）。
+
+        可写性由连接**本身**保证：写路径的 ``BEGIN IMMEDIATE`` 会在只读句柄上
+        如实失败（失败关闭），不需要在每次连接时主动探测可写——那种探测会让
+        **纯读取**也被强制取得写锁（第十批 F4）。仅当本路径尚未完成 schema
+        bootstrap 时才做一次 bootstrap。
+        """
         path = self._path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(path, timeout=10, isolation_level=None)
+        self._ensure_schema(path)
+        return self._open_writable_connection(path)
+
+    def _connect_readonly(self) -> sqlite3.Connection:
+        """打开**只读**连接（用于纯查询）。
+
+        读取不得被串行到写锁：只读连接不参与写事务，SQLite 在 WAL 下允许
+        读与写并发。schema 若尚未初始化，先确保 bootstrap（幂等、只做一次）。
+        """
+        path = self._path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_schema(path)
+        return self._open_readonly_connection(path)
+
+    def _open_writable_connection(self, path: Path) -> sqlite3.Connection:
+        # WAL 模式下 Windows/SQLite 偶发把刚打开的连接持成只读句柄；这是短暂状态，
+        # 重开即可恢复，不能把短暂只读当成永久失败，更不能降级为只读或跳过写入。
+        # 但**不得**在每次连接时用 BEGIN IMMEDIATE 主动探测可写（会使纯读也取写锁）。
+        last_error: sqlite3.OperationalError | None = None
+        for attempt in range(_READONLY_RETRY_ATTEMPTS):
+            connection = sqlite3.connect(path, timeout=10, isolation_level=None)
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA busy_timeout = 10000")
+            if _connection_is_writable(connection):
+                return connection
+            connection.close()
+            last_error = sqlite3.OperationalError("attempt to write a readonly database")
+            time.sleep(0.005 * (attempt + 1))
+        raise last_error if last_error is not None else sqlite3.OperationalError(
+            "无法获得可写数据库连接"
+        )
+
+    def _open_readonly_connection(self, path: Path) -> sqlite3.Connection:
+        """只读连接：``mode=ro`` 打开，不参与写事务，不取写锁。"""
+        connection = sqlite3.connect(
+            f"file:{path.as_posix()}?mode=ro", timeout=10, isolation_level=None, uri=True
+        )
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 10000")
-        self._ensure_schema(connection, path)
         return connection
 
-    def _ensure_schema(self, connection: sqlite3.Connection, path: Path) -> None:
+    def _ensure_schema(self, path: Path) -> None:
         if path in self._initialized_paths:
             return
         with self._schema_lock:
             if path in self._initialized_paths:
                 return
-            connection.execute("PRAGMA journal_mode = WAL")
-            connection.execute("PRAGMA synchronous = FULL")
-            connection.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS folder_operations (
-                    operation_id TEXT PRIMARY KEY,
-                    request_fingerprint TEXT NOT NULL,
-                    status TEXT NOT NULL CHECK (
-                        status IN ('running', 'completed', 'failed', 'needs_reconciliation')
-                    ),
-                    last_sequence INTEGER NOT NULL DEFAULT 0 CHECK (last_sequence >= 0),
-                    result_json TEXT,
-                    error_json TEXT,
-                    created_at REAL NOT NULL,
-                    updated_at REAL NOT NULL,
-                    executor_id TEXT NOT NULL,
-                    revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1),
-                    work_directory TEXT,
-                    session_id TEXT,
-                    plan_id TEXT,
-                    execution_id TEXT,
-                    undo_id TEXT
-                );
-                CREATE TABLE IF NOT EXISTS folder_operation_events (
-                    operation_id TEXT NOT NULL,
-                    sequence INTEGER NOT NULL CHECK (sequence > 0),
-                    payload_json TEXT NOT NULL,
-                    created_at REAL NOT NULL,
-                    PRIMARY KEY (operation_id, sequence),
-                    FOREIGN KEY (operation_id)
-                        REFERENCES folder_operations(operation_id) ON DELETE CASCADE
-                );
-                CREATE INDEX IF NOT EXISTS idx_folder_operations_status_updated
-                    ON folder_operations(status, updated_at);
-                CREATE TABLE IF NOT EXISTS folder_operation_checkpoints (
-                    operation_id TEXT PRIMARY KEY,
-                    generation INTEGER NOT NULL CHECK (generation >= 1),
-                    kind TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    created_at REAL NOT NULL,
-                    updated_at REAL NOT NULL,
-                    FOREIGN KEY (operation_id)
-                        REFERENCES folder_operations(operation_id) ON DELETE CASCADE
-                );
-                CREATE TABLE IF NOT EXISTS folder_operation_tombstones (
-                    operation_id TEXT PRIMARY KEY,
-                    request_fingerprint TEXT NOT NULL,
-                    expired_at REAL NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS managed_directories (
-                    directory_id TEXT PRIMARY KEY,
-                    path TEXT NOT NULL UNIQUE,
-                    status TEXT NOT NULL CHECK (
-                        status IN ('active', 'unavailable', 'unsafe', 'removed')
-                    ),
-                    registered_at REAL NOT NULL,
-                    last_seen_at REAL NOT NULL,
-                    last_scanned_at REAL,
-                    recovery_count INTEGER NOT NULL DEFAULT 0 CHECK (recovery_count >= 0),
-                    attention_count INTEGER NOT NULL DEFAULT 0 CHECK (attention_count >= 0),
-                    operation_count INTEGER NOT NULL DEFAULT 0 CHECK (operation_count >= 0),
-                    last_error TEXT,
-                    revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1)
-                );
-                CREATE INDEX IF NOT EXISTS idx_managed_directories_status_seen
-                    ON managed_directories(status, last_seen_at);
-                CREATE TABLE IF NOT EXISTS planning_tasks (
-                    turn_id TEXT PRIMARY KEY,
-                    request_fingerprint TEXT NOT NULL,
-                    request_json TEXT NOT NULL,
-                    status TEXT NOT NULL CHECK (
-                        status IN ('running', 'waiting_user', 'completed', 'failed', 'cancelled')
-                    ),
-                    last_sequence INTEGER NOT NULL DEFAULT 0 CHECK (last_sequence >= 0),
-                    checkpoint_json TEXT,
-                    result_json TEXT,
-                    error_json TEXT,
-                    pause_reason TEXT,
-                    active_elapsed_seconds REAL NOT NULL DEFAULT 0 CHECK (active_elapsed_seconds >= 0),
-                    approved_wall_time_seconds REAL NOT NULL CHECK (approved_wall_time_seconds > 0),
-                    extension_count INTEGER NOT NULL DEFAULT 0 CHECK (extension_count >= 0),
-                    current_model_id TEXT,
-                    model_switches_json TEXT NOT NULL DEFAULT '{"items":[]}',
-                    executor_id TEXT NOT NULL,
-                    revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1),
-                    created_at REAL NOT NULL,
-                    updated_at REAL NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_planning_tasks_status_updated
-                    ON planning_tasks(status, updated_at);
-                CREATE TABLE IF NOT EXISTS planning_task_events (
-                    turn_id TEXT NOT NULL,
-                    sequence INTEGER NOT NULL CHECK (sequence > 0),
-                    payload_json TEXT NOT NULL,
-                    created_at REAL NOT NULL,
-                    PRIMARY KEY (turn_id, sequence),
-                    FOREIGN KEY (turn_id)
-                        REFERENCES planning_tasks(turn_id) ON DELETE CASCADE
-                );
-                CREATE TABLE IF NOT EXISTS planning_budget_extensions (
-                    turn_id TEXT NOT NULL,
-                    request_id TEXT NOT NULL,
-                    added_seconds REAL NOT NULL CHECK (added_seconds >= 0),
-                    model_id TEXT,
-                    created_at REAL NOT NULL,
-                    PRIMARY KEY (turn_id, request_id),
-                    FOREIGN KEY (turn_id)
-                        REFERENCES planning_tasks(turn_id) ON DELETE CASCADE
-                );
-                CREATE TABLE IF NOT EXISTS office_executions (
-                    operation_id TEXT PRIMARY KEY,
-                    request_fingerprint TEXT NOT NULL,
-                    plan_json TEXT NOT NULL,
-                    authorization_json TEXT NOT NULL,
-                    workbook_identity TEXT NOT NULL,
-                    task_id TEXT,
-                    status TEXT NOT NULL CHECK (
-                        status IN ('running', 'needs_reconciliation', 'completed', 'failed')
-                    ),
-                    next_action_index INTEGER NOT NULL DEFAULT 0 CHECK (next_action_index >= 0),
-                    in_flight_action_index INTEGER,
-                    before_snapshot_json TEXT,
-                    checkpoint_json TEXT,
-                    result_json TEXT,
-                    error_json TEXT,
-                    owner_token TEXT NOT NULL,
-                    revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1),
-                    created_at REAL NOT NULL,
-                    updated_at REAL NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_office_executions_status_updated
-                    ON office_executions(status, updated_at);
-                """
-            )
-            operation_columns = {
-                str(row["name"])
-                for row in connection.execute(
-                    "PRAGMA table_info(folder_operations)"
-                ).fetchall()
-            }
-            for column in (
-                "work_directory",
-                "session_id",
-                "plan_id",
-                "execution_id",
-                "undo_id",
-                "request_json",
-                "authorization_json",
-            ):
-                if column not in operation_columns:
-                    connection.execute(
-                        f"ALTER TABLE folder_operations ADD COLUMN {column} TEXT"
-                    )
-            planning_columns = {
-                str(row["name"])
-                for row in connection.execute(
-                    "PRAGMA table_info(planning_tasks)"
-                ).fetchall()
-            }
-            if "current_model_id" not in planning_columns:
-                connection.execute(
-                    "ALTER TABLE planning_tasks ADD COLUMN current_model_id TEXT"
-                )
-            if "model_switches_json" not in planning_columns:
-                connection.execute(
-                    "ALTER TABLE planning_tasks ADD COLUMN model_switches_json "
-                    "TEXT NOT NULL DEFAULT '{\"items\":[]}'"
-                )
-            extension_columns = {
-                str(row["name"])
-                for row in connection.execute(
-                    "PRAGMA table_info(planning_budget_extensions)"
-                ).fetchall()
-            }
-            if "model_id" not in extension_columns:
-                connection.execute(
-                    "ALTER TABLE planning_budget_extensions ADD COLUMN model_id TEXT"
-                )
-            office_columns = {
-                str(row["name"])
-                for row in connection.execute(
-                    "PRAGMA table_info(office_executions)"
-                ).fetchall()
-            }
-            if "task_id" not in office_columns:
-                connection.execute(
-                    "ALTER TABLE office_executions ADD COLUMN task_id TEXT"
-                )
-            connection.execute("PRAGMA user_version = 8")
+            self._run_schema_bootstrap(path)
             self._initialized_paths.add(path)
+
+    def _run_schema_bootstrap(self, path: Path) -> None:
+        # 已有库（user_version 已达当前版本）无需重建：直接返回，避免每次新实例
+        # 都重跑 journal_mode 切换与迁移——那会与并发写事务冲突（第十批 F4）。
+        if _schema_is_current(path):
+            return
+        # bootstrap 连接自身也可能被 WAL 切换持成只读；同样重开，不得降级。
+        last_error: sqlite3.OperationalError | None = None
+        for attempt in range(_READONLY_RETRY_ATTEMPTS):
+            bootstrap = sqlite3.connect(path, timeout=10, isolation_level=None)
+            try:
+                bootstrap.row_factory = sqlite3.Row
+                self._initialize_schema(bootstrap)
+            except sqlite3.OperationalError as error:
+                bootstrap.close()
+                if not _is_readonly_error(error):
+                    raise
+                last_error = error
+                time.sleep(0.005 * (attempt + 1))
+                continue
+            bootstrap.close()
+            return
+        raise last_error if last_error is not None else sqlite3.OperationalError(
+            "无法完成账本 schema 初始化"
+        )
+
+    def _initialize_schema(self, connection: sqlite3.Connection) -> None:
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute("PRAGMA synchronous = FULL")
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS folder_operations (
+                operation_id TEXT PRIMARY KEY,
+                request_fingerprint TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (
+                    status IN ('running', 'completed', 'failed', 'needs_reconciliation')
+                ),
+                last_sequence INTEGER NOT NULL DEFAULT 0 CHECK (last_sequence >= 0),
+                result_json TEXT,
+                error_json TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                executor_id TEXT NOT NULL,
+                revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1),
+                work_directory TEXT,
+                session_id TEXT,
+                plan_id TEXT,
+                execution_id TEXT,
+                undo_id TEXT
+            );
+            CREATE TABLE IF NOT EXISTS folder_operation_events (
+                operation_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL CHECK (sequence > 0),
+                payload_json TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                PRIMARY KEY (operation_id, sequence),
+                FOREIGN KEY (operation_id)
+                    REFERENCES folder_operations(operation_id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_folder_operations_status_updated
+                ON folder_operations(status, updated_at);
+            CREATE TABLE IF NOT EXISTS folder_operation_checkpoints (
+                operation_id TEXT PRIMARY KEY,
+                generation INTEGER NOT NULL CHECK (generation >= 1),
+                kind TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                FOREIGN KEY (operation_id)
+                    REFERENCES folder_operations(operation_id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS folder_operation_tombstones (
+                operation_id TEXT PRIMARY KEY,
+                request_fingerprint TEXT NOT NULL,
+                expired_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS managed_directories (
+                directory_id TEXT PRIMARY KEY,
+                path TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL CHECK (
+                    status IN ('active', 'unavailable', 'unsafe', 'removed')
+                ),
+                registered_at REAL NOT NULL,
+                last_seen_at REAL NOT NULL,
+                last_scanned_at REAL,
+                recovery_count INTEGER NOT NULL DEFAULT 0 CHECK (recovery_count >= 0),
+                attention_count INTEGER NOT NULL DEFAULT 0 CHECK (attention_count >= 0),
+                operation_count INTEGER NOT NULL DEFAULT 0 CHECK (operation_count >= 0),
+                last_error TEXT,
+                revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1)
+            );
+            CREATE INDEX IF NOT EXISTS idx_managed_directories_status_seen
+                ON managed_directories(status, last_seen_at);
+            CREATE TABLE IF NOT EXISTS planning_tasks (
+                turn_id TEXT PRIMARY KEY,
+                request_fingerprint TEXT NOT NULL,
+                request_json TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (
+                    status IN ('running', 'waiting_user', 'completed', 'failed', 'cancelled')
+                ),
+                last_sequence INTEGER NOT NULL DEFAULT 0 CHECK (last_sequence >= 0),
+                checkpoint_json TEXT,
+                result_json TEXT,
+                error_json TEXT,
+                pause_reason TEXT,
+                active_elapsed_seconds REAL NOT NULL DEFAULT 0 CHECK (active_elapsed_seconds >= 0),
+                approved_wall_time_seconds REAL NOT NULL CHECK (approved_wall_time_seconds > 0),
+                extension_count INTEGER NOT NULL DEFAULT 0 CHECK (extension_count >= 0),
+                current_model_id TEXT,
+                model_switches_json TEXT NOT NULL DEFAULT '{"items":[]}',
+                executor_id TEXT NOT NULL,
+                revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1),
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_planning_tasks_status_updated
+                ON planning_tasks(status, updated_at);
+            CREATE TABLE IF NOT EXISTS planning_task_events (
+                turn_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL CHECK (sequence > 0),
+                payload_json TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                PRIMARY KEY (turn_id, sequence),
+                FOREIGN KEY (turn_id)
+                    REFERENCES planning_tasks(turn_id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS planning_budget_extensions (
+                turn_id TEXT NOT NULL,
+                request_id TEXT NOT NULL,
+                added_seconds REAL NOT NULL CHECK (added_seconds >= 0),
+                model_id TEXT,
+                created_at REAL NOT NULL,
+                PRIMARY KEY (turn_id, request_id),
+                FOREIGN KEY (turn_id)
+                    REFERENCES planning_tasks(turn_id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS office_executions (
+                operation_id TEXT PRIMARY KEY,
+                request_fingerprint TEXT NOT NULL,
+                plan_json TEXT NOT NULL,
+                authorization_json TEXT NOT NULL,
+                workbook_identity TEXT NOT NULL,
+                task_id TEXT,
+                status TEXT NOT NULL CHECK (
+                    status IN ('running', 'needs_reconciliation', 'completed', 'failed')
+                ),
+                next_action_index INTEGER NOT NULL DEFAULT 0 CHECK (next_action_index >= 0),
+                in_flight_action_index INTEGER,
+                before_snapshot_json TEXT,
+                checkpoint_json TEXT,
+                result_json TEXT,
+                error_json TEXT,
+                owner_token TEXT NOT NULL,
+                revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1),
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_office_executions_status_updated
+                ON office_executions(status, updated_at);
+            """
+        )
+        operation_columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(folder_operations)"
+            ).fetchall()
+        }
+        for column in (
+            "work_directory",
+            "session_id",
+            "plan_id",
+            "execution_id",
+            "undo_id",
+            "request_json",
+            "authorization_json",
+        ):
+            if column not in operation_columns:
+                connection.execute(
+                    f"ALTER TABLE folder_operations ADD COLUMN {column} TEXT"
+                )
+        planning_columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(planning_tasks)"
+            ).fetchall()
+        }
+        if "current_model_id" not in planning_columns:
+            connection.execute(
+                "ALTER TABLE planning_tasks ADD COLUMN current_model_id TEXT"
+            )
+        if "model_switches_json" not in planning_columns:
+            connection.execute(
+                "ALTER TABLE planning_tasks ADD COLUMN model_switches_json "
+                "TEXT NOT NULL DEFAULT '{\"items\":[]}'"
+            )
+        extension_columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(planning_budget_extensions)"
+            ).fetchall()
+        }
+        if "model_id" not in extension_columns:
+            connection.execute(
+                "ALTER TABLE planning_budget_extensions ADD COLUMN model_id TEXT"
+            )
+        office_columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(office_executions)"
+            ).fetchall()
+        }
+        if "task_id" not in office_columns:
+            connection.execute(
+                "ALTER TABLE office_executions ADD COLUMN task_id TEXT"
+            )
+        connection.execute("PRAGMA user_version = %d" % _SCHEMA_VERSION)
 
     @staticmethod
     def _decode(value: str | None) -> dict[str, Any] | None:
@@ -536,7 +663,7 @@ class FolderOperationLedger:
             return self._record(row), False
 
     def get(self, operation_id: str) -> FolderOperationRecord | None:
-        with self._connect() as connection:
+        with self._connect_readonly() as connection:
             row = connection.execute(
                 "SELECT * FROM folder_operations WHERE operation_id = ?",
                 (operation_id,),
@@ -610,7 +737,7 @@ class FolderOperationLedger:
         return self._record(updated)
 
     def checkpoint(self, operation_id: str) -> FolderOperationCheckpoint | None:
-        with self._connect() as connection:
+        with self._connect_readonly() as connection:
             row = connection.execute(
                 "SELECT * FROM folder_operation_checkpoints WHERE operation_id = ?",
                 (operation_id,),
@@ -725,7 +852,7 @@ class FolderOperationLedger:
         return self._record(row)
 
     def expired_fingerprint(self, operation_id: str) -> str | None:
-        with self._connect() as connection:
+        with self._connect_readonly() as connection:
             row = connection.execute(
                 "SELECT request_fingerprint FROM folder_operation_tombstones WHERE operation_id = ?",
                 (operation_id,),
@@ -800,7 +927,7 @@ class FolderOperationLedger:
         return self._record(row)
 
     def events(self, operation_id: str) -> list[dict[str, Any]]:
-        with self._connect() as connection:
+        with self._connect_readonly() as connection:
             rows = connection.execute(
                 """
                 SELECT payload_json FROM folder_operation_events
@@ -983,14 +1110,14 @@ class FolderOperationLedger:
         return record, False
 
     def planning_task(self, turn_id: str) -> PlanningTaskRecord | None:
-        with self._connect() as connection:
+        with self._connect_readonly() as connection:
             row = connection.execute(
                 "SELECT * FROM planning_tasks WHERE turn_id = ?", (turn_id,)
             ).fetchone()
         return self._planning_record(row) if row is not None else None
 
     def planning_events(self, turn_id: str) -> list[dict[str, Any]]:
-        with self._connect() as connection:
+        with self._connect_readonly() as connection:
             rows = connection.execute(
                 """
                 SELECT payload_json FROM planning_task_events
@@ -1403,12 +1530,12 @@ class FolderOperationLedger:
             sql += " WHERE status != ?"
             parameters = ("removed",)
         sql += " ORDER BY last_seen_at DESC"
-        with self._connect() as connection:
+        with self._connect_readonly() as connection:
             rows = connection.execute(sql, parameters).fetchall()
         return [self._directory_record(row) for row in rows]
 
     def managed_directory(self, directory_id: str) -> ManagedDirectoryRecord | None:
-        with self._connect() as connection:
+        with self._connect_readonly() as connection:
             row = connection.execute(
                 "SELECT * FROM managed_directories WHERE directory_id = ?",
                 (directory_id,),
@@ -1547,7 +1674,7 @@ class FolderOperationLedger:
         return record, False
 
     def office_execution(self, operation_id: str) -> OfficeExecutionRecord | None:
-        with self._connect() as connection:
+        with self._connect_readonly() as connection:
             row = connection.execute(
                 "SELECT * FROM office_executions WHERE operation_id = ?",
                 (operation_id,),

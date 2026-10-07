@@ -3,6 +3,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ColumnMappingRule } from "../contracts";
 import { LocalMappingResolution } from "./LocalMappingResolution";
+import { TargetConfirmationRequiredError } from "@excel-bro/core/authorizedTarget";
 
 afterEach(cleanup);
 
@@ -20,6 +21,94 @@ const rule: ColumnMappingRule = {
 };
 
 describe("本地映射补全卡 · 两宿主共用", () => {
+  it("目标读取失败不调用计算；恢复后原答案仍可提交", async () => {
+    const checkScope = vi.fn().mockRejectedValueOnce(new Error("私有路径不显示"))
+      .mockResolvedValue(null);
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    render(<LocalMappingResolution rule={rule} values={["甲，乙"]} allowExactMapping busy={false}
+      checkScope={checkScope} onResolve={onResolve} onCancel={vi.fn()} />);
+    await screen.findByRole("alert");
+    expect(document.body.textContent).not.toContain("私有路径不显示");
+    expect(onResolve).not.toHaveBeenCalled();
+    fireEvent.change(screen.getByLabelText("来源值 甲，乙 的目标值"), { target: { value: "高" } });
+    fireEvent.click(screen.getByRole("button", { name: "按补充映射重新生成预览" }));
+    await waitFor(() => expect(onResolve).toHaveBeenCalledTimes(1));
+  });
+
+  it("提交核对期间卸载表单：不能继续调用宿主计算", async () => {
+    let resolveCheck!: (value: null) => void;
+    const checkScope = vi.fn().mockResolvedValueOnce(null).mockImplementation(() => new Promise<null>((resolve) => { resolveCheck = resolve; }));
+    const onResolve = vi.fn();
+    const view = render(<LocalMappingResolution rule={rule} values={["甲，乙"]} allowExactMapping busy={false}
+      checkScope={checkScope} onResolve={onResolve} onCancel={vi.fn()} />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "按补充映射重新生成预览" })).toHaveProperty("disabled", false));
+    fireEvent.change(screen.getByLabelText("来源值 甲，乙 的目标值"), { target: { value: "高" } });
+    fireEvent.click(screen.getByRole("button", { name: "按补充映射重新生成预览" }));
+    view.unmount();
+    resolveCheck(null);
+    await Promise.resolve();
+    expect(onResolve).not.toHaveBeenCalled();
+  });
+  it("范围已在分析前确认：补全表单只有业务输入，不再包含目标授权", async () => {
+    const checkScope = vi.fn().mockResolvedValue(undefined);
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    render(<LocalMappingResolution rule={rule} values={["甲，乙"]} allowExactMapping busy={false}
+      checkScope={checkScope} onResolve={onResolve} onCancel={vi.fn()} />);
+    const button = screen.getByRole("button", { name: "按补充映射重新生成预览" });
+    await waitFor(() => expect(button).toHaveProperty("disabled", false));
+    expect(screen.queryByRole("checkbox")).toBeNull();
+    expect(document.body.textContent).not.toContain("确认当前操作目标");
+    fireEvent.change(screen.getByLabelText("来源值 甲，乙 的目标值"), { target: { value: "高" } });
+    fireEvent.click(button);
+    await waitFor(() => expect(onResolve).toHaveBeenCalledTimes(1));
+    expect(onResolve.mock.calls[0]).toHaveLength(1);
+    expect(checkScope).toHaveBeenCalledTimes(2);
+  });
+
+  it("分析后目标又变化：独立目标检查阻止计算，业务表单保留答案而不新增授权框", async () => {
+    const checkScope = vi.fn().mockResolvedValueOnce(undefined)
+      .mockRejectedValue(new TargetConfirmationRequiredError());
+    const onResolve = vi.fn();
+    render(<LocalMappingResolution rule={rule} values={["甲，乙"]} allowExactMapping busy={false}
+      checkScope={checkScope} onResolve={onResolve} onCancel={vi.fn()} />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "按补充映射重新生成预览" })).toHaveProperty("disabled", false));
+    fireEvent.change(screen.getByLabelText("来源值 甲，乙 的目标值"), { target: { value: "高" } });
+    fireEvent.click(screen.getByRole("button", { name: "按补充映射重新生成预览" }));
+    await screen.findByRole("alert");
+    expect(screen.queryByRole("checkbox")).toBeNull();
+    expect(onResolve).not.toHaveBeenCalled();
+    expect(screen.getByLabelText("来源值 甲，乙 的目标值")).toHaveProperty("value", "高");
+  });
+
+  it("身份可证明相同时不增加范围勾选，仍在提交前重新检查", async () => {
+    const checkScope = vi.fn().mockResolvedValue(null);
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    render(<LocalMappingResolution rule={rule} values={["甲，乙"]} allowExactMapping busy={false}
+      checkScope={checkScope} onResolve={onResolve} onCancel={vi.fn()} />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "按补充映射重新生成预览" })).toHaveProperty("disabled", false));
+    expect(screen.queryByRole("checkbox")).toBeNull();
+    fireEvent.change(screen.getByLabelText("来源值 甲，乙 的目标值"), { target: { value: "高" } });
+    fireEvent.click(screen.getByRole("button", { name: "按补充映射重新生成预览" }));
+    await waitFor(() => expect(onResolve).toHaveBeenCalledTimes(1));
+    expect(onResolve.mock.calls[0]).toHaveLength(1);
+    expect(checkScope).toHaveBeenCalledTimes(2);
+  });
+  it("已提交规则等待身份确认时提供明确入口，不要求重填或重发需求", async () => {
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    const onReauthorize = vi.fn().mockResolvedValue(undefined);
+    const props = { rule, values: ["甲，乙"], allowExactMapping: true, busy: false, onResolve, onCancel: vi.fn() };
+    const view = render(<LocalMappingResolution {...props} />);
+    fireEvent.change(screen.getByLabelText("来源值 甲，乙 的目标值"), { target: { value: "高" } });
+    fireEvent.click(screen.getByRole("button", { name: "按补充映射重新生成预览" }));
+    await waitFor(() => expect(onResolve).toHaveBeenCalledTimes(1));
+    view.rerender(<LocalMappingResolution {...props} onReauthorize={onReauthorize} />);
+    expect(screen.queryByRole("button", { name: "按补充映射重新生成预览" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "确认此范围并生成预览" }));
+    await waitFor(() => expect(onReauthorize).toHaveBeenCalledTimes(1));
+    expect(onResolve).toHaveBeenCalledTimes(1);
+    view.rerender(<LocalMappingResolution {...props} />);
+    expect(screen.getByLabelText("来源值 甲，乙 的目标值")).toHaveProperty("value", "高");
+  });
   it("切到拆分规则仍留在卡上；未显式确认优先级不能生成预览", () => {
     const onResolve = vi.fn().mockResolvedValue(undefined);
     const onCancel = vi.fn();
@@ -76,7 +165,7 @@ describe("本地映射补全卡 · 两宿主共用", () => {
     expect(screen.getAllByRole("button", { name: "暂不修改" })).toHaveLength(1);
   });
 
-  it("四个空白选项各自落成不同的结构化策略，不互相冒充", () => {
+  it("四个空白选项各自落成不同的结构化策略，不互相冒充", async () => {
     const onResolve = vi.fn().mockResolvedValue(undefined);
     render(<LocalMappingResolution
       rule={rule} values={[]} allowExactMapping={false} busy={false}
@@ -87,15 +176,18 @@ describe("本地映射补全卡 · 两宿主共用", () => {
 
     // 默认就是"保留目标原值"：不写入，不是读回原值再写回。
     fireEvent.click(submit());
+    await waitFor(() => expect(onResolve).toHaveBeenCalledTimes(1));
     expect((onResolve.mock.calls[0][0] as ColumnMappingRule).blankPolicy).toEqual({ kind: "keep" });
     expect((onResolve.mock.calls[0][0] as ColumnMappingRule).blankLabel).toBeUndefined();
 
     fireEvent.click(screen.getByLabelText("清空目标内容 —— 清成真空单元格，不是写一个空字符串"));
     fireEvent.click(submit());
+    await waitFor(() => expect(onResolve).toHaveBeenCalledTimes(2));
     expect((onResolve.mock.calls[1][0] as ColumnMappingRule).blankPolicy).toEqual({ kind: "clear" });
 
     fireEvent.click(screen.getByLabelText("写入空字符串 —— 明确写一个空字符串常量，与「清空」不同"));
     fireEvent.click(submit());
+    await waitFor(() => expect(onResolve).toHaveBeenCalledTimes(3));
     expect((onResolve.mock.calls[2][0] as ColumnMappingRule).blankPolicy).toEqual({ kind: "value", value: "" });
 
     fireEvent.click(screen.getByLabelText("写入下面填的指定值"));
@@ -104,6 +196,7 @@ describe("本地映射补全卡 · 两宿主共用", () => {
     expect(onResolve).toHaveBeenCalledTimes(3);
     fireEvent.change(screen.getByLabelText("空白格写入的值"), { target: { value: "未分类" } });
     fireEvent.click(submit());
+    await waitFor(() => expect(onResolve).toHaveBeenCalledTimes(4));
     expect((onResolve.mock.calls[3][0] as ColumnMappingRule).blankPolicy).toEqual({ kind: "value", value: "未分类" });
   });
 

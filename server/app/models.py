@@ -25,6 +25,69 @@ from .safety import (
 CellValue = str | int | float | bool | None
 
 
+class PythonDataSource(BaseModel):
+    """Metadata for one exact authorized range; never a file path."""
+    model_config = ConfigDict(extra="forbid", strict=True)
+    sheetId: str = Field(min_length=1, max_length=80)
+    sheetName: str = Field(min_length=1, max_length=31)
+    range: str = Field(pattern=r"^[A-Z]{1,3}[1-9][0-9]{0,6}(?::[A-Z]{1,3}[1-9][0-9]{0,6})?$")
+
+
+class PythonDataScope(BaseModel):
+    """Local-only protocol. Not a field of PlanRequest/history/checkpoints."""
+    model_config = ConfigDict(extra="forbid", strict=True)
+    version: Literal[1]
+    taskId: str = Field(pattern=r"^[A-Za-z0-9_-]{1,80}$")
+    hostId: Literal["excel-office", "wps-et"]
+    workbookIdentityHash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    authorizationVersion: str = Field(pattern=r"^[0-9a-f]{64}$")
+    sources: list[PythonDataSource] = Field(min_length=1, max_length=8)
+
+
+class PythonDataScopeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    scope: PythonDataScope
+
+
+class PythonDataSnapshotRequest(PythonDataScopeRequest):
+    scopeToken: str = Field(pattern=r"^[A-Za-z0-9_-]{43}$")
+    sourceIndex: int = Field(ge=0, le=7)
+    # Matrix shape/scalars/finite numbers and byte bounds are checked by the
+    # trusted registry. FastAPI must not echo validation input in HTTP errors.
+    values: list[list[Any]]
+
+
+class PythonDataRevokeRequest(PythonDataScopeRequest):
+    scopeToken: str = Field(pattern=r"^[A-Za-z0-9_-]{43}$")
+
+
+class PythonDatasetReceipt(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    datasetHandle: str = Field(pattern=r"^dataset://[A-Za-z0-9_-]{43}$")
+    contentFingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class PythonResultReceipt(BaseModel):
+    """Local-only reference, never a model tool result or execution permission."""
+    model_config = ConfigDict(extra="forbid", strict=True)
+    resultHandle: str = Field(pattern=r"^result://[A-Za-z0-9_-]{43}$")
+    contentFingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    rows: int = Field(ge=1, le=500)
+    columns: int = Field(ge=1, le=50)
+
+
+class PythonResultReadRequest(PythonDataRevokeRequest):
+    datasets: list[PythonDatasetReceipt] = Field(min_length=1, max_length=8)
+    result: PythonResultReceipt
+
+
+class PythonMatrixResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    kind: Literal["matrix"]
+    # Trust-boundary validation is in python_results; never coerce nested values.
+    values: list[list[Any]]
+
+
 class ExcelReviewLayoutPrepareRequest(BaseModel):
     """Window metadata only. Never accept paths, plans, values or window handles."""
     model_config = ConfigDict(extra="forbid")

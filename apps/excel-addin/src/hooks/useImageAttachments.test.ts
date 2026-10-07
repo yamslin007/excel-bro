@@ -42,6 +42,51 @@ function dropEvent(files: File[], types = ["Files"]) {
 }
 
 describe("useImageAttachments", () => {
+  it("reserves slots during parallel preparations and exposes preparation state", async () => {
+    let release!: (image: PendingImage) => void;
+    prepareImageFileMock.mockImplementationOnce(() => new Promise((resolve) => { release = resolve; }));
+    const { result } = renderHook(() => useImageAttachments());
+    let first!: Promise<void>;
+    act(() => { first = result.current.addImage(imageFile("a.png")); });
+    expect(result.current.preparingImages).toBe(true);
+    await act(async () => {
+      await result.current.addImageFiles([imageFile("b.png"), imageFile("c.png")]);
+    });
+    expect(prepareImageFileMock).toHaveBeenCalledTimes(2);
+    await act(async () => { release(pendingImage("a.png")); await first; });
+    expect(result.current.pendingImages).toHaveLength(2);
+    expect(result.current.pendingImages.map((image) => image.name)).toEqual(["a.png", "b.png"]);
+    expect(result.current.preparingImages).toBe(false);
+  });
+
+  it("clearing or switching conversations prevents a late preparation from reappearing", async () => {
+    let release!: (image: PendingImage) => void;
+    prepareImageFileMock.mockImplementationOnce(() => new Promise((resolve) => { release = resolve; }));
+    const { result } = renderHook(() => useImageAttachments());
+    let preparation!: Promise<void>;
+    act(() => { preparation = result.current.addImage(imageFile()); });
+    act(() => result.current.clearImages());
+    await act(async () => { release(pendingImage("late.png")); await preparation; });
+    expect(result.current.pendingImages).toEqual([]);
+    expect(result.current.preparingImages).toBe(false);
+  });
+
+  it("pastes image files but leaves ordinary text paste alone", async () => {
+    const { result } = renderHook(() => useImageAttachments());
+    const preventDefault = vi.fn();
+    await act(async () => {
+      result.current.handleImagePaste({ preventDefault, clipboardData: { items: [
+        { kind: "file", type: "image/png", getAsFile: () => imageFile("paste.png") }
+      ] } } as never);
+    });
+    expect(preventDefault).toHaveBeenCalledOnce();
+    expect(result.current.pendingImages[0].name).toBe("paste.png");
+    preventDefault.mockClear();
+    act(() => result.current.handleImagePaste({ preventDefault, clipboardData: { items: [
+      { kind: "string", type: "text/plain" }
+    ] } } as never));
+    expect(preventDefault).not.toHaveBeenCalled();
+  });
   beforeEach(() => {
     vi.clearAllMocks();
     prepareImageFileMock.mockImplementation(async (file) =>

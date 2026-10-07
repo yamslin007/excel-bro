@@ -1,8 +1,16 @@
 import { describe, expect, it, vi } from "vitest";
 import type { PlanRequest } from "../../excel-addin/src/contracts";
 import type { WpsApplication, WpsRange, WpsWorksheet } from "./wpsHost";
-import { buildWpsReadonlyContexts, runWpsReadonlyTurn } from "./wpsReadonlyAgent";
+import {
+  buildWpsReadonlyContexts,
+  reinspectWpsPlanningPause,
+  resumeWpsPlanning,
+  runWpsReadonlyTurn,
+  resumeWpsLocalMapping
+} from "./wpsReadonlyAgent";
+import { ApiRequestError } from "../../excel-addin/src/api";
 import type { WpsSheetReadResult } from "./wpsWorkbookReader";
+import { TargetConfirmationRequiredError } from "@excel-bro/core/authorizedTarget";
 
 function makeApplication(): WpsApplication {
   const sheets: WpsWorksheet[] = [{ Name: "明细" }, { Name: "未授权" }];
@@ -37,11 +45,53 @@ const readResult: WpsSheetReadResult = {
 };
 
 describe("WPS readonly agent", () => {
+  it("local mapping resume checks target before reading source rows", async () => {
+    const readSheets = vi.fn(async () => [readResult]);
+    await expect(resumeWpsLocalMapping({ application: makeApplication(), selectedSheetIndexes: [1],
+      rule: { kind: "columnMapping", sourceSheet: "明细", targetSheet: "明细", sourceRange: "A2:A3", targetRange: "B2:B3",
+        mapping: [{ source: "甲", target: "一" }, { source: "乙", target: "二" }], blankPolicy: { kind: "keep" } },
+      context: { summary: "映射", warnings: [], assumptions: [] }, additions: [],
+      beforeRead: async () => { throw new TargetConfirmationRequiredError(); }
+    }, { readSheets, readSchemas: vi.fn(), checkIntent: vi.fn(), createAssistantResponse: vi.fn(), streamPlanning: vi.fn(), getPlanningStatus: vi.fn(), continuePlanning: vi.fn(), executeQuery: vi.fn() }))
+      .rejects.toBeInstanceOf(TargetConfirmationRequiredError);
+    expect(readSheets).not.toHaveBeenCalled();
+  });
+  it("local mapping resume checks again after host read; a switched target cannot become a plan", async () => {
+    let switched = false;
+    const readSheets = vi.fn(async () => { switched = true; return [readResult]; });
+    const guard = vi.fn(async () => { if (switched) throw new TargetConfirmationRequiredError(); });
+    await expect(resumeWpsLocalMapping({ application: makeApplication(), selectedSheetIndexes: [1],
+      rule: { kind: "columnMapping", sourceSheet: "明细", targetSheet: "明细", sourceRange: "A2:A3", targetRange: "B2:B3",
+        mapping: [{ source: "甲", target: "一" }, { source: "乙", target: "二" }], blankPolicy: { kind: "keep" } },
+      context: { summary: "映射", warnings: [], assumptions: [] }, additions: [], beforeRead: guard
+    }, { readSheets, readSchemas: vi.fn(), checkIntent: vi.fn(), createAssistantResponse: vi.fn(), streamPlanning: vi.fn(), getPlanningStatus: vi.fn(), continuePlanning: vi.fn(), executeQuery: vi.fn() }))
+      .rejects.toBeInstanceOf(TargetConfirmationRequiredError);
+    expect(readSheets).toHaveBeenCalledTimes(1);
+    expect(guard).toHaveBeenCalledTimes(2);
+  });
+  it("pauses before any source rows are read when target changes during model intent", async () => {
+    let changed = false;
+    const readSchemas = vi.fn(async () => [readResult]);
+    const readSheets = vi.fn();
+    const createAssistantResponse = vi.fn();
+    await expect(runWpsReadonlyTurn({ application: makeApplication(), selectedSheetIndexes: [1], prompt: "统计记录",
+      beforeRead: async () => { if (changed) throw new TargetConfirmationRequiredError(); }
+    }, {
+      checkIntent: vi.fn(async () => { changed = true; return {
+        kind: "tool_request" as const, summary: "统计", confirmedPrompt: "统计", provider: "model" as const,
+        request: { id: "q", tool: "query_table" as const, arguments: { mode: "aggregate" as const,
+          metrics: [{ operation: "countRows" as const, outputName: "记录数" }] } }
+      }; }), readSchemas, readSheets, createAssistantResponse, streamPlanning: vi.fn(), getPlanningStatus: vi.fn(), continuePlanning: vi.fn(), executeQuery: vi.fn()
+    })).rejects.toBeInstanceOf(TargetConfirmationRequiredError);
+    expect(readSchemas).toHaveBeenCalledOnce();
+    expect(readSheets).not.toHaveBeenCalled();
+    expect(createAssistantResponse).not.toHaveBeenCalled();
+  });
   it("preserves a structured planner failure rather than returning a successful answer", async () => {
     const result = await runWpsReadonlyTurn({ application: makeApplication(), selectedSheetIndexes: [1], prompt: "生成预览" }, {
       checkIntent: vi.fn(async () => ({ kind: "proceed" as const, summary: "预览", confirmedPrompt: "生成预览", provider: "model" as const })),
       createAssistantResponse: vi.fn(async () => ({ kind: "answer" as const, provider: "system" as const, message: "规划已停止", outcome: "failed" as const, stopReason: "max_tokens" as const })),
-      readSchemas: vi.fn(async () => [readResult]), readSheets: vi.fn(), executeQuery: vi.fn()
+      readSchemas: vi.fn(async () => [readResult]), readSheets: vi.fn(), streamPlanning: vi.fn(), getPlanningStatus: vi.fn(), continuePlanning: vi.fn(), executeQuery: vi.fn()
     });
     expect(result).toMatchObject({ kind: "answer", outcome: "failed" });
     expect(result).not.toHaveProperty("plan");
@@ -56,7 +106,7 @@ describe("WPS readonly agent", () => {
     const result = await runWpsReadonlyTurn({ application: makeApplication(), selectedSheetIndexes: [1], prompt: "请生成统计预览" }, {
       checkIntent: vi.fn(async () => ({ kind: "proceed" as const, summary: "统计", confirmedPrompt: "请生成统计预览", provider: "model" as const })),
       createAssistantResponse: vi.fn(async () => response),
-      readSchemas: vi.fn(async () => [readResult]), readSheets, executeQuery: vi.fn()
+      readSchemas: vi.fn(async () => [readResult]), readSheets, streamPlanning: vi.fn(), getPlanningStatus: vi.fn(), continuePlanning: vi.fn(), executeQuery: vi.fn()
     });
     expect(result).toMatchObject({ kind: "clarification", clarification: { response }, headerRows: [["影院", "数量"]] });
     expect(readSheets).not.toHaveBeenCalled();
@@ -120,6 +170,9 @@ describe("WPS readonly agent", () => {
         checkIntent,
         executeQuery,
         createAssistantResponse,
+        streamPlanning: vi.fn(),
+        getPlanningStatus: vi.fn(),
+        continuePlanning: vi.fn(),
         readSchemas: vi.fn(async () => [readResult]),
         readSheets: vi.fn(async () => [readResult])
       }
@@ -150,6 +203,9 @@ describe("WPS readonly agent", () => {
           provider: "model" as const
         })),
         executeQuery: vi.fn(),
+        streamPlanning: vi.fn(),
+        getPlanningStatus: vi.fn(),
+        continuePlanning: vi.fn(),
         createAssistantResponse: vi.fn(async () => ({
           kind: "plan" as const,
           provider: "model" as const,
@@ -427,6 +483,9 @@ describe("WPS readonly agent", () => {
       {
         checkIntent: vi.fn(async () => ({ kind: "conversation" as const, message: "你好，有什么需要我帮忙？", provider: "model" as const })),
         executeQuery: vi.fn(),
+        streamPlanning: vi.fn(),
+        getPlanningStatus: vi.fn(),
+        continuePlanning: vi.fn(),
         createAssistantResponse,
         readSchemas,
         readSheets
@@ -437,5 +496,443 @@ describe("WPS readonly agent", () => {
     expect(readSchemas).toHaveBeenCalledOnce();
     expect(readSheets).not.toHaveBeenCalled();
     expect(createAssistantResponse).not.toHaveBeenCalled();
+  });
+
+  /**
+   * CAP-02：`runWpsTurn` 的**通道选择**纪律。
+   *
+   * 这一组测试保护的不是"能不能流式"，而是三条容易写错的分支：
+   *  1. 有 turnId 时必须优先走流式（否则 CAP-02 等于没接）；
+   *  2. **只**在端点不存在/连不上时回退一次性 —— 业务错误必须原样抛出；
+   *  3. 暂停是结构化终态，不能被当成 answer 或失败。
+   */
+  describe("CAP-02 规划通道选择", () => {
+    function baseDeps(overrides: Record<string, unknown> = {}) {
+      return {
+        checkIntent: vi.fn(async () => ({
+          kind: "proceed" as const,
+          summary: "预览",
+          confirmedPrompt: "生成预览",
+          provider: "model" as const,
+          turnId: "turn-stream-1"
+        })),
+        readSchemas: vi.fn(async () => [readResult]),
+        readSheets: vi.fn(async () => [readResult]),
+        executeQuery: vi.fn(),
+        createAssistantResponse: vi.fn(async () => ({
+          kind: "answer" as const,
+          provider: "model" as const,
+          message: "一次性通道回答",
+          resultContext: null
+        })),
+        streamPlanning: vi.fn(),
+        getPlanningStatus: vi.fn(),
+        continuePlanning: vi.fn(),
+        ...overrides
+      } as never;
+    }
+
+    async function run(deps: Record<string, unknown>) {
+      return runWpsReadonlyTurn(
+        { application: makeApplication(), selectedSheetIndexes: [1], prompt: "生成预览" },
+        deps as never
+      );
+    }
+
+    it("有 turnId 时优先走流式，且事件进增量进度（变异点：跳过流式直接一次性）", async () => {
+      const progress: string[] = [];
+      const streamPlanning = vi.fn(async (_req: unknown, _turnId: string, hooks: { onProgress?: (e: { stepId: string; title: string; summary?: string }) => void }) => {
+        hooks.onProgress?.({ stepId: "s1", title: "读取结构", summary: "正在读取" });
+        return { kind: "answer" as const, provider: "model" as const, message: "流式回答", resultContext: null };
+      });
+      const deps = baseDeps({ streamPlanning });
+      const result = await runWpsReadonlyTurn(
+        {
+          application: makeApplication(),
+          selectedSheetIndexes: [1],
+          prompt: "生成预览",
+          onProgress: (p) => progress.push(p.title ?? "")
+        },
+        deps
+      );
+      expect(result).toMatchObject({ kind: "answer", message: "流式回答" });
+      expect((deps as { createAssistantResponse: ReturnType<typeof vi.fn> }).createAssistantResponse)
+        .not.toHaveBeenCalled();
+      expect(progress).toContain("读取结构");
+    });
+
+    it("端点不存在（404）才回退一次性通道", async () => {
+      const notFound = new ApiRequestError(404, "NOT_FOUND", "没有这个路由", false);
+      const deps = baseDeps({ streamPlanning: vi.fn(async () => { throw notFound; }) });
+      const result = await run(deps);
+      expect(result).toMatchObject({ kind: "answer", message: "一次性通道回答" });
+      expect((deps as { createAssistantResponse: ReturnType<typeof vi.fn> }).createAssistantResponse)
+        .toHaveBeenCalledOnce();
+    });
+
+    it("本地服务连不上时回退一次性通道", async () => {
+      const offline = new TypeError("Failed to fetch");
+      const deps = baseDeps({ streamPlanning: vi.fn(async () => { throw offline; }) });
+      const result = await run(deps);
+      expect(result).toMatchObject({ kind: "answer", message: "一次性通道回答" });
+    });
+
+    it("业务错误必须原样抛出、绝不回退（变异点：把回退条件放宽成 any）", async () => {
+      // 409 是"服务端收到了请求并明确拒绝"，回退只会掩盖原因、可能再花一次模型钱。
+      const conflict = new ApiRequestError(409, "CAPABILITY_MISMATCH", "能力不匹配", false);
+      const deps = baseDeps({ streamPlanning: vi.fn(async () => { throw conflict; }) });
+      await expect(run(deps)).rejects.toBe(conflict);
+      expect((deps as { createAssistantResponse: ReturnType<typeof vi.fn> }).createAssistantResponse)
+        .not.toHaveBeenCalled();
+    });
+
+    it("暂停作为结构化终态返回，不落到 answer 分支（变异点：当成 answer 渲染）", async () => {
+      const pause = {
+        kind: "planning_pause" as const,
+        turnId: "turn-stream-1",
+        status: "waiting_user" as const,
+        revision: 3,
+        lastSequence: 7,
+        reason: "本轮处理时间已达上限。",
+        activeElapsedSeconds: 120,
+        approvedWallTimeSeconds: 120,
+        extensionSeconds: 60,
+        extensionCount: 1,
+        maximumExtensions: 3,
+        canContinue: true,
+        requiresExtension: true,
+        pauseType: "budget" as const,
+        currentModelId: null,
+        modelSwitchCount: 0,
+        canSwitchModel: false,
+        availableModelConnections: []
+      };
+      const deps = baseDeps({ streamPlanning: vi.fn(async () => pause) });
+      const result = await run(deps);
+      expect(result).toMatchObject({ kind: "planning_pause", pause: { turnId: "turn-stream-1" } });
+      expect(result).not.toHaveProperty("message");
+      // 暂停不是失败路径：一次性通道根本不该被调用。
+      expect((deps as { createAssistantResponse: ReturnType<typeof vi.fn> }).createAssistantResponse)
+        .not.toHaveBeenCalled();
+    });
+
+    it("没有 turnId 时不走流式（服务端要靠它去重与恢复）", async () => {
+      const deps = baseDeps({
+        checkIntent: vi.fn(async () => ({
+          kind: "proceed" as const,
+          summary: "预览",
+          confirmedPrompt: "生成预览",
+          provider: "model" as const
+        }))
+      });
+      await run(deps);
+      expect((deps as { streamPlanning: ReturnType<typeof vi.fn> }).streamPlanning).not.toHaveBeenCalled();
+      expect((deps as { createAssistantResponse: ReturnType<typeof vi.fn> }).createAssistantResponse)
+        .toHaveBeenCalledOnce();
+    });
+
+    it("流式返回未知结果种类必须报错，不静默丢弃", async () => {
+      const deps = baseDeps({
+        streamPlanning: vi.fn(async () => ({ kind: "totally_new_kind", payload: 1 }))
+      });
+      await expect(run(deps)).rejects.toThrow(/尚不支持的结果类型/);
+      expect((deps as { createAssistantResponse: ReturnType<typeof vi.fn> }).createAssistantResponse)
+        .not.toHaveBeenCalled();
+    });
+  });
+
+  /**
+   * CAP-02：续跑入口的纪律。
+   *
+   * 这两个断言钉的是"续跑不会变成重跑"与"续跑不写单元格"。
+   */
+  describe("CAP-02 续跑入口", () => {
+    it("先查状态再继续：用真实 revision/游标做 CAS，而不是界面上的旧值", async () => {
+      const order: string[] = [];
+      const getPlanningStatus = vi.fn(async () => {
+        order.push("status");
+        return {
+          turnId: "turn-r",
+          status: "waiting_user" as const,
+          revision: 8,
+          lastSequence: 21,
+          canContinue: true,
+          pauseType: "budget" as const,
+          reason: null
+        };
+      });
+      const continuePlanning = vi.fn(async (body: { expectedRevision: number; afterSequence: number }) => {
+        order.push("continue");
+        expect(body.expectedRevision).toBe(8);
+        expect(body.afterSequence).toBe(21);
+        return { kind: "answer" as const, provider: "model" as const, message: "继续完成", resultContext: null };
+      });
+      const result = await resumeWpsPlanning(
+        { turnId: "turn-r" },
+        { getPlanningStatus, continuePlanning } as never
+      );
+      expect(order).toEqual(["status", "continue"]);
+      expect(result.outcome).toMatchObject({ kind: "answer", message: "继续完成" });
+    });
+
+    it("服务端说不能继续时不硬续（变异点：无视 canContinue 直接续）", async () => {
+      const continuePlanning = vi.fn();
+      // 刻意构造"有检查点但服务端明确说不能继续"：只凭 action 推导会误放行，
+      // 必须由 canContinue 闸拦住 —— 这正是这条断言的唯一判别点。
+      const result = await resumeWpsPlanning(
+        { turnId: "turn-paused" },
+        {
+          getPlanningStatus: vi.fn(async () => ({
+            turnId: "turn-paused",
+            status: "waiting_user" as const,
+            revision: 6,
+            lastSequence: 12,
+            canContinue: false,
+            pauseType: "budget" as const,
+            reason: "本轮预算已耗尽，需要重新发起。"
+          })),
+          continuePlanning
+        } as never
+      );
+      expect(continuePlanning).not.toHaveBeenCalled();
+      expect(result.outcome).toBeNull();
+    });
+
+    it("已完成的任务绝不续跑", async () => {
+      const continuePlanning = vi.fn();
+      const result = await resumeWpsPlanning(
+        { turnId: "turn-done" },
+        {
+          getPlanningStatus: vi.fn(async () => ({
+            turnId: "turn-done",
+            status: "completed" as const,
+            revision: 9,
+            lastSequence: 30,
+            canContinue: false,
+            pauseType: null,
+            reason: null
+          })),
+          continuePlanning
+        } as never
+      );
+      expect(continuePlanning).not.toHaveBeenCalled();
+      expect(result.outcome).toBeNull();
+    });
+
+    /**
+     * 第 2 条：**调用方给了 requestId 就必须原样用**。
+     *
+     * 变异点：函数内部无视传入值、每次都 `newPlanningRequestId()` ——
+     * 超时重试就变成"另一次继续"，服务端重复追加预算、重复跑规划。
+     */
+    it("沿用调用方传入的 requestId（幂等键不由内部另生成）", async () => {
+      const continuePlanning = vi.fn(async (body: { requestId: string }) => ({
+        kind: "answer" as const, provider: "model" as const, message: "好", resultContext: null
+      }));
+      await resumeWpsPlanning(
+        { turnId: "turn-x", requestId: "plan-continue-fixed" },
+        {
+          getPlanningStatus: vi.fn(async () => ({
+            turnId: "turn-x",
+            status: "waiting_user" as const,
+            revision: 3,
+            lastSequence: 7,
+            canContinue: true,
+            pauseType: "budget" as const,
+            reason: null
+          })),
+          continuePlanning
+        } as never
+      );
+      expect(continuePlanning.mock.calls[0][0]).toMatchObject({
+        requestId: "plan-continue-fixed"
+      });
+    });
+
+    /**
+     * 第 3 条：调用方给了**客户端游标**时必须用它，不得退回服务端最新序号。
+     *
+     * 变异点：忽略 `afterSequence` 直接用 `status.lastSequence` ——
+     * 中间那些"已提交但客户端漏收"的事件会被永久跳过。
+     */
+    it("游标用客户端已确认位置，不用服务端最新序号（漏收补发）", async () => {
+      const continuePlanning = vi.fn(async (_input: { afterSequence?: number }) => ({
+        kind: "answer" as const, provider: "model" as const, message: "好", resultContext: null
+      }));
+      await resumeWpsPlanning(
+        { turnId: "turn-y", requestId: "r-1", afterSequence: 4 },
+        {
+          getPlanningStatus: vi.fn(async () => ({
+            turnId: "turn-y",
+            status: "waiting_user" as const,
+            revision: 5,
+            lastSequence: 20,
+            canContinue: true,
+            pauseType: "budget" as const,
+            reason: null
+          })),
+          continuePlanning
+        } as never
+      );
+      // 服务端已到 20，但客户端只消费到 4 → 必须传 4，让 5..20 被补发。
+      expect(continuePlanning.mock.calls[0][0]).toMatchObject({ afterSequence: 4 });
+    });
+
+    it("未给游标时退回服务端最新序号（本端从未消费过事件）", async () => {
+      const continuePlanning = vi.fn(async (_input: { afterSequence?: number }) => ({
+        kind: "answer" as const, provider: "model" as const, message: "好", resultContext: null
+      }));
+      await resumeWpsPlanning(
+        { turnId: "turn-z", requestId: "r-2" },
+        {
+          getPlanningStatus: vi.fn(async () => ({
+            turnId: "turn-z",
+            status: "waiting_user" as const,
+            revision: 5,
+            lastSequence: 20,
+            canContinue: true,
+            pauseType: "budget" as const,
+            reason: null
+          })),
+          continuePlanning
+        } as never
+      );
+      expect(continuePlanning.mock.calls[0][0]).toMatchObject({ afterSequence: 20 });
+    });
+  });
+/**
+   * CAP-02 第 5 条：面板刷新后重新核对历史里的暂停。
+   *
+   * 这段不与上面的「续跑入口」合并 —— 它钉的是**重开那一刻**的行为：
+   * 只核对、不续跑，且不能续跑的结论必须来自服务端而不是历史快照。
+   */
+  describe("CAP-02 刷新后重新核对暂停", () => {
+    const pausedAt = {
+      kind: "planning_pause" as const,
+      turnId: "turn-reload",
+      status: "waiting_user" as const,
+      revision: 3,
+      lastSequence: 9,
+      reason: "本轮处理时间已达上限",
+      activeElapsedSeconds: 120,
+      approvedWallTimeSeconds: 600,
+      extensionSeconds: 0,
+      extensionCount: 0,
+      maximumExtensions: 3,
+      canContinue: true,
+      requiresExtension: true,
+      pauseType: "budget" as const,
+      currentModelId: null,
+      modelSwitchCount: 0,
+      canSwitchModel: false,
+      availableModelConnections: []
+    };
+
+    it("重开只核对、不自动续跑：continuePlanning 一次都不许被调用", async () => {
+      const continuePlanning = vi.fn();
+      const continueSpy = continuePlanning;
+      const result = await reinspectWpsPlanningPause(
+        { turnId: "turn-reload", pausedAt },
+        undefined,
+        {
+          getPlanningStatus: vi.fn(async () => ({
+            turnId: "turn-reload",
+            status: "waiting_user" as const,
+            revision: 7,
+            lastSequence: 15,
+            canContinue: true,
+            pauseType: "budget" as const,
+            reason: null
+          })),
+          continuePlanning: continueSpy
+        } as never
+      );
+      expect(continueSpy).not.toHaveBeenCalled();
+      expect(result.view.action).toBe("continue_checkpoint");
+      expect(result.view.canContinue).toBe(true);
+    });
+
+    it("服务端已推进 revision 时，按钮用的是**服务端**的现场而不是历史快照", async () => {
+      const result = await reinspectWpsPlanningPause(
+        { turnId: "turn-reload", pausedAt },
+        undefined,
+        {
+          getPlanningStatus: vi.fn(async () => ({
+            turnId: "turn-reload",
+            status: "waiting_user" as const,
+            revision: 42,
+            lastSequence: 88,
+            canContinue: true,
+            pauseType: "budget" as const,
+            reason: null
+          }))
+        } as never
+      );
+      expect(result.payload.revision).toBe(42);
+      expect(result.payload.lastSequence).toBe(88);
+      // 历史快照的 revision=3 绝不能泄漏成续跑凭据（用旧值续会被 CAS 拒）。
+      expect(result.payload.revision).not.toBe(pausedAt.revision);
+    });
+
+    it("服务端已完成时不给继续按钮（重开不是'任务还没跑完'的证据）", async () => {
+      const result = await reinspectWpsPlanningPause(
+        { turnId: "turn-reload", pausedAt },
+        undefined,
+        {
+          getPlanningStatus: vi.fn(async () => ({
+            turnId: "turn-reload",
+            status: "completed" as const,
+            revision: 50,
+            lastSequence: 99,
+            result: { kind: "answer" as const, provider: "model" as const, message: "已完成" },
+            canContinue: false,
+            pauseType: null,
+            reason: null
+          }))
+        } as never
+      );
+      expect(result.view.canContinue).toBe(false);
+      expect(result.view.action).toBe("none");
+    });
+
+    it("服务端没有暂停成因时退回历史快照**仅供显示**，revision 仍以服务端为准", async () => {
+      const result = await reinspectWpsPlanningPause(
+        { turnId: "turn-reload", pausedAt },
+        undefined,
+        {
+          getPlanningStatus: vi.fn(async () => ({
+            turnId: "turn-reload",
+            status: "interrupted" as const,
+            revision: 11,
+            lastSequence: 20,
+            canContinue: true,
+            pauseType: null,
+            reason: null
+          }))
+        } as never
+      );
+      expect(result.payload.pauseType).toBe("budget");
+      expect(result.payload.revision).toBe(11);
+    });
+
+    it("历史里没有暂停快照时也能核对（不因缺快照就整条放弃）", async () => {
+      const result = await reinspectWpsPlanningPause(
+        { turnId: "turn-reload", pausedAt: null },
+        undefined,
+        {
+          getPlanningStatus: vi.fn(async () => ({
+            turnId: "turn-reload",
+            status: "waiting_user" as const,
+            revision: 5,
+            lastSequence: 10,
+            canContinue: true,
+            pauseType: "model_error" as const,
+            reason: "模型连接中断"
+          }))
+        } as never
+      );
+      expect(result.payload.pauseType).toBe("model_error");
+      expect(result.payload.reason).toBe("模型连接中断");
+    });
   });
 });

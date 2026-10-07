@@ -687,6 +687,57 @@ describe("已提交答案：断线后不丢答案、不重复询问", () => {
  * 授权其实只证明了"你现在授权这几张表"。下面三条分别钉住这两种后果。
  */
 describe("重新授权不是澄清答案", () => {
+  it("回答提交时身份变成 unknown：真实答案先保存，重新授权时带上答案而不是重问", async () => {
+    const host = hostStub({ sheetNames: ["订单"] });
+    getWpsApplicationMock.mockReturnValue(host.application);
+    clarificationCard();
+    const container = await pendingClarification();
+    // 真正改变 workbook/worksheet 包装对象，不只是改变 Range 包装。
+    const app = host.application as unknown as { ActiveWorkbook: { Worksheets: { Item: (index: number) => unknown } } };
+    const book = app.ActiveWorkbook;
+    Object.defineProperty(app, "ActiveWorkbook", { get: () => ({
+      ...book, Worksheets: { ...book.Worksheets, Item: (index: number) => ({ ...(book.Worksheets.Item(index) as object) }) }
+    }) });
+    await type(container.querySelector<HTMLTextAreaElement>('.clarification-custom-input textarea'), "逐行映射，空白不写入");
+    await click(container.querySelector<HTMLButtonElement>('.clarification-custom-input button'));
+    await until(() => Boolean(container.querySelector('.clarification-recovery')), "等待重新授权");
+    expect(runTurnMock).toHaveBeenCalledTimes(1);
+    expect(storedTaskResumes().at(-1)?.confirmations).toEqual([
+      expect.objectContaining({ value: "逐行映射，空白不写入" })
+    ]);
+    expect(textOf(container)).toContain("已提交的 1 项回答");
+    await click(recoveryButton(container, "确认此范围并继续"));
+    await until(() => Boolean(container.querySelector('.authorized-target-dialog')), "恢复先确认弱宿主目标证据");
+    expect(runTurnMock).toHaveBeenCalledTimes(1);
+    await click(container.querySelector<HTMLInputElement>('.authorized-target-dialog input[value="original"]') ??
+      container.querySelector<HTMLInputElement>('.authorized-target-dialog input[type="radio"]'));
+    await click(Array.from(container.querySelectorAll<HTMLButtonElement>('.authorized-target-dialog button'))
+      .find((button) => button.textContent === "确认目标并继续") ?? null);
+    await until(() => runTurnMock.mock.calls.length === 2, "确认后发起新一轮");
+    expect(runTurnMock.mock.calls[1][0].prompt).toContain("补充确认：逐行映射，空白不写入");
+    expect(storedTaskResumes().at(-1)?.confirmations).toHaveLength(1);
+  });
+
+  it("连续两次澄清再重开：新卡仍带全部确认信息与原始需求，不把确认重复拼进原需求", async () => {
+    getWpsApplicationMock.mockReturnValue(hostStub({ sheetNames: ["订单"] }).application);
+    clarificationCard();
+    const container = await pendingClarification();
+    clarificationCard(); // 下一轮是新问题，具有不同的 questionId。
+    await click(clarificationOptions(container)[0]);
+    await until(() => runTurnMock.mock.calls.length === 2 && clarificationOptions(container).length > 0, "第二张澄清卡");
+    expect(storedTaskResumes().at(-1)?.originalPrompt).toBe("帮我处理表格");
+    expect(storedTaskResumes().at(-1)?.confirmations).toHaveLength(1);
+    await type(container.querySelector<HTMLTextAreaElement>('.clarification-card.pending textarea'), "空白保留原值");
+    await click(container.querySelector<HTMLButtonElement>('.clarification-card.pending .clarification-custom-input button'));
+    await until(() => runTurnMock.mock.calls.length === 3, "第三轮");
+    expect(storedTaskResumes().at(-1)?.confirmations).toHaveLength(2);
+    const reopened = await reopen();
+    await click(recoveryButton(reopened, "确认此范围并继续"));
+    await until(() => runTurnMock.mock.calls.length === 4, "重开继续");
+    const prompt = runTurnMock.mock.calls[3][0].prompt;
+    expect(prompt.match(/补充确认：查询数据/g)).toHaveLength(1);
+    expect(prompt.match(/补充确认：空白保留原值/g)).toHaveLength(1);
+  });
   /** 造一条"待继续"的历史：带一道题与一条已确认信息。 */
   function pendingTaskMessage(overrides: {
     clarification: Record<string, unknown>;

@@ -364,6 +364,7 @@ function storedAction(partial: Partial<StoredAction> & Pick<StoredAction, "range
     previewFingerprint: "preview",
     rect: { startRow: 1, startColumn: 1, endRow: rows, endColumn: columns },
     beforeValues: [[null]],
+    beforeValuesCaptured: true,
     beforeFormulas: [[null]],
     beforeFingerprint: "before",
     afterFingerprint: null,

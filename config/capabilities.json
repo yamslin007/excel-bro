@@ -1,5 +1,8 @@
 {
   "version": 1,
+  "authorizedTarget": {
+    "monitorIntervalMs": 2000
+  },
   "excelNativeComparison": {
     "maxCells": 20000,
     "maxBytes": 8388608
@@ -11,14 +14,21 @@
     "pollIntervalMs": 250,
     "requestTimeoutMs": 20000,
     "originalWidthFraction": 0.6,
+    "windowGapDip": 0,
+    "maxFrameInsetDip": 32,
+    "positionTolerancePixels": 4
+  },
+  "reviewPaneSizing": {
     "reviewTaskPaneWidthFraction": 0.4,
     "reviewTaskPaneMinWidthCssPx": 320,
     "reviewPaneMeasureIntervalMs": 1500,
     "reviewPaneResizeDebounceMs": 200,
     "taskPaneWidthToleranceCssPx": 8,
-    "windowGapDip": 0,
-    "maxFrameInsetDip": 32,
-    "positionTolerancePixels": 4
+    "maxHostWidthCssPx": 32768
+  },
+  "wpsReviewPane": {
+    "leaseTtlMs": 6000,
+    "maxOpenWorkbooks": 256
   },
   "snapshot": {
     "dataRows": 200,
@@ -213,12 +223,12 @@
     "folderBackupRetentionDays": 7,
     "folderBackupMaxBytes": 1073741824,
     "folderBackupMinFreeBytes": 67108864,
-    "folderBackupOpenTokenTtlSeconds": 300
+    "folderBackupOpenTokenTtlSeconds": 86400
   },
   "folder": {
     "maxFiles": 100,
     "maxSessions": 20,
-    "sessionTtlSeconds": 1800,
+    "sessionTtlSeconds": 86400,
     "outputFileName": "Excel Bro 结果.xlsx"
   },
   "images": {
@@ -247,7 +257,7 @@
     "maxTurns": 8,
     "claudeSdkMaxBudgetUsd": 1.0,
     "maxTotalTokens": null,
-    "maxWallTimeSeconds": 60.0,
+    "maxWallTimeSeconds": 600.0,
     "maxConsecutiveErrors": 2,
     "maxCacheHitsPerQuery": 3,
     "maxToolPathLoopLength": 4,
@@ -263,15 +273,60 @@
   "safety": {
     "allowHyperlink": false
   },
+  "pythonExecution": {
+    "enabled": false,
+    "maxCodeChars": 20000,
+    "maxCallsPerTask": 12,
+    "maxWallTimeSeconds": 120,
+    "maxCpuTimeSeconds": 60,
+    "maxMemoryMb": 1024,
+    "maxProcesses": 1,
+    "maxScratchMb": 256,
+    "maxResultBytes": 1048576,
+    "maxStdoutBytes": 65536,
+    "maxStderrBytes": 262144,
+    "maxResultDepth": 32,
+    "maxResultElements": 200000,
+    "maxDatasetHandles": 8,
+    "maxDatasetHandleChars": 256
+  },
+  "pythonData": {
+    "maxScopes": 32,
+    "maxDatasetsPerScope": 8,
+    "maxCellsPerDataset": 20000,
+    "maxDatasetBytes": 1048576,
+    "maxRegistryBytes": 16777216,
+    "maxAnalysisInputBytes": 1048576,
+    "maxRequestBytes": 1114112,
+    "requestTimeoutMs": 10000,
+    "scopeTtlSeconds": 900
+  },
+  "pythonResult": {
+    "maxResultsPerScope": 12,
+    "maxRegistryBytes": 16777216,
+    "maxBytes": 1048576,
+    "maxRows": 500,
+    "maxColumns": 50,
+    "maxCells": 20000,
+    "maxCellChars": 32767
+  },
+  "pythonDocker": {
+    "image": "excel-bro-python-sandbox",
+    "imageDigest": "sha256:812d1ccea0e507e8fe0990c874d3be043f0bc52dfd4d60932338d555d955e630",
+    "nonRootUser": "65534:65534",
+    "endpointScheme": "npipe",
+    "containerUserNumeric": 65534,
+    "analysisThreads": 2
+  },
   "llm": {
     "maxRetries": 5,
     "retryBaseDelaySeconds": 1.5,
     "retryMaxDelaySeconds": 45.0,
-    "timeoutSeconds": 180.0
+    "timeoutSeconds": 300.0
   },
   "turns": {
     "maxActive": 500,
-    "ttlSeconds": 3600
+    "ttlSeconds": 86400
   },
   "progress": {
     "heartbeatSeconds": 10,
@@ -288,7 +343,7 @@
     "maxCheckpointBytes": 67108864,
     "planningReminderSeconds": 60,
     "planningExtensionSeconds": 60,
-    "planningHardWallTimeSeconds": 300,
+    "planningHardWallTimeSeconds": 1800,
     "planningMaxExtensions": 4
   }
 }

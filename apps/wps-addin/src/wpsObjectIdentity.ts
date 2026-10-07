@@ -36,7 +36,7 @@ export type WpsSheetObjectIdentity = {
   id?: string;
   /** 结构信号：`[起始行, 起始列, 行数, 列数]`。用来感知"同索引重建"后尺寸变化。 */
   shape?: readonly [number, number, number, number];
-  /** 宿主对象引用 —— 同会话内同一张表必须仍是同一个对象。 */
+  /** 宿主对象引用；宿主可以返回新包装对象，引用不同不等于文件发生变化。 */
   ref: WpsWorksheet;
 };
 
@@ -166,14 +166,14 @@ export function captureWpsObjectIdentity(
  *
  * 判据分三层，**任一层能证明不同就判不同**：
  *
- *  1. **工作簿对象引用**：同会话内换了本子，对象必然不同。这一条同时覆盖
- *     "两个不同目录的同名工作簿"——名字一样但对象不是同一个。
+ *  1. **工作簿对象引用**：引用相等提供正面证据；引用不同可能只是新包装对象，
+ *     不据此单独断言换了工作簿。
  *  2. **完整路径 / 完整名**：即使引用恰好相同（宿主复用对象），路径不同
  *     也是换了本子。未保存工作簿两边都为空，退回第 1 层，
  *     **不因为"两边都为空"就判相同**。
  *  3. **工作表对象引用**：删掉再重建的同名同表头工作表，即使名称、表头、
  *     尺寸全都一致，**对象引用必然不同** —— 这是唯一能识破它的信号。
- *     权限内再核对稳定 ID，防宿主对象池复用。引用不同则直接判不同，
+ *     权限内再核对稳定 ID，防宿主对象池复用。引用不同且 ID 没有正面变化则判未知，
  *     不拿"名称/表头/ID 相同"反推相同。
  */
 export function verifyWpsObjectIdentity(
@@ -234,29 +234,29 @@ export function verifyWpsObjectIdentity(
     if (!sheet?.Name) return "unknown";
     if (String(sheet.Name) !== recorded.name) return "different";
     if (isWpsSystemSheet(String(sheet.Name))) return "different";
+    const currentId = readSheetStableId(sheet);
+    if (recorded.id != null && currentId != null && currentId !== recorded.id) {
+      return "different";
+    }
 
     /**
      * **放行的唯一充分条件：对象引用未变。**
      *
      * 这是本模块的核心纪律 —— "能证明相同"与"没发现不同"是两回事。
-     * 真宿主在同一会话内对同一张表返回同一个包装对象，所以引用相等是可以
-     * 正面证明的。引用不等时**没有任何**其它信号可以反过来证明"它就是同一张表"：
+     * 宿主不保证包装对象稳定，所以引用不等仅为 unknown，必须显式重新授权。
+     * 引用相等则可以正面证明。引用不等时其它信号不能反推相同：
      *
      *  - 名称相同、表头相同、尺寸相同 —— 一张重建的复制表全都满足，正是要堵的缺口；
      *  - 稳定 ID 相同 —— 只能说"编号一样"，而编号在"删除后按模板重建"
      *    或"复制整表"的场景里并不保证换新；拿它放行等于把 fail-closed 又拧回 fail-open。
      *
-     * 所以这里只在引用相等时放行；引用不等一律判**不同**（fail-closed），
+     * 所以这里只在引用相等时放行；引用不等且没有正面变化则判未知（fail-closed），
      * 由调用方要求用户重新选范围、重新预览。稳定 ID 与结构信号则作为
      * **加固**：它们与引用一致地指向"变了"时，同样判不同（多一条证据而已，
      * 不会把"不同"翻成"相同"）。
      */
     if (sheet === recorded.ref) {
       // 正面证明：还是建卡时那个对象。再核对一遍稳定 ID，防宿主对象池复用。
-      const currentId = readSheetStableId(sheet);
-      if (recorded.id != null && currentId != null && currentId !== recorded.id) {
-        return "different";
-      }
       continue;
     }
 

@@ -25,6 +25,14 @@ import WpsAgentPanel from "./WpsAgentPanel";
 import { runWpsReadonlyTurn } from "./wpsReadonlyAgent";
 import { getWpsApplication } from "./wpsHost";
 
+// Isolate the pre-existing stronger clarification proof from the new early metadata guard.
+// Full real-guard integration is exercised in WpsAgentPanel.test.tsx.
+vi.mock("../../excel-addin/src/hooks/useAuthorizedTarget", () => ({
+  useAuthorizedTarget: () => ({ check: async () => true, checkForAnalysis: async () => true,
+    clearAnalysisConsent: () => {}, hasAnalysisConsent: () => false,
+    requestConfirmation: async () => false, notice: null, checking: false, binding: null })
+}));
+
 vi.mock("../../excel-addin/src/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../excel-addin/src/api")>();
   return { ...actual, listModels: vi.fn(), getModelSettings: vi.fn(), validatePlan: vi.fn() };

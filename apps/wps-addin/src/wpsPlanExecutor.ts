@@ -57,6 +57,16 @@ export type WpsPreparedAction = {
   cellCount: number;
   values: CellValue[][];
   preview: CellValue[][];
+  /**
+   * 预览生成那一刻、目标区域在宿主里的**真实原值**（与 `previewFingerprint` 同源同一次读取）。
+   *
+   * 只活在内存里，供确认卡首屏的「修改前」列使用 —— 让用户在写入前看到"到底改了什么"。
+   * 出站闸 `wpsRecoveryDescriptor` 是**白名单投影**，不会取这两个字段，所以它
+   * 没有路径进入登记请求或落盘。
+   */
+  beforeValues: CellValue[][];
+  /** false = 宿主这次没交出 `Value2`，确认卡必须标"原值未取得"，不得拿公式顶替。 */
+  beforeValuesCaptured: boolean;
   /** Target state when the user was shown this preview. */
   previewFingerprint: string;
   rect: Rect;
@@ -475,6 +485,9 @@ export function prepareWpsPlan(
       cellCount: rowCount * columnCount,
       values,
       preview: values.slice(0, 5).map((row) => row.slice(0, 5)),
+      // 与 `previewFingerprint` 来自同一次 `readMatrices`（零额外宿主读取）。
+      beforeValues: beforePreview.values,
+      beforeValuesCaptured: beforePreview.valuesCaptured,
       previewFingerprint: beforePreview.fingerprint,
       rect
     };

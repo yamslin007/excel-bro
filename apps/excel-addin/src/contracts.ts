@@ -6,6 +6,9 @@ import type { CellValue } from "@excel-bro/core/contracts";
 import type { BlankPolicy } from "@excel-bro/core";
 
 export type { CellValue, BlankPolicy };
+export type { PythonResultReceipt, PythonResultReadRequest, PythonMatrixResult } from "@excel-bro/core/contracts";
+export type { PythonDataSource, PythonDataScope, PythonDataScopeRequest,
+  PythonDataSnapshotRequest, PythonDataRevokeRequest, PythonDatasetReceipt } from "@excel-bro/core/contracts";
 
 // Local Windows layout bridge. No workbook paths, cell data, plans or HWNDs.
 export interface ExcelReviewLayoutPrepareRequest {

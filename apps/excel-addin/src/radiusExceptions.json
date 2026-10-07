@@ -1,0 +1,46 @@
+{
+  "_comment": "需求 K 第 4 点：允许有理由的单侧圆角的**组件例外白名单**。测试据此放行；其余规则若出现非对称四值即失败。",
+  "_rationale": "只有结构性组件才需要单侧圆角：贴边容器（贴住窗口/面板边框的那一边不倒角）、连通条（左/右接续相邻单元）、断角显示（与父容器边框重叠的一侧）。",
+  "allow": [
+    {
+      "selector": ".tool-card",
+      "reason": "卡片头：上圆下直，与下方展开内容连成一体，底边不出现圆形接缝。"
+    },
+    {
+      "selector": ".tool-purpose",
+      "reason": "引用条：左侧 3px 品牌色竖线贴边，左侧不倒角，右端才收圆。"
+    },
+    {
+      "selector": ".activity-step-trace",
+      "reason": "轨迹条：左侧 2px 竖线贴边，同引用条。"
+    },
+    {
+      "selector": ".sheet-picker",
+      "reason": "贴右边缘弹出的选表面板：左上角被触发区遮挡故不倒角（保留 var(--radius-sm)），其余三角收圆。"
+    },
+    {
+      "selector": ".theme-panel",
+      "reason": "贴底的换肤面板：上圆下直，贴住 task pane 底边。"
+    },
+    {
+      "selector": ".tool-drawer",
+      "reason": "贴底抽屉：上圆下直，贴住 task pane 底边。"
+    },
+    {
+      "selector": ".json-editor-toolbar",
+      "reason": "编辑器工具栏：上圆下直，与下方滚动区拼接。"
+    },
+    {
+      "selector": ".json-editor-scroll",
+      "reason": "编辑器滚动区：上直下圆，与上方工具栏拼接（与上一条配对）。"
+    },
+    {
+      "selector": ".query-result-card .message-text",
+      "reason": "结果卡内文本块：DOM 嵌套决定它已落在卡内，自身不再倒角（radius: 0）。"
+    },
+    {
+      "selector": ".wps-model-settings",
+      "reason": "WPS 模型设置容器：与宿主面板边框重叠，四角不倒。"
+    }
+  ]
+}

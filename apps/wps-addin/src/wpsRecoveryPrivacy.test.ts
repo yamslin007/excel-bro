@@ -66,6 +66,8 @@ function preparedWithSentinel(): WpsPreparedPlan {
         cellCount: 4,
         values,
         preview: values,
+        beforeValues: [[null, null], [null, null]],
+        beforeValuesCaptured: true,
         previewFingerprint: "4:1a2b3c4d",
         rect: { startRow: 1, startColumn: 1, endRow: 2, endColumn: 2 }
       }

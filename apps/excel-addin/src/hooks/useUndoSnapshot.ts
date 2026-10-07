@@ -11,6 +11,7 @@ interface UseUndoSnapshotOptions {
   onStatusChange: (status: "executing" | "idle") => void;
   onMessage: (text: string) => void;
   onAfterUndo?: () => Promise<void> | void;
+  beforeOperation?: () => Promise<boolean>;
 }
 
 function snapshotCellCount(snapshot: ExecutionUndoSnapshot): number {
@@ -53,7 +54,8 @@ export function useUndoSnapshot({
   isBusy,
   onStatusChange,
   onMessage,
-  onAfterUndo
+  onAfterUndo,
+  beforeOperation
 }: UseUndoSnapshotOptions) {
   const [undoStack, setUndoStack] = useState<ExecutionUndoSnapshot[]>([]);
   const lastUndoSnapshot =
@@ -84,6 +86,7 @@ export function useUndoSnapshot({
                 entry.planId === executionIdOrPlanId
             );
       if (index < 0) return;
+      if (beforeOperation && !(await beforeOperation())) return;
       // 逆序撤销：先撤最近的，再往前退，保证每一步的上下文都是它执行完的状态。
       const targets = undoStack.slice(index).reverse();
 
@@ -112,7 +115,7 @@ export function useUndoSnapshot({
         onStatusChange("idle");
       }
     },
-    [undoStack, isBusy, onStatusChange, onMessage, onAfterUndo]
+    [undoStack, isBusy, onStatusChange, onMessage, onAfterUndo, beforeOperation]
   );
 
   const undoLastExecution = useCallback(

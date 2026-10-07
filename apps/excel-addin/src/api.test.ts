@@ -101,6 +101,32 @@ it("preserves interactive fields in a streamed planning clarification", async ()
   await expect(streamAssistantResponse(streamPlanRequest)).resolves.toEqual(response);
 });
 
+it("Excel stream sends attachment bytes, while intent sends only imageCount", async () => {
+  const image = { name: "user.png", mediaType: "image/png" as const, data: "aGVsbG8=" };
+  const request: PlanRequest = { ...streamPlanRequest, images: [image], planningReadPolicy: "none" };
+  expect(request.images?.[0].data).toBe("aGVsbG8=");
+  const fetchMock = vi.fn()
+    .mockResolvedValueOnce(new Response(JSON.stringify({
+      kind: "proceed", provider: "model", summary: "看图", confirmedPrompt: "结合图片分析"
+    }), { status: 200 }))
+    .mockResolvedValueOnce(sseStreamResponse([
+      'event: result\ndata: {"kind":"answer","provider":"model","message":"看图完成"}\n\n'
+    ]));
+  vi.stubGlobal("fetch", fetchMock);
+  await checkIntent({ prompt: "结合图片分析", imageCount: 1, modelId: "vision-model", scope: {
+    workbookName: "测试.xlsx", sourceMode: "workbook", selectionMode: "manual",
+    activeWorksheet: "Sheet1", selectedRange: null, totalWorksheetCount: 1,
+    worksheetNames: ["Sheet1"], sheets: []
+  }, conversation: [], intentConfirmed: false, clarificationRound: 0 });
+  await streamAssistantResponse(request);
+  const intentBody = JSON.parse(fetchMock.mock.calls[0][1].body);
+  const planningBody = JSON.parse(fetchMock.mock.calls[1][1].body);
+  expect(intentBody.imageCount).toBe(1);
+  expect(intentBody.images).toBeUndefined();
+  expect(JSON.stringify(intentBody)).not.toContain(image.data);
+  expect(planningBody.images).toEqual([image]);
+});
+
 describe("service discovery", () => {
   it("distinguishes local connectivity failures from model responses", () => {
     expect(apiErrorCategory(new TypeError("Failed to fetch"))).toBe(

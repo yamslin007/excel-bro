@@ -222,23 +222,59 @@ describe("WPS 原生双窗口的隔离审阅", () => {
     expect(host.originalCell.value).toBe("原值");
   });
 
-  it("公式文本未变但计算显示值漂移时，两边都不能冒充仍是已确认现场", () => {
+  it("常量单元格在预览后被改动，拒绝写回且新增写入为 0", () => {
+    // Constant cell: only the displayed value exists (no formula linkage), so a drift is a real
+    // external change and must be intercepted. Which guard fires first is not the point — the
+    // assertion only requires that the write-back is rejected and no new write happens.
     const host = fakeHost();
-    host.originalCell.formula = "=1+1";
-    host.originalCell.value = "2";
-    const prepared = prepareWpsPlan(host.application, [1], host.plan);
-    const staged = stageWpsNativeComparison(host.application, prepared);
-    host.originalCell.value = "3";
-    expect(() => verifyWpsNativeComparison(host.application, staged)).toThrow("原表在并排审阅后发生变化");
-    const formulaHost = fakeHost();
-    formulaHost.plan.actions = [{ type: "writeFormulas", sheet: "Sheet1", range: "A1", formulas: [["=1+1"]] }];
-    const formulaStaged = stageWpsNativeComparison(
-      formulaHost.application,
-      prepareWpsPlan(formulaHost.application, [1], formulaHost.plan)
-    );
-    formulaHost.copiedCell.value = "3"; // formula text remains =1+1
-    expect(() => verifyWpsNativeComparison(formulaHost.application, formulaStaged))
+    const staged = stageWpsNativeComparison(host.application, prepareWpsPlan(host.application, [1], host.plan));
+    const before = host.originalCell.value;
+    host.originalCell.value = "他人改的值";
+    expect(() => verifyWpsNativeComparison(host.application, staged)).toThrow();
+    // 新增写入为 0：原表仍是外部改动的值，没有被覆盖成计划值
+    expect(host.originalCell.value).toBe("他人改的值");
+    expect(host.originalCell.value).not.toBe(before);
+  });
+
+  it("原表公式文本未变但计算值漂移时拒绝写回（公式重算，不是常量改动）", () => {
+    // Real formula baseline on the original, established *before* the plan is prepared so the
+    // preview snapshot binds the formula. Write the formula through the range setter (the same
+    // path a real host uses), giving formula "=1+1" with calculated value "2".
+    //
+    // 原表侧漂移由两道合法守卫共同保证：`assertOriginalUnchanged`（重新读原表、比对快照 →
+    // 「原表或授权范围在预览后发生变化」）在后道复核之前先触发。本用例断言**前一道**的确切
+    // 文案，从而针对 `assertOriginalUnchanged` 形成独立判别力；后道快照守卫是同性质的冗余层，
+    // 不在此用例中冒充独立证据（拆任一道仍可能被另一道拒绝，见 docs/DEVELOPMENT.md 记录）。
+    const host = fakeHost({ formulaDisplayOnOriginal: "2" });
+    host.originalSheet.Range("A1").Formula = "=1+1";
+    expect(host.originalCell.formula).toBe("=1+1");
+    const staged = stageWpsNativeComparison(host.application, prepareWpsPlan(host.application, [1], host.plan));
+    // 基线：公式文本 + 计算值都拿到了
+    expect(host.originalCell.formula).toBe("=1+1");
+    expect(host.originalCell.value).toBe("2");
+    // 公式文本不变，仅计算值漂移（真实公式重算，非常量编辑）
+    host.originalCell.value = "99";
+    expect(host.originalCell.formula).toBe("=1+1");
+    expect(host.originalCell.value).toBe("99");
+    expect(() => verifyWpsNativeComparison(host.application, staged))
+      .toThrow("原表或授权范围在预览后发生变化");
+    // 新增写入为 0：漂移的计算值保留，未被计划值覆盖
+    expect(host.originalCell.value).toBe("99");
+  });
+
+  it("副本公式文本未变但计算值漂移时拒绝审阅写回（副本侧指纹绑定公式）", () => {
+    // Formula cell on the disposable copy: after staging the formula text stays "=1+1" while the
+    // calculated display value drifts. The copy-side check reads this before the original-side
+    // snapshot, so it is reached without any original change.
+    const host = fakeHost();
+    host.plan.actions = [{ type: "writeFormulas", sheet: "Sheet1", range: "A1", formulas: [["=1+1"]] }];
+    const staged = stageWpsNativeComparison(host.application, prepareWpsPlan(host.application, [1], host.plan));
+    host.copiedCell.formula = "=1+1";
+    host.copiedCell.value = "3"; // formula text unchanged, calculated value drifted
+    expect(() => verifyWpsNativeComparison(host.application, staged))
       .toThrow("审阅副本在生成对照后发生变化");
+    // 原表未被写入
+    expect(host.originalCell.value).toBe("原值");
   });
 
   it("明确保存后才用原执行器写回，并逐格核对副本与原表结果", async () => {

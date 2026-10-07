@@ -1,4 +1,4 @@
-"""Opt-in, header-only Claude Agent SDK adapter.
+"""Opt-in Claude Agent SDK adapter: structure and explicit user images only.
 
 This adapter never gives the SDK workbook data rows, a live-workbook handle,
 filesystem/command tools, or an execution tool. Its only terminal tools return
@@ -17,7 +17,7 @@ from typing import Any, Awaitable, Callable
 from .capabilities import capability_float, capability_int
 from .llm.config import DEEPSEEK_ANTHROPIC_URL, ModelConnection, ModelNotAvailableError
 from .llm.errors import LLMHTTPStatusError, LLMResponseError, LLMTimeoutError
-from .models import AssistantResponse, IntentCheckRequest, IntentCheckResponse, PlanRequest
+from .models import AssistantResponse, ImageAttachment, IntentCheckRequest, IntentCheckResponse, PlanRequest
 
 
 def _sdk() -> Any:
@@ -82,10 +82,21 @@ def _options(
         max_turns=max_turns,
         max_budget_usd=capability_float("agent", "claudeSdkMaxBudgetUsd"),
         env=sdk_env,
+        extra_args={"no-session-persistence": None},
     )
 
 
-async def _result(sdk: Any, prompt: str, options: Any, timeout: float) -> str:
+async def _image_prompt(text: str, images: list[ImageAttachment]):
+    """User attachments only: no temporary files or filesystem tools."""
+    yield {"type": "user", "message": {"role": "user", "content": [
+        {"type": "text", "text": text},
+        *[{"type": "image", "source": {
+            "type": "base64", "media_type": image.mediaType, "data": image.data,
+        }} for image in images],
+    ]}}
+
+
+async def _result(sdk: Any, prompt: Any, options: Any, timeout: float) -> str:
     # Uvicorn's Windows reload/multi-worker mode installs a Selector loop,
     # which has no subprocess transport. Fail before invoking the SDK rather
     # than misreporting NotImplementedError as a model-network failure.
@@ -136,7 +147,7 @@ async def _result(sdk: Any, prompt: str, options: Any, timeout: float) -> str:
 async def check_sdk_intent(
     request: IntentCheckRequest, connection: ModelConnection
 ) -> IntentCheckResponse:
-    """Only the current prompt and authorized table *structure* leave EB."""
+    """Current prompt, image count and authorized table structure only."""
     from .intent import (
         INTENT_SYSTEM_PROMPT, MAX_CLARIFICATION_ROUNDS,
         _parse_model_response, _read_only_routing_fallback,
@@ -144,12 +155,13 @@ async def check_sdk_intent(
     )
 
     sdk = _sdk()
-    if request.imageCount:
-        raise ModelNotAvailableError("Claude Agent SDK 当前未接入图片输入，请选择原模型连接。")
+    if request.imageCount and not connection.supports_vision:
+        raise ModelNotAvailableError("当前模型不支持图片，请选择支持视觉输入的模型。")
     read_only = is_explicit_read_only_query(request.prompt)
     scope = request.scope
     prompt = json.dumps({
         "prompt": request.prompt,
+        "imageCount": request.imageCount,
         "intentConfirmed": request.intentConfirmed,
         "clarificationRound": request.clarificationRound,
         "maxClarificationRounds": MAX_CLARIFICATION_ROUNDS,
@@ -189,25 +201,51 @@ async def check_sdk_intent(
     raise LLMResponseError("Claude Agent SDK 未能生成有效的意图判断。")
 
 
+# SDK 后端明确批准下发的非终结工具白名单。登记与投影统一在
+# excel_agent.NON_TERMINAL_TOOL_PROJECTIONS 完成；这里只决定"哪些非终结
+# 结果允许经出站闸下发"，其余 dict 结果一律维持"非终结工具结果不可用"。
+_APPROVED_NON_TERMINAL_TOOLS = frozenset({"run_python_analysis"})
+
+
 async def run_sdk_plan(
     request: PlanRequest, connection: ModelConnection,
     *, on_event: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
 ) -> AssistantResponse:
-    """Header-only planning; data-bearing requests fail without fallback."""
-    if request.planningReadPolicy != "none" or request.dataResults or request.images:
+    """No workbook rows; explicitly attached images use native content blocks."""
+    if request.planningReadPolicy != "none" or request.dataResults:
         raise ModelNotAvailableError(
             "Claude Agent SDK 当前仅支持不上传数据行的表结构规划。"
-            "请切换到原模型连接处理需要数据行或图片的请求。"
+            "请切换到原模型连接处理需要数据行的请求。"
         )
+    if request.images and not connection.supports_vision:
+        raise ModelNotAvailableError("当前模型不支持图片，请选择支持视觉输入的模型。")
     from .excel_agent import (
         AGENT_SYSTEM_PROMPT, AGENT_TOOLS_WITH_DATA, _execute_tool, _parse_content,
+        _non_terminal_tool_content,
+    )
+    from .python_analysis import (
+        python_analysis_tool_definition, python_error_response_content,
+        python_execution_enabled,
     )
 
     sdk = _sdk()
     terminal: AssistantResponse | None = None
     tools = []
     allowed = []
-    for definition in AGENT_TOOLS_WITH_DATA:
+    # 隔离 Python 分析：总开关默认关闭；开启后追加到注册表尾部。
+    # 无执行器时工具仍失败关闭，只返回固定不可用回执。
+    #
+    # 隐私边界（如实记录的限制）：SDK CLI 托管模型对话转录，模型自己发出的
+    # run_python_analysis 参数（含代码字面量）存在于其内部历史中，服务端
+    # 无法对 SDK 内部转录做投影。服务端可控出口均已收口：工具结果只下发
+    # 有类型回执投影（经 _non_terminal_tool_content 出站闸），请求 prompt
+    # 保持 header-only，参数不写检查点（SDK 路径无检查点）、不进日志。
+    # 因此该能力的内部转录闭环依赖 CLI 行为，功能整体保持默认关闭，
+    # 不宣称双后端已完成同等隐私闭环。
+    definitions = [*AGENT_TOOLS_WITH_DATA]
+    if python_execution_enabled():
+        definitions.append(python_analysis_tool_definition())
+    for definition in definitions:
         function = definition["function"]
         name = function["name"]
 
@@ -218,11 +256,21 @@ async def run_sdk_plan(
             try:
                 result = _execute_tool(request, tool_name, args)
             except (ValueError, TypeError, KeyError) as error:
+                # 缺陷 3：run_python_analysis 的执行路径异常统一映射为固定安全
+                # 回执，绝不把 str(error)（可能携带参数/代码字面量）回显给模型。
+                if tool_name == "run_python_analysis":
+                    return {
+                        "content": [{"type": "text", "text": python_error_response_content()}],
+                        "is_error": True,
+                    }
                 return {
                     "content": [{"type": "text", "text": f"规则或计划未通过校验：{str(error)[:300]}"}],
                     "is_error": True,
                 }
             if isinstance(result, dict):
+                if tool_name in _APPROVED_NON_TERMINAL_TOOLS:
+                    # 出站闸：非终结工具只有登记过投影的才把载荷发给模型。
+                    return {"content": [{"type": "text", "text": _non_terminal_tool_content(tool_name, result)}]}
                 return {"content": [{"type": "text", "text": "非终结工具结果不可用。"}], "is_error": True}
             terminal = result
             if on_event:
@@ -271,7 +319,7 @@ async def run_sdk_plan(
         server=server, allowed=allowed,
     )
     content = await _result(
-        sdk, prompt, options,
+        sdk, _image_prompt(prompt, request.images) if request.images else prompt, options,
         capability_float("taskRecovery", "planningHardWallTimeSeconds"),
     )
     if terminal is None:

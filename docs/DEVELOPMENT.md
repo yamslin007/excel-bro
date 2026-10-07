@@ -1,5 +1,77 @@
 # Excel Bro 开发指南
 
+### 易失 Python 结果与本机预览准备（2026-10-07 最新）
+
+结果只进任务内存，不落盘/日志/聊天/检查点；持有句柄不等于获得写入授权。只用服务器签发、当前 grant 下输入顺序/指纹完全匹配的结果，关闭/撤销/源变化/TTL 后重读重算。不要用 JS 重新序列化结果计算服务端指纹：Python 的 `1.0` 与 JS 的 `1` 不同，核对实际响应 UTF-8 字节。矩阵与回执独立严格校验，疑似公式文本失败关闭，不能静默转义；明确值矩阵只编译 writeValues。
+
+两端 `prepareOfficePythonResult` / `prepareWpsPythonResult` 共用 stagePythonResultPreview，返回只读准备数据和 assertCurrent。它们尚未接入面板或写入按钮；后续必须在实际首次写入之前重新调用活性守卫、执行各宿主完整可写性检查并明确确认，原生副本不是本批功能。不能复用会保存矩阵的旧执行/撤销账本而声称“不落盘”；需要单独实现非持久执行与会话内撤销，或者先获得变更隐私边界的授权。
+
+内部验收程序可调用 run_registered_result_internal；**没有 HTTP/模型执行路由**，总开关保持 false。模型出口仍拒绝内部 completed/receipt，不因已有结果登记就擅自扩大 SDK 权限。结果读取/丢弃接口仍默认关闭。测试、限制和下一批接线门槛见 [结果预览记录](./PYTHON_RESULT_PREVIEW_2026-10-07.md)。
+
+### 内核门禁与授权数据通道（2026-10-07 前一阶段）
+
+当前镜像在生成代码之前安装附加 seccomp；不要用 pids-limit 冒充禁 exec，也不要在宿主运行 worker 代码以凑分析绿灯。只支持验证过的 Linux/amd64，安装失败关闭。独立本机数据接口与 core 只读客户端不属于 PlanRequest：数据、秘密 token、路径不得进模型/存储/检查点，URL 必须本机且禁重定向；两端使用前后复核真实身份/源值，任务终止或授权变化调用 dispose。当前面板调用及文件夹适配未实现，不可直接开启开关。数据登记是受控客户端绑定检查，不是服务器可独立证明当前 Excel 文件。新镜像、API、限额、测试及后续门槛详见 [实施记录](./PYTHON_AUTHORIZED_DATA_2026-10-07.md)。
+
+### 隔离 Python 分析的实施门槛（2026-10-07，Docker 本机运行时已验收，产品入口仍关闭）
+
+本机最新证据见 [Docker 真实验收记录](./DOCKER_PYTHON_REAL_VALIDATION_2026-10-07.md)。用户启动 Docker Desktop 后，已构建专用镜像并回填真实 RepoDigest；15 项真实 Docker 合成数据测试通过。不要继续沿用历史“无引擎、整体 skip”作为当前结论，也不要把本机通过推广为朋友电脑或产品入口已可用。
+
+在仓库根运行 `.venv\Scripts\python.exe -m scripts.build_python_sandbox` 是当前可信构建入口，需要事先批准下载公开依赖/镜像与使用磁盘。只提交三个明确文件的 tar 上下文；独立临时 CLI 配置不读取用户 Docker 凭据，固定本机 `-H` 和 `--builder default`，核实唯一运行中 docker driver 节点与引擎前后身份。若插件目录布局不受支持、builder 不可核实或 RepoDigest 缺失，拒绝构建/配置，不能换远端 builder 或把 image ID 当 repository digest。脚本不自动改功能开关；镜像记录为机器本地前置，不是发布安装包。
+
+容器内固定 `OPENBLAS_NUM_THREADS=1`、`OMP_NUM_THREADS=1`、`MKL_NUM_THREADS=1`、NumExpr 两项线程变量为 1；不得继承宿主覆盖值或为解决库导入而扩大进程限额。流读取采用 `read1`（无此接口的原始流用 `read`），避免短输出直到 EOF 才可观察；取消测试必须证明分析代码已开始，再取消并核实确切容器消失。
+
+允许模型生成 Python 分析代码，不允许宿主裸执行、任意 Bash/Read、直接修改工作簿或默认数据出站。先读 [设计](./SDK_ISOLATED_PYTHON_DESIGN_2026-10-06.md) 和 [DeepSeek 实施提示词](./DEEPSEEK_ISOLATED_PYTHON_PROMPT_2026-10-06.md)，不复制已停用的 SDK 代码草稿。默认关闭；隔离不可用时明确拒绝并保留现有受控工具，不能静默切到非隔离路径。运行环境、依赖安装、镜像构建或付费模型验证须另获明确授权。
+
+**运行时三层分离**：协调器 `python_analysis.py` → 可替换运行时适配器 `python_docker_runner.py` → 容器内固定工作程序 `docker_worker.py`。Docker 是第一种实现、非强制依赖；适配器可替换。固定启动链由可信代码决定，模型只提供 code 经 stdin 传入（绝不进命令行、不用 pickle、不拼 shell）。容器安全配置必须由环境强制并**逐项校验**（`validate_isolation_config`，缺任一项拒绝执行）：`--network none`、`--read-only` + 限大小 tmpfs scratch、非 root（**拒绝一切 root UID 形式**）、`--cap-drop ALL`、`--security-opt no-new-privileges`、内存/swap/CPU 速率/累计 CPU 时间（`--ulimit cpu`）/pids 限额、`--log-driver none`；不挂载用户目录/仓库/工作簿/凭据/Docker socket。
+
+**输出运行期有界（不是"有界临时文件"）**：`run_python_isolated` 用 `Popen` + 两条 reader 线程**并发**读取 stdout/stderr，各通道独立字节上限（`_OutputCollector`）；任一通道触顶立即 kill 容器并进入终止核对——不把内存风险转移到宿主磁盘，也不等进程自然结束。原始输出**不落**宿主临时文件/日志/历史/账本（只在有界内存中暂存用于协议解析）。`maxStderrBytes` 与 `maxOutputBytes` 是两个独立预算，stderr 不得无界。
+
+**清理可核实（不是"清理闭环已完成"）**：每次运行绑定可信侧运行身份（唯一容器名 `--name excel-bro-py-<uuid>`）；`rm -f` 之后必须 `container inspect` 核实，返回 `gone`（确认消失）/`unknown`（无法确认）。清理未确认时**不发布结果、不复用沙箱**。取消经 `cancel_check` 回调实现，清理后按原契约传播，取消后的迟到结果一律拒绝。禁止全局 prune / 宽泛前缀删除，只清理本容器。
+
+**端点核实并锁定（不是"剔除变量即绑定本机"）**：仅剔除 `DOCKER_HOST`/`DOCKER_CONTEXT` 环境变量不等于绑定本机——Docker 仍会读取磁盘上持久化的 current context。`verify_local_endpoint()` 用 `docker context inspect` + `docker info` 查询**实际端点**，只接受本机 `npipe://`/`unix://`，拒绝 `tcp://`/`ssh://`/未知；`VerifiedEndpoint` 一旦核实即把整个生命周期（health/image/run/stop/rm/verify）用 `-H <host>` 锁到该端点，运行期不再重新解析 context；不修改用户全局 context。端点解析**必须取结构化字段 `Endpoints.docker.Host`**（context inspect 的权威来源），不能只取第一个 URL 匹配——真实输出里 `Metadata.otel.OTEL_EXPORTER_OTLP_ENDPOINT`（`unix://...`）会出现在 docker `Host` 之前，取第一个匹配会把 otel 端点误锁进生命周期；结构化字段缺失时才退回正则（`docker info` 自由文本形态）。
+
+**端点必须是经结构校验的本机形态（不是判 scheme 前缀）**：`startswith("npipe://"/"unix://")` 不足——`npipe:////remote-host/pipe/docker_engine` 前缀合法、实为远端主机，会被前缀判定误接受。`_classify_local_endpoint()` 按各形态的**结构**逐段校验：Windows 命名管道只接受本机命名空间 `//./pipe/<name>` 与扩展长度前缀 `//?/pipe/<name>`（远端主机段、空管名、缺失 `pipe/` 段一律拒绝）；Unix socket 只接受本机**绝对路径**（`//host/...` 远端 authority、相对路径、根目录一律拒绝）；`tcp`/`ssh`/`fd`/`http`/空/畸形一律拒绝；**不把任意主机别名改写为 local**。执行路径**不按对象名信任** `VerifiedEndpoint`——`endpoint_is_locally_verified()` 对传入实例重新做结构校验，`run_python_isolated` 入口与 `_run_docker_cli` 最内层各有一道校验，非法端点在任何 docker 调用前失败。**运行期端点核实 ≠ builder 核实**：本 runner 的 `-H` 锁定只证明运行生命周期锁到本机；镜像构建阶段的远端 buildx builder 由构建流程单独核实，不因 runner 的 `-H` 锁定而被视为安全。
+
+**回包严格校验**：`completed` 必须带 `result` 键（显式 null 合法，缺键不合法），拒绝 NaN/Infinity/过深/元素爆炸/畸形 UTF-8/多包协议；`status=error`（即便退出码 0）一律映射为 `error`。镜像身份必须**不可变**（`name@sha256:...`）；缺 digest 时 `image_ref()` 返回不可解析哨兵（失败关闭），不静默降级为可变 tag。
+
+构建归档内部路径以 `server/` 为根，但不把整个目录交给 Docker：`build_python_sandbox.py` 明确只打包 `.dockerignore`、`docker/Dockerfile`、`app/docker_worker.py`。`server/.dockerignore` 同时采用默认全排除，不再重纳入 `.env.example`。Docker 日志不作为代码/数据/输出的持久化出口（`--log-driver none` 强制）。
+
+**真实验证与未实现分列**：`server/tests/test_python_docker_real.py` 本机 15 项通过；其它机器的引擎/镜像缺失仍显式 skip，不冒充通过。完全禁 exec、授权句柄登记、结果库/计划编译及双端入口仍未实现，产品入口保持关闭。mock 层缺陷复现与独立反向变异在 `server/tests/test_python_docker_defects2.py` + `scripts/mutate_python_docker_defects2.py`（M1–M21）、`server/tests/test_python_docker_defects.py` + `scripts/mutate_python_docker_defects.py`（M1/M5/M6）、`scripts/mutate_task_ledger_wal.py`（M13/M14，SQLite 并发首建只读）。**代码与部分真实证据不等于安全闭环完成**；不得只凭这 15 项通过打开 `pythonExecution.enabled`。
+
+**资源参数严格校验（不是只查 `isinstance(int)`/`< 0`）**：Python 里 `bool` 是 `int` 子类，`capability_int` 的 `isinstance(value, int)` 会把 JSON 的 `true` 当合法配额（`True` 冒充 1，限额被静默放大）；`capability_float` 不拒绝 `NaN`/`Infinity`（`NaN` 与任何上限比较都为 `False`，可绕过全部限额）。修复：`capability_int` 显式剔除 `bool`，`capability_float` 增加 `math.isfinite` 校验（两者都是 Python 侧通用 bug，`config/capabilities.json` 中的 `bool` 只出现在 `enabled`/`allowHyperlink` 字段，均不由这两个 helper 消费，故不改变其它配置规则）。runner 侧另有 **Python 专用**严格校验：`_require_positive_int`/`_require_positive_finite_float`/`_validate_resource_limits` 在 `build_run_arguments`（适配器入口，构造 CLI 前）与 `run_python_isolated`（执行入口，起 Docker 前）各校验一次，拒绝 `bool`/非整数/零/负数/`NaN`/`Infinity`/非数值，**不得静默钳位或降级为默认/无限**。注意语义区分：`cpu_quota`（`--cpus`）是 CPU **速率**上限，累计 CPU 时间另由 `cpu_seconds`（`--ulimit cpu=<s>:<s>`，RLIMIT_CPU）表达；`pids_limit`（`--pids-limit`）限制进程/线程数，**不表示禁止 exec**。
+
+**冗余守卫的变异纪律（WPS 原生比较）**：原表侧漂移由两道同性质守卫共同保证——`assertOriginalUnchanged`（重新读原表、比对快照 → 文案「原表或授权范围在预览后发生变化」）与后道逐格快照复核（文案「原表在并排审阅后发生变化」）。拆其中任一道，另一道仍可能拒绝，因此**不能**用"拆一道后用例变红"冒充该道守卫的独立变异；测试断言**前一道的确切文案**才能把判别力落到 `assertOriginalUnchanged`。副本侧漂移先于原表侧被检查，其用例独立判别副本侧值比较。常量单元格改动不联动公式（`Range.Value2` setter 才联动），按实际合法拦截路径验证即可，不冒充公式重算。
+
+已落地的隐私/入参防线（修改受控工具时不得拆掉）：`run_python_analysis` 的参数在 assistant 消息进入消息历史、检查点与恢复现场**之前**做可信侧最小白名单投影——只保留 `code` 固定占位，`datasetHandles` 投影为空列表（句柄登记未实现，不保留模型自报的任何句柄原值），未知字段、嵌套对象、任意自由文本、畸形 JSON 一律丢弃（不做哨兵扫描、不做全局替换），入参校验与历史投影是两道独立边界，被拒绝的参数不会因"没执行"就原样进历史；同轮执行参数走受控内存，恢复现场（旧检查点的 `messages` 与 `pendingAssistantMessage`）统一投影后判 `code_not_preserved`。恢复现场还必须做**回执归属核对**（assistant 调用 ID→工具名 的关联纳入 pending，孤立 ID/名称冲突/关联歧义失败关闭拒绝恢复，合法非 Python 回执保持内容顺序、一致镜像不误拒）与 **loopState 收口**（Python 相关状态判定同时考虑 messages 与 pending，涉及 Python 时清空 `lastErrorMessage`/`lastWarning`，不得进入任何新持久记录）。回执投影按封闭枚举组合再生 `message`；执行路径（解析/校验/协调器/分发/投影/序列化）异常统一映射为固定 `execution_error` 回执，普通后端与 SDK 同源，`asyncio.CancelledError` 继续传播。继续开发时保持纪律：先写能复现缺陷的合成哨兵测试再修生产代码；模型出口、持久化出口（SQLite 账本全列、每次保存边界）、异常出口、恢复现场分别取证；普通后端与 SDK 的工具契约逐字同源，SDK 内部转录无法投影这一点要如实记录而非假装覆盖。既有反向变异（历史投影/回执校验/未知字段/执行异常/恢复投影/归属核对/loopState 收口）作为回归护栏。
+
+开工核对源码，不把 `planningReadPolicy=none` 的拒绝改为全局放行，也不把任意工具 dict 序列化给模型。仅为批准工具添加有类型的输入与模型出口投影，协议同步 TS/Python。客户端读值只能投递给经验证的本地执行器；本地执行授权和模型接收数据授权分开。Python 的 stdout/异常/摘要/值矩阵与嵌入数据的代码按敏感输出处理，检查日志、SSE、SDK 转录、缓存及恢复账本所有出口。
+
+必须有真实隔离集成测试，不只 mock SDK 或检查配置文本：越权读宿主文件/凭据、联网、派生进程、资源耗尽、超时/取消整树终止、运行器缺失/配置损坏的拒绝。使用纯合成敏感哨兵，先证明哨兵存在于本地输入/输出，再断言真实 fetch、模型消息、日志和持久记录不包含它；摘要与错误出口单独测试。某平台测试跳过就是该平台未验证，不等于通过。做独立反向变异，但变异红灯不能代替真实隔离证据。
+
+Excel/WPS 同步覆盖实际授权、运行、结果审阅、确认写入与取消点击链路，确认前新增宿主写入为 0；授权变化/现场冲突停止旧结果，不丢补充答案、不循环追问。按 AGENTS.md 跑双端 test/build 与服务端 pytest/compileall，修改 core 另跑 test:core；分别报告失败、环境阻断与真实宿主待验，未实现不能记作待验。本轮文档更新仅检查 diff/链接，未运行模型或宿主、未启用 Python。
+
+### 输入失败双守卫的独立变异（2026-10-07）
+
+`test_python_docker_defects2.py` 用 `Event` 控制真实 `_feed_stdin` 记录错误的时机，不用固定 sleep 排序。运行中输入失败须返回 `error / execution_error`，不接受 timeout 兜底；自然结束场景只在循环内检查之后释放输入失败，即便 stdout 是合法完成回包也不得发布结果。
+
+`python scripts/mutate_python_docker_defects2.py M23a` 只拆循环内守卫，`M23b` 只拆自然结束后的守卫。兼容命令 `M23` 顺序运行两项，任一 RED-MISS 即失败；不得同时拆两道守卫充当独立证据。这两项在独立 pytest 进程内存中加载可信仓库源码的单守卫变异，不写回生产源码，不运行模型提供的分析代码。脚本注册、另一道守卫保留、兼容入口顺序和失败停止由 `test_python_docker_mutations.py` 回归。此证据不替代真实 Docker 验收，产品入口保持关闭。
+
+### 新功能双端完成门槛（2026-10-05）
+
+新增功能必须同时覆盖 Excel/WPS，按相同用户任务、确认与安全语义验收，不只检查外观。开工前在计划表列出双端现状与缺口，实施后分别报告实现、接线、自动化及真实宿主证据；单端上线不得标整体完成。宿主限制必须有证据与真实降级，分批实施须用户明确同意；未实现不可写成待实机验收。共享协议/逻辑优先复用，宿主特定 API 留在适配层。
+
+双端代码改动至少运行 `npm run test:addin`、`npm run build:addin`、`npm run test:wps`、`npm run build:wps`，以及服务端 pytest/compileall；修改共享 core 时另跑 `npm run test:core`。只修改说明/计划等文档时检查 diff 与链接，不以文档更新冒充代码验收。AI 40% 比例已双端接线，实际宿主效果仍待验收。
+
+### WPS AI 40% 比例验收（2026-10-05）
+
+刷新/重新打开 WPS EB，使用独立、已保存的测试工作簿生成本次原生副本。AI 应约占包含两张表的 WPS 主窗口 40%，不是任一表格子窗口的 40%；主窗口逻辑宽 1200px 时目标为 480 CSS px，极窄时共用半窗口产品上限。调主窗口宽度等待约 1.5 秒应跟随；手动拖 AI 边界后再改主窗口宽度，本次审阅不抢宽，Ribbon 重新打开也不应套用 1080；新副本重新启用自动比例。放弃/确认/卸载尝试恢复进入审阅前宽度，未生成副本不临时调宽。不要把尺寸调整当作自动批准写入。
+
+缺少窗口/窗格接口、另存副本、切换到其他文档、关闭副本、身份重复等显示手动指引，不创建新窗格、不读写单元格；API 成功但实际宽度未达到目标时同样不得报成功。100%/150%/200% DPI、WebView 缩放与跨显示器实测仍待验：DPR 发生变化时本轮停止自动调宽，按指引手动调整或重新生成审阅重新校准；不是已实现无缝跨缩放随动。此 WPS 前端变更无需重启 Python，也不接 Excel measure 端点。
+
+新增 `wpsReviewPaneSizing.test.tsx` 覆盖比例/单位校准、实际宽度确认、主窗口随动/防抖/隐藏/卸载、手动与 Ribbon 所有权、退出恢复、身份变化、能力缺失、隐私哨兵和 StrictMode；面板用实际按钮验证进入/放弃审阅，原表零写入。共享目标与判定在 core 测试，Excel 原 12 条比例回归保留。反向变异拆掉手动优先、现场身份、普通宽度恢复分别 1/3/5 条红，还原后复跑。自动化与真实宿主必须分开报告。
+
+本轮最终：WPS 433、Excel 730、core 216、服务端 790；两端 tsc/Vite、compileall、diff --check 通过。无最终失败或环境阻断；既有 React act 告警、pytest cache 写权限警告保留，不阻断测试。尚未操作真实 Excel/WPS，不能以此把所有版本标为验收通过。
+
 ### AI 40% 比例验收（2026-10-05）
 
 自动化结果：Excel 730、WPS 406、core 213、服务端全量 790；两端 tsc/Vite、compileall 与 diff --check 通过，最终无失败或环境阻断。WPS 既有 act 警告不变。自动化未操作真实 Excel，不能替代下述验收。
@@ -182,15 +254,17 @@ SDK 请求使用官方 `https://api.deepseek.com/anthropic` 兼容端点，其�
 若要使用 Anthropic 原生连接，可另在 `server/.env` 私下配置
 `CLAUDE_AGENT_SDK_MODEL`、`ANTHROPIC_API_KEY`、`CLAUDE_AGENT_SDK_STATE_DIR`
 （仓库外绝对路径），对应模型菜单中的独立「Claude Agent SDK」选项。
-会话目录会保存 SDK 对话资料，应限制本机访问、按隐私策略保留/清理，不能提交 Git。
+会话目录用于 CLI 配置，本次请求使用 `--no-session-persistence`；旧版可能留下的资料
+仍应限制本机访问、按隐私策略保留/清理，不能提交 Git。
 该 `.ps1` 保持 ASCII 文本，以兼容 Windows PowerShell 5.1 对无 BOM UTF-8 脚本的读取；
 若修改脚本提示文案，不要直接加入非 ASCII 字符。
 不要把真实密钥写进示例文件。SDK 的 `max_budget_usd` 不保证等于 DeepSeek
 实际计费，试用时应查看 DeepSeek 平台账单与额度。
 
 当前 SDK 通道仅用于表结构意图与 `planningReadPolicy=none` 的无数据行规划：
-既不上传原始数据行、上一轮紧凑结果、历史对话、图片或本地文件路径，也不开
-SDK 的 Read/Bash/Edit 等工具。需要这些输入的请求会明确拒绝并提示用户切回原模型；
+既不上传原始数据行、上一轮紧凑结果、历史对话或本地文件路径，也不开
+SDK 的 Read/Bash/Edit 等工具。用户显式添加的图片现已通过原生 image content block 接入，
+不转成文件路径、不创建临时文件。数据行请求仍明确拒绝并提示用户切回原模型；
 依赖上一轮对话指代的请求应在本轮重新说明完整需求，不能期待 SDK 自动读取旧会话。
 `/function`、AI 编辑计划等未接入的子功能同样不会把 SDK 凭据误发到 OpenAI 兼容端点。
 SDK 通过 EB 白名单终局工具提交回答、列映射规则或预览计划，写入仍需用户确认。
@@ -400,7 +474,8 @@ Excel 当前工作簿与文件夹模式目前仍使用固定值，不能写成�
 行数和回读状态，不能把原始单元格值写入历史。复制按钮应覆盖用户与助手消息，
 并验证 WPS WebView 拒绝 `navigator.clipboard` 时的降级路径。当前尚未接入服务端
 规划 SSE 的完整事件时间线，不可把本地步骤误称为 Excel 端全部进度能力已对齐。
-逻辑复用不得突破宿主能力：工作目录与图片输入暂未开放；工作流仍须验证并预览；固化查询必须在当前
+逻辑复用不得突破宿主能力：工作目录暂未开放；图片输入已与 Excel 共用附件处理 Hook；
+工作流仍须验证并预览；固化查询必须在当前
 授权表内由本地确定性执行器运行。自动范围在每次发送时重新读取活动表，手动多表授权不得自动
 增加工作表。修改这些区域后至少运行 `npm run test:wps` 与 `npm run build:wps`，并在目标 WPS
 版本分别检查窄窗和加宽窗格。
@@ -508,6 +583,20 @@ bash packaging/build_mac.sh
   "网络中断 / 等待回答 / 需重新授权 / 结果不确定"混为一谈的老问题。
 - **只有 `checkpoint` 能说"从上次保存的进度继续"**：`taskResumeDecision()` 是唯一判定
   入口。改它的文案时不要删掉"重新生成预览"这一类说法，那是对"没有检查点"的诚实交代。
+- **WPS 规划暂停在面板重开后只能"核对"，不能"自动续跑"**（CAP-02 §5）：重开效果走
+  `planningPausedEntriesFromHistory`（共享层）→ `reinspectWpsPlanningPause`（查询）→
+  面板挂载 effect。三条不可越过：① 核对中**不画操作区**；② 按钮只由
+  `wpsPlanningResumeView` 从**服务端刚返回的**状态推导，历史快照只许用于显示；
+  ③ `revision` / `lastSequence` 一律采信服务端。改这里的条件时**不要把
+  `canContinue` 和 `action` 合并成一个 if** —— 那会把"放行但非精确续跑通路"误报成
+  "不能精确续跑"，等于替服务端下结论。
+- **两条后端差异必须显式说明，且只描述"当前接入"**：普通模型后端有检查点
+  （`loopState`/`messages`/`toolCache`）；Claude Agent SDK 后端**当前接入未实现
+  检查点恢复** —— 本次接入把对话状态交给 CLI 子进程托管，服务端读不到那份现场。
+  写文档时**不要**推断成"SDK 永远不支持检查点"：那是没核实过的结论。将来换接入
+  方式或补做现场托管，改这句话而不是改历史结论。`planner.py` 在分发前用
+  `ModelNotAvailableError` 挡住跨后端续跑。**不要**改成静默重新规划 —— 用户点的是
+  "从上次进度继续"，静默从头规划会重复调用模型与工具，界面还显示"继续成功"。
 - **持久化必须走 `sanitizeTaskResumeRecord()`**：它是显式白名单重建，多余键一律丢弃。
   新增字段要同时加进白名单，否则字段会被静默丢弃（不会报错）；`originalPrompt` 为空时
   返回 `null` 是**故意**的 —— 缺原需求时宁可明确报"无法恢复"。
@@ -1022,6 +1111,10 @@ Stop-Process -Id <PID>
 
 ## 12. 文档维护
 
+先确认目标再分析回归（2026-10-05）：共享 `useAuthorizedTarget.test.tsx` 验证弱证据先确认、强身份直接分析、取消不分析、新任务不继承弱同意，以及确认/分析检查期间身份证据改变。`LocalMappingResolution.test.tsx` 验证业务卡没有目标授权勾选，提交仍复核现场并保留规则；两端 `*AuthorizedTarget.test.ts` 验证宿主证据不读取单元格值。WPS `wpsLocalPlanOutbound.test.tsx` 用真实 fetch 与宿主读取计数证明确认前表头/数据行/模型请求/写入均为 0，确认后补全直接到新预览；换文件和源值改变仍拒绝陈旧计划。`wpsTaskResume.test.tsx` 验证弱证据恢复先走独立目标卡，保留真实答案。独立反向变异：绕过 WPS 分析前检查 1 条红、移除弱证据同意条件 4 条红、移除确认时证据键一致检查 1 条红，均已还原。完整证据与实机项目见 `docs/AUTHORIZATION_BEFORE_ANALYSIS_2026-10-05.md`。
+
+授权目标前置确认（2026-10-05）：重点回归共享 `useAuthorizedTarget.test.tsx`、`authorizedTarget.test.ts`、`officeAuthorizedTarget.test.ts`、WPS 面板和只读代理，以及 Excel 原生审阅入口。必须检查实际点击未确认前模型/读取/写入为 0、确认期间再次切换拒绝、后台监测不重置勾选、旧写入不自动重放。实机项目见 `docs/AUTHORIZED_TARGET_PREFLIGHT_2026-10-05.md`。
+
 以下变更必须同步更新 `docs/ARCHITECTURE.md`：
 
 - 新增服务、数据流或持久化方式；
@@ -1030,5 +1123,7 @@ Stop-Process -Id <PID>
 - 新增本地工具；
 - 修改动作协议或执行通道；
 - 改变 `/api/turn` 状态机。
+
+澄清恢复回归（2026-10-05）：不仅断言“调用了新一轮”，还须完整点击答案提交、范围确认、预览入口，验证确认不丢失、不重复询问；WPS 替身的 ActiveWorkbook 与 Worksheets.Item 每次都返回新对象。检查真实 fetch 与历史的隐私哨兵，以及预览路径原表写入为 0。同名异路径必须拒绝私有规则续接。实现与证据见 `docs/CLARIFICATION_LOOP_FIX_2026-10-05.md`；Excel 共享表单测试不代替真实 Office.js 验收。
 
 启动命令、环境变量、端口或调试方式变化时，更新本文和根目录 `README.md`。

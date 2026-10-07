@@ -33,6 +33,17 @@ import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import WpsAgentPanel from "./WpsAgentPanel";
 import { getWpsApplication } from "./wpsHost";
+import type { WpsApplication } from "./wpsHost";
+import { prepareImageFile } from "../../excel-addin/src/imageAttachments";
+
+vi.mock("../../excel-addin/src/imageAttachments", async (original) => ({
+  ...await original<typeof import("../../excel-addin/src/imageAttachments")>(),
+  prepareImageFile: vi.fn(async (file: File) => ({
+    id: file.name, name: file.name, mediaType: "image/png" as const,
+    data: "ZXhwbGljaXQtaW1hZ2Utc2VudGluZWw=",
+    previewUrl: "data:image/png;base64,ZXhwbGljaXQtaW1hZ2Utc2VudGluZWw="
+  }))
+}));
 
 vi.mock("./wpsHost", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./wpsHost")>();
@@ -213,6 +224,7 @@ function jsonResponse(payload: unknown): Response {
  */
 function makeApplication(initialRow3Value: string) {
   let row3Value = initialRow3Value;
+  let writes = 0;
   const headerRow = ["类别", "归属"];
   /**
    * 真实取值面的记账：**谁被取过值就记谁**，不看调用方贴的 `purpose` 标签。
@@ -250,8 +262,10 @@ function makeApplication(initialRow3Value: string) {
       Columns: { Count: endCol - startCol + 1 },
       MergeCells: false,
       // `readChunkRange` 读 Value2；`prepareWpsPlan` 复核源值时读 Formula。
-      Formula: flat,
-      Value2: flat
+      get Formula() { return flat; },
+      set Formula(_value: unknown) { writes += 1; },
+      get Value2() { return flat; },
+      set Value2(_value: unknown) { writes += 1; }
     } as Record<string, unknown>;
     return range;
   }
@@ -334,7 +348,8 @@ function makeApplication(initialRow3Value: string) {
     dataValueCount: () => dataValues.size,
     /** 一次性跨过表头与数据行的读取次数 —— 必须为 0（没有整片源列读取）。 */
     wholeReads: () => sourceColumnWholeReads.length,
-    setRow3Value: (value: string) => { row3Value = value; }
+    setRow3Value: (value: string) => { row3Value = value; },
+    writeCount: () => writes
   };
 }
 
@@ -408,6 +423,7 @@ beforeEach(() => {
   localStorage.clear();
   captured = [];
   vi.clearAllMocks();
+  modelCatalog.models[0].supportsVision = false;
   // `POST /api/turn` 被复用两次：先意图、再规划。用计数器区分，避免把
   // 意图请求误判成规划请求。
   let turnCallCount = 0;
@@ -423,9 +439,9 @@ beforeEach(() => {
       }
       if (url.includes("/api/turn")) {
         turnCallCount += 1;
-        // 第一次是意图判断，第二次才是规划。
+        // Distinguish by the real request shape, including subsequent clarification turns.
         return jsonResponse(
-          turnCallCount === 1 ? intentProceedResponse() : planResponseFactory()
+          JSON.parse(String(init?.body ?? "{}")).scope ? intentProceedResponse() : planResponseFactory()
         );
       }
       if (url.includes("/api/plans/validate")) {
@@ -459,6 +475,93 @@ function allBodies(): string {
   return captured.map((item) => `${item.url}\n${item.body}`).join("\n");
 }
 
+describe("图片附件的真实 fetch 链路", () => {
+  async function attach(container: HTMLElement) {
+    const input = container.querySelector<HTMLInputElement>('input[aria-label="选择图片附件"]')!;
+    const file = new File(["explicit image"], "user-screenshot.png", { type: "image/png" });
+    Object.defineProperty(input, "files", { configurable: true, value: [file] });
+    await act(async () => { input.dispatchEvent(new Event("change", { bubbles: true })); });
+    await until(() => Boolean(container.querySelector(".composer-attachments img")), "应出现图片预览");
+    return container.querySelector<HTMLTextAreaElement>(".composer textarea");
+  }
+
+  it("先确认目标；意图只发数量，规划发真实图片；澄清续答仍携带原图，不落聊天存储", async () => {
+    const host = makeApplication(PRIVATE_SENTINEL);
+    getWpsApplicationMock.mockReturnValue(host.application);
+    modelCatalog.models[0].supportsVision = true;
+    let plans = 0;
+    planResponseFactory = () => ++plans === 1 ? {
+      kind: "clarification", provider: "model", clarification: {
+        id: "image-question", summary: "补充图片目标", question: "如何使用图片？",
+        reason: "缺目标", scopeLabel: "Sheet1", options: [
+          { id: "analyze", label: "只分析图片", description: "不修改原表", resolution: "只分析图片", resolutionMode: "append" },
+          { id: "preview", label: "参考图片生成预览", description: "先预览", resolution: "参考图片生成预览", resolutionMode: "append" }
+        ], fields: []
+      }
+    } : { kind: "answer", provider: "model", message: "已结合附件图片分析", resultContext: null };
+    const { container } = await mount(panel());
+    await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("第一个连接") ?? false, "模型加载");
+    const textarea = await attach(container);
+    expect(prepareImageFile).toHaveBeenCalledOnce();
+    expect(container.querySelector<HTMLImageElement>(".composer-attachments img")?.src).toContain("ZXhwbGljaXQ");
+    expect(captured.filter((r) => r.url.includes("/api/turn"))).toHaveLength(0);
+    await submit(textarea);
+    if (container.querySelector('[role="dialog"]')) await confirmBeforeAnalysis(container);
+    await until(() => textOf(container).includes("补充图片目标"), "应出现图片任务澄清");
+    await click(Array.from(container.querySelectorAll("button")).find((button) =>
+      button.textContent?.includes("只分析图片")) ?? null);
+    await until(() => textOf(container).includes("已结合附件图片分析"), "图片续答应完成");
+    const bodies = captured.filter((r) => r.url.includes("/api/turn")).map((r) => JSON.parse(r.body));
+    const intents = bodies.filter((b) => b.imageCount !== undefined);
+    const planning = bodies.filter((b) => b.workbook);
+    expect(intents.length).toBeGreaterThan(0);
+    expect(intents.every((b) => b.imageCount === 1 && !b.images)).toBe(true);
+    expect(planning).toHaveLength(2);
+    for (const request of planning) {
+      expect(request.images).toEqual([{ name: "user-screenshot.png", mediaType: "image/png", data: "ZXhwbGljaXQtaW1hZ2Utc2VudGluZWw=" }]);
+    }
+    expect(allBodies()).not.toContain(PRIVATE_SENTINEL);
+    expect(allBodies()).not.toContain((host.application as WpsApplication).ActiveWorkbook!.FullName);
+    const stored = localStorage.getItem("excel-bro.wps.chat.v1") ?? "";
+    expect(stored).toContain("user-screenshot.png");
+    expect(stored).not.toContain("ZXhwbGljaXQ");
+    expect(host.writeCount()).toBe(0);
+  });
+
+  it("非视觉模型允许添加和删除，但阻止发送，不丢附件", async () => {
+    const host = makeApplication(PRIVATE_SENTINEL);
+    getWpsApplicationMock.mockReturnValue(host.application);
+    const { container } = await mount(panel());
+    await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("第一个连接") ?? false, "模型加载");
+    const textarea = await attach(container);
+    await submit(textarea);
+    expect(textOf(container)).toContain("当前模型不支持图片");
+    expect(captured.filter((r) => r.url.includes("/api/turn"))).toHaveLength(0);
+    expect(container.querySelector(".composer-attachments img")).not.toBeNull();
+    await click(container.querySelector('button[aria-label="移除图片 user-screenshot.png"]'));
+    expect(container.querySelector(".composer-attachments")).toBeNull();
+    expect(host.writeCount()).toBe(0);
+  });
+
+  it("图片规划连接失败后保留图片与原需求，不能冒充成功或写入", async () => {
+    const host = makeApplication(PRIVATE_SENTINEL);
+    getWpsApplicationMock.mockReturnValue(host.application);
+    modelCatalog.models[0].supportsVision = true;
+    planResponseFactory = () => { throw new TypeError("Failed to fetch"); };
+    const { container } = await mount(panel());
+    await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("第一个连接") ?? false, "模型加载");
+    const textarea = await attach(container);
+    await type(textarea, "按截图生成预览，不执行写入");
+    await submit(textarea);
+    if (container.querySelector('[role="dialog"]')) await confirmBeforeAnalysis(container);
+    await until(() => captured.filter((r) => r.url.includes("/api/turn")).length === 2 &&
+      textarea?.value === "按截图生成预览，不执行写入", "失败后应恢复原需求");
+    expect(container.querySelector(".composer-attachments img")).not.toBeNull();
+    expect(localStorage.getItem("excel-bro.wps.chat.v1")).not.toContain("ZXhwbGljaXQ");
+    expect(host.writeCount()).toBe(0);
+  });
+});
+
 /** 跑一次完整的"输入 → 提交"，停在结果出现之前。 */
 async function ask(
   container: HTMLElement,
@@ -469,12 +572,127 @@ async function ask(
   await submit(textarea);
 }
 
+async function confirmBeforeAnalysis(container: HTMLElement) {
+  await until(() => Boolean(container.querySelector('[role="dialog"]')), "需求分析前应先显示独立目标确认");
+  const dialog = container.querySelector('[role="dialog"]')!;
+  await click(dialog.querySelector('input[type="radio"]'));
+  await click(findButton(container, "确认目标并继续"));
+}
+
 describe("local_plan_rule 的真实出站请求体", () => {
   describe("未知私有值：规则里没有它，本地计划必须拒绝而不是兜底", () => {
     beforeEach(() => {
       // 规则只列了 A2 的已知类别；A3 的私有值**不在映射表内**。
       planResponseFactory = () =>
         localRuleTurnResponse(PRIVATE_SENTINEL, false);
+    });
+
+    it("每次返回新包装对象：分析前确认目标，随后业务补全直接预览，不再混入授权", async () => {
+      const host = makeApplication(PRIVATE_SENTINEL);
+      const app = host.application as WpsApplication;
+      const book = app.ActiveWorkbook!;
+      Object.defineProperty(app, "ActiveWorkbook", { get: () => ({
+        ...book, Worksheets: { ...book.Worksheets, Item: (index: number) => ({ ...book.Worksheets.Item(index) }) }
+      }) });
+      expect(app.ActiveWorkbook).not.toBe(app.ActiveWorkbook);
+      expect(app.ActiveWorkbook!.Worksheets.Item(1)).not.toBe(app.ActiveWorkbook!.Worksheets.Item(1));
+      getWpsApplicationMock.mockReturnValue(host.application);
+      const { container } = await mount(panel());
+      await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "应加载模型");
+      await ask(container);
+      await until(() => Boolean(container.querySelector('[role="dialog"]')), "分析前先确认目标");
+      expect(captured.filter((item) => item.url.includes("/api/turn"))).toHaveLength(0);
+      expect(host.headerValueCount()).toBe(0);
+      expect(host.dataValueCount()).toBe(0);
+      expect(host.writeCount()).toBe(0);
+      expect(textOf(container)).not.toContain("需求分析过程");
+      expect(textOf(container)).not.toContain(PRIVATE_SENTINEL);
+      await confirmBeforeAnalysis(container);
+      await until(() => textOf(container).includes(PRIVATE_SENTINEL), "应展示本地未知来源值");
+      const requestCount = captured.length;
+      const target = "用户本地答案-6K9B";
+      await until(() => !findButton(container, "按补充映射重新生成预览")!.disabled, "已授权的补全表单应可作答");
+      expect(container.querySelector('.local-mapping-scope-confirmation')).toBeNull();
+      expect(textOf(container)).not.toContain("确认当前操作目标：");
+      await typeInput(container.querySelector<HTMLInputElement>('.wps-local-mapping-values input[type="text"]'), target);
+      await click(findButton(container, "按补充映射重新生成预览"));
+      await until(() => textOf(container).includes("写入前确认"), "确认后必须进入新预览，而不是重问同一道题");
+      expect(textOf(container)).not.toContain("无法确认当前工作簿和授权工作表");
+      expect(textOf(container)).not.toContain("已重新确认当前数据范围");
+      expect(findButton(container, "确认此范围并继续")).toBeNull();
+      expect(captured.length).toBe(requestCount);
+      expect(findButton(container, "按补充映射重新生成预览")).toBeNull();
+      expect(textOf(container)).toContain(target);
+      expect(allBodies()).not.toContain(PRIVATE_SENTINEL);
+      expect(allBodies()).not.toContain(target);
+      const stored = localStorage.getItem("excel-bro.wps.chat.v1") ?? "";
+      expect(stored).not.toContain(PRIVATE_SENTINEL);
+      expect(stored).not.toContain(target);
+      expect(stored).toContain('"authorizationRevision":2');
+      expect(stored).not.toContain(book.FullName);
+      expect(allBodies()).not.toContain(book.FullName);
+      expect(host.writeCount()).toBe(0);
+    });
+
+    it("分析前授权后换到同名异路径文件：不得把私有补全规则用于另一份文件", async () => {
+      const host = makeApplication(PRIVATE_SENTINEL);
+      const app = host.application as WpsApplication;
+      const book = app.ActiveWorkbook!;
+      let fullName = book.FullName;
+      Object.defineProperty(app, "ActiveWorkbook", { get: () => ({
+        ...book, FullName: fullName,
+        Worksheets: { ...book.Worksheets, Item: (index: number) => ({ ...book.Worksheets.Item(index) }) }
+      }) });
+      getWpsApplicationMock.mockReturnValue(host.application);
+      const { container } = await mount(panel());
+      await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "应加载模型");
+      await ask(container);
+      await confirmBeforeAnalysis(container);
+      await until(() => textOf(container).includes(PRIVATE_SENTINEL), "应展示本地澄清");
+      const target = "禁止跨文件挪用-4Q1C";
+      await until(() => !findButton(container, "按补充映射重新生成预览")!.disabled, "已有前置授权");
+      await typeInput(container.querySelector<HTMLInputElement>('.wps-local-mapping-values input[type="text"]'), target);
+      const count = captured.length;
+      fullName = "C:\\Other\\测试.xlsx";
+      await click(findButton(container, "按补充映射重新生成预览"));
+      await until(() => Boolean(container.querySelector('[role="dialog"]')), "跨文件应先要求选择目标，不能先重规划");
+      expect(captured.length).toBe(count);
+      expect(host.writeCount()).toBe(0);
+      expect(container.querySelector<HTMLInputElement>('.wps-local-mapping-values input[type="text"]')!.value).toBe(target);
+      const dialog = container.querySelector('[role="dialog"]')!;
+      await click(dialog.querySelectorAll('input[type="radio"]')[1]);
+      await click(dialog.querySelector('input[type="checkbox"]'));
+      await click(findButton(container, "确认目标并继续"));
+      expect(captured.length).toBe(count); // Scope confirmation must not auto-replay old mapping or planning.
+      expect(textOf(container)).not.toContain(target);
+      expect(textOf(container)).not.toContain("写入前确认");
+      expect(allBodies()).not.toContain(target);
+    });
+
+    it("新包装对象且回答期间源值改变：确认目标后仍读真实新值，不能用旧快照生成预览", async () => {
+      const host = makeApplication(PRIVATE_SENTINEL);
+      const app = host.application as WpsApplication;
+      const book = app.ActiveWorkbook!;
+      Object.defineProperty(app, "ActiveWorkbook", { get: () => ({ ...book,
+        Worksheets: { ...book.Worksheets, Item: (index: number) => ({ ...book.Worksheets.Item(index) }) }
+      }) });
+      getWpsApplicationMock.mockReturnValue(app);
+      const { container } = await mount(panel());
+      await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "应加载模型");
+      await ask(container);
+      await confirmBeforeAnalysis(container);
+      await until(() => textOf(container).includes(PRIVATE_SENTINEL) &&
+        !findButton(container, "按补充映射重新生成预览")!.disabled, "前置确认后应展示业务缺口");
+      const count = captured.length;
+      host.setRow3Value("新的私有来源-8F2H");
+      await typeInput(container.querySelector<HTMLInputElement>('.wps-local-mapping-values input[type="text"]'), "旧值目标-4J2H");
+      await click(findButton(container, "按补充映射重新生成预览"));
+      await until(() => textOf(container).includes("新的私有来源-8F2H"), "应读取当前数据并在原卡询问新缺口");
+      expect(findButton(container, "生成右侧副本并排审阅")).toBeNull();
+      expect(captured.length).toBe(count);
+      expect(host.writeCount()).toBe(0);
+      expect(allBodies()).not.toContain("新的私有来源-8F2H");
+      expect(localStorage.getItem("excel-bro.wps.chat.v1") ?? "").not.toContain("新的私有来源-8F2H");
     });
 
     it("主动询问未知值；补全后重新预览，全程不把源值或目标矩阵出站/落盘", async () => {

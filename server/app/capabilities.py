@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from functools import lru_cache
 from pathlib import Path
@@ -22,7 +23,9 @@ def capabilities() -> dict[str, Any]:
 
 def capability_int(section: str, key: str) -> int:
     value = capabilities()[section][key]
-    if not isinstance(value, int) or value <= 0:
+    # bool 是 int 子类：JSON 的 true/false 会被 isinstance(int) 误判为合法整数配额，
+    # 必须显式剔除，否则 True 会冒充 1、把限额静默变成"几乎无限制"。
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise RuntimeError(f"能力配置 {section}.{key} 必须是正整数")
     return value
 
@@ -31,6 +34,10 @@ def capability_float(section: str, key: str) -> float:
     value = capabilities()[section][key]
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
         raise RuntimeError(f"能力配置 {section}.{key} 必须是非负数值")
+    # NaN/Infinity 会绕过一切上限比较（NaN 与任何值比较都为 False），必须拒绝，
+    # 否则限额可被静默放大为"无限"。非有限数一律视为非法配置。
+    if not math.isfinite(value):
+        raise RuntimeError(f"能力配置 {section}.{key} 必须是有限数值")
     return float(value)
 
 

@@ -201,3 +201,33 @@ export {
   withTaskResumeState,
   withTaskResumeConfirmation
 } from "./taskResume";
+
+// L2 semantics：规划流式消费与检查点续跑的身份/游标/终态口径。
+// 两端共用，避免各自再写一套会漂移的规划状态机。权威现场仍在服务端
+// `planning_tasks`；本模块只做归并、游标判定与"下一步能做什么"的推导。
+export type {
+  PlanningStreamPhase,
+  PlanningTaskStatus,
+  PlanningPauseType,
+  PlanningStepEventView,
+  PlanningCursor,
+  PlanningEventApplication,
+  PlanningResumeDecision,
+  PlanningStatusView,
+  PlanningStepLifecycle,
+  PlanningPausedEntry
+} from "./planningStream";
+export {
+  MODEL_ERROR_CODE_PREFIX,
+  PLANNING_RESUME_HOST_WRITES,
+  newPlanningCursor,
+  planningAfterSequence,
+  applyPlanningEvent,
+  reconcilePlanningCursor,
+  planningResumeDecision,
+  isSamePlanningResume,
+  resolveTurnIdForNewRequest,
+  newPlanningRequestId,
+  closeDanglingSteps,
+  planningPausedEntriesFromHistory
+} from "./planningStream";

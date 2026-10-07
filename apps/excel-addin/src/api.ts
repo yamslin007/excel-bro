@@ -69,7 +69,11 @@ export interface PlanChatResponse {
   modifiedPlan: AnalysisPlan;
 }
 
-const API_BASE_URL =
+/**
+ * 本地服务基址。导出是为了让 WPS 端的规划流客户端复用**同一份**解析规则
+ * （含 `VITE_API_BASE_URL` 覆盖），而不是各自再写一遍环境变量读取。
+ */
+export const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8765";
 
 export class ExcelReviewLayoutVersionError extends Error {

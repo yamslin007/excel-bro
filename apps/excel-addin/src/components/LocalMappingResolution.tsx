@@ -1,5 +1,6 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { BlankPolicy, CellValue } from "@excel-bro/core";
+import { TargetConfirmationRequiredError } from "@excel-bro/core/authorizedTarget";
 import type { ColumnMappingRule } from "../contracts";
 import {
   addExactMapping,
@@ -48,6 +49,10 @@ export function LocalMappingResolution(props: {
   /** `reason === "blank"` 时真实读到的空白格数量。 */
   blankCount?: number;
   onResolve: (rule: ColumnMappingRule) => Promise<void>;
+  /** Verify an existing authorization only. New target consent belongs before analysis. */
+  checkScope?: () => Promise<void>;
+  /** 已提交的本地规则由宿主保留，确认范围后只重读计算，不重新问模型。 */
+  onReauthorize?: () => Promise<void>;
   onCancel: () => void;
 }) {
   const reason = props.reason ?? "unmapped";
@@ -66,6 +71,26 @@ export function LocalMappingResolution(props: {
   const [priorityOrder, setPriorityOrder] = useState<string[]>(() => mappingTargets(props.rule));
   const [priorityConfirmed, setPriorityConfirmed] = useState(false);
   const [error, setError] = useState("");
+  const [scopeChecking, setScopeChecking] = useState(Boolean(props.checkScope));
+  const [scopeBlocked, setScopeBlocked] = useState(false);
+  const submitLock = useRef(false);
+  const mounted = useRef(true);
+  const checkScopeRef = useRef(props.checkScope);
+  checkScopeRef.current = props.checkScope;
+  const hasScopeCheck = Boolean(props.checkScope);
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
+  useEffect(() => {
+    let alive = true;
+    if (!hasScopeCheck) return;
+    setScopeChecking(true);
+    void checkScopeRef.current!().then(() => {
+      if (alive) setScopeBlocked(false);
+    }).catch(() => {
+      if (alive) { setScopeBlocked(true); setError("暂时无法确认操作目标，请检查当前文件后重试；补充内容仍保留在本卡片。"); }
+    }).finally(() => { if (alive) setScopeChecking(false); });
+    return () => { alive = false; };
+  }, [hasScopeCheck]);
+  const submitDisabled = props.busy || scopeChecking;
   const missingItems = useMemo(
     () => uncoveredSplitItems(props.rule, props.values, delimiter),
     [props.rule, props.values, delimiter]
@@ -83,6 +108,16 @@ export function LocalMappingResolution(props: {
   }, [props.rule, missingItems, splitTargets, priorityOrder]);
 
   const submit = async () => {
+    if (submitLock.current || submitDisabled) return;
+    submitLock.current = true;
+    try {
+    // Recheck the existing target before reading. This form never grants target authorization.
+    if (checkScopeRef.current) {
+      setScopeChecking(true);
+      await checkScopeRef.current();
+      if (!mounted.current) return;
+      setScopeBlocked(false);
+    }
     let rule: ColumnMappingRule;
     try {
       rule = reason === "blank"
@@ -107,14 +142,32 @@ export function LocalMappingResolution(props: {
     setError("");
     try {
       await props.onResolve(rule);
-    } catch {
+    } catch (failure) {
       // 宿主错误可能含源单元格原文，不在表单里显示 Error.message。
-      setError("重新读取或生成预览失败，原表未写入。请检查授权范围后重试。");
+      if (mounted.current) setError(failure instanceof TargetConfirmationRequiredError
+        ? "请先确认当前操作目标；补充内容仍保留在本卡片，尚未写入。"
+        : "重新读取或生成预览失败，原表未写入。请检查授权范围后重试。");
+    }
+    } catch {
+      if (mounted.current) {
+        setScopeBlocked(true);
+        setError("暂时无法确认操作目标，请检查当前文件后重试；补充内容仍保留在本卡片。");
+      }
+    } finally {
+      submitLock.current = false;
+      if (mounted.current) setScopeChecking(false);
     }
   };
 
   return (
     <div className="wps-local-mapping-values local-mapping-resolution">
+      {props.onReauthorize ? <>
+        <p>补充规则已保留在当前窗格。请确认当前工作簿与已选工作表，随后重新读取并生成预览；原表尚未写入。</p>
+        <button type="button" disabled={props.busy} onClick={() => void props.onReauthorize?.()}>确认此范围并生成预览</button>
+        <button type="button" disabled={props.busy} onClick={props.onCancel}>暂不修改</button>
+      </> : <>
+      {scopeChecking && <p role="status">正在核对操作目标…</p>}
+      {scopeBlocked && <p>目标检查未完成，提交时会重新检查。</p>}
       {reason === "blank" ? (
         <>
           <p>
@@ -178,7 +231,7 @@ export function LocalMappingResolution(props: {
           <div className="clarification-actions">
             <button
               type="button"
-              disabled={props.busy || (blankChoice === "value" && blankValue.trim() === "")}
+              disabled={submitDisabled || (blankChoice === "value" && blankValue.trim() === "")}
               onClick={() => void submit()}
             >
               按选定的空白处理重新生成预览
@@ -269,7 +322,7 @@ export function LocalMappingResolution(props: {
         <>
           {error && <p role="alert" className="local-mapping-error">{error}</p>}
           <div className="clarification-actions">
-            <button type="button" disabled={props.busy || (mode === "split" && (!delimiter || !priorityConfirmed))} onClick={() => void submit()}>
+            <button type="button" disabled={submitDisabled || (mode === "split" && (!delimiter || !priorityConfirmed))} onClick={() => void submit()}>
               按补充映射重新生成预览
             </button>
             {mode === "exact" ? (
@@ -281,6 +334,7 @@ export function LocalMappingResolution(props: {
           </div>
         </>
       )}
+      </>}
     </div>
   );
 }

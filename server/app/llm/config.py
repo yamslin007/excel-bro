@@ -84,7 +84,7 @@ def _claude_sdk_connection() -> ModelConnection | None:
         base_url="https://api.anthropic.com",
         model=model,
         api_key=key,
-        supports_vision=False,
+        supports_vision=os.getenv("CLAUDE_AGENT_SDK_SUPPORTS_VISION", "").strip().lower() == "true",
         adapter="claude_agent_sdk",
     )
 
@@ -135,7 +135,7 @@ def _managed_sdk_connection(
         base_url=sdk_url,
         model=selected.model,
         api_key=selected.api_key,
-        supports_vision=False,
+        supports_vision=selected.supports_vision,
         adapter="claude_agent_sdk",
     )
 
@@ -645,7 +645,7 @@ def model_catalog() -> dict[str, object]:
                 "label": f"Agent SDK · {base_label}{suffix}",
                 "provider": "model",
                 "available": True,
-                "supportsVision": False,
+                "supportsVision": connection.supports_vision,
             })
     sdk_connection = _claude_sdk_connection()
     if sdk_connection is not None:
@@ -654,7 +654,7 @@ def model_catalog() -> dict[str, object]:
             "label": f"Claude Agent SDK · {sdk_connection.model}",
             "provider": "model",
             "available": True,
-            "supportsVision": False,
+            "supportsVision": sdk_connection.supports_vision,
         })
     if settings is not None:
         default_model_id: str | None = settings.default_model

@@ -118,6 +118,10 @@ export type WpsShowDialog = (
 
 export type WpsApplication = {
   Version?: string;
+  /** ET documented main application width in points; do not use a sheet subwindow width. */
+  Width?: number;
+  Hwnd?: number;
+  Workbooks?: WpsCollection<WpsWorkbook>;
   ActiveWorkbook?: WpsWorkbook;
   ActiveSheet?: WpsWorksheet;
   Windows?: WpsNativeWindows;

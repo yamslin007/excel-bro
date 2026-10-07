@@ -31,6 +31,20 @@ function makeSnapshot(
 }
 
 describe("useUndoSnapshot", () => {
+  it("pauses undo for target confirmation before any host read/write or failure message", async () => {
+    const beforeOperation = vi.fn(async () => false);
+    const onMessage = vi.fn();
+    const onStatusChange = vi.fn();
+    const { result } = renderHook(() => useUndoSnapshot({ isBusy: false, beforeOperation, onMessage, onStatusChange }));
+    act(() => result.current.pushUndoSnapshot(snapshot));
+    await act(async () => { await result.current.undoLastExecution(); });
+    expect(undoExecutionMock).not.toHaveBeenCalled();
+    expect(onMessage).not.toHaveBeenCalled(); expect(onStatusChange).not.toHaveBeenCalled();
+    expect(result.current.lastUndoSnapshot).toBe(snapshot);
+    beforeOperation.mockResolvedValue(true);
+    await act(async () => { await result.current.undoLastExecution(); });
+    expect(undoExecutionMock).toHaveBeenCalledOnce();
+  });
   beforeEach(() => {
     vi.clearAllMocks();
     isRunningInExcelMock.mockReturnValue(true);

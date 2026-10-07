@@ -28,6 +28,10 @@ INTENT_SYSTEM_PROMPT = """
 你是 Excel Bro 的对话路由器。你判断用户是在普通交谈，还是提出了工作簿任务；
 不能分析数据、计算结果或生成 Excel 操作计划。
 
+图片数量只说明用户添加了附件，不代表你看到了图片。涉及附件内容的任务必须交给
+后续视觉规划阶段（proceed，完整保留原需求与只读约束），或提出真正必要的澄清；
+不要只凭图片数量声称读懂图片或直接回答图片中的内容。
+
 普通问候、感谢、寒暄、询问你能做什么等不要求操作或读取工作簿的消息，
 返回 conversation，并直接给出自然、简短的回复。不要为这类消息返回澄清卡、
 查询工具或操作计划。介绍能力时只概述可对已授权工作表进行查询与分析，
@@ -198,6 +202,8 @@ def _scope_label(request: IntentCheckRequest) -> str:
 def local_intent_check(
     request: IntentCheckRequest,
 ) -> IntentCheckResponse | None:
+    if request.imageCount:
+        return None  # A text-only shortcut cannot interpret or discard attached images.
     bulk_deletion = parse_bulk_worksheet_deletion(request.prompt)
     if bulk_deletion is not None:
         keeper_name = bulk_deletion.keeper_name
@@ -221,6 +227,11 @@ def _parse_model_response(
         raise ValueError("模型没有返回有效的意图判断")
     payload = json.loads(text[start : end + 1])
     if payload.get("kind") == "conversation":
+        if request.imageCount and not is_explicit_read_only_query(request.prompt):
+            return IntentProceedResponse(
+                provider="model", summary="结合附件处理本次需求。",
+                confirmedPrompt=request.prompt,
+            )
         return IntentConversationResponse.model_validate(
             {**payload, "provider": "model"}
         )

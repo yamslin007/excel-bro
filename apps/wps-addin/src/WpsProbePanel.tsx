@@ -338,7 +338,11 @@ export default function WpsProbePanel() {
           aria-expanded={scopeOpen}
           onClick={() => (scopeOpen ? discardScopeEdit() : openScope())}
         >
-          <i aria-hidden="true">▦</i>
+          <i aria-hidden="true">
+            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <path d="M19.2 12.1l-6.9 6.9a4.6 4.6 0 0 1-6.5-6.5l6.9-6.9a3 3 0 0 1 4.3 4.3l-6.9 6.9a1.4 1.4 0 0 1-2-2l6.2-6.2" />
+            </svg>
+          </i>
           <span>
             <small title={probe.value.workbookName}>{probe.value.workbookName}</small>
             <span className="scope-sep" aria-hidden="true">|</span>
@@ -355,6 +359,15 @@ export default function WpsProbePanel() {
       <WpsAgentPanel
         selectedSheetIndexes={selectedIndexes}
         resolveSelectedSheetIndexes={resolveSelectedSheetIndexes}
+        scopeMode={scopeMode}
+        onAuthorizeTarget={(indexes) => {
+          const nextMetadata = listWpsWorksheets(getWpsApplication());
+          setMetadata(nextMetadata);
+          setProbe(runProbe());
+          setScopeMode("manual");
+          setSelectedIndexes(indexes);
+          setDraftIndexes(indexes);
+        }}
         scopeDock={scopeDock}
       />
     </main>

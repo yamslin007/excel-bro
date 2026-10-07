@@ -7,7 +7,7 @@ import { measureLocalExcelWindow } from '../excelWindowLayout';
 import capabilities from '../../../../config/capabilities.json';
 vi.mock('../excelWindowLayout', () => ({ measureLocalExcelWindow: vi.fn() }));
 const scope = {workbookIdentity:'url:E:/Original.xlsx', original:{name:'Ledger'}, copySheetName:'EB_'+'a'.repeat(20)};
-const interval = capabilities.excelWindowLayout.reviewPaneMeasureIntervalMs;
+const interval = capabilities.reviewPaneSizing.reviewPaneMeasureIntervalMs;
 let host: number, setWidth: ReturnType<typeof vi.fn>;
 beforeEach(() => {
   vi.useFakeTimers(); localStorage.clear(); host = 1200;

@@ -595,6 +595,18 @@ def test_images_require_a_vision_model(
         asyncio.run(create_plan(request))
 
 
+def test_address_shortcut_cannot_silently_discard_an_attachment(monkeypatch):
+    monkeypatch.setenv("AI_BASE_URL", "https://api.example.test/v1")
+    monkeypatch.setenv("AI_MODEL", "text-only-model")
+    monkeypatch.setenv("AI_VISION_MODELS", "")
+    request = _score_request("清空 Sheet1!B2:B4")
+    request = PlanRequest.model_validate({**request.model_dump(), "images": [
+        {"name": "explicit.png", "mediaType": "image/png", "data": "aGVsbG8="}]})
+    assert request.images[0].data == "aGVsbG8="
+    with pytest.raises(ValueError, match="图片能力"):
+        asyncio.run(create_plan(request))
+
+
 def test_request_rejects_model_outside_allowlist(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

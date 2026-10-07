@@ -392,13 +392,13 @@ async def create_plan(
     resume_checkpoint: dict[str, Any] | None = None,
     approved_wall_time_seconds: float | None = None,
 ) -> AssistantResponse:
-    structural_plan = _local_bulk_worksheet_deletion_plan(request)
+    structural_plan = None if request.images else _local_bulk_worksheet_deletion_plan(request)
     if structural_plan is not None:
         return structural_plan
     # 纯语法地址命令（清空区域 / 地址写值 / 地址写公式）是已固化下来的确定性
     # 能力：只做字面解析，不需要模型理解语义，也不该因为“没有选模型”或
     # “选了模型”而变成两条不同行为。它必须排在模型解析之前。
-    address_plan = _local_address_plan(request)
+    address_plan = None if request.images else _local_address_plan(request)
     if address_plan is not None:
         return address_plan
     # 其余请求都需要外部模型理解需求。没有可用模型时必须显式失败：

@@ -1,15 +1,9 @@
 import { useEffect, useState } from 'react';
-import capabilities from '../../../../config/capabilities.json';
+import { REVIEW_PANE_LIMITS as limits, ReviewPaneSizing } from '@excel-bro/core/reviewPaneSizing';
+export { reviewPaneTargetWidth } from '@excel-bro/core/reviewPaneSizing';
 import { measureLocalExcelWindow } from '../excelWindowLayout';
 
-const limits = capabilities.excelWindowLayout;
 export type ReviewPaneScope = { workbookIdentity: string; original: { name: string }; copySheetName: string };
-
-export function reviewPaneTargetWidth(clientWidth: number): number {
-  // Office on Windows caps the native pane at half the host client width.
-  return Math.min(Math.floor(clientWidth / 2), Math.round(Math.max(limits.reviewTaskPaneMinWidthCssPx,
-    clientWidth * limits.reviewTaskPaneWidthFraction)));
-}
 
 /** Only this live review's host is measured; never use iframe/screen width as host width. */
 export function useReviewPaneRatio(scope?: ReviewPaneScope) {
@@ -19,11 +13,8 @@ export function useReviewPaneRatio(scope?: ReviewPaneScope) {
     setNeedsResize(false);
     if (!identity || !sheet || !nonce) return;
     let disposed = false, busy = false, manual = false, stopped = false;
-    let hostWidth: number | undefined, lastPaneWidth = window.innerWidth;
-    let expectedWidth: number | undefined;
+    const sizing = new ReviewPaneSizing(window.innerWidth);
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const tolerance = limits.taskPaneWidthToleranceCssPx;
-    const close = (a: number, b: number) => Math.abs(a - b) <= tolerance;
     const schedule = (delay: number) => {
       clearTimeout(timer);
       if (!disposed && !manual && !stopped) timer = setTimeout(() => void probe(), delay);
@@ -35,23 +26,10 @@ export function useReviewPaneRatio(scope?: ReviewPaneScope) {
       try {
         const { clientWidthCssPx } = await measureLocalExcelWindow(identity!, sheet!, nonce!);
         if (disposed) return;
-        const changedHost = hostWidth === undefined || !close(clientWidthCssPx, hostWidth);
-        const paneWidth = window.innerWidth;
-        // Native host resize and native pane resize are different events. Only a
-        // pane-only change not acknowledging our request grants manual override.
-        if (!changedHost && !close(paneWidth, lastPaneWidth) &&
-          (expectedWidth === undefined || !close(paneWidth, expectedWidth))) {
-          manual = true; setNeedsResize(false); return;
-        }
-        if (expectedWidth !== undefined && close(paneWidth, expectedWidth)) expectedWidth = undefined;
-        if (changedHost) hostWidth = clientWidthCssPx;
-        lastPaneWidth = paneWidth;
-        const target = reviewPaneTargetWidth(clientWidthCssPx);
-        setNeedsResize(!close(paneWidth, target)); // setWidth returning is not evidence.
-        if (changedHost && !close(paneWidth, target)) {
-          expectedWidth = target;
-          Office.extensionLifeCycle.taskpane.setWidth(target);
-        }
+        const decision = sizing.observe(clientWidthCssPx, window.innerWidth);
+        manual = decision.manual;
+        setNeedsResize(decision.needsResize);
+        if (decision.requestWidth !== undefined) Office.extensionLifeCycle.taskpane.setWidth(decision.requestWidth);
       } catch {
         if (!disposed) { stopped = true; setNeedsResize(true); }
       } finally {

@@ -9,6 +9,30 @@
 /** 单元格标量值。两端读写与比对的最小公共类型。 */
 export type CellValue = string | number | boolean | null;
 
+/** Local-only data channel. NEVER add these to PlanRequest or chat persistence. */
+export interface PythonDataSource { sheetId: string; sheetName: string; range: string }
+export interface PythonDataScope {
+  version: 1;
+  taskId: string;
+  hostId: "excel-office" | "wps-et";
+  workbookIdentityHash: string;
+  authorizationVersion: string;
+  sources: PythonDataSource[];
+}
+export interface PythonDataScopeRequest { scope: PythonDataScope }
+export interface PythonDataSnapshotRequest extends PythonDataScopeRequest {
+  scopeToken: string; sourceIndex: number; values: CellValue[][];
+}
+export interface PythonDataRevokeRequest extends PythonDataScopeRequest { scopeToken: string }
+export interface PythonDatasetReceipt { datasetHandle: string; contentFingerprint: string }
+export interface PythonResultReceipt {
+  resultHandle: string; contentFingerprint: string; rows: number; columns: number;
+}
+export interface PythonResultReadRequest extends PythonDataRevokeRequest {
+  datasets: PythonDatasetReceipt[]; result: PythonResultReceipt;
+}
+export interface PythonMatrixResult { kind: "matrix"; values: CellValue[][] }
+
 /**
  * 工作簿身份的共享层内部表示（方案 §2.3 第 1 条）。
  *

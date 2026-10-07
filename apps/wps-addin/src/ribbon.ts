@@ -1,6 +1,6 @@
 import { getWpsApplication, type WpsTaskPane } from "./wpsHost";
+import { readReviewPaneLease, TASK_PANE_STORAGE_KEY } from './wpsReviewPaneLease';
 
-const TASK_PANE_STORAGE_KEY = "excel_bro_taskpane_id";
 const DEFAULT_TASK_PANE_WIDTH = 1080;
 const PREVIOUS_TASK_PANE_WIDTH = 720;
 const initializedPaneIds = new Set<string>();
@@ -18,6 +18,8 @@ export function initializeVisiblePaneWidth(pane: WpsTaskPane, reused: boolean): 
   if (initializedPaneIds.has(paneId)) return;
 
   try {
+    // Ribbon and pane live in separate WebViews. Do not migrate a temporary review width.
+    if (readReviewPaneLease(getWpsApplication())?.paneId === paneId) return;
     const widthBefore = Number(pane.Width) || 0;
     // Migrate panes still near the former narrow default; preserve wider manual sizes.
     if (!reused || widthBefore <= PREVIOUS_TASK_PANE_WIDTH) {

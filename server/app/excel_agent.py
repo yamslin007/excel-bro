@@ -41,6 +41,17 @@ from .column_mapping import (
     validate_column_mapping_shape,
 )
 from .llm import ModelConnection, OpenAICompatibleClient
+from .python_analysis import (
+    PYTHON_ANALYSIS_OLD_RECEIPT_RECONSTRUCTED_CONTENT,
+    PYTHON_ANALYSIS_UNATTRIBUTABLE_RESUME_MESSAGE,
+    PYTHON_CODE_WITHHELD_MARKER,
+    execute_python_analysis,
+    project_python_analysis_receipt,
+    python_analysis_tool_definition,
+    python_error_response_content,
+    python_execution_enabled,
+    withheld_python_arguments,
+)
 from .models import (
     AnalysisPlan,
     AnswerResponse,
@@ -1446,6 +1457,10 @@ def _execute_tool(
 ) -> AssistantResponse | dict[str, Any]:
     if name == "select_plan_actions":
         return {"selectedActionTypes": _select_plan_actions(request, arguments), "next": "submit_plan"}
+    if name == "run_python_analysis":
+        # 隔离 Python 分析（设计授权，运行时未实现）：失败关闭，
+        # 没有已验证执行器时只返回固定的不可用回执，不做任何执行。
+        return execute_python_analysis(request, arguments)
     if request.planningReadPolicy == "none" and name in READONLY_TOOLS:
         raise ValueError("本轮源值仅在客户端读取，不允许调用规划只读工具")
     if name == "get_workbook_context":
@@ -1480,6 +1495,310 @@ def _execute_tool(
             clarification=IntentClarification.model_validate(arguments.get("clarification")),
         )
     raise ValueError(f"未知工具：{name}")
+
+
+def _project_non_terminal_result(name: str, result: dict[str, Any]) -> dict[str, Any]:
+    """非终结工具结果的**模型出站投影闸**（设计 §5 的落点）。
+
+    只有登记在 ``NON_TERMINAL_TOOL_PROJECTIONS`` 里的工具才允许把结果发给
+    模型，且发出去的必须是投影函数产出的**有类型**载荷——不是把任意 dict
+    ``json.dumps`` 出去。未登记的工具一律拒绝（失败关闭）：将来新增工具
+    （例如隔离 Python 分析）时，必须同时登记一个投影函数，把数值矩阵、
+    stdout、异常、嵌入数据的代码挡在模型消息流之外。
+
+    投影层在可信侧运行，模型生成的代码改不到它。
+    """
+    projector = NON_TERMINAL_TOOL_PROJECTIONS.get(name)
+    if projector is None:
+        raise ValueError(f"工具 {name} 没有登记模型出站投影，结果不予下发")
+    projected = projector(result)
+    if not isinstance(projected, dict):
+        raise ValueError(f"工具 {name} 的出站投影必须是对象")
+    return projected
+
+
+def _non_terminal_tool_content(name: str, result: dict[str, Any]) -> str:
+    """出站闸 + 序列化的唯一入口。测试与反向变异都钉在这里。
+
+    投影失败（任何 ValueError）时对 ``run_python_analysis`` 失败关闭：
+    返回固定安全文案，绝不把 ``str(error)``、原始异常或原样回执发给模型
+    （错误文本可能携带投射前的内容）。其他工具维持原有异常路径，
+    由主循环的结构校验错误分支处理。
+    """
+    try:
+        projected = _project_non_terminal_result(name, result)
+    except ValueError:
+        if name == "run_python_analysis":
+            return PYTHON_PROJECTION_FAILED_CONTENT
+        raise
+    return json.dumps(projected, ensure_ascii=False)
+
+
+# 投影失败时的固定安全内容。字段与有类型回执同形，reasonCategory 单列，
+# 文案写死在这里——不含任何来自结果或异常的文本。
+PYTHON_PROJECTION_FAILED_CONTENT = json.dumps({
+    "status": "unavailable",
+    "reasonCategory": "projection_failed",
+    "message": "工具结果未通过出站校验，本轮内容不予下发。",
+}, ensure_ascii=False)
+
+
+def _capture_raw_python_arguments(message: dict[str, Any]) -> dict[str, str]:
+    """从原始模型响应捕获 ``run_python_analysis`` 的原始参数 JSON 串。
+
+    仅本轮执行使用：按 ``tool_call id`` 索引，存在受控内存里，轮次结束即弃，
+    不落盘、不回模型、不进检查点。恢复轮从检查点拿到的响应已是投影版，
+    这里捕获到的就是占位参数——由协调器判定 code_not_preserved。
+    """
+    captured: dict[str, str] = {}
+    tool_calls = message.get("tool_calls")
+    if not isinstance(tool_calls, list):
+        return captured
+    for call in tool_calls:
+        if not isinstance(call, dict):
+            continue
+        function = call.get("function")
+        if not isinstance(function, dict):
+            continue
+        if function.get("name") != "run_python_analysis":
+            continue
+        call_id = call.get("id")
+        if not isinstance(call_id, str):
+            continue
+        arguments_value = function.get("arguments")
+        captured[call_id] = (
+            arguments_value if isinstance(arguments_value, str) else "{}"
+        )
+    return captured
+
+
+def _withhold_python_code_in_assistant_message(message: dict[str, Any]) -> None:
+    """缺陷 1 修复：``run_python_analysis`` 的原始代码不进入任何现场。
+
+    在 assistant 消息进入消息历史 / 检查点 / 恢复现场**之前**调用：
+    ``code`` 字段确定性替换为固定占位（不做内容扫描、不做全局字符串替换），
+    ``tool_call_id``、工具名与其余参数原样保留，协议配对不变。幂等。
+    """
+    tool_calls = message.get("tool_calls")
+    if not isinstance(tool_calls, list):
+        return
+    safe_calls: list[Any] = []
+    changed = False
+    for call in tool_calls:
+        if not isinstance(call, dict):
+            safe_calls.append(call)
+            continue
+        function = call.get("function")
+        if (
+            isinstance(function, dict)
+            and function.get("name") == "run_python_analysis"
+        ):
+            safe_calls.append({
+                **call,
+                "function": {
+                    **function,
+                    "arguments": withheld_python_arguments(
+                        function.get("arguments")
+                        if isinstance(function.get("arguments"), str) else None
+                    ),
+                },
+            })
+            changed = True
+        else:
+            safe_calls.append(call)
+    if changed:
+        message["tool_calls"] = safe_calls
+
+
+def _build_tool_call_association(
+    messages: list[dict[str, Any]],
+    pending_assistant_message: dict[str, Any] | None,
+) -> dict[str, str]:
+    """建立 assistant 工具调用 ID → 工具名的可信关联。
+
+    同时纳入 ``messages`` 里的 assistant 调用与 ``pendingAssistantMessage``
+    里的调用。这是恢复现场核对 ``role=tool`` 回执归属的唯一依据：
+
+    - 同一 tool_call_id 在 messages 与 pending 里是**一致镜像**（同 id 同 name）
+      时，只登记一次，不误判冲突；
+    - 同一 tool_call_id 被映射到**不同工具名**（真正冲突）→ 抛
+      :class:`ValueError` 拒绝恢复，不静默选一个；
+    - 不靠自然语言、敏感词扫描或正则猜测归属。
+
+    ``pendingAssistantMessage`` 是 assistant 消息本身（不含 tool 回执），
+    因此它的 tool_calls 直接进关联表，与 messages 里已完成的调用一起
+    构成完整的 id→name 映射。
+    """
+    association: dict[str, str] = {}
+    candidates: list[dict[str, Any]] = list(messages)
+    if isinstance(pending_assistant_message, dict):
+        candidates.append(pending_assistant_message)
+    for item in candidates:
+        if not isinstance(item, dict) or item.get("role") != "assistant":
+            continue
+        for call in item.get("tool_calls") or []:
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function")
+            if not isinstance(function, dict):
+                continue
+            name = function.get("name")
+            call_id = call.get("id")
+            if not isinstance(call_id, str) or not isinstance(name, str):
+                continue
+            if call_id in association and association[call_id] != name:
+                # 真正冲突：同一调用 ID 被映射到不同工具名。
+                raise ValueError(PYTHON_ANALYSIS_UNATTRIBUTABLE_RESUME_MESSAGE)
+            association[call_id] = name
+    return association
+
+
+def _reconstruct_python_tool_receipt(tool_message: dict[str, Any]) -> dict[str, Any]:
+    """把能确认属于 ``run_python_analysis`` 的旧工具回执重建为固定回执。
+
+    不读取旧 content（可能是 error/message/stdout/traceback 自由文本），
+    直接用可信固定回执（``code_not_preserved``）整体替换内容；保留
+    ``role`` / ``tool_call_id`` / ``name`` 的协议配对，不破坏消息结构。
+    """
+    reconstructed = dict(tool_message)
+    reconstructed["content"] = PYTHON_ANALYSIS_OLD_RECEIPT_RECONSTRUCTED_CONTENT
+    return reconstructed
+
+
+def _project_python_code_in_checkpoint_messages(
+    messages: list[dict[str, Any]],
+    association: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    """对**恢复输入**的消息现场做 Python 隐私投影与工具回执归属核对。
+
+    旧检查点（修复前版本）里的 ``messages`` 可能仍携带原始 Python code，
+    以及旧 ``run_python_analysis`` 工具回执（自由文本 error/message/stdout/
+    traceback）。恢复入口在把它们交给模型请求、检查点再保存或工具处理
+    **之前**统一收口：
+
+    - assistant 消息里 ``run_python_analysis`` 的参数做最小白名单投影
+      （复用 ``withheld_python_arguments``，code→占位、datasetHandles→空列表）；
+    - 每个 ``role=tool`` 回执必须能关联到 ``association`` 里的一个 assistant
+      调用（孤立 ID 拒绝）；有 ``name`` 时必须与对应调用的工具名一致
+      （不一致拒绝），无 ``name`` 时由调用 ID 推导归属；
+    - 归属为 ``run_python_analysis`` 的回执用可信固定回执整体重建，不读旧
+      内容；其余工具回执原样保留（不破坏非 Python 工具）；
+    - 无法可靠确认归属或存在名称冲突/关联歧义 → 抛 :class:`ValueError`
+      失败关闭，拒绝恢复，不回显原 content。
+
+    - 返回新列表（不原地改动调用方传入的检查点 dict）；
+    - 不含 Python 调用的检查点：association 里没有 ``run_python_analysis``，
+      非 Python 回执只要归属可核对就原样保留，本函数不破坏既有恢复。
+
+    ``association`` 由 :func:`_build_tool_call_association` 在恢复入口一次
+    构建（同时纳入 messages 与 pending），保证 messages 与 pending 的镜像
+    不会各自构建出互相矛盾的关联表。
+    """
+    if association is None:
+        association = {}
+    projected_messages: list[dict[str, Any]] = []
+    for item in messages:
+        if not isinstance(item, dict):
+            projected_messages.append(item)
+            continue
+        copied = dict(item)
+        _withhold_python_code_in_assistant_message(copied)
+        if copied.get("role") == "tool":
+            tool_call_id = copied.get("tool_call_id")
+            name = copied.get("name")
+            if not isinstance(tool_call_id, str) or tool_call_id not in association:
+                # 孤立 ID：无法关联到任何 assistant 调用，内容归属不明，拒绝。
+                raise ValueError(PYTHON_ANALYSIS_UNATTRIBUTABLE_RESUME_MESSAGE)
+            expected_name = association[tool_call_id]
+            if isinstance(name, str) and name != expected_name:
+                # 名称冲突：回执声称的工具名与调用名不一致，拒绝。
+                raise ValueError(PYTHON_ANALYSIS_UNATTRIBUTABLE_RESUME_MESSAGE)
+            if expected_name == "run_python_analysis":
+                copied = _reconstruct_python_tool_receipt(copied)
+        projected_messages.append(copied)
+    return projected_messages
+
+
+def _checkpoint_involves_python(
+    messages: list[dict[str, Any]],
+    pending_assistant_message: dict[str, Any] | None = None,
+) -> bool:
+    """判断恢复现场是否涉及 ``run_python_analysis``。
+
+    同时检查 ``messages``（assistant 工具调用名 + ``role=tool`` 回执的 ``name``）
+    与 ``pendingAssistantMessage``（assistant 工具调用名）。pending 里的 Python
+    调用不能被漏掉——否则 messages 只有 system/user 时会把 loopState 里的
+    Python 错误/警告自由文本漏清理。不匹配自然语言错误文案。
+    """
+    candidates: list[dict[str, Any]] = list(messages)
+    if isinstance(pending_assistant_message, dict):
+        candidates.append(pending_assistant_message)
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        if item.get("role") == "assistant":
+            for call in item.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                function = call.get("function")
+                if (
+                    isinstance(function, dict)
+                    and function.get("name") == "run_python_analysis"
+                ):
+                    return True
+        elif item.get("role") == "tool" and item.get("name") == "run_python_analysis":
+            return True
+    return False
+
+
+def _scrub_python_loop_state(
+    state: LoopState,
+    messages: list[dict[str, Any]],
+    pending_assistant_message: dict[str, Any] | None = None,
+) -> None:
+    """收口 loopState 里可能携带旧 Python 错误上下文的自由文本字段。
+
+    旧版本在 Python 执行异常时把 ``str(error)[:200]`` 写进
+    ``last_error_message``（含自由文本），路径循环警告写进 ``last_warning``。
+    这些字段没有 tool_call_id，无法逐条确认是否来自 Python；因此只要本
+    检查点的恢复现场（messages + pendingAssistantMessage）涉及
+    ``run_python_analysis``，就保守地把这两个自由文本字段清空（fail-closed），
+    不猜测安全后重放，也不影响不含 Python 的恢复。
+    """
+    if _checkpoint_involves_python(messages, pending_assistant_message):
+        state.last_error_message = None
+        state.last_warning = None
+
+
+def _passthrough_structure(result: dict[str, Any]) -> dict[str, Any]:
+    """既有结构类工具的恒等投影：字段与形状保持历史行为逐字不变。
+
+    这些工具（结构摘要 / 计划动作选择）的载荷本来就不含数据行；它们的
+    投影意义在于**显式登记**——让"这个工具允许出站"成为一行看得见的
+    声明，而不是隐含在"任何 dict 都直接 dumps"的旧默认里。
+    """
+    if not isinstance(result, dict):
+        raise ValueError("非终结工具结果必须是对象")
+    return dict(result)
+
+
+def _project_read_range(result: dict[str, Any]) -> dict[str, Any]:
+    """``read_range`` 的出站投影。
+
+    载荷含区域值矩阵——这是 ``planningReadPolicy="ifNeeded"`` 时**唯一**
+    被契约允许的数据行出站通道（`_execute_tool` 在 ``none`` 时已直接拒绝
+    该工具）。投影不做数值变换，但保留显式登记点：策略收紧时只改这里。
+    """
+    return _passthrough_structure(result)
+
+
+NON_TERMINAL_TOOL_PROJECTIONS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
+    "select_plan_actions": _passthrough_structure,
+    "get_workbook_context": _passthrough_structure,
+    "find_fields": _passthrough_structure,
+    "read_range": _project_read_range,
+    "run_python_analysis": project_python_analysis_receipt,
+}
 
 
 READONLY_TOOLS = frozenset(
@@ -1879,11 +2198,36 @@ async def run_excel_agent(
             isinstance(item, dict) for item in raw_messages
         ):
             raise ValueError("规划检查点缺少完整消息现场")
-        messages = [dict(item) for item in raw_messages]
+        raw_pending = resume_checkpoint.get("pendingAssistantMessage")
+        raw_pending_dict = dict(raw_pending) if isinstance(raw_pending, dict) else None
+        # 缺陷 2：旧检查点可能携带原始 Python code、旧 run_python_analysis 工具
+        # 回执与 loopState 里的 Python 错误/警告自由文本。在进入模型请求 /
+        # 检查点再保存 / 工具处理之前统一收口：
+        #   1) 一次构建 assistant 调用 ID→工具名 的可信关联（纳入 messages 与
+        #      pending，真正冲突即拒绝）；
+        #   2) 消息现场按最小白名单投影 + 回执归属核对（孤立 ID / 名称冲突 /
+        #      关联歧义拒绝恢复）；
+        #   3) loopState 自由文本字段在涉及 Python 时清空。
+        # 返回新列表，不改动调用方传入的检查点 dict。
+        association = _build_tool_call_association(
+            [dict(item) for item in raw_messages], raw_pending_dict
+        )
+        messages = _project_python_code_in_checkpoint_messages(
+            [dict(item) for item in raw_messages], association
+        )
+        pending_assistant_message = (
+            _project_python_code_in_checkpoint_messages(
+                [raw_pending_dict], association
+            )[0]
+            if raw_pending_dict is not None
+            else None
+        )
+        _scrub_python_loop_state(state, messages, pending_assistant_message)
         if cache is not None and isinstance(resume_checkpoint.get("toolCache"), dict):
             cache.clear()
             cache.update(dict(resume_checkpoint["toolCache"]))
     else:
+        pending_assistant_message = None
         messages = [
             {"role": "system", "content": AGENT_SYSTEM_PROMPT},
             {
@@ -1912,6 +2256,16 @@ async def run_excel_agent(
     }.get(tool_mode)
     if tools is None:
         raise ValueError("规划检查点包含未知工具集合")
+
+    def model_tools() -> list[dict[str, Any]]:
+        # 隔离 Python 分析：总开关默认关闭；开启后在传给模型的列表上追加。
+        # 无执行器时工具本身仍失败关闭（只返回固定不可用回执）。绝不替换
+        # tools 本身——current_tool_mode、修复降级与只读批次降级都依赖
+        # 规范列表的身份判断；plan_only 模式不追加（该模式只允许提交计划）。
+        if python_execution_enabled() and tools is not PLAN_ONLY_TOOLS:
+            return [*tools, python_analysis_tool_definition()]
+        return tools
+
     repairing_submission = bool(
         resume_checkpoint.get("repairingSubmission")
         if resume_checkpoint is not None
@@ -1926,12 +2280,6 @@ async def run_excel_agent(
         if resume_checkpoint is not None
         else 0,
         0,
-    )
-    pending_assistant_message = (
-        dict(resume_checkpoint["pendingAssistantMessage"])
-        if resume_checkpoint is not None
-        and isinstance(resume_checkpoint.get("pendingAssistantMessage"), dict)
-        else None
     )
     next_tool_index = max(
         int(resume_checkpoint.get("nextToolIndex", 0) or 0)
@@ -2093,7 +2441,7 @@ async def run_excel_agent(
                 )
                 payload, usage = await client.chat_completions(
                     messages=messages,
-                    tools=_planning_tools(request, tools, selected_action_types),
+                    tools=_planning_tools(request, model_tools(), selected_action_types),
                     tool_choice="auto",
                     max_tokens=(
                         REPAIR_MAX_OUTPUT_TOKENS
@@ -2116,6 +2464,11 @@ async def run_excel_agent(
                     message = {"role": "assistant", "content": "", "_incomplete": finish_reason}
             assistant_message = dict(message)
             assistant_message.setdefault("role", "assistant")
+            # 缺陷 1：run_python_analysis 的原始代码先捕获到受控内存（本轮执行
+            # 用，轮次结束即弃），再对进入现场的消息做确定性字段投影——
+            # 消息历史、检查点、恢复现场从此只见占位，不见代码字面量。
+            raw_python_arguments = _capture_raw_python_arguments(message)
+            _withhold_python_code_in_assistant_message(assistant_message)
             await pause_if_needed(
                 "model_response_saved",
                 upcoming_turn=turn_index,
@@ -2268,9 +2621,20 @@ async def run_excel_agent(
                     f"planning.tool.{turn_index + 1}.{tool_index + 1}"
                 )
                 try:
-                    parsed_arguments = json.loads(
-                        function.get("arguments") or "{}"
-                    )
+                    if (
+                        name == "run_python_analysis"
+                        and str(tool_call.get("id") or "") in raw_python_arguments
+                    ):
+                        # 同轮执行用受控内存里的原始参数；恢复轮捕获到的
+                        # 是投影占位，由协调器判定 code_not_preserved。
+                        raw_arguments_json = raw_python_arguments.pop(
+                            str(tool_call.get("id") or "")
+                        )
+                        parsed_arguments = json.loads(raw_arguments_json or "{}")
+                    else:
+                        parsed_arguments = json.loads(
+                            function.get("arguments") or "{}"
+                        )
                     if not isinstance(parsed_arguments, dict):
                         raise ValueError("工具参数必须是 JSON 对象")
                     arguments = parsed_arguments
@@ -2399,7 +2763,8 @@ async def run_excel_agent(
                         used_cache = False
                         if _contains_snapshot_truncation(result):
                             state.encountered_truncation = True
-                        tool_content = json.dumps(result, ensure_ascii=False)
+                        # 出站闸：只有登记过投影的非终结工具才能把载荷发给模型。
+                        tool_content = _non_terminal_tool_content(name, result)
                         if cache_key is not None:
                             cache[cache_key] = tool_content
 
@@ -2470,20 +2835,32 @@ async def run_excel_agent(
                             if isinstance(failed_plan, dict)
                             else None
                         )
-                    state.last_error_message = str(error)[:200]
+                    # 缺陷 3：run_python_analysis 的执行路径异常（参数解析/校验/
+                    # 协调器/分发/投影/序列化）统一映射为固定安全回执，绝不把
+                    # str(error) 写进 last_error_message、tool_content 或事件 trace。
+                    if name == "run_python_analysis":
+                        state.last_error_message = python_error_response_content()
+                        tool_content = python_error_response_content()
+                        correction_summary = (
+                            "隔离 Python 分析执行环节出错，本轮未运行任何代码。"
+                        )
+                        trace_basis = "隔离 Python 分析执行环节出错，本轮未运行任何代码。"
+                    else:
+                        state.last_error_message = str(error)[:200]
+                        tool_content = json.dumps(
+                            {"error": str(error)}, ensure_ascii=False
+                        )
+                        correction_summary = (
+                            "操作计划未通过结构校验，正在修正。"
+                            if name == "submit_plan"
+                            else f"受控工具 {name or '调用'} 未成功，正在调整下一步。"
+                        )
+                        trace_basis = _safe_progress_text(error, 1000)
                     update_loop_state(
                         state,
                         name,
                         None,
                         error_occurred=True,
-                    )
-                    tool_content = json.dumps(
-                        {"error": str(error)}, ensure_ascii=False
-                    )
-                    correction_summary = (
-                        "操作计划未通过结构校验，正在修正。"
-                        if name == "submit_plan"
-                        else f"受控工具 {name or '调用'} 未成功，正在调整下一步。"
                     )
                     await emit(
                         tool_step_id,
@@ -2501,7 +2878,7 @@ async def run_excel_agent(
                         trace={
                             "kind": "correction",
                             "summary": correction_summary,
-                            "basis": _safe_progress_text(error, 1000),
+                            "basis": trace_basis,
                         },
                     )
                 messages.append(

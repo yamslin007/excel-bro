@@ -15,10 +15,10 @@ const session: ExcelNativeComparison = { plan: p, authorization: ["Ledger"], cha
   original: { id: "original", name: "Ledger", address: "A1:C2", startRow: 1, startColumn: 1,
     values: [["x"]], formulas: [["x"]], numberFormat: [["General"]], properties: [[{}]], formulaCells: [], rowHeights: [16], columnWidths: [60] }
 };
-function Harness({ commit, authorization = ["Ledger"], paneNeedsResize = false }: { commit: (s: ExcelNativeComparison) => Promise<boolean>; authorization?: string[]; paneNeedsResize?: boolean }) {
+function Harness({ commit, authorization = ["Ledger"], paneNeedsResize = false, beforeOperation }: { commit: (s: ExcelNativeComparison) => Promise<boolean>; authorization?: string[]; paneNeedsResize?: boolean; beforeOperation?: () => Promise<boolean> }) {
   const controller = useExcelNativeComparison();
   return <>
-    <div data-testid="original-message"><ExcelNativeReviewActions messageId="m1" plan={p} authorization={authorization} controller={controller} disabled={controller.pending} commit={commit} paneNeedsResize={paneNeedsResize} /></div>
+    <div data-testid="original-message"><ExcelNativeReviewActions messageId="m1" plan={p} authorization={authorization} controller={controller} disabled={controller.pending} commit={commit} paneNeedsResize={paneNeedsResize} beforeOperation={beforeOperation} /></div>
     <div data-testid="later-message">后续普通对话</div>
     <div data-testid="second-plan"><ExcelNativeReviewActions messageId="m2" plan={p} authorization={authorization} controller={controller} disabled={controller.pending} commit={commit} /></div>
     <button onClick={() => void controller.save('m1', p, authorization, commit)}>test direct save without review acknowledgement</button>
@@ -27,6 +27,20 @@ function Harness({ commit, authorization = ["Ledger"], paneNeedsResize = false }
 beforeEach(() => {
   vi.clearAllMocks(); mocks.mode.mockReturnValue('native'); mocks.stage.mockResolvedValue(session); mocks.guard.mockResolvedValue(undefined); mocks.close.mockResolvedValue(true);
   vi.stubGlobal("Excel", { run: async (job: (context: unknown) => Promise<void>) => job({}) });
+});
+it("checks the authorized target before creating a copy AND before saving; confirmation never replays a blocked write", async () => {
+  const beforeOperation = vi.fn(async () => false);
+  const commit = vi.fn(async () => true);
+  const ui = render(<Harness commit={commit} beforeOperation={beforeOperation} />);
+  await click(ui.getAllByText("生成副本并排审阅")[0]);
+  expect(mocks.stage).not.toHaveBeenCalled(); expect(commit).not.toHaveBeenCalled();
+  beforeOperation.mockResolvedValue(true);
+  await click(ui.getAllByText("生成副本并排审阅")[0]);
+  expect(mocks.stage).toHaveBeenCalledOnce();
+  beforeOperation.mockResolvedValue(false);
+  await click(ui.getByText("保存变更到原表"));
+  expect(commit).not.toHaveBeenCalled(); expect(mocks.guard).not.toHaveBeenCalled();
+  expect(beforeOperation).toHaveBeenCalledTimes(3);
 });
 describe('manual compatibility review', () => {
   const manualSession: ExcelNativeComparison = { ...session, mode:'manual', actionEvidence:'', copyEvidence:'' };

@@ -202,6 +202,11 @@ app.add_middleware(
     allow_headers=["Content-Type"],
 )
 
+# Deliberately separate from /plan: volatile authorized rows may only reach a
+# local service and are never included in the model/history/checkpoint DTOs.
+from .python_data_api import create_python_data_router
+app.include_router(create_python_data_router(ALLOWED_ORIGINS))
+
 
 def _review_layout_origin(request: Request) -> str:
     # This desktop action is narrower than the general planning API: localhost

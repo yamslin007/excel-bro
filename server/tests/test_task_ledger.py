@@ -31,6 +31,151 @@ def test_register_is_atomic_and_reuses_existing_identity(tmp_path) -> None:
     assert record.status == "running"
 
 
+def test_first_initialization_under_concurrency_never_reports_readonly(
+    tmp_path,
+) -> None:
+    """首次并发落库必须在 Windows/WAL 下保持可写，不得抛出只读库错误。
+
+    真实缺陷：旧实现在建表连接尚未关闭时就让其它连接打开同一文件，
+    SQLite 在 Windows 上会把并发打开的连接持成只读句柄，
+    报 "attempt to write a readonly database"。这里用多轮并发首建复现。
+    """
+
+    failures: list[str] = []
+    for round_index in range(12):
+        database = tmp_path / f"round-{round_index}" / "tasks" / "state.sqlite3"
+        ledger = FolderOperationLedger(lambda: database)
+
+        def register(index: int = round_index) -> bool:
+            _record, created = ledger.register(
+                f"operation-{index}", f"fingerprint-{index}"
+            )
+            return created
+
+        try:
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                results = list(pool.map(lambda _index: register(), range(16)))
+        except sqlite3.OperationalError as error:  # pragma: no cover - 缺陷路径
+            failures.append(f"round {round_index}: {error}")
+            continue
+        assert results.count(True) == 1
+
+    assert failures == []
+
+
+def test_read_is_not_serialized_behind_concurrent_write_lock(tmp_path) -> None:
+    """第十批 F4：纯读取不得被另一连接的写事务串行化。
+
+    主连接持有未提交写事务时，另一实例的 ``get()``（只读）必须**立即**返回，
+    不能等写锁释放、也不能抛 "database is locked"。旧实现在每次 _connect 都用
+    BEGIN IMMEDIATE 探测可写，导致纯读也去抢写锁。
+    """
+    import time
+
+    database = tmp_path / "tasks" / "state.sqlite3"
+    writer = FolderOperationLedger(lambda: database)
+    writer.register("op-1", "fp-1")
+
+    connection = None
+    writer._ensure_schema(writer._path())
+    connection = writer._open_writable_connection(writer._path())
+    connection.execute("BEGIN IMMEDIATE")
+    connection.execute(
+        "INSERT INTO folder_operations(operation_id, request_fingerprint, status, "
+        "created_at, updated_at, executor_id) VALUES ('op-held','fp-held','running',?,?,?)",
+        (time.time(), time.time(), "holder"),
+    )
+    try:
+        reader = FolderOperationLedger(lambda: database)
+        started = time.monotonic()
+        record = reader.get("op-1")
+        elapsed = time.monotonic() - started
+        assert record is not None and record.status == "running"
+        assert elapsed < 0.5, f"只读被写锁串行化：{elapsed:.3f}s"
+    finally:
+        connection.rollback()
+        connection.close()
+
+
+def test_new_instance_on_existing_db_does_not_collide_with_open_writer(tmp_path) -> None:
+    """第十批 F4：已有库上新建实例不得因重跑 bootstrap 与写锁冲突。
+
+    旧实现每个实例都会重跑 ``_initialize_schema``（WAL 切换 / 迁移），
+    在另一连接持写事务时直接抛 "database is locked"。
+    """
+    import time
+
+    database = tmp_path / "tasks" / "state.sqlite3"
+    first = FolderOperationLedger(lambda: database)
+    first.register("op-1", "fp-1")
+
+    connection = first._open_writable_connection(first._path())
+    connection.execute("BEGIN IMMEDIATE")
+    connection.execute(
+        "INSERT INTO folder_operations(operation_id, request_fingerprint, status, "
+        "created_at, updated_at, executor_id) VALUES ('op-held2','fp-held2','running',?,?,?)",
+        (time.time(), time.time(), "holder"),
+    )
+    try:
+        second = FolderOperationLedger(lambda: database)  # 新实例
+        record = second.get("op-1")  # 应能读，不抛 database is locked
+        assert record is not None
+    finally:
+        connection.rollback()
+        connection.close()
+
+
+def test_read_after_write_commit_reflects_new_state(tmp_path) -> None:
+    """第十批 F4：写入提交后，只读连接能看到新状态（读写并发正确性）。"""
+    database = tmp_path / "tasks" / "state.sqlite3"
+    ledger = FolderOperationLedger(lambda: database)
+    ledger.register("op-1", "fp-1")
+    assert ledger.get("op-1").status == "running"
+    ledger.finish("op-1", status="completed", result={"ok": True})
+    record = ledger.get("op-1")
+    assert record is not None and record.status == "completed"
+
+
+def test_readonly_connection_release_after_exception(tmp_path) -> None:
+    """第十批 F4：只读连接在异常后必须被释放，不泄漏句柄。"""
+    database = tmp_path / "tasks" / "state.sqlite3"
+    ledger = FolderOperationLedger(lambda: database)
+    ledger.register("op-1", "fp-1")
+
+    # 读取不存在的记录不抛异常，返回 None
+    assert ledger.get("does-not-exist") is None
+    # 连续多次读取仍成功（句柄正确释放）
+    for _ in range(5):
+        assert ledger.get("op-1") is not None
+
+
+def test_writable_connection_retries_on_readonly_error_code(tmp_path, monkeypatch) -> None:
+    """第十批 F4：可写连接重试须基于**准确错误类别**（sqlite_errorcode），非字符串。"""
+    import server.app.task_ledger as module
+
+    calls = {"n": 0}
+    real_connect = sqlite3.connect
+
+    class FakeReadonlyOnce:
+        pass
+
+    # 直接验证 _is_readonly_error 按 errorcode 判定
+    err = sqlite3.OperationalError("attempt to write a readonly database")
+    # 真实异常带 sqlite_errorcode；构造一个带 errorcode 的替身
+    class Coded(sqlite3.OperationalError):
+        sqlite_errorcode = 8
+        sqlite_errorname = "SQLITE_READONLY"
+
+    assert module._is_readonly_error(Coded("x")) is True
+    # 非只读错误码不得被判为只读
+    class Other(sqlite3.OperationalError):
+        sqlite_errorcode = 5  # SQLITE_BUSY
+        sqlite_errorname = "SQLITE_BUSY"
+
+    assert module._is_readonly_error(Other("database is locked")) is False
+
+
+
 def test_ledger_replays_events_and_result_after_new_instance(tmp_path) -> None:
     database = tmp_path / "tasks" / "state.sqlite3"
     first = FolderOperationLedger(lambda: database, executor_id="first-process")

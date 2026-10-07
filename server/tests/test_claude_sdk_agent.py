@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,7 +20,7 @@ from server.app.llm.config import (
     selected_model_config,
 )
 from server.app.llm import config as llm_config
-from server.app.models import IntentCheckRequest, PlanRequest
+from server.app.models import ImageAttachment, IntentCheckRequest, PlanRequest
 from server.app.planner import create_plan
 
 
@@ -69,6 +70,8 @@ class _FakeSdk:
         return {tool.name: tool for tool in tools}
 
     async def query(self, *, prompt: str, options: SimpleNamespace):
+        if not isinstance(prompt, str):
+            prompt = [message async for message in prompt]
         self.calls.append((prompt, options))
         if self.invoke is not None:
             name, args = self.invoke
@@ -176,9 +179,77 @@ def test_sdk_intent_rejects_images_before_query(
     fake = _FakeSdk()
     _install_fake(monkeypatch, tmp_path, fake)
     request = _intent_request().model_copy(update={"imageCount": 1})
-    with pytest.raises(ModelNotAvailableError, match="未接入图片"):
+    with pytest.raises(ModelNotAvailableError, match="不支持图片"):
         asyncio.run(check_intent(request, config=_connection()))
     assert fake.calls == []
+
+
+@pytest.mark.parametrize("kind", ["proceed", "conversation"])
+def test_sdk_vision_intent_only_sends_image_count(monkeypatch, tmp_path, kind):
+    fake = _FakeSdk(response=json.dumps({
+        "kind": kind, "message": "未看图的直接回复", "summary": "结合图片分析",
+        "confirmedPrompt": "结合图片分析当前工作簿",
+    }, ensure_ascii=False))
+    _install_fake(monkeypatch, tmp_path, fake)
+    connection = replace(_connection(), supports_vision=True)
+    request = _intent_request().model_copy(update={"imageCount": 1})
+    result = asyncio.run(check_intent(request, config=connection))
+    assert result.kind == "proceed"
+    text, options = fake.calls[0]
+    assert json.loads(text)["imageCount"] == 1
+    assert "PRIVATE_CONVERSATION_ROW" not in text
+    assert options.extra_args == {"no-session-persistence": None}
+
+
+def test_sdk_images_are_real_content_blocks_not_text_or_files(monkeypatch, tmp_path):
+    fake = _FakeSdk(invoke=("submit_answer", {"message": "已分析附件"}))
+    _install_fake(monkeypatch, tmp_path, fake)
+    image = ImageAttachment(name="explicit.png", mediaType="image/png", data="aGVsbG8=")
+    request = _plan_request().model_copy(update={"images": [image]})
+    assert request.images[0].data == "aGVsbG8="
+    assert request.workbook.worksheets[0].dataRows[0][0] == "PRIVATE_DATA_ROW"
+    result = asyncio.run(claude_sdk_agent.run_sdk_plan(request, replace(_connection(), supports_vision=True)))
+    assert result.kind == "answer"
+    messages, options = fake.calls[0]
+    blocks = messages[0]["message"]["content"]
+    assert blocks[1] == {"type": "image", "source": {
+        "type": "base64", "media_type": "image/png", "data": image.data}}
+    assert "PRIVATE_DATA_ROW" not in blocks[0]["text"]
+    assert "PRIVATE_FULL_PATH" not in json.dumps(messages)
+    assert options.tools == []
+    assert options.extra_args == {"no-session-persistence": None}
+
+
+def test_sdk_nonvision_plan_rejects_images_without_query(monkeypatch, tmp_path):
+    fake = _FakeSdk()
+    _install_fake(monkeypatch, tmp_path, fake)
+    request = _plan_request().model_copy(update={"images": [
+        ImageAttachment(name="x.png", mediaType="image/png", data="aGVsbG8=")]})
+    with pytest.raises(ModelNotAvailableError, match="不支持图片"):
+        asyncio.run(claude_sdk_agent.run_sdk_plan(request, _connection()))
+    assert not fake.calls
+
+
+def test_sdk_standalone_vision_flag_is_explicit(monkeypatch, tmp_path):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv("CLAUDE_AGENT_SDK_MODEL", "test-claude")
+    monkeypatch.setattr(llm_config, "_claude_sdk_state_ready", lambda: True)
+    monkeypatch.delenv("CLAUDE_AGENT_SDK_SUPPORTS_VISION", raising=False)
+    assert llm_config._claude_sdk_connection().supports_vision is False
+    monkeypatch.setenv("CLAUDE_AGENT_SDK_SUPPORTS_VISION", "true")
+    assert llm_config._claude_sdk_connection().supports_vision is True
+
+
+@pytest.mark.parametrize("vision", [False, True])
+def test_derived_sdk_connection_inherits_explicit_vision_capability(monkeypatch, vision):
+    monkeypatch.setattr(llm_config, "_claude_sdk_state_ready", lambda: True)
+    selected = SimpleNamespace(
+        id="vision-id", api_key="private-key", base_url="https://api.deepseek.com",
+        model="configured-model", supports_vision=vision,
+    )
+    connection = llm_config._managed_sdk_connection("claude-agent-sdk:vision-id", (selected,))
+    assert connection is not None
+    assert connection.supports_vision is vision
 
 
 def test_sdk_planner_uses_validated_terminal_tool_without_exporting_rows(
@@ -309,6 +380,36 @@ def test_sdk_rejects_data_bearing_plan_without_fallback(
 def test_sdk_connection_cannot_be_used_as_openai_compatible() -> None:
     with pytest.raises(ModelNotAvailableError, match="尚未接入"):
         OpenAICompatibleClient(_connection(), timeout=1)
+
+
+def test_sdk_refuses_another_backends_checkpoint_instead_of_replanning(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """普通模型后端存下的检查点，SDK 后端必须**显式拒绝**，不能静默重新规划。
+
+    两条后端消费同一份结构化结果，但**检查点格式不通**：普通后端会在
+    `excel_agent` 的循环里维持 loopState/messages/toolCache，SDK 后端把
+    对话状态交给 CLI 托管，读不到那份现场。
+
+    静默重新规划在这里是最坏的一种"看起来成功"：用户点的是"从上次进度继续"，
+    拿到的却是一次从头开始的新规划 —— 可能重复调用模型与工具，界面还显示
+    "继续成功"。所以这条路径必须以 `ModelNotAvailableError` 挡住。
+    """
+    fake = _FakeSdk()
+    _install_fake(monkeypatch, tmp_path, fake)
+    monkeypatch.setattr("server.app.planner.selected_model_config", lambda _id: _connection())
+    checkpoint = {
+        "schemaVersion": 2,
+        "kind": "planning",
+        "messages": [{"role": "user", "content": "请按类别填写等级"}],
+        "loopState": {},
+        "toolCache": {},
+    }
+    with pytest.raises(ModelNotAvailableError, match="不能恢复另一规划后端的检查点"):
+        asyncio.run(create_plan(_plan_request(), resume_checkpoint=checkpoint))
+    # 关键：拒绝发生在**启动 CLI 之前** —— 一次模型调用都不许发出去。
+    assert fake.calls == []
+
 
 
 def test_sdk_reuses_saved_deepseek_connection_without_reentering_key(

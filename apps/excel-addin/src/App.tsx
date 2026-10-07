@@ -4,8 +4,6 @@ import {
   useMemo,
   useRef,
   useState,
-  type ClipboardEvent,
-  type DragEvent
 } from "react";
 import {
   checkIntent,
@@ -33,6 +31,11 @@ import {
 } from "./api";
 import { ClarificationFields } from "./components/ClarificationFields";
 import { ModelPickerIcon } from "./components/ModelPickerIcon";
+import { AuthorizedTargetConfirmation } from "./components/AuthorizedTargetConfirmation";
+import { useAuthorizedTarget } from "./hooks/useAuthorizedTarget";
+import { inspectOfficeAuthorizedTarget, officeAnalysisTargetEvidence } from "./officeAuthorizedTarget";
+import { checkAuthorizedTarget, TargetConfirmationRequiredError } from "@excel-bro/core/authorizedTarget";
+import { retireTargetMessage } from "./authorizedTargetArtifacts";
 import type {
   AnalysisPlan,
   AssistantResponse,
@@ -115,9 +118,9 @@ import { highlightToolDsl, renderToolDsl } from "./toolDsl";
 import type { PlanEditorTarget } from "./hooks/usePlanEditor";
 import {
   MAX_IMAGE_ATTACHMENTS,
-  prepareImageFile,
   type PendingImage
 } from "./imageAttachments";
+import { useImageAttachments } from "./hooks/useImageAttachments";
 import { extractWorkbookDataPeriod, workbookFolderFromDocumentUrl } from "./workbookIdentity";
 import {
   currentOfficeHostVersion,
@@ -687,15 +690,17 @@ export default function App() {
     id: number;
     previousSaved: boolean;
   } | null>(null);
-  const [pendingImages, setPendingImages] = useState<PendingImage[]>([]);
-  const [imageError, setImageError] = useState("");
+  const {
+    pendingImages, setPendingImages, imageError, setImageError,
+    draggingImage, setDraggingImage, preparingImages, addImageFiles,
+    handleImagePaste, handleDrop: handleImageDrop
+  } = useImageAttachments();
   const [clarificationDrafts, setClarificationDrafts] = useState<
     Record<string, string>
   >({});
   const [clarificationFieldDrafts, setClarificationFieldDrafts] = useState<
     Record<string, Record<string, string>>
   >({});
-  const [draggingImage, setDraggingImage] = useState(false);
 
   // 对话管理（使用自定义 Hook）
   const conversationHook = useConversation();
@@ -936,6 +941,7 @@ export default function App() {
     toolDescription,
     setToolDescription,
     selectedSheetNames,
+    committedSheetNames,
     setSelectedSheetNames,
     selectionConfirmed,
     setSelectionConfirmed,
@@ -960,6 +966,25 @@ export default function App() {
     selectAllSheets,
     clearSelectedSheets
   } = useScopeSelection();
+  const retrySendRef = useRef<(text: string) => void>(() => {});
+  const targetGuard = useAuthorizedTarget({
+    enabled: sourceMode === "workbook" && isRunningInExcel() && workbook !== null,
+    reviewActive: Boolean(nativeComparison.review),
+    monitorPaused: status !== "idle",
+    inspect: () => inspectOfficeAuthorizedTarget(workbookScopeMode === "auto" ? null : committedSheetNames),
+    analysisEvidence: officeAnalysisTargetEvidence,
+    adopt: (target) => {
+      const names = target.sheets.filter((sheet) => target.selected.includes(sheet.id)).map((sheet) => sheet.name);
+      if (workbook) adoptCurrentWorkbookScope(workbook, names);
+      if (targetGuard.binding && checkAuthorizedTarget(targetGuard.binding, target) === "same") return;
+      localMappingDraftsRef.current.clear();
+      clearUndoSnapshot();
+      planEditorDialogRef.current?.close();
+      planEditorDialogRef.current = null;
+      setChatHistory((current) => ({ ...current, conversations: current.conversations.map((conversation) =>
+        ({ ...conversation, messages: conversation.messages.map(retireTargetMessage) })) }));
+    }
+  });
 
   // 备份管理目标：文件夹模式用 session，工作簿模式从文件路径推导
   const folderBackupTarget = useMemo((): FolderBackupTarget => {
@@ -999,6 +1024,7 @@ export default function App() {
     scopeFingerprint: string;
     authorizedSheets: string[];
     workbookIdentity: string | undefined;
+    pendingRule?: ColumnMappingRule;
     revision: number;
   }>());
   const activityScrollSignal = [
@@ -1170,6 +1196,7 @@ export default function App() {
     undoExecutionTo
   } = useUndoSnapshot({
     isBusy: busy,
+    beforeOperation: targetGuard.check,
     onStatusChange: setStatus,
     onMessage: (text) => {
       appendMessage({
@@ -1965,6 +1992,7 @@ export default function App() {
   }
 
   async function resumeInterruptedOfficeExecution(message: ChatMessage): Promise<void> {
+    if (!(await targetGuard.check())) return;
     const resume = message.officeResume;
     const pending = loadPendingOfficeExecution();
     if (!resume || !pending || pending.operationId !== resume.operationId) {
@@ -2224,6 +2252,7 @@ export default function App() {
     response: PlanningStreamResult,
     baseline: NonNullable<ChatMessage["planningResume"]>
   ): Promise<"paused" | "completed" | "awaiting_input" | "failed"> {
+    if (!(await targetGuard.check())) return "awaiting_input";
     if (response.kind === "planning_pause") {
       updateFolderResumeMessage(message.id, (current) => ({
         ...current,
@@ -2360,6 +2389,7 @@ export default function App() {
   ): Promise<void> {
     const resume = message.planningResume;
     if (!resume || busy) return;
+    if (!(await targetGuard.check())) return;
     const requestId = resume.requestId ?? messageId();
     const turnController = new AbortController();
     turnAbortRef.current = turnController;
@@ -2778,60 +2808,6 @@ export default function App() {
     }).format(date);
   }
 
-  async function addImageFiles(files: File[]) {
-    if (!supportsVision) {
-      setImageError("当前模型不支持图片，请先切换到支持视觉输入的模型。");
-      return;
-    }
-    const remaining = MAX_IMAGE_ATTACHMENTS - pendingImages.length;
-    if (remaining <= 0) {
-      setImageError(`一次最多添加 ${MAX_IMAGE_ATTACHMENTS} 张图片。`);
-      return;
-    }
-    const accepted = files.slice(0, remaining);
-    try {
-      const prepared: PendingImage[] = [];
-      for (const file of accepted) {
-        prepared.push(await prepareImageFile(file));
-      }
-      setPendingImages((current) => [
-        ...current,
-        ...prepared.slice(0, MAX_IMAGE_ATTACHMENTS - current.length)
-      ]);
-      setImageError(
-        files.length > remaining
-          ? `一次最多添加 ${MAX_IMAGE_ATTACHMENTS} 张图片。`
-          : ""
-      );
-    } catch (reason) {
-      setImageError(
-        reason instanceof Error ? reason.message : "添加图片失败"
-      );
-    }
-  }
-
-  function handleImagePaste(event: ClipboardEvent<HTMLTextAreaElement>) {
-    const files = [...event.clipboardData.items]
-      .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
-      .map((item) => item.getAsFile())
-      .filter((file): file is File => file !== null);
-    if (files.length === 0) return;
-    event.preventDefault();
-    void addImageFiles(files);
-  }
-
-  function handleImageDrop(event: DragEvent<HTMLDivElement>) {
-    event.preventDefault();
-    setDraggingImage(false);
-    const files = [...event.dataTransfer.files].filter((file) =>
-      file.type.startsWith("image/")
-    );
-    if (files.length === 0) {
-      setImageError("请拖入 PNG、JPEG 或 WebP 图片。");
-      return;
-    }
-    void addImageFiles(files);
-  }
 
   async function browseFolder(): Promise<FolderCatalog | null> {
     setStatus("scanning");
@@ -3432,6 +3408,7 @@ export default function App() {
     clarificationRound = 0
   ): Promise<TurnPlanningOutcome> {
     if (!workbook) return "skipped";
+    if (!(await targetGuard.checkForAnalysis())) return "skipped";
     let activityOutcome: TurnPlanningOutcome = "planned";
     planningReadPolicy = planningReadPolicyForModel(effectiveModelId, planningReadPolicy);
     setStatus("planning");
@@ -3561,6 +3538,11 @@ export default function App() {
         }
       );
       markServerOnline();
+      if (!(await targetGuard.check())) {
+        setPrompt(confirmedPrompt);
+        finishActivity("completed", "等待确认操作目标", "awaiting_input");
+        return "skipped";
+      }
       if (response.kind === "planning_pause") {
         const planningActivity = getActivitySnapshot();
         appendMessage({
@@ -3665,6 +3647,7 @@ export default function App() {
           });
         }
       } else if (response.kind === "local_plan_rule") {
+        if (!(await targetGuard.check())) return "skipped";
         // 服务端已经判定"这条规则还缺参数/缺类别，算不出正确答案"。
         // 这时**不要**读源值、更不要算：算出来的矩阵必然是猜的，
         // 而猜错在单元格层面看不出来。把归因接进澄清卡，让用户补完再跑。
@@ -3807,6 +3790,7 @@ export default function App() {
     correctionAttempt = 0
   ): Promise<TurnPlanningOutcome> {
     if (!workbook) return "skipped";
+    if (!(await targetGuard.checkForAnalysis())) return "skipped";
     if (sourceMode === "folder") {
       if (!folderCatalog) return "skipped";      setStatus("tooling");
       advanceActivity(
@@ -4144,19 +4128,50 @@ export default function App() {
     );
   }
 
+  async function checkExcelLocalMappingScope(message: ChatMessage) {
+    const draft = localMappingDraftsRef.current.get(message.id);
+    if (!draft || !workbook || !(await targetGuard.check())) throw new TargetConfirmationRequiredError();
+    const fresh = isRunningInExcel() ? await captureWorkbookStructure(draft.authorizedSheets) : workbook;
+    const names = selectedNamesFor(fresh);
+    const scope = intentScopeFingerprint(buildIntentScope(fresh, names));
+    const identity = currentOfficeWorkbookIdentity();
+    if (!identity || scope !== draft.scopeFingerprint ||
+        JSON.stringify(names) !== JSON.stringify(draft.authorizedSheets) ||
+        (draft.workbookIdentity && identity !== draft.workbookIdentity)) {
+      await targetGuard.requestConfirmation();
+      throw new TargetConfirmationRequiredError();
+    }
+    if (!draft.workbookIdentity) {
+      await targetGuard.requestConfirmation();
+      throw new TargetConfirmationRequiredError();
+    }
+  }
+
   async function resolveExcelLocalMapping(
     message: ChatMessage,
-    rule: ColumnMappingRule
+    rule: ColumnMappingRule,
+    reauthorized = false
   ): Promise<void> {
     const draft = localMappingDraftsRef.current.get(message.id);
     if (!draft || busy || !workbook || message.clarification?.status !== "pending") return;
-    const currentSheets = selectedNamesFor(workbook);
-    const currentScope = intentScopeFingerprint(buildIntentScope(workbook, currentSheets));
+    if (!(await targetGuard.check())) return;
+    if (!reauthorized) await checkExcelLocalMappingScope(message);
+    let freshWorkbook = workbook;
+    if (isRunningInExcel()) {
+      try {
+        freshWorkbook = await captureWorkbookStructure(draft.authorizedSheets);
+      } catch {
+        appendMessage({ role: "system", text: "无法读取当前授权范围。已保留补充规则，原表未写入；请检查工作簿后重试。" });
+        return;
+      }
+    }
+    const currentSheets = selectedNamesFor(freshWorkbook);
+    const currentScope = intentScopeFingerprint(buildIntentScope(freshWorkbook, currentSheets));
     const currentIdentity = currentOfficeWorkbookIdentity();
     if (
       currentScope !== draft.scopeFingerprint ||
       JSON.stringify(currentSheets) !== JSON.stringify(draft.authorizedSheets) ||
-      !draft.workbookIdentity || currentIdentity !== draft.workbookIdentity
+      (draft.workbookIdentity && currentIdentity && currentIdentity !== draft.workbookIdentity)
     ) {
       setMessages((current) => current.map((item) =>
         item.id === message.id && item.clarification
@@ -4171,6 +4186,15 @@ export default function App() {
       });
       return;
     }
+    if (!currentIdentity || (!draft.workbookIdentity && !reauthorized)) {
+      draft.pendingRule = rule;
+      // 只缺身份正面证据：留住已提交规则，不销毁草稿，也不假称范围发生变化。
+      setMessages((current) => current.map((item) => item.id === message.id ? { ...item } : item));
+      appendMessage({ role: "system", text: "补充规则已保留。请确认当前范围后重新读取并生成预览；若仍无法读取工作簿身份，请先保存文件并刷新范围。" });
+      return;
+    }
+    draft.workbookIdentity = currentIdentity;
+    draft.pendingRule = undefined;
     setStatus("planning");
     beginActivity("重新读取授权源列", "按你确认的本地规则重新计算；不向模型发送源值。");
     const response: Extract<AssistantResponse, { kind: "local_plan_rule" }> = {
@@ -4183,6 +4207,9 @@ export default function App() {
       try {
         plan = await localMappingPlanFromRule(response, draft.authorizedSheets);
       } catch (error) {
+        // A gap is also a result of the async read: do not attach another target's values
+        // to this clarification when the workbook changed during that read.
+        await checkExcelLocalMappingScope(message);
         if (recordExcelLocalMappingGap({
           error,
           response,
@@ -4198,6 +4225,7 @@ export default function App() {
       }
       plan.sourceFingerprintSheets = [...draft.authorizedSheets];
       plan.sourceFingerprint = await captureWorkbookSourceFingerprint(draft.authorizedSheets);
+      await checkExcelLocalMappingScope(message);
       localMappingDraftsRef.current.delete(message.id);
       setMessages((current) => current.map((item) =>
         item.id === message.id && item.clarification
@@ -4208,7 +4236,11 @@ export default function App() {
       ));
       appendMessage({ role: "assistant", text: plan.summary, plan, provider: "local" });
       finishActivity("completed", undefined, "awaiting_input");
-    } catch {
+    } catch (failure) {
+      if (failure instanceof TargetConfirmationRequiredError) {
+        finishActivity("completed", undefined, "awaiting_input");
+        throw failure;
+      }
       // Office.js 异常可能含单元格原文；不把异常原文持久化进消息历史。
       appendMessage({ role: "system", text: "重新读取或生成预览失败，原表未写入。请检查授权范围后重试。" });
       finishActivity("failed", "本地映射预览未生成", "failed");
@@ -4225,7 +4257,8 @@ export default function App() {
     resolutionMode: IntentOption["resolutionMode"] = "append"
   ) {
     const clarification = message.clarification;
-    if (!clarification || clarification.status !== "pending" || busy) return;
+    if (!clarification || clarification.status !== "pending" || busy || preparingImages) return;
+    if (!(await targetGuard.check())) return;
     if (clarification.localMapping) return; // 只走本地结构化补全，绝不把源值送进模型澄清。
     if (!resolution.trim()) return;
     const rememberedImages =
@@ -4236,6 +4269,11 @@ export default function App() {
     );
     if (clarification.hadImages && sentImages.length === 0) {
       setImageError("原需求包含图片，请重新添加图片后再确认。");
+      return;
+    }
+    if (sentImages.length && !supportsVision) {
+      setImageError("当前模型不支持图片，请切换到支持视觉输入的模型后继续。附件已保留。");
+      setModelMenuOpen(true);
       return;
     }
     setMessages((current) =>
@@ -4552,6 +4590,7 @@ export default function App() {
   // /function 阶段一：不立即生成，先弹「确定写入单元格」卡（预填智能建议）。
   // 光标点哪都无所谓——目标由用户在卡里确认后，才作 activeCell 生成+试算。
   async function handleFunctionCommand(description: string) {
+    if (!(await targetGuard.check())) return;
     setPrompt("");
     appendMessage({ role: "user", text: `/function ${description}` });
 
@@ -4685,6 +4724,7 @@ export default function App() {
   ) {
     const preview = message.functionPreview;
     if (!preview || preview.phase !== "target" || busy) return;
+    if (!(await targetGuard.check())) return;
 
     const resolved = resolveWriteTarget(preview);
     if (!resolved.address) {
@@ -4854,7 +4894,13 @@ export default function App() {
       (pendingImages.length > 0
         ? "请结合附件图片分析当前工作簿，并说明发现的问题。"
         : "");
-    if (!workbook || !text || text.length < 2 || busy) return;
+    if (!workbook || !text || text.length < 2 || busy || preparingImages) return;
+    if (pendingImages.length && !supportsVision) {
+      setImageError("当前模型不支持图片，请切换到支持视觉输入的模型后发送。附件已保留。");
+      setModelMenuOpen(true);
+      return;
+    }
+    if (!(await targetGuard.checkForAnalysis(() => retrySendRef.current(text)))) return;
     // 续聊前的旧记录闸。这条历史在读取时就被脱敏过（真凭据不会进入界面、内存
     // 或请求），同时被登记进 `legacyCredentialConversationIds`。判据是那个
     // **持久标记**，不是"文本里还能不能匹配到凭据" —— 后者在脱敏那一刻就永远
@@ -4872,7 +4918,7 @@ export default function App() {
     }
     // /function 短链：绕开 planner（checkIntent/streamAssistantResponse），
     // 命中式单发生成原生公式 + 首格真实试算 + 预览卡。
-    if (enteredText.startsWith("/function ")) {
+    if (enteredText.startsWith("/function ") && pendingImages.length === 0) {
       const description = enteredText.slice("/function ".length).trim();
       if (description) {
         await handleFunctionCommand(description);
@@ -5114,6 +5160,13 @@ export default function App() {
       }, turnController.signal);
       markServerOnline();
       const decision = describeIntentDecision(intent);
+      if (!(await targetGuard.check())) {
+        setPrompt(text);
+        setPendingImages(sentImages);
+        setStatus("idle");
+        finishActivity("completed", "等待确认操作目标", "awaiting_input");
+        return;
+      }
       if (intent.kind === "clarification") {
         completeCurrentStep(decision.label, {
           note: decision.note,
@@ -5154,6 +5207,7 @@ export default function App() {
         return;
       }
       setPendingImages(sentImages);
+      if (sentImages.length) setPrompt(text);
       if (isLocalServiceConnectionError(reason)) {
         markServerOffline();
         markActivityInterrupted("连接中断，执行结果待确认。");
@@ -5185,6 +5239,7 @@ export default function App() {
     acknowledgeStaleSource?: boolean,
     nativeReview?: ExcelNativeComparison
   ): Promise<boolean> {
+    if (sourceMode === "workbook" && !(await targetGuard.check())) return false;
     if (nativeReview && sourceMode !== "workbook") {
       appendMessage({ role: "system", text: "数据来源模式已变化，不能把原生审阅用于其他数据来源。" });
       return false;
@@ -5664,6 +5719,7 @@ export default function App() {
   async function pickFunctionTarget(message: ChatMessage) {
     const preview = message.functionPreview;
     if (!preview || preview.pickingTarget || busy) return;
+    if (!(await targetGuard.check())) return;
     markFunctionPreview(message.id, {
       pickingTarget: true,
       targetError: undefined
@@ -5701,6 +5757,7 @@ export default function App() {
   // 相对引用逐格平移——R1C1 在写入前从目标首格现取（此时锚点已正确）。
   // 复用 runPlan 的撤销与独立验收。
   async function applyFunctionPreview(message: ChatMessage) {
+    if (!(await targetGuard.check())) return;
     const preview = message.functionPreview;
     if (
       !preview ||
@@ -6143,6 +6200,7 @@ export default function App() {
               }
 
               if (message.type === "plan-editor-save" && message.payload) {
+                if (planEditorDialogRef.current !== dialog) return;
                 const {
                   plan: updatedPlan,
                   target: saveTarget,
@@ -6290,6 +6348,7 @@ export default function App() {
   }
 
   async function previewTool(tool: SavedTool) {
+    if (!(await targetGuard.check())) return;
     try {
       const plan = instantiateTool(tool, toolParameterValues, workbook);
       if (
@@ -6369,6 +6428,7 @@ export default function App() {
   }
 
   async function runQueryTool(tool: SavedQueryTool) {
+    if (!(await targetGuard.check())) return;
     if (!workbook) return;
     setToolActionBusy("query");
     setStatus("tooling");
@@ -6516,8 +6576,13 @@ export default function App() {
     }
   }
 
+  retrySendRef.current = (text) => { void sendMessage({ overrideText: text }); };
+
   return (
     <main className="chat-shell">
+      {targetGuard.notice && <AuthorizedTargetConfirmation notice={targetGuard.notice}
+        error={targetGuard.error} busy={targetGuard.confirming}
+        onConfirm={(choice, selected) => void targetGuard.confirm(choice, selected)} onCancel={targetGuard.cancel} />}
       <header
         className={`chat-header${modelMenuOpen || moreMenuOpen ? " menu-open" : ""}`}
       >
@@ -8422,6 +8487,11 @@ export default function App() {
                           reason={localMappingDraftsRef.current.get(message.id)!.reason}
                           blankCount={localMappingDraftsRef.current.get(message.id)!.blankCount}
                           busy={busy}
+                          checkScope={() => checkExcelLocalMappingScope(message)}
+                          onReauthorize={localMappingDraftsRef.current.get(message.id)!.pendingRule
+                            ? () => resolveExcelLocalMapping(message,
+                                localMappingDraftsRef.current.get(message.id)!.pendingRule!, true)
+                            : undefined}
                           onResolve={(rule) => resolveExcelLocalMapping(message, rule)}
                           onCancel={() => cancelClarification(message)}
                         />
@@ -9096,6 +9166,7 @@ export default function App() {
                     <ExcelNativeReviewActions messageId={message.id} plan={message.plan}
                       paneNeedsResize={comparisonPaneNeedsResize}
                       authorization={workbook ? selectedNamesFor(workbook) : []} controller={nativeComparison} disabled={busy}
+                      beforeOperation={targetGuard.check}
                       commit={session => runPlan(message.plan!, undefined, false, false, session)} />
                   )}
 
@@ -9211,15 +9282,13 @@ export default function App() {
           className="new-progress-button"
           onClick={scrollToLatest}
           aria-label="查看最新执行进度"
+          title="查看最新进度"
         >
-          <svg
-            viewBox="0 0 20 20"
-            aria-hidden="true"
-            focusable="false"
-          >
-            <path d="M5.5 8 10 12.5 14.5 8" />
-          </svg>
-          <span>查看最新进度</span>
+          <span className="progress-dots" aria-hidden="true">
+            <span />
+            <span />
+            <span />
+          </span>
         </button>
       )}
       </div>
@@ -9723,7 +9792,11 @@ export default function App() {
           }}
           aria-expanded={contextOpen}
         >
-          <i aria-hidden="true">▦</i>
+          <i aria-hidden="true">
+            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <path d="M19.2 12.1l-6.9 6.9a4.6 4.6 0 0 1-6.5-6.5l6.9-6.9a3 3 0 0 1 4.3 4.3l-6.9 6.9a1.4 1.4 0 0 1-2-2l6.2-6.2" />
+            </svg>
+          </i>
           <span>
             {workbook && sourceMode === "workbook" && (
               <>
@@ -9814,6 +9887,7 @@ export default function App() {
                     <img src={image.previewUrl} alt={image.name} />
                     <figcaption title={image.name}>{image.name}</figcaption>
                     <button
+                      disabled={busy || preparingImages}
                       onClick={() => {
                         setPendingImages((current) =>
                           current.filter((item) => item.id !== image.id)
@@ -9828,12 +9902,17 @@ export default function App() {
                 ))}
               </div>
             )}
+            {preparingImages && <div className="composer-image-error" role="status">正在处理图片…</div>}
+            {pendingImages.length > 0 && !supportsVision && (
+              <div className="composer-image-error" role="status">当前模型不支持图片，请切换到支持视觉输入的模型后发送。附件不会自动发送。</div>
+            )}
             {imageError && (
               <div className="composer-image-error">{imageError}</div>
             )}
             <div className="composer-toolbar">
               <input
                 ref={imageInputRef}
+                aria-label="选择图片附件"
                 className="image-file-input"
                 type="file"
                 accept="image/png,image/jpeg,image/webp"
@@ -9847,12 +9926,12 @@ export default function App() {
               <div className="composer-tools-left">
                 <button
                   className="attach-image-button"
-                  disabled={!supportsVision || busy}
+                  disabled={busy || preparingImages}
                   onClick={() => imageInputRef.current?.click()}
                   title={
                     supportsVision
                       ? "添加图片，也可以直接粘贴或拖入截图"
-                      : "当前模型不支持图片"
+                      : "添加图片；当前模型不支持视觉，发送前需切换模型"
                   }
                   aria-label="添加图片"
                 >
@@ -9865,7 +9944,6 @@ export default function App() {
                     <circle cx="9" cy="9.5" r="1.5" />
                     <path d="m5.5 17 4.2-4.4 3.1 3 2.2-2.2 3.5 3.6" />
                   </svg>
-                  <span>图片</span>
                 </button>
               </div>
               <span
@@ -9903,6 +9981,7 @@ export default function App() {
                   className="send-button"
                   disabled={
                     !workbook ||
+                    preparingImages ||
                     (!prompt.trim() && pendingImages.length === 0) ||
                     (pendingImages.length > 0 && !supportsVision)
                   }
