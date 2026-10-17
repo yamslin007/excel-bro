@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { describe, it, expect } from "vitest";
+import { beforeEach, describe, it, expect } from "vitest";
 import { renderHook, act } from "@testing-library/react";
 import type {
   FolderCatalog,
@@ -63,6 +63,8 @@ const folderCatalog: FolderCatalog = {
   truncated: false,
   expiresAt: "2026-08-16T01:00:00.000Z"
 };
+
+beforeEach(() => localStorage.clear());
 
 describe("useScopeSelection", () => {
   it("should leave selected-only view when clearing the last selected file", () => {
@@ -185,7 +187,8 @@ describe("useScopeSelection", () => {
     expect(result.current.sourceMode).toBe("workbook");
     expect(result.current.workbookScopeMode).toBe("auto");
     expect(result.current.selectedSheetNames).toEqual(["Sheet1"]);
-    expect(result.current.selectionConfirmed).toBe(true);
+    expect(result.current.selectionConfirmed).toBe(false);
+    expect(result.current.committedSheetNames).toEqual([]);
   });
 
   it("should choose manual scope and preserve selected sheets", () => {
@@ -197,7 +200,8 @@ describe("useScopeSelection", () => {
     expect(result.current.sourceMode).toBe("workbook");
     expect(result.current.workbookScopeMode).toBe("manual");
     expect(result.current.selectedSheetNames).toEqual(["Sheet2"]);
-    expect(result.current.selectionConfirmed).toBe(true);
+    expect(result.current.selectionConfirmed).toBe(false);
+    expect(result.current.committedSheetNames).toEqual([]);
   });
 
   it("should atomically adopt selected sheets from the current workbook", () => {
@@ -230,7 +234,7 @@ describe("useScopeSelection", () => {
     expect(result.current.selectionConfirmed).toBe(true);
   });
 
-  it("should choose folder scope based on selected folder sheets", () => {
+  it("switching to folder scope does not authorize draft or persisted selections", () => {
     const { result } = renderHook(() => useScopeSelection());
 
     act(() => result.current.applyFolderCatalog(folderCatalog));
@@ -238,7 +242,42 @@ describe("useScopeSelection", () => {
     act(() => result.current.chooseFolderScope());
 
     expect(result.current.sourceMode).toBe("folder");
+    expect(result.current.selectionConfirmed).toBe(false);
+  });
+
+  it("a candidate refresh keeps confirmed selection when the same targets still exist", () => {
+    const { result } = renderHook(() => useScopeSelection());
+    act(() => result.current.applyFolderCatalog(folderCatalog));
+    act(() => result.current.toggleFolderSheet("file-1", "Data"));
+    act(() => result.current.chooseFolderScope());
+    act(() => result.current.setSelectionConfirmed(true));
+    act(() => result.current.applyFolderCatalog({ ...folderCatalog }, { preserveAuthorization: true }));
+    expect(result.current.folderSheetKeys).toEqual(["file-1\0Data"]);
     expect(result.current.selectionConfirmed).toBe(true);
+  });
+
+  it.each(["path", "session", "removed"])("refresh invalidates authorization when %s changes", (change) => {
+    const { result } = renderHook(() => useScopeSelection());
+    act(() => result.current.applyFolderCatalog(folderCatalog));
+    act(() => result.current.toggleFolderSheet("file-1", "Data"));
+    act(() => result.current.chooseFolderScope());
+    act(() => result.current.setSelectionConfirmed(true));
+    const refreshed = {
+      ...folderCatalog,
+      ...(change === "path" ? { folderPath: "D:/Other/Data" } : {}),
+      ...(change === "session" ? { sessionId: "replacement-session" } : {}),
+      ...(change === "removed" ? { files: folderCatalog.files.slice(1) } : {})
+    };
+    act(() => result.current.applyFolderCatalog(refreshed, { preserveAuthorization: true }));
+    expect(result.current.selectionConfirmed).toBe(false);
+  });
+
+  it("candidate refresh cannot confirm a selection that is still a draft", () => {
+    const { result } = renderHook(() => useScopeSelection());
+    act(() => result.current.applyFolderCatalog(folderCatalog));
+    act(() => result.current.toggleFolderSheet("file-1", "Data"));
+    act(() => result.current.applyFolderCatalog(folderCatalog, { preserveAuthorization: true }));
+    expect(result.current.selectionConfirmed).toBe(false);
   });
 
   it("should keep still-valid folder selection when applying a new catalog", () => {
@@ -312,6 +351,7 @@ describe("useScopeSelection：草稿与已提交授权分开", () => {
     const { result } = renderHook(() => useScopeSelection());
 
     act(() => result.current.chooseAutomaticScope(workbook));
+    act(() => result.current.confirmScopeSelection(workbook));
     expect(result.current.committedSheetNames).toEqual(["Sheet1"]);
     expect(result.current.scopeDraftDirty).toBe(false);
 
@@ -332,6 +372,7 @@ describe("useScopeSelection：草稿与已提交授权分开", () => {
     const { result } = renderHook(() => useScopeSelection());
 
     act(() => result.current.chooseAutomaticScope(workbook));
+    act(() => result.current.confirmScopeSelection(workbook));
     act(() => result.current.toggleSheet("Sheet2"));
     expect(result.current.scopeDraftDirty).toBe(true);
 
@@ -346,30 +387,30 @@ describe("useScopeSelection：草稿与已提交授权分开", () => {
     const { result } = renderHook(() => useScopeSelection());
 
     act(() => result.current.chooseAutomaticScope(workbook));
+    act(() => result.current.confirmScopeSelection(workbook));
     act(() => result.current.setSelectedSheetNames(["Sheet1", "Gone"]));
     act(() => {
       // 弹层可能开了很久：确认时按**当前**工作簿清单复核，而不是开弹层时的快照。
       const committed = result.current.confirmScopeSelection(workbook);
-      expect(committed).toEqual(["Sheet1"]);
+      expect(committed).toEqual([]);
     });
 
     expect(result.current.committedSheetNames).toEqual(["Sheet1"]);
-    expect(result.current.selectedSheetNames).toEqual(["Sheet1"]);
-    expect(result.current.scopeDraftDirty).toBe(false);
+    expect(result.current.selectedSheetNames).toEqual(["Sheet1", "Gone"]);
+    expect(result.current.selectionConfirmed).toBe(false);
+    expect(result.current.scopeDraftDirty).toBe(true);
   });
 
-  it("确认范围时草稿里的表全部不存在则回落到活动工作表", () => {
+  it("确认范围时草稿里的表全部不存在也不能擅自改用活动工作表", () => {
     const { result } = renderHook(() => useScopeSelection());
 
     act(() => result.current.setSelectedSheetNames(["Gone", "AlsoGone"]));
     act(() => {
-      expect(result.current.confirmScopeSelection(workbook)).toEqual([
-        "Sheet1"
-      ]);
+      expect(result.current.confirmScopeSelection(workbook)).toEqual([]);
     });
 
-    expect(result.current.committedSheetNames).toEqual(["Sheet1"]);
-    expect(result.current.selectionConfirmed).toBe(true);
+    expect(result.current.committedSheetNames).toEqual([]);
+    expect(result.current.selectionConfirmed).toBe(false);
   });
 
   it("确认范围不带快照时原样提交草稿", () => {

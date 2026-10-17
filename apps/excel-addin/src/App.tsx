@@ -4,9 +4,16 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
 } from "react";
+import { ResultReview } from '@excel-bro/core/resultReview';
+import { ResultReviewBar } from './components/ResultReviewBar';
+import { captureExcelBeforeResult, showExcelBeforeResult, closeExcelNativeComparison, type SheetSnapshot } from './excelNativeComparison';
+import { markExcelResult, clearExcelResultMarks, type ExcelResultMarks } from './resultReviewMarkers';
+import type { PlanExecutionResult, ExecutionUndoSnapshot } from './contracts';
 import {
   checkIntent,
+  understandMessage,
   claimOfficeExecutionResume,
   completeOfficeAction,
   continuePlanningTask,
@@ -15,6 +22,7 @@ import {
   getPlanningTaskStatus,
   streamAssistantResponse,
   createFolderSnapshot,
+  checkFolderAdmission,
   executeFolderPlan,
   executeFolderQuery,
   generateFormula,
@@ -30,11 +38,19 @@ import {
   suspendOfficeExecution,
 } from "./api";
 import { ClarificationFields } from "./components/ClarificationFields";
+import { brandLogoUrl } from "./brandLogo";
+import { createAgentTaskContext, confirmAgentTaskDecision, type AgentTaskContext } from "@excel-bro/core/agentTaskContext";
+import { renderConfirmedPrompt } from "@excel-bro/core/clarificationAnswers";
 import { ModelPickerIcon } from "./components/ModelPickerIcon";
-import { AuthorizedTargetConfirmation } from "./components/AuthorizedTargetConfirmation";
+import { TargetScopeNotice } from "./components/TargetScopeNotice";
+import { ScopeAdmissionSummary } from "./components/ScopeAdmissionStatus";
+import { useScopeAdmission } from "./hooks/useScopeAdmission";
 import { useAuthorizedTarget } from "./hooks/useAuthorizedTarget";
-import { inspectOfficeAuthorizedTarget, officeAnalysisTargetEvidence } from "./officeAuthorizedTarget";
-import { checkAuthorizedTarget, TargetConfirmationRequiredError } from "@excel-bro/core/authorizedTarget";
+import { confirmOfficeAuthorizedScope, inspectOfficeAuthorizedTarget, inspectOfficeScopeAdmission, officeAnalysisTargetEvidence } from "./officeAuthorizedTarget";
+import { admissionComplete, admissionItem } from "@excel-bro/core/scopeAdmission";
+import { checkAuthorizedTarget, TargetConfirmationRequiredError, type AuthorizedTarget } from "@excel-bro/core/authorizedTarget";
+import { folderRootIdentity, intentScopeFingerprint as sharedIntentScopeFingerprint } from "@excel-bro/core/scopeFingerprint";
+import { folderScopeDraftDirty } from "@excel-bro/core/folderScope";
 import { retireTargetMessage } from "./authorizedTargetArtifacts";
 import type {
   AnalysisPlan,
@@ -69,9 +85,14 @@ import type { SourceMode, WorkbookScopeMode } from "./types/workbook";
 import {
   BlankPolicyNeededError,
   NeedsClarificationError,
+  PLAN_FORMAT_IMPACT_LABEL,
+  PLAN_FORMAT_SECTION,
   PLAN_NOTE_SECTIONS,
   UnmappedCategoryError,
-  VERIFICATION_PASSED_LABEL
+  VERIFICATION_PASSED_LABEL,
+  bridgeWorkbookIdentity,
+  formatPlanPreview,
+  selectFormatActions
 } from "@excel-bro/core";
 import type { CellValue } from "@excel-bro/core";
 import type { RangeChangeReview } from "@excel-bro/core/changeReview";
@@ -81,8 +102,10 @@ import {
   captureWorkbook,
   captureWorkbookSourceFingerprint,
   captureWorkbookStructure,
+  captureWorkbookCatalog,
   dataEpochsChanged,
   currentOfficeWorkbookIdentity,
+  assertUndoPostState,
   executePlan,
   isExplicitA1Address,
   isEBSystemSheet,
@@ -121,7 +144,7 @@ import {
   type PendingImage
 } from "./imageAttachments";
 import { useImageAttachments } from "./hooks/useImageAttachments";
-import { extractWorkbookDataPeriod, workbookFolderFromDocumentUrl } from "./workbookIdentity";
+import { workbookFolderFromDocumentUrl } from "./workbookIdentity";
 import {
   currentOfficeHostVersion,
   officeHostRequestFields
@@ -162,8 +185,7 @@ import {
   type FocusPayload
 } from "./focusState";
 import {
-  describeIntentDecision,
-  resolveConfirmedPrompt
+  describeIntentDecision
 } from "./intent";
 import PetCompanion from "./PetCompanion";
 import { RuleManager } from "./RuleManager";
@@ -172,10 +194,18 @@ import ThemePanel from "./components/ThemePanel";
 import TaskProgressTimeline from "./components/TaskProgressTimeline";
 import ChangeReviewSummaryCard from "./components/ChangeReviewSummaryCard";
 import { ExcelNativeReviewActions } from "./components/ExcelNativeReviewActions";
-import { useExcelNativeComparison } from "./hooks/useExcelNativeComparison";
+import { SaveToolDialog } from "./components/SaveToolDialog";
+import { useExcelNativeComparison, excelReviewBlocksNewCopy } from "./hooks/useExcelNativeComparison";
 import { assertExcelNativeComparisonUnchanged, compareExcelNativeCommittedResult, nativeComparisonPlanIssue, type ExcelNativeComparison } from "./excelNativeComparison";
+import {
+  attestResultSourceDependency,
+  attestSourceDependency,
+  trustedToolReads
+} from "./planSourceDependency";
 import { LocalMappingResolution } from "./components/LocalMappingResolution";
 import MessageCopyButton from "./components/MessageCopyButton";
+import { ExecutionResultCard } from "./components/ExecutionResultCard";
+import ScrollToLatestButton from "./components/ScrollToLatestButton";
 import { FolderBackupManager } from "./components/FolderBackupManager";
 import { ScopeSelectionGuidance } from "./components/ScopeSelectionGuidance";
 import HistoryStorageNotice from "./components/HistoryStorageNotice";
@@ -185,8 +215,11 @@ import {
 } from "./components/WorkDirectoryGuide";
 import type { FolderBackupTarget } from "./hooks/useFolderBackups";
 import { MODEL_REQUIRED_HELP_TEXT } from "./helpCommand";
-import { chooseAvailableModel, connectionModelSuffix, isRealModelId, planningReadPolicyForModel } from "./modelSelection";
+import { chooseAvailableModel, connectionModelSuffix, isRealModelId, isSdkPlanningModel, planningReadPolicyForModel } from "./modelSelection";
 import { useActivityProgress, type ActivityLog, type ActivityProgress } from "./hooks/useActivityProgress";
+import { useSdkToolBridge } from "./hooks/useSdkToolBridge";
+import { loadBridgeResult, type SdkBridgeLiveContext } from "./sdkBridgeHost";
+import LocalResultCard from "./components/LocalResultCard";
 import { useMessageAutoFollow } from "./hooks/useMessageAutoFollow";
 import { useComposerResize } from "./hooks/useComposerResize";
 import { useConversation } from "./hooks/useConversation";
@@ -195,6 +228,10 @@ import {
   redactHistoryCredentials,
   remainingLegacyCredentialConversationIds
 } from "./conversation";
+import {
+  markFolderExecutionUndone,
+  markWorkbookExecutionUndone
+} from "./executionUndone";
 import {
   insertChatMessage,
   persistActivityMessage
@@ -322,23 +359,6 @@ function isAbortError(reason: unknown): boolean {
     return true;
   }
   return false;
-}
-
-function intentScopeFingerprint(scope: IntentScopeContext): string {
-  // selectedRange (光标位置) 不纳入指纹：查询不依赖它，写入落点由预览确认兜底。
-  // 把它算进来只会在用户移动光标时造成误判（"数据范围已经变化"）。
-  // activeWorksheet 在 auto 模式下决定扫描哪张表，切表意味着数据真的变了，仍需保留。
-  return JSON.stringify({
-    workbookName: scope.workbookName,
-    sourceMode: scope.sourceMode,
-    selectionMode: scope.selectionMode,
-    sheets: scope.sheets.map((sheet) => sheet.name),
-    ...(scope.selectionMode === "auto"
-      ? {
-          activeWorksheet: scope.activeWorksheet
-        }
-      : {})
-  });
 }
 
 function latestResultContext(items: ChatMessage[]): ResultContext | null {
@@ -600,6 +620,20 @@ function conversationTitle(messages: ChatMessage[]): string {
 // 这里不再保留副本 —— 两份实现会让"读取时是否脱敏"这种安全语义在不同入口上分叉。
 
 
+/**
+ * 计划卡里的「格式改动」预览。
+ *
+ * 行高/列宽是**行级/列级**属性：在 `B3:D5` 上设行高改的是第 3–5 整行。
+ * 只写动作标签（"调整 B3:D5 的行高列宽"）会让用户以为只动这一小块，
+ * 所以这里必须把真实影响范围单独念出来。
+ *
+ * 归组、属性文案、影响范围判定都在共用层（`@excel-bro/core`），
+ * 两端同一份实现 —— 各写一份就会出现"Excel 说了、WPS 没说"。
+ */
+function planFormatPreview(plan: AnalysisPlan) {
+  return formatPlanPreview(selectFormatActions(plan.actions));
+}
+
 function actionLabel(action: AnalysisPlan["actions"][number]): string {
   switch (action.type) {
     case "createWorksheet":
@@ -683,6 +717,21 @@ function actionLabel(action: AnalysisPlan["actions"][number]): string {
   }
 }
 
+/**
+ * "读不到宿主现场"时的桥现场。
+ *
+ * 刻意是**空范围 + 空身份 + 无指纹**：复核拿它去跟绑定比必然不通过，于是
+ * 一次宿主读取都不会发生（fail-closed）。任何"读不到就当没变化"的降级都不许写在这里。
+ */
+function emptyBridgeLiveContext(): SdkBridgeLiveContext {
+  return {
+    workbookIdentity: "",
+    sourceFingerprint: null,
+    authorizedSheetNames: [],
+    activeWorksheet: ""
+  };
+}
+
 export default function App() {
   const [workbook, setWorkbook] = useState<WorkbookSnapshot | null>(null);
   const [prompt, setPrompt] = useState("");
@@ -724,6 +773,16 @@ export default function App() {
   const [status, setStatus] = useState<Status>("idle");
   const [activePlanId, setActivePlanId] = useState<string | null>(null);
   const nativeComparison = useExcelNativeComparison();
+  type ResultReceipt = { executionId: string; verified: boolean; undoable: boolean; undo: ExecutionUndoSnapshot | null };
+  const [resultReview] = useState(() => new ResultReview<SheetSnapshot, ResultReceipt, ExcelResultMarks, ExcelNativeComparison>());
+  const resultReviewState = useSyncExternalStore(resultReview.subscribe, resultReview.getSnapshot, resultReview.getSnapshot);
+  const [resultCandidate, setResultCandidate] = useState<{ id: string; plan: AnalysisPlan; authorization: string[]; identity: string; conversationId: string } | null>(null);
+  const resultMessages = useRef(new Set<string>());
+  const resultLive = useRef({ messages, workbookIdentity: '', authorization: '', conversationId: '' });
+  const resultUndo = useRef<(id: string) => Promise<boolean>>(async () => false);
+  // 只有用户主动点「重新排列」才会自增；AI 窗格据此重建自适应状态机并重套默认比例。
+  // 消息更新、流式输出、回读、保存工具都不改它 —— 用户摆好的布局不会被反复抢回。
+  const reviewPaneRearm = 0;
   const activeActivityMessageIdRef = useRef<string | null>(null);
   // 双栏变更对照的完整前后矩阵只活在这里（按 executionId 索引的会话内内存）。
   // 刻意不挂到 ChatMessage 上：消息会被持久化，矩阵不许进历史、也不许出站。
@@ -732,13 +791,20 @@ export default function App() {
   const activityHook = useActivityProgress({
     onPersistLog: (log, persistenceKey) => {
       const targetId = persistenceKey ?? activeActivityMessageIdRef.current;
+      const binding = sdkBridge.binding();
       setMessages((messages) =>
         persistActivityMessage(messages, log, targetId, {
           id: targetId ?? messageId(),
           role: "assistant",
           activityLog: log,
           createdAt: new Date().toISOString()
-        })
+        }, binding && binding.taskId === log.operationId ? {
+          taskId: binding.taskId,
+          hostId: binding.hostId as "excel-office" | "wps-et",
+          workbookName: binding.workbookName,
+          workbookIdentity: binding.workbookIdentity,
+          sourceFingerprint: binding.sourceFingerprint
+        } : undefined)
       );
       if (activeActivityMessageIdRef.current === targetId) {
         activeActivityMessageIdRef.current = null;
@@ -761,6 +827,14 @@ export default function App() {
     markActivityConnected,
     completeActivity: finishActivity
   } = activityHook;
+
+  // SDK 任务工具桥：规划流里的 bridgeTool 指针 → 本机轮询/读表/回执。
+  // 只读，不碰任何写入 API；值只经本机回环进出。
+  const sdkBridge = useSdkToolBridge();
+  // 执行前的授权复核要用**当前**范围，不能在开始规划时快照死。
+  const bridgeLiveContextRef = useRef<
+    () => SdkBridgeLiveContext | Promise<SdkBridgeLiveContext>
+  >(() => emptyBridgeLiveContext());
 
   // 服务健康状态为模型管理提供模型目录刷新能力。
   const serviceHealthHook = useServiceHealth();
@@ -819,7 +893,7 @@ export default function App() {
     onToolDslCopyError: () => {
       appendMessage({
         role: "system",
-        text: "复制专家脚本失败，请手动选择脚本内容后复制。"
+        text: "复制专家计划失败，请手动选择计划内容后复制。"
       });
     }
   });
@@ -895,7 +969,8 @@ export default function App() {
     composerHeight, setComposerHeight,
     comparisonPaneNeedsResize,
     togglePetVisibility
-  } = useUIState(Boolean(nativeComparison.review) || nativeComparison.pending, nativeComparison.review?.session);
+  } = useUIState(excelReviewBlocksNewCopy(nativeComparison.review) || nativeComparison.pending,
+    excelReviewBlocksNewCopy(nativeComparison.review) ? nativeComparison.review?.session : undefined, reviewPaneRearm);
 
   const themeApi = useTheme();
   const logoLongPress = useLongPress(() => setThemePanelOpen(true));
@@ -903,13 +978,13 @@ export default function App() {
   // 执行验收与工具固化批准状态（自定义 Hook）
   const {
     saveCandidate,
-    setSaveCandidate,
     approveFixedContent,
     setApproveFixedContent,
     approveDestructive,
     setApproveDestructive,
     verifiedPlanIds,
     markPlanVerified,
+    unmarkPlanVerified,
     saveEligibility,
     beginSaveCandidate,
     closeSaveCandidate
@@ -942,11 +1017,14 @@ export default function App() {
     setToolDescription,
     selectedSheetNames,
     committedSheetNames,
+    scopeDraftDirty,
+    cancelScopeEdit,
     setSelectedSheetNames,
     selectionConfirmed,
     setSelectionConfirmed,
     sourceMode,
     workbookScopeMode,
+    setWorkbookScopeMode,
     folderCatalog,
     setFolderCatalog,
     folderSheetKeys,
@@ -966,10 +1044,48 @@ export default function App() {
     selectAllSheets,
     clearSelectedSheets
   } = useScopeSelection();
-  const retrySendRef = useRef<(text: string) => void>(() => {});
+  /**
+   * 当前**已确认**的授权表名，随渲染刷新。
+   *
+   * 桥的执行前复核要拿"此刻的授权"去比，而这个"此刻"指的是用户当前已确认的
+   * 范围，不是规划启动的那一刻。用 ref 而不是闭包，正是为了让复核读到最新值：
+   * 等待期间用户收窄/撤销授权后，这里必须已经变窄。
+   */
+  const committedSheetNamesRef = useRef<readonly string[]>(committedSheetNames);
+  committedSheetNamesRef.current = committedSheetNames;
+  // Restoring a server session may replay explicit consent, never picker drafts
+  // or localStorage selections left over from another panel session.
+  const confirmedFolderScopeRef = useRef<{ root: string; keys: string[] } | null>(null);
+
+  /**
+   * 工作目录的**草稿 vs 已提交**。
+   *
+   * 草稿是 `folderSheetKeys`（勾选 / 全选 / 清空都只改它，localStorage 里存的也是它）；
+   * 已提交只在上面那个 ref 里，**只有「确认」才写**。判据用共享层的
+   * `folderScopeDraftDirty` —— 与 WPS 同一份，两端不许各写一套。
+   *
+   * 现读 ref、不缓存：它的每一次写入都与状态更新同批发生（`setWorkbook` /
+   * `setSelectedSheetNames` / `setSelectionConfirmed` / `setContextOpen`），
+   * 所以本次渲染读到的就是最新值，不存在"读到出生那一刻的事实"的问题。
+   *
+   * 根不一致一律按"没有已提交范围"处理：换了目录，旧根上的授权不许再当新目录的判据。
+   */
+  const confirmedFolderKeys =
+    folderCatalog && confirmedFolderScopeRef.current?.root === folderRootIdentity(folderCatalog.folderPath)
+      ? confirmedFolderScopeRef.current.keys
+      : [];
+  const folderDraftDirty =
+    sourceMode === "folder" && folderScopeDraftDirty(folderSheetKeys, confirmedFolderKeys);
+  function intentScopeFingerprint(scope: IntentScopeContext): string {
+    // This identity stays local. No absolute folder paths are added to intent
+    // requests; the existing selected-field/data-row privacy contract is unchanged.
+    return sharedIntentScopeFingerprint(scope, folderCatalog?.folderPath);
+  }
+  const retrySendRef = useRef<(text: string, understanding?: Awaited<ReturnType<typeof understandMessage>>) => void>(() => {});
+  const [scopeConfirmationError, setScopeConfirmationError] = useState("");
   const targetGuard = useAuthorizedTarget({
     enabled: sourceMode === "workbook" && isRunningInExcel() && workbook !== null,
-    reviewActive: Boolean(nativeComparison.review),
+    reviewActive: excelReviewBlocksNewCopy(nativeComparison.review),
     monitorPaused: status !== "idle",
     inspect: () => inspectOfficeAuthorizedTarget(workbookScopeMode === "auto" ? null : committedSheetNames),
     analysisEvidence: officeAnalysisTargetEvidence,
@@ -985,6 +1101,59 @@ export default function App() {
         ({ ...conversation, messages: conversation.messages.map(retireTargetMessage) })) }));
     }
   });
+  const [scopeCheckingCommit, setScopeCheckingCommit] = useState(false);
+  const scopeCommitLock = useRef(false);
+  // Private identity of the catalog visibly opened in this picker, not its filename.
+  const scopePickerFile = useRef<Pick<AuthorizedTarget, "fileKey" | "fileRef"> | null>(null);
+  const [scopeCatalogChecking, setScopeCatalogChecking] = useState(false);
+  const [scopeCatalogRevision, setScopeCatalogRevision] = useState(0);
+  const scopeAdmissionIds = sourceMode === "folder" ? folderSheetKeys : selectedSheetNames;
+  const scopeAdmission = useScopeAdmission({
+    enabled: contextOpen && workbook !== null && !scopeCatalogChecking,
+    scopeKey: JSON.stringify([sourceMode, workbookScopeMode, workbook?.name, workbook?.capturedAt,
+      folderCatalog?.sessionId, folderCatalog?.folderPath, scopeCatalogRevision]),
+    ids: scopeAdmissionIds,
+    inspect: async () => sourceMode === "folder"
+      ? folderCatalog ? checkFolderAdmission(folderCatalog.sessionId, folderSelections())
+        : { items: folderSheetKeys.map((id) => admissionItem(id, "missing")) }
+      : isRunningInExcel() ? scopePickerFile.current
+        ? inspectOfficeScopeAdmission(selectedSheetNames, scopePickerFile.current)
+        : { items: selectedSheetNames.map((id) => admissionItem(id, "identity_unverified")) }
+        : { items: selectedSheetNames.map((id) => admissionItem(id, "host_write_blocked")) }
+  });
+  async function openScopePicker() {
+    if (scopeCommitLock.current) return;
+    setScopeConfirmationError("");
+    setContextOpen(true);
+    setFolderBackupOpen(false);
+    setSheetSearch("");
+    setFolderSheetSearch("");
+    if (sourceMode === "folder") {
+      if (folderCatalog && !busy) void refreshCurrentFolder({ quiet: true });
+      return;
+    }
+    if (isRunningInExcel()) {
+      setScopeCatalogChecking(true);
+      try {
+        const fileKey = currentOfficeWorkbookIdentity() ?? null;
+        const fileRef = Office.context.document;
+        const catalog = await captureWorkbookCatalog();
+        if (fileKey !== (currentOfficeWorkbookIdentity() ?? null) || fileRef !== Office.context.document) {
+          throw new Error("catalog target changed");
+        }
+        scopePickerFile.current = { fileKey, fileRef };
+        setScopeCatalogRevision((value) => value + 1);
+        setWorkbook(catalog);
+        if (workbookScopeMode === "auto" && (selectedSheetNames.length !== 1 || selectedSheetNames[0] !== catalog.activeWorksheet)) {
+          setSelectedSheetNames([catalog.activeWorksheet]);
+        }
+        else if (workbookScopeMode === "manual" && targetGuard.notice?.reason === "file_changed") setSelectedSheetNames([]);
+      } catch {
+        scopePickerFile.current = null;
+        setScopeConfirmationError("暂时无法读取目标，请刷新选择器。");
+      } finally { setScopeCatalogChecking(false); }
+    }
+  }
 
   // 备份管理目标：文件夹模式用 session，工作簿模式从文件路径推导
   const folderBackupTarget = useMemo((): FolderBackupTarget => {
@@ -1039,16 +1208,18 @@ export default function App() {
   ].join(":");
   const {
     containerRef: messageStreamRef,
-    hasUnseenProgress,
+    awayFromBottom,
     handleScroll: handleMessageStreamScroll,
     scrollToLatest
-  } = useMessageAutoFollow(activityScrollSignal);
+  } = useMessageAutoFollow(activityScrollSignal, chatHistory.activeConversationId);
   const focusDialogRef = useRef<Office.Dialog | null>(null);
   const planEditorDialogRef = useRef<Office.Dialog | null>(null);
   const queryAbortRef = useRef<AbortController | null>(null);
   // turnAbortRef：整个 turn（需求确认→本地取数→生成方案）共用的打断句柄。
   // 每个 turn 开始时新建；用户中途插话/停止时 abort，串在链上的模型请求会一起 reject。
   const turnAbortRef = useRef<AbortController | null>(null);
+  const pauseRequestedControllerRef = useRef<AbortController | null>(null);
+  const planningResumeInFlightRef = useRef(false);
   // pendingSteerRef：转向时先掐掉当前 turn，把新话暂存这里；等 busy 回落到 idle，
   // 由 effect 带着这句新话重新发起一个 turn（硬转向 = abort + 带新话重跑）。
   const pendingSteerRef = useRef<string | null>(null);
@@ -1129,7 +1300,7 @@ export default function App() {
     [modelOptions, effectiveModelId]
   );
 
-  const busy = status !== "idle" || nativeComparison.pending;
+  const busy = status !== "idle" || nativeComparison.pending || resultReviewState.pending || resultReviewState.phase === 'reviewing';
 
   // 目录成功加载后迁移旧的 local 记录和已删除连接；目录读取失败时必须保留
   // 原有选择，不能依据空列表删掉仍然有效的记录。
@@ -1195,7 +1366,7 @@ export default function App() {
     undoLastExecution,
     undoExecutionTo
   } = useUndoSnapshot({
-    isBusy: busy,
+    isBusy: status !== 'idle' || nativeComparison.pending,
     beforeOperation: targetGuard.check,
     onStatusChange: setStatus,
     onMessage: (text) => {
@@ -1204,8 +1375,73 @@ export default function App() {
         text
       });
     },
-    onAfterUndo: () => scan()
+    onAfterUndo: () => scan(),
+    onRestored: (snapshot) =>
+      setMessages((current) => {
+        const marking = markWorkbookExecutionUndone(current, snapshot);
+        if (marking.ambiguous) {
+          appendMessage({
+            role: "system",
+            text: "本次执行已恢复，但无法确认它对应哪一条历史记录，未自动标记「已撤销」。"
+          });
+        }
+        return marking.messages;
+      })
   });
+  resultUndo.current = async executionId => {
+    if (undoStack.at(-1)?.executionId !== executionId) throw new Error('本次执行不是当前恢复栈顶，未撤销其他任务。');
+    return (await undoExecutionTo(executionId)) === true;
+  };
+  let resultWorkbookIdentity = '';
+  try { resultWorkbookIdentity = currentOfficeWorkbookIdentity() ?? ''; } catch { /* Unavailable identity must block writes, not crash rendering. */ }
+  resultLive.current = { messages, workbookIdentity: resultWorkbookIdentity,
+    authorization: JSON.stringify(workbook ? [...selectedNamesFor(workbook)].sort() : []),
+    conversationId: chatHistory.activeConversationId };
+  useEffect(() => {
+    if (!resultCandidate || status !== 'idle' || nativeComparison.pending || resultReviewState.pending || resultReviewState.phase === 'reviewing') return;
+    const candidate = resultCandidate;
+    const planKey = JSON.stringify(candidate.plan), scope = JSON.stringify([...candidate.authorization].sort());
+    const isCurrent = () => {
+      const now = resultLive.current;
+      return now.workbookIdentity === candidate.identity && currentOfficeWorkbookIdentity() === candidate.identity &&
+        now.authorization === scope && now.conversationId === candidate.conversationId &&
+        now.messages.some(message => message.id === candidate.id && JSON.stringify(message.plan) === planKey);
+    };
+    void resultReview.start(candidate.id, {
+      isCurrent,
+      prepare: async () => {
+        if (sdkBridge.failure()) throw new Error('本轮本地读取未通过现场核对，请重新读取后生成结果；原表未写入。');
+        if (!(await targetGuard.check()) || !isCurrent()) throw new Error('当前计划或授权已变化，未执行。');
+        unmarkPlanVerified(candidate.plan.id);
+        return captureExcelBeforeResult(candidate.plan, candidate.authorization);
+      },
+      execute: async () => {
+        let observed: PlanExecutionResult | null = null;
+        const succeeded = await runPlan(candidate.plan, undefined, false, false, undefined,
+          { plan: candidate.plan, authorization: candidate.authorization, workbookIdentity: candidate.identity },
+          result => { observed = result; });
+        const result = observed as PlanExecutionResult | null;
+        if (!succeeded || !result) throw new Error('执行未完成，请查看执行记录和恢复入口；不会自动重试。');
+        return { executionId: result.undoSnapshot?.executionId ?? '', verified: result.verification.status === 'verified',
+          undoable: result.undoSnapshot?.postStateCoverage === 'complete', undo: result.undoSnapshot ?? null };
+      },
+      mark: () => markExcelResult(candidate.plan, candidate.identity),
+      clearMarker: clearExcelResultMarks,
+      showBefore: before => showExcelBeforeResult(before, candidate.identity, candidate.plan, candidate.authorization),
+      closeBefore: async copy => {
+        const outcome = await closeExcelNativeComparison(copy);
+        return outcome === 'closed' || outcome === 'already_closed' ? null : '执行前对比副本仍保留，请手动核对；原表不会被关闭。';
+      },
+      restore: async receipt => {
+        if (!(await resultUndo.current(receipt.executionId))) throw new Error('恢复未成功，当前结果仍保留。');
+      },
+      validateResult: async receipt => {
+        if (!receipt.undo) throw new Error('恢复记录不可用，未确认变更。');
+        await Excel.run(context => assertUndoPostState(context, receipt.undo!));
+      },
+      accepted: () => markPlanVerified(candidate.plan.id)
+    });
+  }, [resultCandidate, status, nativeComparison.pending, resultReviewState.pending, resultReviewState.phase]);
   const {
     folderUndoStack,
     pushFolderUndo,
@@ -1213,6 +1449,17 @@ export default function App() {
     undoFolderExecutionTo
   } = useFolderUndo({
     isBusy: busy,
+    onRestored: (entries) =>
+      setMessages((current) => {
+        const marking = markFolderExecutionUndone(current, entries);
+        if (marking.ambiguous) {
+          appendMessage({
+            role: "system",
+            text: "本次文件夹执行已恢复，但无法确认它对应哪一条历史记录，未自动标记「已撤销」。"
+          });
+        }
+        return marking.messages;
+      }),
     onStatusChange: setStatus,
     onMessage: (text) => {
       appendMessage({
@@ -1281,10 +1528,6 @@ export default function App() {
         (connection) => connection.id === connectionDraft.id
       )
     : null;
-  const workbookDataPeriod = useMemo(
-    () => (workbook ? extractWorkbookDataPeriod(workbook.name) : null),
-    [workbook]
-  );
   const filteredWorksheets = useMemo(
     () => {
       const query = sheetSearch.trim().toLocaleLowerCase();
@@ -1376,6 +1619,22 @@ export default function App() {
       setFolderRefreshNotice(
         "已清空本文件，当前没有已选工作表，已显示全部。"
       );
+    }
+  }
+
+  /**
+   * 清空**整个工作目录**的草稿勾选（不是"本文件"）。
+   *
+   * 与「选择多个」的「清空」同一件事：只清草稿（`folderSheetKeys`），已提交的
+   * `confirmedFolderScopeRef` 一字不动，要换成更小的范围仍需按「确认」。这也是
+   * 页脚「取消」的反向出口 —— 清空后 `folderDraftDirty` 一定为真、取消按钮出现。
+   */
+  function clearFolderSelection(): void {
+    if (folderSheetKeys.length === 0) return;
+    setFolderSheetKeys([]);
+    setRecentlyAddedFolderSheetKeys([]);
+    if (showSelectedFolderSheets) {
+      setShowSelectedFolderSheets(false);
     }
   }
 
@@ -1757,6 +2016,13 @@ export default function App() {
         activeActivityMessageIdRef.current
       )
     );
+    // Only freshly produced plans enter automatic execution. Reloaded history never does.
+    if (message.plan && !message.staleSourceConfirm && sourceMode === 'workbook' && workbook &&
+        nativeComparisonPlanIssue(message.plan, selectedNamesFor(workbook)) === null && currentOfficeWorkbookIdentity()) {
+      resultMessages.current.add(id);
+      setResultCandidate({ id, plan: message.plan, authorization: [...selectedNamesFor(workbook)],
+        identity: currentOfficeWorkbookIdentity()!, conversationId: chatHistory.activeConversationId });
+    }
     return id;
   }
 
@@ -2261,7 +2527,8 @@ export default function App() {
         planningResume: {
           ...baseline,
           expectedRevision: response.revision,
-          clientLastSequence: response.lastSequence,
+          clientLastSequence: Math.min(Math.max(baseline.clientLastSequence ?? 0, getActivitySnapshot()?.sequence ?? 0), response.lastSequence),
+          awaitingStatus: false,
           lastSequence: response.lastSequence,
           status: "pending",
           reason: response.reason,
@@ -2292,7 +2559,8 @@ export default function App() {
       if (!originalPrompt) throw new Error("旧规划记录缺少原需求，请重新发送需求后补充信息。");
       await continueIntentDecision({ ...response, turnId: undefined }, originalPrompt, [],
         intentScopeFingerprint(buildIntentScope(workbook,
-          baseline.sourceFingerprintSheets?.length ? baseline.sourceFingerprintSheets : selectedNamesFor(workbook))));
+          baseline.sourceFingerprintSheets?.length ? baseline.sourceFingerprintSheets : selectedNamesFor(workbook))),
+        undefined, 0, 0, sourceMode === "workbook" ? "none" : "ifNeeded", baseline.taskContext);
       updateFolderResumeMessage(message.id, (current) => ({ ...current, planningResume: undefined }));
       return "awaiting_input";
     }
@@ -2325,15 +2593,19 @@ export default function App() {
       }));
       return "completed";
     }
-    const plan: AnalysisPlan = {
-      ...response.plan,
-      sourceFingerprint:
-        baseline.sourceFingerprint ?? response.plan.sourceFingerprint,
-      sourceFingerprintSheets:
-        baseline.sourceFingerprintSheets?.length
-          ? baseline.sourceFingerprintSheets
-          : response.plan.sourceFingerprintSheets
-    };
+    const plan: AnalysisPlan = attestSourceDependency(
+      {
+        ...response.plan,
+        sourceFingerprint:
+          baseline.sourceFingerprint ?? response.plan.sourceFingerprint,
+        sourceFingerprintSheets:
+          baseline.sourceFingerprintSheets?.length
+            ? baseline.sourceFingerprintSheets
+            : response.plan.sourceFingerprintSheets
+      },
+      // 续跑通道这一轮没有本机读取记录：**不采信计划自报的来源依赖**，删掉该字段。
+      null
+    );
     updateFolderResumeMessage(message.id, (current) => ({
       ...current,
       text: plan.summary,
@@ -2385,11 +2657,13 @@ export default function App() {
 
   async function resumePlanningTaskFromMessage(
     message: ChatMessage,
-    fallbackModelId?: string
+    fallbackModelId?: string,
+    inspectOnly = false
   ): Promise<void> {
     const resume = message.planningResume;
-    if (!resume || busy) return;
-    if (!(await targetGuard.check())) return;
+    if (!resume || planningResumeInFlightRef.current || (busy && !inspectOnly)) return;
+    planningResumeInFlightRef.current = true;
+    let inspectAfterPause: ChatMessage | null = null;
     const requestId = resume.requestId ?? messageId();
     const turnController = new AbortController();
     turnAbortRef.current = turnController;
@@ -2401,11 +2675,39 @@ export default function App() {
         : undefined
     }));
     try {
+      if (!(await targetGuard.check())) {
+        updateFolderResumeMessage(message.id, (current) => ({ ...current,
+          planningResume: current.planningResume ? { ...current.planningResume, status: "pending", awaitingStatus: true,
+            reason: "原任务的操作目标需要确认；尚未查询或继续原任务。" } : undefined }));
+        finishActivity("warning", "原任务范围需要确认", "awaiting_input");
+        return;
+      }
+      if (turnController.signal.aborted) throw new DOMException("Aborted", "AbortError");
       const taskStatus = await getPlanningTaskStatus(
         resume.turnId,
         turnController.signal
       );
+      if (turnController.signal.aborted) throw new DOMException("Aborted", "AbortError");
       if (taskStatus.status === "completed") {
+        /*
+         * 完成态有两种：
+         * - 账本记录里**没有值被省略** → 服务端给了完整 `result`，按原路回放；
+         * - 有值被省略 → 只有 `recovery` 描述。**绝不**拿它当完整计划渲染，
+         *   如实告诉用户值没有留在账本里，需要重新运行或从结果卡取值。
+         */
+        if (taskStatus.result === undefined) {
+          const recovery = taskStatus.recovery;
+          updateFolderResumeMessage(message.id, (current) => ({
+            ...current,
+            text: recovery?.resultRef
+              ? "原任务已完成，但结果含数据值 —— 账本只保留结构与引用，未保存值。可用结果卡按引用查看，或重新运行以取得完整结果。"
+              : "原任务已完成；该结果含数据值，账本只保留了恢复描述，未保存值。请重新运行以取得完整结果。",
+            planningResume: undefined
+          }));
+          markServerOnline();
+          finishActivity("warning", "已完成，但账本未保存数据值");
+          return;
+        }
         const outcome = await applyPlanningContinuationResult(
           message,
           taskStatus.result,
@@ -2436,21 +2738,48 @@ export default function App() {
           ...current,
           text: "任务仍在处理中，无需重复继续。稍后再查看状态。",
           planningResume: current.planningResume
-            ? { ...current.planningResume, status: "pending" }
+            ? { ...current.planningResume, status: "pending", awaitingStatus: true,
+                reason: "原任务仍在服务端处理中；稍后核对，不重复规划。" }
             : undefined
         }));
         finishActivity("warning", "任务仍在处理中");
         return;
       }
       if (!taskStatus.canContinue) {
+        // 如实区分"总时长已用完"与"没有可续跑检查点"：前者不是找不到现场，
+        // 而是**不应**再承诺继续，不能糊成同一句"没有已核实的可续跑检查点"。
+        // 联合类型里 `pauseType` 只在实际查到任务的分支上存在，用 in 守卫收窄。
+        const pauseType = "pauseType" in taskStatus ? taskStatus.pauseType : undefined;
+        const exhausted = pauseType === "budget_exhausted";
         updateFolderResumeMessage(message.id, (current) => ({
           ...current,
-          text: "该任务已达到安全处理上限，不能再追加运行时间。请简化需求后重新发送。",
+          text: exhausted
+            ? `本轮有效运行总时长已用完，不再启动新的模型或工具调用：${("reason" in taskStatus && taskStatus.reason) || "已完成的步骤与现场已保存。"} 原需求仍保留，可重新发起任务。`
+            : `该任务当前不能精确续跑：${("reason" in taskStatus && taskStatus.reason) || "没有已核实的可续跑检查点。"} 原需求仍保留。`,
           planningResume: current.planningResume
-            ? { ...current.planningResume, status: "failed" }
+            ? {
+                ...current.planningResume,
+                status: "failed",
+                pauseType,
+                reason: exhausted
+                  ? "本轮有效运行总时长已用完，不能再按这里的引用直接续跑；请重新发起任务。"
+                  : "没有已核实的可续跑检查点，不能从断点继续。需要重新开始任务。"
+              }
             : undefined
         }));
-        finishActivity("warning", "已达到安全处理上限");
+        finishActivity("warning", exhausted ? "本轮有效运行总时长已用完" : "当前任务不能精确续跑");
+        return;
+      }
+
+      // 自动核对永远只查状态；检查点可用也不能自动 POST 继续。
+      if (resume.awaitingStatus || inspectOnly) {
+        updateFolderResumeMessage(message.id, (current) => ({ ...current, text: "已核实服务端检查点；点击继续才会接续规划，未写入工作表。",
+          planningResume: current.planningResume ? { ...current.planningResume, awaitingStatus: false, status: "pending",
+            expectedRevision: taskStatus.revision, lastSequence: taskStatus.lastSequence,
+            pauseType: taskStatus.pauseType, reason: taskStatus.reason, extensionSeconds: taskStatus.extensionSeconds,
+            currentModelId: taskStatus.currentModelId, canSwitchModel: taskStatus.canSwitchModel,
+            availableModelConnections: taskStatus.availableModelConnections, requestId: undefined } : undefined }));
+        finishActivity("warning", "已核实检查点，等待你继续", "awaiting_input");
         return;
       }
 
@@ -2503,6 +2832,14 @@ export default function App() {
         taskStatus.sourceFingerprintSheets?.length
           ? taskStatus.sourceFingerprintSheets
           : resume.sourceFingerprintSheets;
+      if (workbook && sourceFingerprintSheets?.length &&
+          JSON.stringify([...sourceFingerprintSheets].sort()) !== JSON.stringify([...selectedNamesFor(workbook)].sort())) {
+        updateFolderResumeMessage(message.id, (current) => ({ ...current,
+          text: "原任务的授权工作表范围已变化；不会继续旧任务或读取已撤销授权的工作表。请按当前范围重新生成预览。",
+          planningResume: current.planningResume ? { ...current.planningResume, status: "failed" } : undefined }));
+        finishActivity("warning", "授权范围已变化，未继续旧任务");
+        return;
+      }
       if (
         sourceMode === "workbook" &&
         isRunningInExcel() &&
@@ -2598,29 +2935,39 @@ export default function App() {
       );
     } catch (reason) {
       if (isAbortError(reason)) {
+        const clientLastSequence = Math.max(resume.clientLastSequence ?? 0, getActivitySnapshot()?.sequence ?? 0);
         updateFolderResumeMessage(message.id, (current) => ({
           ...current,
           planningResume: current.planningResume
-            ? { ...current.planningResume, status: "pending", requestId }
+            ? { ...current.planningResume, status: "pending", requestId, awaitingStatus: true, clientLastSequence }
             : undefined
         }));
-        finishActivity("cancelled", "已停止接收进度，任务现场仍保留");
-        return;
+        if (pauseRequestedControllerRef.current === turnController) {
+          pauseRequestedControllerRef.current = null;
+          // 暂停续跑流后自动查一次；暂停查询本身则不递归查询。
+          if (!inspectOnly && !resume.awaitingStatus) inspectAfterPause = { ...message,
+            planningResume: { ...resume, status: "pending", requestId, awaitingStatus: true, clientLastSequence } };
+        }
+        finishActivity("warning", "已暂停接收进度，需核对原任务现场", "awaiting_input");
+      } else {
+        const detail = reason instanceof Error ? reason.message : String(reason);
+        if (isLocalServiceConnectionError(reason)) markServerOffline();
+        updateFolderResumeMessage(message.id, (current) => ({
+          ...current,
+          text: `查询或接续原任务失败：${detail} 需求和任务身份仍保留；先核对状态，不重复发送需求。`,
+          planningResume: current.planningResume
+            ? { ...current.planningResume, status: "pending", requestId, awaitingStatus: true,
+              clientLastSequence: Math.max(current.planningResume.clientLastSequence ?? 0, getActivitySnapshot()?.sequence ?? 0) }
+            : undefined
+        }));
+        finishActivity("warning", "继续任务时连接中断");
       }
-      const detail = reason instanceof Error ? reason.message : String(reason);
-      if (isLocalServiceConnectionError(reason)) markServerOffline();
-      updateFolderResumeMessage(message.id, (current) => ({
-        ...current,
-        text: `继续任务时连接中断：${detail} 已保存的进度仍然保留，可以使用同一按钮重试。`,
-        planningResume: current.planningResume
-          ? { ...current.planningResume, status: "pending", requestId }
-          : undefined
-      }));
-      finishActivity("warning", "继续任务时连接中断");
     } finally {
       if (turnAbortRef.current === turnController) turnAbortRef.current = null;
+      planningResumeInFlightRef.current = false;
       setStatus("idle");
     }
+    if (inspectAfterPause) await resumePlanningTaskFromMessage(inspectAfterPause, undefined, true);
   }
 
   function beginActivity(
@@ -2697,11 +3044,7 @@ export default function App() {
     setStatus("scanning");
     try {
       const snapshot = isRunningInExcel()
-        ? await captureWorkbookStructure(
-            sourceMode === "workbook" && workbookScopeMode === "manual"
-              ? selectedSheetNames
-              : undefined
-          )
+        ? await captureWorkbookCatalog()
         : demoWorkbook;
       setWorkbook(snapshot);
       applyWorkbookSnapshotSelection(snapshot);
@@ -2874,11 +3217,11 @@ export default function App() {
   }
 
   /**
-   * 会话丢失后按本地记录重建：拿 folderPath 重新扫盘，再重放工作表勾选。
+   * 会话丢失后按本地记录重建候选目录，只重放本面板会话明确确认过的授权。
    *
    * 后端会话存在纯内存字典里，开发期 --reload 一重启就清空。前端本地已经存了
-   * folderPath 和勾选（都在 localStorage），所以不需要后端持久化——重建让授权集合
-   * 重新由 create_folder_snapshot 推导出来，边界校验路径保持完整。
+   * localStorage 的勾选只是草稿，不能当授权。create_folder_snapshot 只恢复
+   * confirmedFolderScopeRef；新范围仍由「完成」显式提交。
    *
    * 重建**不掩盖数据变更**：新快照按当前文件状态重算 source_fingerprint，旧计划带的
    * 是生成时的指纹，执行时比对不一致仍会被拒，照旧走「数据已变」二次确认。
@@ -2886,7 +3229,12 @@ export default function App() {
   async function rebuildFolderSession(): Promise<FolderCatalog | null> {
     const folderPath = folderCatalog?.folderPath;
     if (!folderPath) return null;
-    const wantedKeys = folderSheetKeys;
+    const confirmedScope = confirmedFolderScopeRef.current;
+    const wantedKeys = confirmedScope?.root === folderRootIdentity(folderPath)
+      ? confirmedScope.keys : [];
+    const keepConfirmation = selectionConfirmed && wantedKeys.length > 0 &&
+      wantedKeys.length === folderSheetKeys.length &&
+      wantedKeys.every((key) => folderSheetKeys.includes(key));
     try {
       const rebuilt = await scanFolderByPath(folderPath);
       // fileId 是相对路径的 uuid5，跨会话稳定，所以旧 key 能直接在新 catalog 里匹配。
@@ -2912,7 +3260,7 @@ export default function App() {
         const snapshot = await createFolderSnapshot(rebuilt.sessionId, selections);
         setWorkbook(snapshot);
         setSelectedSheetNames(snapshot.worksheets.map((sheet) => sheet.name));
-        setSelectionConfirmed(true);
+        setSelectionConfirmed(keepConfirmation);
       }
       appendMessage({
         role: "system",
@@ -2922,6 +3270,7 @@ export default function App() {
     } catch (reason) {
       setFolderCatalog(null);
       setFolderSheetKeys([]);
+      setSelectionConfirmed(false);
       appendMessage({
         role: "system",
         text: `文件夹会话已失效且无法自动重建（${
@@ -2958,8 +3307,9 @@ export default function App() {
     refreshed: FolderCatalog,
     quiet: boolean
   ) {
+    setScopeConfirmationError("");
     const addedKeys = addedFolderSheetKeys(folderCatalog, refreshed);
-    applyFolderCatalog(refreshed);
+    applyFolderCatalog(refreshed, { preserveAuthorization: true });
     setRecentlyAddedFolderSheetKeys(addedKeys);
     if (addedKeys.length > 0) {
       const separator = addedKeys[0].indexOf("\0");
@@ -2985,8 +3335,10 @@ export default function App() {
   }
 
   async function refreshCurrentFolder(options: { quiet?: boolean } = {}) {
-    if (!folderCatalog || busy) return;
+    if (!folderCatalog || busy || scopeCommitLock.current) return;
     setStatus("scanning");
+    setScopeCatalogChecking(true);
+    setScopeConfirmationError("");
     try {
       const refreshed = await refreshFolder(folderCatalog.sessionId);
       applyFolderRefreshResult(refreshed, options.quiet ?? false);
@@ -3007,34 +3359,136 @@ export default function App() {
         });
       }
     } finally {
+      // Retry access checks even if the catalog is unchanged or refresh failed.
+      setScopeCatalogRevision((value) => value + 1);
+      setScopeCatalogChecking(false);
       setStatus("idle");
     }
   }
 
-  async function refreshWorkbook() {
-    if (busy) return;
+  /** 每次点「刷新」自增：作为图标的 `key`，换 key 即重挂载 → 旋转动画重放一次。 */
+  const [refreshSpin, setRefreshSpin] = useState(0);
+
+  /**
+   * 重新读取当前工作簿，把选择器拉回真实宿主。
+   *
+   * 返回读到的快照（失败/被挡时 `null`）——「从工作目录切回工作簿来源」要拿它重置名字草稿，
+   * 因为那时 `workbook` 与草稿都还是文件夹快照的「文件.xlsx › Sheet」复合名。
+   */
+  async function refreshWorkbook(
+    options: { spin?: boolean; ignoreBusy?: boolean } = {}
+  ): Promise<WorkbookSnapshot | null> {
+    // 先记一次点击反馈（放在最前面，`busy` 早退时同样要转）。
+    if (options.spin !== false) setRefreshSpin((value) => value + 1);
+    // `ignoreBusy` 只给「从工作目录切回工作簿来源」用：那一刻可能还有一次目录刷新在飞行中
+    // （打开面板就会静默刷一次），等它结束再读会把切回变成静默失效 —— 用户实测踩到的正是这个。
+    // 重读本身有 fileKey/fileRef 的一致性复核，并发重入最坏也只是把同一份真实宿主多写一遍。
+    if (!options.ignoreBusy && (busy || scopeCommitLock.current)) return null;
+    setScopeConfirmationError("");
     setStatus("scanning");
+    setScopeCatalogChecking(true);
     try {
+      const fileKey = isRunningInExcel() ? currentOfficeWorkbookIdentity() ?? null : null;
+      const fileRef = isRunningInExcel() ? Office.context.document : null;
       const refreshed = isRunningInExcel()
-        ? await captureWorkbook()
+        ? await captureWorkbookCatalog()
         : demoWorkbook;
-      setWorkbook(refreshed);
-      if (sourceMode === "workbook") {
-        applyWorkbookSnapshotSelection(refreshed);
+      if (isRunningInExcel()) {
+        if (fileKey !== (currentOfficeWorkbookIdentity() ?? null) || fileRef !== Office.context.document) {
+          throw new Error("文件在刷新期间发生变化，请重新刷新。");
+        }
+        scopePickerFile.current = { fileKey, fileRef };
+        setScopeCatalogRevision((value) => value + 1);
       }
+      setWorkbook(refreshed);
+      if (sourceMode === "workbook" && workbookScopeMode === "auto" &&
+          (selectedSheetNames.length !== 1 || selectedSheetNames[0] !== refreshed.activeWorksheet)) {
+        // Refresh updates the automatic draft, never grants a new scope. Manual
+        // selections (including missing items) remain for the user to resolve.
+        setSelectedSheetNames([refreshed.activeWorksheet]);
+      }
+      return refreshed;
     } catch (reason) {
+      scopePickerFile.current = null;
+      setScopeCatalogRevision((value) => value + 1);
+      setScopeConfirmationError("暂时无法读取目标，请刷新选择器；未变更授权。");
       appendMessage({
         role: "system",
         text: `刷新工作簿失败：${
           reason instanceof Error ? reason.message : String(reason)
         }`
       });
+      return null;
     } finally {
+      setScopeCatalogChecking(false);
       setStatus("idle");
     }
   }
 
+  /**
+   * 切换工作簿来源里的模式（跟随当前 / 选择多个）。
+   *
+   * **从「工作目录」切回来必须重新读一次真实宿主**：文件夹确认把 `workbook` 换成了
+   * 文件夹快照（表名是「文件.xlsx › Sheet」复合名），名字草稿也是它们 —— 直接用会把
+   * 这份快照当当前工作簿渲染，确认时全部「文件或工作表已不存在」（用户实测踩到的就是这个）。
+   * 所以这里先切来源（传 `null`，不从快照播种草稿），再借 `refreshWorkbook` 重读宿主：
+   * 跟随当前的草稿由它自动置为当前表；选择多个的草稿是"保留缺失项"语义，得在拿到
+   * 新快照后显式重置。已提交的授权不动 —— 要换成工作簿范围仍需用户按「确认」。
+   */
+  async function switchScopeMode(mode: "auto" | "manual"): Promise<void> {
+    if (sourceMode !== "folder") {
+      if (mode === "auto") chooseAutomaticScope(workbook);
+      else chooseManualScope(workbook);
+      return;
+    }
+    if (mode === "auto") chooseAutomaticScope(null);
+    else chooseManualScope(null);
+    if (scopeCommitLock.current) return;
+    // 重读真实宿主不受 `busy` 闸拦：切回工作簿来源的那一刻，打开面板触发的目录刷新
+    // 可能仍在飞行中（`busy=true`），等它结束再读会把切回变成静默失效。`refreshWorkbook`
+    // 用 `ignoreBusy` 放行这一次，重读内部仍有 fileKey/fileRef 的一致性复核兜底。
+    const refreshed = await refreshWorkbook({ spin: false, ignoreBusy: true });
+    if (refreshed && mode === "manual") {
+      setSelectedSheetNames([refreshed.activeWorksheet]);
+    }
+  }
+
+  /**
+   * 工作簿动作条的「取消」：草稿退回已提交授权，并**关闭弹层** —— 与 WPS 的
+   * `discardScopeEdit` 同一条出口语义（用户裁决 2026-10-16：取消即离开，不是"看看"）。
+   *
+   * 已提交授权一字不改；要作废/更换授权仍需重新确认。
+   */
+  function discardWorkbookScopeEdit(): void {
+    if (scopeCommitLock.current || scopeCheckingCommit) return;
+    cancelScopeEdit();
+    setContextOpen(false);
+  }
+
+  /**
+   * 工作目录页脚的「取消」：草稿回到**已提交**的授权，已提交一字不改，并关闭弹层。
+   *
+   * 与 WPS 文件夹页脚的「取消」逐字同形（那边走 `discardScopeEdit`：退回 + 关闭），
+   * 与工作簿侧 `discardWorkbookScopeEdit` 也是同一件事 —— 只是各自回退自己那份草稿。
+   *
+   * 判据 `folderDraftDirty` 与这里的回退读的是**同一个** `confirmedFolderKeys` ——
+   * 免得出现"按钮因为草稿差异而出现，点下去却回退到另一份键"。
+   */
+  function cancelFolderScopeEdit(): void {
+    if (scopeCommitLock.current) return;
+    setFolderSheetKeys(confirmedFolderKeys);
+    cancelScopeEdit();
+    setContextOpen(false);
+  }
+
   async function confirmSheetSelection() {
+    if (scopeCommitLock.current || !scopeAdmission.canCommit) return;
+    scopeCommitLock.current = true;
+    setScopeCheckingCommit(true);
+    setScopeConfirmationError("");
+    try {
+      const checked = await scopeAdmission.verify();
+      if (!checked) return;
     if (sourceMode === "folder") {
       if (!folderCatalog || folderSheetKeys.length === 0) return;
       setStatus("scanning");
@@ -3061,7 +3515,7 @@ export default function App() {
           currentWorkbookPath === selectedFilePath
         ) {
           try {
-            const nameSnapshot = await captureWorkbook();
+            const nameSnapshot = await captureWorkbookCatalog();
             const actualNames = new Map(
               nameSnapshot.worksheets.map((sheet) => [
                 sheet.name.toLocaleLowerCase(),
@@ -3072,7 +3526,17 @@ export default function App() {
               .map((name) => actualNames.get(name.toLocaleLowerCase()))
               .filter((name): name is string => name !== undefined);
             if (selectedNames.length === selections[0].sheets.length) {
+              const officeCheck = await inspectOfficeScopeAdmission(selectedNames);
+              if (!admissionComplete(selectedNames, officeCheck) || !officeCheck.target) {
+                setScopeConfirmationError("当前打开的工作簿暂时无法核实，请刷新后重试；未变更授权。");
+                return;
+              }
               const snapshot = await captureWorkbook(selectedNames);
+              const after = await inspectOfficeAuthorizedTarget(selectedNames);
+              if (checkAuthorizedTarget(officeCheck.target, after) !== "same" || officeCheck.target.fileRef !== after.fileRef) {
+                setScopeConfirmationError("目标在确认期间发生变化，请刷新后重新选择；未变更授权。");
+                return;
+              }
               const snapshotNames = new Set(
                 snapshot.worksheets.map((sheet) =>
                   sheet.name.toLocaleLowerCase()
@@ -3084,6 +3548,7 @@ export default function App() {
                 )
               ) {
                 setWorkbook(snapshot);
+                targetGuard.bind(after);
                 adoptCurrentWorkbookScope(snapshot, selectedNames);
                 setContextOpen(false);
                 appendMessage({
@@ -3101,6 +3566,12 @@ export default function App() {
           folderCatalog.sessionId,
           (sessionId) => createFolderSnapshot(sessionId, selections)
         );
+        const root = folderRootIdentity(folderCatalog.folderPath);
+        if (!root) throw new Error("无法核实工作目录身份，请重新选择目录。");
+        confirmedFolderScopeRef.current = {
+          root,
+          keys: selections.flatMap((selection) => selection.sheets.map((name) => folderSheetKey(selection.fileId, name)))
+        };
         setWorkbook(snapshot);
         setSelectedSheetNames(snapshot.worksheets.map((sheet) => sheet.name));
         setSelectionConfirmed(true);
@@ -3109,10 +3580,7 @@ export default function App() {
         const message = reason instanceof Error ? reason.message : "读取所选工作表失败";
         // 会话失效的分支已由 withFolderSessionRecovery 处理（重建失败时它已提示重选）。
         if (!isFolderSessionLost(message)) {
-          appendMessage({
-            role: "system",
-            text: message
-          });
+          setScopeConfirmationError(message);
         }
       } finally {
         setStatus("idle");
@@ -3121,8 +3589,30 @@ export default function App() {
     }
 
     if (!workbook || selectedSheetNames.length === 0) return;
+    if (isRunningInExcel()) {
+      setScopeConfirmationError("");
+      try {
+        if (!(await confirmOfficeAuthorizedScope(
+          workbookScopeMode === "auto" ? null : selectedSheetNames,
+          (target) => targetGuard.confirmScope(target, { continuePendingAnalysis: true }), checked.target
+        ))) {
+          setScopeConfirmationError("暂时无法核实目标，请刷新后重试；未变更授权。");
+          return;
+        }
+        // Target-dialog adoption defaults to manual; the range picker must retain
+        // the automatic/manual mode explicitly chosen for this confirmation.
+        setWorkbookScopeMode(workbookScopeMode);
+      } catch {
+        setScopeConfirmationError("暂时无法读取目标身份，请刷新后重试；未变更授权。");
+        return;
+      }
+    }
     setSelectionConfirmed(true);
     setContextOpen(false);
+    } finally {
+      scopeCommitLock.current = false;
+      setScopeCheckingCommit(false);
+    }
   }
 
   function buildIntentScope(
@@ -3217,11 +3707,19 @@ export default function App() {
       "正在按规则计算目标列",
       "使用与 WPS、服务端同一套确定性映射实现，在本机逐格计算。"
     );
-    return buildColumnMappingPlan(rule, sheet, {
-      summary: response.summary,
-      warnings: response.warnings ?? [],
-      assumptions: response.assumptions ?? []
-    });
+    /*
+     * 实际来源依赖 = **刚才真的读过的那张表**（`readSheetUsedRange(rule.sourceSheet)`），
+     * 这是确定性本地读取的记账，不是模型声明的参数，也不是"授权范围减目标"。
+     * 映射规则的目标列通常就落在同一张表上 → 读写重叠 → 照旧不登记断点恢复。
+     */
+    return attestSourceDependency(
+      buildColumnMappingPlan(rule, sheet, {
+        summary: response.summary,
+        warnings: response.warnings ?? [],
+        assumptions: response.assumptions ?? []
+      }),
+      { origin: "deterministic-local-read", sheets: [rule.sourceSheet] }
+    );
   }
 
   /** 空白策略未定且**真读到空白**：结构化澄清，不是报错，也不替用户挑默认值。 */
@@ -3405,11 +3903,14 @@ export default function App() {
     turnId?: string | null,
     planningReadPolicy: "ifNeeded" | "none" = sourceMode === "workbook" ? "none" : "ifNeeded",
     /** 这一轮的澄清轮次。列映射的澄清卡要沿用同一个计数，不能各自从 0 起。 */
-    clarificationRound = 0
+    clarificationRound = 0,
+    taskContext?: AgentTaskContext,
+    planningGoal?: "read_only" | "write_preview"
   ): Promise<TurnPlanningOutcome> {
     if (!workbook) return "skipped";
     if (!(await targetGuard.checkForAnalysis())) return "skipped";
     let activityOutcome: TurnPlanningOutcome = "planned";
+    const planningController = turnAbortRef.current;
     planningReadPolicy = planningReadPolicyForModel(effectiveModelId, planningReadPolicy);
     setStatus("planning");
     if (turnId) bindActivityOperation(turnId);
@@ -3488,8 +3989,82 @@ export default function App() {
       const activeWorksheetIsSelected = effectiveSheetNames.includes(
         latestWorkbook.activeWorksheet
       );
+      /*
+       * 桥宿主现场：**执行那一刻**重读，不是规划启动时的快照。
+       * 旧实现把 `latestWorkbook` / `effectiveSheetNames` 闭包进来，等价于用一
+       * 个静止的现场去"证明"等待期间什么都没变 —— 用户收窄/撤销授权、换簿、
+       * 改源值全都漏过去。这里改成真的重读：
+       *   - 身份：`currentOfficeWorkbookIdentity()`（读当前 Office 上下文）
+       *   - 来源指纹：`captureWorkbookSourceFingerprint`（真读单元格内容）
+       *   - 当前授权：`committedSheetNamesRef`（用户此刻已确认的范围）
+       *   - 活动表：`captureSelectionContext()`
+       * 读不到就如实降级（指纹置 null）—— 复核绝不对"读不到"下"没变化"的结论。
+       */
+      bridgeLiveContextRef.current = async () => {
+        const scopeNames = [...committedSheetNamesRef.current];
+        let sourceFingerprint: string | null = null;
+        let activeWorksheet = "";
+        try {
+          activeWorksheet = (await captureSelectionContext()).activeWorksheet;
+        } catch {
+          activeWorksheet = "";
+        }
+        try {
+          sourceFingerprint = await captureWorkbookSourceFingerprint(scopeNames);
+        } catch {
+          sourceFingerprint = null;
+        }
+        return {
+          workbookIdentity: bridgeWorkbookIdentity(
+            latestWorkbook.name,
+            currentOfficeWorkbookIdentity() ?? null
+          ),
+          sourceFingerprint,
+          authorizedSheetNames: scopeNames,
+          activeWorksheet
+        };
+      };
+      /*
+       * 本轮的**来源基线**（身份 + 来源指纹）取自上面这个读取器本身，不能另起一份。
+       *
+       * WPS 侧早就是这么接的：先读一次现场，把 name / 身份 / 指纹一起交给桥。
+       * Excel 侧原来交的是**快照**上的 `workbookIdentity` / `sourceFingerprint`，
+       * 而这两者与复核读到的值根本不在一个口径上：
+       *   - 身份：快照上的身份过去没有任何捕获点写入（恒为空），只配到"文件名兜底"，
+       *     复核读到的却是 `url:`/路径身份 —— 同一个工作簿自比不自等；
+       *   - 指纹：快照指纹由 `sourceFingerprintForSnapshot` 产出（`fnv1a32:`），
+       *     复核用的是 `captureWorkbookSourceFingerprint`（`fnv1a32x2:`），
+       *     连算法都不同，永远不可能相等。
+       * 于是复核必然判"换了一个工作簿/来源已变化"，工具桥在真实工作簿上永远读不到
+       * 数据；读不到就没有"本机实际读过哪些表"的可信记账，写侧的断点恢复登记
+       * 也就永远不可达。这里把基线固定成"复核将要读的那一份"。
+       *
+       * 同一个值还要交给规划请求：服务端按 `workbook.workbookIdentity`/
+       * `sourceFingerprint` 建立桥绑定与授权归属，也会拿它跟回执里的指纹比
+       * （与本地复核是同一判据）。三处必须是**同一个值**，否则链上总有一处
+       * 会判来源变化。
+       */
+      let turnSourceBaseline: SdkBridgeLiveContext | null = null;
+      try {
+        turnSourceBaseline = await bridgeLiveContextRef.current();
+      } catch {
+        /*
+         * 读不到现场（例如 Office 上下文已失效）：不把整轮规划打掉，也**绝不**
+         * 假装"什么都没变"。退回原有的保守路径 —— 规划请求与桥绑定照旧，而
+         * 执行前的复核会因为读不到现场而一律拒绝（fail-closed）。
+         */
+        turnSourceBaseline = null;
+      }
       const requestWorkbook: WorkbookSnapshot = {
         ...latestWorkbook,
+        // 身份/指纹/覆盖范围一律采信"复核将读到的那一份"，不采信快照（理由见上）。
+        ...(turnSourceBaseline
+          ? {
+              workbookIdentity: turnSourceBaseline.workbookIdentity,
+              sourceFingerprint: turnSourceBaseline.sourceFingerprint,
+              sourceFingerprintSheets: [...turnSourceBaseline.authorizedSheetNames]
+            }
+          : {}),
         activeWorksheet: activeWorksheetIsSelected
           ? latestWorkbook.activeWorksheet
           : effectiveSheetNames[0],
@@ -3515,10 +4090,38 @@ export default function App() {
       completeCurrentStep("已准备规划请求", {
         detail: "已核对本轮授权范围并整理请求；尚未生成预览或写入工作表。"
       });
+      // 任务 ID 必须由本端确定：缺省时服务端会自己生成，客户端就再也对不上桥。
+      const planningTurnId = turnId?.trim() || `turn-${messageId()}`;
+      await sdkBridge.begin({
+        taskId: planningTurnId,
+        workbookName: plannedWorkbook.name,
+        // 与规划请求、与执行前复核读到的**同一份**基线（见上面 `turnSourceBaseline`）；
+        // 读不到现场时退回快照值，复核会因为读不到而 fail-closed。
+        workbookIdentity:
+          turnSourceBaseline?.workbookIdentity ??
+          plannedWorkbook.workbookIdentity ??
+          null,
+        sourceFingerprint:
+          turnSourceBaseline?.sourceFingerprint ??
+          plannedWorkbook.sourceFingerprint ??
+          null,
+        signal: turnAbortRef.current?.signal,
+        liveContext: () => bridgeLiveContextRef.current(),
+        onProgress: ({ scannedRows, totalRows, sheet }) => {
+          updateActivityDetail(
+            `正在读取「${sheet}」：${scannedRows.toLocaleString()} / ${totalRows.toLocaleString()} 行`
+          );
+        },
+        onError: () => {
+          updateActivityDetail("本地查询未完成，已把固定错误码交回模型继续。");
+        }
+      });
       const response = await streamAssistantResponse(
         {
-          turnId,
+          turnId: planningTurnId,
           prompt: confirmedPrompt,
+          planningGoal: planningGoal ?? (intentMemory?.toolRequest || dataResults.length > 0 ? "read_only" : undefined),
+          taskContext: taskContext ?? createAgentTaskContext(confirmedPrompt),
           workbook: plannedWorkbook,
           lastResult: planningReadPolicy === "none" && dataResults.length === 0 ? null : lastResult,
           images: sentImages.map(({ name, mediaType, data }) => ({
@@ -3534,7 +4137,11 @@ export default function App() {
         },
         {
           signal: turnAbortRef.current?.signal,
-          onProgress: applyProgressEvent
+          // 规划流里的 bridgeTool 指针交给本机桥：轮询→复核授权→读表→回执。
+          onProgress: (event) => {
+            applyProgressEvent(event);
+            sdkBridge.handleProgressEvent(event);
+          }
         }
       );
       markServerOnline();
@@ -3555,11 +4162,12 @@ export default function App() {
           planningResume: {
             turnId: response.turnId,
             originalPrompt: confirmedPrompt,
+            taskContext,
             activityMessageId:
               planningActivity?.persistenceKey ??
               activeActivityMessageIdRef.current ??
               undefined,
-            clientLastSequence: response.lastSequence,
+            clientLastSequence: Math.min(planningActivity?.sequence ?? 0, response.lastSequence),
             expectedRevision: response.revision,
             lastSequence: response.lastSequence,
             status: "pending",
@@ -3589,7 +4197,7 @@ export default function App() {
         // A completed planning invocation has an immutable request fingerprint.
         // The user's answers start a fresh invocation with the full original request.
         await continueIntentDecision({ ...response, turnId: undefined }, confirmedPrompt, sentImages,
-          intentScopeFingerprint(latestScope), clarificationMessageId, clarificationRound + 1, 0, planningReadPolicy);
+          intentScopeFingerprint(latestScope), clarificationMessageId, clarificationRound + 1, 0, planningReadPolicy, taskContext);
         finishActivity("completed", "等待你补充信息；本次没有写入", "awaiting_input");
         activityOutcome = "skipped";
         return activityOutcome;
@@ -3603,10 +4211,24 @@ export default function App() {
         const querySourceSheetIds = currentWorksheets
           .map((sheet) => sheet.sourceSheetId)
           .filter((value): value is string => Boolean(value));
+        const localResultBinding = sdkBridge.binding();
         appendMessage({
           role: "assistant",
           text: response.message,
           resultContext: response.resultContext ?? undefined,
+          // SDK 本地结果卡：只带引用与结构，值由本机回环按引用取回后渲染。
+          localResult: response.localResult ?? undefined,
+          // 会话关闭后服务端按授权归属校验，所以要带上**这一轮**的绑定。
+          localResultBinding:
+            response.localResult && localResultBinding
+              ? {
+                  taskId: localResultBinding.taskId,
+                  hostId: localResultBinding.hostId,
+                  workbookName: localResultBinding.workbookName,
+                  workbookIdentity: localResultBinding.workbookIdentity,
+                  sourceFingerprint: localResultBinding.sourceFingerprint
+                }
+              : undefined,
           intentMemory,
           ...(dataResults.length > 0
             ? {
@@ -3656,13 +4278,13 @@ export default function App() {
             role: "assistant",
             text: response.summary,
             intentMemory,
-            clarification: columnMappingClarificationMessage({
+            clarification: { ...columnMappingClarificationMessage({
               clarification: response.rule.clarification,
               scopeLabel: `${response.rule.sourceSheet}!${response.rule.sourceRange}`,
               originalPrompt: confirmedPrompt,
               scopeFingerprint: intentScopeFingerprint(latestScope),
               round: clarificationRound + 1
-            }),
+            }), taskContext },
             provider: response.provider
           });
           activityOutcome = "skipped";
@@ -3701,11 +4323,28 @@ export default function App() {
           sourceMode === "workbook" && isRunningInExcel()
             ? await captureWorkbookSourceFingerprint(effectiveSheetNames)
             : latestWorkbook.sourceFingerprint;
-        const plan: AnalysisPlan = {
+        /*
+         * 计划来自服务端（SDK 编译结果），来源依赖**不能采信它自报的**：只认本端
+         * 这一轮桥上的确定性读取记录（`recordTrustedToolReads` 在执行器读完那一刻
+         * 记账）。没有记录 = 依赖不确定 = 删掉该字段，恢复登记退回既有保守口径。
+         *
+         * 例外是**由本地结果编译出的计划**（带 `localResultRef`）：它的来源由服务端
+         * 按"实际交给执行器的输入句柄"认定，比本端"本轮读过谁"的并集更精确
+         * （本轮可能读过 A/B 却只把 A 交给执行器）。两侧取**交集**：既要有服务端
+         * 的结果依赖声明，又要有本端真的读过它的凭据。
+         */
+        const trustedReads = trustedToolReads(planningTurnId);
+        const basePlan: AnalysisPlan = {
           ...response.plan,
           sourceFingerprint,
           sourceFingerprintSheets: effectiveSheetNames
         };
+        const plan: AnalysisPlan = basePlan.localResultRef
+          ? attestResultSourceDependency(
+              basePlan,
+              trustedReads ? [trustedReads] : []
+            )
+          : attestSourceDependency(basePlan, trustedReads);
         appendMessage({
           role: "assistant",
           text: plan.summary,
@@ -3715,25 +4354,28 @@ export default function App() {
         });
       }
     } catch (reason) {
-      // 用户在生成方案途中打断：静默退出，已吐出的 step 留作上下文。
-      if (isAbortError(reason)) {
+      const manualPause = isAbortError(reason) && pauseRequestedControllerRef.current === planningController;
+      if (isAbortError(reason) && !manualPause) {
         activityOutcome = "aborted";
         setStatus("idle");
         return "aborted";
       }
-      setPendingImages(sentImages);
-      if (isLocalServiceConnectionError(reason)) {
+      if (manualPause) {
+        pauseRequestedControllerRef.current = null;
+      } else setPendingImages(sentImages);
+      if (!manualPause && isLocalServiceConnectionError(reason)) {
         markServerOffline();
         markActivityInterrupted("连接中断，执行结果待确认。");
       } else {
         markServerOnline();
       }
-      if (isLocalServiceConnectionError(reason) && turnId) {
+      if ((manualPause || isLocalServiceConnectionError(reason)) && turnId) {
         const planningActivity = getActivitySnapshot();
-        appendMessage({
+        const pausedMessage: Omit<ChatMessage, "id" | "createdAt"> = {
           role: "assistant",
           provider: "system",
-          text: "连接中断，但服务端可能已经保存了规划现场。恢复连接后可在这里核对并继续。",
+          text: manualPause ? "已暂停接收进度；需求已保留。先核对原任务，确认检查点后再继续。未写入工作表。"
+            : "连接中断，但服务端可能已经保存了规划现场。恢复连接后可在这里核对并继续。",
           intentMemory,
           planningResume: {
             turnId,
@@ -3748,8 +4390,10 @@ export default function App() {
             expectedRevision: 1,
             lastSequence: Math.max(0, planningActivity?.sequence ?? 0),
             status: "pending",
-            reason: "连接中断，等待恢复后核对任务状态。",
+            awaitingStatus: true,
+            reason: manualPause ? "主动暂停，等待核对任务状态。" : "连接中断，等待恢复后核对任务状态。",
             originalPrompt: confirmedPrompt,
+            taskContext,
             extensionSeconds: 0,
             activeElapsedSeconds: 0,
             pauseType: "interrupted",
@@ -3757,13 +4401,20 @@ export default function App() {
             sourceFingerprint: workbook.sourceFingerprint,
             sourceFingerprintSheets: selectedNamesFor(workbook)
           }
-        });
+        };
+        const pausedMessageId = appendMessage(pausedMessage);
         finishActivity(
           "warning",
-          "连接中断，执行结果待确认。",
-          "interrupted"
+          manualPause ? "已暂停，等待核对检查点" : "连接中断，执行结果待确认。",
+          manualPause ? "awaiting_input" : "interrupted"
         );
-        activityOutcome = "failed";
+        activityOutcome = manualPause ? "skipped" : "failed";
+        if (manualPause) await resumePlanningTaskFromMessage({ ...pausedMessage, id: pausedMessageId,
+          createdAt: new Date().toISOString() }, undefined, true);
+      } else if (manualPause) {
+        appendMessage({ role: "system", text: "已暂停；尚未形成可续跑检查点，不能从断点继续。原需求保留在对话中，如需处理请重新开始；未修改工作表。" });
+        finishActivity("warning", "尚未形成可续跑检查点", "awaiting_input");
+        activityOutcome = "skipped";
       } else {
         appendMessage({
           role: "system",
@@ -3777,6 +4428,8 @@ export default function App() {
         activityOutcome = "failed";
       }
     } finally {
+      // 本轮结束：停止桥轮询。服务端的结果登记有独立保留期，结果卡仍可取回值。
+      sdkBridge.end();
       setStatus("idle");
     }
     return activityOutcome;
@@ -3787,7 +4440,8 @@ export default function App() {
     sentImages: PendingImage[],
     expectedScopeFingerprint: string,
     clarificationMessageId?: string,
-    correctionAttempt = 0
+    correctionAttempt = 0,
+    taskContext?: AgentTaskContext
   ): Promise<TurnPlanningOutcome> {
     if (!workbook) return "skipped";
     if (!(await targetGuard.checkForAnalysis())) return "skipped";
@@ -3813,7 +4467,7 @@ export default function App() {
             confirmedPrompt: intent.confirmedPrompt,
             toolRequest: intent.request
           },
-          intent.turnId
+          intent.turnId, "none", 0, taskContext, intent.planningGoal ?? "read_only"
         );
       } catch (reason) {
         appendMessage({
@@ -3840,7 +4494,10 @@ export default function App() {
           confirmedPrompt: intent.confirmedPrompt,
           toolRequest: intent.request
         },
-        intent.turnId
+        intent.turnId,
+        sourceMode === "workbook" ? "none" : "ifNeeded",
+        0,
+        taskContext, intent.planningGoal ?? "read_only"
       );
     }
     setStatus("tooling");
@@ -3917,6 +4574,32 @@ export default function App() {
         finishActivity("warning", "数据范围已变化，本次没有继续", "warning");
         return "skipped";
       }
+      /*
+       * SDK 适配器：本地**不预置**计算结果。
+       *
+       * SDK 只拿得到表结构，模型要自己调 query_table 经本机桥在真实宿主上执行
+       * 确定性查询。若这里仍把算好的结果塞进 dataResults，服务端的"不上传数据行"
+       * 守卫会直接拒绝整条请求，新工具桥就永远拿不到执行权。读表与计算推迟到
+       * 桥指针回来那一刻（`sdkBridge.handleProgressEvent`）。
+       */
+      if (isSdkPlanningModel(effectiveModelId)) {
+        setWorkbook(liveWorkbook);
+        setSelectedSheetNames(effectiveSheetNames);
+        setStatus("idle");
+        return await analyzeConfirmedIntent(
+          intent.confirmedPrompt,
+          sentImages,
+          undefined,
+          clarificationMessageId,
+          [],
+          liveWorkbook,
+          {
+            confirmedPrompt: intent.confirmedPrompt,
+            toolRequest: intent.request
+          },
+          intent.turnId, "none", 0, taskContext, intent.planningGoal ?? "read_only"
+        );
+      }
       // 二级命中：结构化意图相同且数据未变时，跳过本地全表扫描直接复用结论。
       if (!forceRecomputeRef.current) {
         const intentKey = normalizeIntentKey(
@@ -3975,7 +4658,7 @@ export default function App() {
           confirmedPrompt: intent.confirmedPrompt,
           toolRequest: intent.request
         },
-        intent.turnId
+        intent.turnId, "none", 0, taskContext, intent.planningGoal ?? "read_only"
       );
     } catch (reason) {
       recordDiagnosticEvent({
@@ -4008,6 +4691,7 @@ export default function App() {
           const corrected = await checkIntent({
             turnId: intent.turnId,
             prompt: intent.confirmedPrompt,
+            taskContext,
             scope: correctionScope,
             imageCount: sentImages.length,
             intentConfirmed: true,
@@ -4047,7 +4731,9 @@ export default function App() {
             expectedScopeFingerprint,
             clarificationMessageId,
             1,
-            correctionAttempt + 1
+            correctionAttempt + 1,
+            sourceMode === "workbook" ? "none" : "ifNeeded",
+            taskContext
           );
         } catch {
           // Fall through to the user-facing tool error below.
@@ -4076,7 +4762,8 @@ export default function App() {
     clarificationMessageId?: string,
     clarificationRound = 0,
     correctionAttempt = 0,
-    planningReadPolicy: "ifNeeded" | "none" = sourceMode === "workbook" ? "none" : "ifNeeded"
+    planningReadPolicy: "ifNeeded" | "none" = sourceMode === "workbook" ? "none" : "ifNeeded",
+    taskContext: AgentTaskContext = createAgentTaskContext(originalPrompt)
   ): Promise<TurnPlanningOutcome> {
     if (intent.kind === "conversation") {
       appendMessage({ role: "assistant", provider: intent.provider, text: intent.message });
@@ -4095,6 +4782,7 @@ export default function App() {
           turnId: intent.turnId ?? undefined,
           planningReadPolicy: planningReadPolicyForModel(effectiveModelId, planningReadPolicy),
           originalPrompt,
+          taskContext,
           scopeFingerprint,
           hadImages: sentImages.length > 0,
           round: clarificationRound,
@@ -4109,7 +4797,8 @@ export default function App() {
         sentImages,
         scopeFingerprint,
         clarificationMessageId,
-        correctionAttempt
+        correctionAttempt,
+        taskContext
       );
     }
     return analyzeConfirmedIntent(
@@ -4124,7 +4813,9 @@ export default function App() {
       },
       intent.turnId,
       planningReadPolicy,
-      clarificationRound
+      clarificationRound,
+      taskContext,
+      intent.planningGoal ?? "write_preview"
     );
   }
 
@@ -4258,6 +4949,11 @@ export default function App() {
   ) {
     const clarification = message.clarification;
     if (!clarification || clarification.status !== "pending" || busy || preparingImages) return;
+    if (sourceMode === "folder" && !folderCatalog) {
+      setContextOpen(true);
+      appendMessage({ role: "system", text: "请先在上方「数据范围」中选择文件夹和工作表。" });
+      return;
+    }
     if (!(await targetGuard.check())) return;
     if (clarification.localMapping) return; // 只走本地结构化补全，绝不把源值送进模型澄清。
     if (!resolution.trim()) return;
@@ -4276,6 +4972,17 @@ export default function App() {
       setModelMenuOpen(true);
       return;
     }
+    let taskContext: AgentTaskContext;
+    try {
+      taskContext = confirmAgentTaskDecision(
+        clarification.taskContext ?? createAgentTaskContext(clarification.originalPrompt),
+        { questionId: clarification.id, label: clarification.summary.slice(0, capabilities.taskContext.maxLabelChars) || "补充说明", value: resolution },
+        resolutionMode
+      );
+    } catch (error) {
+      appendMessage({ role: "system", text: error instanceof Error ? error.message : "请检查补充说明，原表未写入。" });
+      return;
+    }
     setMessages((current) =>
       current.map((item) =>
         item.id === message.id && item.clarification
@@ -4283,6 +4990,10 @@ export default function App() {
               ...item,
               clarification: {
                 ...item.clarification,
+                // Save explicit semantics before the model request: a failed
+                // request must not erase the answer or duplicate it on retry.
+                taskContext,
+                originalPrompt: taskContext.originalPrompt,
                 status: "resolving"
               }
             }
@@ -4291,11 +5002,7 @@ export default function App() {
     );
     setPendingImages([]);
     setImageError("");
-    const confirmedPrompt = resolveConfirmedPrompt(
-      clarification.originalPrompt,
-      resolution,
-      resolutionMode
-    );
+    const confirmedPrompt = renderConfirmedPrompt(taskContext.originalPrompt, taskContext.confirmations);
     if (!workbook) return;
     const sheetNames = selectedNamesFor(workbook);
     const scope = buildIntentScope(workbook, sheetNames);
@@ -4344,6 +5051,7 @@ export default function App() {
             {
               turnId: clarification.turnId,
               prompt: confirmedPrompt,
+              taskContext,
               scope,
               imageCount: sentImages.length,
               intentConfirmed: true,
@@ -4418,7 +5126,8 @@ export default function App() {
             clarification.round + 1
           ),
           0,
-          clarification.planningReadPolicy ?? (finalSelection ? "none" : "ifNeeded")
+          clarification.planningReadPolicy ?? (finalSelection ? "none" : "ifNeeded"),
+          taskContext
         );
       } else {
         advanceActivity(
@@ -4438,7 +5147,8 @@ export default function App() {
             clarification.round + 1
           ),
           0,
-          clarification.planningReadPolicy ?? (finalSelection ? "none" : "ifNeeded")
+          clarification.planningReadPolicy ?? (finalSelection ? "none" : "ifNeeded"),
+          taskContext
         );
         // 规划失败时已在内部以失败收尾，这里不再覆盖成「已完成」。
         if (shouldFinishActivityAsCompleted(outcome)) {
@@ -4551,11 +5261,12 @@ export default function App() {
     setContextOpen(true);
   }
 
-  // 纯停止：掐掉当前 turn，不再重跑。清掉待转向文本与被打断意图，避免误触发重跑或串味。
+  // 暂停规划接收，不自动重跑；保存任务身份后仍须核对服务端检查点。
   function stopTurn() {
     pendingSteerRef.current = null;
     steerBasePromptRef.current = null;
-    markActivityInterrupted("已停止接收进度，执行结果待确认。");
+    pauseRequestedControllerRef.current = turnAbortRef.current;
+    markActivityInterrupted("已暂停接收进度，等待核对检查点。");
     turnAbortRef.current?.abort();
     queryAbortRef.current?.abort();
   }
@@ -4887,6 +5598,13 @@ export default function App() {
   async function sendMessage(options?: {
     forceRecompute?: boolean;
     overrideText?: string;
+    messageUnderstanding?: Awaited<ReturnType<typeof understandMessage>>;
+    /**
+     * 这次进来是「操作目标确认之后」的回调重入（`retrySendRef`），不是用户又发了一遍。
+     * 那句话**已经**在对话里、输入框也**已经**清空，不能再送一遍。
+     * 与 WPS 的 `targetConfirmedRetry` 同义（`WpsAgentPanel.tsx`）。
+     */
+    targetConfirmedRetry?: boolean;
   }) {
     const enteredText = (options?.overrideText ?? prompt).trim();
     const text =
@@ -4894,13 +5612,12 @@ export default function App() {
       (pendingImages.length > 0
         ? "请结合附件图片分析当前工作簿，并说明发现的问题。"
         : "");
-    if (!workbook || !text || text.length < 2 || busy || preparingImages) return;
+    if (!text || text.length < 2 || busy || preparingImages) return;
     if (pendingImages.length && !supportsVision) {
       setImageError("当前模型不支持图片，请切换到支持视觉输入的模型后发送。附件已保留。");
       setModelMenuOpen(true);
       return;
     }
-    if (!(await targetGuard.checkForAnalysis(() => retrySendRef.current(text)))) return;
     // 续聊前的旧记录闸。这条历史在读取时就被脱敏过（真凭据不会进入界面、内存
     // 或请求），同时被登记进 `legacyCredentialConversationIds`。判据是那个
     // **持久标记**，不是"文本里还能不能匹配到凭据" —— 后者在脱敏那一刻就永远
@@ -4921,9 +5638,43 @@ export default function App() {
     if (enteredText.startsWith("/function ") && pendingImages.length === 0) {
       const description = enteredText.slice("/function ".length).trim();
       if (description) {
+        if (!(await targetGuard.checkForAnalysis(() => retrySendRef.current(text)))) return;
         await handleFunctionCommand(description);
         return;
       }
+    }
+    // —— 受理即送达 ——
+    //
+    // 拿到这句话就把它送进对话、并清空输入框，**不等「理解消息」跑完**。
+    // 「理解消息」是一次模型往返，后面还夹着操作目标核对与授权表结构读取，可能要等几秒。
+    // 这期间输入框里还留着这句话会有两个后果：
+    // ① 运行中的发送键停在「打断并补充」（↑）而不是「暂停」（■）——用户再按一次
+    //    Enter 就会拿着**同一句**去转向重跑；
+    // ② 对话里看不到自己刚发的话，看起来像"还没发出去"。
+    //
+    // 两处例外不能在这里提前送：
+    // - **回答澄清卡**（`resolveClarification`）：那句回答由澄清卡承载，不由这里另起气泡；
+    // - **目标确认后的回调重入**（`targetConfirmedRetry`）：上一次调用已经送过了。
+    //
+    // 下面两个 `find` 只读 `messages` 与 `enteredText`，提前到这里取值不会变
+    // ——后面「取消本地映射澄清 / 按补充回答继续」两段逻辑仍留在原位，不搬家。
+    const pendingLocalMapping = [...messages]
+      .reverse()
+      .find((message) => message.clarification?.status === "pending" && message.clarification.localMapping);
+    const pendingClarification = [...messages]
+      .reverse()
+      .find(
+        (message) =>
+          message.clarification?.status === "pending" && !message.clarification.localMapping
+      );
+    const answeringClarification = Boolean(enteredText) && Boolean(pendingClarification);
+    if (!answeringClarification && options?.targetConfirmedRetry !== true) {
+      appendMessage({
+        role: "user",
+        text: enteredText || "请结合附件图片分析当前工作簿。",
+        attachmentNames: pendingImages.map((image) => image.name)
+      });
+      setPrompt("");
     }
     // 转向重跑：把被打断那句的意图并进这句，让 checkIntent 收到完整承接式需求。
     // 仅影响送模型与缓存的意图文本（intentText），气泡仍只显示用户实际输入（text）。
@@ -4937,17 +5688,122 @@ export default function App() {
       !standaloneStructuralIntent && steerBasePrompt && steerBasePrompt !== text
         ? `${steerBasePrompt}；补充：${text}`
         : text;
+    // Stage 1 is message-only. Do not build scope, read headers or send prior results here.
+    forceRecomputeRef.current = options?.forceRecompute === true;
+    rawPromptRef.current = intentText;
+    const messageController = new AbortController();
+    turnAbortRef.current = messageController;
+    setStatus("planning");
+    beginActivity("理解消息", "先判断是否需要工作簿上下文；尚未读取字段或数据。");
+    let understanding: Awaited<ReturnType<typeof understandMessage>>;
+    let needsContext = false;
+    try {
+      understanding = options?.messageUnderstanding ?? await understandMessage({
+        prompt: intentText,
+        imageCount: pendingImages.length,
+        conversation: messages
+          .filter((message) => (message.role === "user" || message.role === "assistant") && message.text?.trim())
+          .slice(-INTENT_HISTORY_MESSAGES)
+          .map((message) => ({ role: message.role as "user" | "assistant", text: message.text!.slice(0, INTENT_MESSAGE_CHARACTERS) })),
+        modelId: effectiveModelId || null
+      }, messageController.signal);
+      if (messageController.signal.aborted) throw new DOMException("Aborted", "AbortError");
+      markServerOnline();
+      if (understanding.kind === "conversation") {
+        // 普通发送/转向在受理时就把用户气泡送进对话了（见上面「受理即送达」），
+        // 这里只补**回答澄清卡**那一种：它的气泡不由那条链路产生。
+        if (answeringClarification) appendMessage({ role: "user", text });
+        appendMessage({ role: "assistant", text: understanding.message, provider: understanding.provider });
+        setPrompt("");
+        setPendingImages([]);
+        setImageError("");
+        finishActivity("completed", "已理解并直接回复；未读取工作表", "completed", { defaultCollapsed: true });
+        return;
+      }
+      needsContext = true;
+      completeCurrentStep("已理解消息：需要工作簿上下文");
+    } catch (reason) {
+      if (isAbortError(reason) && pauseRequestedControllerRef.current === messageController) {
+        pauseRequestedControllerRef.current = null;
+        setPrompt((current) => current.trim() === text ? "" : current);
+        // 同上：只有回答澄清卡时气泡还没送出；普通发送的气泡已经在受理那一刻落盘。
+        if (answeringClarification) {
+          appendMessage({ role: "user", text, attachmentNames: pendingImages.map((image) => image.name) });
+        }
+        appendMessage({ role: "system", text: "已暂停；尚未形成可续跑检查点，不能从断点继续。原需求保留在对话中，如需处理请重新开始；未修改工作表。" });
+        finishActivity("warning", "尚未形成可续跑检查点", "awaiting_input");
+      } else if (isAbortError(reason)) finishActivity("cancelled", "用户已取消");
+      else {
+        setPrompt(text);
+        if (isLocalServiceConnectionError(reason)) markServerOffline();
+        appendMessage({ role: "system", text: reason instanceof Error ? reason.message : "消息理解失败，尚未读取工作表。" });
+        finishActivity("failed", "消息理解未完成；未读取工作表");
+      }
+      return;
+    } finally {
+      if (!needsContext) {
+        if (turnAbortRef.current === messageController) turnAbortRef.current = null;
+        setStatus("idle");
+      }
+    }
+    const pauseBeforeContext = () => {
+      if (turnAbortRef.current === messageController) turnAbortRef.current = null;
+      setStatus("idle");
+    };
+    /**
+     * 「停下来让用户先调整、这句话还没被消费」时把它放回输入框。
+     *
+     * 受理那一刻已经清空了输入框（见「受理即送达」），所以这些**在读取字段之前**
+     * 就交还控制权的出口必须把它还回去 —— 否则用户白打一遍。这也解释了为什么
+     * 结构化删除那几条出口本来就写着 `setPrompt(enteredText)`：口径一致。
+     *
+     * 只填**空的**输入框：停在这里期间用户可能已经打了新草稿，不能覆盖掉。
+     * （同款判据见上面暂停出口的 `current.trim() === text ? "" : current`。）
+     */
+    const keepRequestInComposer = () => {
+      if (!enteredText) return;
+      setPrompt((current) => (current.trim() ? current : enteredText));
+    };
+    if (!workbook) {
+      setContextOpen(true);
+      keepRequestInComposer();
+      finishActivity("completed", "请先选择工作簿", "awaiting_input");
+      pauseBeforeContext();
+      return;
+    }
+    // Refreshing/opening a picker cannot turn a manual draft into permission.
+    // A restored draft may differ from the guard's committed scope even when
+    // the workbook identity itself is unchanged. Stop before reading fields.
+    if (sourceMode === "workbook" && workbookScopeMode === "manual" && scopeDraftDirty) {
+      setContextOpen(true);
+      setScopeConfirmationError("请先确认当前对话的数据范围；需求仍保留，尚未读取字段。");
+      keepRequestInComposer();
+      finishActivity("completed", "等待确认数据范围", "awaiting_input");
+      pauseBeforeContext();
+      return;
+    }
+    if (!(await targetGuard.checkForAnalysis(() => retrySendRef.current(intentText, understanding)))) {
+      keepRequestInComposer();
+      finishActivity("completed", "等待确认操作目标", "awaiting_input");
+      pauseBeforeContext();
+      return;
+    }
+    if (messageController.signal.aborted) {
+      finishActivity("cancelled", "用户已取消");
+      pauseBeforeContext();
+      return;
+    }
     // "仍要重新计算"绕过整个命中判定，并在重算后覆写缓存。
     forceRecomputeRef.current = options?.forceRecompute === true;
     rawPromptRef.current = intentText;
     if (pendingImages.length > 0 && !supportsVision) {
       setImageError("当前模型不支持图片，请切换模型或移除附件。");
+      keepRequestInComposer();
       return;
     }
 
-    const pendingLocalMapping = [...messages]
-      .reverse()
-      .find((message) => message.clarification?.status === "pending" && message.clarification.localMapping);
+    // `pendingLocalMapping` / `pendingClarification` 已在上面「受理即送达」处算好
+    // （只依赖 `messages` 与 `enteredText`，中间没有变更），这里直接用，不重算。
     if (pendingLocalMapping && enteredText) {
       // 自由文本是用户发起的新请求；不能误走通用澄清，把本地来源值带入模型。
       localMappingDraftsRef.current.delete(pendingLocalMapping.id);
@@ -4957,13 +5813,9 @@ export default function App() {
           : message
       ));
     }
-    const pendingClarification = [...messages]
-      .reverse()
-      .find(
-        (message) =>
-          message.clarification?.status === "pending" && !message.clarification.localMapping
-      );
     if (pendingClarification && enteredText) {
+      finishActivity("completed", "按补充回答继续");
+      pauseBeforeContext();
       await resolveClarification(
         pendingClarification,
         enteredText,
@@ -4982,14 +5834,20 @@ export default function App() {
         role: "system",
         text: "请至少选择一个工作表，或改为跟随当前工作表。"
       });
+      keepRequestInComposer();
+      finishActivity("completed", "等待选择工作表", "awaiting_input");
+      pauseBeforeContext();
       return;
     }
-    if (sourceMode === "folder" && !selectionConfirmed) {
+    if (sourceMode === "folder" && (!folderCatalog || !selectionConfirmed)) {
       setContextOpen(true);
       appendMessage({
         role: "system",
         text: "请先在上方「数据范围」中选择文件夹和工作表。"
       });
+      keepRequestInComposer();
+      finishActivity("completed", "等待选择文件和工作表", "awaiting_input");
+      pauseBeforeContext();
       return;
     }
     if (!selectionConfirmed) setSelectionConfirmed(true);
@@ -4997,9 +5855,10 @@ export default function App() {
     let intentWorkbook = workbook;
     if (sourceMode === "workbook" && isRunningInExcel()) {
       setStatus("planning");
-      beginActivity(
-        "正在扫描字段结构",
-        `正在本地检查 ${selectedNamesFor(workbook).length} 张工作表；不会上传数据行。`
+      advanceActivity(
+        "读取已授权表结构",
+        `消息需要工作簿上下文；正在本地检查 ${selectedNamesFor(workbook).length} 张工作表，不上传数据行。`,
+        "已理解消息，需要工作簿上下文"
       );
       try {
         intentWorkbook = await captureWorkbookStructure(
@@ -5014,12 +5873,20 @@ export default function App() {
               ? `读取工作表结构失败：${reason.message}`
               : "读取工作表结构失败"
         });
+        // 本地读表失败，需求一个字都没消费掉，放回输入框让用户可以直接重发。
+        keepRequestInComposer();
         setStatus("idle");
+        pauseBeforeContext();
         finishActivity();
         return;
       }
     }
     const effectiveSheetNames = selectedNamesFor(intentWorkbook);
+    if (messageController.signal.aborted) {
+      finishActivity("cancelled", "用户已取消");
+      pauseBeforeContext();
+      return;
+    }
     setSelectedSheetNames(effectiveSheetNames);
     const structuralDeletion =
       sourceMode === "workbook"
@@ -5032,7 +5899,7 @@ export default function App() {
           )
         : { kind: "notMatched" as const };
     if (structuralDeletion.kind === "keeperMissing") {
-      appendMessage({ role: "user", text: enteredText });
+      // 用户气泡已在「受理即送达」时落盘；这里只补结果说明。
       appendMessage({
         role: "system",
         text:
@@ -5042,6 +5909,7 @@ export default function App() {
       setPrompt(enteredText);
       setStatus("idle");
       finishActivity();
+      pauseBeforeContext();
       return;
     }
     if (structuralDeletion.kind === "selectionRequired") {
@@ -5053,7 +5921,6 @@ export default function App() {
         structuralDeletion.missingSheetNames.length > 6
           ? `等 ${structuralDeletion.missingSheetNames.length} 张工作表`
           : "";
-      appendMessage({ role: "user", text: enteredText });
       appendMessage({
         role: "system",
         text:
@@ -5071,10 +5938,10 @@ export default function App() {
       setPrompt(enteredText);
       setStatus("idle");
       finishActivity();
+      pauseBeforeContext();
       return;
     }
     if (structuralDeletion.kind === "nothingToDelete") {
-      appendMessage({ role: "user", text: enteredText });
       appendMessage({
         role: "assistant",
         text: `当前工作簿只剩"${structuralDeletion.keeperName}"，没有其他工作表需要删除。`
@@ -5084,6 +5951,7 @@ export default function App() {
       setImageError("");
       setStatus("idle");
       finishActivity();
+      pauseBeforeContext();
       return;
     }
     const intentScope = buildIntentScope(
@@ -5092,11 +5960,6 @@ export default function App() {
     );
     const scopeFingerprint = intentScopeFingerprint(intentScope);
     const sentImages = pendingImages;
-    appendMessage({
-      role: "user",
-      text: enteredText || "请结合附件图片分析当前工作簿。",
-      attachmentNames: sentImages.map((image) => image.name)
-    });
     animatePet("turtle-encourage", 1000);
     setPrompt("");
     setPendingImages([]);
@@ -5116,28 +5979,25 @@ export default function App() {
         : undefined;
       if (hit) {
         reuseCachedConclusion(hit);
+        finishActivity("completed", "复用已核对的查询结论");
         setStatus("idle");
+        pauseBeforeContext();
         return;
       }
     }
     setStatus("planning");
     // 开启一个新的 turn：建 controller 存进 ref，串到本 turn 所有模型请求上。
-    const turnController = new AbortController();
+    const turnController = messageController;
     turnAbortRef.current = turnController;
-    if (!(sourceMode === "workbook" && isRunningInExcel())) {
-      beginActivity(
-        "正在准备需求上下文",
-        `已选择 ${effectiveSheetNames.length} 张工作表。`
-      );
-    }
     advanceActivity(
-      "正在确认需求",
+      "结合字段理解任务",
       "正在结合字段结构、最近对话和上一轮紧凑结果判断是否需要本地工具。",
       `已识别 ${intentScope.sheets.length} 张工作表的字段结构`
     );
     try {
       const intent = await checkIntent({
         prompt: intentText,
+        taskContext: createAgentTaskContext(intentText),
         scope: intentScope,
         imageCount: sentImages.length,
         conversation: messages
@@ -5200,9 +6060,13 @@ export default function App() {
       }
       setStatus("idle");
     } catch (reason) {
-      // 用户主动打断：静默收尾，不弹错误。转向时新 turn 已在 steerTurn 里另起。
+      // 主动暂停与转向取消分开；没有任务身份就不能编造检查点。
       if (isAbortError(reason)) {
-        finishActivity("cancelled", "用户已取消");
+        if (pauseRequestedControllerRef.current === turnController) {
+          pauseRequestedControllerRef.current = null;
+          appendMessage({ role: "system", text: "已暂停；尚未形成可续跑检查点，不能从断点继续。原需求保留在对话中，如需处理请重新开始；未修改工作表。" });
+          finishActivity("warning", "尚未形成可续跑检查点", "awaiting_input");
+        } else finishActivity("cancelled", "用户已取消");
         setStatus("idle");
         return;
       }
@@ -5231,19 +6095,58 @@ export default function App() {
     }
   }
 
+  /**
+   * **直接执行**路径的执行前复核凭据。
+   *
+   * 与 `nativeReview` 互斥：直接执行没有副本可比，所以它自己的"复核"不能是
+   * `assertExcelNativeComparisonUnchanged`（那会去找一个不存在的副本）。
+   * 它复核的是同样重要的三件事 —— 同一计划版本、同一授权范围、同一本工作簿。
+   *
+   * 存在的意义是让"直接执行没跳过执行前复核"这句话有**代码位置**：
+   * 没有它，直接执行就会成为唯一一条没有 `beforeFirstWrite` 的写入路径。
+   */
+  type DirectExecutionRecheck = {
+    plan: AnalysisPlan;
+    authorization: readonly string[];
+    workbookIdentity: string;
+  };
+
   async function runPlan(
     plan: AnalysisPlan,
     allowedExternalFiles?: ReadonlySet<string>,
     forceLocal?: boolean,
     /** 用户在「数据已变」二次确认里点了「仍要执行」。 */
     acknowledgeStaleSource?: boolean,
-    nativeReview?: ExcelNativeComparison
+    nativeReview?: ExcelNativeComparison,
+    /** 直接执行路径的执行前复核凭据；与 `nativeReview` 互斥。 */
+    directRecheck?: DirectExecutionRecheck,
+    onResultReview?: (result: PlanExecutionResult) => void
   ): Promise<boolean> {
+    if (nativeReview && directRecheck) {
+      appendMessage({ role: "system", text: "一次执行只能有一条复核来源；原表未写入。" });
+      return false;
+    }
     if (sourceMode === "workbook" && !(await targetGuard.check())) return false;
     if (nativeReview && sourceMode !== "workbook") {
       appendMessage({ role: "system", text: "数据来源模式已变化，不能把原生审阅用于其他数据来源。" });
       return false;
     }
+    /*
+     * 直接执行的执行前复核与审阅路径**同样在首写之前**：授权勾选、计划版本与
+     * 原工作簿身份三项任一变化都当场停下，不写。放在这里而不是执行器内部，
+     * 是为了让两条路径的"写之前"位置一目了然。
+     */
+    const directRecheckGuard = directRecheck
+      ? async () => {
+        if (currentOfficeWorkbookIdentity() !== directRecheck.workbookIdentity) {
+          throw new Error("原工作簿身份已变化，本次直接执行已停止；原表未写入。");
+        }
+        const currentNames = workbook ? selectedNamesFor(workbook) : [];
+        if (JSON.stringify(currentNames) !== JSON.stringify([...directRecheck.authorization])) {
+          throw new Error("授权工作表范围在确认后发生变化，本次直接执行已停止；原表未写入。");
+        }
+      }
+      : null;
     if (sourceMode === "folder" && !forceLocal) {
       if (!folderCatalog) return false;
       const operationId = `execution-${messageId()}`;
@@ -5373,6 +6276,12 @@ export default function App() {
     const workbookIdentity = currentOfficeWorkbookIdentity();
     let officeState: Awaited<ReturnType<typeof registerOfficeExecution>> | null = null;
     let recoveryLimitation: string | null = null;
+    /*
+     * 登记成功时的**恢复范围**说明。不写"支持断点恢复"这种笼统话：说清是哪一级
+     * 断点（动作级）、什么时候还能续（关闭或重载任务窗格后）、续跑前做什么
+     * （先核对真实单元格状态），以及范围（只续跑本次登记的动作）。
+     */
+    let recoveryNotice: string | null = null;
     setActivePlanId(plan.id);
     beginActivity("正在执行操作计划", plan.summary, {
       operationId,
@@ -5412,12 +6321,20 @@ export default function App() {
           if (!pendingSaved) {
             throw new Error("无法保存 Office 任务挂接索引，已停止执行以避免丢失恢复入口。");
           }
+          recoveryNotice =
+            "已登记动作级断点：关闭或重载任务窗格后可从已完成动作之后继续；续跑前先核对真实单元格状态，只续跑本次登记的动作。";
         }
       } else {
         recoveryLimitation = `${recoverySupport.reason ?? "该计划包含复杂对象操作"}；本次不承诺跨重启自动续跑。`;
       }
       const result = await executePlan(plan, {
-        beforeFirstWrite: nativeReview ? context => assertExcelNativeComparisonUnchanged(context, nativeReview, authorizedSheetNames, plan) : undefined,
+        /*
+       * 直接执行**也**挂 `beforeFirstWrite`：这就是"只跳过副本比对"的落点。
+       * 少了这一行，两条路径的差别就不止"有没有副本"，还会多出"有没有执行前复核"。
+       */
+      beforeFirstWrite: nativeReview
+        ? context => assertExcelNativeComparisonUnchanged(context, nativeReview, authorizedSheetNames, plan)
+        : directRecheckGuard ?? undefined,
         authorizedSheetNames,
         allowedExternalFiles,
         acknowledgeStaleSource,
@@ -5460,6 +6377,11 @@ export default function App() {
           : {})
       });
       let nativeResultNotice = "";
+      if (directRecheck) {
+        // 直接执行没有副本可比：如实说"未与副本比对"，而不是让这句话缺席。
+        // 动作回读与恢复点仍然照常，措辞不许让人以为跳过了验证。
+        nativeResultNotice = "本次直接执行未生成副本，因此没有与副本比对；上述验证为执行侧逐格回读与恢复点核对。";
+      }
       if (nativeReview?.mode === "manual") {
         nativeResultNotice = "兼容副本未自动回读；上述验证仅针对原表执行结果，不代表已核对原表与副本的计算值一致。";
       } else if (nativeReview) {
@@ -5506,13 +6428,14 @@ export default function App() {
               ? `已记录 ${result.undoSnapshot.ranges.length} 项本次执行撤销数据，并已核对执行后状态。`
               : "已保留本次执行捕获的数据，但执行后状态未能完整核对，暂不能直接撤销。"
             : ""
-        }${recoveryLimitation ? `${recoveryLimitation}` : ""}${nativeResultNotice}原始工作表没有被删除或清空。`,
+        }${recoveryLimitation ?? recoveryNotice ?? ""}${nativeResultNotice}原始工作表没有被删除或清空。`,
         verification: result.verification,
         executedPlanId: plan.id,
         executedExecutionId: result.undoSnapshot?.executionId
       });
       pushUndoSnapshot(result.undoSnapshot ?? null);
-      if (result.verification.status === "verified") {
+      onResultReview?.(result);
+      if (result.verification.status === "verified" && !onResultReview) {
         markPlanVerified(plan.id);
       }
       await scan();
@@ -5538,6 +6461,12 @@ export default function App() {
         workbookActivitySummary = reason.message;
         if (nativeReview) {
           appendMessage({ role: "system", text: `${reason.message}原生审阅已失效，请关闭副本并重新生成预览；不能跳过并排审阅直接写入旧结果。` });
+          return false;
+        }
+        if (directRecheck) {
+          // 直接执行同样**不豁免**来源复核：数据变了要么重新生成计划，要么走上面的二次确认，
+          // 但绝不因为"没生成副本"就当这份计划可以直接写。
+          appendMessage({ role: "system", text: `${reason.message}本次直接执行已停止；请重新生成计划，或确认数据已变后再次执行。原表未写入。` });
           return false;
         }
         // 数据变了但计划本身仍可执行：给出二次确认，而不是像字段缺失那样堵死。
@@ -6216,9 +7145,15 @@ export default function App() {
                         : msg
                     )
                   );
+                  // 编辑后旧版本作废：撤回「已验证」资格（须重新执行并验证才能保存为工具），
+                  // 并放弃该消息上仍未写回的审阅副本，避免拿旧副本去写已改的计划。
+                  unmarkPlanVerified(updatedPlan.id);
+                  if (nativeComparison.review?.messageId === saveTarget.messageId) {
+                    void nativeComparison.discard(saveTarget.messageId);
+                  }
                   appendMessage({
                     role: "system",
-                    text: "已更新计划脚本。"
+                    text: "已更新计划。编辑后需重新确认预览才能写入。"
                   });
                 }
 
@@ -6227,7 +7162,7 @@ export default function App() {
                   setTools(updatedTools);
                   appendMessage({
                     role: "system",
-                    text: "已更新工具脚本。"
+                    text: "已更新工具计划。运行前仍会按当前授权重新校验并预览。"
                   });
                 }
 
@@ -6350,7 +7285,15 @@ export default function App() {
   async function previewTool(tool: SavedTool) {
     if (!(await targetGuard.check())) return;
     try {
-      const plan = instantiateTool(tool, toolParameterValues, workbook);
+      /*
+       * 已保存工具：模板里可能残留上一次保存时带进来的 `sourceDependencySheets`，
+       * 但这一步**没有真的读表**（只是按模板+参数实例化），所以依赖不确定 ——
+       * 剥掉该字段，恢复登记退回既有保守口径，不拿模板当"读过"的证据。
+       */
+      const plan = attestSourceDependency(
+        instantiateTool(tool, toolParameterValues, workbook),
+        null
+      );
       if (
         sourceMode === "workbook" &&
         isRunningInExcel() &&
@@ -6576,17 +7519,18 @@ export default function App() {
     }
   }
 
-  retrySendRef.current = (text) => { void sendMessage({ overrideText: text }); };
+  // 「操作目标确认之后」的回调重入：这句话已经送过一次（气泡已落盘、输入框已清空），
+  // 带上 `targetConfirmedRetry` 让 `sendMessage` 不再重复送达一遍。与 WPS 同款标记。
+  retrySendRef.current = (text, messageUnderstanding) => {
+    void sendMessage({ overrideText: text, messageUnderstanding, targetConfirmedRetry: true });
+  };
 
   return (
     <main className="chat-shell">
-      {targetGuard.notice && <AuthorizedTargetConfirmation notice={targetGuard.notice}
-        error={targetGuard.error} busy={targetGuard.confirming}
-        onConfirm={(choice, selected) => void targetGuard.confirm(choice, selected)} onCancel={targetGuard.cancel} />}
       <header
         className={`chat-header${modelMenuOpen || moreMenuOpen ? " menu-open" : ""}`}
       >
-        <div className="brand-mark">EB</div>
+        <img className="brand-mark" src={brandLogoUrl} alt="" />
         <div className="brand-copy">
           <strong className="app-logo" {...logoLongPress}>
             Excel Bro
@@ -7568,7 +8512,7 @@ export default function App() {
                           >
                             切换到专家视图
                           </button>
-                          后可以编辑脚本。
+                          后可以编辑计划。
                         </p>
                       </>
                     ) : (
@@ -7576,7 +8520,7 @@ export default function App() {
                         <div className="tool-expert-heading">
                           <div>
                             <small>CONTROLLED PLAN</small>
-                            <strong>专家脚本</strong>
+                            <strong>专家计划</strong>
                             <span>由保存的白名单计划确定性生成</span>
                           </div>
                           <div className="tool-expert-actions">
@@ -7590,7 +8534,7 @@ export default function App() {
                                 })
                               }
                             >
-                              编辑脚本
+                              编辑计划
                             </button>
                             <button
                               className="tool-copy-dsl"
@@ -7598,7 +8542,7 @@ export default function App() {
                             >
                               {copiedToolDslId === tool.id
                                 ? "已复制"
-                                : "复制脚本"}
+                                : "复制计划"}
                             </button>
                           </div>
                         </div>
@@ -7617,8 +8561,8 @@ export default function App() {
                           />
                         </pre>
                         <p className="tool-expert-note">
-                          这里和普通视图是同一份工具。上面的脚本文本是只读展示；要改内容请用
-                          「编辑脚本」，保存时会检查 JSON 格式与白名单结构。实际运行仍使用受控
+                          这里和普通视图是同一份工具。上面的计划文本是只读展示；要改内容请用
+                          「编辑计划」，保存时会检查 JSON 格式与白名单结构。实际运行仍使用受控
                           AnalysisPlan，并在写入前让你确认预览。
                         </p>
                       </div>
@@ -8037,107 +8981,21 @@ export default function App() {
           ))}
 
       {saveCandidate && (
-        <div className="tool-dialog-backdrop" role="presentation">
-          <section
-            className="tool-dialog"
-            role="dialog"
-            aria-modal="true"
-            aria-label="保存为工具"
-          >
-            <div className="tool-dialog-title">
-              <div>
-                <strong>保存为工具</strong>
-                <span>验证后可从"我的工具"重复使用</span>
-              </div>
-              <button onClick={() => setSaveCandidate(null)}>×</button>
-            </div>
-            <label>
-              <span>工具名称</span>
-              <input
-                value={toolName}
-                maxLength={60}
-                autoFocus
-                onChange={(event) => setToolName(event.target.value)}
-              />
-            </label>
-            <label>
-              <span>用途说明</span>
-              <textarea
-                value={toolDescription}
-                maxLength={240}
-                onChange={(event) => setToolDescription(event.target.value)}
-              />
-            </label>
-            <div className="tool-dialog-note">
-              只保存白名单 Excel 操作，不会保存 API Key，也不会执行系统命令。
-            </div>
-            {saveEligibility && saveEligibility.issues.length > 0 && (
-              <div className="tool-save-review">
-                <strong>固化检查</strong>
-                {saveEligibility.issues.map((issue) => (
-                  <div
-                    className={`tool-save-issue ${issue.severity}`}
-                    key={issue.code}
-                  >
-                    <span>{issue.message}</span>
-                    {issue.approval === "fixedContent" && (
-                      <label>
-                        <input
-                          type="checkbox"
-                          checked={approveFixedContent}
-                          onChange={(event) =>
-                            setApproveFixedContent(event.target.checked)
-                          }
-                        />
-                        我确认以后仍写入这些固定内容
-                      </label>
-                    )}
-                    {issue.approval === "destructive" && (
-                      <label>
-                        <input
-                          type="checkbox"
-                          checked={approveDestructive}
-                          onChange={(event) =>
-                            setApproveDestructive(event.target.checked)
-                          }
-                        />
-                        我确认此工具包含覆盖或删除操作
-                      </label>
-                    )}
-                  </div>
-                ))}
-              </div>
-            )}
-            <div className="tool-dialog-actions">
-              <button
-                className="secondary-button"
-                onClick={() => setSaveCandidate(null)}
-              >
-                取消
-              </button>
-              <button
-                className="primary-button"
-                disabled={
-                  !toolName.trim() ||
-                  Boolean(saveEligibility?.blocked) ||
-                  Boolean(
-                    saveEligibility?.requiredApprovals.includes(
-                      "fixedContent"
-                    ) && !approveFixedContent
-                  ) ||
-                  Boolean(
-                    saveEligibility?.requiredApprovals.includes(
-                      "destructive"
-                    ) && !approveDestructive
-                  )
-                }
-                onClick={confirmSaveTool}
-              >
-                保存到我的工具
-              </button>
-            </div>
-          </section>
-        </div>
+        <SaveToolDialog
+          toolName={toolName}
+          toolDescription={toolDescription}
+          eligibility={saveEligibility}
+          approveFixedContent={approveFixedContent}
+          approveDestructive={approveDestructive}
+          onToolNameChange={setToolName}
+          onToolDescriptionChange={setToolDescription}
+          onApproveFixedContentChange={setApproveFixedContent}
+          onApproveDestructiveChange={setApproveDestructive}
+          onCancel={closeSaveCandidate}
+          onConfirm={confirmSaveTool}
+          subtitle="验证后可从“我的工具”重复使用"
+          note="只保存白名单 Excel 操作，不会保存 API Key，也不会执行系统命令。"
+        />
       )}
 
       <div className={`message-stream-shell${newConversationNotice ? " conversation-starting" : ""}`}>
@@ -8301,16 +9159,21 @@ export default function App() {
                   <div className="folder-resume-copy">
                     <strong>
                       {message.planningResume.status === "resuming"
-                        ? "正在从保存的进度继续"
-                        : message.planningResume.pauseType === "model_error" ||
-                            message.planningResume.pauseType === "interrupted"
+                        ? message.planningResume.awaitingStatus ? "正在核对原任务" : "正在从保存的进度继续"
+                        : message.planningResume.status === "failed" ? "任务不能继续，需要重新开始"
+                        : message.planningResume.awaitingStatus ? "已暂停接收，待核对原任务"
+                        : message.planningResume.pauseType === "model_error"
                           ? "模型连接中断，任务现场已保存"
-                          : "进度已保存"}
+                          : message.planningResume.pauseType === "interrupted" ? "任务已暂停，可继续"
+                          : message.planningResume.pauseType === "budget_exhausted"
+                            ? "本轮有效运行总时长已用完"
+                          : "本轮处理已暂停"}
                     </strong>
                     <span>{message.planningResume.reason}</span>
                     <span>
-                      已完成约 {Math.round(message.planningResume.activeElapsedSeconds)} 秒有效处理；
-                      继续时不会重做已经提交的工具结果。
+                      {message.planningResume.awaitingStatus
+                        ? "只查询原任务；尚未确认存在可续跑检查点，不会自动重新规划或写入。"
+                        : `已完成约 ${Math.round(message.planningResume.activeElapsedSeconds)} 秒有效处理；继续时不会重做已经提交的工具结果。`}
                     </span>
                     {(message.planningResume.pauseType === "model_error" ||
                       message.planningResume.pauseType === "interrupted") &&
@@ -8323,12 +9186,13 @@ export default function App() {
                       type="button"
                       className="primary-button"
                       disabled={
-                        busy || message.planningResume.status === "resuming"
+                        busy || message.planningResume.status === "resuming" || message.planningResume.status === "failed"
                       }
                       onClick={() => void resumePlanningTaskFromMessage(message)}
                     >
                       {message.planningResume.status === "resuming"
-                        ? "正在继续..."
+                        ? message.planningResume.awaitingStatus ? "正在核对..." : "正在继续..."
+                        : message.planningResume.awaitingStatus ? "核对任务状态"
                         : (message.planningResume.pauseType === "model_error" ||
                               message.planningResume.pauseType === "interrupted") &&
                             effectiveModelId &&
@@ -8336,11 +9200,13 @@ export default function App() {
                           ? `使用「${selectedModel?.label ?? effectiveModelId}」从断点继续`
                           : message.planningResume.pauseType === "model_error"
                             ? "重试当前模型"
+                          : message.planningResume.pauseType === "budget_exhausted"
+                            ? "重新发起任务"
                           : message.planningResume.extensionSeconds > 0
                           ? `继续处理（约 ${Math.round(
                               message.planningResume.extensionSeconds
                             )} 秒）`
-                          : "核对任务状态"}
+                          : "继续任务"}
                     </button>
                     {(message.planningResume.pauseType === "model_error" ||
                       message.planningResume.pauseType === "interrupted") &&
@@ -8617,18 +9483,31 @@ export default function App() {
                   )}
                 </section>
               )}
-              {message.verification && (
-                <div
-                  className={`verification-card ${message.verification.status}`}
-                >
-                  <strong>
-                    {message.verification.status === "verified"
+              {message.localResult && (
+                <LocalResultCard
+                  card={message.localResult}
+                  load={(resultRef) =>
+                    message.localResultBinding
+                      ? loadBridgeResult(message.localResultBinding, resultRef)
+                      : Promise.resolve(null)
+                  }
+                />
+              )}
+              {(message.verification || message.executedPlanId || message.executedExecutionId) && (
+                <ExecutionResultCard
+                  tone={message.executionUndone ? "undone" : message.verification?.status ?? "unverified"}
+                  title={message.executionUndone ? "已撤销并恢复" : !message.verification ? "执行记录" : message.verification.status === "verified"
                       ? VERIFICATION_PASSED_LABEL
                       : message.verification.status === "executed_unverified"
                         ? "已执行，部分操作未独立验证"
                         : "执行完成，但验证未通过"}
-                  </strong>
-                  <span>
+                  summary={message.executionUndone
+                    ? /* 已撤销：按模式说清恢复了什么 —— 文件夹模式恢复的是文件，
+                         当前工作簿模式才是单元格的内容与格式。不混用同一句笼统描述。 */
+                      message.executedUndoId
+                        ? "已把本次执行影响的文件恢复到执行前状态。"
+                        : "已恢复本次执行记录的内容和格式。"
+                    : message.verification ? <>
                     {
                       message.verification.checks.filter((check) => check.passed)
                         .length
@@ -8637,8 +9516,9 @@ export default function App() {
                     {message.verification.unverifiedActions.length > 0
                       ? `；${message.verification.unverifiedActions.length} 步缺少独立验收`
                       : ""}
-                  </span>
-                  {message.verification.status === "failed" && (
+                  </> : "详细状态见执行过程"}
+                >
+                  {!message.executionUndone && message.verification?.status === "failed" && (
                     <ul>
                       {message.verification.checks
                         .filter((check) => !check.passed)
@@ -8649,7 +9529,7 @@ export default function App() {
                         ))}
                     </ul>
                   )}
-                  {message.verification.status ===
+                  {!message.executionUndone && message.verification?.status ===
                     "executed_unverified" && (
                     <ul>
                       {message.verification.unverifiedActions.map(
@@ -8663,9 +9543,7 @@ export default function App() {
                       )}
                     </ul>
                   )}
-                </div>
-              )}
-              {message.executedExecutionId &&
+              {!message.executionUndone && message.executedExecutionId &&
                 changeReviewsRef.current.has(message.executedExecutionId) && (
                   <ChangeReviewSummaryCard
                     reviews={
@@ -8687,7 +9565,13 @@ export default function App() {
                       ? entry.undoId === message.executedUndoId
                       : entry.planId === message.executedPlanId
                   );
-                  if (workbookIndex < 0 && folderIndex < 0) return null;
+                  if (message.executionUndone || (workbookIndex < 0 && folderIndex < 0)) {
+                    return <div className="execution-recovery-footer">
+                      <span>{message.executionUndone
+                        ? "本次执行已撤销"
+                        : "当前没有可用的撤销记录；这不表示执行已撤销。"}</span>
+                    </div>;
+                  }
                   const isFolderUndo = folderIndex >= 0;
                   const workbookUndoEntry =
                     workbookIndex >= 0 ? undoStack[workbookIndex] : null;
@@ -8703,7 +9587,7 @@ export default function App() {
                   // 栈顶之后还有多少次执行会被连带撤销。
                   const alsoUndone = activeStackLength - 1 - stackIndex;
                   return (
-                    <div className="undo-row execution-undo-row">
+                    <div className="undo-row execution-undo-row execution-recovery-footer">
                       <button
                         type="button"
                         className="secondary-button"
@@ -8751,6 +9635,8 @@ export default function App() {
                     </div>
                   );
                 })()}
+                </ExecutionResultCard>
+              )}
               {message.functionPreview &&
                 message.functionPreview.phase === "target" && (
                   <div className="inline-plan">
@@ -9133,6 +10019,20 @@ export default function App() {
                     </div>
                   </div>
 
+                  {message.plan.summary && (
+                    <p className="inline-plan-summary">{message.plan.summary}</p>
+                  )}
+                  <p className="inline-plan-scale">
+                    {message.plan.actions.length} 个动作 ·{" "}
+                    {message.plan.actions
+                      .slice(0, 3)
+                      .map((action) => actionLabel(action))
+                      .join("；")}
+                    {message.plan.actions.length > 3
+                      ? `；等 ${message.plan.actions.length} 步`
+                      : ""}
+                  </p>
+
                   <div className="inline-plan-buttons">
                     <button
                       className="secondary-button"
@@ -9161,13 +10061,19 @@ export default function App() {
                     )}
                   </div>
 
-                  {!message.staleSourceConfirm && (nativeComparison.review?.messageId === message.id ||
+                  {!resultMessages.current.has(message.id) && !message.staleSourceConfirm && (nativeComparison.review?.messageId === message.id ||
                     (sourceMode === "workbook" && workbook && nativeComparisonPlanIssue(message.plan, selectedNamesFor(workbook)) === null)) && (
                     <ExcelNativeReviewActions messageId={message.id} plan={message.plan}
                       paneNeedsResize={comparisonPaneNeedsResize}
                       authorization={workbook ? selectedNamesFor(workbook) : []} controller={nativeComparison} disabled={busy}
                       beforeOperation={targetGuard.check}
-                      commit={session => runPlan(message.plan!, undefined, false, false, session)} />
+                      commit={session => session
+                        ? runPlan(message.plan!, undefined, false, false, session)
+                        : runPlan(message.plan!, undefined, false, false, undefined, {
+                          plan: message.plan!,
+                          authorization: workbook ? selectedNamesFor(workbook) : [],
+                          workbookIdentity: currentOfficeWorkbookIdentity() ?? ""
+                        })} />
                   )}
 
                   <details
@@ -9210,6 +10116,30 @@ export default function App() {
                       ))}
                     </ol>
 
+                    {planFormatPreview(message.plan).length > 0 && (
+                      <div className="inline-notes format-preview">
+                        <strong>{PLAN_FORMAT_SECTION}</strong>
+                        <ul>
+                          {planFormatPreview(message.plan).map((entry) => (
+                            <li key={`${message.id}-format-${entry.key}`}>
+                              <span className="format-preview-target">
+                                「{entry.sheet}!{entry.range}」
+                              </span>
+                              <span className="format-preview-changes">
+                                {entry.changes.join("、")}
+                              </span>
+                              {entry.impactNotice && (
+                                <span className="format-preview-impact">
+                                  <b>{PLAN_FORMAT_IMPACT_LABEL}</b>
+                                  {entry.impactNotice}
+                                </span>
+                              )}
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+
                     <div className="inline-plan-buttons">
                       <button
                         className="secondary-button"
@@ -9223,7 +10153,7 @@ export default function App() {
                           });
                         }}
                       >
-                        编辑脚本
+                        编辑计划
                       </button>
                     </div>
                   </details>
@@ -9276,20 +10206,17 @@ export default function App() {
 
         <div />
       </section>
-      {hasUnseenProgress && (
-        <button
-          type="button"
-          className="new-progress-button"
-          onClick={scrollToLatest}
-          aria-label="查看最新执行进度"
-          title="查看最新进度"
-        >
-          <span className="progress-dots" aria-hidden="true">
-            <span />
-            <span />
-            <span />
-          </span>
-        </button>
+      {/*
+        用户往上滚离底部时出现，判据是 `useMessageAutoFollow` 的 `awayFromBottom`
+        —— **只看位置**，不要求"期间又来了一次新内容"。旧口径（`hasUnseenProgress`）
+        要求"离底 **且** 有新内容"两个条件同时成立，于是往上翻历史、期间没有新内容时
+        界面上什么都不会出现，只能手动滚回去。
+        字形跟着**本轮是否在跑**走：跑着是三点动效，跑完换成锚。判据用 `busy`
+        （本轮 turn 是否在途），不是"最近有没有报过进度" —— 后者在没有进度回调的
+        快速回答里会是 false，于是一个正在跑的 turn 被画成"已停下"。
+      */}
+      {awayFromBottom && (
+        <ScrollToLatestButton running={busy} onClick={scrollToLatest} />
       )}
       </div>
 
@@ -9305,6 +10232,13 @@ export default function App() {
       )}
 
       <footer className="composer">
+        <ResultReviewBar state={resultReviewState} title={resultCandidate?.plan.title ?? ''}
+          onCompare={() => void resultReview.compare(resultReviewState.key ?? '')}
+          onConfirm={() => void resultReview.confirm(resultReviewState.key ?? '')}
+          onDiscard={() => void resultReview.discard(resultReviewState.key ?? '')} />
+        {targetGuard.notice && !contextOpen && <TargetScopeNotice notice={targetGuard.notice} error={targetGuard.error}
+          busy={targetGuard.confirming || scopeCheckingCommit} onOpenScope={() => void openScopePicker()}
+        />}
         {showWorkDirectoryGuide && (
           <WorkDirectoryGuide
             busy={busy}
@@ -9315,6 +10249,7 @@ export default function App() {
         {contextOpen && workbook && (
           <section className="scope-popover" aria-label="选择数据范围">
             <div className="scope-popover-scroll">
+              <fieldset className="scope-selection-fields" disabled={scopeCheckingCommit}>
               <div className="scope-popover-header">
               <div>
                 <strong>这次对话使用哪些数据？</strong>
@@ -9325,6 +10260,7 @@ export default function App() {
                 </span>
               </div>
               <button
+                disabled={scopeCheckingCommit}
                 onClick={() => setContextOpen(false)}
                 aria-label="关闭数据范围选择"
               >
@@ -9338,18 +10274,22 @@ export default function App() {
                 <span>
                   <small>当前文件</small>
                   <strong title={workbook.name}>{workbook.name}</strong>
-                  <em>
-                    {workbookDataPeriod
-                      ? `报表日期 ${workbookDataPeriod}`
-                      : "文件名中未识别到报表日期"}
-                    {" · "}
-                    当前工作表 {workbook.activeWorksheet}
-                  </em>
+                  {/*
+                    当前文件卡只说**用户此刻要用的那两件事**：哪个文件、哪张表。
+                    这里**不认文件名里的日期** —— 报表日期识别整条已经下线（2026-10-16 产品决定：
+                    "不需要识别日期"）。下线的不是"那句否定式提示"，而是**识别这件事本身**：
+                    上一版改成"有日期就显示、没日期就不说"，用户看到的仍然是"这软件在猜我的日期"。
+                    所以 `extractWorkbookDataPeriod` 与它派生出的 `workbookDataPeriod` 都已删除，
+                    不是留着一个没人读的派生值 —— 留着它，任何一处 JSX 都能把它请回来。
+                    与 WPS 的当前文件卡同口径：那边本来就只有「当前工作表 X」。
+                  */}
+                  <em>当前工作表 {workbook.activeWorksheet}</em>
                 </span>
               </div>
             )}
 
             <div className="scope-controls">
+              <fieldset className="scope-selection-fields" disabled={scopeCheckingCommit}>
               <div className="scope-mode-list">
                 <button
                   className={
@@ -9357,7 +10297,7 @@ export default function App() {
                       ? "selected"
                       : ""
                   }
-                  onClick={() => chooseAutomaticScope(workbook)}
+                  onClick={() => void switchScopeMode("auto")}
                 >
                   <i>◎</i>
                   <span>
@@ -9371,7 +10311,7 @@ export default function App() {
                       ? "selected"
                       : ""
                   }
-                  onClick={() => chooseManualScope(workbook)}
+                  onClick={() => void switchScopeMode("manual")}
                 >
                   <i>☷</i>
                   <span>
@@ -9379,6 +10319,81 @@ export default function App() {
                     <small>用于跨表查询、比较或汇总</small>
                   </span>
                 </button>
+                {/* 子表选择紧跟「选择多个」，而不是落在「工作目录」下方：
+                    它是该模式的展开内容，不能隔着一条无关的模式项。
+                    面板常挂载、由 `.open` 类驱动收放 —— 条件渲染会在切走时
+                    直接卸载，收缩无从播放。收起态靠 CSS 的 0fr + visibility:hidden。 */}
+                {sourceMode === "workbook" && (
+                  <div className={`scope-picker-reveal${workbookScopeMode === "manual" ? " open" : ""}`}>
+                    <div className="workbook-sheet-picker">
+                      <div className="sheet-search-row">
+                        <input
+                          value={sheetSearch}
+                          onChange={(event) => setSheetSearch(event.target.value)}
+                          placeholder="搜索工作表..."
+                          aria-label="搜索工作表"
+                        />
+                        <span>
+                          已选 {selectedSheetNames.length}/{workbook.worksheets.length}
+                        </span>
+                      </div>
+                      <div className="sheet-picker-toolbar">
+                        <button
+                          onClick={() => {
+                            selectAllSheets(
+                              filteredWorksheets.map((sheet) => sheet.name)
+                            );
+                          }}
+                        >
+                          全选搜索结果
+                        </button>
+                        <button
+                          onClick={clearSelectedSheets}
+                        >
+                          清空
+                        </button>
+                      </div>
+                      <div className="workbook-sheet-list">
+                        {filteredWorksheets.map((sheet) => {
+                          const selected = selectedSheetNames.includes(sheet.name);
+                          return (
+                            <button
+                              className={selected ? "selected" : ""}
+                              key={sheet.name}
+                              onClick={() => toggleSheet(sheet.name)}
+                              aria-pressed={selected}
+                            >
+                              <i
+                                className="sheet-checkbox"
+                                aria-hidden="true"
+                              >
+                                {selected ? "✓" : ""}
+                              </i>
+                              {/*
+                                行内**不显示**授权状态文案：这一行的选择控件才是它要表达的
+                                东西，而「可分析 · 修改仍需预览确认」等长句子会把单行撑成两行、
+                                行高随之跳动，也在视觉上压过工作表名。授权状态的唯一去处是
+                                列表下方那一条 ScopeAdmissionSummary（整次选择的汇总）。
+                              */}
+                              <span>
+                                <strong>{sheet.name}</strong>
+                                <small>
+                                  {sheet.name === workbook.activeWorksheet
+                                    ? "当前工作表 · "
+                                    : ""}
+                                  {workbook.catalogOnly ? "字段按需读取" : `${sheet.rowCount} 行 · ${sheet.columnCount} 列`}
+                                </small>
+                              </span>
+                            </button>
+                          );
+                        })}
+                        {filteredWorksheets.length === 0 && (
+                          <p>没有匹配的工作表</p>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                )}
                 <button
                   className={sourceMode === "folder" ? "selected" : ""}
                   onClick={() => {
@@ -9397,93 +10412,10 @@ export default function App() {
                   </span>
                 </button>
               </div>
-              {sourceMode === "workbook" && (
-                <div className="scope-action-buttons">
-                  <button
-                    className="scope-refresh"
-                    disabled={busy}
-                    onClick={() => void refreshWorkbook()}
-                    title="刷新工作簿（更新工作簿名和工作表列表）"
-                  >
-                    ↻ 刷新
-                  </button>
-                  <button
-                    className="scope-confirm"
-                    disabled={
-                      workbookScopeMode === "manual" &&
-                      selectedSheetNames.length === 0
-                    }
-                    onClick={() => void confirmSheetSelection()}
-                  >
-                    {status === "scanning" ? "读取中..." : "完成"}
-                  </button>
-                </div>
-              )}
+              </fieldset>
+              {sourceMode === "workbook" && <ScopeAdmissionSummary items={scopeAdmission.report?.items ?? []}
+                count={scopeAdmissionIds.length} checking={scopeAdmission.checking} />}
             </div>
-
-            {sourceMode === "workbook" && workbookScopeMode === "manual" && (
-              <div className="workbook-sheet-picker">
-                <div className="sheet-search-row">
-                  <input
-                    value={sheetSearch}
-                    onChange={(event) => setSheetSearch(event.target.value)}
-                    placeholder="搜索工作表..."
-                    aria-label="搜索工作表"
-                  />
-                  <span>
-                    已选 {selectedSheetNames.length}/{workbook.worksheets.length}
-                  </span>
-                </div>
-                <div className="sheet-picker-toolbar">
-                  <button
-                    onClick={() => {
-                      selectAllSheets(
-                        filteredWorksheets.map((sheet) => sheet.name)
-                      );
-                    }}
-                  >
-                    全选搜索结果
-                  </button>
-                  <button
-                    onClick={clearSelectedSheets}
-                  >
-                    清空
-                  </button>
-                </div>
-                <div className="workbook-sheet-list">
-                  {filteredWorksheets.map((sheet) => {
-                    const selected = selectedSheetNames.includes(sheet.name);
-                    return (
-                      <button
-                        className={selected ? "selected" : ""}
-                        key={sheet.name}
-                        onClick={() => toggleSheet(sheet.name)}
-                        aria-pressed={selected}
-                      >
-                        <i
-                          className="sheet-checkbox"
-                          aria-hidden="true"
-                        >
-                          {selected ? "✓" : ""}
-                        </i>
-                        <span>
-                          <strong>{sheet.name}</strong>
-                          <small>
-                            {sheet.name === workbook.activeWorksheet
-                              ? "当前工作表 · "
-                              : ""}
-                            {sheet.rowCount} 行 · {sheet.columnCount} 列
-                          </small>
-                        </span>
-                      </button>
-                    );
-                  })}
-                  {filteredWorksheets.length === 0 && (
-                    <p>没有匹配的工作表</p>
-                  )}
-                </div>
-              </div>
-            )}
 
             {sourceMode === "folder" && (
               <div className="folder-scope-picker">
@@ -9554,20 +10486,29 @@ export default function App() {
                       <span>
                         {folderCatalog.files.length} 个文件 · {totalSelectableFolderSheets} 张表
                       </span>
-                      <button
-                        type="button"
-                        className={showSelectedFolderSheets ? "selected" : ""}
-                        disabled={
-                          !showSelectedFolderSheets &&
-                          folderSheetKeys.length === 0
-                        }
-                        onClick={() =>
-                          setShowSelectedFolderSheets((current) => !current)
-                        }
-                        aria-pressed={showSelectedFolderSheets}
-                      >
-                        {showSelectedFolderSheets ? "显示全部" : "只看已选"}
-                      </button>
+                      <div className="folder-selection-filter-actions">
+                        <button
+                          type="button"
+                          disabled={folderSheetKeys.length === 0}
+                          onClick={clearFolderSelection}
+                        >
+                          清空
+                        </button>
+                        <button
+                          type="button"
+                          className={showSelectedFolderSheets ? "selected" : ""}
+                          disabled={
+                            !showSelectedFolderSheets &&
+                            folderSheetKeys.length === 0
+                          }
+                          onClick={() =>
+                            setShowSelectedFolderSheets((current) => !current)
+                          }
+                          aria-pressed={showSelectedFolderSheets}
+                        >
+                          {showSelectedFolderSheets ? "显示全部" : "只看已选"}
+                        </button>
+                      </div>
                     </div>
                     <div
                       className={`folder-master-detail folder-picker-view-${folderPickerView}`}
@@ -9738,7 +10679,56 @@ export default function App() {
                 )}
               </div>
             )}
+            </fieldset>
             </div>
+
+            {/*
+              动作条是 `.scope-popover-scroll` 的**兄弟**节点，不是它的后代。
+              这正是 Excel 与 WPS 「完成按钮所在的层不一样」的根因：放进滚动容器里，
+              它就只是"内容末尾的一行 flex"，内容一滚、它跟着滚走；放在外面，才被
+              `.scope-popover`（column flex + `overflow: hidden`）钉成固定页脚。
+              所以这里的层不是靠多写几条 padding 对齐的，而是靠**结构**对齐：
+              两端读同一份声明（`.scope-action-buttons, .wps-scope-actions` 写在
+              共享样式表里），任一端把容器搬回去，两端就会立刻重新分叉。
+              按钮集合同样对齐 WPS：刷新 / 确认 / 取消；「取消」只在草稿与已提交
+              授权不一致时出现，出口语义是 `discardWorkbookScopeEdit`（草稿退回已提交
+              授权**并关闭弹层**，已提交授权一字不改），与 WPS 的 `discardScopeEdit`
+              是同一件事。
+            */}
+            {sourceMode === "workbook" && (
+              <div className="scope-action-buttons">
+                <button
+                  className="scope-refresh"
+                  disabled={busy || scopeCheckingCommit}
+                  onClick={() => void refreshWorkbook()}
+                  title="刷新工作簿（更新工作簿名和工作表列表）"
+                >
+                  <i
+                    className={`scope-refresh-glyph${refreshSpin ? " spinning" : ""}`}
+                    key={refreshSpin}
+                    aria-hidden="true"
+                  >↻</i>
+                  {" "}刷新
+                </button>
+                <button
+                  className="scope-confirm"
+                  disabled={
+                    busy || targetGuard.confirming || scopeCheckingCommit || !scopeAdmission.canCommit ||
+                    (workbookScopeMode === "manual" && selectedSheetNames.length === 0)
+                  }
+                  onClick={() => void confirmSheetSelection()}
+                >
+                  {targetGuard.confirming || scopeCheckingCommit ? "核对中..." : status === "scanning" ? "读取中..." : "确认"}
+                </button>
+                {scopeDraftDirty && (
+                  <button type="button" className="scope-discard" onClick={discardWorkbookScopeEdit}>
+                    取消
+                  </button>
+                )}
+              </div>
+            )}
+            {sourceMode === "workbook" && scopeConfirmationError &&
+              <p role="alert" className="authorized-target-error">{targetGuard.error || scopeConfirmationError}</p>}
 
             {sourceMode === "folder" && folderCatalog && (
               <div className="folder-selection-footer">
@@ -9761,14 +10751,27 @@ export default function App() {
                 <button
                   type="button"
                   className="scope-confirm"
-                  disabled={folderSheetKeys.length === 0 || busy}
+                  disabled={folderSheetKeys.length === 0 || busy || scopeCheckingCommit || !scopeAdmission.canCommit}
                   onClick={() => void confirmSheetSelection()}
                 >
-                  {status === "scanning" ? "读取中..." : "完成"}
+                  {scopeCheckingCommit ? "核对中..." : status === "scanning" ? "读取中..." : "确认"}
                 </button>
+                {/*
+                  草稿与已提交授权不一致时才出现 —— 与工作簿动作条同一条规则、同一个出口语义。
+                  「取消」= 草稿回到 `confirmedFolderScopeRef` 里那份已提交的键、关闭弹层；
+                  已提交一字不改。两端（Excel / WPS）文件夹页脚到此**逐字同形**：
+                  计数 + ⓘ → 确认 →（可选）取消，且取消都关闭面板（WPS `discardScopeEdit` 同款）。
+                */}
+                {folderDraftDirty && (
+                  <button type="button" className="scope-discard" onClick={cancelFolderScopeEdit}>
+                    取消
+                  </button>
+                )}
               </div>
             )}
-
+            {sourceMode === "folder" && <ScopeAdmissionSummary items={scopeAdmission.report?.items ?? []}
+              count={scopeAdmissionIds.length} checking={scopeAdmission.checking} />}
+            {sourceMode === "folder" && scopeConfirmationError && <p role="alert" className="authorized-target-error">{scopeConfirmationError}</p>}
           </section>
         )}
 
@@ -9776,6 +10779,8 @@ export default function App() {
         <button
           className={`scope-trigger ${contextOpen ? "open" : ""}`}
           onClick={() => {
+            if (scopeCheckingCommit) return;
+            if (!contextOpen) { void openScopePicker(); return; }
             const nextOpen = !contextOpen;
             setFolderBackupOpen(false);
             setSheetSearch("");
@@ -9814,16 +10819,8 @@ export default function App() {
                     ? `工作目录 ${folderCatalog.folderName} · 已选 ${folderSheetKeys.length} 张表`
                     : "设置工作目录"
                   : workbookScopeMode === "auto"
-                    ? `${
-                        workbookDataPeriod
-                          ? `${workbookDataPeriod} · `
-                          : ""
-                      }当前表 ${workbook.activeWorksheet}`
-                    : `${
-                        workbookDataPeriod
-                          ? `${workbookDataPeriod} · `
-                          : ""
-                      }已固定 ${selectedSheetNames.length} 个工作表`}
+                    ? `当前表 ${workbook.activeWorksheet}`
+                    : `已固定 ${selectedSheetNames.length} 个工作表`}
             </strong>
           </span>
           <b>{contextOpen ? "⌄" : "⌃"}</b>
@@ -9950,12 +10947,12 @@ export default function App() {
                 className="composer-shortcut-hint"
                 title={
                   busy
-                    ? "运行中：输入新内容按 Enter 可打断并转向，留空点 ■ 停止"
+                    ? "运行中：输入新内容按 Enter 可打断并转向，留空点 ■ 暂停"
                     : "Enter 发送 · Shift + Enter 换行 · 可粘贴截图"
                 }
               >
                 {busy
-                  ? "运行中：输入新内容按 Enter 可打断并转向，留空点 ■ 停止"
+                  ? "运行中：输入新内容按 Enter 可打断并转向，留空点 ■ 暂停"
                   : "Enter 发送 · Shift + Enter 换行 · 可粘贴截图"}
               </span>
               {busy ? (
@@ -9967,11 +10964,11 @@ export default function App() {
                   onClick={() =>
                     prompt.trim() ? steerTurn(prompt) : stopTurn()
                   }
-                  aria-label={prompt.trim() ? "打断并补充" : "停止"}
+                  aria-label={prompt.trim() ? "打断并补充" : "暂停任务"}
                   title={
                     prompt.trim()
                       ? "打断当前处理，带上这句话重新开始"
-                      : "停止当前处理"
+                      : "暂停当前规划，核对检查点后继续"
                   }
                 >
                   {prompt.trim() ? "↑" : "■"}

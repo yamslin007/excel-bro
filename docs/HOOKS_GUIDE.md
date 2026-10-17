@@ -554,7 +554,6 @@ const {
   workbookScopeMode,
   folderCatalog,
   folderSheetKeys,
-  workbookDataPeriod,
   scan,
   toggleSheet,
   toggleFolderSheet,

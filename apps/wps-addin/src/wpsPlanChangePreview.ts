@@ -2,6 +2,7 @@ import { columnLetterFromIndex } from "@excel-bro/core/range";
 import { parseExplicitA1Rect } from "../../excel-addin/src/planCore";
 import type { CellValue } from "../../excel-addin/src/contracts";
 import type { WpsPreparedPlan } from "./wpsPlanExecutor";
+import { describeWpsFormatAction } from "./wpsFormatCapability";
 
 /**
  * 确认卡默认可见的「位置 / 修改前 / 修改后」预览。
@@ -40,6 +41,12 @@ export type PlanPreviewAction = {
   sheetName: string;
   range: string;
   rows: PlanPreviewRow[];
+  /**
+   * 格式动作（setFont/setAlignment/resizeRange）的人类可读描述（含整行/整列影响
+   * 提示）。存在时，首屏不再显示"修改前 → 修改后"的值矩阵对照（格式动作不改值），
+   * 而是显示这条格式描述；`rows` 为 `[]`。值动作没有此字段。
+   */
+  formatDescription?: string;
   /** 这块区域一共多少格（不代表 rows.length）。 */
   totalCells: number;
   /** 是否只展示了代表性子集。 */
@@ -58,11 +65,20 @@ export function planPreviewCellText(value: CellValue): string {
   return String(value);
 }
 
+/** 是否为格式动作（走格式快照路径，预览显示格式描述而非"写入值"）。 */
+function isFormatActionType(type: string): type is "setFont" | "setAlignment" | "resizeRange" {
+  return type === "setFont" || type === "setAlignment" || type === "resizeRange";
+}
+
 /** 动作类型 → 用户能读的说法。与计划卡其它地方共用同一套词汇。 */
-export function planActionLabel(type: WpsPreparedPlan["actions"][number]["type"]): string {
+export function planActionLabel(type: string): string {
   if (type === "clearRange") return "清空内容";
   if (type === "writeFormulas") return "写入公式";
-  return "写入值";
+  if (type === "setFont") return "设置字体";
+  if (type === "setAlignment") return "设置对齐";
+  if (type === "resizeRange") return "调整尺寸";
+  if (type === "writeValues") return "写入值";
+  return `其他操作（${type}）`;
 }
 
 function valueMatrixFor(
@@ -89,6 +105,23 @@ export function buildPlanChangePreview(
   maxRows = 3
 ): PlanChangePreview {
   const actions: PlanPreviewAction[] = plan.actions.map((action) => {
+    // 格式动作不改值：首屏不显示"旧值 → 旧值"的值矩阵对照（那是误导），
+    // 而是显示格式描述（含整行/整列影响提示）。`formatAction` 字段由
+    // `prepareFormatAction` 在预览时写入，永远存在。
+    if (isFormatActionType(action.type)) {
+      return {
+        key: `${action.actionIndex}:${action.sheetName}:${action.range}`,
+        label: planActionLabel(action.type),
+        sheetName: action.sheetName,
+        range: action.range,
+        rows: [],
+        formatDescription: describeWpsFormatAction(
+          action.formatAction ?? (action as unknown as Parameters<typeof describeWpsFormatAction>[0])
+        ),
+        totalCells: action.cellCount,
+        truncated: false
+      };
+    }
     const rect = parseExplicitA1Rect(
       action.range.includes("!") ? (action.range.split("!").pop() ?? action.range) : action.range
     );

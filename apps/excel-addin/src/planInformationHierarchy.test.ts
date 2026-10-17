@@ -1,6 +1,8 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
+  PLAN_FORMAT_IMPACT_LABEL,
+  PLAN_FORMAT_SECTION,
   PLAN_NOTE_SECTIONS,
   SESSION_RECOVERY_LABEL,
   SESSION_RECOVERY_NOTICE_PREFIX,
@@ -77,5 +79,24 @@ describe("任务窗格信息层级：Excel 与 WPS 的同状态口径", () => {
     expect(wpsStyles).toMatch(
       /@media \(max-width: 430px\)[\s\S]*?\.wps-plan-notes ul\s*\{[\s\S]*?padding-left:\s*16px;/
     );
+  });
+
+  it("格式改动预览只在 Excel 端消费（WPS 端本轮没接通格式动作）", () => {
+    expect(PLAN_FORMAT_SECTION).toBe("格式改动");
+    expect(PLAN_FORMAT_IMPACT_LABEL).toContain("整行");
+    // 常量必须**真的被消费**，否则它只是摆设：把 App.tsx 里那两处引用删掉就变红。
+    expect(appSource).toContain("PLAN_FORMAT_SECTION");
+    expect(appSource).toContain("PLAN_FORMAT_IMPACT_LABEL");
+    // 标题不许写死在 JSX 里 —— 写死就等于放弃"两端同一份口径"。
+    expect(appSource).not.toContain(">格式改动<");
+    // 区块必须有对应样式，否则渲染出来是一坨没有层级的纯文本。
+    expect(excelStyles).toMatch(/\.format-preview ul\s*\{[\s\S]*?\}/);
+    expect(excelStyles).toMatch(/\.format-preview-impact\s*\{[\s\S]*?\}/);
+    // WPS 端**没有**接入格式动作：既不该渲染这个区块，也不该出现它的文案。
+    // 这条同时是"不许把 Excel 端的成果说成两端都有"的机器判据 ——
+    // 真去 WPS 接线时它会变红，那时应当连同计划表里的能力矩阵一起改。
+    expect(wpsSource).not.toContain("PLAN_FORMAT_SECTION");
+    expect(wpsSource).not.toContain(">格式改动<");
+    expect(wpsStyles).not.toContain(".format-preview");
   });
 });

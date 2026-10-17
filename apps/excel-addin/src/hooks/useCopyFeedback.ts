@@ -27,14 +27,22 @@ export function useCopyFeedback({
   const functionCopyTimerRef = useRef<number | null>(null);
 
   useEffect(
-    () => () => {
-      mountedRef.current = false;
-      if (copyFeedbackTimerRef.current !== null) {
-        window.clearTimeout(copyFeedbackTimerRef.current);
-      }
-      if (functionCopyTimerRef.current !== null) {
-        window.clearTimeout(functionCopyTimerRef.current);
-      }
+    () => {
+      // 必须在 setup 里**重新武装**：`main.tsx` 用 `React.StrictMode` 包 `<App />`，
+      // 开发构建下 React 会重放 effect（setup → cleanup → setup）。
+      // 只在 cleanup 里置 false、不在 setup 里置回 true 的话，重放之后这个开关
+      // 会**永久**停在 false，之后每次点复制都在写入"已复制"状态之前被它拦掉 ——
+      // 界面表现就是"点了复制毫无反应"。
+      mountedRef.current = true;
+      return () => {
+        mountedRef.current = false;
+        if (copyFeedbackTimerRef.current !== null) {
+          window.clearTimeout(copyFeedbackTimerRef.current);
+        }
+        if (functionCopyTimerRef.current !== null) {
+          window.clearTimeout(functionCopyTimerRef.current);
+        }
+      };
     },
     []
   );

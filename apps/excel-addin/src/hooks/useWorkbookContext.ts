@@ -1,18 +1,17 @@
-import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import type {
   WorkbookSnapshot,
   FolderCatalog,
   FolderSelection
 } from "../contracts";
 import {
-  captureWorkbookStructure,
+  captureWorkbookCatalog,
   watchWorkbookStructureChanges,
   isRunningInExcel
 } from "../excel";
 import { selectFolder } from "../api";
 import { folderSheetKey } from "../utils";
 import { demoWorkbook } from "../demo";
-import { extractWorkbookDataPeriod } from "../workbookIdentity";
 import type { DiagnosticEvent } from "../diagnostics";
 import type { SourceMode, WorkbookScopeMode } from "../types/workbook";
 
@@ -40,14 +39,6 @@ export function useWorkbookContext() {
   const [folderSheetKeys, setFolderSheetKeys] = useState<string[]>([]);
 
   /**
-   * 派生状态：工作簿数据周期（从文件名提取）
-   */
-  const workbookDataPeriod = useMemo(
-    () => (workbook ? extractWorkbookDataPeriod(workbook.name) : null),
-    [workbook]
-  );
-
-  /**
    * 捕获工作簿快照
    *
    * @param options.announce - 是否在消息流中通知
@@ -63,11 +54,7 @@ export function useWorkbookContext() {
 
     try {
       const snapshot = isRunningInExcel()
-        ? await captureWorkbookStructure(
-            sourceMode === "workbook" && workbookScopeMode === "manual"
-              ? selectedSheetNames
-              : undefined
-          )
+        ? await captureWorkbookCatalog()
         : demoWorkbook;
 
       setWorkbook(snapshot);
@@ -288,9 +275,6 @@ export function useWorkbookContext() {
     workbookScopeMode,
     folderCatalog,
     folderSheetKeys,
-
-    // 派生状态
-    workbookDataPeriod,
 
     // 操作
     scan,

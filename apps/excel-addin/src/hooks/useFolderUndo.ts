@@ -16,6 +16,7 @@ interface UseFolderUndoOptions {
   isBusy: boolean;
   onStatusChange: (status: "executing" | "idle") => void;
   onMessage: (text: string) => void;
+  onRestored?: (entries: readonly FolderUndoEntry[]) => void;
   onAfterUndo?: (
     entry: FolderUndoEntry,
     result: FolderUndoResult
@@ -26,6 +27,7 @@ export function useFolderUndo({
   isBusy,
   onStatusChange,
   onMessage,
+  onRestored,
   onAfterUndo
 }: UseFolderUndoOptions) {
   const [folderUndoStack, setFolderUndoStack] = useState<FolderUndoEntry[]>([]);
@@ -79,6 +81,7 @@ export function useFolderUndo({
           entry.sessionId,
           entry.undoId
         );
+        onRestored?.(index >= 0 ? folderUndoStack.slice(index) : [entry]);
         setFolderUndoStack((stack) =>
           index >= 0
             ? stack.slice(0, index)
@@ -111,6 +114,7 @@ export function useFolderUndo({
       isBusy,
       onStatusChange,
       onMessage,
+      onRestored,
       onAfterUndo
     ]
   );

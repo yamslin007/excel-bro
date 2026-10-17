@@ -102,7 +102,14 @@ export default function PlanEditorDialog() {
   const originalDraftRef = useRef<string | null>(null);
 
   const applyPayload = useCallback((next: PlanEditorInitMessage["payload"]) => {
-    const formatted = JSON.stringify(next.plan, null, 2);
+    /*
+     * 编辑器只展示**可编辑**的计划口径。实际来源依赖是本机的可信记账，不是计划
+     * 的编辑项：把它显示出来会让人以为改了 JSON 就等于改了"读过谁"。保存时同样
+     * 会被剥掉（`handleSave`），这里先不让它进草稿，免得用户看到"改前有、改后没了"。
+     */
+    const editable: AnalysisPlan = { ...next.plan };
+    delete editable.sourceDependencySheets;
+    const formatted = JSON.stringify(editable, null, 2);
     setPayload(next);
     setDraft(formatted);
     originalDraftRef.current = formatted;
@@ -276,6 +283,14 @@ export default function PlanEditorDialog() {
       return;
     }
 
+    /*
+     * 编辑器里的是**用户可改的 JSON 文本**：动作区域、工作表都能被改掉，所以
+     * "这份计划读过谁"不再有任何可信记账支撑。保存一律剥掉实际来源依赖，按
+     * "依赖不确定"处理 —— 不登记断点恢复，也不用编辑过的文本去声明来源。
+     */
+    const editedPlan = { ...(parsed as AnalysisPlan) };
+    delete editedPlan.sourceDependencySheets;
+
     // 第二道门：服务端 Pydantic 规范化。逐动作校验合法性并重算验收条件
     // （acceptanceCriteria），返回的才是最终要保存的版本 —— 前端白名单只
     // 保证「字段在不在」，值是否合法、验收条件怎么算都只有后端知道。
@@ -288,7 +303,7 @@ export default function PlanEditorDialog() {
     let normalized: AnalysisPlan;
     try {
       normalized = await validatePlan(
-        parsed as AnalysisPlan,
+        editedPlan,
         payload.authorizedSheets,
         payload.workbook.worksheets.map((sheet) => sheet.name)
       );
@@ -415,7 +430,7 @@ export default function PlanEditorDialog() {
 
   const busy = phase === "chatting" || phase === "validating";
   const breadcrumb = payload
-    ? `${payload.target.kind === "savedTool" ? "我的工具 › 固化工具" : "消息 › 计划脚本"} · ${payload.plan.title} · ${payload.plan.actions.length} 个动作`
+    ? `${payload.target.kind === "savedTool" ? "我的工具 › 固化工具" : "消息 › 计划"} · ${payload.plan.title} · ${payload.plan.actions.length} 个动作`
     : "";
 
   return (
@@ -433,7 +448,7 @@ export default function PlanEditorDialog() {
           </button>
           <div className="plan-editor-dialog-title">
             <div className="plan-editor-dialog-title-row">
-              <h1>编辑执行脚本</h1>
+              <h1>编辑计划</h1>
               {isDirty && (
                 <span className="plan-editor-dirty">已修改</span>
               )}

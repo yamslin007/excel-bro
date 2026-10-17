@@ -283,15 +283,27 @@ class TestBudgetControl:
     @pytest.mark.parametrize("state, reason", [
         (LoopState(total_tokens=1_000_000, turn_index=8), "max_turns"),
         (LoopState(total_tokens=1_000_000, consecutive_errors=3), "consecutive_errors"),
-        (LoopState(total_tokens=1_000_000, elapsed_time=60), "timeout"),
     ])
     def test_disabled_tokens_do_not_disable_other_guards(self, state, reason):
         assert should_stop(state, LoopConfig(max_total_tokens=None)) == (True, reason)
 
-    def test_should_stop_timeout(self):
-        state = LoopState(elapsed_time=60.0)
+    def test_should_stop_does_not_own_wall_time(self):
+        """累计活跃耗时的收口不在 ``should_stop``。
 
-        assert should_stop(state, LoopConfig()) == (True, "timeout")
+        2026-10-10 改造：``config.max_wall_time_seconds`` 是**累计活跃执行总时限**
+        （默认 1800 秒）。它必须由 ``run_excel_agent`` 的
+        ``note_progress(..., enforce_total_wall_time=True)`` 判定并抛
+        ``AgentBudgetPause``（现场已保存、可按真实恢复能力继续）；若留在
+        ``should_stop``，会被当作普通熔断走 ``safe_degradation``，出现"一边说现场
+        已保存、一边说规划超时"的双重口径。
+        """
+        over_budget = LoopState(elapsed_time=10_000.0)
+
+        # 与 max_turns / consecutive_errors 等真实熔断不同，超时**不**在这里停。
+        assert should_stop(over_budget, LoopConfig()) == (False, None)
+        assert should_stop(
+            LoopState(elapsed_time=10_000.0, turn_index=8), LoopConfig()
+        ) == (True, "max_turns")
 
     def test_should_stop_consecutive_errors(self):
         state = LoopState(consecutive_errors=3)

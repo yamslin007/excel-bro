@@ -22,6 +22,9 @@
     "test:core": "npm run test --workspace @excel-bro/core",
     "dev:server": "python -m uvicorn server.app.main:app --host 127.0.0.1 --port 8765 --reload",
     "test:server": "python -m pytest server/tests --basetemp=.tmp-pytest",
+    "test:cross-process": "node scripts/run_cross_process_chain.mjs",
+    "test:online": "node scripts/run_online_link.mjs",
+    "test:wps-format-ledger": "node scripts/run_wps_format_ledger_link.mjs",
     "test": "npm run test:addin && npm run test:wps && npm run test:server"
   },
   "devDependencies": {

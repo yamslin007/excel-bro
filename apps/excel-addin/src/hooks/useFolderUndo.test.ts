@@ -227,4 +227,73 @@ describe("useFolderUndo", () => {
     );
     expect(result.current.folderUndoStack).toEqual([first]);
   });
+
+  it("onRestored receives the associated entries only on success", async () => {
+    const onRestored = vi.fn();
+    const { result } = renderHook(() =>
+      useFolderUndo({
+        isBusy: false,
+        onStatusChange: vi.fn(),
+        onMessage: vi.fn(),
+        onRestored
+      })
+    );
+    const first = entry("plan-1");
+    const second = entry("plan-2");
+    act(() => {
+      result.current.pushFolderUndo(first);
+      result.current.pushFolderUndo(second);
+    });
+
+    await act(async () => {
+      await result.current.undoFolderExecutionTo("plan-1");
+    });
+
+    // 从 plan-1 往前连带撤销：返回的是 [first, second] 两条关联条目。
+    expect(onRestored).toHaveBeenCalledTimes(1);
+    expect(onRestored).toHaveBeenCalledWith([first, second]);
+  });
+
+  it("onRestored not fired on failure (file changed after execution)", async () => {
+    undoFolderExecutionMock.mockRejectedValue(new Error("执行后文件又发生了变化"));
+    const onRestored = vi.fn();
+    const { result } = renderHook(() =>
+      useFolderUndo({
+        isBusy: false,
+        onStatusChange: vi.fn(),
+        onMessage: vi.fn(),
+        onRestored
+      })
+    );
+    const undo = entry("conflict-plan");
+    act(() => result.current.pushFolderUndo(undo));
+
+    await act(async () => {
+      await result.current.undoFolderExecutionTo(undo.planId);
+    });
+
+    expect(onRestored).not.toHaveBeenCalled();
+    expect(result.current.folderUndoStack).toEqual([undo]);
+  });
+
+  it("reconcileFolderUndoIds does not fire onRestored (dropping stale entries is not an undo)", () => {
+    const onRestored = vi.fn();
+    const { result } = renderHook(() =>
+      useFolderUndo({
+        isBusy: false,
+        onStatusChange: vi.fn(),
+        onMessage: vi.fn(),
+        onRestored
+      })
+    );
+    const first = entry("same-plan", "undo-1");
+    const second = entry("same-plan", "undo-2");
+    act(() => {
+      result.current.pushFolderUndo(first);
+      result.current.pushFolderUndo(second);
+      result.current.reconcileFolderUndoIds(["undo-2"]);
+    });
+
+    expect(onRestored).not.toHaveBeenCalled();
+  });
 });

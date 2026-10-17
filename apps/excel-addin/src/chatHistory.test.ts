@@ -119,6 +119,39 @@ describe("history verification migration", () => {
   });
 });
 
+describe("executionUndone normalization", () => {
+  it("persists a true undone flag and coerces a missing/falsy flag to false", () => {
+    // 已撤销的卡重载后仍要显示「已撤销」，不能退回旧验证结论。
+    expect(
+      normalizeStoredMessage({
+        id: "undone-1",
+        role: "system",
+        text: "",
+        executionUndone: true,
+        createdAt: "2026-10-14T00:00:00.000Z"
+      }).executionUndone
+    ).toBe(true);
+    // 未撤销的卡：缺字段 / 非 true 都归一为 false（重载历史不等于撤销，绝不能凭空标已撤销）。
+    expect(
+      normalizeStoredMessage({
+        id: "undone-2",
+        role: "system",
+        text: "",
+        createdAt: "2026-10-14T00:00:00.000Z"
+      }).executionUndone
+    ).toBe(false);
+    expect(
+      normalizeStoredMessage({
+        id: "undone-3",
+        role: "system",
+        text: "",
+        executionUndone: false,
+        createdAt: "2026-10-14T00:00:00.000Z"
+      }).executionUndone
+    ).toBe(false);
+  });
+});
+
 describe("stale source plan preview", () => {
   const plan = {
     id: "stale-plan",

@@ -9,6 +9,21 @@
   --color-brand-bg: #edf3ec;
   --color-brand-text: #2f6b47;
   --color-brand-hover: #e3ebe2;
+  /*
+   * 「有新进度」浮标的**前景色**（= 本主题 brandText 同色相压深 20%），
+   * 两个字形共用：运行中的三颗圆点、跑完之后的锚图标。
+   *
+   * 为什么不叫 `--color-progress-dot`：这个控件现在有两个字形，令牌是"浮标上的
+   * 图形"而不是"圆点"的颜色 —— 名字跟着字形走，就会在换字形时变成谎话。
+   *
+   * 取值**必须与 `useTheme.ts` 四个预设里的 `progressGlyph` 一致**，改一处要
+   * 两处同改（`styles.test.ts` 会比对，并对每个预设算 3:1 对比度）。它是
+   * **字面量**而不是 `color-mix()` 现算：宿主引擎（WPS 是 QtWebEngine）对
+   * `color-mix()` 的支持不可假设，而**降级行救不了这种情况** —— 两条声明是同一个
+   * 属性，color-mix 那条赢在层叠、只是算不出值，于是 `background` 落到初始值
+   * `transparent`，图形**整个消失**。详见 `useTheme.ts` 里 progressGlyph 的注释。
+   */
+  --color-progress-glyph: #265639;
   --color-border: #e9e9e7;
   --color-border-strong: #d3d2cf;
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.04);
@@ -68,6 +83,29 @@
   --spacing-md: 12px;
   --spacing-lg: 16px;
   --spacing-xl: 24px;
+  /*
+   * 数据范围面板里所有「一行一个选项」的框**共用一个行高**（模式卡 / 工作表行 /
+   * 工作目录模式下的工作表行）：模式卡、工作表行在同一个面板里上下相邻，
+   * 高度不一致时列表会显得"比上面那两块细"，也是用户直接看出来的那个问题。
+   *
+   * 数值不是拍出来的，是模式卡的固有高度：卡内是「标题行 + 说明行」两行文字
+   * （各 line-height 20px）+ 1px 行距 + 上下 var(--spacing-sm) 内边距 + 上下 1px 描边
+   * = 20 + 1 + 20 + 8 + 8 + 1 + 1 = 59px。
+   * **模式卡自己也读这个 token**（而不是让工作表行去猜模式卡有多高），
+   * 这样"统一"是被同一份声明保证的，不靠两边凑巧相等。
+   */
+  --scope-option-height: 59px;
+  /*
+   * 子表选择面板收放的时长与曲线（**一个地方调快慢**）。
+   * 展开/收起共用同一组值，所以两个方向是对称的；只在该 token 生效的
+   * 过渡里使用（见 `.scope-picker-reveal`），且仅在
+   * `prefers-reduced-motion: no-preference` 下声明。
+   * 历史：初版 260ms + 强 ease-out，起手过急、观感像"瞬间出现"。
+   */
+  --motion-picker-duration: 360ms;
+  --motion-picker-ease: cubic-bezier(0.4, 0, 0.2, 1);
+  /* 「刷新」图标点击时转一圈的时长。 */
+  --motion-refresh-duration: 540ms;
   --font-family-base:
     "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI",
     "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
@@ -379,8 +417,8 @@ textarea:focus-visible {
 }
 
 .tool-card-icon.tone-sage {
-  background: #e6f2e9;
-  color: #226c3c;
+  background: var(--color-brand-bg);
+  color: var(--color-brand-text);
 }
 
 .tool-card-icon.tone-blue {
@@ -444,6 +482,30 @@ textarea:focus-visible {
   color: var(--color-text-tertiary);
   font-size: var(--font-size-caption);
   line-height: 1.4;
+}
+
+.tool-card-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
+.tool-card-edit {
+  flex: 0 0 auto;
+  border: 0;
+  border-radius: var(--radius-sm);
+  corner-shape: squircle;
+  background: transparent;
+  color: var(--color-brand-text);
+  padding: 3px 2px;
+  font-size: var(--font-size-caption);
+  font-weight: 750;
+}
+
+.tool-card-edit:hover {
+  text-decoration: underline;
+  text-underline-offset: 2px;
 }
 
 .tool-card-delete {
@@ -612,7 +674,7 @@ textarea:focus-visible {
 }
 
 .tool-dsl {
-  /* 只读专家脚本固定使用深色代码皮肤，token 颜色同步切换 */
+  /* 只读专家计划固定使用深色代码皮肤，token 颜色同步切换 */
   --code-bg: #17211b;
   --code-fg: #d9e7dc;
   --code-border: #263b2e;
@@ -660,6 +722,42 @@ textarea:focus-visible {
   gap: var(--spacing-md);
   min-height: 0;
   padding: var(--spacing-lg) clamp(20px, 4vw, 40px) var(--spacing-xl);
+}
+
+.plan-editor-textarea {
+  width: 100%;
+  min-height: 180px;
+  resize: vertical;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  corner-shape: squircle;
+  background: var(--color-background);
+  color: var(--color-text);
+  padding: 12px 14px;
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-caption);
+  line-height: 1.6;
+  tab-size: 2;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.plan-editor-textarea:focus {
+  outline: 2px solid var(--color-brand-text);
+  outline-offset: 2px;
+}
+
+.plan-editor-error {
+  margin: 0;
+  color: #a36a61;
+  font-size: var(--font-size-caption);
+  line-height: 1.5;
+}
+
+.wps-save-tool-inline {
+  margin-top: 8px;
+  border-top: 1px solid var(--color-border);
+  padding-top: 8px;
 }
 
 .tool-expert-note {
@@ -1200,7 +1298,7 @@ textarea:focus-visible {
   width: 12px;
   height: 12px;
   border: 2px solid rgba(255, 255, 255, 0.35);
-  border-top-color: #ffffff;
+  border-top-color: var(--color-background);
   border-radius: var(--radius-full);
   display: inline-block;
   animation: tool-button-spin 0.8s linear infinite;
@@ -1258,6 +1356,18 @@ textarea:focus-visible {
   gap: 7px;
   border-top: 1px solid var(--color-border);
   padding-top: 9px;
+}
+
+.tool-save-blocked-reason {
+  margin: 0;
+  border: 1px solid var(--color-danger-border);
+  border-radius: var(--radius-sm);
+  corner-shape: squircle;
+  background: var(--color-danger-bg);
+  color: var(--color-danger-text);
+  padding: 8px 10px;
+  font-size: var(--font-size-caption);
+  line-height: 1.5;
 }
 
 .tool-save-review > strong {
@@ -1381,18 +1491,21 @@ textarea:focus-visible {
   z-index: 50;
 }
 
+/*
+ * 品牌徽标。2026-10-12 起从「EB 字标」换成**图片**，所以不再需要底色/字色/
+ * 字号 —— 那些声明留着会在图片下面垫一层品牌绿、把 logo 的半透明边缘染绿。
+ *
+ * `border-radius: var(--radius-full)` 保留：styles.test.ts 把这一组类名作为
+ * 「真圆元素」统一管理（要么不带圆角，要么必须全圆且不许加 squircle）。新图
+ * 自带四周留白，圆角不会裁到内容，保留它才能让这条契约继续有意义。
+ */
 .brand-mark {
-  display: grid;
+  display: block;
   width: 28px;
   height: 28px;
   flex: 0 0 28px;
-  place-items: center;
+  object-fit: contain;
   border-radius: var(--radius-full);
-  background: var(--color-brand-text);
-  color: white;
-  font-size: var(--font-size-caption);
-  font-weight: 700;
-  letter-spacing: -0.02em;
 }
 
 .brand-copy {
@@ -1438,7 +1551,7 @@ textarea:focus-visible {
 }
 
 .brand-copy span.model-online {
-  color: #216f3d;
+  color: var(--color-brand-text);
 }
 
 .model-help-button {
@@ -1457,8 +1570,8 @@ textarea:focus-visible {
 }
 
 .model-help-button:hover {
-  background: #edf3ef;
-  color: #216f3d;
+  background: var(--color-brand-bg);
+  color: var(--color-brand-text);
 }
 
 .model-help-button svg {
@@ -1960,7 +2073,7 @@ textarea:focus-visible {
 }
 
 .brand-copy span.online i {
-  background: #2eaa5e;
+  background: var(--color-brand-text);
   box-shadow: 0 0 0 2px rgba(46, 170, 94, 0.12);
 }
 
@@ -2039,7 +2152,7 @@ textarea:focus-visible {
 .header-button.new-chat-entry {
   border-color: var(--color-brand-text);
   background: var(--color-brand-text);
-  color: #fff;
+  color: var(--color-background);
 }
 
 .header-button.new-chat-entry:hover:not(:disabled) {
@@ -2072,10 +2185,10 @@ textarea:focus-visible {
   display: grid;
   width: 260px;
   gap: 4px;
-  border: 1px solid #d8e2da;
+  border: 1px solid var(--color-brand-hover);
   border-radius: var(--radius-md);
   corner-shape: squircle;
-  background: #fff;
+  background: var(--color-background);
   padding: 6px;
   box-shadow: 0 16px 36px rgba(24, 53, 33, 0.18);
 }
@@ -2093,11 +2206,11 @@ textarea:focus-visible {
 }
 
 .view-menu > button:hover {
-  background: #f0f6f2;
+  background: var(--color-brand-bg);
 }
 
 .view-menu strong {
-  color: #2b4635;
+  color: var(--color-brand-text);
   font-size: var(--font-size-body);
   line-height: var(--line-height-body);
 }
@@ -2582,7 +2695,7 @@ textarea:focus-visible {
   margin-top: 0;
   border-color: var(--color-brand-text);
   background: var(--color-brand-text);
-  color: #fff;
+  color: var(--color-background);
 }
 
 .connection-test-feedback {
@@ -2756,8 +2869,8 @@ textarea:focus-visible {
   place-items: center;
   border-radius: var(--radius-xs);
   corner-shape: squircle;
-  background: #edf5ef;
-  color: #2b7545;
+  background: var(--color-brand-bg);
+  color: var(--color-brand-text);
   font-size: var(--font-size-caption);
   font-style: normal;
 }
@@ -2785,7 +2898,7 @@ textarea:focus-visible {
 }
 
 .context-summary b {
-  color: #3e7850;
+  color: var(--color-brand-text);
   font-size: var(--font-size-caption);
   white-space: nowrap;
 }
@@ -2794,7 +2907,7 @@ textarea:focus-visible {
   max-height: min(360px, 46vh);
   overflow-y: auto;
   border-top: 1px solid #edf0ed;
-  background: #fafcfb;
+  background: var(--color-brand-bg);
   padding: 10px 12px 11px;
 }
 
@@ -2807,7 +2920,7 @@ textarea:focus-visible {
 
 .sheet-chip {
   min-width: 94px;
-  border: 1px solid #dde5de;
+  border: 1px solid var(--color-brand-hover);
   border-radius: var(--radius-sm);
   corner-shape: squircle;
   background: white;
@@ -2819,9 +2932,9 @@ textarea:focus-visible {
 }
 
 .sheet-chip.selected {
-  border-color: #55a06d;
-  background: #edf7f0;
-  color: #216f3d;
+  border-color: var(--color-brand-text);
+  background: var(--color-brand-bg);
+  color: var(--color-brand-text);
   box-shadow: inset 0 0 0 1px rgba(48, 132, 74, 0.08);
 }
 
@@ -2838,14 +2951,14 @@ textarea:focus-visible {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  border-top: 1px solid #e8ede9;
+  border-top: 1px solid var(--color-brand-bg);
   padding-top: 9px;
 }
 
 .context-actions button {
   border: 0;
   background: transparent;
-  color: #287044;
+  color: var(--color-brand-text);
   padding: 2px 0;
   font-size: var(--font-size-caption);
   font-weight: 750;
@@ -2859,10 +2972,10 @@ textarea:focus-visible {
 .context-actions .context-confirm {
   min-height: 29px;
   margin-left: auto;
-  border: 1px solid #246f41;
+  border: 1px solid var(--color-brand-text);
   border-radius: var(--radius-sm);
   corner-shape: squircle;
-  background: #246f41;
+  background: var(--color-brand-text);
   color: white;
   padding: 5px 10px;
 }
@@ -2925,6 +3038,15 @@ textarea:focus-visible {
   scroll-behavior: smooth;
 }
 
+/*
+ * 「有新进度」浮标。
+ *
+ * 同一个控件两个状态，字形不同、语义同一个（点一下回到底部）：
+ * - 运行中：`.progress-dots` 三点动效（下面的注释）。
+ * - 已停下：`.progress-anchor-icon` 锚图标（再下面那条规则的注释）。
+ * 状态由按钮上的 `data-mode="running|idle"` 标注，但**字形是条件渲染**的 ——
+ * CSS 不需要按 `data-mode` 去藏字形，`data-mode` 只作为可断言的状态出口。
+ */
 .new-progress-button {
   position: absolute;
   left: 50%;
@@ -2936,46 +3058,196 @@ textarea:focus-visible {
   width: 42px;
   height: 42px;
   padding: 0;
-  border: 1px solid rgba(255, 255, 255, 0.14);
+  /*
+   * 外圈 = **本主题的品牌浅色渐变**，且跟随主题。
+   *
+   * 取值是 `--color-brand-bg` → `--color-brand-hover`，四个预设各自给出本主题的
+   * 浅色调：default 浅绿、warm-orange 浅橙、calm-blue 浅蓝、vivid-green 淡绿。
+   * 没有任何写死色值，所以它不是"绿色"，而是"本主题的品牌浅色"。
+   *
+   * **为什么起点不用 `.activity-card` 的 `--color-background-subtle`**：那对令牌里
+   * `background-subtle` 在 default 预设下就是**纯白 `#ffffff`**（卡片是白→浅绿），
+   * 于是 42px 的圆上有一半是纯白，整个控件读成了"白圆圈"。卡片面积大、能看到
+   * 绿的那一端，圆做不到。改成走**两个品牌色**之后，圆整体是本主题的浅色，
+   * 跟卡片同族但不会出现纯白起点。
+   *
+   * 原先这里是写死的 `#1f1f1f` 深色药丸 + 白描边：深底把前景图形逼成浅色，
+   * 整个控件与卡片/面板的浅色体系割裂。
+   *
+   * **不描边**（2026-10-12 用户裁决，原话「去掉这个圆形边缘线条」；同日追加
+   * 「去掉边框颜色，改为透明即可」）。曾经用 `--color-border-strong` 画了一圈 1px
+   * 灰边：在浅色渐变外面再套一圈灰线，42px 的小圆上那一圈比圆本身还抢眼，读成
+   * "一个描了边的灰圈"而不是"一枚浮标"。圆的轮廓现在**完全由这层渐变自己撑**
+   * （面板底是 `--color-background-subtle`，四个预设都比它深一档、也更饱和），
+   * 再加上 `--shadow-md` 的投影，边界依然清楚 —— 但那是"影子"，不是"线"。
+   *
+   * **下面那条把边框显式关掉的声明不能省。** 作者这边一旦在这个选择器上完全不写
+   * 边框属性，浏览器的 UA 样式就会接管 `<button>`（Chrome 默认是 `2px outset
+   * ButtonBorder`），浅绿圆外面立刻冒出一圈**黑环** —— 用户第二张截图里那个黑圈
+   * 就是这么来的，也正是他把话说成"去掉边框颜色，改为透明即可"的原因。所以这里
+   * 要的不是"删干净"，而是"显式说不要"：关掉之后一个像素都不画，视觉上就是透明。
+   * **别再加回来**：`styles.test.ts` 有一条负向断言钉着它 —— 判据是"值会不会真的
+   * 画出一条线"，所以"关掉"的这条声明放行，画边的那种（带 `solid`、带非零宽度）
+   * 会被拦下，变异 M4 就是"把那圈边画回来"。
+   * （这里刻意不写画边声明的完整原文，免得被按"声明"扫的正则误伤。）
+   */
+  border: none;
   border-radius: var(--radius-full);
-  background: #1f1f1f;
+  background: linear-gradient(
+    145deg,
+    var(--color-brand-bg),
+    var(--color-brand-hover)
+  );
   box-shadow: var(--shadow-md);
   cursor: pointer;
   transform: translateX(-50%);
   animation: new-progress-enter 160ms ease-out;
 }
 
+/*
+ * 「有新进度」提示的三点动效。
+ *
+ * 语义不是"我正在加载"，而是"你往上滚走了，下面还有新内容"。所以这里用
+ * **聚合 → 分散 + 整体环绕**，而不是上下弹跳：弹跳读起来像等待，用户会以为
+ * 点了也还得等。
+ *
+ * 结构：外层 `.progress-dots` 匀速自转，三颗点各自做"散开 → 收成一颗 → 再散开"
+ * 的半径动画。两者叠加，同一段周期里既有环绕也有聚散。**只有三个 span**，不变；
+ * 聚合那一刻它们**同心重叠**成一颗（同色，最大的 8px 盖住 5 / 6px 两颗）。
+ *
+ * 为什么角度不等分（0 / 125 / 250）且展开半径也不同（13 / 10.5 / 12px）：
+ * 等分加同半径会读成"一个在转的等边三角形"；不等分还顺带避免了某个瞬间
+ * 两颗点正好同高、排成一行。三颗点尺寸也刻意不同（8 / 5 / 6px）。
+ *
+ * 第二条动画只做淡入：状态从"跑完"切回"又跑起来"时，三点重挂进 DOM，不淡入
+ * 会是一记硬切。它**只动 opacity** —— 自转那条动的是 `transform`，两条若同时
+ * 声明同一个属性，后一条会整段盖掉前一条，环绕会被打断 160ms。
+ */
 .new-progress-button .progress-dots {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
+  position: absolute;
+  inset: 0;
+  animation:
+    progress-orbit-spin 3.2s linear infinite,
+    progress-glyph-swap 160ms ease-out;
 }
 
 .new-progress-button .progress-dots span {
-  width: 5px;
-  height: 5px;
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  display: block;
   border-radius: var(--radius-full);
-  background: rgba(255, 255, 255, 0.88);
-  animation: progress-dot-bounce 1.1s ease-in-out infinite;
+  /*
+   * 圆点 = **主题色**，压在品牌浅色渐变底上。
+   *
+   * 用的是 `--color-progress-glyph`（= 本主题 `brandText` 同色相压深 20%），**不是**
+   * `color-mix()` 现算 —— 原因见 `:root` 里该令牌的注释：宿主引擎对 `color-mix()`
+   * 的支持不可假设，而"降级行 + color-mix"这种双写**在这一处根本救不了**，因为
+   * color-mix 那条赢在层叠、只是算不出值，`background` 会落到 `transparent`，
+   * 圆点整个消失（这正是"外圈正常、里面空的"那个现象）。
+   *
+   * 为什么不直接用 `--color-brand-text`：四个预设里有两个压在环形渐变的最暗端
+   * 过不了 **3:1**（非文本 UI 图形门槛，WCAG 1.4.11）—— warm-orange 只有 2.58、
+   * vivid-green 2.93。而且这不是"渐变太深"造成的：warm-orange 的品牌色
+   * `#d97739` 压在**纯白**上也才 3.16，它本身就是中调橙，把底色调得再浅也救不
+   * 回来（实测混合到 25% 仍只有 2.95）。所以只能**同色相压深**：只降明度、不动
+   * 色相，仍然读作"主题色"，且在 5–8px 这个尺寸上本来也需要更沉一点才看得清。
+   * 压深 20% 是**必要且充分**的下限（10% 时悬停端点只有 2.89，不够）。
+   *
+   * 实测（压在环形渐变最暗端 `brandHover` 上）：default 6.98 / warm-orange 3.53 /
+   * calm-blue 4.30 / vivid-green 4.00，全部过门槛。**锚图标用同一个令牌**，
+   * 所以这四组对比度对它同样成立。
+   */
+  background: var(--color-progress-glyph);
+  /* 基准位形 = 展开态。动画停用时（含 prefers-reduced-motion）就是它，
+     所以静态降级仍然是一组错落的点，不会全叠在圆心。 */
+  transform: translate(-50%, -50%) rotate(var(--progress-orbit-angle, 0deg))
+    translateY(calc(-1 * var(--progress-orbit-radius, 13px)));
+}
+
+.new-progress-button .progress-dots span:nth-child(1) {
+  --progress-orbit-angle: 0deg;
+  --progress-orbit-radius: 13px;
+  width: 8px;
+  height: 8px;
+  animation: progress-orbit-a 3.2s ease-in-out infinite;
 }
 
 .new-progress-button .progress-dots span:nth-child(2) {
-  animation-delay: 0.15s;
+  --progress-orbit-angle: 125deg;
+  --progress-orbit-radius: 10.5px;
+  width: 5px;
+  height: 5px;
+  animation: progress-orbit-b 3.2s ease-in-out infinite;
 }
 
 .new-progress-button .progress-dots span:nth-child(3) {
-  animation-delay: 0.3s;
+  --progress-orbit-angle: 250deg;
+  --progress-orbit-radius: 12px;
+  width: 6px;
+  height: 6px;
+  animation: progress-orbit-c 3.2s ease-in-out infinite;
+}
+
+/*
+ * 「EB 已停下」状态：三点换成**实心剪影锚**，颜色不变、底不变，只换字形。
+ *
+ * 为什么是锚：控件出现的语义是"下面还有你没看到的内容"，不是一个通用的
+ * "回到底部"导航。锚读作"东西停在那儿、钉住这个位置"，与运行中那组会动的点
+ * 构成**动 / 静**对照 —— 用户扫一眼就知道这一轮跑完了没有。
+ *
+ * 颜色**必须**与圆点同一个令牌：同一个控件、同一层浅色底，换个字形不该换种
+ * 颜色；而且令牌已经是压深过的值，直接继承"过 3:1"的结论。
+ *
+ * 这里**只填色、不描边**（2026-10-12 用户裁决：锚换成参考图那种实心剪影）。
+ * 形状整个由 svg 里那些 `d` / 几何决定，`fill` 一上就是那块剪影；一旦再挂
+ * `stroke` 声明，实心形的边缘会再糊一圈、还会和填充打架，反而毁掉剪影的干净边。
+ * 所以**没有** `fill: none`、也**没有任何 `stroke*`** —— 这不是漏写，是这套
+ * 字形的要求；`styles.test.ts` 两条断言盯着它：fill 必须是同一个主题令牌、
+ * 且不许出现描边声明。
+ */
+.new-progress-button .progress-anchor-icon {
+  width: 20px;
+  height: 20px;
+  fill: var(--color-progress-glyph);
+  animation: progress-glyph-swap 160ms ease-out;
+}
+
+/* 字形切换的淡入。**只动 opacity**：`.progress-dots` 上另一条动画动的是
+   `transform`，两条同时声明同一属性时后一条会整段盖掉前一条。 */
+@keyframes progress-glyph-swap {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
 }
 
 .new-progress-button:hover {
-  background: #2a2a2a;
-  border-color: rgba(255, 255, 255, 0.24);
-  box-shadow: var(--shadow-md);
+  /*
+   * 悬停 = 渐变**整体深一档**：起点从 `--color-brand-bg` 走到 `--color-brand-hover`。
+   * 四个预设里 `brand-hover` 都比 `brand-bg` 深、比 `brand-text` 浅，所以它既是
+   * 悬停的落点，也是**前景图形对比度的最坏端点** —— 圆点与锚的注释、
+   * `styles.test.ts` 的守卫都按这个端点算 3:1，不是按较浅的常态起点算。
+   */
+  background: linear-gradient(
+    145deg,
+    var(--color-brand-hover),
+    var(--color-brand-hover)
+  );
+  /* 阴影**不在这里重复**：常态已是 `--shadow-md`，而本表只有 `sm`/`md` 两档，
+   * 再写一遍就是同值冗余（无判别力的空声明）。只有 `:active` 需要动它 ——
+   * 按下要读成"贴回纸面"，所以那一条降到 `--shadow-sm`。 */
   transform: translateX(-50%);
 }
 
 .new-progress-button:active {
-  background: #171717;
+  background: linear-gradient(
+    145deg,
+    var(--color-brand-hover),
+    var(--color-brand-hover)
+  );
   box-shadow: var(--shadow-sm);
   transform: translateX(-50%);
 }
@@ -2996,16 +3268,61 @@ textarea:focus-visible {
   }
 }
 
-@keyframes progress-dot-bounce {
-  0%,
-  55%,
-  100% {
-    transform: translateY(0);
-    opacity: 0.5;
+@keyframes progress-orbit-spin {
+  from {
+    transform: rotate(0deg);
   }
-  30% {
-    transform: translateY(-4px);
-    opacity: 1;
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/*
+ * 45%–55% 是"聚合"平台：三颗点半径同时收到 **0**，即三颗同心叠成**一颗**
+ * （同色，最大的 8px 完全盖住 5 / 6px 那两颗，读起来就是一个圆点）。
+ * 收到"快相触"（如 4px）是不对的 —— 那看起来仍是三颗挤在一起，不是聚合。
+ *
+ * 平台期占周期 10%（3.2s → 0.32s），足够看清"合成一颗"这一拍；再长会显得
+ * 卡顿，再短则这一拍会被忽略。用 ease-in-out 而不是匀速，收拢与张开才有加
+ * 减速；匀速会像机械呼吸。
+ *
+ * 聚合成一颗的那一瞬间，外层自转是**看不见**的（绕自身中心转一个点等于没
+ * 转），这正是想要的：视野里此刻只有一颗静止的圆点，等它再散开时旋转重新
+ * 显现 —— 于是"整体旋转"和"聚散"在同一段周期里读成两件事，不互相打散。
+ *
+ * 各点角度在这里**逐条写死**（而不是引用 var），因为关键帧里插值自定义属性
+ * 在部分宿主引擎上不可靠，写死能保证 QtWebEngine / CEF 两端表现一致。
+ */
+@keyframes progress-orbit-a {
+  0%,
+  100% {
+    transform: translate(-50%, -50%) rotate(0deg) translateY(-13px);
+  }
+  45%,
+  55% {
+    transform: translate(-50%, -50%) rotate(0deg) translateY(0);
+  }
+}
+
+@keyframes progress-orbit-b {
+  0%,
+  100% {
+    transform: translate(-50%, -50%) rotate(125deg) translateY(-10.5px);
+  }
+  45%,
+  55% {
+    transform: translate(-50%, -50%) rotate(125deg) translateY(0);
+  }
+}
+
+@keyframes progress-orbit-c {
+  0%,
+  100% {
+    transform: translate(-50%, -50%) rotate(250deg) translateY(-12px);
+  }
+  45%,
+  55% {
+    transform: translate(-50%, -50%) rotate(250deg) translateY(0);
   }
 }
 
@@ -3014,9 +3331,18 @@ textarea:focus-visible {
     animation: none;
   }
 
-  .new-progress-button .progress-dots span {
+  /*
+   * 停掉自转与收放，只保留**展开**这个静态位形。基准 transform（见
+   * `.progress-dots span`）本来就是展开态，所以这里不需要回写坐标 ——
+   * 但**必须**把 `animation: none` 同时作用到圆点上：只停外层的话，
+   * 三颗点会继续各自收放，那是"减少动效"里最不该留下的部分。
+   *
+   * 锚图标同理：它的淡入是纯装饰，静态呈现本身就是完整字形。
+   */
+  .new-progress-button .progress-dots,
+  .new-progress-button .progress-dots span,
+  .new-progress-button .progress-anchor-icon {
     animation: none;
-    opacity: 0.9;
   }
 }
 
@@ -3044,8 +3370,8 @@ textarea:focus-visible {
   border: 0;
   border-radius: var(--radius-full);
   background:
-    radial-gradient(circle at 30% 26%, #ffffff, transparent 42%),
-    #eef7f1;
+    radial-gradient(circle at 30% 26%, var(--color-background), transparent 42%),
+    var(--color-brand-bg);
   padding: 0;
   cursor: pointer;
   pointer-events: auto;
@@ -3103,7 +3429,7 @@ textarea:focus-visible {
   corner-shape: squircle;
   background:
     radial-gradient(circle at 12% 14%, rgba(115, 197, 139, 0.16), transparent 40%),
-    linear-gradient(135deg, #fbfefc, #eef7f1);
+    linear-gradient(135deg, var(--color-brand-bg), var(--color-brand-bg));
   padding: 12px 14px 14px;
   box-shadow: var(--shadow-md);
   animation: pet-bubble-in 0.16s ease;
@@ -3119,7 +3445,7 @@ textarea:focus-visible {
   height: 14px;
   border-left: 1px solid var(--color-brand-hover);
   border-top: 1px solid var(--color-brand-hover);
-  background: #fbfefc;
+  background: var(--color-brand-bg);
   transform: rotate(45deg);
 }
 
@@ -3143,14 +3469,14 @@ textarea:focus-visible {
 }
 
 .pet-bubble-eyebrow {
-  color: #2f7b4a;
+  color: var(--color-brand-text);
   font-size: var(--font-size-caption);
   font-weight: 700;
   letter-spacing: 0.03em;
 }
 
 .pet-bubble strong {
-  color: #24513a;
+  color: var(--color-brand-text);
   font-size: var(--font-size-body);
 }
 
@@ -3164,13 +3490,13 @@ textarea:focus-visible {
 .pet-shortcut {
   justify-self: start;
   margin-top: 8px;
-  border: 1px solid #bcd9c6;
+  border: 1px solid var(--color-brand-hover);
   border-bottom-width: 2px;
   border-radius: var(--radius-sm);
   corner-shape: squircle;
-  background: #fff;
+  background: var(--color-background);
   padding: 2px 8px;
-  color: #276d42;
+  color: var(--color-brand-text);
   font-family: var(--font-family-mono);
   font-size: var(--font-size-caption);
   font-weight: 600;
@@ -3179,19 +3505,19 @@ textarea:focus-visible {
 .pet-next {
   flex: 0 0 auto;
   margin-left: auto;
-  border: 1px solid #bcd9c6;
+  border: 1px solid var(--color-brand-hover);
   border-radius: var(--radius-sm);
   corner-shape: squircle;
-  background: #fff;
+  background: var(--color-background);
   padding: 3px 10px;
-  color: #276d42;
+  color: var(--color-brand-text);
   font-size: var(--font-size-caption);
   font-weight: 600;
   cursor: pointer;
 }
 
 .pet-next:hover {
-  background: #eaf4ed;
+  background: var(--color-brand-bg);
 }
 
 
@@ -3339,7 +3665,14 @@ textarea:focus-visible {
   font-size: var(--font-size-caption);
 }
 
-.folder-selection-filter > button {
+/* 「清空」与「只看已选」一起钉在右侧，不拆成两个 `space-between` 端点。 */
+.folder-selection-filter-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.folder-selection-filter button {
   border: 1px solid var(--color-border);
   border-radius: var(--radius-sm);
   corner-shape: squircle;
@@ -3351,13 +3684,13 @@ textarea:focus-visible {
   white-space: nowrap;
 }
 
-.folder-selection-filter > button.selected {
+.folder-selection-filter button.selected {
   border-color: var(--color-brand-hover);
   background: var(--color-brand-bg);
   color: var(--color-brand-text);
 }
 
-.folder-selection-filter > button:disabled {
+.folder-selection-filter button:disabled {
   cursor: not-allowed;
   opacity: 0.46;
 }
@@ -3415,7 +3748,7 @@ textarea:focus-visible {
   place-items: center;
   border-radius: var(--radius-sm);
   corner-shape: squircle;
-  background: #e5f1e8;
+  background: var(--color-brand-bg);
   color: var(--color-brand-text);
   font-size: var(--font-size-caption);
   font-style: normal;
@@ -3512,6 +3845,7 @@ textarea:focus-visible {
 
 .folder-sheet-list > button {
   display: flex;
+  min-height: var(--scope-option-height);
   align-items: center;
   gap: 8px;
   width: 100%;
@@ -3666,27 +4000,17 @@ textarea:focus-visible {
   margin-left: auto;
 }
 
-@media (min-width: 520px) {
-  .folder-master-detail {
-    grid-template-columns: minmax(160px, 0.8fr) minmax(230px, 1.2fr);
-    gap: 9px;
-  }
-
-  .folder-master-detail .folder-file-list,
-  .folder-master-detail.folder-picker-view-sheets .folder-file-list,
-  .folder-master-detail .folder-sheet-detail {
-    display: grid;
-  }
-
-  .folder-file-list,
-  .folder-sheet-list {
-    max-height: 300px;
-  }
-
-  .folder-back-button {
-    display: none;
-  }
-}
+/*
+ * 这里原来有一段 `@media (min-width: 520px)` 的覆盖：宽屏把 `.folder-master-detail`
+ * 切成两栏（文件列表 | 工作表详情）、强制两列都显示、并把 `.folder-back-button`
+ * 藏起来 —— 于是宽面板（WPS 任务窗格）变成"左边一直挂着文件列表、右边勾子表"，
+ * 而 Excel 用户熟悉的交互是「点文件 → 进入该文件 → 勾它的子表（← 文件 返回）」。
+ * 2026-10-16 按用户口径整段删掉：**任何宽度都走进入式单栏**，两端同一份声明、
+ * 没有分叉。窄屏形态的规则（`folder-picker-view-sheets` 藏文件列表、显示返回按钮）
+ * 就在上方基础区，删掉覆盖后它们在所有宽度都生效。
+ * 反向变异 L1（`scripts/mutate_scope_action_bar_layer.mjs`）会把这段两栏覆盖插回来，
+ * 钉住"不许复活"。
+ */
 
 .confirm-sheets {
   width: 100%;
@@ -3867,11 +4191,11 @@ textarea:focus-visible {
   align-items: center;
   gap: 5px;
   margin: 0 4px;
-  border: 1px solid #bdd9c5;
+  border: 1px solid var(--color-brand-hover);
   border-radius: var(--radius-xs);
   corner-shape: squircle;
-  background: #f4faf5;
-  color: #267044;
+  background: var(--color-brand-bg);
+  color: var(--color-brand-text);
   padding: 2px 7px 2px 3px;
   font-weight: 750;
   line-height: 1.4;
@@ -3886,8 +4210,8 @@ textarea:focus-visible {
   place-items: center;
   border-radius: var(--radius-xs);
   corner-shape: squircle;
-  background: #e5f1e8;
-  color: #267044;
+  background: var(--color-brand-bg);
+  color: var(--color-brand-text);
   font-size: var(--font-size-caption);
   font-style: normal;
 }
@@ -4244,7 +4568,7 @@ textarea:focus-visible {
   border-radius: var(--radius-sm);
   corner-shape: squircle;
   padding: 0 10px;
-  color: #fff;
+  color: var(--color-background);
   background: var(--color-brand-text);
   font-size: var(--font-size-caption);
   font-weight: 700;
@@ -4480,7 +4804,7 @@ textarea:focus-visible {
   width: 4px;
   height: 4px;
   border-radius: 50%;
-  background: #4c9362;
+  background: var(--color-brand-text);
   animation: pulse 1s infinite ease-in-out;
 }
 
@@ -5285,8 +5609,8 @@ textarea:focus-visible {
   padding: 6px 8px;
   border-radius: var(--radius-sm);
   corner-shape: squircle;
-  border: 1px solid #dce4dd;
-  background: #f7faf8;
+  border: 1px solid var(--color-brand-hover);
+  background: var(--color-brand-bg);
   color: #5a6b60;
   font-size: 12px;
   cursor: pointer;
@@ -5294,13 +5618,13 @@ textarea:focus-visible {
 }
 
 .function-preview-versions .version-tab:hover {
-  border-color: #b8ccbe;
+  border-color: var(--color-brand-text);
 }
 
 .function-preview-versions .version-tab.active {
-  background: #e3f0e7;
-  border-color: #6aa67f;
-  color: #26332b;
+  background: var(--color-brand-bg);
+  border-color: var(--color-brand-text);
+  color: var(--color-brand-text);
   font-weight: 600;
 }
 
@@ -5309,13 +5633,13 @@ textarea:focus-visible {
   padding: 8px 10px;
   border-radius: var(--radius-sm);
   corner-shape: squircle;
-  background: #f2f6f3;
-  border: 1px solid #dce4dd;
+  background: var(--color-brand-bg);
+  border: 1px solid var(--color-brand-hover);
   font-family: "Consolas", "Menlo", monospace;
   font-size: 12.5px;
   white-space: pre-wrap;
   word-break: break-all;
-  color: #26332b;
+  color: var(--color-brand-text);
 }
 
 .function-preview-trial {
@@ -5332,7 +5656,7 @@ textarea:focus-visible {
 
 .function-preview-trial strong {
   font-size: 13px;
-  color: #26332b;
+  color: var(--color-brand-text);
 }
 
 .function-local-badge {
@@ -5341,8 +5665,8 @@ textarea:focus-visible {
   padding: 1px 7px;
   border-radius: var(--radius-xs);
   corner-shape: squircle;
-  background: #e3f0e7;
-  color: #216f3d;
+  background: var(--color-brand-bg);
+  color: var(--color-brand-text);
   font-size: 12px;
   font-weight: 700;
   font-style: normal;
@@ -5353,15 +5677,15 @@ textarea:focus-visible {
   gap: 8px;
   margin-top: 10px;
   padding: 10px;
-  border: 1px solid #dce4dd;
+  border: 1px solid var(--color-brand-hover);
   border-radius: var(--radius-sm);
   corner-shape: squircle;
-  background: #f7faf8;
+  background: var(--color-brand-bg);
 }
 
 .function-match-proposal > strong {
   font-size: 12.5px;
-  color: #26332b;
+  color: var(--color-brand-text);
 }
 
 .function-match-row {
@@ -5383,11 +5707,11 @@ textarea:focus-visible {
   min-height: 30px;
   max-width: 140px;
   padding: 3px 6px;
-  border: 1px solid #d4ded6;
+  border: 1px solid var(--color-brand-hover);
   border-radius: var(--radius-sm);
   corner-shape: squircle;
-  background: #ffffff;
-  color: #26372c;
+  background: var(--color-background);
+  color: var(--color-brand-text);
   font: inherit;
   font-size: 12px;
 }
@@ -5456,21 +5780,21 @@ textarea:focus-visible {
   padding: 6px 10px;
   border-radius: var(--radius-sm);
   corner-shape: squircle;
-  border: 1px solid #dce4dd;
-  background: #fff;
-  color: #26332b;
+  border: 1px solid var(--color-brand-hover);
+  background: var(--color-background);
+  color: var(--color-brand-text);
   font-family: "Consolas", "Menlo", monospace;
   font-size: 12.5px;
 }
 
 .function-write-target-input:focus {
   outline: none;
-  border-color: #6aa67f;
+  border-color: var(--color-brand-text);
   box-shadow: none;
 }
 
 .function-write-target-input:disabled {
-  background: #f2f6f3;
+  background: var(--color-brand-bg);
   color: #8a998f;
   cursor: not-allowed;
 }
@@ -5502,7 +5826,7 @@ textarea:focus-visible {
 }
 
 .inline-plan-title span {
-  color: #3b7b50;
+  color: var(--color-brand-text);
   font-size: var(--font-size-caption);
   font-weight: 800;
   letter-spacing: 0.04em;
@@ -5512,11 +5836,27 @@ textarea:focus-visible {
   font-size: var(--font-size-caption);
 }
 
+.inline-plan-summary {
+  margin: 6px 0 0;
+  color: var(--color-text);
+  font-size: var(--font-size-caption);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.inline-plan-scale {
+  margin: 6px 0 0;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-caption);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
 .inline-plan-title b {
   border-radius: var(--radius-xs);
   corner-shape: squircle;
-  background: #edf4ef;
-  color: #467457;
+  background: var(--color-brand-bg);
+  color: var(--color-brand-text);
   padding: 4px 6px;
   font-size: var(--font-size-caption);
   white-space: nowrap;
@@ -5546,7 +5886,7 @@ textarea:focus-visible {
 
 .plan-details summary::before {
   content: "›";
-  color: #4f7d5f;
+  color: var(--color-brand-text);
   font-size: var(--font-size-body);
   line-height: 1;
   transition: transform 160ms ease;
@@ -5565,8 +5905,8 @@ textarea:focus-visible {
 
 .inline-notes {
   margin-top: 9px;
-  border-left: 2px solid #7bae89;
-  background: #f5f8f5;
+  border-left: 2px solid var(--color-brand-text);
+  background: var(--color-brand-bg);
   padding: 7px 8px;
   font-size: var(--font-size-caption);
 }
@@ -5588,6 +5928,43 @@ textarea:focus-visible {
   line-height: 1.5;
 }
 
+/* 格式改动预览：把"要改哪些属性"和"真实影响整行/整列"分开摆。
+   影响提示单独给一个小色块 —— 它和普通说明不是一回事，淹没在列表里就白写了。 */
+.format-preview ul {
+  display: grid;
+  gap: 5px;
+  padding-left: 0;
+  list-style: none;
+}
+
+.format-preview li {
+  display: grid;
+  gap: 2px;
+}
+
+.format-preview-target {
+  color: var(--color-brand-text);
+  font-weight: 700;
+}
+
+.format-preview-changes {
+  color: #4c5850;
+}
+
+.format-preview-impact {
+  margin-top: 2px;
+  border-left: 2px solid #d49438;
+  background: #fff8ed;
+  padding: 4px 6px;
+  color: #7a5a1d;
+  line-height: 1.5;
+}
+
+.format-preview-impact b {
+  margin-right: 5px;
+  color: #b9761f;
+}
+
 .inline-actions {
   display: grid;
   gap: 5px;
@@ -5605,7 +5982,7 @@ textarea:focus-visible {
   border: 1px solid #e8ebe8;
   border-radius: var(--radius-sm);
   corner-shape: squircle;
-  background: #fafcfa;
+  background: var(--color-brand-bg);
   padding: 7px;
   color: #4c5850;
   font-size: var(--font-size-caption);
@@ -5619,8 +5996,8 @@ textarea:focus-visible {
   place-items: center;
   border-radius: var(--radius-xs);
   corner-shape: squircle;
-  background: #e8f2eb;
-  color: #337148;
+  background: var(--color-brand-bg);
+  color: var(--color-brand-text);
   font-size: var(--font-size-caption);
   font-weight: 800;
 }
@@ -5770,8 +6147,8 @@ textarea:focus-visible {
   place-items: center;
   border-radius: var(--radius-xs);
   corner-shape: squircle;
-  background: #e5f1e8;
-  color: #267044;
+  background: var(--color-brand-bg);
+  color: var(--color-brand-text);
   font-style: normal;
 }
 
@@ -5821,18 +6198,29 @@ textarea:focus-visible {
 
 .scope-trigger .scope-sep {
   flex: 0 0 auto;
-  color: #cbd7ce;
+  color: var(--color-brand-hover);
   font-weight: 400;
 }
 
 .scope-trigger > b {
   margin-left: auto;
-  color: #4b775a;
+  color: var(--color-brand-text);
   font-size: var(--font-size-caption);
 }
 
 .scope-popover {
   --scope-popover-padding: var(--spacing-md);
+  /*
+   * 面板里**块与块之间**的竖向间距（标题 / 当前文件卡 / 模式列表 …）共用一个值。
+   *
+   * 两端的面板外壳不同：WPS 的面板正文直接是 `.scope-popover-scroll` 的 grid 子项，
+   * `gap` 生效；Excel 的正文多包了一层 `fieldset.scope-selection-fields`（为了在
+   * 提交期间整体 `disabled`），而 fieldset 是**块盒**、不是 grid 容器，
+   * 于是 scroll 的 gap 落空 —— 当前文件卡和「跟随当前」卡只剩两条描边贴在一起，
+   * 间距实测为 0，正是用户看到的"excel 的间隔太窄"。
+   * 修法不是再补一个魔法数，而是让**内层那层也读同一个 token**。
+   */
+  --scope-popover-block-gap: 10px;
   position: absolute;
   right: 10px;
   bottom: calc(100% + 7px);
@@ -6311,11 +6699,11 @@ textarea:focus-visible {
 }
 
 .folder-backup-recovery-confirm strong {
-  color: #245f49;
+  color: var(--color-brand-text);
 }
 
 .folder-backup-recovery-confirm span {
-  color: #3f6557;
+  color: var(--color-brand-text);
 }
 
 .folder-backup-delete-confirm-actions {
@@ -6381,7 +6769,7 @@ textarea:focus-visible {
   display: grid;
   min-height: 0;
   flex: 1 1 auto;
-  gap: 10px;
+  gap: var(--scope-popover-block-gap);
   overflow-y: auto;
   padding: var(--scope-popover-padding);
 }
@@ -6487,10 +6875,27 @@ textarea:focus-visible {
   min-width: 0;
 }
 
-.scope-action-buttons {
+/*
+ * 数据范围弹层的**固定页脚**：WPS（`.wps-scope-actions`）与 Excel
+ * （`.scope-action-buttons`）读的是同一份声明，两端不再各写一套。
+ *
+ * 它之所以钉得住，靠的是**结构**而不是这几条样式：动作条必须是
+ * `.scope-popover-scroll` 的**兄弟**节点，才能吃到 `.scope-popover` 的 column flex
+ * 与 `overflow: hidden`。一旦被放回滚动容器里面，`flex: 0 0 auto` 只表示"不许被
+ * 压缩"，挡不住容器整体滚动 —— 动作条会跟着内容一起滚出视口。所以这条规则与
+ * App.tsx / WpsProbePanel.tsx 里动作条所在的位置是**一对**判据，缺一不可。
+ *
+ * `border-top` 划出滚动内容与操作区的分界；按钮节奏（`gap: 7px`、`padding`）
+ * 与其余按钮行保持一致。
+ */
+.scope-action-buttons,
+.wps-scope-actions {
   display: flex;
-  gap: 7px;
+  flex: 0 0 auto;
   justify-content: flex-end;
+  gap: 7px;
+  border-top: 1px solid var(--color-border);
+  padding: 10px var(--spacing-md);
 }
 
 .scope-refresh {
@@ -6515,6 +6920,29 @@ textarea:focus-visible {
 .scope-refresh:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+/*
+ * 「刷新」按钮的图标：点击时转一圈，给一次可感知的反馈。
+ * `.spinning` 由点击计数驱动（组件里把计数当 `key`，换 key 即重挂载 → 动画重放），
+ * 所以不需要 `animationend` 之类的收尾逻辑；动画只播一次、不带 `forwards`。
+ * 旋转本身只在 `prefers-reduced-motion: no-preference` 下生效。
+ */
+.scope-refresh-glyph {
+  display: inline-block;
+  font-style: normal;
+}
+
+@keyframes scope-refresh-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .scope-refresh-glyph.spinning {
+    animation: scope-refresh-spin var(--motion-refresh-duration) cubic-bezier(0.4, 0, 0.2, 1);
+  }
 }
 
 .scope-confirm {
@@ -6580,6 +7008,7 @@ textarea:focus-visible {
 .scope-mode-list > button {
   display: flex;
   width: 100%;
+  min-height: var(--scope-option-height);
   align-items: center;
   gap: 9px;
   border: 1px solid var(--color-border);
@@ -6598,7 +7027,15 @@ textarea:focus-visible {
   box-shadow: inset 0 0 0 1px rgba(47, 107, 71, 0.08);
 }
 
-.scope-mode-list i {
+/*
+ * 只吃**直接子代**的图标（模式卡左端那个 25px 圆角方块）。
+ * 这里必须是子代选择器而不是 `.scope-mode-list i`：整棵工作表选择器都挂在
+ * `.scope-mode-list` 的子树里，后代选择器会把行内勾选框（`.sheet-checkbox`）
+ * 一起吃掉 —— 于是勾选框被撑成 25px、还被涂上 `--color-surface-hover` 的灰底，
+ * 在浅色行里看起来就是个"凹进去的灰方块"（实测 rgb(241,240,238)）。
+ * 勾选框只认 `.sheet-checkbox` 一份声明，这里不再越界。
+ */
+.scope-mode-list > button > i {
   display: grid;
   width: 25px;
   height: 25px;
@@ -6612,7 +7049,7 @@ textarea:focus-visible {
   font-style: normal;
 }
 
-.scope-mode-list button.selected i {
+.scope-mode-list > button.selected > i {
   background: var(--color-brand-hover);
 }
 
@@ -6653,8 +7090,69 @@ textarea:focus-visible {
   cursor: not-allowed;
 }
 
-.workbook-sheet-picker,
+/*
+ * 「选择多个」的子表选择面板的**展开 / 收起**动效。
+ *
+ * 用 `transition: grid-template-rows 0fr ↔ 1fr` 做**真实高度**收放：下方的
+ * 「工作目录」被平滑推下去、也会被平滑收回来。关键是**两个方向都走 CSS 过渡**
+ * （而不是只播一次的 `animation`）——面板常挂载、由 `.open` 类切换，
+ * 收起时才会有动画。只做 opacity/transform 的入场动画既推不动下方内容，
+ * 也无法收起；靠条件渲染卸载则连收起的机会都没有。
+ * 不支持的引擎会退化为瞬时收放，布局仍然正确。
+ *
+ * `visibility` 跟着过渡、**收起时延迟到高度收完才隐藏**：它把收起态的子控件
+ * 移出 Tab 序，否则键盘仍能聚焦到"看不见却还占着 0 高度"的按钮。
+ *
+ * `overflow: hidden`（兜底）→ `overflow: clip` + `overflow-clip-margin`（渐进增强）：
+ * 收放过程中必须裁掉溢出的内容，但裁切盒要往内控件的 `:focus-visible` 描边
+ * （2px 描边 + 2px offset）外让出余量，否则整行按钮的焦点环会被削掉两侧。
+ */
+.scope-picker-reveal {
+  display: grid;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  visibility: hidden;
+  overflow: hidden;
+  overflow: clip;
+  overflow-clip-margin: 6px;
+}
+
+.scope-picker-reveal.open {
+  grid-template-rows: 1fr;
+  opacity: 1;
+  visibility: visible;
+}
+
+.scope-picker-reveal > * {
+  min-height: 0;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .scope-picker-reveal {
+    transition:
+      grid-template-rows var(--motion-picker-duration) var(--motion-picker-ease),
+      opacity var(--motion-picker-duration) var(--motion-picker-ease),
+      visibility 0s linear var(--motion-picker-duration);
+  }
+
+  /* 展开方向：`visibility` 立刻可见过渡，高度与透明度再跟上。 */
+  .scope-picker-reveal.open {
+    transition:
+      grid-template-rows var(--motion-picker-duration) var(--motion-picker-ease),
+      opacity var(--motion-picker-duration) var(--motion-picker-ease),
+      visibility 0s;
+  }
+}
+
+.workbook-sheet-picker {
+  /* 现在是「选择多个」模式卡**内部**的展开内容（夹在模式卡之间），
+     不再需要分隔线与上边距——否则会和相邻模式卡的边框叠成三条横线。 */
+  display: grid;
+  gap: 7px;
+}
+
 .folder-scope-picker {
+  /* 仍在外层、单独成块，保留与上方模式卡的分隔线。 */
   display: grid;
   gap: 7px;
   border-top: 1px solid var(--color-border);
@@ -6718,6 +7216,7 @@ textarea:focus-visible {
 .workbook-sheet-list > button {
   display: flex;
   width: 100%;
+  min-height: var(--scope-option-height);
   align-items: center;
   gap: 8px;
   border: 1px solid var(--color-border);
@@ -6734,17 +7233,26 @@ textarea:focus-visible {
   background: var(--color-brand-bg);
 }
 
+/*
+ * 列表行左端的勾选框 —— **两端共用这一份声明**（Excel 的工作表行 / 工作目录行、
+ * WPS 的工作表行都挂 `sheet-checkbox` 这个类），免得两边各写一套各自漂移。
+ *
+ * 取 WPS 那一套观感：20px、1px 描边、**不填色**。空框读起来是"等你去勾的一个框"，
+ * 而不是一枚"凹进列表里的灰方块"：填充色一旦接近行底色（`--color-surface`
+ * #fafaf9 ≈ 行底色），空框就整个隐进列表里；勾上以后才整块换成品牌绿 + 白勾，
+ * 与行选中态的底色拉开对比。
+ */
 .sheet-checkbox {
   display: grid;
-  width: 18px;
-  height: 18px;
-  flex: 0 0 18px;
+  width: 20px;
+  height: 20px;
+  flex: 0 0 20px;
   place-items: center;
-  border: 1.5px solid var(--color-border-strong);
+  border: 1px solid var(--color-border-strong);
   border-radius: var(--radius-xs);
   corner-shape: squircle;
-  background: var(--color-surface);
-  color: white;
+  background: transparent;
+  color: var(--color-brand-text);
   font-size: 13px;
   font-weight: 800;
   font-style: normal;
@@ -6757,6 +7265,7 @@ textarea:focus-visible {
 button.selected > .sheet-checkbox {
   border-color: var(--color-brand-text);
   background: var(--color-brand-text);
+  color: var(--color-background);
 }
 
 .workbook-sheet-list > button > span {
@@ -6795,11 +7304,11 @@ button.selected > .sheet-checkbox {
   z-index: 4;
   display: grid;
   place-items: center;
-  border: 2px dashed #4d9a67;
+  border: 2px dashed var(--color-brand-text);
   border-radius: var(--radius-lg);
   corner-shape: squircle;
   background: rgba(241, 249, 243, 0.94);
-  color: #267044;
+  color: var(--color-brand-text);
   content: "松开以添加图片";
   font-size: var(--font-size-caption);
   font-weight: 750;
@@ -6835,7 +7344,7 @@ button.selected > .sheet-checkbox {
 .composer-resize-handle:hover i,
 .composer-resize-handle:focus-visible i {
   width: 34px;
-  background: #5c9270;
+  background: var(--color-brand-text);
 }
 
 .composer-resize-handle:focus-visible {
@@ -6871,10 +7380,10 @@ button.selected > .sheet-checkbox {
   flex: 0 0 72px;
   overflow: hidden;
   margin: 0;
-  border: 1px solid #d5e1d8;
+  border: 1px solid var(--color-brand-hover);
   border-radius: var(--radius-sm);
   corner-shape: squircle;
-  background: #f5f8f6;
+  background: var(--color-brand-bg);
 }
 
 .composer-attachments img {
@@ -6920,11 +7429,11 @@ button.selected > .sheet-checkbox {
   gap: 8px;
   margin: 1px 1px 2px;
   padding: 5px 6px 5px 10px;
-  border: 1px solid #cfe3d4;
+  border: 1px solid var(--color-brand-hover);
   border-radius: var(--radius-sm);
   corner-shape: squircle;
-  background: #eef6f0;
-  color: #2f4d39;
+  background: var(--color-brand-bg);
+  color: var(--color-brand-text);
   font-size: var(--font-size-caption);
 }
 
@@ -6949,8 +7458,8 @@ button.selected > .sheet-checkbox {
 }
 
 .composer-reply-chip button:hover {
-  background: #d9eadf;
-  color: #243a2c;
+  background: var(--color-brand-hover);
+  color: var(--color-brand-text);
 }
 
 .composer-toolbar {
@@ -6978,7 +7487,7 @@ button.selected > .sheet-checkbox {
 }
 
 .composer-box:focus-within {
-  border-color: #63a579;
+  border-color: var(--color-brand-text);
   box-shadow: none;
 }
 
@@ -7027,21 +7536,21 @@ button.selected > .sheet-checkbox {
 
 .slash-command-item:hover,
 .slash-command-item.selected {
-  background: #f0f5f2;
+  background: var(--color-brand-bg);
 }
 
 .slash-command-name {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  color: #2e8048;
+  color: var(--color-brand-text);
   font-size: var(--font-size-body);
   font-weight: 600;
   line-height: var(--line-height-body);
 }
 
 .slash-command-check {
-  color: #2e8048;
+  color: var(--color-brand-text);
   font-size: var(--font-size-subtitle);
   font-weight: bold;
   margin-left: 8px;
@@ -7133,9 +7642,10 @@ button.selected > .sheet-checkbox {
   cursor: pointer;
 }
 
-/* 纯停止：中性灰底方块，表示「掐掉、不重跑」。 */
+/* 纯停止：与发送同用当前主题色，停止语义由方块图标、可访问名称与说明表达。
+   与「转向」的区分不靠颜色，而靠：转向多一圈脉冲动画 + ↑ 图标，停止是 ■ 方块。 */
 .send-button.is-stop {
-  background: #787774;
+  background: var(--color-brand-text);
   font-size: var(--font-size-subtitle);
 }
 
@@ -7168,7 +7678,7 @@ button.selected > .sheet-checkbox {
   border: 1px solid #c7d3cc;
   border-radius: var(--radius-sm);
   corner-shape: squircle;
-  background: #fff;
+  background: var(--color-background);
   color: #4a5a51;
   font-size: var(--font-size-caption);
   cursor: pointer;
@@ -7176,7 +7686,7 @@ button.selected > .sheet-checkbox {
 
 .activity-stop-button:hover {
   border-color: #a9b8b0;
-  background: #f4f7f5;
+  background: var(--color-brand-bg);
 }
 
 @media (max-width: 340px) {
@@ -7274,7 +7784,7 @@ button.selected > .sheet-checkbox {
   border-radius: var(--radius-sm);
   corner-shape: squircle;
   background: white;
-  color: #17211b;
+  color: var(--color-brand-text);
   padding: 5px 11px;
 }
 
@@ -7286,7 +7796,7 @@ button.selected > .sheet-checkbox {
 
 .rule-section-title {
   margin: 0;
-  color: #2d7a49;
+  color: var(--color-brand-text);
   font-weight: 800;
   letter-spacing: 0.06em;
 }
@@ -7294,10 +7804,10 @@ button.selected > .sheet-checkbox {
 .rule-card {
   display: grid;
   gap: 7px;
-  border: 1px solid #dce4de;
+  border: 1px solid var(--color-brand-hover);
   border-radius: var(--radius-md);
   corner-shape: squircle;
-  background: #fff;
+  background: var(--color-background);
   padding: 12px 14px;
   box-shadow: 0 3px 12px rgba(38, 65, 46, 0.045);
 }
@@ -7315,14 +7825,14 @@ button.selected > .sheet-checkbox {
   align-items: center;
   gap: 6px;
   min-width: 0;
-  color: #25372b;
+  color: var(--color-brand-text);
 }
 
 .rule-tag {
   border-radius: var(--radius-xs);
   corner-shape: squircle;
-  background: #e6f2e9;
-  color: #226c3c;
+  background: var(--color-brand-bg);
+  color: var(--color-brand-text);
   padding: 1px 7px;
   white-space: nowrap;
 }
@@ -7344,8 +7854,8 @@ button.selected > .sheet-checkbox {
   overflow-x: auto;
   border-radius: var(--radius-sm);
   corner-shape: squircle;
-  background: #f5f7f4;
-  color: #277046;
+  background: var(--color-brand-bg);
+  color: var(--color-brand-text);
   padding: 7px 9px;
   font-family: var(--font-family-mono);
   white-space: pre-wrap;
@@ -7376,7 +7886,7 @@ button.selected > .sheet-checkbox {
 }
 
 .rule-field > label {
-  color: #3a4c40;
+  color: var(--color-brand-text);
   font-weight: 600;
 }
 
@@ -7388,7 +7898,7 @@ button.selected > .sheet-checkbox {
   border-radius: var(--radius-sm);
   corner-shape: squircle;
   background: white;
-  color: #17211b;
+  color: var(--color-brand-text);
   padding: 6px 10px;
 }
 
@@ -8310,7 +8820,7 @@ button.selected > .sheet-checkbox {
   border-radius: var(--radius-md);
   corner-shape: squircle;
   background: var(--color-brand-text);
-  color: #fff;
+  color: var(--color-background);
   padding: var(--spacing-sm) var(--spacing-md);
   font-size: var(--font-size-body);
 }
@@ -8321,7 +8831,7 @@ button.selected > .sheet-checkbox {
   border-radius: var(--radius-md);
   corner-shape: squircle;
   background: var(--color-brand-text);
-  color: #fff;
+  color: var(--color-background);
   padding: 6px 12px;
   font-size: var(--font-size-caption);
   font-weight: 800;
@@ -8571,7 +9081,7 @@ button.selected > .sheet-checkbox {
 
 .tool-drawer .primary-button {
   background: var(--color-brand-text);
-  color: #ffffff;
+  color: var(--color-background);
 }
 
 .tool-drawer .primary-button:hover {
@@ -8973,8 +9483,8 @@ button.selected > .sheet-checkbox {
   bottom: 28px;
   transform: translateX(-50%);
   z-index: 90;
-  background: #24302a;
-  color: #e7f2ea;
+  background: var(--color-brand-text);
+  color: var(--color-brand-bg);
   border-radius: var(--radius-sm);
   corner-shape: squircle;
   padding: 8px 18px;
@@ -9339,7 +9849,7 @@ button.selected > .sheet-checkbox {
   border: none;
   border-radius: var(--radius-full);
   background: var(--color-brand-text);
-  color: #ffffff;
+  color: var(--color-background);
   font-size: var(--font-size-subtitle);
   line-height: 1;
 }
@@ -9723,6 +10233,20 @@ button.selected > .sheet-checkbox {
   line-height: 1.6;
 }
 .authorized-target-option > label > span { min-width: 0; align-self: center; }
+.authorized-target-summary {
+  padding: 13px 96px 13px 14px;
+  min-height: 44px;
+  font-size: 14px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+  cursor: default;
+}
+.authorized-target-summary > span:first-child { display: block; min-width: 0; }
+.authorized-target-summary:hover {
+  border-color: var(--color-border-strong, #d3d2cf);
+  background: var(--color-background, #ffffff);
+}
+.authorized-target-summary:active { transform: none; }
 .authorized-target-option input {
   flex: 0 0 auto;
   margin: 0;
@@ -9822,6 +10346,140 @@ button.selected > .sheet-checkbox {
   color: var(--color-background, #ffffff);
 }
 .authorized-target-actions button.primary:hover:not(:disabled) {
-  background: #275c3d;
-  border-color: #275c3d;
+  background: var(--color-brand-text);
+  border-color: var(--color-brand-text);
 }
+/* One authorization entry: eligibility lives in the picker, notices stay beside it. */
+/*
+ * 这层 fieldset 同时是**布局容器**：Excel 用它把「标题 / 当前文件卡 / 模式列表 …」
+ * 一起 `disabled`，代价是这些块不再是 `.scope-popover-scroll` 的 grid 子项、
+ * 拿不到外层 gap。这里让它自己按同一个 token 排布，Excel/WPS 的块间距就一致了。
+ * 只包一个子项的那层（模式列表那层、WPS 那层）gap 自然不起作用。
+ */
+.scope-selection-fields {
+  display: grid;
+  gap: var(--scope-popover-block-gap);
+  border: 0;
+  padding: 0;
+  margin: 0;
+  min-width: 0;
+  width: 100%;
+}
+/*
+ * 行内授权徽标（`.scope-admission-badge`）已随「列表行只留勾选框 + 表名」下线：
+ * 逐行的授权文案会把单行撑成两行、行高跟着跳，也不是行内要表达的东西。
+ * 授权状态只在**列表下方**的 `.scope-admission-summary` 里汇总一次。
+ * 这里只留汇总用得到的错误色。
+ */
+.scope-admission-error { color: var(--color-danger-text); }
+.scope-admission-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; padding: 4px 0; margin: 8px 0; color: var(--color-text-secondary); font-size: var(--font-size-caption); line-height: 1.5; overflow-wrap: anywhere; }
+.target-scope-notice { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; padding: 10px 12px; margin: 8px 0; border: 1px solid var(--color-border-strong); border-radius: var(--radius-md); corner-shape: squircle; background: var(--color-brand-bg); font-size: var(--font-size-caption); line-height: 1.5; overflow-wrap: anywhere; }
+.scope-admission-summary > .scope-admission-error, .scope-admission-summary > .scope-admission-detail { flex-basis: 100%; }
+.target-scope-notice button { border: 1px solid var(--color-border-strong); border-radius: var(--radius-sm); corner-shape: squircle; background: var(--color-background); color: var(--color-brand-text); padding: 4px 8px; font-size: inherit; cursor: pointer; }
+.target-scope-notice button:disabled { opacity: .5; cursor: default; }
+.target-scope-notice { background: var(--color-warning-bg); border-color: var(--color-warning-border); }
+.target-scope-notice > strong, .target-scope-notice > span, .target-scope-notice > small { flex-basis: 100%; }
+.target-scope-notice > div { display: flex; flex-wrap: wrap; gap: 8px; }
+
+/* 本地查询结果卡：服务端只给引用与结构，值由本机回环端点按引用取回。 */
+.local-result-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-sm);
+  padding: var(--spacing-md);
+  border: 1px solid var(--color-border);
+  border-left: 4px solid var(--color-brand-text);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  corner-shape: squircle;
+}
+
+.local-result-card-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--spacing-sm);
+  color: var(--color-text-primary);
+  font-size: var(--font-size-body);
+}
+
+.local-result-card-shape {
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-caption);
+}
+
+.local-result-card-source,
+.local-result-card-partial,
+.local-result-card-status,
+.local-result-card-calculation {
+  margin: 0;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-caption);
+}
+
+.local-result-card-unavailable {
+  color: var(--color-warning-text);
+}
+
+.local-result-card-table-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-xs);
+  overflow-x: auto;
+}
+
+.local-result-card-table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: var(--font-size-caption);
+  color: var(--color-text-primary);
+}
+
+.local-result-card-table th,
+.local-result-card-table td {
+  padding: var(--spacing-xs) var(--spacing-sm);
+  border: 1px solid var(--color-border);
+  text-align: left;
+  white-space: nowrap;
+}
+
+.local-result-card-table thead th {
+  background: var(--color-brand-bg);
+  color: var(--color-brand-text);
+  font-weight: 600;
+}
+
+/*
+ * 执行方式选择（直接执行 / 副本比对）。
+ *
+ * 两个选项各占一行整块可点：说明文字比较长，挤在同一行会被逐字折行，反而读不下去。
+ * 选中项用左侧标记 + 边框表达，不靠颜色单独承载状态。
+ */
+.excel-execution-mode {
+  margin: 12px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--color-border, #e1dfdd);
+  border-radius: var(--radius-sm);
+}
+.excel-execution-mode legend { font-size: 12px; font-weight: 700; padding: 0 4px; }
+.excel-execution-mode-preface { margin: 0 0 8px; font-size: 12px; color: var(--color-text-secondary, #787774); }
+.excel-execution-mode-option {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  grid-template-areas: "radio label" ". detail";
+  gap: 2px 8px;
+  padding: 8px 8px 8px 6px;
+  border-left: 3px solid transparent;
+  cursor: pointer;
+}
+.excel-execution-mode-option + .excel-execution-mode-option { margin-top: 4px; }
+.excel-execution-mode-option.selected { border-left-color: var(--color-accent, #2b6cb0); background: var(--color-subtle, rgba(0, 0, 0, 0.03)); }
+.excel-execution-mode-option.unavailable { cursor: not-allowed; opacity: 0.7; }
+.excel-execution-mode-option input { grid-area: radio; margin-top: 3px; }
+.excel-execution-mode-label { grid-area: label; font-size: 13px; font-weight: 700; }
+.excel-execution-mode-detail { grid-area: detail; font-size: 12px; line-height: 1.5; color: var(--color-text-secondary, #787774); }
+.excel-execution-mode-blocked { grid-area: detail; font-size: 12px; color: var(--color-warning, #a4262c); }
+.result-review-bar { flex: 0 0 auto; padding: 10px 12px; border: 1px solid var(--color-border, #dce5df); border-radius: var(--radius-md); background: var(--color-surface, #fff); display: flex; flex-direction: column; gap: 5px; overflow-wrap: anywhere; }
+.result-review-bar p { margin: 0; font-size: 12px; line-height: 1.5; }
+.result-review-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.result-review-actions button { min-width: 0; white-space: normal; }

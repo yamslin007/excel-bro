@@ -15,6 +15,7 @@ import server.app.main as main_module
 import server.app.llm.config as llm_config
 import server.app.planner as planner_module
 import server.app.folder_workbooks as folder_workbooks_module
+from server.app.capabilities import capability_float
 from server.app.main import app
 from server.app.llm import ModelConnection, selected_model_config
 from server.app.models import (
@@ -148,6 +149,122 @@ def _office_plan(action: dict[str, object]) -> dict[str, object]:
         "warnings": [],
         "actions": [action],
     }
+
+
+def _office_register_payload(
+    operation_id: str, plan: dict[str, object], **overrides: object
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "operationId": operation_id,
+        "plan": plan,
+        "authorizedSheetNames": ["数据", "结果"],
+        "allowedExternalFiles": [],
+        "workbookIdentity": "url:c:/work/report.xlsx",
+        "confirmed": True,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_office_recovery_uses_attested_source_dependency() -> None:
+    """读写重叠看**实际来源依赖**，不是指纹覆盖范围。
+
+    指纹范围取的是本次授权范围（含写入目标），拿它判重叠会把每个正常计划都拒掉，
+    登记断点恢复因此永远不可达。本端给出"实际读过谁"的可信记账后，来源与目标明确
+    不重叠的计划必须真的能登记成功。
+    """
+    client = TestClient(app)
+    plan = _office_plan(
+        {
+            "type": "writeValues",
+            "sheet": "结果",
+            "range": "A1",
+            "values": [["ok"]],
+        }
+    )
+    plan["sourceFingerprintSheets"] = ["数据", "结果"]
+    plan["sourceDependencySheets"] = ["数据"]
+
+    response = client.post(
+        "/api/office/executions/register",
+        json=_office_register_payload("office-api-dependency-0001", plan),
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["ownerToken"]
+
+
+def test_office_recovery_still_refuses_when_dependency_overlaps_target() -> None:
+    """真重叠照旧拒绝：依赖里含写入目标时不能登记。
+
+    这条同时证明判定读的是依赖记录本身 —— 端上完全可以把目标从来源集合里摘掉，
+    但没有摘，"读过结果表"就是"读过结果表"。
+    """
+    client = TestClient(app)
+    plan = _office_plan(
+        {
+            "type": "writeValues",
+            "sheet": "结果",
+            "range": "A1",
+            "values": [["ok"]],
+        }
+    )
+    plan["sourceFingerprintSheets"] = ["数据", "结果"]
+    plan["sourceDependencySheets"] = ["数据", "结果"]
+
+    response = client.post(
+        "/api/office/executions/register",
+        json=_office_register_payload("office-api-dependency-0002", plan),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "OFFICE_RECOVERY_SOURCE_TARGET_OVERLAP"
+
+
+def test_office_recovery_falls_back_when_dependency_unknown() -> None:
+    """没有可信记账时退回既有保守口径：不动指纹范围判重叠，照旧拒绝。"""
+    client = TestClient(app)
+    plan = _office_plan(
+        {
+            "type": "writeValues",
+            "sheet": "结果",
+            "range": "A1",
+            "values": [["ok"]],
+        }
+    )
+    plan["sourceFingerprintSheets"] = ["数据", "结果"]
+
+    response = client.post(
+        "/api/office/executions/register",
+        json=_office_register_payload("office-api-dependency-0003", plan),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "OFFICE_RECOVERY_SOURCE_TARGET_OVERLAP"
+
+
+def test_office_recovery_refuses_dependency_outside_authorization() -> None:
+    """实际来源依赖不许越过本次授权：记账越界说明端上与授权对不上，宁可拒绝。"""
+    client = TestClient(app)
+    plan = _office_plan(
+        {
+            "type": "writeValues",
+            "sheet": "结果",
+            "range": "A1",
+            "values": [["ok"]],
+        }
+    )
+    plan["sourceFingerprintSheets"] = ["数据", "结果"]
+    plan["sourceDependencySheets"] = ["未授权表"]
+
+    response = client.post(
+        "/api/office/executions/register",
+        json=_office_register_payload("office-api-dependency-0004", plan),
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "OFFICE_RECOVERY_SCOPE_MISMATCH"
+    assert "未授权表" in response.text
 
 
 def test_office_recovery_api_requires_supported_saved_workbook_action() -> None:
@@ -1211,7 +1328,9 @@ def test_turn_stream_persists_budget_stop_as_failed_not_completed(monkeypatch):
     assert result["stopReason"] == "max_tokens"
     record = main_module._folder_operation_ledger.planning_task("turn-stopped-test")
     assert record.status == "failed"
-    assert record.result["outcome"] == "failed"
+    # 账本存的是**版本化恢复描述**，响应体在 `response` 里；这条没有值被省略。
+    assert record.result["valuesOmitted"] is False
+    assert record.result["response"]["outcome"] == "failed"
     assert main_module.turn_registry.touch("turn-stopped-test").stage == "failed"
     status = client.get("/api/turn/turn-stopped-test/status").json()
     assert status["status"] == "failed"
@@ -1814,6 +1933,7 @@ def test_turn_stream_pauses_persists_and_continues_from_checkpoint(
         on_checkpoint=None,
         resume_checkpoint=None,
         approved_wall_time_seconds=None,
+        reminder_seconds=None,
     ) -> AnswerResponse:
         nonlocal calls
         calls += 1
@@ -1884,8 +2004,14 @@ def test_turn_stream_pauses_persists_and_continues_from_checkpoint(
     )
     assert record is not None
     assert record.status == "completed"
-    assert record.extension_count == 1
-    assert record.approved_wall_time_seconds == 120
+    # 2026-10-10 改造后的口径：初批批准预算就是**总活跃执行时限**
+    # （``planningHardWallTimeSeconds``），所以一次"继续"即已结清到总时限，
+    # 不再按 ``planningExtensionSeconds`` 逐次累加（旧口径是 60 + 60 = 120）。
+    # 结清不产生额外秒数，因此 ``extension_count`` 也不再增长。
+    assert record.approved_wall_time_seconds == capability_float(
+        "taskRecovery", "planningHardWallTimeSeconds"
+    )
+    assert record.extension_count == 0
 
 
 def test_model_timeout_pauses_and_user_can_switch_configured_fallback(
@@ -2005,7 +2131,10 @@ def test_model_timeout_pauses_and_user_can_switch_configured_fallback(
     assert record is not None
     assert record.current_model_id == "connection:fallback"
     assert record.extension_count == 0
-    assert record.approved_wall_time_seconds == 60
+    # 初批预算即总活跃执行时限（2026-10-10 改造），继续不产生额外秒数。
+    assert record.approved_wall_time_seconds == capability_float(
+        "taskRecovery", "planningHardWallTimeSeconds"
+    )
     assert len(record.model_switches) == 1
     assert "secret-not-persisted" not in json.dumps(record.model_switches)
 

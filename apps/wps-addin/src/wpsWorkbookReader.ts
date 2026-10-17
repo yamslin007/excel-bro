@@ -1,4 +1,5 @@
 import capabilities from "../../../config/capabilities.json";
+import { bridgeWorkbookIdentity } from "@excel-bro/core/sdkToolBridge";
 import type { WpsApplication, WpsRange, WpsWorkbook, WpsWorksheet } from "./wpsHost";
 
 export type WpsCellValue = string | number | boolean | null;
@@ -37,6 +38,10 @@ export type WpsSheetReadResult = {
   columnCount: number;
   chunksRead: number;
   values: WpsCellValue[][];
+  /** 与 `values` 同形的显示文本矩阵；仅在 `includeDisplay` 时给出。 */
+  texts?: string[][];
+  /** 与 `values` 同形的数字格式矩阵；仅在 `includeDisplay` 时给出。 */
+  numberFormats?: string[][];
 };
 
 export type WpsReadProgress = {
@@ -51,6 +56,15 @@ export type WpsReadOptions = {
   chunkRows?: number;
   onProgress?: (progress: WpsReadProgress) => void;
   yieldControl?: () => Promise<void>;
+  /**
+   * 同时取回**显示文本**与**数字格式**（默认 `false`，不改变既有调用）。
+   *
+   * 只有隔离 Python 的数据登记需要它：值矩阵里的前导零编号会退化成数字
+   * （`001` → `1`）、日期会退化成序列值（`2027/7/4` → `46572`），必须靠
+   * `Text`/`NumberFormat` 才能还原成用户看到的样子。查询/映射路径不需要，
+   * 也就不该多读这两份矩阵。
+   */
+  includeDisplay?: boolean;
 };
 
 export class WpsAuthorizationError extends Error {
@@ -94,13 +108,8 @@ function normalizeCell(value: unknown): WpsCellValue {
   return String(value);
 }
 
-export function normalizeWpsMatrix(
-  raw: unknown,
-  rowCount: number,
-  columnCount: number
-): WpsCellValue[][] {
-  if (rowCount <= 0 || columnCount <= 0) return [];
-
+/** 把宿主返回的（可能是扁平的）原始值整理成 `rowCount × columnCount` 的未知矩阵。 */
+function shapeWpsMatrix(raw: unknown, rowCount: number, columnCount: number): unknown[][] {
   let rows: unknown[][];
   if (Array.isArray(raw) && raw.some(Array.isArray)) {
     rows = raw.map((row) => Array.isArray(row) ? row : [row]);
@@ -115,11 +124,37 @@ export function normalizeWpsMatrix(
   } else {
     rows = [[raw]];
   }
+  return rows;
+}
 
+export function normalizeWpsMatrix(
+  raw: unknown,
+  rowCount: number,
+  columnCount: number
+): WpsCellValue[][] {
+  if (rowCount <= 0 || columnCount <= 0) return [];
+  const rows = shapeWpsMatrix(raw, rowCount, columnCount);
   return Array.from({ length: rowCount }, (_, rowIndex) =>
     Array.from({ length: columnCount }, (_, columnIndex) =>
       normalizeCell(rows[rowIndex]?.[columnIndex])
     )
+  );
+}
+
+/** 与 `values` 同形的字符串矩阵（`Text` / `NumberFormat`）。形状逻辑**共用**一份。 */
+export function normalizeWpsStringMatrix(
+  raw: unknown,
+  rowCount: number,
+  columnCount: number,
+  fallback = ""
+): string[][] {
+  if (rowCount <= 0 || columnCount <= 0) return [];
+  const rows = shapeWpsMatrix(raw, rowCount, columnCount);
+  return Array.from({ length: rowCount }, (_, rowIndex) =>
+    Array.from({ length: columnCount }, (_, columnIndex) => {
+      const value = rows[rowIndex]?.[columnIndex];
+      return value === null || value === undefined ? fallback : String(value);
+    })
   );
 }
 
@@ -146,6 +181,110 @@ export function listWpsWorksheets(application: WpsApplication): WpsWorkbookMetad
     fullName: workbookFullName(workbook),
     sheets
   };
+}
+
+/**
+ * **桥用的**工作簿身份：能拿到磁盘路径就用 ``wps-path:``，否则用**会话内对象身份**。
+ *
+ * 与写入用的 `workbookIdentity`（`wpsPlanExecutor`，要求已保存的 .xlsx）不同：
+ * 桥要服务的恰恰是**打开但未保存**的工作簿，所以这里不拒绝未保存文件。
+ *
+ * 但"未保存"不等于"可以用名字顶替"：两份都叫「新建工作表.xlsx」的未保存工作簿
+ * 是不同的对象，退回 `name:` 会让它们互相冒充，桥上的轮询与回执就会张冠李戴。
+ * 所以未保存时按**当前工作簿对象**发一个会话内令牌（同一个工作簿每次拿到同一个
+ * 令牌，换一个未保存工作簿就是另一个令牌）。
+ *
+ * 连工作簿对象都拿不到（身份无法核实）时**明确阻断**：抛出，绝不退回一个会与
+ * 别人撞车的名字。调用方据此 fail-closed（桥的授权复核一律拒绝）。
+ *
+ * 归一必须与服务端 `BridgeBinding.from_request` **逐字一致**（同一份 core
+ * 函数）。不一致的话轮询会被判成"不属于本次任务"，症状是"分析卡住、一个回执
+ * 都没有"——而不是报错，很难查。
+ */
+const wpsSessionIdentities = new WeakMap<object, string>();
+let wpsSessionCounter = 0;
+
+export function wpsWorkbookBridgeIdentity(application: WpsApplication): string {
+  const workbook = application.ActiveWorkbook;
+  if (!workbook) {
+    throw new WpsAuthorizationError(
+      "无法读取当前工作簿身份，不能建立本机数据桥；请确认 WPS 中有一个打开的工作簿。"
+    );
+  }
+  const metadata = listWpsWorksheets(application);
+  const full = metadata.fullName?.trim();
+  if (full) {
+    return bridgeWorkbookIdentity(metadata.name, `wps-path:${full.toLowerCase()}`);
+  }
+  let token = wpsSessionIdentities.get(workbook as object);
+  if (!token) {
+    wpsSessionCounter += 1;
+    token = `wps-session:${wpsSessionCounter}-${Math.random().toString(16).slice(2, 10)}`;
+    wpsSessionIdentities.set(workbook as object, token);
+  }
+  return bridgeWorkbookIdentity(metadata.name, token);
+}
+
+function sourceHash(text: string): string {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return `${text.length}:${(hash >>> 0).toString(16).padStart(8, "0")}`;
+}
+
+/**
+ * 授权源的**内容指纹**——把本地查询结果绑定到"它读的是哪一版源"。
+ *
+ * 取值面与 `readAuthorizedWpsSheets` **逐字相同**（同一批授权工作表 × 各自的已用
+ * 区域 × 同一批只读上限），所以"指纹变了 ⟺ 授权源内容变了"。写入前拿它跟结果
+ * 登记时的指纹一比，就能在动手写之前发现来源已经变了。
+ *
+ * 口径限制（如实记，不假装被覆盖）：只对**值**取指纹，公式文本不计入 —— 只改
+ * 公式、值不变这一档测不出来。WPS JSAPI 里 `Value2` 同步可读，够用来做这一层
+ * 绑定；不把 `Formula` 算进来，也不声称算了。
+ *
+ * 读不动（越界/授权失效）时返回 `null`：调用方据此**如实降级**为"不比指纹"，
+ * 而不是伪造一个"没变化"的值去放行。
+ */
+export function wpsAuthorizedSourceFingerprint(
+  application: WpsApplication,
+  selectedSheetIndexes: readonly number[]
+): string | null {
+  try {
+    const authorization = authorizeWpsSheets(application, selectedSheetIndexes);
+    const payload: unknown[] = [authorization.workbookName, authorization.workbookFullName];
+    for (const authorizedSheet of authorization.sheets) {
+      const sheet = assertWpsAuthorization(application, authorization, authorizedSheet);
+      const usedRange = sheet.UsedRange;
+      if (!usedRange) return null;
+      const rowCount = Math.max(0, Number(usedRange.Rows?.Count ?? 0));
+      const columnCount = Math.max(0, Number(usedRange.Columns?.Count ?? 0));
+      if (rowCount > capabilities.wpsRead.maxRows) return null;
+      if (columnCount > capabilities.wpsRead.maxColumns) return null;
+      if (rowCount * columnCount > capabilities.wpsRead.maxCells) return null;
+      const range = readChunkRange(
+        sheet,
+        usedRange,
+        0,
+        rowCount,
+        Math.min(columnCount, Number(capabilities.wpsRead.maxColumns)),
+        "values"
+      );
+      payload.push([
+        authorizedSheet.name,
+        Number(usedRange.Row ?? 1),
+        Number(usedRange.Column ?? 1),
+        rowCount,
+        columnCount,
+        normalizeWpsMatrix(range.Value2, rowCount, columnCount)
+      ]);
+    }
+    return sourceHash(JSON.stringify(payload));
+  } catch {
+    return null;
+  }
 }
 
 export function authorizeWpsSheets(
@@ -324,6 +463,10 @@ async function readAuthorizedWpsSheetsInternal(
     }
 
     const values: WpsCellValue[][] = [];
+    // 与 `values` 同 chunk 同形状，绝不在分块边界上错位。
+    const texts: string[][] = [];
+    const numberFormats: string[][] = [];
+    const includeDisplay = options.includeDisplay === true;
     const rowsToRead = schemaOnly ? Math.min(rowCount, headerRows) : rowCount;
     // 结构扫描可以按 `structureColumns` 取宽（表可能很宽，字段也很多）；
     // 数据读取必须严守授权上限。
@@ -357,6 +500,14 @@ async function readAuthorizedWpsSheetsInternal(
         readPurpose
       );
       values.push(...normalizeWpsMatrix(range.Value2, currentChunkRows, columnsToRead));
+      if (includeDisplay) {
+        texts.push(
+          ...normalizeWpsStringMatrix(range.Text, currentChunkRows, columnsToRead)
+        );
+        numberFormats.push(
+          ...normalizeWpsStringMatrix(range.NumberFormat, currentChunkRows, columnsToRead, "General")
+        );
+      }
       chunksRead += 1;
       options.onProgress?.({
         sheet: authorizedSheet,
@@ -374,7 +525,8 @@ async function readAuthorizedWpsSheetsInternal(
       rowCount,
       columnCount,
       chunksRead,
-      values
+      values,
+      ...(includeDisplay ? { texts, numberFormats } : {})
     });
   }
 

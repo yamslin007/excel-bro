@@ -52,17 +52,16 @@ body {
   backdrop-filter: blur(12px);
 }
 
+/*
+ * 专注窗口的品牌徽标。与任务窗格的 `.brand-mark` 同步换成图片 logo（原先
+ * 是 "EB" 字标 + 深绿圆角方底的文字徽标），故去掉底色/字色/字号与 13px 圆角。
+ */
 .focus-brand-mark {
-  display: grid;
+  display: block;
   width: 42px;
   height: 42px;
   flex: 0 0 42px;
-  place-items: center;
-  border-radius: 13px;
-  background: #1d7040;
-  color: #fff;
-  font-size: var(--font-size-subtitle);
-  font-weight: 700;
+  object-fit: contain;
 }
 
 .focus-brand-copy {

@@ -347,6 +347,14 @@ def test_progress_events_summarize_tools_without_exposing_raw_rows(
 def test_budget_pause_resumes_complete_model_response_without_repeating_tool(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """总时限到达时在"启动下一次模型调用前"暂停，且已保存的响应不重复执行工具。
+
+    2026-10-10 时间策略改造后，"短时预算暂停"已不存在：``approved_wall_time_seconds``
+    只作 ``reminder_seconds`` 的兼容别名（只发非阻塞提醒）。真正的暂停由
+    ``note_progress(..., enforce_total_wall_time=True)`` 在**累计活跃执行时间**达到
+    ``LoopConfig.max_wall_time_seconds`` 时产生。所以这里把总时限设得极小来触发暂停，
+    而不是靠旧的"批准预算"。
+    """
     def responder(call_count: int):
         if call_count == 1:
             return (
@@ -395,18 +403,28 @@ def test_budget_pause_resumes_complete_model_response_without_repeating_tool(
                 timeout=10,
                 tool_cache={},
                 on_checkpoint=save_checkpoint,
-                approved_wall_time_seconds=0.05,
-                config=LoopConfig(max_wall_time_seconds=3600),
+                # 总时限极小 ⇒ 第一次工具执行耗掉 0.08s 后，启动下一次模型调用前
+                # 由 note_progress(enforce_total_wall_time=True) 收口。
+                config=LoopConfig(max_wall_time_seconds=0.05),
             )
         )
 
     checkpoint = paused.value.checkpoint
-    assert checkpoint["stage"] == "model_response_saved"
-    assert checkpoint["loopState"]["totalTokens"] == 1_000_000
-    assert checkpoint["pendingAssistantMessage"]["tool_calls"][0]["function"][
+    # 2026-10-10 时间策略改造后，总时限收口发生在**启动下一次模型调用之前**，
+    # 所以暂停边界就是 ``before_model``（而不是旧的 ``model_response_saved``）。
+    # 上一轮的完整模型响应早在 ``model_response_saved`` 边界落过盘，这里要
+    # 断言的是"暂停时已保存的响应不会被丢掉、也不会被重复执行"。
+    assert checkpoint["stage"] == "before_model"
+    response_checkpoint = next(
+        item for item in checkpoints if item["stage"] == "model_response_saved"
+    )
+    assert response_checkpoint["loopState"]["totalTokens"] == 1_000_000
+    assert response_checkpoint["pendingAssistantMessage"]["tool_calls"][0]["function"][
         "name"
     ] == "read_range"
-    assert executed_tools == []
+    # 从 ``model_response_saved`` 到收口为止，那个工具恰好执行了一次；恢复后
+    # 不得再执行第二次（完整响应里的工具步骤已提交，不能重复）。
+    assert executed_tools == ["read_range"]
     assert checkpoints[-1] == checkpoint
 
     response = asyncio.run(

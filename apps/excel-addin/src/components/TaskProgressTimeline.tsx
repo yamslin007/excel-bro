@@ -103,7 +103,11 @@ export function TaskProgressTimeline({
   live = false,
   onStop
 }: TaskProgressTimelineProps) {
-  const [expanded, setExpanded] = useState(true);
+  const collapseCompletedChat = !live && log.outcome === "completed" && log.defaultCollapsed === true;
+  const [expanded, setExpanded] = useState(!collapseCompletedChat);
+  // WPS reuses the live card; fold only on this completed-chat transition.
+  // Later rerenders must not override the user's choice to open its details.
+  useLayoutEffect(() => { setExpanded(!collapseCompletedChat); }, [collapseCompletedChat]);
   const [hasLongContent, setHasLongContent] = useState(false);
   const contentId = useId();
   const sectionRef = useRef<HTMLElement>(null);
@@ -190,7 +194,7 @@ export function TaskProgressTimeline({
               className="activity-stop-button"
               onClick={onStop}
             >
-              停止
+                暂停
             </button>
           )}
           <button

@@ -1,0 +1,208 @@
+{
+  "_doc": "prepare_python_data 的双端共同契约夹具。Excel（officeTestHost 替身）与 WPS（假 WpsApplication）跑同一张表、同一批区域、同一批单元格，期望值必须逐项一致；任何一端单方面改语义都会让该端变红。",
+  "sheet": {
+    "name": "共享契约表",
+    "startRow": 3,
+    "startColumn": 2,
+    "matrix": [
+      ["编号", "名称", "数量", "备注"],
+      ["001", "苹果", 10, "入库"],
+      ["002", "梨", 20, ""],
+      ["003", "", 30, ""]
+    ],
+    "texts": [
+      ["编号", "名称", "数量", "备注"],
+      ["001", "苹果", "10", "入库"],
+      ["002", "梨", "20", ""],
+      ["003", "", "30", ""]
+    ],
+    "numberFormats": [
+      ["General", "General", "General", "General"],
+      ["000", "General", "General", "General"],
+      ["000", "General", "General", "General"],
+      ["000", "General", "General", "General"]
+    ]
+  },
+  "slice": [
+    {
+      "name": "非 A1 起点：整块已用区域 B3:E6",
+      "range": "B3:E6",
+      "expected": [
+        ["编号", "名称", "数量", "备注"],
+        ["001", "苹果", 10, "入库"],
+        ["002", "梨", 20, ""],
+        ["003", "", 30, ""]
+      ]
+    },
+    {
+      "name": "非 A1 起点：子区域 C4:D5",
+      "range": "C4:D5",
+      "expected": [
+        ["苹果", 10],
+        ["梨", 20]
+      ]
+    },
+    {
+      "name": "非 A1 起点：左上角单格 B3",
+      "range": "B3:B3",
+      "expected": [["编号"]]
+    },
+    {
+      "name": "非 A1 起点：右下角单格 E6（真实空白，不是补齐）",
+      "range": "E6:E6",
+      "expected": [[""]]
+    },
+    {
+      "name": "区域内真实空白 C6",
+      "range": "C6:C6",
+      "expected": [[""]]
+    },
+    {
+      "name": "跨越一整行 D4:E4",
+      "range": "D4:E4",
+      "expected": [[10, "入库"]]
+    },
+    {
+      "name": "越界：起点早于已用区域 A1:B3",
+      "range": "A1:B3",
+      "refuse": true
+    },
+    {
+      "name": "越界：越过右下角 D5:G9",
+      "range": "D5:G9",
+      "refuse": true
+    },
+    {
+      "name": "越界：整体落在已用区域之外 A1:A2",
+      "range": "A1:A2",
+      "refuse": true
+    },
+    {
+      "name": "越界：只越一行 B3:E7",
+      "range": "B3:E7",
+      "refuse": true
+    },
+    {
+      "name": "越界：只越一列 A3:E6",
+      "range": "A3:E6",
+      "refuse": true
+    }
+  ],
+  "values": [
+    {
+      "name": "前导零编号：数字格式 000 必须还原成字符串",
+      "value": 1,
+      "text": "001",
+      "numberFormat": "000",
+      "expected": "001"
+    },
+    {
+      "name": "前导零编号：文本格式 @ 必须还原成字符串",
+      "value": 7,
+      "text": "007",
+      "numberFormat": "@",
+      "expected": "007"
+    },
+    {
+      "name": "文本格式但没有前导零：仍按数字取值",
+      "value": 12,
+      "text": "12",
+      "numberFormat": "@",
+      "expected": 12
+    },
+    {
+      "name": "日期：yyyy/m/d 序列值必须还原成 ISO 日期",
+      "value": 46572,
+      "text": "2027/7/4",
+      "numberFormat": "yyyy/m/d",
+      "expected": "2027-07-04"
+    },
+    {
+      "name": "日期：yyyy-mm-dd",
+      "value": 45000,
+      "text": "2023-03-15",
+      "numberFormat": "yyyy-mm-dd",
+      "expected": "2023-03-15"
+    },
+    {
+      "name": "日期：带时间的格式也按日期还原",
+      "value": 45000,
+      "text": "2023-03-15 00:00",
+      "numberFormat": "yyyy/m/d h:mm",
+      "expected": "2023-03-15"
+    },
+    {
+      "name": "数字格式：百分比按真值取，不是显示文本",
+      "value": 0.25,
+      "text": "25%",
+      "numberFormat": "0%",
+      "expected": 0.25
+    },
+    {
+      "name": "数字格式：General 下的序列值不冒充日期",
+      "value": 46572,
+      "text": "46572",
+      "numberFormat": "General",
+      "expected": 46572
+    },
+    {
+      "name": "真实空白：空串就是空串，不变成 null",
+      "value": "",
+      "text": "",
+      "numberFormat": "General",
+      "expected": ""
+    },
+    {
+      "name": "字符串原样",
+      "value": "苹果",
+      "text": "苹果",
+      "numberFormat": "General",
+      "expected": "苹果"
+    },
+    {
+      "name": "布尔原样",
+      "value": true,
+      "text": "TRUE",
+      "numberFormat": "General",
+      "expected": true
+    }
+  ],
+  "ragged": [
+    {
+      "name": "缺失行：声明 4 行但只读到 2 行",
+      "matrix": [
+        ["编号", "名称"],
+        ["001", "苹果"]
+      ],
+      "rowCount": 4,
+      "columnCount": 2,
+      "range": "B3:C6",
+      "refuse": true
+    },
+    {
+      "name": "短行：第 2 行只有 1 列",
+      "matrix": [
+        ["编号", "名称"],
+        ["001"]
+      ],
+      "rowCount": 2,
+      "columnCount": 2,
+      "range": "B3:C4",
+      "refuse": true
+    },
+    {
+      "name": "完整矩阵：同形状必须放行",
+      "matrix": [
+        ["编号", "名称"],
+        ["001", "苹果"]
+      ],
+      "rowCount": 2,
+      "columnCount": 2,
+      "range": "B3:C4",
+      "expected": [
+        ["编号", "名称"],
+        ["001", "苹果"]
+      ]
+    }
+  ]
+}

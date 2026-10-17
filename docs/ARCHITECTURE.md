@@ -1,5 +1,195 @@
 # Excel Bro 架构文档
 
+## 2026-10-10：双端在线连续集成 + 两后端终局结果工具共用（最新）
+
+**本轮只补接线，不扩新功能。** 目标是让**同一次任务**在两端各跑完一条**在线**链路：
+真实面板发起 → 真实 HTTP → 真实规划流（SSE）→ `bridgeTool` 指针 → 面板自己的桥读
+**有状态宿主替身** → 真实回执 → 服务端登记数据集 → `run_python_analysis` → **真实
+Docker 隔离执行器** → 结果登记与引用 → 白名单计划编译 → 面板预览（确认前零写入）
+→ 用户确认 → 产品执行器写回 → 产品回读 → 用户撤销 → 核对恢复。
+
+### 缺口一（已修）：普通后端没有终局结果工具
+
+`submit_local_result` / `submit_result_plan` 原先**只注册在 SDK 后端**；普通
+（OpenAI 兼容）后端的 `_execute_tool` 没有对应分支，模型调用只会拿到
+`{"error": "未知工具：submit_result_plan"}`。抽出**共用语义** `server/app/result_submission.py`
+（`resolve_result_ref` 归属校验、`local_result_card`、`build_local_result_answer`、
+`build_result_plan_response`、`ResultSubmissionError` 固定码），两个适配器**只注册/分派/返回**，
+不再有两套实现。普通后端经 `planning_tool_definitions(base)` 注册（`PLAN_ONLY_TOOLS` 原样返回），
+拒绝一律抛 `ValueError`，由既有循环变成模型可见的纠正消息，不静默成功。
+
+### 缺口二（已修）：WPS 并排审阅副本把"授权张数"当成"写入张数"
+
+`stageWpsNativeComparison` 原先要求 `authorization.sheets.length === 1` 且来源也在
+同一张表上。两表关联汇总（授权 3 张：两张只读来源 + 一张写入目标）因此**整片被挡在
+确认写回之外**，而同一份计划在 Excel 端走的是另一条已存在的显式执行入口 —— 两端分叉。
+现在判据改为**"写入只落在一张已授权表上"**，副本只复制**写入目标**那一张表
+（`WpsNativeComparison.writeSheet`）。安全性质**没有放宽**：副本仍然只有一张表，绝不
+把来源表或任何未写入/未授权的表复制出去；跨表**写入**依旧拒绝；来源的核对发生在
+**原表**上（`assertOriginalUnchanged` 会用全部授权序号重读一遍），不需要进副本。
+
+### 一条命令与照实分区
+
+`npm run test:online`（`scripts/run_online_link.mjs`）起**测试专用服务端**
+（`server/tests/online_entry.py`：只绑回环、专用端口、临时能力表打开隔离 Python、
+`EXCEL_BRO_CONFIG_DIR` 隔离模型目录以免开发者真实连接混入），就绪检查通过后依次跑
+`apps/excel-addin/src/onlineLink.test.tsx` 与 `apps/wps-addin/src/wpsOnlineLink.test.tsx`。
+两端共用 `config/online_link_scenario.json` 的**同一份数据 / 规则 / 期望**，并都做
+"改宿主里键 7 的第一次出现（金卡→银卡）后重跑"的**因果验证**（基线 金卡 400 /
+银卡 200 / 未匹配 400 → 改后 金卡 300 / 银卡 300 / 未匹配 400），改动只发生在 TS 宿主
+替身上。Docker 不可用时命令打印环境阻断并**非零退出**。
+
+**允许的替身只有两类**：① 固定模型的工具调用序列（只在 `online_entry.py` 注入，生产
+没有任何旁路开关）；② 有状态宿主替身（Excel `officeTestHost` / WPS 注入
+`getWpsApplication()`）。poll/receipt/result/规划流**不摆 fetch 桩**；结果矩阵、异常
+说明、最终计划都不是预制常量；不从旧工件回放；测试不直接给 `range.values` / `Value2`
+赋值代替产品写回。
+
+**照实分区（不得合并宣称）**：
+
+| 项 | 状态 |
+|---|---|
+| ① 工件回放集成（`npm run test:cross-process`、`continuousPythonChain` / `wpsContinuousPythonChain`） | **通过**（保留，如实命名：面板消费服务端算好的结果，面板自己的回执未参与那次计算） |
+| ② 双端在线连续集成（`npm run test:online`） | **通过**（真实服务端 + 真实 Docker；模型与宿主对象为替身） |
+| ③ 真实 Docker 隔离执行器 | **通过**（本轮在线链路里的计算由它完成） |
+| ④ 真实模型自主规划 | **未完成**（本轮用固定工具调用序列） |
+| ⑤ 真实 Excel / 真实 WPS 客户端 | **未完成**（本轮用有状态宿主替身） |
+
+### 2026-10-09 实机反馈补修：本地总数与查询能力声明
+
+共用 `dataTools.ts` 在分组结果的 `calculation` 中附上筛选后记录数，取自处理完整输入的计数器，独立于指标类型、分组显示上限。读取有缺失警告时只称“已处理记录数（结果不完整）”。Excel/WPS 共用本地结果卡，无新协议字段；`calculation` 继续不进入模型白名单投影。
+
+SDK `query_table` 的工具 schema 仅声明 `combine.mode=union`，纠正先前错误宣称的 join/deduplicate 能力。handler 防御性拒绝这两种模式，不投递宿主；模型终止且没有有效终局时提供固定能力限制说明。不得自动将关联改成追加合并；文件夹关联实现不受影响。
+
+## 2026-10-09：贯通 Claude Agent SDK 本地工具链（本机工具桥，双端已接线）
+
+**目标与边界**：授权范围确定后，SDK 能在**一次 `query()` 内**真实调用本地表格工具、接收有类型回执、按固定错误码修正参数并继续，最终提交本地结果卡或可预览的白名单写入计划。本轮不开启隔离 Python 产品入口、不做 SDK 会话持久化、不新增 WPS 高级动作、不扩大结果值出站；选表授权、意图阶段无原始行、精确 MCP 白名单、写入先预览再确认全部保持不变。
+
+**为什么需要工具桥**：SDK 在 Python 后端运行，`query_table` 要读的却是任务窗格里**打开且可能未保存**的工作簿 —— Python 的 MCP handler 读不到它。因此新增**易失任务工具桥**：SDK handler 提交查询请求 → 桥登记 operation 并按所有权绑定 → 拥有本任务的宿主适配器（Office.js / WPS）在本机执行**现有确定性 `query_table`** → 经本机回环端点回执 → handler 投影后有类型地交回 SDK，同一次 `query()` 继续。
+
+**落点与职责**：
+
+| 区域 | 文件 | 职责 |
+|---|---|---|
+| 共享工具目录/投影 | `server/app/agent_tools.py` | 两后端共用的本地查询工具定义（`describe_authorized_tables`、`query_table`）、本地结果终局工具（`submit_local_result`、`submit_result_plan`）、按宿主裁剪 `submit_plan`、**有类型出站投影白名单** |
+| 结果登记（结果生命周期） | `server/app/local_results.py` | 值矩阵只留可信侧的按任务登记器；句柄不透明、按**归属 claim** 核对、TTL 失效、来源变更失效、保留上限。**独立于会话生命周期** —— 会话结束不删结果 |
+| 任务工具桥（会话生命周期） | `server/app/task_bridge.py` | 会话与所有权绑定、幂等（同 ID 同参幂等／同 ID 不同参拒绝）、取消与迟到回执拒绝、来源指纹不一致→`source_changed`、重授权即 `supersede`；`close()` 只结束会话 |
+| 账本隐私投影 | `server/app/ledger_privacy.py` | 按字段名剥离矩阵（`values`/`rows`/`headers`/`formulas`/`expected`…），作用于 `actions` 与 `acceptanceCriteria`；持久账本只存去值投影，回环 SSE 仍交付完整值 |
+| 结果→计划编译 | `server/app/result_plan.py` | 只生成 `writeValues` 单动作 + 自动 `rangeEquals` 回读 + `localResultRef` 引用；校验矩阵类型/尺寸、目标授权、WPS 格数上限、疑似公式文本 |
+| SDK 适配 | `server/app/claude_sdk_agent.py` | 注册本地工具、经桥等待回执、终局装配 `AnswerResponse.localResult` / `PlanResponse`，`finally` 只关会话 |
+| 本机回环端点 | `server/app/main.py` | `/api/sdk/tool-bridge/{poll,receipt,register,result}`；回环 + Host + Origin + JSON 严格守卫。`register` 要求**活跃且归属一致**的会话；`result` 只按**授权归属**核对（会话可已关闭） |
+| 共享前端状态机与复核判据 | `packages/core/src/sdkToolBridge.ts` | 指针→轮询、待回执跟踪、发请求前判定 accepted/duplicate/conflict/late；`bridgeRequestedSheetNames` / `verifyBridgeAuthorization`（**两端同一份判据**） |
+| 双端宿主适配器 | `apps/excel-addin/src/sdkBridgeHost.ts`、`apps/wps-addin/src/wpsSdkBridgeHost.ts` | 组装 `poll`/`verify`/`execute`/`receipt` 四端口：执行前重读宿主现场 → 授权复核 → 真实读取（Office.js `usedRange` / JSAPI `authorizeWpsSheets`+`readAuthorizedWpsSheets`）→ **既有 `executeQueryTableData`** 计算 |
+| 双端面板接线 | `apps/excel-addin/src/hooks/useSdkToolBridge.ts` + `components/LocalResultCard.tsx`；`apps/wps-addin/src/WpsAgentPanel.tsx` | 消费 `bridgeTool` 指针、串行 drain（重入会让同一次调用被执行两次）、取消即停、`end()` 保留绑定供终局取值；结果卡按 `resultRef` 取回值渲染 |
+| 协议 | `server/app/models.py` ↔ `apps/excel-addin/src/contracts.ts` | `Bridge*` DTO、`PlanRequest.localResultRefs`、`AnswerResponse.localResult`、`TaskProgressEvent.bridgeTool`、`WorkbookSnapshot.workbookIdentity`、`AnalysisPlan.localResultRef`、**`AnalysisPlan.sourceDependencySheets`（第五轮新增）** |
+| **实际来源依赖**（第五轮） | `apps/excel-addin/src/planSourceDependency.ts` | 授权范围 / **实际来源依赖** / 写入目标三口径分离。记账**唯一入口**是 `sdkBridgeHost.execute` 里确定性执行器返回之后（取 `DataToolResult.sourceSheets`）；计划自带的 `sourceDependencySheets` 一律被 `attestSourceDependency` 覆盖或剥离；**没有记录就删字段**（不是空数组） |
+
+**三段生命周期分别建模**（混在一起是三类真实缺陷的来源）：
+
+| 生命周期 | 载体 | 结束时机 | 关键纪律 |
+|---|---|---|---|
+| 授权 | `OwnerClaim` + `authorizationRevision` | 重授权 / 换簿 / 授权范围变化 | 重授权只推进版本并作废旧结果；不编造澄清答案 |
+| 会话 | `ToolBridgeSession` | 一轮规划结束（`close()`） | **只结束会话，不删结果**；否则终局 `resultRef` 取不到值 |
+| 结果 | `RegisteredResult`（`resultRef`） | 自己的 TTL / 保留上限 / 来源变化 | 跨轮按**授权归属**取值；有值计划**不进**持久账本 |
+
+**执行前复核**（`verifyBridgeAuthorization`）三类变化一律拒绝读宿主：换簿（工作簿身份不同）、源数据变化（指纹不同）、**授权收窄**（绑定时的授权范围不再被当前授权完整覆盖）。最后一条最容易漏：只看"当前授权非空"会放行一个少读一张表、静默算出错答案的查询。绑定时的范围快照取自**与复核同一个读取器**，避免两份对不上。
+
+> **第五轮的口径收紧**：绑定时的范围快照取自同一个读取器这条纪律，同样适用于**身份与来源指纹**。
+> 曾经 Excel 侧只把范围接对了、身份与指纹仍从快照取 —— 身份是死字段（三个捕获点都没写过它，只配到
+> `name:<文件名>` 兜底，而复核读 `url:`），指纹连算法都不同（快照 `fnv1a32:` vs 复核 `fnv1a32x2:`），
+> 于是**已保存的**真实工作簿上工具桥恒判 `source_changed` 拒读。现在 Excel 侧先读一次现场作为**本轮基线**，
+> 并把它同时喂给规划请求、桥绑定与计划指纹（WPS 侧本来就是这么接的）。
+
+**通道分离**：进度事件只带**不透明指针** `bridgeTool{operationId,tool}`（会落账本）；请求参数只活在本机易失桥里，由宿主适配器经回环 `poll` 拉取；值矩阵只在回环 `receipt` 上行与 `result` 下行出现。**模型可见回执**只含固定 `status`、不透明 `resultRef`、允许的结构（headers/rowCount/columnCount/complete/truncated）与固定 `errorCode`；`rows`、`title`、`calculation`、`warnings`、`scannedRows` 与原始异常**一律不出站**。
+
+**两端接线**：`apps/excel-addin` 与 `apps/wps-addin` 都消费 `bridgeTool` 指针 → 轮询 → 执行前复核当前授权 → 真实读取 → **既有确定性 `query_table`** → 回执 → 结果卡。计算两端**同源**（都调 `executeQueryTableData`），只有"怎么读宿主"各走本宿主；绑定、状态机、判据、结果卡共用一份实现。WPS 的 `turnId` 由服务端 `checkIntent` 生成，客户端本轮开始前拿不到，故绑定**惰性**建立并按 `turnId` 判重（重建会清空 `delivered`，导致同一次调用被执行两次）。
+
+**结果卡**：只读任务以 `AnswerResponse.localResult`（引用 + 结构，**不含值**）结束；本地渲染器经回环 `result` 端点按引用取回值，取不到时**如实**说"不可用"，不渲染空表冒充成功。`title` 用**固定标签**，不回显可能来自源数据的自由文本。
+
+**写入仍走老链路**：`submit_result_plan` 只做**本地校验与编译**，产出 `writeValues` 白名单计划后**进入预览**；用户确认、写前复核、宿主执行、写后回读一律不变。SDK 工具**不得**直接修改工作簿。
+
+**"展示结果"不等于"完成任务"（2026-10-11，缺陷 3）**：曾出现真实 SDK 模型（`turn-f493dba5ae61470d99a54dd7a933e53d`）读完表、跑完隔离分析、拿到 40×7 结果后**直接 `submit_local_result` 收尾**，`submit_result_plan` 一次都没调 ⇒ 面板 `pendingPlan` 空 ⇒ 确认写回卡根本不渲染。根因**不是**"模型不肯调工具"：全仓并无"本轮规划目标是否达成"的判据，`AnswerResponse` 被无条件当终局（`excel_agent.py` 主循环 `return parsed`），而 SDK 侧 `terminal` 一旦非空即**硬锁后续所有工具**（`claude_sdk_agent.py`）—— 模型即使察觉也**不可能**补救。
+
+修法落在**共享层**（`result_submission.py`，普通后端与 SDK 走同一判据）：
+
+- 意图阶段模型返回 `planningGoal`，两端传入 `PlanRequest`；服务端按同一 `turnId` 保存并优先采用意图决定。目标仍由模型理解，运行时不按行业字段或关键词推断。
+- 已绑定 `write_preview` 的任务，`submit_local_result`、`submit_answer` 和 JSON 回答退路均不能直接结束规划；终局工具重新声明 `read_only` 也不能降级目标。普通后端在本轮循环内纠正；SDK 工具错误不置终局，允许同一次 query 继续提交计划。
+- `read_only` 可正常展示结果；写入仍必须是白名单计划，经预览和用户确认。旧的直接调用方若不提供目标，保留原兼容语义，不能宣称这些调用也有事前目标约束。
+- `planningGoal` 是任务完成判据，不是写入授权；工作表授权、来源校验和宿主预检继续独立执行。
+- 测试：`test_bound_planning_goal.py` 覆盖双后端提前回答、终局降级、SDK 文本退路及同轮修正。
+
+同时修掉一处**真实次生缺陷**：SDK 的 `submit_result_plan` 在编译被拒（尺寸不符 / 未授权 / 来源已变）时回执**缺 `is_error`**，看起来像成功 —— 模型会据此收尾并谎称完成。
+
+**空白只有一种写法（2026-10-11）**：分析产出的 `""` 在**编译层**（`result_plan._blank_cell_of_write`）折成 `None`（写入意义上的空白 = 空单元格）。断言侧也必须同口径比较（`_matrix_of` / `foldBlank`），否则会把这次**正确的折叠**误判成"回读与计划不一致"。**只折结果矩阵**：来源数据的 `memberRows` / `orderRows` 一概不动。
+
+**能力收窄为空集时不得产出空 `anyOf`（2026-10-11，缺陷 3 的次生缺陷）**：修复缺陷 3 后真实 SDK 驱动仍然每次 502 `MODEL_HTTP_ERROR`，探针取到 SDK 原始异常才看清：网关（`https://api.deepseek.com/anthropic`）直接拒绝**整轮**请求 —— `API Error: 400 Invalid schema for function 'mcp__excel_bro__submit_plan': [] has less than 1 item`。触发点是 `agent_tools.host_pruned_terminal_definitions` 的 `{"anyOf": [variants[name] for name in selected]}`：`selected = 服务端上界 ∩ 客户端自报`，而客户端漏报 `selfReportedActions`、`hostVersion` 不匹配、宿主开关关闭或宿主不可识别时这个交集都是**空集**，于是产出**空 `anyOf`**。
+
+空 `anyOf` 是非法 JSON Schema，会让网关拒绝整轮请求。当前修法是：协商动作集合为空时省略 `submit_plan`，保留回答、澄清等工具；有动作时只暴露交集。不能用回落全量动作掩盖协商失败。提交校验和执行预检继续独立存在。`_mutate_action_schema_legality.py` 三项变异均红，还原后 15 项通过。
+
+**本轮未完成 / 宿主限制（如实记录）**：
+
+- WPS 侧**没有可用的源内容指纹**：复核只按工作簿身份 + 授权工作表集合判变化（`sourceFingerprint` 置 `null` = 不比对），不声称已覆盖"内容层面"的改动检测。
+- 未保存的 WPS 工作簿拿不到磁盘路径，身份退回 `name:<工作簿名>`：**两个同名未保存工作簿无法区分**（宿主不给稳定标识）。
+- ~~`submit_result_plan` 的"预览→确认→写前复核→执行回读"在面板上的端到端点击路径无自动化用例~~ —— 2026-10-10 已由双端在线连续集成补上（见文首最新一节：Excel 与 WPS 各有一条真实点击路径，含撤销；但模型与宿主对象仍是替身）。
+- **2026-10-11 并发诊断更正**：旧 A/B 脚本把 SDK 与健康检查放在不同进程，且替换了结果处理；日志只能证明曾停滞，不能证明“任何 HTTP 都冻死”或“环境问题而非代码”。`scripts/diagnose_sdk_http.py` 通过生产 FastAPI/SSE 路径、真实 SDK、真实模型复验：两轮短任务分别成功处理 11 / 10 次并发健康检查；真实 Python 工具链在 47.427 秒完成，115 次健康检查成功，桥回执和结果查询均 200，最终调用 `submit_result_plan`。宿主为合成数据替身，未操作实际工作簿。报告位于 `outputs/sdk-python-http-audit-20261011/report.json`。不据此声称所有并发或取消场景均无问题。
+- 真实模型 + 真实 Docker + 真实 HTTP 的合成宿主链路已验证；本轮没有新增真实 Excel/WPS 客户端点击验收。仓库默认 Python 开关恢复 false；真实诊断通过独立能力配置启用，不修改全局默认值。验证不代表发布。
+
+
+
+## 2026-10-08：双后端任务上下文与本地澄清整合
+
+Excel/WPS 从已有任务记录投影同源 `taskContext`（原需求与明确提交的业务决定），普通意图/规划与 SDK 意图/规划都接收；同题后答替换先答，新需求不继承旧规则，显式替换同时重置恢复记录。上下文不含本地源值/目标矩阵/授权，不等于 CLI 会话或写入确认。TS/Python 严格协议同步，限额集中 taskContext；SDK 仍独立 query、禁止数据行及任意工具，无精确检查点恢复。
+
+共享本地补全卡沿用完整无歧义的显式等级，只在新目标/排序缺口时要求确认；非法输入逐字段提示，提交前阻断。补全后仍重读授权源列、生成预览、独立确认写回。WPS 文件夹与隔离 Python 产品接线不在本批；自动化与实机分列。需重启后端并刷新两端，见 [实施及试用清单](./AGENT_TASK_INTEGRATION_2026-10-08.md)。
+
+## 2026-10-08：手动规划暂停与原任务恢复
+
+**交互补修（覆盖首批手动核对方案）**：共享过程卡与输入区统一称“暂停”，已有 `turnId` 时自动查询一次原任务，不自动 POST 继续。原需求留在用户消息/任务上下文，不回填普通发送框，也不覆盖新草稿。可续检查点由用户明确继续；仍运行/查询失败保留核对入口，无检查点明确需要重新开始。WPS 旧收尾不清除新操作进度，Excel 查询/继续有同步并发闸；不新增轮询、协议字段、模型调用或写入权限。无任务身份时不能编造续跑现场；双端真实宿主时序待验。
+
+双端手动暂停保留原任务身份，状态尚未核实只给查询入口；服务端确认检查点后才由用户继续。中断接收不代表服务端立即暂停，运行中/未知状态不得重发需求。WPS 普通继续省略模型切换字段，事件适配保留 `turnId/sequence`，历史只记客户端实际游标；未知游标从零补收。继续/取回结果复核原授权，不扩展写入、文件夹或 Python 能力。SDK 无可用检查点时不能精确续跑，双宿主实机尚待验收；见 [实施记录](./MANUAL_PLANNING_PAUSE_2026-10-08.md)。
+
+## 2026-10-08：统一数据范围入口与选中即校验（最新）
+
+正式入口的 `TargetScopeNotice` 仅有“检查数据范围”按钮，不提供清除提示的“暂不操作”或独立重试。提醒未处理时保留授权阻断与待续分析；打开选择器不是授权，确认前仍不能读取字段或写入。文件/表真实变化展示原范围与当前范围（仅名称，不展示私有身份）；无法核实仍不声称已变化。本补修不改变守卫触发条件，无范围入口的独立 WPS 兼容回退保持原行为。
+
+选择器摘要仅显示简短状态与必要的具体限制，移除重复“重新检查”按钮及授权说明；原“刷新”同时重读目录和重新校验，同名称/会话也重查。Excel/WPS 刷新只调整自动草稿与候选显示，不提交授权、不静默删除手动缺失项。WPS 当前表两处显示共用元数据快照；Excel 表格分析禁止将新增手动草稿借发送自动授权。未新增持续轮询；确认/发送仍复核真实宿主。
+
+实际 Excel/WPS 窗格不再叠加第二个“原授权 / 当前文件”选择弹窗。正常追问复用有效授权；目标变化或证据不足时，在数据范围入口旁显示非模态状态，打开现有选择器后隐藏重复提示。只有这个选择器提交授权；业务补全仍不夹带授权。独立嵌入且没有范围入口的 WPS 面板保留旧确认组件作为兼容回退，不用于正式宿主入口。
+
+两端复用 `useScopeAdmission`：勾选自动检查元数据，检查中/不可用项禁止提交；只读、受保护或宿主写入能力未知时可授权分析，但不冒充可写。确认前重新检查，并与可见目录的私有文件身份及上一次检查结果绑定；换文件、删表、超时、畸形结果与迟到响应不能静默缩小选择或授予新范围。Office 仅读取名称/稳定 ID、文档身份及受支持的 readOnly/protection 属性；WPS 仅检查身份、表目录/尺寸和保护状态，不读取选区值。功能限额集中在 `scopeAdmission`。
+
+文件夹模式新增本机 `POST /api/folders/admission`，仅接受已登记 sessionId/fileId 与选中表名；检查文件存在、根目录边界、读取/写回访问、工作表存在与保护状态，返回封闭枚举和内容/选择指纹，不发布快照授权、不创建备份、不执行模型或写入。XML 只解析元数据属性，文本不进入业务数据对象；内容哈希会读取文件字节，不等于提取/上传数据行。该预检并非永久权限，执行前来源指纹、授权及写入能力仍独立复核；openpyxl 不自动执行宿主保护规则，因此已有受保护目标的写入在预检中明确拒绝，拆分汇总对源表的只读使用不因此禁止。
+
+`confirmScope(..., {continuePendingAnalysis:true})` 只允许续接由分析入口登记的一次新请求，保留输入/答案；未登记的旧写入不得排队或重放。WPS 文件夹入口仍未实现。详见 [实施与实机清单](./SINGLE_SCOPE_SELECTOR_2026-10-08.md)。此节覆盖此前独立目标弹窗的正式入口描述；模型协议未扩权，TS/Python 的文件夹预检协议同步更新。需重启后端并刷新两端。
+
+## 2026-10-08：当前表确认、未知身份与真实变化分离
+
+双端共用授权交互新增本地 `confirmation_required`，不再把一致弱证据的显式同意伪装成 `unavailable`。首次需要确认只显示一份文件/表范围；临时缺失有限后台重试，耗尽后只提供重新检查，身份冲突立即阻断，不能用第三份证据缺失掩盖前两份冲突。真实文件/表变化仍独立选择目标。已有确认不因每条消息重新询问，重检查不重放旧写入。状态仅在内存，不改模型/服务端协议，写入审批仍独立。自动化与实机分列，见 [实施记录](./TARGET_CONFIRMATION_STATES_2026-10-08.md)。
+
+## 2026-10-08：Excel 文件夹范围安全修复
+
+文件夹快照对全部选中文件做读取前后内容指纹检查，成功后才发布授权；失败不把旧行绑定到新文件指纹，执行前仍独立复核。澄清使用共享 `scopeFingerprint`，本地绑定绝对目录根路径与已选表名，不把目录路径加进模型/API 协议。同根/同会话/已选目标均存在的候选刷新保留原确认，但不授予草稿授权；模式切换不凭保存的勾选自动授权。目录文件转当前工作簿时先只读名称目录，再仅读明确选择的表。
+
+本批不新增 WPS 文件夹入口；共享后端与纯函数可复用，WPS 文件夹模式仍未实现。前后指纹不是外部进程锁或原子文件系统快照；自动化与实机证据分列，见 [修复记录](./FOLDER_SCOPE_SAFETY_FIX_2026-10-08.md)。
+
+## 2026-10-08：产品身份与内部阶段分离
+
+消息理解、字段意图与规划提示共用 `assistant_identity.py` 的产品身份：对用户是 Excel Bro AI 表格助手，不自称路由器或处理环节。底层模型只在用户询问时引用服务端选中连接的 `model` 配置标识；不把 SDK/兼容协议等同于模型，不保证网关背后的厂商或实际模型。普通后端与 SDK 同源；身份提示不增加工具、数据访问或写入权限。
+
+双端普通聊天成功完成后过程卡默认收起，可手动展开；运行中、失败、警告和等待确认保留现有可见性。`ActivityLog.defaultCollapsed` 只是本地展示标记，不是服务端协议或授权信息。详见 [实施记录](./ASSISTANT_IDENTITY_2026-10-08.md)。
+
+## 2026-10-08：消息理解先于字段读取
+
+双宿主的新消息先调用独立 `/api/intent/message`，只发送当前消息、限长对话和图片数量；不自动附带工作簿、字段、priorResult 或 priorIntent。`conversation` 直接回复，`needs_workbook_context` 才复核目标授权、读取字段并进入既有字段意图/规划。第一阶段失败或截断不默认读表。普通模型/SDK 同源提示和协议，SDK 权限未扩大。Excel 启动和范围刷新只读目录元数据；文件夹发送也先消息理解，用户主动文件扫描保持不变。
+
+授权前允许的只是这次**无工作簿上下文**的理解请求，不授予数据访问；表头/数据行/字段意图/规划/写入仍必须在授权复核后。后台元数据监测和既有业务补全/执行守卫保留，写入审批独立。当前接口和进度顺序覆盖此前“所有意图模型都在授权后”的描述；旧批次测试是历史证据。详情见 [实施记录](./MESSAGE_FIRST_ROUTING_2026-10-08.md)，需重启后端并刷新两端。
+
+## 2026-10-08：已选范围与后续追问使用同一授权
+
+Excel/WPS 的范围确认接入共享 `useAuthorizedTarget.confirmScope`：点击时只重读文件与表身份元数据和宿主证据，核实后一起提交已选范围、授权基线及当前会话的分析同意；不读表头/数据行、不调用模型、不重放旧请求或写入。每条追问仍走 `checkForAnalysis`，比对原授权与当前元数据、宿主证据。WPS 不再因普通消息开始而撤销弱包装证据的显式同意；同意只绑定当前已确认的文件/表范围，检测到变化、证据冲突、撤销、关闭或重载后失效。写入执行器不消费这个分析许可，白名单计划、预览和独立写入确认不变。文件夹模式与模型协议未改。
+
+无法核实身份与确实换文件采用不同提示；不能用同名、同表头、隐藏弹窗或直接放行来解决重复确认。实现、自动化证据与双宿主实机步骤见 [修复记录](./SCOPE_AUTHORIZATION_FOLLOWUP_FIX_2026-10-08.md)。
+
 ## 2026-10-07：易失结果登记与双端本地预览准备（最新状态，产品仍关闭）
 
 内部 `run_registered_result_internal` 把真实容器的严格矩阵结果交给同一易失授权登记器，发布随机 resultHandle、原始 JSON 字节 SHA256 和矩阵尺寸，不返回原始值。结果绑定原授权及有序数据句柄/指纹；替换源快照删除依赖结果，撤销/重授权/任务 TTL/服务重启失效。数量和编码总字节限额在 `pythonResult`。没有持久结果库或模型工具成功通道。
@@ -40,7 +230,78 @@ worker 在生成代码之前安装不可撤销的 Linux/amd64 seccomp 附加过�
 
 Excel/WPS 同等用户任务能力是新功能的完成条件，不只是未来目标。新增功能从设计起同时列出两端入口、语义、授权/隐私、执行前确认、结果核验、异常与恢复、窄窗交互及测试证据。共享语义/协议/确定性计算优先复用，宿主差异通过适配层处理，不要求调用同一个 API，也不允许为了表面一致扩大授权或降低验证。双端自动化和实机证据分别报告；一端未实现时不能标整体完成。确有宿主限制或用户明确批准分批时，计划表保留具体未对齐项和验收条件，并区分未实现、宿主限制、实机待验。
 
-审阅 AI 40% 自适应已接入 Excel 与 WPS，比例/手动优先共享，尺寸获取与宽度恢复由宿主适配；两端自动化已通过，真实宿主证据仍独立待验，不能称所有版本已验收。
+审阅窗格比例已双端接线：**唯一参照是整个显示器可用工作区**，默认 **副本 35% / 原表+AI 65% / AI 30%（占整个可用宽度）**，比例/手动优先共享，尺寸获取与宽度恢复由宿主适配。两端自动化已通过；真实宿主截图验收仍独立待验，不能称所有版本已验收。
+
+## 2026-10-14：审阅布局改为「按整个工作区 35/35/30」（修真实比例缺陷）
+
+**根因（真实缺陷，不是文案问题）**：AI 比例一直按**整个工作区宽度**在 `packages/core` 计算，但两端喂进去的"宿主宽度"口径不一致 —— Excel 传的是**原表窗口内容区宽度**（`clientWidthCssPx`，是原表窗口自己的宽度，不是工作区），WPS 传的是 `Application.Width`（含两张表的主窗口）。于是同一份 `reviewAiWidthFraction`（当时 0.4）在两端代表**不同含义**，Excel 侧实际得到的是"占原表窗口若干比例"的 AI 窗格 —— 用户截图的 40/24/36 与"AI 约占右侧窗口 60%（36/60）、原表只剩 40%（24/60）"一致，说明 AI 拿走的是右侧窗口的大头，而不是"整个可用宽度的 30%"。
+
+**修法**：一个外侧比例 + 一个内侧比例，且内侧比例只有一个参照。
+- 外侧：`reviewPaneSizing.reviewCopyWidthFraction`（默认 0.35），服务端 `position_pair` 取 `1 − 该值` = 0.65；删除 `excelWindowLayout.originalWidthFraction`。
+- 内侧：`reviewPaneSizing.reviewAiWidthFraction`（默认 0.3），`reviewPaneTargetWidth` / `reviewLayoutPlan` 都作用于**整个工作区宽度**。`reviewLayoutPlan(W)` = 副本 `round(0.35W)`、原表 `W − 副本`、AI `clamp(0.3W, 320, ⌊原表/2⌋)`、原表可见表格 = 原表 − AI；`degraded` 在原表可见宽 < 280 或 AI < 320 时为真。
+- 参照来源：Excel 本地桥 `measure` 现在返回两个字段 —— `clientWidthCssPx`（诊断用）与 **`workAreaWidthCssPx`（AI 比例唯一参照）**，后者由 `work_area_width_css_px` 用 per-monitor 线程 DPI 上下文读 `MonitorFromWindow(..., MONITOR_DEFAULTTONEAREST)` + `GetMonitorInfo().Work`，再按 `GetDpiForWindow` 归一到 96-DPI 逻辑像素；WPS 仍是 `Application.Width`（磅 → ×96/72）。前端只接受**两个字段齐备且合法**的测量回执，缺工作区宽度宁可降级为手动，也不拿客户区宽度顶替。
+
+**用户入口与降级**：Excel 与 WPS 都在副本审阅卡上提供「重新排列」次按钮，**只有用户主动点击**才重跑默认布局。`rearm` 是一个只由该点击递增的计数器，作为 AI 窗格自适应状态机的额外依赖，用来清掉"用户已手动拖过"的标记并重套默认比例；消息更新、流式输出、回读、保存工具**都不改** `rearm`，因此不会反复抢回布局。宿主不能由代码设置 AI 窗格宽度时（Excel 缺 `TaskPaneApi 1.1`、WPS 的 `Window` 没有可写宽度成员且 `TaskPane.Width` 被静默忽略），文案必须**分开说**："窗口已排列"（由本地桥/原生比较的真实几何或回执核对过）与"AI 比例尚未确认，请拖到整个可用宽度约 30%"（真实回读结论），不得宣称已按 35/35/30 全部自动完成。退出审阅时只恢复**本次流程自动改过**的宽度：`useWpsReviewPaneRatio` 的恢复被 `!manual` 门控，用户中途拖过的宽度不被当成我们的临时布局抹掉。
+
+**两端自动控制的真实范围**：Excel 由 Python 本地桥经 Win32 精确设置两窗矩形（外侧 35/65 可读回核对）；WPS 只能用 `Windows.CompareSideBySideWith` / `ResetPositionsSideBySide` / `SyncScrollingSideBySide` 重排两张表窗口，**不能**设置精确宽度。排列失败只写反馈，不改审阅阶段，也不影响已完成的写回/撤销。
+
+## 2026-10-14：审阅副本的生命周期（身份、关闭、临时文件、业务结果分离）
+
+**用户看到的问题**：Excel 兼容模式生成「工作簿5…」这类审阅副本，确认写回或放弃后副本仍留在屏幕上。排查结论是**能力缺口**不是文案问题：`closeExcelNativeComparison` 在 manual 分支直接 `return false`（注释写着「No API handle」），而前端对 manual 分支干脆不调用关闭。
+
+**三种副本，各自的身份与所有权**（`packages/core/src/reviewCopyLifecycle.ts` 的 `reviewCopyCreationSummary` 是唯一权威说法）：
+
+| 类型 | 实际创建了什么 | 谁关它 / 怎么关 | 有磁盘文件吗 |
+| --- | --- | --- | --- |
+| `excel-native` | `Excel.createWorkbook(base64)` 新建的**未保存**工作簿窗口（Desktop 1.1） | Office.js `Window.close()`；宿主自行决定是否弹保存提示 | 否 |
+| `excel-compat` | `Excel.createWorkbook(artifact.base64)` 新建的**未保存**工作簿（本机生成的 OOXML） | Office.js 在兼容宿主**没有窗口句柄** ⇒ 改用本机桥对该窗口发 `WM_CLOSE` | 否 |
+| `wps-native` | `Worksheet.Copy()` 生成的**未保存**单表副本工作簿 | WPS `Workbook.Close(false)` | 否 |
+
+**副本身份判据（不得用文件名/前缀/活动窗口）**：本次随机生成的 `copySheetName = EB_<20hex>` nonce（protocol 侧 `^EB_[0-9a-f]{20}$`）是副本活动表名，再叠宿主侧身份元数据与唯一性。Excel 侧服务端要求「未保存 + 活动表名 == nonce + 唯一 + 同一时刻唯一已保存原表在场」；WPS 侧持有的是活对象引用，另加 `copyIdentity`（Name/FullName/Path 三元组）复核。"工作簿N"、`EB_` 前缀、活动窗口、文件名相似都**不是**判据。
+
+**无提示丢弃副本前必须过三项判断，且前两项推不出第三项**（`describeCopyDiscardSafety` 是第三项的唯一判定入口）：
+① **副本身份可信**（nonce + 未保存标记 + 唯一性）；② **没被另存/替换**（否则那是用户自己的文件）；
+③ **副本里没有额外的人工修改**。①+② 只说明"这是我们的副本、它没变成用户的磁盘文件"，**不说明**"它还是我们写入后的样子"——用户在并排审阅期间完全可以往副本里敲字。只有适配器**逐格读回并核对**过才允许说 `unchanged`；读不到一律 `unknown`（不许把"没读到"当成"应该没改"）。③ 不通过 ⇒ 返回 `extra_edits`（确认被改过）或 `edits_unverified`（读不到），**不关副本**、把决定权交回用户；这两种结果同时禁止声称磁盘文件已清理。
+
+**结束时的处理规则**（业务结论与副本清理结果**永远分开陈述**）：
+1. 写回并**验证**后 ⇒ `closed`：主卡标题即业务结论「已写回原表」；副本关闭状态**另起一处独立**显示（「审阅副本已关闭。」），不带业务前缀。
+2. 放弃变更 ⇒ `discarded`：**终态** —— 确认框与三个审阅按钮立刻撤下，主卡只说「已放弃变更」＋「本次计划未写入原表。」。副本仍打开时另给手动处理顺序（**不**无条件让用户选「不保存」：副本里可能有用户自己要留的修改）。
+3. 写回失败 / 部分完成 / 结果不确定 ⇒ **默认保留**副本供核对（`not_attempted` + `RETAIN_MESSAGES`），不自动关闭、不删除排查材料；面板只结束会话并说明原因。
+4. 用户另存 / 替换过副本（身份变了 / 未保存标记消失）⇒ `user_saved`，**不自动丢弃**，明确交还用户决定。
+5. 原表与用户自己保存的文件**永不**被关闭或删除。
+6. 关闭失败**绝不**改写业务结论：业务结论（标题＋说明）只由 `outcome` 决定，副本关闭结果只作**次要**的独立状态跟在后面，不冲淡「计划已取消 / 已写回」这一主结论。`write_failed`（守卫在写入前拦下 ⇒ 原表可能一格未改）与 `partial_or_unknown`（执行器跑到一半没确认 ⇒ 结果未知）必须说成**两句不同**的话，绝不互相冒充。
+
+**审阅卡的信息分层（`packages/core/src/reviewCardPresentation.ts`，两端共用）**。这是"哪个阶段说什么、哪条信息放在哪一层"的唯一来源；两端只负责把手上的**事实**喂进来（**不**入此层：执行算法、撤销算法、关闭/清理判据）。
+
+| 阶段（唯一来源 `outcome`） | 首屏（主卡） | 折叠层 |
+| --- | --- | --- |
+| `reviewing` 审阅中 | 标题 / 说明 / 范围 / 兼容模式必要说明 / 确认框 / 三个按钮（重新排列 · 放弃变更 · 确认写回原表） | 「兼容模式说明」（格式恢复、为何读不回副本）、「诊断详情」（开发环境重启提示、排列与同步滚动指引、随机副本标识、关闭诊断、磁盘清理结果） |
+| `discarded` 已放弃 | 标题 ＋ 说明（＋副本仍打开时的手动处理顺序） | —— |
+| `verified` 写回成功 | 标题 ＋ 说明 ＋ 实际写回与回读证据；副本关闭状态**独立**显示 | 「兼容模式说明」「诊断详情」 |
+| `write_failed` / `partial_or_unknown` 写回失败 | 标题 ＋ 说明（两档**不同**的实话）＋实际原因 | 同上 |
+
+四条纪律：
+- `outcome` 是阶段的**唯一**来源，界面想过什么不算数；标题与说明**按 outcome 取值**（不是按 phase），否则 `write_failed` 与 `partial_or_unknown` 会拿到同一个标题。
+- 标题 ＋ 说明**就是**业务结论，主卡不再另起一行重复；左右排列说明只出现在审阅中那一句里，不重复念。
+- `reviewCardClaimsSuccess()` 是界面套成功模板的**唯一**许可闸：只有 `verified` + `verification === 'passed'` 为真。
+- 文案一律**纯文本**（这些串直接进 DOM 文本节点）：`reviewCardMarkdownLeaks()` 是渲染前最后一道闸，`**粗体**` 会原样把星号显示给用户。
+
+**写回入口的唯一闸门（`wpsWriteBackBlockReason`）**。判据只有一份，且**只读实时事实**：`confirmPendingPlan` 是渲染期闭包，旧闭包会一直看到它诞生那一刻的 `pendingPlan` / `stagedReview` / `reviewAcknowledged` —— 放弃之后拿着旧闭包再调一次，闭包里的"计划还在"是**过期事实**。所以闸门读的是每次渲染刷新的实时引用，并在授权检查（异步）返回后**再判一次**；另有一次写回在跑的同步闸（`busy` 是渲染期派生值，同一 tick 的第二次调用还看不到它）。这条路径已有反向变异用例钉住：把闸门改回闭包变量 ⇒ 旧回调会把已放弃的计划写进原表（`expected 1 to be 0`）。
+- **异步授权检查回来后的身份复核**（`wpsWriteBackStillCurrent` → `reviewWriteBackTargetChanged`，`packages/core/src/reviewWriteBackGate.ts`）：请求在发起点记下身份三元组——**同一次审阅 / 同一计划版本 / 同一原工作簿**，检查回来后逐项按**对象引用**比对（内容相同但换过对象也算换了），任一侧缺席一律 fail-closed。只判"当前有审阅"会把**新副本**的确认状态借给旧请求：用户核对过的那一份从来没被写、没核对过的那一份反而被写。这条复合路径目前被 `busy`（含 `targetGuard.checking`）挡在界面之外，属纵深防御；判据本身由反向变异钉住（S16/S17）。Excel 端的等价防护是 `save()` 的 `messageId` 归属校验 + 副本 nonce 绑定（兼容模式）+ `assertExcelNativeComparisonUnchanged` 在 `Excel.run` 之后逐字复核计划/授权/工作簿身份/原表快照，并有反向变异 S18 钉住"授权检查在途期间换掉现场 ⇒ 旧请求不写回"。
+
+**关闭副本（当前实现）**：见本文“审阅结束与副本处理（2026-10-15）”。兼容路径已换为同一 Workbook 先归档再关闭，旧 WM_CLOSE 路径不使用；仍需单独实机验收。
+
+**「窗口还在」不等于「宿主在问是否保存」**：关闭请求发出后窗口仍存在，只能说明"关闭尚未确认"。本机桥**没有对话框证据**，关得慢、被别的模态框挡住、宿主在弹保存提示，在这个层面**长得一模一样**。所以一律报 `close_unconfirmed`（「关闭尚未确认，请到副本窗口前确认」）并提示用户查看该窗口，**不推断**原因（关闭回执不包含任何保存对话框证据）。同理由此删掉了两个"看起来有、其实没人会产生"的状态：`prompt_pending`（改名为不推断的 `close_unconfirmed`）与 `user_cancelled`（没有任何适配器能观察到"用户点了取消"；Excel `Window.close()` 返回 `false` 是**歧义**信号，一律按 `close_unconfirmed` 报）。
+
+**磁盘文件**：生成审阅时是未保存工作簿；Excel 兼容路径结束审阅前新增本机恢复归档。恢复文件保留并展示路径，不属于自动删除的临时文件。
+
+**关闭协议**：v4 请求必须携带 closeVersion，回执增加 recoveryCopyPath；原表业务结论仍与关闭结果独立。排列接口保留 v3。
+
+**界面**：`ExcelNativeReviewActions` 与 `WpsAgentPanel` 都渲染 `reviewCopyCleanupState` 产出的「业务结果 → 副本清理结果 → 磁盘文件」三段；可重试的结果（`close_unconfirmed` / `extra_edits` / `edits_unverified` / `failed` / `identity_lost`）**保留审阅卡片**（Excel）或审阅现场（WPS）以便再点一次，已确认收尾的结果才释放会话。`blocked` 阶段按钮改为「保留副本并结束审阅」，`committed` 阶段为「关闭审阅副本」。清理副本**与撤销无关**：不动原表的撤销快照/恢复记录（Excel 端 `excelWriteEndToEnd` / `ExcelFormatReviewFlow`、WPS 端 `wpsNativeComparison` 都有「清理后仍可撤销」的断言）。
+
+**未消费的限额不当成已实现能力**：`config/capabilities.json.reviewCopyLifecycle` 只留服务端真正读的两项 `closeWaitSeconds` / `closePollIntervalMs`（关闭后轮询窗口是否消失）。此前的 `maxCloseAttempts` / `tempCleanupWaitSeconds` / `tempRootLabel` **没有任何消费点**，已删除 —— 本轮**不**引入自动重试循环（重试由用户再点一次驱动），也**不**声称已实现临时文件清理等待。
+
+**验收状态**：替身自动化已证明并在本轮复跑全绿 —— core **455/455**（27 文件，含 `reviewCopyLifecycle.test.ts` 27 例）、Excel 加载项 **1235 通过 / 3 跳过**（105 文件含 2 跳过）、WPS **827 通过 / 3 跳过**（54 文件含 2 跳过）、服务端窗口布局模块 **92 通过**、服务端全量 **1411 通过 / 28 跳过 / 2 失败**（失败两例为 `test_python_event_delivery.py`，本机 Docker 不可用 ⇒ `unavailable`，属环境阻断非代码缺陷）；两端 `npm run build`（含 `tsc --noEmit`）退出码 0；`scripts/mutate_review_copy_lifecycle.mjs` 10 个 SEED 全红且逐字节 sha256 还原，`scripts/check_excel_layout_guards.py` 13 项守卫全被抓，`mutate_excel_format_compat.mjs check` 18 个 SEED 在位。**真实客户端验收未执行**：Excel 2024 与 WPS 里「副本被自动关掉、宿主保存提示出现、用户选不保存后窗口消失」这条链路必须在真机上跑一遍才算闭环；最短步骤见 `docs/DEVELOPMENT.md`「审阅副本生命周期验收（2026-10-14）」。当前只能说「已实现且替身自动化可证」，不能说「实机已验证」。
 
 ## 2026-10-05：WPS 审阅窗格比例对齐
 
@@ -94,13 +355,13 @@ Excel `analyzeConfirmedIntent` 的本地步骤只表示「准备规划请求」�
 
 按用户要求移除 Excel 的 `review.html` 对话框与 WPS 的窗格全幅网页双网格，并删除专用组件、传输状态、样式、构建入口及 core 网格投影模块。侧栏保留变更摘要（定位、计数、真实回读状态）及已撤销的历史说明；执行器的前后证据采集、授权核对、验证与恢复能力不删除。
 
-WPS 独立副本原生并排、确认写回与放弃副本保持不变。Excel 原生单表副本审阅已接线（范围和限制见下一节），不等于完成两端全部原生能力对齐。专注对话窗口与只读宿主能力探针不是网页前后对比，继续保留。旧双网格指导文件仅为历史记录，不代表当前产品入口。
+WPS 独立副本原生并排、确认写回与放弃变更保持不变。Excel 原生单表副本审阅已接线（范围和限制见下一节），不等于完成两端全部原生能力对齐。专注对话窗口与只读宿主能力探针不是网页前后对比，继续保留。旧双网格指导文件仅为历史记录，不代表当前产品入口。
 
 ## 2026-10-03：Excel 原生单表副本并排审阅
 
 **2026-10-04 兼容路径补充**：`excelNativeReviewMode` 先检测基础 `ExcelApi 1.13` / `createWorkbook`，再区分支持 `ExcelApiDesktop 1.1` 的 Office 窗口模式和不支持它的兼容模式（内部仍名为 manual，如本机 Office 2024 Volume）。兼容模式使用 `manualReviewFile.ts` 将授权表快照与白名单计划直接投影为本地 OOXML：包含真实公式、常量、基础格式及绿色计划变化标记，要求 Excel 打开后重算，不伪造公式缓存结果；列宽按点到字符宽度近似转换。副本数据只通过 `createWorkbook` 交给本机 Excel，不调用不支持的 Office 窗口 API，不向原表写入，不新增单元格数据出站或持久存储。范围、动作、复杂对象与公式依赖限制和 Office 窗口模式相同，未支持的计划不能绕过限制。
 
-兼容模式现通过既有 Python 本地服务尝试自动左右排列（见下节）；不能确认窗口时才明确提示手动「视图 → 并排查看」或排列不同实例。用户须勾选「已在 Excel 中核对副本」才能保存，hook 内也验证确认，不仅依赖按钮禁用。保存前及执行器首次写入前仍复核原表身份、授权、计划和完整来源快照；只执行原计划，不导入副本人工修改。此模式**不能自动回读副本单元格或关闭另一实例的副本**：窗口布局成功不是计算结果验证，结果验证只针对原表，不宣称与副本计算值一致；放弃/保存后均明确要求手动关闭临时副本且不保存。打开、重算、真实窗口排列和宿主复核时序待实机验收。以下 Office 窗口集合与副本实际回读描述仅适用于支持 Desktop 1.1 的模式。
+兼容模式通过本机桥尝试左右排列，仍需人工核对副本后确认；不能自动回读副本计算值，写回只执行已审阅计划。关闭改为工作簿级归档后关闭，详见本文 2026-10-15 更新。
 
 ### 兼容副本的本机窗口排列桥接（2026-10-04）
 
@@ -108,7 +369,7 @@ WPS 独立副本原生并排、确认写回与放弃副本保持不变。Excel �
 
 Windows `XLMAIN`/`EXCEL7` 可访问性接口只读取窗口关联的活动表名和工作簿 Path/FullName 等身份元数据，验证进程为 Excel.exe。不读取 Range/Cells，不创建 COM Application，不运行外部程序/VBA/脚本，不修改工作簿数据；身份扫描不激活窗口，版本 3 比较阶段仅可激活已核实原窗口、调整本次两窗视口及同步开关。prepare 唯一匹配原表并记录所有既有 Excel HWND/PID；createWorkbook 后 arrange 只接受新窗口、未保存副本和本次 nonce 三者同时成立的唯一候选。已有“工作簿1”、仅同名或同路径的多窗口都不放行；移动前再次核对双方身份及 HWND/PID，过期或模糊证据不移动。
 
-Win32 仅在原表所在显示器工作区排列本次两窗：**左侧审阅副本 40%，右侧原表与 AI 窗格 60%**，先扣除配置间隔再分配宽度（版本 3 默认可见间隔 0 DIP，并补偿不可见拖拽边框），高度填满工作区。不修改 Excel 自带的系统边框样式或单元格格式；任务窗格的审阅临时宽度由前端单独处理；尺寸由 `originalWidthFraction` 与 `windowGapDip` 配置，间隔按窗口 DPI 换算，负坐标显示器同样按工作区计算。跨 Excel 进程也可尝试；DPI 处理后核对实际矩形，不一致或失败则尽力恢复原窗口位置，禁止报成功。限额放在 `config/capabilities.json` 的 `excelWindowLayout`：凭据 120 秒、最多 20 项、等待新窗口 12 秒、轮询 250ms、请求超时 20 秒、矩形误差 4px。凭据绑定 Origin、单次使用，只有内存元数据，不落执行账本。COM 元数据调用可能因 Excel 忙而阻塞，前端请求超时并回退，服务端检查等待截止后不得发起迟到的移动；不是所有原生 COM 调用都可强制取消。服务重启会丢弃凭据，必须重新生成副本。窗口布局成功不能自动勾选审阅、放宽写回；版本 3 的同步滚动独立回执只在原生比较和开关回读成功时为 enabled，跨实例自动同步未实现；兼容副本回读/自动关闭仍未实现。
+Win32 仅在原表所在显示器工作区排列本次两窗：**左侧审阅副本 35%，右侧原表与 AI 窗格 65%**（见 2026-10-14 一节；此前为 40/60，是 AI 窗格被挤出原表的根因），先扣除配置间隔再分配宽度（版本 3 默认可见间隔 0 DIP，并补偿不可见拖拽边框），高度填满工作区。不修改 Excel 自带的系统边框样式或单元格格式；任务窗格的审阅临时宽度由前端单独处理；外侧尺寸由 `reviewPaneSizing.reviewCopyWidthFraction`（服务端取 `1 − 该值`）与 `windowGapDip` 配置，间隔按窗口 DPI 换算，负坐标显示器同样按工作区计算。跨 Excel 进程也可尝试；DPI 处理后核对实际矩形，不一致或失败则尽力恢复原窗口位置，禁止报成功。限额放在 `config/capabilities.json` 的 `excelWindowLayout`：凭据 120 秒、最多 20 项、等待新窗口 12 秒、轮询 250ms、请求超时 20 秒、矩形误差 4px。凭据绑定 Origin、单次使用，只有内存元数据，不落执行账本。COM 元数据调用可能因 Excel 忙而阻塞，前端请求超时并回退，服务端检查等待截止后不得发起迟到的移动；不是所有原生 COM 调用都可强制取消。服务重启会丢弃凭据，必须重新生成副本。窗口布局成功不能自动勾选审阅、放宽写回；版本 3 的同步滚动独立回执只在原生比较和开关回读成功时为 enabled，跨实例自动同步未实现。**关闭**走同一条本机桥的独立协议 `/api/office/review-layout/close`（版本 3）：身份判据与排列相同，但回执只回答「副本关没关」，**不含**任何原表写回结论；兼容副本的**单元格回读**仍未实现（见 2026-10-14 生命周期一节）。
 
 仅 Windows 交互桌面且与 Excel 同用户、可访问的权限级别适用；非 Windows、云文件、不支持的身份、依赖缺失、后台服务会话、权限隔离均回退手动。文件夹 openpyxl 路径不启动窗口布局，WPS 保持既有原生比较通道不变。真实 Office 2024 COM 身份接口、跨实例排列、DPI/多显示器与聊天留存仍待实机验收。
 
@@ -348,7 +609,7 @@ ownerToken；Office 路由先核对 `url:` 命名空间，不能绕过 WPS 守�
 | **第一次宿主写入之前** | `executing` | `unknown` | `reconcile` |
 | 写入与回读完成 | `executing` | `confirmed_result` | `unavailable`（终态） |
 | 部分写入 / 回读不符 | `executing` | `needs_review` | `reconcile` |
-| 用户放弃副本 | `preview_ready` | `not_written` | `unavailable`（终态） |
+| 用户放弃变更 | `preview_ready` | `not_written` | `unavailable`（终态） |
 
 **顺序是关键**：登记必须早于第一次宿主写入。否则写入途中断线 / 重载时记录里仍是
 `not_written`，卡片会对用户说"原表未写入"—— 而原表可能已被改过。宁可先说"未知"。
@@ -400,7 +661,7 @@ WPS 与 Excel 任务窗格共用 `apps/excel-addin/src/styles.css` 作为产品�
 2026-09-30 用户明确修正 WPS 双视图需求：原表与**独立复制的工作簿**使用 WPS 自带
 「并排比较」，对话留在任务窗格。WPS 计划预览后先复制已授权的单张工作表，
 只在未保存副本上试写、回读和标色；「确认写回原表」重新核对两边状态后才调用
-既有 `executeWpsPlan`，放弃则 `Close(false)`（按钮为「放弃副本」）。
+既有 `executeWpsPlan`，放弃则 `Close(false)`（按钮为「放弃变更」）。
 **侧栏只负责状态、摘要、风险与决策**：原生表格负责比较，不重新引入窄 HTML 双网格，
 也不默认把逐格长公式铺成主画面。成功结果不再展示旧的双网格。
 副本数据只活在当前会话内存；多表计划不通过复制整本工作簿变相扩大授权。
@@ -411,7 +672,7 @@ WPS 与 Excel 任务窗格共用 `apps/excel-addin/src/styles.css` 作为产品�
 详见[WPS 原生并排审阅](./WPS_NATIVE_SIDE_BY_SIDE_REVIEW_2026-09-30.md)。
 
 **审阅侧栏的信息层级**（2026-09-30）。状态说明独占 `.wps-native-review-status`，
-操作区 `.wps-native-review-actions` **只放按钮**（「放弃副本」「确认写回原表」）。
+操作区 `.wps-native-review-actions` **只放按钮**（「重新排列」「放弃变更」「确认写回原表」）。
 两者混进同一个单行 flex 容器会把按钮压到逐字折行 —— 那是真机截图里按钮竖排的直接
 原因。按钮 ≥44px 高且 `white-space: nowrap`（不靠缩小字号或截断文案塞进一行）；
 ≥560 CSS px 水平排列，更窄时 `flex-basis: 100%` 整行纵排。完整公式与计划默认收进
@@ -434,6 +695,8 @@ WPS 的本地读取、计算及写入回调会整理为 Excel 共用的 `TaskPro
 记录步骤、阶段、动作类型、已授权目标、行数和终态，不把原始单元格值写进过程日志。
 过程消息保存在对话历史中；刷新时尚无终态的步骤显示为中断，不冒充继续运行或成功。
 消息流仅在用户靠近底部时自动跟随更新；上翻阅读时显示“查看最新进度”，不强制拉回底部。
+Excel/WPS 共用的消息自动跟随状态绑定当前对话 ID：新建或切换对话时清除上一段对话的未读进度提示并恢复跟随；内容已位于底部或不足一屏时，不显示该提示。三点提示按钮的样式保持不变。
+共享滚动 Hook 的实现放在 `useMessageAutoFollowRuntime.tsx`，由原 `.ts` 入口转发；Vite 为实现生成 Fast Refresh 签名，Hook 顺序变化时不得复用不兼容的组件状态，旧窗格缓存的入口地址仍可加载。
 这只对齐了当前 WPS 本地可见过程；服务端规划流的逐事件补发仍须单独接线与验收。
 
 写入能力按共享核心与宿主适配器分层：`apps/excel-addin/src/planCore.ts` 提供两端共用的
@@ -831,9 +1094,14 @@ Office.js 执行快照按真实 executionId 绑定，成功、动作失败和验
 
 达到 token、轮次、连续错误等硬限制后不再抛出裸异常，而是返回 provider 为 system、
 outcome 为 failed 的 AnswerResponse，其中包含停止原因、压缩后的工具调用记录和针对截断、格式错误
-或循环的建议。流式规划另受 `taskRecovery` 的时间预算控制：首次 60 秒，在完整模型响应
-或完整单次工具调用边界持久保存现场并暂停；用户通过带 revision 和稳定 requestId 的明确操作继续，
-每次增加 60 秒且累计不超过 300 秒。继续不会提高 token、轮次或错误上限。
+或循环的建议。流式规划另受 `taskRecovery` 的时间控制，2026-10-10 起**提醒与暂停分离**：
+`planningReminderSeconds`（60 秒）只是**非阻塞**的耗时提醒——超过它只发一条限频进度
+事件，任务继续、界面不显示"继续"按钮；真正的停止阈值是 `planningHardWallTimeSeconds`
+（1800 秒），按**累计活跃执行时间**计算，到达后由循环在启动下一次模型/工具调用之前收口
+并如实说明（`pauseType=budget_exhausted`，不承诺"必然可以继续"）。每个可恢复边界仍照常
+持久保存检查点。用户通过带 revision 和稳定 requestId 的明确操作接续现场；续跑不提高
+token、轮次或错误上限。Claude Agent SDK 后端以同一总时限作单次请求上限，没有 60 秒停顿，
+但**没有检查点恢复能力**。
 OpenAI-compatible 适配器统一返回 payload 与 usage；缺失 usage 的服务会得到零值
 token 统计。
 
@@ -1227,8 +1495,27 @@ PlanResponse.provider 仍只允许 model 或 local。
 
 ### 澄清续答与重新授权（2026-10-05）
 
-目标确认前移：两端在需求分析入口调用共享 `checkForAnalysis`，已有强身份证据且授权一致时直接进入分析；弱包装对象、身份证据缺失或目标变化时，先暂停并显示独立目标选择卡。确认前不读取表头/数据行、不请求意图或规划模型、不创建需求分析活动。确认期间再次采集证据与元数据，变化仍拒绝。业务补全表单只做规则填写和既有授权复核，不授予新目标同意。WPS 同任务的显式前置同意只许可重新读取/规划；有匹配的私有目标键、实际表头与授权指纹时，可继续语义澄清及本地计算，但不把原生对象 unknown 改成强身份相同，执行器不消费此许可。新任务清除弱证据同意，路径/表身份/授权集合冲突仍暂停；写入强身份、快照和独立确认不变。文件夹模式、模型协议不变。详见 `docs/AUTHORIZATION_BEFORE_ANALYSIS_2026-10-05.md`；原内联勾选方案仅保留历史记录。
+目标确认前移：两端在需求分析入口调用共享 `checkForAnalysis`，已有强身份证据且授权一致时直接进入分析；弱包装对象没有有效显式同意、身份证据缺失或目标变化时，先暂停并显示独立目标选择卡。确认前不读取表头/数据行、不请求意图或规划模型、不创建需求分析活动。确认期间再次采集证据与元数据，变化仍拒绝。业务补全表单只做规则填写和既有授权复核，不授予新目标同意。WPS 已确认范围的显式前置同意只许可重新读取/规划；有匹配的私有目标键、实际表头与授权指纹时，可继续语义澄清及本地计算，但不把原生对象 unknown 改成强身份相同，执行器不消费此许可。2026-10-08 起普通追问不清除弱证据同意；检测到路径/表身份/授权集合冲突、撤销或会话结束仍失效。写入强身份、快照和独立确认不变。文件夹模式、模型协议不变。详见 `docs/AUTHORIZATION_BEFORE_ANALYSIS_2026-10-05.md`；原内联勾选方案仅保留历史记录。
 
 授权目标前置确认：两宿主共享内存基线、空闲元数据监测和操作入口检查。变化先弹目标/工作表选择卡，确认时重新核对；旧预览不能移植到新授权。此层不替代原有强身份及快照守卫；文件夹模式不变。实现范围、未实现项与宿主验收见 `docs/AUTHORIZED_TARGET_PREFLIGHT_2026-10-05.md`。
 
 回答与授权继续分离，但不能先拦截授权、再丢弃答案：WPS 作答先存真实确认，下一轮携带原 taskId、原需求与全部答案。本地规则仅在内存按原消息定位；unknown 时显式重新授权后直接重读计算并生成新预览，不能重新启动原需求而反复问同一道题。Excel 身份不足同样保留本地规则并给出确认入口，读取新结构后才能继续。正面的路径、表身份或授权集合冲突仍拒绝旧规则，预览不能代替确认写入。详见 `docs/CLARIFICATION_LOOP_FIX_2026-10-05.md`。
+
+
+## 2026-10-11：Python 进度结果卡补全
+
+Claude 初版新增 `pythonResult` 回调，但 HTTP 事件组装、双端共用解析器、普通后端回调及 WPS 消费尚未接通。当前补齐这些边界，服务端字段采用 `LocalResultCard` 严格模型；前端重建元数据白名单，值仍按该轮绑定从回环端点获取。结果展示不改变任务目标，不执行计划。Excel 保存活动日志时保留原有卡片，补新建消息分支并使用该活动任务身份校验绑定；WPS 对结果引用去重并拒收取消/不同任务事件。函数回调测试不称作真实 SSE/客户端端到端；新增 HTTP SSE 与双端面板替身测试另列。
+
+## 审阅结束与副本处理（2026-10-15，本轮范围）
+
+- Excel、WPS 审阅卡移除“重新排列”；生成副本时的首次自动排列保留。
+- 放弃计划后立即进入终态，旧写回入口失效；确认写回成功后才收尾副本。写回失败或结果不确定时保留副本。
+- Excel 兼容路径启用 v4 本机关闭协议。先核对唯一副本与原表身份，再获取 Workbook 对象，直接检查该对象的未保存状态、唯一工作表 nonce 与 XLSX 格式；不在核对后重新获取关闭对象，不使用 WM_CLOSE、ActiveWorkbook、全局 DisplayAlerts 或关闭整个 Application。
+- 同一 Workbook 先 SaveCopyAs 到应用数据目录 `review-copies/<随机目录>/review-copy.xlsx`，检查文件为可读 XLSX 后，再复核对象身份并 Close(False)。归档失败、身份不符时不关；关闭失败仍保留已生成的恢复文件。恢复文件包含副本中的额外人工修改，**不会写回原表**。
+- 默认恢复目录为 `%LOCALAPPDATA%\Excel Bro\review-copies`；配置 `EXCEL_BRO_CONFIG_DIR` 时位于该目录下。结果卡显示实际路径；文件仅在本机保留，不上传模型、不自动删除，用户确认不需要后自行删除。原表文件和用户自行另存的副本均不删除、不自动关闭。
+- 请求新增必填 `closeVersion: 4`，旧服务在校验时拒绝；返回 `status / layoutVersion:4 / copyClosed / recoveryCopyPath`。排列接口仍是 v3。升级后需重启 Python 服务并刷新加载项。
+- Excel 原生与 WPS 保留既有内容核对后关闭逻辑：额外修改或读数未知时保留副本；没有生成磁盘文件时不宣称已删除文件。关闭副本不清除原表撤销记录。
+- 实现与自动化证据已补齐；本轮未操作真实 Excel/WPS 窗口，自动化通过不表示实机关闭已验收。
+
+最短实机核对：在专用测试工作簿生成副本，分别点“放弃变更”和确认写回；确认只关闭副本、原表保持打开且无原表保存提示，写回后仍可撤销。兼容副本中另改一格后放弃，打开卡片列出的恢复文件核对该修改仍在。另存副本后再放弃应保留已另存的工作簿。归档目录不可写时应保留副本并报告未关闭。
+

@@ -10,6 +10,20 @@ import type { CellValue, DataToolRequest } from "./contracts";
 import capabilities from "../../../config/capabilities.json";
 
 describe("executeQueryTableData", () => {
+  it("reports the filtered record total across sheets before limiting groups", () => {
+    const result = executeQueryTableData({
+      id: "union-total", tool: "query_table", arguments: {
+        mode: "aggregate", combine: { mode: "union" }, groupBy: ["类别"],
+        metrics: [{ operation: "countRows", outputName: "数量" }], limit: 1,
+        filters: [{ field: "类别", operator: "notEquals", value: "排除" }]
+      }
+    }, [
+      { name: "一", values: [["类别"], ["甲"], ["乙"], ["排除"]] },
+      { name: "二", values: [["类别"], ["甲"], ["丙"]] }
+    ]);
+    expect(result.rows).toHaveLength(1);
+    expect(result.calculation).toContain("筛选后总记录数：4");
+  });
   it("detects a title row and aggregates complete selected-sheet data", () => {
     const request: DataToolRequest = {
       id: "aggregate-movies",
@@ -266,6 +280,8 @@ describe("executeQueryTableData", () => {
 
     expect(result.rows).toEqual([["甲", 10]]);
     expect(result.complete).toBe(false);
+    expect(result.calculation).toContain("已处理记录数（结果不完整）：1");
+    expect(result.calculation).not.toContain("总记录数");
     expect(result.warnings).toEqual([
       "「缺字段表」未找到字段：数值"
     ]);

@@ -39,6 +39,44 @@ def test_context_rejects_symlink_instead_of_following_it(tmp_path):
         worker.symlink_to(outside)
     except OSError:
         pytest.skip("symlink creation unavailable")
+    if not worker.is_symlink():
+        # 有些运行环境（含受限沙箱）会把 symlink_to 降级成"建一个空文件"：
+        # 此时 is_symlink() 为假，本用例的前提（真的造出了符号链接）不成立，
+        # 继续断言只会得到一条假失败。真正判定"是不是链接"的守卫由下面那条
+        # 不依赖宿主能力的用例来验。
+        pytest.skip("symlink creation unavailable")
+    with pytest.raises(ValueError):
+        build.build_context(tmp_path)
+
+
+@pytest.mark.parametrize("member", ["file", "parent", "root"])
+def test_context_rejects_a_symlink_at_every_context_path(monkeypatch, tmp_path, member):
+    """符号链接守卫必须在**每个**上下文路径上都生效。
+
+    上一条用例依赖宿主能不能真的造出符号链接（受限环境下会 skip），这一条不
+    依赖：`is_symlink` 是唯一的判据，把它在被测对象上置真即可证明守卫真的会
+    拒绝，而不是靠 `is_file`/路径包含检查蒙对。
+    """
+    for name in build.CONTEXT_FILES:
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"approved-file")
+
+    # 正向锚点：上下文里没有链接时，同一份上下文是可以正常打包的 ——
+    # 证明下面那条 ValueError 是守卫拦的，不是打包恒失败。
+    assert build.build_context(tmp_path)
+
+    selected = {
+        "file": tmp_path / "app" / "docker_worker.py",
+        "parent": tmp_path / "app",
+        "root": tmp_path,
+    }[member]
+    real_is_symlink = Path.is_symlink
+    monkeypatch.setattr(
+        Path,
+        "is_symlink",
+        lambda self: True if self == selected else real_is_symlink(self),
+    )
     with pytest.raises(ValueError):
         build.build_context(tmp_path)
 

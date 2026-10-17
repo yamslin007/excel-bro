@@ -1,13 +1,83 @@
-import type { AnalysisPlan, CellValue } from "./contracts";
+import type { AnalysisPlan, CellValue, ExcelAction } from "./contracts";
+import { isFormatAction } from "./contracts";
 import type { SheetSnapshot } from "./excelNativeComparison";
 import { nativeColumnName, nativeReviewPackage, nativeReviewXml as xml } from "./nativeReviewFile";
 import { parseExplicitA1Rect } from "./planCore";
+import { excelFormatActionFields } from "./excelFormatCapability";
+import { directFormatFieldValue } from "./excel";
 
 const NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
 const color = (value?: string) => value && /^#[0-9a-f]{6}$/i.test(value) ? `FF${value.slice(1).toUpperCase()}` : undefined;
 function attribute(name: string, value: string | number | boolean | undefined): string {
   return value == null ? "" : ` ${name}="${xml(String(typeof value === 'boolean' ? Number(value) : value))}"`;
 }
+
+/** 深拷贝一份 `CellPropertiesFormat`：投影格式动作时会逐格改写嵌套的 font/fill/borders，不能共享引用。 */
+function cloneCellFormat(source: Excel.CellPropertiesFormat | undefined): Excel.CellPropertiesFormat {
+  if (!source) return {};
+  return {
+    ...source,
+    ...(source.font ? { font: { ...source.font } } : {}),
+    ...(source.fill ? { fill: { ...source.fill } } : {}),
+    ...(source.borders
+      ? {
+          borders: Object.fromEntries(
+            Object.entries(source.borders).map(([side, state]) => [
+              side,
+              state ? { ...(state as object) } : state
+            ])
+          )
+        }
+      : {}),
+    ...(source.protection ? { protection: { ...source.protection } } : {})
+  } as Excel.CellPropertiesFormat;
+}
+
+/** 格式动作里"线型/线宽"在 OOXML 侧用首字母大写的词（`Continuous` / `Thin`）。 */
+const capitalize = (value: string) => value.charAt(0).toUpperCase() + value.slice(1);
+
+/**
+ * 把一个**格式动作**投影到某格的直接格式上（纯数据变换，不碰宿主）。
+ *
+ * 与执行器 `applyFormatAction` 的语义逐字对齐：`setFill` 设色即视为有填充（`Solid`）；
+ * `setFont`/`setAlignment` 只改显式给出的属性；`setBorders` 补齐缺省值后写指定边；
+ * `setNumberFormat` 由调用方另行按格记录。
+ */
+function projectFormatAction(target: Excel.CellPropertiesFormat, action: ExcelAction): void {
+  switch (action.type) {
+    case "setFill":
+      target.fill = { pattern: "Solid", color: action.color } as Excel.CellPropertiesFormat["fill"];
+      return;
+    case "setFont": {
+      const font = { ...(target.font ?? {}) } as NonNullable<Excel.CellPropertiesFormat["font"]>;
+      if (action.bold != null) font.bold = action.bold;
+      if (action.italic != null) font.italic = action.italic;
+      if (action.name != null) font.name = action.name;
+      if (action.size != null) font.size = action.size;
+      if (action.color != null) font.color = action.color;
+      target.font = font;
+      return;
+    }
+    case "setAlignment": {
+      if (action.horizontal != null) target.horizontalAlignment = capitalize(action.horizontal) as Excel.CellPropertiesFormat["horizontalAlignment"];
+      if (action.vertical != null) target.verticalAlignment = capitalize(action.vertical) as Excel.CellPropertiesFormat["verticalAlignment"];
+      if (action.wrapText != null) target.wrapText = action.wrapText;
+      return;
+    }
+    case "setBorders": {
+      const style = capitalize(action.style ?? "continuous");
+      const weight = capitalize(action.weight ?? "thin");
+      const borderColor = action.color ?? "#000000";
+      const borders = { ...(target.borders ?? {}) } as Record<string, { style: string; color: string; weight: string }>;
+      for (const side of action.sides) borders[side] = { style, color: borderColor, weight };
+      target.borders = borders as Excel.CellPropertiesFormat["borders"];
+      return;
+    }
+    default:
+      return;
+  }
+}
+
 function styleTable() {
   const fonts = ['<font><sz val="11"/><name val="Calibri"/></font>'];
   const fills = ['<fill><patternFill patternType="none"/></fill>', '<fill><patternFill patternType="gray125"/></fill>'];
@@ -50,7 +120,53 @@ export function buildManualReviewFile(sheetName: string, source: SheetSnapshot, 
     return [address, source.formulas[r.startRow-source.startRow][r.startColumn-source.startColumn] as string];
   }));
   const updates = new Map<string, CellValue>(), marked = new Set<string>();
+  // 格式动作的投影结果（逐格）：与值更新分开存，因为格式是"叠加"而不是"替换"。
+  const projectedFormat = new Map<string, Excel.CellPropertiesFormat>();
+  const projectedNumberFormat = new Map<string, string>();
+  // 行高/列宽投影：先复制源的逐行/逐列尺寸，再按 resizeRange 覆盖命中行列。
+  const projectedRowHeights = [...source.rowHeights];
+  const projectedColumnWidths = [...source.columnWidths];
+  const sourceFormatAt = (row: number, column: number): Excel.CellPropertiesFormat | undefined =>
+    source.properties[row - source.startRow]?.[column - source.startColumn]?.format;
+  const projectedFormatAt = (row: number, column: number, address: string): Excel.CellPropertiesFormat => {
+    const existing = projectedFormat.get(address);
+    if (existing) return existing;
+    const clone = cloneCellFormat(sourceFormatAt(row, column));
+    projectedFormat.set(address, clone);
+    return clone;
+  };
   for (const action of plan.actions) {
+    if (isFormatAction(action)) {
+      const rect = parseExplicitA1Rect(action.range)!;
+      if (action.type === "resizeRange") {
+        if (action.rowHeight != null) {
+          for (let row = rect.startRow; row <= rect.endRow; row += 1) {
+            projectedRowHeights[row - source.startRow] = action.rowHeight;
+          }
+        }
+        if (action.columnWidth != null) {
+          for (let column = rect.startColumn; column <= rect.endColumn; column += 1) {
+            projectedColumnWidths[column - source.startColumn] = action.columnWidth;
+          }
+        }
+        continue;
+      }
+      const fields = excelFormatActionFields(action);
+      for (let r = 0; r < rect.rows; r++) for (let c = 0; c < rect.columns; c++) {
+        const row = rect.startRow + r, column = rect.startColumn + c;
+        const address = `${nativeColumnName(column)}${row}`;
+        const before = cloneCellFormat(projectedFormatAt(row, column, address));
+        const after = cloneCellFormat(before);
+        projectFormatAction(after, action);
+        // 只比**该动作实际修改的属性**：未涉及的属性变化不该被算成"本次改动"。
+        const digest = (format: Excel.CellPropertiesFormat) =>
+          JSON.stringify(fields.map((field) => directFormatFieldValue(format, field)));
+        if (digest(before) !== digest(after)) marked.add(address);
+        projectedFormat.set(address, after);
+        if (action.type === "setNumberFormat") projectedNumberFormat.set(address, action.formatCode);
+      }
+      continue;
+    }
     if (action.type !== 'writeValues' && action.type !== 'writeFormulas' && action.type !== 'clearRange') throw new Error('不支持的兼容审阅动作。');
     const rect = parseExplicitA1Rect(action.range)!;
     for (let r=0; r<rect.rows; r++) for (let c=0; c<rect.columns; c++) {
@@ -74,7 +190,16 @@ export function buildManualReviewFile(sheetName: string, source: SheetSnapshot, 
     for (let column=firstColumn; column<=lastColumn; column++) {
       const address = `${nativeColumnName(column)}${row}`, r = row-source.startRow, c = column-source.startColumn;
       const value = updates.has(address) ? updates.get(address)! : source.values[r]?.[c] ?? null;
-      const formula = formulas.get(address), style = styles.index(source.properties[r]?.[c], source.numberFormat[r]?.[c] ?? 'General', marked.has(address));
+      const formula = formulas.get(address);
+      // 投影后的格式优先：格式动作改过的格子必须按**动作生效后**的样子渲染，
+      // 否则副本上看不出"加粗/居中/行高"到底会变成什么。
+      const properties: Excel.CellProperties | undefined = projectedFormat.has(address)
+        ? { format: projectedFormat.get(address) }
+        : source.properties[r]?.[c];
+      const numberFormat = projectedNumberFormat.get(address) ?? source.numberFormat[r]?.[c] ?? 'General';
+      // Keep format previews visually faithful; a green marker must not overwrite
+      // either the requested fill or the cell's unchanged background.
+      const style = styles.index(properties, numberFormat, marked.has(address) && !projectedFormat.has(address));
       const head = `<c r="${address}" s="${style}"`;
       if (formula) cells += `${head}><f>${xml(formula.slice(1))}</f></c>`;
       else if (value === null) cells += `${head}/>`;
@@ -84,11 +209,11 @@ export function buildManualReviewFile(sheetName: string, source: SheetSnapshot, 
       } else if (typeof value === 'boolean') cells += `${head} t="b"><v>${Number(value)}</v></c>`;
       else cells += `${head} t="inlineStr"><is><t xml:space="preserve">${xml(value)}</t></is></c>`;
     }
-    const height = source.rowHeights[row-source.startRow];
+    const height = projectedRowHeights[row-source.startRow];
     rows += `<row r="${row}"${height > 0 && Number.isFinite(height) ? ` ht="${height}" customHeight="1"` : ''}>${cells}</row>`;
   }
   // Office widths are points; OOXML widths are font character units (approximate).
-  const columns = source.columnWidths.map((width,c) => width > 0 && Number.isFinite(width) ? `<col min="${source.startColumn+c}" max="${source.startColumn+c}" width="${Math.max(0,(width*96/72-5)/7).toFixed(4)}" customWidth="1"/>` : '').join('');
+  const columns = projectedColumnWidths.map((width,c) => width > 0 && Number.isFinite(width) ? `<col min="${source.startColumn+c}" max="${source.startColumn+c}" width="${Math.max(0,(width*96/72-5)/7).toFixed(4)}" customWidth="1"/>` : '').join('');
   const topLeft = `${nativeColumnName(firstColumn)}${firstRow}`;
   const sheetXml = `<worksheet xmlns="${NS}"><dimension ref="${topLeft}:${nativeColumnName(lastColumn)}${lastRow}"/><sheetViews><sheetView workbookViewId="0" topLeftCell="${topLeft}"/></sheetViews><sheetFormatPr defaultRowHeight="15"/><cols>${columns}</cols><sheetData>${rows}</sheetData></worksheet>`;
   return { base64: nativeReviewPackage(sheetName, sheetXml, maxBytes, styles.xml()), markedCells: marked.size };

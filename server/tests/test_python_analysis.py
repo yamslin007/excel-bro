@@ -1224,14 +1224,17 @@ def test_old_checkpoint_python_code_not_sent_or_executed(monkeypatch):
     checkpoint = _old_checkpoint_with_python_code()
 
     captured_exec_arguments: list[dict[str, Any]] = []
-    original_execute = excel_agent._execute_tool
+    # ``run_python_analysis`` 改走 offload 入口（同步容器运行不能占住事件循环），
+    # 因此取证点挂在这条**当前唯一**的执行入口上，而不是 ``_execute_tool``。
+    from server.app import python_coordinator as _pyc
 
-    def _spy_execute(request, name, arguments):
-        if name == "run_python_analysis":
-            captured_exec_arguments.append(copy.deepcopy(arguments))
-        return original_execute(request, name, arguments)
+    original_async = _pyc.execute_python_analysis_async
 
-    monkeypatch.setattr(excel_agent, "_execute_tool", _spy_execute)
+    async def _spy_async(request, arguments, *, cancel_check=None, on_event=None):
+        captured_exec_arguments.append(copy.deepcopy(arguments))
+        return await original_async(request, arguments, cancel_check=cancel_check, on_event=on_event)
+
+    monkeypatch.setattr(_pyc, "execute_python_analysis_async", _spy_async)
 
     def resumed_responder(turn: int) -> tuple[dict[str, Any], dict[str, int]]:
         return (_tool_payload("submit_plan", {"plan": _PLAN}, "plan2"), _usage())
@@ -1271,14 +1274,17 @@ def test_old_checkpoint_pending_message_code_not_preserved(monkeypatch):
     ]
 
     captured_exec_arguments: list[dict[str, Any]] = []
-    original_execute = excel_agent._execute_tool
+    # ``run_python_analysis`` 改走 offload 入口（同步容器运行不能占住事件循环），
+    # 因此取证点挂在这条**当前唯一**的执行入口上，而不是 ``_execute_tool``。
+    from server.app import python_coordinator as _pyc
 
-    def _spy_execute(request, name, arguments):
-        if name == "run_python_analysis":
-            captured_exec_arguments.append(copy.deepcopy(arguments))
-        return original_execute(request, name, arguments)
+    original_async = _pyc.execute_python_analysis_async
 
-    monkeypatch.setattr(excel_agent, "_execute_tool", _spy_execute)
+    async def _spy_async(request, arguments, *, cancel_check=None, on_event=None):
+        captured_exec_arguments.append(copy.deepcopy(arguments))
+        return await original_async(request, arguments, cancel_check=cancel_check, on_event=on_event)
+
+    monkeypatch.setattr(_pyc, "execute_python_analysis_async", _spy_async)
 
     def resumed_responder(turn: int) -> tuple[dict[str, Any], dict[str, int]]:
         return (_tool_payload("submit_plan", {"plan": _PLAN}, "plan2"), _usage())
@@ -1337,14 +1343,14 @@ def test_execution_entry_exception_fails_closed_in_loop(monkeypatch):
     last_error_message、事件、持久记录都不含原始异常文本。"""
     _enable_python(monkeypatch)
     error_with_sentinel = ValueError(f"EXEC_ENTRY_EXPLOSION_{_CODE_SENTINEL}")
-    original_execute = excel_agent._execute_tool
+    # 执行入口异常：取证/注入点挂在 offload 入口（run_python_analysis 当前唯一
+    # 的执行分派缝）上。
+    from server.app import python_coordinator as _pyc
 
-    def _explode_execute(request, name, arguments):
-        if name == "run_python_analysis":
-            raise error_with_sentinel
-        return original_execute(request, name, arguments)
+    async def _explode_async(request, arguments, *, cancel_check=None, on_event=None):
+        raise error_with_sentinel
 
-    monkeypatch.setattr(excel_agent, "_execute_tool", _explode_execute)
+    monkeypatch.setattr(_pyc, "execute_python_analysis_async", _explode_async)
     events: list[dict[str, Any]] = []
 
     async def on_event(event: dict[str, Any]) -> None:
@@ -1378,14 +1384,14 @@ def test_execution_entry_exception_fails_closed_in_sdk(monkeypatch, tmp_path):
 
     _enable_python(monkeypatch)
     error_with_sentinel = ValueError(f"SDK_EXEC_EXPLOSION_{_CODE_SENTINEL}")
-    original_execute = excel_agent._execute_tool
+    # 执行入口异常：取证/注入点挂在 offload 入口（run_python_analysis 当前唯一
+    # 的执行分派缝）上。
+    from server.app import python_coordinator as _pyc
 
-    def _explode_execute(request, name, arguments):
-        if name == "run_python_analysis":
-            raise error_with_sentinel
-        return original_execute(request, name, arguments)
+    async def _explode_async(request, arguments, *, cancel_check=None, on_event=None):
+        raise error_with_sentinel
 
-    monkeypatch.setattr(excel_agent, "_execute_tool", _explode_execute)
+    monkeypatch.setattr(_pyc, "execute_python_analysis_async", _explode_async)
     fake = _FakeSdk(
         response=json.dumps({"kind": "answer", "message": "收到"}),
         invoke=("run_python_analysis", {"code": _CODE_SENTINEL, "datasetHandles": []}),
@@ -1408,14 +1414,12 @@ def test_execution_entry_exception_fails_closed_in_sdk(monkeypatch, tmp_path):
 def test_cancelled_error_still_propagates(monkeypatch):
     """缺陷③边界：asyncio.CancelledError 不得被无差别吞掉伪装成成功/固定回执。"""
     _enable_python(monkeypatch)
-    original_execute = excel_agent._execute_tool
+    from server.app import python_coordinator as _pyc
 
-    def _cancel_execute(request, name, arguments):
-        if name == "run_python_analysis":
-            raise asyncio.CancelledError()
-        return original_execute(request, name, arguments)
+    async def _cancel_async(request, arguments, *, cancel_check=None, on_event=None):
+        raise asyncio.CancelledError()
 
-    monkeypatch.setattr(excel_agent, "_execute_tool", _cancel_execute)
+    monkeypatch.setattr(_pyc, "execute_python_analysis_async", _cancel_async)
 
     def responder(turn: int) -> tuple[dict[str, Any], dict[str, int]]:
         if turn == 1:

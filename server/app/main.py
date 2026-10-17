@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import sqlite3
 import uuid
 import time
 from collections import deque
@@ -22,7 +23,7 @@ from pydantic import BaseModel
 
 from .capabilities import capabilities, capability_float, capability_int
 from .capabilities import model_timeout_seconds
-from .intent import check_intent
+from .intent import check_intent, check_message_understanding
 from .folder_workbooks import (
     FolderCatalog,
     FolderExecuteRequest,
@@ -52,7 +53,10 @@ from .folder_workbooks import (
     collect_legacy_folder_backups,
     undo_folder_execution,
 )
+from .folder_admission import check_folder_admission
 from .models import (
+    FolderAdmissionRequest,
+    FolderAdmissionResponse,
     AnalysisPlan,
     AnswerResponse,
     AssistantResponse,
@@ -78,6 +82,8 @@ from .models import (
     FolderUndoResponse,
     IntentCheckRequest,
     IntentCheckResponse,
+    MessageUnderstandingRequest,
+    MessageUnderstandingResponse,
     ManagedFolderRecoveryDirectoriesResponse,
     ManagedFolderRecoveryDirectory,
     ModelSettingsResponse,
@@ -97,6 +103,7 @@ from .models import (
     WpsExecutionResumeRequest,
     WpsExecutionStateResponse,
     WpsExecutionSuspendRequest,
+    WpsRecoveryActionDescriptor,
     WpsRecoveryDescriptor,
     PlanRequest,
     PlanningContinueRequest,
@@ -152,7 +159,21 @@ from .rule_generator import (
 )
 from .turn_state import TurnStateError, turn_registry
 from .excel_window_layout import excel_window_layout, WindowLayoutError
-from .models import ExcelReviewLayoutPrepareRequest, ExcelReviewLayoutTicket, ExcelReviewLayoutResult, ExcelReviewLayoutArrangeRequest, ExcelReviewPaneMeasurement
+from .models import ExcelReviewLayoutPrepareRequest, ExcelReviewLayoutTicket, ExcelReviewLayoutResult, ExcelReviewLayoutArrangeRequest, ExcelReviewPaneMeasurement, ExcelReviewCopyCloseRequest, ExcelReviewCopyCloseResult
+from .models import (
+    BridgeBindingRequest,
+    BridgePollResponse,
+    BridgePendingCall,
+    BridgeReceiptRequest,
+    BridgeReceiptResponse,
+    BridgeRegisterRequest,
+    BridgeRegisterResponse,
+    BridgeResultRequest,
+    BridgeResultResponse,
+)
+from .task_bridge import BridgeError, register_bridge_result, task_tool_bridge
+from .local_results import local_results
+from .ledger_privacy import ledger_recovery_descriptor
 
 load_dotenv("server/.env")
 logger = logging.getLogger(__name__)
@@ -249,6 +270,186 @@ async def arrange_excel_review_layout(payload: ExcelReviewLayoutArrangeRequest, 
     except Exception as exc:
         code = exc.code if isinstance(exc, WindowLayoutError) else "LAYOUT_UNAVAILABLE"
         raise HTTPException(409, detail={"code": code, "message": "自动窗口排列未完成；请手动并排查看。原表未因此写入。", "retryable": False}) from None
+
+
+@app.post("/api/office/review-layout/close", response_model=ExcelReviewCopyCloseResult)
+async def close_excel_review_copy(payload: ExcelReviewCopyCloseRequest, request: Request):
+    """Ask the host to close this review's copy. Never reports on the original's write.
+
+    A transport-level failure degrades to ``failed`` (manual close), never to an
+    error that the pane could read as "the writeback failed".
+    """
+    _review_layout_origin(request)
+    try:
+        return await run_in_threadpool(excel_window_layout.close_copy, payload)
+    except Exception:
+        return ExcelReviewCopyCloseResult(status="failed", layoutVersion=4, copyClosed=False)
+
+
+def _bridge_local_guard(request: Request) -> None:
+    """任务工具桥只允许本机加载项访问。
+
+    比一般规划接口更窄：必须是回环客户端、回环 Host、显式 JSON；浏览器
+    来源必须命中 Origin 白名单（两端任务窗格都在白名单内），无 Origin 的
+    本机脚本沿用「不是浏览器跨站面」的既有放行口径。桥承载的是本地查询
+    请求与值回执，绝不能因 CORS 或可猜 taskId 而放行。
+    """
+    origin = request.headers.get("origin")
+    if (
+        not request.client
+        or request.client.host not in {"127.0.0.1", "::1"}
+        or request.url.hostname not in {"127.0.0.1", "localhost", "::1"}
+        or (origin is not None and origin not in ALLOWED_ORIGINS)
+        or request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        != "application/json"
+    ):
+        raise HTTPException(
+            403,
+            detail={
+                "code": "BRIDGE_FORBIDDEN",
+                "message": "仅允许本机加载项访问任务工具桥。",
+                "retryable": False,
+            },
+        )
+
+
+@app.post("/api/sdk/tool-bridge/poll", response_model=BridgePollResponse)
+async def sdk_tool_bridge_poll(payload: BridgeBindingRequest, request: Request):
+    _bridge_local_guard(request)
+    session = task_tool_bridge.session(payload.taskId)
+    if session is None or session.cancel_reason is not None or not session.binding.matches(
+        host_id=payload.hostId,
+        workbook_name=payload.workbookName,
+        workbook_identity=payload.workbookIdentity,
+    ):
+        return BridgePollResponse(calls=[], generation=session.generation if session else 0)
+    calls = [BridgePendingCall(**call) for call in session.pending_calls]
+    return BridgePollResponse(calls=calls, generation=session.generation)
+
+
+@app.post("/api/sdk/tool-bridge/receipt", response_model=BridgeReceiptResponse)
+async def sdk_tool_bridge_receipt(payload: BridgeReceiptRequest, request: Request):
+    _bridge_local_guard(request)
+    session = task_tool_bridge.session(payload.taskId)
+    if session is None:
+        return BridgeReceiptResponse(status="rejected", code="late")
+    try:
+        outcome = session.deliver(
+            operation_id=payload.operationId,
+            request_fingerprint=payload.requestFingerprint,
+            host_id=payload.hostId,
+            workbook_name=payload.workbookName,
+            workbook_identity=payload.workbookIdentity,
+            source_fingerprint=payload.sourceFingerprint,
+            result=payload.receipt.result,
+            error_code=payload.receipt.errorCode,
+            datasets=payload.receipt.datasets,
+        )
+    except BridgeError as error:
+        return BridgeReceiptResponse(status="rejected", code=error.code)
+    return BridgeReceiptResponse(status=outcome["status"])
+
+
+@app.post("/api/sdk/tool-bridge/register", response_model=BridgeRegisterResponse)
+async def sdk_tool_bridge_register(payload: BridgeRegisterRequest, request: Request):
+    """登记本机已算好的结果。
+
+    与 ``result`` 端点不同，登记是**轮内**动作：必须存在**活跃且归属一致**的
+    会话。只凭可猜的 ``taskId`` 不能替别人登记值。
+    """
+    _bridge_local_guard(request)
+    session = task_tool_bridge.session(payload.taskId)
+    if (
+        session is None
+        or session.cancel_reason is not None
+        or not session.binding.matches(
+            host_id=payload.hostId,
+            workbook_name=payload.workbookName,
+            workbook_identity=payload.workbookIdentity,
+        )
+    ):
+        raise HTTPException(
+            403,
+            detail={
+                "code": "BRIDGE_NOT_OWNED",
+                "message": "本次任务没有活跃且归属一致的会话，不能登记本地结果。",
+                "retryable": False,
+            },
+        )
+    try:
+        handle = register_bridge_result(
+            payload.taskId, payload.result, payload.sourceFingerprint
+        )
+    except BridgeError as error:
+        raise HTTPException(
+            409,
+            detail={
+                "code": "BRIDGE_NOT_OWNED",
+                "message": "本次任务没有生效的授权，不能登记本地结果。",
+                "retryable": False,
+            },
+        ) from error
+    except ValueError as error:
+        raise HTTPException(
+            422,
+            detail={
+                "code": "BRIDGE_RESULT_INVALID",
+                "message": "本地结果未通过校验，请检查结果大小与取值类型。",
+                "retryable": False,
+            },
+        ) from error
+    item = local_results.resolve(payload.taskId, handle)
+    assert item is not None
+    return BridgeRegisterResponse(
+        resultRef=item.handle,
+        structure={
+            "headers": list(item.headers),
+            "rowCount": item.row_count,
+            "columnCount": item.column_count,
+            "complete": bool(item.complete),
+        },
+    )
+
+
+@app.post("/api/sdk/tool-bridge/result", response_model=BridgeResultResponse)
+async def sdk_tool_bridge_result(payload: BridgeResultRequest, request: Request):
+    """按引用取回结果值（本地结果卡的渲染路径）。
+
+    **跨轮读取**：此时会话可能已经关闭，因此校验的是**授权归属**（claim）
+    而不是活跃会话；授权变化 / 换簿 / 同名不同工作簿一律拒绝。
+    """
+    _bridge_local_guard(request)
+    item = local_results.resolve_owned(
+        payload.taskId,
+        payload.resultRef,
+        host_id=payload.hostId,
+        workbook_name=payload.workbookName,
+        workbook_identity=payload.workbookIdentity,
+    )
+    if item is None:
+        raise HTTPException(
+            404,
+            detail={
+                "code": "BRIDGE_RESULT_UNAVAILABLE",
+                "message": "本地结果不存在或已过期，请重新查询。",
+                "retryable": False,
+            },
+        )
+    response = JSONResponse(
+        content=BridgeResultResponse(
+            resultRef=item.handle,
+            title=item.title,
+            headers=list(item.headers),
+            rows=[list(row) for row in item.rows],
+            sourceSheets=list(item.source_sheets),
+            warnings=list(item.warnings),
+            complete=bool(item.complete),
+            calculation=item.calculation,
+            scannedRows=item.scanned_rows,
+        ).model_dump(mode="json")
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.middleware("http")
@@ -674,6 +875,8 @@ async def turn(request: TurnRequest) -> TurnResponse:
             turn_registry.record_decision(turn_id, response)
         else:
             state = turn_registry.touch(turn_id)
+            if state.planning_goal is not None:
+                request = request.model_copy(update={"planningGoal": state.planning_goal})
             async with state.completion_lock:
                 cached = turn_registry.cached_completion(turn_id, request)
                 if cached is not None:
@@ -814,6 +1017,13 @@ def _folder_state_from_record(record: FolderOperationRecord) -> _FolderOperation
 
 def _task_state_error(error: Exception) -> HTTPException:
     logger.exception("持久任务记录不可用")
+    code = getattr(error, "sqlite_errorcode", 0)
+    if isinstance(error, sqlite3.DatabaseError) and isinstance(code, int) and (code & 255) in (
+        sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_NOTADB
+    ):
+        return service_error(503, "TASK_STATE_CORRUPT",
+            "本地任务数据库损坏，无法登记或读取规划任务。请先备份并修复任务数据库，再核对任务状态。",
+            retryable=False)
     return service_error(
         503,
         "TASK_STATE_UNAVAILABLE",
@@ -1172,13 +1382,41 @@ _OFFICE_RECOVERABLE_ACTION_TYPES = {
     "setFill",
     "setFont",
     "setNumberFormat",
+    # 只改格式的三个动作：端上 `recoverableActionRange` 与 `captureRangeFormat`
+    # 都已覆盖，`classifyOfficeActionState` 也补齐了它们的判定。之前漏在这里，
+    # 表现是"能执行、能撤销，但重启后拒绝登记断点"。
+    # `autofit` 仍不在名单：结果由宿主按内容计算，没有确定性期望值可比对。
+    "setBorders",
+    "setAlignment",
+    "resizeRange",
 }
 
-# WPS 当前只开放这三类，且 clearRange 只认 contents；R1C1 与结构动作一律拒绝。
+# WPS 开放的写入动作（写值与公式 + 三个格式动作）。
+#
+# 与 `config/capabilities.json` 的 `wpsWrite.allowedActions` **必须同改** ——
+# 端上还有一道 `assertAllowedAction`，两边不一致时服务端放行的计划会在客户端被拒；
+# 反过来，服务端放宽到端上没接通的动作（曾经把 setFill / setNumberFormat /
+# setBorders / autofit 也列在这里）会让"能登记"读起来像"能执行"。漂移由
+# `server/tests/test_wps_execution_api.py::test_wps_action_whitelist_matches_capabilities` 钉住。
 _WPS_RECOVERABLE_ACTION_TYPES = {
     "writeValues",
     "writeFormulas",
     "clearRange",
+    "setFont",
+    "setAlignment",
+    "resizeRange",
+}
+
+# 每个格式动作**可以声明**的属性名。
+#
+# 与 `apps/wps-addin/src/wpsFormatCapability.ts` 的已验证属性白名单同口径：
+# `underline`（哨兵误用布尔）/ `vertical`（哨兵与原值同值）/ `columnWidth`（量化漂移）
+# 都未通过实机验证，因此**不在**这里 —— 模型若带了它们，执行器在预览阶段就拒绝整份
+# 计划；这份表是服务端一侧的第二道闸，防止有人绕过端上投影直接登记。
+_WPS_FORMAT_ACTION_PROPERTIES: dict[str, frozenset[str]] = {
+    "setFont": frozenset({"bold", "italic", "name", "size", "color"}),
+    "setAlignment": frozenset({"horizontalAlignment", "wrapText"}),
+    "resizeRange": frozenset({"rowHeight"}),
 }
 
 
@@ -1192,7 +1430,25 @@ def _office_request_fingerprint(request: OfficeExecutionRegisterRequest) -> str:
 
 def _validate_office_recovery_plan(request: OfficeExecutionRegisterRequest) -> None:
     authorized = {name.casefold() for name in request.authorizedSheetNames}
-    source_sheets = {name.casefold() for name in request.plan.sourceFingerprintSheets}
+    # 读写重叠看的是**实际来源依赖**（端上的确定性读取/工具执行记录），不是指纹
+    # 覆盖范围：指纹范围取的是本次授权范围，含写入目标，拿它判重叠会把所有正常
+    # 计划都拒掉。没有"本机读过谁"的可信记账时退回指纹范围 —— 也就是既有的保守
+    # 拒绝条件：依赖不确定时宁可说"不支持断点恢复"，不猜。
+    dependency = request.plan.sourceDependencySheets
+    source_sheets = {
+        name.casefold()
+        for name in (dependency if dependency else request.plan.sourceFingerprintSheets)
+    }
+    # 可信记账不许越过本次授权：端上读表时本来只能读授权范围，越界说明记账与授权
+    # 对不上（或有人伪造），而伪造的依赖可以把真实重叠藏起来。宁可拒绝登记。
+    for dependency_sheet in dependency:
+        if dependency_sheet.casefold() not in authorized:
+            raise service_error(
+                403,
+                "OFFICE_RECOVERY_SCOPE_MISMATCH",
+                f"计划声明的实际来源依赖「{dependency_sheet}」不在本次授权范围内。",
+                retryable=False,
+            )
     for index, action in enumerate(request.plan.actions):
         if action.type not in _OFFICE_RECOVERABLE_ACTION_TYPES:
             raise service_error(
@@ -1293,6 +1549,74 @@ def _validate_wps_recovery_descriptor(request: WpsExecutionRegisterRequest) -> N
                 "R1C1 铺满公式暂不支持 WPS 跨重启效果核对。",
                 retryable=False,
             )
+        _validate_wps_format_evidence(index, action)
+
+
+def _validate_wps_format_evidence(
+    index: int, action: WpsRecoveryActionDescriptor
+) -> None:
+    """格式动作的**属性级**校验（第三道闸；前两道在端上的投影与 `contracts.ts`）。
+
+    值动作与格式动作的证据是**两个不可互换的命名空间**：
+
+    * 值动作的指纹是值矩阵指纹（`matrixFingerprintV2` 的 `v2:`，或以长度开头的
+      版本 1 旧指纹）—— 它只反映单元格内容。
+    * 格式动作的指纹是**格式证据指纹**（`f1:`）—— 只由声明的属性与目标值加区域形状
+      算出，不含单元格内容。
+
+    为什么必须分开：格式动作**不改值**，值矩阵指纹在写前与写后完全一样，拿它登记
+    等于"没有任何判据能区分写没写成"。`f1:` 前缀就是这条判据的可判定形式，服务端
+    在这里把它钉住，而不是只信任端上的投影。
+
+    `formatFields` 同时被逐名字核对：`setFont` 不得声明 `rowHeight`，任何动作都不得
+    声明未通过实机验证的 `underline` / `vertical` / `columnWidth`（它们不在
+    `_WPS_FORMAT_ACTION_PROPERTIES` 里，这里因此直接拒绝，而不是"忽略后照常登记"）。
+    """
+    declared = list(action.formatFields)
+    allowed = _WPS_FORMAT_ACTION_PROPERTIES.get(action.type)
+    if allowed is None:
+        if declared:
+            raise service_error(
+                422,
+                "WPS_RECOVERY_INVALID",
+                f"第 {index + 1} 步 {action.type} 是值动作，不得声明格式属性。",
+                retryable=False,
+            )
+        if action.previewFingerprint.startswith("f1:") or (
+            action.expectedFingerprint or ""
+        ).startswith("f1:"):
+            raise service_error(
+                422,
+                "WPS_RECOVERY_INVALID",
+                f"第 {index + 1} 步 {action.type} 是值动作，证据必须是值指纹。",
+                retryable=False,
+            )
+        return
+    if not declared:
+        raise service_error(
+            422,
+            "WPS_RECOVERY_INVALID",
+            f"第 {index + 1} 步 {action.type} 必须声明本次要改的格式属性。",
+            retryable=False,
+        )
+    unsupported = [name for name in declared if name not in allowed]
+    if unsupported:
+        raise service_error(
+            422,
+            "WPS_RECOVERY_UNSUPPORTED_ACTION",
+            "第 {} 步 {} 不支持属性「{}」。".format(
+                index + 1, action.type, "、".join(unsupported)
+            ),
+            retryable=False,
+        )
+    target = action.expectedFingerprint or ""
+    if not action.previewFingerprint.startswith("f1:") or not target.startswith("f1:"):
+        raise service_error(
+            422,
+            "WPS_RECOVERY_INVALID",
+            f"第 {index + 1} 步 {action.type} 的写前与写后证据必须是格式状态指纹。",
+            retryable=False,
+        )
 
 
 def _wps_state_payload(
@@ -1366,6 +1690,33 @@ def _wps_evidence(operation_id: str, action_index: int, evidence: Any, *, after:
     return payload
 
 
+def _planning_pause_reason(
+    record: PlanningTaskRecord,
+    *,
+    interrupted: bool,
+    model_error: bool,
+    budget_exhausted: bool,
+) -> str:
+    """按**真实暂停原因**给用户如实文案，不用一句`进度已安全保存`包打天下。
+
+    2026-10-10 改造：提醒与预算分离后，暂停只剩三种真实原因（外加一种保存口径），
+    它们的恢复能力互不相同，文案必须各自说清，尤其**不能**让"总预算耗尽"读起来
+    像是"必然可以继续"。
+    """
+    if record.pause_reason:
+        return record.pause_reason
+    if model_error:
+        return "模型连接中断，已保存当前进度。可切换模型后继续。"
+    if interrupted:
+        return "服务重启后已找回已保存的规划现场。"
+    if budget_exhausted:
+        return (
+            "本轮有效运行总时长已用完，不再启动新的模型或工具调用。"
+            "已完成的步骤与现场已保存，但恢复能力受当前引用是否仍然有效限制。"
+        )
+    return "本轮处理已暂停，当前进度已保存。"
+
+
 def _planning_pause_payload(
     record: PlanningTaskRecord,
     *,
@@ -1380,7 +1731,16 @@ def _planning_pause_payload(
         and str(record.error.get("code", "")).startswith("MODEL_")
         and bool(record.error.get("retryable", False))
     )
-    requires_extension = record.status == "waiting_user" and not model_error
+    # 总预算耗尽的判别点：累计活跃执行时间已达总时限，且暂停不是模型错误或
+    # 服务重启中断造成的。这一种不给"按一下继续就能接着跑"的假承诺。
+    budget_exhausted = (
+        not model_error
+        and not interrupted
+        and record.active_elapsed_seconds >= hard_seconds
+    )
+    requires_extension = (
+        record.status == "waiting_user" and not model_error and not budget_exhausted
+    )
     settings = model_settings_view()
     raw_connections = settings.get("connections", [])
     requires_vision = bool(record.request.get("images"))
@@ -1397,23 +1757,27 @@ def _planning_pause_payload(
         and str(connection.get("catalogModelId", "")) != record.current_model_id
         and (not requires_vision or connection.get("supportsVision") is True)
     ]
+    # 可继续 = 有可续跑的检查点现场 + 未达累计活跃执行总时限。
+    #
+    # 2026-10-10 改造：不再要求"批准预算 < 总时限"。初批预算现在**就是**总时限，
+    # 因此"继续"的作用是**接续现场**（从检查点接着跑剩余步骤），而不是把预算从
+    # 60 秒一点点加满。旧条件（``approved < hard``）会让所有暂停任务的继续按钮
+    # 永远消失 —— 那正是要修的毛病。扩展次数上限只在真正需要追加预算时才有意义，
+    # 这里不再拿它当"能不能继续"的判据。
     can_continue = (
         record.checkpoint is not None
         and within_hard_limit
-        and (
-            record.status == "running"
-            or (
-                record.status == "waiting_user"
-                and (
-                    model_error
-                    or (
-                        record.extension_count < maximum_extensions
-                        and record.approved_wall_time_seconds < hard_seconds
-                    )
-                )
-            )
-        )
+        and not budget_exhausted
+        and record.status in {"running", "waiting_user"}
     )
+    if model_error:
+        pause_type = "model_error"
+    elif interrupted:
+        pause_type = "interrupted"
+    elif budget_exhausted:
+        pause_type = "budget_exhausted"
+    else:
+        pause_type = "budget"
     workbook = record.request.get("workbook")
     workbook_snapshot = workbook if isinstance(workbook, dict) else {}
     return {
@@ -1422,11 +1786,11 @@ def _planning_pause_payload(
         "status": "interrupted" if interrupted else "waiting_user",
         "revision": record.revision,
         "lastSequence": record.last_sequence,
-        "reason": record.pause_reason
-        or (
-            "服务重启后已找回已保存的规划现场。"
-            if interrupted
-            else "本轮处理时间已用完，当前进度已安全保存。"
+        "reason": _planning_pause_reason(
+            record,
+            interrupted=interrupted,
+            model_error=model_error,
+            budget_exhausted=budget_exhausted,
         ),
         "activeElapsedSeconds": record.active_elapsed_seconds,
         "approvedWallTimeSeconds": record.approved_wall_time_seconds,
@@ -1438,7 +1802,7 @@ def _planning_pause_payload(
         "maximumExtensions": maximum_extensions,
         "canContinue": can_continue,
         "requiresExtension": requires_extension,
-        "pauseType": "model_error" if model_error else ("interrupted" if interrupted else "budget"),
+        "pauseType": pause_type,
         "currentModelId": record.current_model_id,
         "modelSwitchCount": len(record.model_switches),
         "canSwitchModel": (model_error or interrupted)
@@ -1508,6 +1872,8 @@ async def _planning_task_stream(
                     "facts": event.get("facts"),
                     "target": event.get("target"),
                     "trace": event.get("trace"),
+                    "bridgeTool": event.get("bridgeTool"),
+                    "pythonResult": event.get("pythonResult"),
                     "timestamp": datetime.now().astimezone().isoformat(),
                 }
                 validated = TaskProgressEvent.model_validate(payload)
@@ -1540,6 +1906,9 @@ async def _planning_task_stream(
                     on_checkpoint=on_checkpoint,
                     resume_checkpoint=current_record.checkpoint,
                     approved_wall_time_seconds=current_record.approved_wall_time_seconds,
+                    reminder_seconds=capability_float(
+                        "taskRecovery", "planningReminderSeconds"
+                    ),
                 )
             )
             while True:
@@ -1575,12 +1944,15 @@ async def _planning_task_stream(
             current_record = _folder_operation_ledger.finish_planning_task(
                 turn_id,
                 status="failed" if isinstance(result, AnswerResponse) and result.outcome == "failed" else "completed",
-                result=result.model_dump(mode="json"),
+                # 账本持久化的是**版本化恢复描述**：明确写出值被省略、要取值走哪个
+                # 结果引用。它**不是**一个可回放的 AssistantResponse。
+                result=ledger_recovery_descriptor(result),
                 error=({"status": 422, "code": "PLANNING_STOPPED", "message": result.message, "retryable": False}
                        if isinstance(result, AnswerResponse) and result.outcome == "failed" else None),
             )
             turn_registry.record_completion(turn_id, request, response)
-            yield _sse_frame("result", current_record.result or result.model_dump(mode="json"))
+            # 完整响应（含值）只经本机回环 SSE 交给本地客户端；账本副本是投影版。
+            yield _sse_frame("result", result.model_dump(mode="json"))
         except (
             LLMTimeoutError,
             LLMConnectError,
@@ -1682,13 +2054,21 @@ async def turn_stream(request: TurnRequest) -> StreamingResponse:
         )
     turn_id = request.turnId or f"turn-{uuid.uuid4().hex}"
     normalized_request = request.model_copy(update={"turnId": turn_id})
+    intent_goal = turn_registry.touch(turn_id).planning_goal
+    if intent_goal is not None:
+        normalized_request = normalized_request.model_copy(update={"planningGoal": intent_goal})
     try:
         record, created = _folder_operation_ledger.register_planning_task(
             turn_id,
             _planning_request_fingerprint(normalized_request),
             normalized_request.model_dump(mode="json", exclude_none=True),
+            # 2026-10-10 改造：初始批准预算 = 任务总活跃执行时限
+            # （``planningHardWallTimeSeconds``），不再是 60 秒的提醒阈值。
+            # 提醒（``planningReminderSeconds``）是**非阻塞**进度提示，在
+            # ``run_excel_agent`` 里以 ``reminder_seconds`` 独立传入，不参与
+            # 暂停判定，因此不会打断真实多步任务。
             approved_wall_time_seconds=capability_float(
-                "taskRecovery", "planningReminderSeconds"
+                "taskRecovery", "planningHardWallTimeSeconds"
             ),
         )
     except Exception as error:
@@ -1743,7 +2123,10 @@ async def turn_stream(request: TurnRequest) -> StreamingResponse:
 
 @app.get("/api/turn/{turn_id}/status")
 async def planning_task_status(turn_id: str) -> dict[str, Any]:
-    record = _folder_operation_ledger.planning_task(turn_id)
+    try:
+        record = _folder_operation_ledger.planning_task(turn_id)
+    except Exception as error:
+        raise _task_state_error(error) from error
     if record is None:
         raise service_error(
             404, "PLANNING_TASK_NOT_FOUND", "未找到该规划任务。", retryable=False
@@ -1751,14 +2134,22 @@ async def planning_task_status(turn_id: str) -> dict[str, Any]:
     async with _active_planning_tasks_lock:
         active = turn_id in _active_planning_tasks
     if record.status == "completed":
-        return {
+        recovery = record.result if isinstance(record.result, dict) else None
+        base = {
             "turnId": turn_id,
             "status": "completed",
             "revision": record.revision,
             "lastSequence": record.last_sequence,
-            "result": record.result,
             "canContinue": False,
         }
+        if recovery is None:
+            return {**base, "recovery": None}
+        if recovery.get("valuesOmitted") is True:
+            # 值被省略过：**只**给恢复描述，绝不给一个矩阵全空的假响应。
+            return {**base, "recovery": recovery}
+        # 没有值被省略 → 这条记录就是完整响应，按 `result` 回放（普通后端的
+        # 完成结果取回走的正是这一支）。
+        return {**base, "result": recovery.get("response")}
     if record.status in {"running", "waiting_user"}:
         interrupted = record.status == "running" and not active
         return {
@@ -1788,7 +2179,10 @@ async def planning_task_continue_stream(
                 "该规划任务仍在处理中，不能重复继续。",
                 retryable=True,
             )
-    existing = _folder_operation_ledger.planning_task(request.turnId)
+    try:
+        existing = _folder_operation_ledger.planning_task(request.turnId)
+    except Exception as error:
+        raise _task_state_error(error) from error
     if existing is None or existing.checkpoint is None:
         raise service_error(
             409,
@@ -2551,6 +2945,14 @@ async def restore_managed_folder_recovery(
     return response
 
 
+@app.post("/api/folders/admission", response_model=FolderAdmissionResponse)
+async def folder_admission(request: FolderAdmissionRequest) -> FolderAdmissionResponse:
+    try:
+        return await run_in_threadpool(check_folder_admission, request)
+    except ValueError as error:
+        raise service_error(422, "FOLDER_SESSION_LOST", "文件夹会话已失效，请重新选择文件夹", retryable=True) from error
+
+
 @app.post("/api/folders/snapshot", response_model=WorkbookSnapshot)
 async def folder_snapshot(request: FolderSnapshotRequest) -> WorkbookSnapshot:
     try:
@@ -3219,6 +3621,20 @@ async def plan_chat_modify(request: PlanChatRequest) -> PlanChatResponse:
         raise service_error(
             422, "INVALID_PLAN_MODIFICATION", str(error), retryable=False
         ) from error
+
+
+@app.post(
+    "/api/intent/message",
+    response_model=MessageUnderstandingResponse,
+    response_model_exclude_none=True,
+)
+async def understand_message(request: MessageUnderstandingRequest) -> MessageUnderstandingResponse:
+    try:
+        return await check_message_understanding(request, config=selected_model_config(request.modelId))
+    except (ModelNotConfiguredError, ModelNotAvailableError, LLMTimeoutError, LLMConnectError,
+            LLMHTTPStatusError, LLMTransportError, LLMResponseError) as error:
+        status, code, message, retryable = _map_turn_error(error)
+        raise service_error(status, code, message, retryable=retryable) from error
 
 
 @app.post(

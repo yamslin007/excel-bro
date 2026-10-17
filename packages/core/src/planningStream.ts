@@ -47,8 +47,18 @@ export type PlanningTaskStatus =
   | "failed"
   | "cancelled";
 
-/** 暂停成因，来自服务端 `pauseType`。 */
-export type PlanningPauseType = "budget" | "model_error" | "interrupted";
+/**
+ * 暂停成因，来自服务端 `pauseType`。
+ *
+ * `budget_exhausted`（2026-10-10 新增）：累计活跃执行时间已达总时限，不再启动
+ * 新的模型或工具调用；它与 `budget`（本轮预算暂停、可再续）的恢复能力不同，
+ * **不能**合并成一个值 —— 否则界面会把"总时长用完了"说成"按一下就能继续"。
+ */
+export type PlanningPauseType =
+  | "budget"
+  | "budget_exhausted"
+  | "model_error"
+  | "interrupted";
 
 /** 服务端 `error.code` 里表示"模型连接类故障、可换模型接续"的前缀。 */
 export const MODEL_ERROR_CODE_PREFIX = "MODEL_";

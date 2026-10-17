@@ -49,6 +49,7 @@ vi.mock("../../excel-addin/src/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../excel-addin/src/api")>();
   return {
     ...actual,
+    understandMessage: vi.fn(async () => ({ kind: "needs_workbook_context", summary: "需要字段结构", provider: "model" })),
     listModels: vi.fn(),
     getModelSettings: vi.fn()
   };
@@ -336,6 +337,7 @@ describe("CAP-02 规划暂停卡", () => {
       "action",
       "actionLabel",
       "canContinue",
+      "clientLastSequence",
       "detail",
       "pauseType",
       "reason",

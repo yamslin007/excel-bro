@@ -7,11 +7,51 @@ export type WpsRange = {
   Address?: string | ((...args: unknown[]) => unknown);
   Text?: unknown;
   Value2?: unknown;
+  /** 数字格式。读取归一与写入时的临时文本保真使用；写后恢复原格式。 */
+  NumberFormat?: unknown;
   Formula?: unknown;
   MergeCells?: unknown;
-  Interior?: { Color?: number };
+  Interior?: { Color?: number; Pattern?: unknown; PatternColor?: unknown };
+  /**
+   * 字体对象。官方文档（open.wps.cn Range）确认 `Range.Font` 存在，成员含
+   * `Bold`/`Italic`/`Name`/`Size`/`Color`/`Underline`。**全部标可选**：这是类型
+   * 补齐，不等于已实机验证这些成员在目标 WPS 版本可用 —— 用前仍需受控探测。
+   */
+  Font?: {
+    Bold?: unknown;
+    Italic?: unknown;
+    Name?: unknown;
+    Size?: unknown;
+    Color?: unknown;
+    Underline?: unknown;
+  };
+  /**
+   * 边框集合。官方文档确认 `Range.Borders.Item(xlEdgeBottom)` 返回单边，成员含
+   * `LineStyle`/`Weight`/`ColorIndex`。标可选：未实机验证。
+   */
+  Borders?: {
+    Count?: number;
+    Item?(index: unknown): {
+      LineStyle?: unknown;
+      Weight?: unknown;
+      Color?: unknown;
+      ColorIndex?: unknown;
+    };
+  };
+  /** 水平对齐。官方文档：xlCenter/xlLeft/xlRight/xlJustify/xlDistributed。 */
+  HorizontalAlignment?: unknown;
+  /** 垂直对齐。官方文档：xlVAlign 常量。 */
+  VerticalAlignment?: unknown;
+  WrapText?: unknown;
+  IndentLevel?: unknown;
+  ShrinkToFit?: unknown;
   Row?: number;
   Column?: number;
+  RowHeight?: unknown;
+  ColumnWidth?: unknown;
+  /** 整行 / 整列。`AutoFit` 常通过 `EntireColumn.AutoFit()` / `EntireRow.AutoFit()` 调用。 */
+  EntireRow?: WpsRange & { AutoFit?(): void };
+  EntireColumn?: WpsRange & { AutoFit?(): void };
   Rows?: { Count: number };
   Columns?: { Count: number };
   Item?(rowIndex: number, columnIndex?: number): WpsRange;
@@ -187,7 +227,7 @@ function readRangeAddress(range: WpsRange | undefined): string | null {
   return address == null || address === "" ? null : String(address);
 }
 
-export function readWpsHostProbe(application: WpsApplication): WpsHostProbe {
+export function readWpsHostProbe(application: WpsApplication, options: { includeSelectionPreview?: boolean } = {}): WpsHostProbe {
   const workbook = application.ActiveWorkbook;
   if (!workbook) {
     throw new WpsHostUnavailableError("WPS 表格中当前没有打开的工作簿。");
@@ -200,7 +240,7 @@ export function readWpsHostProbe(application: WpsApplication): WpsHostProbe {
   }
 
   const activeSheet = application.ActiveSheet ?? workbook.ActiveSheet;
-  const selection = application.Selection;
+  const selection = options.includeSelectionPreview === false ? undefined : application.Selection;
   const selectionText = selection?.Text ?? selection?.Value2;
 
   return {

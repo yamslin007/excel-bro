@@ -1,0 +1,124 @@
+/* Shared result presentation: quiet success, explicit warnings, recovery belongs to this run. */
+.verification-card.execution-result-card {
+  --result-accent: var(--color-brand-text, #2f6b47);
+  gap: 10px;
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  padding: 14px;
+  border: 1px solid var(--color-border);
+  border-left: 3px solid var(--result-accent);
+  border-radius: var(--radius-md);
+  background: var(--color-background);
+  color: var(--color-text-primary);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.execution-result-card.failed {
+  --result-accent: var(--color-danger-text, #a33f34);
+}
+.execution-result-card:is(.unverified, .executed_unverified, .partial) {
+  --result-accent: var(--color-warning-text, #9a6328);
+}
+.execution-result-card.undone {
+  --result-accent: var(--color-text-secondary);
+}
+.execution-result-heading {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  color: var(--result-accent);
+}
+/* 标题可能是长句（如「已执行，部分操作未独立验证」）：允许在窄窗格内换行，
+   不能靠 flex 的 `min-width:auto` 把卡片撑宽。 */
+.execution-result-heading > strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.execution-result-icon { flex: 0 0 auto; font-weight: 800; }
+.execution-result-summary,
+.execution-result-card small { color: var(--color-text-secondary); }
+/* 异常信息 / 未验证动作列表：窄窗格下浏览器默认的 40px 缩进会吃掉大量宽度，
+   这里收紧并允许长句断行。 */
+.execution-result-card ul {
+  margin: 0;
+  padding-left: 18px;
+  list-style-position: outside;
+}
+.execution-result-card li {
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+.execution-result-card .change-review-summary {
+  margin: 0;
+  border: 0;
+  border-top: 1px solid var(--color-border);
+  border-radius: 0;
+  padding: 10px 0 0;
+  background: transparent;
+  box-shadow: none;
+}
+.execution-result-details > summary {
+  cursor: pointer;
+  color: var(--color-brand-text);
+  font-weight: 600;
+}
+.execution-result-details[open] > summary { margin-bottom: 8px; }
+.execution-result-card .execution-recovery-footer {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 0;
+  padding: 12px 0 0;
+  border: 0;
+  border-top: 1px dashed var(--color-border);
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  backdrop-filter: none;
+}
+.execution-recovery-footer > span {
+  flex: 1 1 160px;
+  min-width: 0;
+  order: -1;
+  font-size: var(--font-size-caption);
+}
+.execution-result-card .execution-recovery-footer .undo-row-hint {
+  color: var(--color-text-secondary);
+  font-weight: 400;
+}
+.execution-recovery-footer button {
+  min-height: 34px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: 6px 12px;
+  background: var(--color-background);
+  color: var(--color-brand-text);
+  font-weight: 700;
+  /* 长按钮文案（如「↶ 撤销本次执行（含之后 2 次）」）允许换行，不横向溢出。 */
+  white-space: normal;
+  overflow-wrap: anywhere;
+  min-width: 0;
+  max-width: 100%;
+}
+.execution-recovery-footer button:disabled { opacity: 0.55; }
+.execution-recovery-footer:is(.conflict, .unavailable) > span {
+  color: var(--color-warning-text, #9a6328);
+}
+/* 窄窗格（300px / 430px）：整块改为纵向堆叠，说明文字与按钮各占一行，
+   长句与长按钮都不横向溢出。 */
+@media (max-width: 430px) {
+  .execution-result-card .execution-recovery-footer {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .execution-recovery-footer > span {
+    flex: none;
+    overflow-wrap: anywhere;
+  }
+  .execution-recovery-footer button {
+    width: 100%;
+  }
+}

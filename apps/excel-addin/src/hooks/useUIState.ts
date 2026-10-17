@@ -57,8 +57,8 @@ function storePreferredTaskPaneWidth(width: number | null): void {
  * - 管理菜单状态（模型菜单、更多菜单、规则管理器）
  * - 管理 UI 辅助状态（宠物可见性、窗格宽度、引导步骤、输入框高度）
  */
-export function useUIState(comparisonActive = false, reviewScope?: ReviewPaneScope) {
-  const ratioNeedsResize = useReviewPaneRatio(reviewScope);
+export function useUIState(comparisonActive = false, reviewScope?: ReviewPaneScope, reviewRearm = 0) {
+  const ratioNeedsResize = useReviewPaneRatio(reviewScope, reviewRearm);
   const hasReviewScope = Boolean(reviewScope);
   const [initialPreferredTaskPaneWidth] = useState(
     readPreferredTaskPaneWidth

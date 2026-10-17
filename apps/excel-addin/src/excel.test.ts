@@ -113,6 +113,48 @@ describe("Office action checkpoint recovery", () => {
     ).toBe(false);
   });
 
+  it("judges read/write overlap by the attested source dependency, not the fingerprint scope", () => {
+    /*
+     * 三者口径必须分开：指纹覆盖范围（端上取本次授权范围，含写入目标）／实际来源
+     * 依赖（本机可信记账）／写入目标（actions[].sheet）。
+     * 拿指纹范围判重叠 = 每个正常计划都"会修改来源表" → 登记断点恢复永不可达。
+     */
+    const plan: AnalysisPlan = {
+      id: "plan-dependency-1",
+      title: "汇总到结果表",
+      summary: "从数据表汇总写到结果表",
+      assumptions: [],
+      warnings: [],
+      actions: [
+        { type: "writeValues", sheet: "结果", range: "A1", values: [["ok"]] }
+      ],
+      sourceFingerprintSheets: ["数据", "结果"]
+    };
+
+    // 依赖不确定：退回指纹范围 → 既有的保守拒绝条件原样保留。
+    const uncertain = officeRecoverySupport(plan);
+    expect(uncertain.supported).toBe(false);
+    expect(uncertain.reason).toContain("无法确定来源与目标是否重叠");
+
+    // 可信记账说"只读了数据表"：来源与目标明确不重叠 → 可以登记。
+    expect(
+      officeRecoverySupport({ ...plan, sourceDependencySheets: ["数据"] }).supported
+    ).toBe(true);
+
+    // 记账里确实含写入目标 → 真重叠，照旧拒绝（不因为能摘掉就摘掉）。
+    const overlapping = officeRecoverySupport({
+      ...plan,
+      sourceDependencySheets: ["数据", "结果"]
+    });
+    expect(overlapping.supported).toBe(false);
+    expect(overlapping.reason).toContain("会修改来源工作表");
+
+    // 空数组不等于"依赖为空"，仍然按不确定处理。
+    expect(
+      officeRecoverySupport({ ...plan, sourceDependencySheets: [] }).supported
+    ).toBe(false);
+  });
+
   it("builds a cumulative, workbook-bound undo checkpoint", () => {
     const plan: AnalysisPlan = {
       id: "plan-1",

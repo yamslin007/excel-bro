@@ -24,6 +24,31 @@ interface PresetPalette {
   brandBg: string;
   brandText: string;
   brandHover: string;
+  /**
+   * 「有新进度」浮标的**前景色**（两个字形共用一个值：运行中的三颗圆点、
+   * 跑完之后的锚图标）。
+   *
+   * 为什么要单独一个令牌，而不是在 CSS 里用 `color-mix()` 从 `brandText` 现算：
+   *
+   * 1. **宿主引擎的 `color-mix()` 支持不可假设**。Excel 侧是 WebView2（新版
+   *    Chromium，支持），WPS 侧是 QtWebEngine，版本随安装包走。一旦不支持，
+   *    那条声明被整条丢弃；而**降级行救不了**——`background: var(--x)` 与
+   *    `background: color-mix(...)` 是同一个属性，后者在前者之后、赢在层叠，
+   *    只是"算出无效"而非"语法无效"，于是 `background` 落到初始值
+   *    `transparent`，图形直接**看不见**（不是"浅一点的主题色"）。
+   *    写成令牌就没有任何运行时色彩函数参与，任何引擎都拿得到确定值。
+   * 2. 值可以**被守卫断言**。`styles.test.ts` 能直接读它、算对比度、并校验它
+   *    确实是本主题 `brandText` 的同色相压深，而不是"某个近白色"。
+   *
+   * 取值 = 本主题 `brandText` 向黑混 20%（只降明度、不动色相）。20% 是**必要
+   * 且充分**的下限：压在环形渐变最暗端（`brandHover`）上，warm-orange 需要它
+   * 才能从 2.58 抬到 3.53，vivid-green 从 2.93 抬到 4.00，双双过非文本 UI 的
+   * **3:1**（WCAG 1.4.11）。压深 10% 在静态下够、悬停端点只有 2.89，不够。
+   *
+   * 字段名与令牌一样刻意**不跟着字形走**（旧名 `progressDot`）：浮标现在有两个
+   * 字形，名字跟着字形改就会在下一次换字形时变成谎话。
+   */
+  progressGlyph: string;
   border: string;
   borderStrong: string;
   shadowSm: string;
@@ -43,6 +68,7 @@ const PRESETS: Record<ThemePreset, PresetPalette> = {
     brandBg: "#edf3ec",
     brandText: "#2f6b47",
     brandHover: "#e3ebe2",
+    progressGlyph: "#265639",
     border: "#e9e9e7",
     borderStrong: "#d3d2cf",
     shadowSm: "0 1px 2px rgba(0, 0, 0, 0.04)",
@@ -60,6 +86,7 @@ const PRESETS: Record<ThemePreset, PresetPalette> = {
     brandBg: "#ffe4c4",
     brandText: "#d97739",
     brandHover: "#ffd9b0",
+    progressGlyph: "#ae5f2e",
     border: "#f5d9b8",
     borderStrong: "#e8c89f",
     shadowSm: "0 1px 2px rgba(217, 119, 57, 0.08)",
@@ -77,6 +104,7 @@ const PRESETS: Record<ThemePreset, PresetPalette> = {
     brandBg: "#d4e8ff",
     brandText: "#3b7dd6",
     brandHover: "#c2deff",
+    progressGlyph: "#2f64ab",
     border: "#c7dff7",
     borderStrong: "#aecef0",
     shadowSm: "0 1px 2px rgba(59, 125, 214, 0.08)",
@@ -94,6 +122,7 @@ const PRESETS: Record<ThemePreset, PresetPalette> = {
     brandBg: "#c8f5d9",
     brandText: "#2d9b63",
     brandHover: "#b5f0ca",
+    progressGlyph: "#247c4f",
     border: "#b8e8ca",
     borderStrong: "#9ddab3",
     shadowSm: "0 1px 2px rgba(45, 155, 99, 0.08)",
@@ -127,6 +156,7 @@ export function applyThemePalette(preset: ThemePreset): void {
   style.setProperty("--color-brand-bg", palette.brandBg);
   style.setProperty("--color-brand-text", palette.brandText);
   style.setProperty("--color-brand-hover", palette.brandHover);
+  style.setProperty("--color-progress-glyph", palette.progressGlyph);
   style.setProperty("--color-border", palette.border);
   style.setProperty("--color-border-strong", palette.borderStrong);
   style.setProperty("--shadow-sm", palette.shadowSm);

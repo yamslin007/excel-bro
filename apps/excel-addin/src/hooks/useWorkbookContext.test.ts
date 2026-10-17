@@ -6,18 +6,17 @@ import type {
   WorkbookSnapshot
 } from "../contracts";
 import {
-  captureWorkbookStructure,
+  captureWorkbookCatalog,
   isRunningInExcel,
   watchWorkbookStructureChanges
 } from "../excel";
 import { selectFolder } from "../api";
 import { folderSheetKey } from "../utils";
 import { demoWorkbook } from "../demo";
-import { extractWorkbookDataPeriod } from "../workbookIdentity";
 import { useWorkbookContext } from "./useWorkbookContext";
 
 vi.mock("../excel", () => ({
-  captureWorkbookStructure: vi.fn(),
+  captureWorkbookCatalog: vi.fn(),
   isRunningInExcel: vi.fn(),
   watchWorkbookStructureChanges: vi.fn()
 }));
@@ -51,18 +50,13 @@ vi.mock("../demo", () => ({
   }
 }));
 
-vi.mock("../workbookIdentity", () => ({
-  extractWorkbookDataPeriod: vi.fn(() => "2026")
-}));
-
-const captureWorkbookStructureMock = vi.mocked(captureWorkbookStructure);
+const captureWorkbookCatalogMock = vi.mocked(captureWorkbookCatalog);
 const isRunningInExcelMock = vi.mocked(isRunningInExcel);
 const watchWorkbookStructureChangesMock = vi.mocked(
   watchWorkbookStructureChanges
 );
 const selectFolderMock = vi.mocked(selectFolder);
 const folderSheetKeyMock = vi.mocked(folderSheetKey);
-const extractWorkbookDataPeriodMock = vi.mocked(extractWorkbookDataPeriod);
 
 const workbook: WorkbookSnapshot = {
   name: "book.xlsx",
@@ -113,14 +107,13 @@ describe("useWorkbookContext", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     readyCallback = undefined;
-    captureWorkbookStructureMock.mockResolvedValue(workbook);
+    captureWorkbookCatalogMock.mockResolvedValue(workbook);
     isRunningInExcelMock.mockReturnValue(true);
     watchWorkbookStructureChangesMock.mockResolvedValue(vi.fn());
     selectFolderMock.mockResolvedValue(folderCatalog);
     folderSheetKeyMock.mockImplementation((fileId, sheetName) =>
       `${fileId}\u0000${sheetName}`
     );
-    extractWorkbookDataPeriodMock.mockReturnValue("2026");
     vi.stubGlobal("Office", {
       onReady: vi.fn((callback: () => Promise<void> | void) => {
         readyCallback = callback;
@@ -163,20 +156,11 @@ describe("useWorkbookContext", () => {
 
     await flushOfficeReady();
 
-    expect(captureWorkbookStructureMock).toHaveBeenCalled();
+    expect(captureWorkbookCatalogMock).toHaveBeenCalled();
     expect(result.current.workbook).toEqual(workbook);
     expect(result.current.selectedSheetNames).toEqual(["Sheet1"]);
     expect(result.current.selectionConfirmed).toBe(true);
     expect(watchWorkbookStructureChangesMock).toHaveBeenCalled();
-  });
-
-  it("should derive workbook data period", async () => {
-    const { result } = renderHook(() => useWorkbookContext());
-
-    await flushOfficeReady();
-
-    expect(extractWorkbookDataPeriodMock).toHaveBeenCalledWith("book.xlsx");
-    expect(result.current.workbookDataPeriod).toBe("2026");
   });
 
   it("should toggle workbook sheets and unconfirm selection", async () => {
@@ -254,7 +238,7 @@ describe("useWorkbookContext", () => {
       await Promise.resolve();
     });
 
-    expect(captureWorkbookStructureMock).not.toHaveBeenCalled();
+    expect(captureWorkbookCatalogMock).not.toHaveBeenCalled();
     expect(watchWorkbookStructureChangesMock).not.toHaveBeenCalled();
   });
 });

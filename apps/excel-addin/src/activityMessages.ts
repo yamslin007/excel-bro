@@ -27,21 +27,30 @@ export function persistActivityMessage(
   messages: ChatMessage[],
   log: ActivityLog,
   targetId: string | null,
-  fallbackMessage: ChatMessage
+  fallbackMessage: ChatMessage,
+  localResultBinding?: ChatMessage["localResultBinding"]
 ): ChatMessage[] {
   const resolvedTargetId = targetId ?? fallbackMessage.id;
   const targetIndex = messages.findIndex(
     (message) => message.id === resolvedTargetId
   );
-  if (targetIndex < 0) return [...messages, fallbackMessage];
-  return messages.flatMap((message, index) => {
+  // 多次分析只展示最近一次；没有新结果时保留原卡片。
+  const pythonResultStep = [...log.steps].reverse().find((step) => step.pythonResult);
+  const pythonResult = pythonResultStep?.pythonResult ?? undefined;
+  const patch = {
+    activityPending: false,
+    activityLog: log,
+    ...(pythonResult && localResultBinding ? { localResult: pythonResult, localResultBinding } : {})
+  };
+  if (targetIndex < 0) return [...messages, { ...fallbackMessage, ...patch }];
+
+  return messages.flatMap((message, index): ChatMessage[] => {
     if (message.id !== resolvedTargetId) return [message];
     if (index !== targetIndex) return [];
     return [
       {
         ...message,
-        activityPending: false,
-        activityLog: log
+        ...patch
       }
     ];
   });

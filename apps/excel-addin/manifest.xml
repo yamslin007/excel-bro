@@ -10,8 +10,8 @@
   <DefaultLocale>zh-CN</DefaultLocale>
   <DisplayName DefaultValue="Excel Bro" />
   <Description DefaultValue="本地优先、可预览和沉淀自动化的 Excel AI 助手。" />
-  <IconUrl DefaultValue="https://localhost:3000/assets/excel-bro-icon-32.png" />
-  <HighResolutionIconUrl DefaultValue="https://localhost:3000/assets/excel-bro-icon-80.png" />
+  <IconUrl DefaultValue="https://localhost:3000/assets/excel-bro-icon-32-v2.png" />
+  <HighResolutionIconUrl DefaultValue="https://localhost:3000/assets/excel-bro-icon-80-v2.png" />
   <SupportUrl DefaultValue="https://localhost:3000" />
   <AppDomains>
     <AppDomain>https://localhost:3000</AppDomain>
@@ -86,9 +86,9 @@
     </Hosts>
     <Resources>
       <bt:Images>
-        <bt:Image id="Icon.16" DefaultValue="https://localhost:3000/assets/excel-bro-icon-16.png" />
-        <bt:Image id="Icon.32" DefaultValue="https://localhost:3000/assets/excel-bro-icon-32.png" />
-        <bt:Image id="Icon.80" DefaultValue="https://localhost:3000/assets/excel-bro-icon-80.png" />
+        <bt:Image id="Icon.16" DefaultValue="https://localhost:3000/assets/excel-bro-icon-16-v2.png" />
+        <bt:Image id="Icon.32" DefaultValue="https://localhost:3000/assets/excel-bro-icon-32-v2.png" />
+        <bt:Image id="Icon.80" DefaultValue="https://localhost:3000/assets/excel-bro-icon-80-v2.png" />
       </bt:Images>
       <bt:Urls>
         <bt:Url id="Commands.Url" DefaultValue="https://localhost:3000/commands.html" />
@@ -99,8 +99,8 @@
       </bt:Urls>
       <bt:ShortStrings>
         <bt:String id="Tab.Label" DefaultValue="Excel Bro" />
-        <bt:String id="Group.Label" DefaultValue="AI 助手" />
-        <bt:String id="Button.Label" DefaultValue="打开 AI 对话" />
+        <bt:String id="Group.Label" DefaultValue="Excel Bro" />
+        <bt:String id="Button.Label" DefaultValue="打开 Excel Bro" />
       </bt:ShortStrings>
       <bt:LongStrings>
         <bt:String id="Button.Description" DefaultValue="打开 Excel Bro 对话窗口，分析和处理当前工作簿。" />

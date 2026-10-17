@@ -1,13 +1,19 @@
 import type {
   AnalysisPlan,
   ActionExecutionResult,
+  BorderSide,
+  CellBorderState,
   CellValue,
   DataToolRequest,
+  DirectCellFormatValues,
   ExecutionUndoSnapshot,
   ExcelAction,
   PlanExecutionResult,
+  UndoCellDirectFormat,
+  UndoCellFormat,
   UndoCreatedWorksheetState,
   UndoRangeFormat,
+  UndoRestoreScope,
   UndoWorksheetSnapshot,
   VerificationCheck,
   VerificationCriterion,
@@ -17,12 +23,25 @@ import type {
   WorkbookSnapshot,
   WorksheetSnapshot
 } from "./contracts";
+// 值导入（不是 type）：边框的缺省补齐与格式属性判据必须共用同一份实现，
+// 否则"写入用的 style"和"回读核对用的 style"在模型省略字段时会各算各的。
+import { normalizeBorderAction } from "./contracts";
+import type { ExcelFormatCapability, ExcelFormatField } from "./excelFormatCapability";
+import {
+  EXCEL_DIRECT_FORMAT_REQUIREMENT,
+  EXCEL_DISPLAYED_FORMAT_REQUIREMENT,
+  blockedFormatActionIndexes,
+  excelFormatActionFields,
+  resolveExcelFormatCapability
+} from "./excelFormatCapability";
 import type { WorkbookLocator } from "@excel-bro/core/contracts";
 import type {
   ChangeReviewStatus,
   RangeChangeReview
 } from "@excel-bro/core/changeReview";
 import { buildRangeChangeReview } from "@excel-bro/core/changeReview";
+// EB 系统遗留表的名单与判定在共享层：WPS 端的工作目录勾选也要用同一份名单。
+import { isEBSystemSheet } from "@excel-bro/core/folderScope";
 import {
   locatorFromOfficeIdentity,
   officeIdentityFromUrl
@@ -70,14 +89,10 @@ const CHANGE_REVIEW_LIMIT = {
   maxRows: capabilities.changeReview.maxRows,
   maxTotalCells: capabilities.changeReview.maxTotalCells
 };
-// EB 规则系统早期把规则存进这两张隐藏工作表（见 README「EB 函数」）。
-// 现已改为纯内置规则，代码不再读写它们，但用户的旧文件里可能残留。
-// 用精确名单过滤，避免误伤用户自己以 # 开头命名的正常表。
-const EB_SYSTEM_SHEETS = new Set(["#EB_RULES", "#EB_RULES_BACKUP"]);
-
-export function isEBSystemSheet(name: string): boolean {
-  return EB_SYSTEM_SHEETS.has(name);
-}
+// EB 系统遗留表的名单与判定已搬到共享层（`@excel-bro/core/folderScope`）。
+// 本文件内部照旧用 `isEBSystemSheet`，同时把名字转出去，
+// 保持旧的导入路径（`./excel`）不变 —— officeAuthorizedTarget.ts 等还在用。
+export { isEBSystemSheet };
 
 let structureCache:
   | { key: string; snapshot: WorkbookSnapshot }
@@ -846,6 +861,15 @@ export async function captureWorkbook(
       capturedAt: new Date().toISOString(),
       activeWorksheet: activeWorksheet.name,
       selectedRange: selectedRange.address,
+      /*
+       * 身份必须**当场**记进快照，不能只当成一个局部变量：
+       * 快照是"这一轮工作簿是谁"的唯一凭据，工具桥绑定（`sdkBridge.begin`）与
+       * 断点恢复账本都读它。留空会让两边退化成 `name:<文件名>`，而执行前复核
+       * （`bridgeLiveContext`）读的是 `url:` 身份 —— 同一个工作簿自比不自等，
+       * 复核必然判 `source_changed`，工具桥在已保存的工作簿上永远读不到数据。
+       * 未保存的工作簿没有 URL，这里如实留空，两边**同时**退化成同名兜底。
+       */
+      workbookIdentity: currentOfficeWorkbookIdentity() ?? null,
       worksheets: snapshots
     };
     const sourceFingerprintSheets = [...sheetsToRead];
@@ -858,6 +882,36 @@ export async function captureWorkbook(
   });
 }
 
+/** Scope catalog only. Startup and scope refresh must not read cells or used ranges. */
+export async function captureWorkbookCatalog(): Promise<WorkbookSnapshot> {
+  const identity = currentOfficeWorkbookIdentity();
+  const documentRef = Office.context.document;
+  const snapshot = await Excel.run(async (context) => {
+    const worksheets = context.workbook.worksheets;
+    const active = worksheets.getActiveWorksheet();
+    worksheets.load("items/name");
+    active.load("name");
+    await context.sync();
+    return {
+      name: workbookNameFromDocumentUrl(Office.context.document.url),
+      catalogOnly: true,
+      capturedAt: new Date().toISOString(),
+      activeWorksheet: active.name,
+      // 目录快照同样要带上身份：它在启动与范围刷新时就成为 `latestWorkbook`，
+      // 后面规划时 `sdkBridge.begin` 用的正是这份快照的身份。
+      workbookIdentity: identity ?? null,
+      worksheets: worksheets.items.filter((sheet) => !isEBSystemSheet(sheet.name)).map((sheet) => ({
+        name: sheet.name, usedRange: null, rowCount: 0, columnCount: 0,
+        headers: [], dataRows: [], truncated: false
+      }))
+    };
+  });
+  if (identity !== currentOfficeWorkbookIdentity() || documentRef !== Office.context.document) {
+    throw new Error("文件身份在目录检查期间发生变化。");
+  }
+  return snapshot;
+}
+
 export async function captureWorkbookStructure(
   dataSheetNames?: string[]
 ): Promise<WorkbookSnapshot> {
@@ -865,6 +919,10 @@ export async function captureWorkbookStructure(
   if (structureCacheEnabled && structureCache?.key === cacheKey) {
     const cached = structuredClone(structureCache.snapshot);
     cached.name = workbookNameFromDocumentUrl(Office.context.document.url);
+    // 身份与 name 一样是**取快照那一刻的实时属性**，不是被缓存的结构本身；
+    // 连 name 都刷新了却不刷新身份，会留下"文件名是新的、身份是上一个工作簿的"
+    // 这种自相矛盾的快照，桥绑定随后必被复核判成换簿。
+    cached.workbookIdentity = currentOfficeWorkbookIdentity() ?? null;
     // 结构缓存只在工作表数据/集合变化时失效，切换活动工作表不会失效。
     // 命中缓存时用一次轻量选区读取刷新活动表与选区，避免拿过期值构建
     // 指纹，导致确认期与运行期不一致的误判。
@@ -929,6 +987,8 @@ export async function captureWorkbookStructure(
       capturedAt: new Date().toISOString(),
       activeWorksheet: activeWorksheet.name,
       selectedRange: selectedRange.address,
+      // 与 `captureWorkbook` 同口径：身份当场落进快照，未保存时如实为空。
+      workbookIdentity: currentOfficeWorkbookIdentity() ?? null,
       worksheets: pending.map(({ worksheet, usedRange }, index) => {
         if (usedRange.isNullObject) {
           return {
@@ -1166,19 +1226,41 @@ function inferredCriteria(
         fillColor: action.color
       });
     } else if (action.type === "setFont") {
+      // 与 models.py 的 `add_deterministic_acceptance_criteria` 同口径：后面还有同范围的
+      // setFont 也给了同一字段时，最终值由后者决定，本条不认领它。
       const laterFonts = laterSameRange("setFont");
-      const bold = laterFonts.some((later) => later.bold !== undefined)
+      const superseded = (field: "bold" | "italic" | "name" | "size" | "color") =>
+        laterFonts.some((later) => later[field] != null);
+      const bold = superseded("bold") ? undefined : (action.bold ?? undefined);
+      const fontItalic = superseded("italic")
         ? undefined
-        : action.bold;
-      const fontColor = laterFonts.some((later) => Boolean(later.color))
+        : (action.italic ?? undefined);
+      const fontName = superseded("name")
         ? undefined
-        : action.color;
-      if (bold === undefined && !fontColor) continue;
+        : (action.name ?? undefined);
+      const fontSize = superseded("size")
+        ? undefined
+        : (action.size ?? undefined);
+      const fontColor = superseded("color")
+        ? undefined
+        : (action.color ?? undefined);
+      if (
+        bold === undefined &&
+        fontItalic === undefined &&
+        fontName === undefined &&
+        fontSize === undefined &&
+        fontColor === undefined
+      ) {
+        continue;
+      }
       addCriterion({
         type: "rangeFormatMatches",
         sheet: action.sheet,
         range: action.range,
         bold,
+        fontItalic,
+        fontName,
+        fontSize,
         fontColor
       });
     } else if (
@@ -1239,14 +1321,17 @@ function inferredCriteria(
         (side) => !laterBorders.some((later) => later.sides.includes(side))
       );
       if (sides.length === 0) continue;
+      // 期望值走与执行器同一条缺省补齐：模型省略 style/color/weight 时，
+      // 写入用的是默认值，核对也必须用同一组默认值，否则"写对了却核不过"。
+      const expected = normalizeBorderAction(action);
       addCriterion({
         type: "bordersMatch",
         sheet: action.sheet,
         range: action.range,
         sides,
-        style: action.style,
-        color: action.color,
-        weight: action.weight
+        style: expected.style,
+        color: expected.color,
+        weight: expected.weight
       });
     } else if (
       action.type === "setDataValidation" &&
@@ -2057,7 +2142,9 @@ async function verifyPlan(
         "horizontalAlignment,verticalAlignment,wrapText,rowHeight,columnWidth"
       );
       fill.load("color");
-      font.load("bold,color");
+      // 字体族/字号/斜体与加粗、字色一样，都是**读宿主当前真实格式**，
+      // 不是"值没变就算过"。五个一起 load，避免多次往返。
+      font.load("bold,italic,name,size,color");
       await context.sync();
       const numberFormatMatches =
         criterion.numberFormat == null ||
@@ -2068,6 +2155,11 @@ async function verifyPlan(
         (criterion.fillColor == null ||
           normalizedColor(fill.color) === normalizedColor(criterion.fillColor)) &&
         (criterion.bold == null || font.bold === criterion.bold) &&
+        (criterion.fontItalic == null || font.italic === criterion.fontItalic) &&
+        (criterion.fontName == null ||
+          String(font.name) === criterion.fontName) &&
+        (criterion.fontSize == null ||
+          closeEnough(font.size, criterion.fontSize)) &&
         (criterion.fontColor == null ||
           normalizedColor(font.color) === normalizedColor(criterion.fontColor)) &&
         numberFormatMatches &&
@@ -2758,6 +2850,28 @@ export function preflightPlanActions(
       addSheet(action.sheet);
     }
   });
+
+  // —— 格式能力检查**前移到预检**：宿主连逐格格式读写所需的最低 API（ExcelApi 1.9）都没有时，
+  // 格式动作必然会在执行期被拒。与其等用户确认后才报一句笼统错误，不如在这里就点名
+  // "缺哪个 API、影响哪几步"。
+  //
+  // 注意这只拦 `unavailable`：1.9–1.17 的宿主要走**兼容路径**（`getCellProperties`），
+  // 不该被拦下来。兼容路径的逐区域拒绝（条件格式 / 合并区域）需要宿主实读，只能在
+  // 写入前判定，因此由预览阶段的**非阻断提示**（`excelFormatCapabilityNotice`）先告知。
+  const formatCapability = resolveExcelFormatCapability((set, version) =>
+    set === "ExcelApi" ? isApiSupported(version) : false
+  );
+  if (formatCapability.path === "unavailable") {
+    for (const index of blockedFormatActionIndexes(plan.actions, formatCapability)) {
+      const action = plan.actions[index];
+      issues.push({
+        index,
+        message:
+          `当前 Excel 缺少 ${formatCapability.missingApis.join("、")}，` +
+          `无法为 ${action.type} 读取或写回逐格格式，该步无法执行`
+      });
+    }
+  }
   return issues;
 }
 
@@ -3480,66 +3594,12 @@ export async function executeAction(
       }
       return;
     }
-    case "setNumberFormat": {
-      const range = sheet.getRange(action.range);
-      range.load("rowCount,columnCount");
-      await context.sync();
-      range.numberFormat = Array.from({ length: range.rowCount }, () =>
-        Array.from({ length: range.columnCount }, () => action.formatCode)
-      );
-      return;
-    }
-    case "setBorders": {
-      const borderIndexes = {
-        top: "EdgeTop",
-        bottom: "EdgeBottom",
-        left: "EdgeLeft",
-        right: "EdgeRight",
-        insideHorizontal: "InsideHorizontal",
-        insideVertical: "InsideVertical"
-      } as const;
-      const borders = sheet.getRange(action.range).format.borders;
-      for (const side of action.sides) {
-        const border = borders.getItem(borderIndexes[side]);
-        border.style = enumText(action.style) as Excel.BorderLineStyle;
-        border.color = action.color;
-        border.weight = enumText(action.weight) as Excel.BorderWeight;
-      }
-      return;
-    }
-    case "setAlignment": {
-      const format = sheet.getRange(action.range).format;
-      if (action.horizontal) {
-        format.horizontalAlignment = enumText(
-          action.horizontal
-        ) as Excel.HorizontalAlignment;
-      }
-      if (action.vertical) {
-        format.verticalAlignment = enumText(
-          action.vertical
-        ) as Excel.VerticalAlignment;
-      }
-      if (action.wrapText !== undefined && action.wrapText !== null) {
-        format.wrapText = action.wrapText;
-      }
-      return;
-    }
     case "mergeCells":
       sheet.getRange(action.range).merge(action.across);
       return;
     case "unmergeCells":
       sheet.getRange(action.range).unmerge();
       return;
-    case "resizeRange": {
-      const format = sheet.getRange(action.range).format;
-      if (action.rowHeight !== undefined && action.rowHeight !== null) {
-        format.rowHeight = action.rowHeight;
-      }
-      if (action.columnWidth !== undefined && action.columnWidth !== null) {
-        format.columnWidth = action.columnWidth;
-      }
-      return;
-    }
     case "freezePanes":
       sheet.freezePanes.unfreeze();
       if (action.rows > 0) sheet.freezePanes.freezeRows(action.rows);
@@ -3658,15 +3718,16 @@ export async function executeAction(
       positionShape(shape, target);
       return;
     }
+    // 六个格式动作统一走 `applyFormatAction`：执行器与原生副本审阅必须同源，
+    // 否则"副本里试算出来的样子"与"真正写回原表的样子"会分叉。
     case "setFill":
-      sheet.getRange(action.range).format.fill.color = action.color;
+    case "setFont":
+    case "setBorders":
+    case "setAlignment":
+    case "setNumberFormat":
+    case "resizeRange":
+      await applyFormatAction(context, sheet.getRange(action.range), action);
       return;
-    case "setFont": {
-      const font = sheet.getRange(action.range).format.font;
-      if (action.bold !== undefined) font.bold = action.bold;
-      if (action.color) font.color = action.color;
-      return;
-    }
     case "autofit": {
       const format = sheet.getRange(action.range).format;
       format.autofitColumns();
@@ -3677,6 +3738,100 @@ export async function executeAction(
       sheet.activate();
       return;
   }
+}
+
+/**
+ * 格式动作各自的恢复依据（用户要求：按动作**实际修改的属性**检查恢复能力，
+ * 不笼统"纯格式动作"一刀切）。**恢复范围的唯一来源是 `undoRestoreScope`**，
+ * 这里只说依据，不再另立一份动作名单 —— 两份名单迟早会对不上。
+ *  - `setFill`/`setFont`/`setBorders`/`setAlignment`（`scope.cellFormat`）：改逐格格式，
+ *    恢复依据是 `getDisplayedCellProperties`（ExcelApi 1.19）的**显示值**。
+ *    宿主 1.9–1.17（批量许可永久版最高到 1.17）走**直接格式兼容路径**：逐格读
+ *    `getCellProperties`（只返回直接设置在单元格上的属性 + 命名样式），撤销时
+ *    先清空区域直接格式、再写回捕获到的直接格式集合 ⇒ 直接格式逐格精确还原、
+ *    未直接设置的属性自动回到继承/默认。宿主连 1.9 都没有 ⇒ 执行前拒绝。
+ *  - `setNumberFormat`：改 `numberFormat`，恢复依据是 `range.numberFormat`（独立捕获，
+ *    不依赖 1.19）。
+ *  - `resizeRange`：改行高/列宽，恢复依据是 `getRowProperties`/`getColumnProperties`
+ *    （1.9，含 `useStandardHeight`/`useStandardWidth`）。
+ */
+
+/**
+ * 当前宿主的格式能力。**唯一入口**，`captureUndoRange`、预检与错误文案共用，
+ * 避免"一处按 1.19 判、另一处按 1.9 判"这种两套口径。
+ */
+export function currentExcelFormatCapability(): ExcelFormatCapability {
+  // 注意签名要**收下两个参数**：`resolveExcelFormatCapability` 会传 `("ExcelApi", "1.19")`。
+  // 只声明一个参数会把 `version` 接成 `"ExcelApi"`，从而永远判成"不支持"。
+  return resolveExcelFormatCapability((_set, version) =>
+    Office.context.requirements.isSetSupported("ExcelApi", version)
+  );
+}
+
+/**
+ * 动作**实际影响** → 撤销恢复范围。纯函数，不依赖宿主，便于单测与变异。
+ *
+ * 逐条依据（都是"没有它就不用恢复"）：
+ *  - `writeValues`/`writeFormulas`：只动值/公式，**不动任何格式**。
+ *  - `writeTable`：写表头与数据行，同样是值。
+ *  - `clearRange`：能走到撤销的只有 `applyTo === "contents"`（见 `recoverableActionRange`），
+ *    清的是内容，不是格式。
+ *  - `setNumberFormat`：只动数字格式。
+ *  - `setFill`/`setFont`/`setBorders`/`setAlignment`：只动逐格格式 ⇒ `cellFormat`，
+ *    并**连带 `numberFormat`**（兼容路径恢复用 `clear(Formats)`，它连数字格式一起清）。
+ *  - `resizeRange`：行高/列宽是行级/列级属性，**绝不碰单元格格式**；只在该动作确实给了
+ *    对应字段时才恢复那一个。
+ *  - 其余（删表/建表等）没有可撤销的范围内格式。
+ */
+export function undoRestoreScope(action: ExcelAction): UndoRestoreScope {
+  const none: UndoRestoreScope = {
+    formulas: false,
+    numberFormat: false,
+    cellFormat: false,
+    rowHeight: false,
+    columnWidth: false
+  };
+  switch (action.type) {
+    case "writeValues":
+    case "writeFormulas":
+    case "writeTable":
+    case "clearRange":
+      return { ...none, formulas: true };
+    case "setNumberFormat":
+      return { ...none, numberFormat: true };
+    case "setFill":
+    case "setFont":
+    case "setBorders":
+    case "setAlignment":
+      // cellFormat 连带 numberFormat：兼容路径的 `clear(Formats)` 会清掉直接数字格式，
+      // 不一起恢复就等于把用户的数字格式弄丢。机制约束，写在这里以免调用方漏掉。
+      return { ...none, cellFormat: true, numberFormat: true };
+    case "resizeRange":
+      return {
+        ...none,
+        rowHeight: action.rowHeight !== undefined && action.rowHeight !== null,
+        columnWidth: action.columnWidth !== undefined && action.columnWidth !== null
+      };
+    default:
+      return none;
+  }
+}
+
+/**
+ * 旧恢复点（无 `scope`）的隐含范围：**全范围恢复**。升级不能改变旧记录的行为 ——
+ * 把一个没有范围信息的旧快照按"只恢复值"处理，会让它该恢复的格式恢复不回来。
+ */
+const LEGACY_FULL_SCOPE: UndoRestoreScope = {
+  formulas: true,
+  numberFormat: true,
+  cellFormat: true,
+  rowHeight: true,
+  columnWidth: true
+};
+
+/** 快照的恢复范围；缺失即旧恢复点，按全范围处理。 */
+function scopeOf(saved: { scope?: UndoRestoreScope }): UndoRestoreScope {
+  return saved.scope ?? LEGACY_FULL_SCOPE;
 }
 
 function recoverableActionRange(action: ExcelAction): string | null {
@@ -3718,15 +3873,577 @@ function undoBorderSides(): Excel.BorderIndex[] {
 }
 
 /**
- * 捕获超出常用格式之外的属性。区域过大时返回 null，撤销退化为只恢复
- * 值/公式/数字格式/填充色/加粗/字色。
+ * `Excel.BorderIndex` 枚举值 → 协议里的边名。
+ *
+ * 只覆盖 `undoBorderSides()` 那六条，所以是一张固定的小表。**不要去拼枚举成员名**
+ * （`edgeTop` → `top`）：成员名与协议边名本来就不同形，靠 `toLowerCase`/`slice`
+ * 去凑，遇到 `insideHorizontal` 这种就错了，而且错得静默。
+ */
+function borderSideName(sideIndex: Excel.BorderIndex): BorderSide {
+  switch (sideIndex) {
+    case Excel.BorderIndex.edgeTop:
+      return "top";
+    case Excel.BorderIndex.edgeBottom:
+      return "bottom";
+    case Excel.BorderIndex.edgeLeft:
+      return "left";
+    case Excel.BorderIndex.edgeRight:
+      return "right";
+    case Excel.BorderIndex.insideHorizontal:
+      return "insideHorizontal";
+    case Excel.BorderIndex.insideVertical:
+      return "insideVertical";
+    default:
+      throw new Error(`未知的边框位置：${String(sideIndex)}`);
+  }
+}
+
+/**
+ * 逐格采集的请求参数。**两条路径各一份**：
+ *  - 显示值路径（1.19）用宿主的显示值语义；
+ *  - 直接格式兼容路径（1.9–1.17）走 `clear(Formats)`，**凡是能被 `clear` 重置的属性
+ *    都要请求**（字体删除线/上下标/底纹、填充图案色/底纹、八条边与边底纹、缩进/
+ *    收缩适应/文字方向/阅读顺序/自动缩进/单元格保护），否则"清空再写回"会静默丢属性。
+ *    **不请求就没有、不写回就等于丢**，所以这里是本机可表达的全量清单。
+ *
+ * **仍然不是"全部格式"**：单元格内部富文本（`textRuns`，ExcelApi 1.18）在 1.17 宿主上
+ * 不可请求 —— **既读不到、也写不回**，因此本机无法判断某个单元格是否含富文本，也无法在
+ * 富文本被改变时还原它。
+ *
+ * 关于 `clear(Formats)`：官方 Excel 语义说它**不清除**单元格内字符级格式
+ * （"Clear Formats 不改单元格内单个字符的格式"）。这是**对 clear 这一步的语义依据**，
+ * **不等于"含富文本的区域可以安全执行并撤销"** —— 完整写入与撤销链路**未经真实宿主验证**，
+ * 且一旦宿主行为与官方语义不符，本机既发现不了也恢复不了。故此处只声明依据，不给出整体安全结论。
+ * 如实声明边界，不补默认值、不声称已覆盖（见 `DirectCellFormatValues` 的同类说明）。
+ */
+const DISPLAYED_FORMAT_LOAD_OPTIONS = {
+  fill: { color: true, pattern: true },
+  font: { name: true, size: true, bold: true, italic: true, color: true, underline: true },
+  borders: { style: true, color: true, weight: true },
+  horizontalAlignment: true,
+  verticalAlignment: true,
+  wrapText: true,
+  indentLevel: true
+} as const;
+
+export const DIRECT_FORMAT_LOAD_OPTIONS = {
+  horizontalAlignment: true,
+  verticalAlignment: true,
+  wrapText: true,
+  indentLevel: true,
+  shrinkToFit: true,
+  textOrientation: true,
+  readingOrder: true,
+  autoIndent: true,
+  // `CellPropertiesFormatLoadOptions.protection` 是布尔开关（不是对象）。
+  protection: true,
+  fill: {
+    color: true,
+    pattern: true,
+    patternColor: true,
+    patternTintAndShade: true,
+    tintAndShade: true
+  },
+  font: {
+    name: true,
+    size: true,
+    bold: true,
+    italic: true,
+    color: true,
+    underline: true,
+    strikethrough: true,
+    subscript: true,
+    superscript: true,
+    tintAndShade: true
+  },
+  borders: { style: true, color: true, weight: true, tintAndShade: true }
+} as const;
+
+/**
+ * `getCellProperties` 的入参。**`style` 与 `format` 同级**（`CellPropertiesLoadOptions.style`，
+ * ExcelApi 1.9）—— 单元格命名样式不是 `format` 的子字段，请求时必须并排给。
+ */
+export const DIRECT_CELL_PROPERTIES_LOAD = {
+  style: true,
+  format: DIRECT_FORMAT_LOAD_OPTIONS
+} as const;
+
+/**
+ * 目标区域的格式**无法可靠恢复**（兼容路径下的条件格式 / 合并区域，或宿主缺 API）。
+ *
+ * 刻意做成独立类型：调用方要把它与"区域过大/矩阵不完整"（返回 null）区分开，
+ * 因为两者的用户指引不同 —— 前者是"这个区域本身不可恢复"，后者是"这次没采全"。
+ */
+class FormatRangeUnrecoverableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "FormatRangeUnrecoverableError";
+  }
+}
+
+/**
+ * 直接格式路径要采的边名：`Excel.CellBorderCollection` 的**八条**。
+ *
+ * 不能只采四条 —— 内部边（`horizontal`/`vertical`）与斜线（`diagonalDown`/`diagonalUp`）
+ * 同样是"直接设置过"的格式，兼容路径恢复要先 `clear(Formats)`，漏采即静默丢失。
+ */
+const CELL_BORDER_SIDES: readonly (keyof NonNullable<
+  DirectCellFormatValues["borders"]
+>)[] = [
+  "top",
+  "bottom",
+  "left",
+  "right",
+  "horizontal",
+  "vertical",
+  "diagonalDown",
+  "diagonalUp"
+];
+
+/**
+ * 把 `getCellProperties` 的返回值读成**直接格式子集**。
+ *
+ * 关键：**只装宿主确实返回了的属性**。没有的字段一概不出现 —— 缺席表示"该属性未直接设置"，
+ * 是"继承样式/条件格式/默认"这一确定状态。绝不在这里补 `defaultCellStyle()` 之类的默认值，
+ * 否则"未直接设置"会被写成"显式设置成默认"，继承语义当场丢失。
+ *
+ * `style` 是 `CellPropertiesLoadOptions.style` 读回来的**命名样式名**，与 `format` 同级，
+ * 因此由调用方单独传进来（而不是从 `cellFormat` 里取）。
+ */
+function readDirectCellFormat(
+  cellFormat: Excel.CellPropertiesFormat | undefined,
+  style?: string
+): DirectCellFormatValues {
+  const direct: DirectCellFormatValues = {};
+  if (style != null) direct.style = style;
+  if (!cellFormat) return direct;
+  const fill = cellFormat.fill;
+  if (fill) {
+    if (fill.pattern != null) direct.fillPattern = String(fill.pattern);
+    if (fill.color != null) direct.fillColor = fill.color;
+    if (fill.patternColor != null) direct.fillPatternColor = fill.patternColor;
+    if (fill.patternTintAndShade != null) {
+      direct.fillPatternTintAndShade = fill.patternTintAndShade;
+    }
+    if (fill.tintAndShade != null) direct.fillTintAndShade = fill.tintAndShade;
+  }
+  const font = cellFormat.font;
+  if (font) {
+    if (font.name != null) direct.fontName = String(font.name);
+    if (font.size != null) direct.fontSize = font.size;
+    if (font.bold != null) direct.fontBold = font.bold;
+    if (font.italic != null) direct.fontItalic = font.italic;
+    if (font.color != null) direct.fontColor = font.color;
+    if (font.underline != null) direct.fontUnderline = String(font.underline);
+    if (font.strikethrough != null) direct.fontStrikethrough = font.strikethrough;
+    if (font.subscript != null) direct.fontSubscript = font.subscript;
+    if (font.superscript != null) direct.fontSuperscript = font.superscript;
+    if (font.tintAndShade != null) direct.fontTintAndShade = font.tintAndShade;
+  }
+  if (cellFormat.horizontalAlignment != null) {
+    direct.horizontalAlignment = String(cellFormat.horizontalAlignment);
+  }
+  if (cellFormat.verticalAlignment != null) {
+    direct.verticalAlignment = String(cellFormat.verticalAlignment);
+  }
+  if (cellFormat.wrapText != null) direct.wrapText = cellFormat.wrapText;
+  if (cellFormat.indentLevel != null) direct.indentLevel = cellFormat.indentLevel;
+  if (cellFormat.shrinkToFit != null) direct.shrinkToFit = cellFormat.shrinkToFit;
+  if (cellFormat.textOrientation != null) direct.textOrientation = cellFormat.textOrientation;
+  if (cellFormat.readingOrder != null) direct.readingOrder = String(cellFormat.readingOrder);
+  if (cellFormat.autoIndent != null) direct.autoIndent = cellFormat.autoIndent;
+  const protection = cellFormat.protection;
+  if (protection) {
+    if (protection.locked != null) direct.locked = protection.locked;
+    if (protection.formulaHidden != null) direct.formulaHidden = protection.formulaHidden;
+  }
+  const cellBorders = cellFormat.borders;
+  if (cellBorders) {
+    const sides: NonNullable<DirectCellFormatValues["borders"]> = {};
+    for (const side of CELL_BORDER_SIDES) {
+      const state = cellBorders[side];
+      // 只有"确实带了线型"的边才算直接设置过；`style` 缺席 = 该边未直接设置。
+      if (state && state.style != null) {
+        const captured: CellBorderState = {
+          style: String(state.style),
+          color: state.color ?? "#000000",
+          weight: state.weight == null ? "Thin" : String(state.weight)
+        };
+        if (state.tintAndShade != null) captured.tintAndShade = state.tintAndShade;
+        sides[side] = captured;
+      }
+    }
+    if (Object.keys(sides).length > 0) direct.borders = sides;
+  }
+  return direct;
+}
+
+/**
+ * 某格**直接格式**在指定属性上的取值（副本审阅用它做逐格"是否变化"的比对）。
+ *
+ * 未直接设置 ⇒ `null`（"继承/默认"这一确定状态），不是"未知"。返回值只装格式化后的
+ * 取值，可安全 `JSON.stringify` 比较。
+ */
+export function directFormatFieldValue(
+  cellFormat: Excel.CellPropertiesFormat | undefined,
+  field: ExcelFormatField
+): unknown {
+  const direct = readDirectCellFormat(cellFormat);
+  switch (field) {
+    case "fill":
+      return direct.fillPattern == null
+        ? null
+        : { pattern: direct.fillPattern, color: direct.fillColor ?? null };
+    case "fontName":
+      return direct.fontName ?? null;
+    case "fontSize":
+      return direct.fontSize ?? null;
+    case "fontBold":
+      return direct.fontBold ?? null;
+    case "fontItalic":
+      return direct.fontItalic ?? null;
+    case "fontColor":
+      return direct.fontColor ?? null;
+    case "fontUnderline":
+      return direct.fontUnderline ?? null;
+    case "horizontalAlignment":
+      return direct.horizontalAlignment ?? null;
+    case "verticalAlignment":
+      return direct.verticalAlignment ?? null;
+    case "wrapText":
+      return direct.wrapText ?? null;
+    case "indentLevel":
+      return direct.indentLevel ?? null;
+    case "borders":
+      return direct.borders ?? null;
+    default:
+      return null;
+  }
+}
+
+/** 该格的**直接格式**里是否包含某个属性（用于判定它这次是"直接"还是"继承"）。 */
+function directFormatHasField(
+  direct: DirectCellFormatValues,
+  field: ExcelFormatField
+): boolean {
+  switch (field) {
+    case "fill":
+      return direct.fillPattern != null;
+    case "fontName":
+      return direct.fontName != null;
+    case "fontSize":
+      return direct.fontSize != null;
+    case "fontBold":
+      return direct.fontBold != null;
+    case "fontItalic":
+      return direct.fontItalic != null;
+    case "fontColor":
+      return direct.fontColor != null;
+    case "fontUnderline":
+      return direct.fontUnderline != null;
+    case "horizontalAlignment":
+      return direct.horizontalAlignment != null;
+    case "verticalAlignment":
+      return direct.verticalAlignment != null;
+    case "wrapText":
+      return direct.wrapText != null;
+    case "indentLevel":
+      return direct.indentLevel != null;
+    case "borders":
+      return direct.borders != null;
+    case "rowHeight":
+    case "columnWidth":
+    case "numberFormat":
+      // 这三个不是逐格属性：行高/列宽走 rowHeights/columnWidths，numberFormat 走
+      // `range.numberFormat`，都不在逐格矩阵里，因此不参与"直接/继承"的逐格判定。
+      return true;
+    default:
+      return true;
+  }
+}
+
+/**
+ * `ExcelFormatField` → 它管辖的**直接格式**键。
+ *
+ * 这是"按动作实际影响拆分恢复"落到**属性级**的那一层：`setFont{bold}` 只该恢复
+ * `fontBold`，不该顺手把 `textOrientation`/`shrinkToFit`/`locked` 一起写回 —— 后者是
+ * 用户可能在本动作之后自己改的属性，写回"执行前的值"就等于覆盖用户的编辑。
+ */
+const FIELD_DIRECT_KEYS: ReadonlyArray<[ExcelFormatField, readonly (keyof DirectCellFormatValues)[]]> = [
+  [
+    "fill",
+    [
+      "fillPattern",
+      "fillColor",
+      "fillPatternColor",
+      "fillPatternTintAndShade",
+      "fillTintAndShade"
+    ]
+  ],
+  ["fontName", ["fontName"]],
+  ["fontSize", ["fontSize"]],
+  ["fontBold", ["fontBold"]],
+  ["fontItalic", ["fontItalic"]],
+  ["fontColor", ["fontColor"]],
+  ["fontUnderline", ["fontUnderline"]],
+  ["horizontalAlignment", ["horizontalAlignment"]],
+  ["verticalAlignment", ["verticalAlignment"]],
+  ["wrapText", ["wrapText"]],
+  ["indentLevel", ["indentLevel"]],
+  ["borders", ["borders"]]
+];
+
+/** 本动作实际修改的属性所管辖的直接格式键集合。 */
+function directKeysOfFields(fields: readonly string[]): Set<keyof DirectCellFormatValues> {  const keys = new Set<keyof DirectCellFormatValues>();
+  for (const [field, owned] of FIELD_DIRECT_KEYS) {
+    if (fields.includes(field)) owned.forEach((key) => keys.add(key));
+  }
+  return keys;
+}
+
+/** `ExcelFormatField` → 它管辖的**显示值**字段（`UndoCellFormat` 的键）。 */
+const FIELD_DISPLAYED_KEYS: ReadonlyArray<[ExcelFormatField, readonly (keyof UndoCellFormat)[]]> = [
+  ["fill", ["fillPattern", "fillColor"]],
+  ["fontName", ["fontName"]],
+  ["fontSize", ["fontSize"]],
+  ["fontBold", ["fontBold"]],
+  ["fontItalic", ["fontItalic"]],
+  ["fontColor", ["fontColor"]],
+  ["fontUnderline", ["fontUnderline"]],
+  ["horizontalAlignment", ["horizontalAlignment"]],
+  ["verticalAlignment", ["verticalAlignment"]],
+  ["wrapText", ["wrapText"]],
+  ["indentLevel", ["indentLevel"]],
+  ["borders", ["borders"]]
+];
+
+/** 本动作实际修改的属性所管辖的显示值字段集合。 */
+function displayedKeysOfFields(fields: readonly string[]): Set<keyof UndoCellFormat> {
+  const keys = new Set<keyof UndoCellFormat>();
+  for (const [field, owned] of FIELD_DISPLAYED_KEYS) {
+    if (fields.includes(field)) owned.forEach((key) => keys.add(key));
+  }
+  return keys;
+}
+
+/**
+ * 旧恢复点没有 `formatFields` 时的兜底：按**全部**逐格格式属性算摘要/恢复。
+ * 它比按动作收窄的版本更严，但对旧记录只能如此 —— 缺信息时宁可保守，也不能假装知道
+ * "这次只改了哪几个属性"。它不会恢复出错误结果，只会更早报冲突。
+ */
+const ALL_DIRECT_FORMAT_FIELDS: readonly string[] = FIELD_DIRECT_KEYS.map(([field]) => field);
+
+/** 从一条记录里只挑出指定键（缺席的键不出现在结果里 ⇒ 不会被误当成"写成 null"）。 */
+function pickKeys<T extends object>(
+  source: T,
+  keys: ReadonlySet<keyof T>
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(source)) {
+    if (value !== undefined && keys.has(key as keyof T)) out[key] = value;
+  }
+  return out;
+}
+
+/**
+ * 冲突摘要用的投影：只保留本动作管辖的键，缺席记为 `null`（"未直接设置"是确定状态）。
+ *
+ * `keys` 收 `ReadonlySet<string>`（而不是 `keyof T`）：聚合摘要（`Set<keyof DirectCellFormatValues>`）
+ * 与逐属性摘要（同一集合的子集）都要用它，统一到同一份实现才能保证两者口径一致。
+ */
+function projectKeys(source: object, keys: ReadonlySet<string>): Record<string, unknown> {
+  const record = source as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const key of keys) out[key] = record[key] ?? null;
+  return out;
+}
+
+/** `Set<具体字面量联合>` → `ReadonlySet<string>`（只为通过类型，不改运行期集合）。 */
+function asKeySet(keys: ReadonlySet<unknown>): ReadonlySet<string> {
+  return keys as unknown as ReadonlySet<string>;
+}
+
+/**
+ * 把一个**格式动作**应用到给定区域。
+ *
+ * 抽成导出函数是为了让"执行器"与"Excel 原生副本审阅"用**同一份**写入逻辑：
+ * 副本里试算的格式必须与真正写回原表时逐字节同源，否则"审阅通过、写回却不一样"，
+ * 副本审阅就失去了意义。属性判空一律用 `!= null`（`bold: false` 是"取消加粗"，
+ * 与"没给"不同）。
+ */
+export async function applyFormatAction(
+  context: Excel.RequestContext,
+  range: Excel.Range,
+  action: ExcelAction
+): Promise<void> {
+  switch (action.type) {
+    case "setFill":
+      range.format.fill.color = action.color;
+      return;
+    case "setFont": {
+      const font = range.format.font;
+      if (action.bold != null) font.bold = action.bold;
+      if (action.italic != null) font.italic = action.italic;
+      if (action.name != null) font.name = action.name;
+      if (action.size != null) font.size = action.size;
+      if (action.color != null) font.color = action.color;
+      return;
+    }
+    case "setNumberFormat": {
+      range.load("rowCount,columnCount");
+      await context.sync();
+      range.numberFormat = Array.from({ length: range.rowCount }, () =>
+        Array.from({ length: range.columnCount }, () => action.formatCode)
+      );
+      return;
+    }
+    case "setBorders": {
+      const borderIndexes = {
+        top: "EdgeTop",
+        bottom: "EdgeBottom",
+        left: "EdgeLeft",
+        right: "EdgeRight",
+        insideHorizontal: "InsideHorizontal",
+        insideVertical: "InsideVertical"
+      } as const;
+      // 缺省补齐只此一处（`normalizeBorderAction`），回读判据走同一条 ——
+      // 模型省略 style/color/weight 时，写入值与期望值必须来自同一个默认。
+      const borders = normalizeBorderAction(action);
+      const target = range.format.borders;
+      for (const side of borders.sides) {
+        const border = target.getItem(borderIndexes[side]);
+        border.style = enumText(borders.style) as Excel.BorderLineStyle;
+        border.color = borders.color;
+        border.weight = enumText(borders.weight) as Excel.BorderWeight;
+      }
+      return;
+    }
+    case "setAlignment": {
+      const format = range.format;
+      if (action.horizontal) {
+        format.horizontalAlignment = enumText(action.horizontal) as Excel.HorizontalAlignment;
+      }
+      if (action.vertical) {
+        format.verticalAlignment = enumText(action.vertical) as Excel.VerticalAlignment;
+      }
+      if (action.wrapText !== undefined && action.wrapText !== null) {
+        format.wrapText = action.wrapText;
+      }
+      return;
+    }
+    case "resizeRange": {
+      const format = range.format;
+      if (action.rowHeight !== undefined && action.rowHeight !== null) {
+        format.rowHeight = action.rowHeight;
+      }
+      if (action.columnWidth !== undefined && action.columnWidth !== null) {
+        format.columnWidth = action.columnWidth;
+      }
+      return;
+    }
+    default:
+      throw new Error(`不是格式动作：${action.type}`);
+  }
+}
+
+/**
+ * 显示值路径下把一格的 `format` 投影成 `UndoCellFormat`（全字段都是**确定的显示值**）。
+ *
+ * 抽出来是为了让"采集快照"与"执行后状态摘要"用**同一份投影** —— 两处各写一份，
+ * 迟早会漂移成"摘要说没变、快照却说变了"。`format` 缺失（宿主异常）⇒ 返回 null，
+ * 由调用方决定是拒绝（采集）还是计入摘要（比对）。
+ */
+function displayedCellFormatOf(
+  cellFormat: Excel.CellPropertiesFormat | undefined
+): UndoCellFormat | null {
+  if (!cellFormat) return null;
+  const cellBorders = cellFormat.borders ?? {};
+  const toCellBorder = (state: Excel.CellBorder | undefined): CellBorderState => ({
+    style: state?.style == null ? "None" : String(state.style),
+    color: state?.color ?? "#000000",
+    weight: state?.weight == null ? "Thin" : String(state.weight)
+  });
+  const font = cellFormat.font ?? {};
+  const fill = cellFormat.fill;
+  // 显示填充：`pattern` 缺失或为 `"None"` 都表示"显示上没有填充"（明确无填充）。
+  // 注意：这是**显示值**的语义 —— 若填充来自样式/条件格式，`pattern` 会是 `"Solid"` 等，
+  // 而不是 `"None"`；`"None"` 只表示"显示上确实没有填充"。
+  const fillPattern = fill?.pattern ?? "None";
+  return {
+    fillPattern,
+    fillColor: fillPattern === "None" ? null : (fill?.color ?? null),
+    fontName: font.name ?? "",
+    fontSize: font.size ?? 11,
+    fontBold: font.bold ?? false,
+    fontItalic: font.italic ?? false,
+    fontColor: font.color ?? "",
+    fontUnderline: font.underline == null ? "None" : String(font.underline),
+    horizontalAlignment:
+      cellFormat.horizontalAlignment == null
+        ? "General"
+        : String(cellFormat.horizontalAlignment),
+    verticalAlignment:
+      cellFormat.verticalAlignment == null ? "Bottom" : String(cellFormat.verticalAlignment),
+    wrapText: cellFormat.wrapText ?? false,
+    indentLevel: cellFormat.indentLevel ?? 0,
+    borders: {
+      top: toCellBorder(cellBorders.top),
+      bottom: toCellBorder(cellBorders.bottom),
+      left: toCellBorder(cellBorders.left),
+      right: toCellBorder(cellBorders.right)
+    }
+  };
+}
+
+/**
+ * 捕获超出常用格式之外的属性，**按属性实际粒度**：
+ *  - 逐格字体/对齐/填充/边框：一次读回二维矩阵，混合值不会被折叠成"区域级单值"
+ *    （这是旧实现丢失混合格式的根因）。
+ *  - 逐行行高：`range.getRowProperties()`（`format.rowHeight`，行级属性）。
+ *  - 逐列列宽：`range.getColumnProperties()`（`format.columnWidth`，列级属性）。
+ *
+ * 两条逐格路径，由宿主能力决定（见 `currentExcelFormatCapability`）：
+ *  - **显示值路径**（ExcelApi ≥ 1.19）：`getDisplayedCellProperties` 返回单元格**实际显示**
+ *    的格式，无论来源是直接设置还是表格样式/命名样式/条件格式 ⇒ 写进 `cells`。
+ *  - **直接格式兼容路径**（ExcelApi 1.9–1.17；批量许可永久版的实际上限）：`getCellProperties`
+ *    只返回**直接设置在单元格上**的属性，缺席即"未直接设置（继承/默认）"这一**确定状态**
+ *    ⇒ 写进 `directCells`，并记录本次动作**实际修改的属性**里哪些是继承态。
+ *    兼容路径下目标区域若含**条件格式**或**合并单元格**，显示状态无法在执行前确定，
+ *    且条件格式/表格样式可能覆盖本次写入的显示效果，因此**明确拒绝**
+ *    （`FormatRangeUnrecoverableError`），不写默认值冒充"采集成功"。
+ *
+ * 关键语义（"未采集 ≠ 默认值"）：两条路径都**不填默认值** —— `cells` 的每个字段都来自
+ * 宿主返回值，`directCells` 只装宿主确认直接设置过的字段；矩阵形状不符/元素非对象一律
+ * 视为"不可完整捕获"（返回 null），由调用方在**原表修改前**拒绝执行。
+ *
+ * `modifiedFields` 是本次动作**实际要改**的属性（`excelFormatActionFields`）。它只用于
+ * 记录来源（`inherited`），不影响恢复 —— 恢复写回的是**整份直接格式集合**。
+ *
+ * `scope` 决定**采什么**（用户要求：按动作实际影响拆分恢复）：
+ *  - `scope.cellFormat` 假 ⇒ 不请求逐格矩阵，也不查条件格式/合并区域（纯 `resizeRange`
+ *    与"区域里有条件格式"无关，不该被误拒）；
+ *  - `scope.rowHeight`/`scope.columnWidth` 皆假 ⇒ 不请求逐行行高/逐列列宽。
+ * 调用方对"没有任何格式范围"的动作（纯值/公式、`setNumberFormat`）干脆不调用本函数，
+ * 快照的 `format` 直接为 null —— **撤销因此一个格式写入都不做**。
  */
 async function captureRangeFormat(
   context: Excel.RequestContext,
   range: Excel.Range,
-  cellCount: number
+  cellCount: number,
+  rowCount: number,
+  columnCount: number,
+  modifiedFields: readonly ExcelFormatField[],
+  scope: UndoRestoreScope
 ): Promise<UndoRangeFormat | null> {
   if (cellCount > UNDO_FORMAT_CAPTURE_MAX_CELLS) return null;
+  const capability = currentExcelFormatCapability();
+  // 连 1.9（getCellProperties/setCellProperties）都没有：逐格格式既读不出也写不回，
+  // 直接拒绝而不是交一份"半份快照"出去 —— 半份快照会让撤销静默失效。
+  if (capability.path === "unavailable" && scope.cellFormat) {
+    throw new FormatRangeUnrecoverableError(
+      `本机 Excel 缺少 ${EXCEL_DIRECT_FORMAT_REQUIREMENT}，无法读取或写回逐格格式`
+    );
+  }
   const format = range.format;
   format.load(
     "horizontalAlignment,verticalAlignment,wrapText,rowHeight,columnWidth,indentLevel"
@@ -3737,7 +4454,137 @@ async function captureRangeFormat(
     border.load("style,color,weight");
     return { sideIndex, border };
   });
+
+  // 逐格采集请求：显示值路径与兼容路径**二选一**，同一批 sync 取回，不额外增加往返。
+  //
+  // 只在动作**确实会改逐格格式**时请求。值/公式动作与 `setNumberFormat` 的范围里没有
+  // `cellFormat`，撤销时也就一个格式写入都不做 ⇒ 它们的混合格式**不采也不会坏**
+  // （不被写回 = 原样保留）。这比"为了撤销而先把格式采一遍"更省，也避免了在
+  // 只改值的动作上因为"区域含条件格式"而被无端拒绝。
+  const displayedAvailable = capability.path === "displayed";
+  const needCellFormat = scope.cellFormat;
+  const cellProperties =
+    needCellFormat && displayedAvailable
+      ? range.getDisplayedCellProperties({ format: DISPLAYED_FORMAT_LOAD_OPTIONS })
+      : null;
+  const directProperties =
+    needCellFormat && !displayedAvailable
+      ? range.getCellProperties(DIRECT_CELL_PROPERTIES_LOAD)
+      : null;
+  // 兼容路径的两个"能不能可靠恢复"判据。**只有真的会写回逐格格式时才查**：
+  // 纯 `resizeRange`（行高/列宽）与"区域里有条件格式"无关，不该被误拒。
+  const conditionalFormats = directProperties ? range.conditionalFormats.getCount() : null;
+  const mergedAreas = directProperties ? range.getMergedAreasOrNullObject() : null;
+  mergedAreas?.load("isNullObject");
+  const dataValidation = directProperties ? range.dataValidation : null;
+  dataValidation?.load("type");
+
+  // 逐行行高 / 逐列列宽：行高是行级、列宽是列级，区域级 `format.rowHeight/columnWidth`
+  // 对混合尺寸不可靠，必须逐行/逐列读。`useStandardHeight`/`useStandardWidth` 一并请求，
+  // 用于区分"直接设置的行高/列宽"与"未直接设置（标准行高/列宽）"—— 后者是确定状态，
+  // 不是"无法确定"。**只在动作真的会改行高/列宽时请求**（即 `resizeRange`）。
+  const needRowHeight = scope.rowHeight;
+  const needColumnWidth = scope.columnWidth;
+  const rowProperties = needRowHeight
+    ? range.getRowProperties({ format: { rowHeight: true, useStandardHeight: true } })
+    : null;
+  const columnProperties = needColumnWidth
+    ? range.getColumnProperties({ format: { columnWidth: true, useStandardWidth: true } })
+    : null;
   await context.sync();
+
+  // 兼容路径的硬性拒绝：条件格式支配显示、合并区域不逐格成立。都在**写入前**抛出，
+  // 且文案指名缺哪个 API / 哪类区域，避免"笼统报错"。
+  if (conditionalFormats && conditionalFormats.value > 0) {
+    throw new FormatRangeUnrecoverableError(
+      `目标区域含 ${conditionalFormats.value} 条条件格式；本机缺少 ${EXCEL_DISPLAYED_FORMAT_REQUIREMENT}，` +
+        "条件格式支配的显示状态无法在执行前确定，也不能保证本次写入的显示生效"
+    );
+  }
+  if (mergedAreas && !mergedAreas.isNullObject) {
+    throw new FormatRangeUnrecoverableError(
+      "目标区域含合并单元格；合并区域的格式不逐格成立，无法按格恢复执行前的格式来源"
+    );
+  }
+  // `clear(Formats)` 会清除区域上的数据验证，而兼容路径既不采集也不逐格还原数据验证
+  // （数据验证不是格式动作的管辖范围，本机也读不回逐格验证来源）。因此含数据验证的区域
+  // 必须在写入前 fail-closed 拒绝，与条件格式 / 合并单元格同口径，而不是静默丢验证。
+  if (dataValidation && dataValidation.type !== "None") {
+    throw new FormatRangeUnrecoverableError(
+      "目标区域含数据验证；恢复用的 clear(Formats) 会清除数据验证且无法逐格还原，本机缺少可验证的保留路径"
+    );
+  }
+
+  // —— 矩阵尺寸 / 行列数量 / 缺项校验：任一不满足即视为"格式不可完整捕获"（返回 null），
+  // 由调用方对纯格式动作执行前拒绝，而不是执行完才发现撤销不了。
+  // 未请求的行高/列宽（动作不改它）不参与校验 —— 缺席就是"不在范围内"。
+  const rowValues = rowProperties?.value;
+  const columnValues = columnProperties?.value;
+  if (needRowHeight && (!Array.isArray(rowValues) || rowValues.length !== rowCount)) return null;
+  if (needColumnWidth && (!Array.isArray(columnValues) || columnValues.length !== columnCount)) {
+    return null;
+  }
+
+  let cells: UndoCellFormat[][] | null = null;
+  if (cellProperties) {
+    const cellMatrix = cellProperties.value;
+    if (!Array.isArray(cellMatrix) || cellMatrix.length !== rowCount) return null;
+    for (const row of cellMatrix) {
+      if (!Array.isArray(row) || row.length !== columnCount) return null;
+    }
+    // 采集失败判据：矩阵里出现**非对象**的元素（宿主异常、返回被截断成 undefined）。
+    // `getDisplayedCellProperties` 对每个单元格都应返回一个对象（含 `format`），元素为
+    // null/非对象即宿主异常。
+    if (
+      cellMatrix.some((row) =>
+        row.some((cell) => cell == null || typeof cell !== "object")
+      )
+    ) {
+      return null;
+    }
+
+    cells = cellMatrix.map((row) =>
+      row.map((cell) => {
+        // `getDisplayedCellProperties` 返回的是**显示值**，`format` 是确定对象。
+        // 若某格的 `format` 缺失（宿主异常），该格显示值不可确定 ⇒ 整个快照不可靠。
+        const projected = displayedCellFormatOf((cell as Excel.CellProperties).format);
+        if (!projected) throw new DisplayedFormatUnavailableError();
+        return projected;
+      })
+    );
+  }
+
+  // —— 兼容路径（宿主 < 1.19）：逐格读**直接格式**，并按本次动作实际修改的属性
+  // 记录"哪些是继承态"。缺席 ≠ 默认值：缺席就是"未直接设置"，不补任何默认。
+  let directCells: UndoCellDirectFormat[][] | null = null;
+  const inheritedFields = new Set<string>();
+  if (directProperties) {
+    const cellMatrix = directProperties.value;
+    if (!Array.isArray(cellMatrix) || cellMatrix.length !== rowCount) return null;
+    for (const row of cellMatrix) {
+      if (!Array.isArray(row) || row.length !== columnCount) return null;
+    }
+    if (
+      cellMatrix.some((row) =>
+        row.some((cell) => cell == null || typeof cell !== "object")
+      )
+    ) {
+      return null;
+    }
+    directCells = cellMatrix.map((row) =>
+      row.map((cell) => {
+        // `style` 与 `format` 同级（`CellPropertiesLoadOptions.style`），单独取出来。
+        const cellProperties = cell as Excel.CellProperties;
+        const direct = readDirectCellFormat(cellProperties.format, cellProperties.style);
+        const inherited = modifiedFields.filter(
+          (field) => !directFormatHasField(direct, field)
+        );
+        inherited.forEach((field) => inheritedFields.add(field));
+        return { direct, inherited: [...inherited] };
+      })
+    );
+  }
+
   return {
     horizontalAlignment: String(format.horizontalAlignment),
     verticalAlignment: String(format.verticalAlignment),
@@ -3754,8 +4601,35 @@ async function captureRangeFormat(
       style: String(border.style),
       color: border.color,
       weight: String(border.weight)
-    }))
+    })),
+    cells,
+    directCells,
+    inheritedFields: directCells ? [...inheritedFields].sort() : undefined,
+    compatPath: directCells != null,
+    // 行高三态：`number` = 直接设置；`"standard"` = `useStandardHeight` 为真（未直接设置）；
+    // `null` = 两者都拿不到（宿主异常，无法确定）。**不在范围内就不采**（数组缺席），
+    // 恢复侧据此判定"这次撤销不碰行高/列宽"。
+    rowHeights: rowValues?.map((row) => {
+      const f = row.format;
+      if (f?.rowHeight != null) return f.rowHeight;
+      if (f?.useStandardHeight === true) return "standard";
+      return null;
+    }),
+    columnWidths: columnValues?.map((column) => {
+      const f = column.format;
+      if (f?.columnWidth != null) return f.columnWidth;
+      if (f?.useStandardWidth === true) return "standard";
+      return null;
+    })
   };
+}
+
+/** 逐格显示格式不可用：`getDisplayedCellProperties` 返回的某格 `format` 缺失（宿主异常）。 */
+class DisplayedFormatUnavailableError extends Error {
+  constructor() {
+    super("无法确定单元格的显示格式，不能可靠保存恢复依据");
+    this.name = "DisplayedFormatUnavailableError";
+  }
 }
 
 /**
@@ -3915,7 +4789,83 @@ async function captureUndoRange(
   );
   await context.sync();
   const cellCount = range.formulas.length * (range.formulas[0]?.length ?? 0);
-  const format = await captureRangeFormat(context, range, cellCount);
+  const rowCount = range.formulas.length;
+  const columnCount = range.formulas[0]?.length ?? 0;
+  // 本次动作**实际要改**的属性：捕获、来源记录与拒绝判据都按它取，不做动作名一刀切。
+  const modifiedFields = excelFormatActionFields(action);
+  // 本次动作**实际要恢复**的范围（`undoRestoreScope`）。它是"采什么""恢复写什么"
+  // "冲突比什么"三处的唯一依据 —— 三处口径不同就会出现"没采却要写"或"写了却没比"。
+  const scope = undoRestoreScope(action);
+  const hasFormatScope = scope.cellFormat || scope.rowHeight || scope.columnWidth;
+  let format: UndoRangeFormat | null = null;
+  if (hasFormatScope) {
+    try {
+      format = await captureRangeFormat(
+        context,
+        range,
+        cellCount,
+        rowCount,
+        columnCount,
+        modifiedFields,
+        scope
+      );
+    } catch (error) {
+      if (error instanceof DisplayedFormatUnavailableError) {
+        // 逐格显示格式不可确定 ⇒ 视为"格式不可完整捕获"，走与 null 相同的拒绝路径。
+        format = null;
+      } else if (error instanceof FormatRangeUnrecoverableError) {
+        // 区域本身不可恢复（条件格式/合并区域/缺 API）：**指名道姓**地拒绝，
+        // 让用户在写入前就知道是哪一类区域、缺哪个 API，而不是笼统报错。
+        throw new Error(
+          `第 ${actionIndex + 1} 步 ${action.type} 的目标区域无法在执行前可靠保存恢复依据，已拒绝执行以避免产生不可撤销的修改：${error.message}`
+        );
+      } else {
+        throw error;
+      }
+    }
+  }
+  // 按动作**实际修改的属性**分别校验恢复能力（用户要求：不笼统"纯格式动作"一刀切）：
+  //  - setFill/setFont/setBorders/setAlignment 改逐格格式（`scope.cellFormat`）⇒ 需要逐格矩阵：
+  //    * 1.19 宿主看 `cells`（显示值）；
+  //    * 1.9–1.17 宿主看 `directCells`（直接格式兼容路径）；
+  //    两者都缺（区域过大 / 矩阵不匹配 / 显示值缺失 / 连 1.9 都没有）⇒ 执行前拒绝。
+  //  - resizeRange 改行高/列宽 ⇒ 依赖 rowHeights/columnWidths 三态；含 null（无法确定）时
+  //    执行前拒绝。
+  //  - setNumberFormat 改 numberFormat ⇒ 依赖 range.numberFormat（独立捕获，总是可得）。
+  // 值/公式类动作（writeValues 等）**根本不在格式范围内**，不采也不写，不在拒绝之列。
+  if (scope.cellFormat) {
+    const hasCellMatrix = format?.cells != null || format?.directCells != null;
+    if (!hasCellMatrix) {
+      throw new Error(
+        `第 ${actionIndex + 1} 步 ${action.type} 的目标区域逐格格式无法在执行前可靠保存恢复依据，已拒绝执行以避免产生不可撤销的修改`
+      );
+    }
+  }
+  if (scope.rowHeight || scope.columnWidth) {
+    // 行高/列宽的可靠恢复约束（**只校验本动作真的要改的那一项**）：
+    //  - 含 null（无法确定该行/列状态）⇒ 拒绝；
+    //  - 混合了"直接设置值"与"标准行高/列宽"⇒ `setRowProperties`/`setColumnProperties`
+    //    只能逐行写具体值、`useStandardHeight`/`useStandardWidth` 只能整区域统一重置，
+    //    无法逐行恢复"标准"行 ⇒ 拒绝；
+    //  - 全部直接设置 或 全部标准 ⇒ 可可靠恢复（分别走逐行写回 / 整区域重置）。
+    const heights = scope.rowHeight ? format?.rowHeights : undefined;
+    const widths = scope.columnWidth ? format?.columnWidths : undefined;
+    const heightsMixed =
+      heights && heights.some((h) => typeof h === "number") && heights.some((h) => h === "standard");
+    const widthsMixed =
+      widths && widths.some((w) => typeof w === "number") && widths.some((w) => w === "standard");
+    const heightBad =
+      scope.rowHeight &&
+      (!heights || heights.some((h) => h == null) || Boolean(heightsMixed));
+    const widthBad =
+      scope.columnWidth &&
+      (!widths || widths.some((w) => w == null) || Boolean(widthsMixed));
+    if (heightBad || widthBad) {
+      throw new Error(
+        `第 ${actionIndex + 1} 步 resizeRange 的目标区域行高/列宽无法在执行前可靠确定，已拒绝执行以避免产生不可撤销的修改`
+      );
+    }
+  }
   const beforeValues =
     cellCount > CHANGE_REVIEW_CAPTURE_MAX_CELLS
       ? null
@@ -3930,6 +4880,8 @@ async function captureUndoRange(
       fillColor: range.format.fill.color,
       fontBold: range.format.font.bold,
       fontColor: range.format.font.color,
+      scope,
+      formatFields: [...modifiedFields],
       format
     },
     beforeValues
@@ -3997,6 +4949,190 @@ function loadedRangePostFingerprint(range: Excel.Range): string {
 }
 
 /**
+ * 撤销守卫要读的全部字段。**一次 load 取回两代判据需要的所有属性** ——
+ * 分两次读会让每个范围多一次 `context.sync()`，而守卫在撤销与执行后各跑一遍。
+ */
+const UNDO_GUARD_RANGE_LOAD =
+  "formulas,numberFormat,format/fill/color,format/font/bold,format/font/color," +
+  "format/horizontalAlignment,format/verticalAlignment,format/wrapText," +
+  "format/rowHeight,format/columnWidth,format/indentLevel," +
+  "format/font/name,format/font/size,format/font/italic,format/font/underline";
+
+/**
+ * **第二代**执行后判据：在 `loadedRangePostFingerprint` 的六项之外，把
+ * 对齐 / 自动换行 / 行高列宽 / 缩进 / 字体名・字号・斜体・下划线 / 六条边框
+ * 一起摘要进来。
+ *
+ * 载荷是**严格超集**：第一代那六项也在里面。所以撤销前只要这一项存在，
+ * 就只用比它 —— 比得过就意味着第一代也对得上，不用再比一次。
+ *
+ * 存在的原因很具体：`setBorders` / `setAlignment` / `resizeRange` 执行完之后，
+ * 用户手动把某个边框改细、把对齐改回左对齐，第一代判据会认为"现场没变"，
+ * 撤销就照常覆盖了用户后来的编辑。
+ */
+function extendedFormatDigest(
+  range: Excel.Range,
+  borders: ReadonlyArray<{ sideIndex: Excel.BorderIndex; border: Excel.RangeBorder }>
+): string {
+  return localStateFingerprint({
+    formulas: range.formulas.map((row) => row.map(normalizeValue)),
+    numberFormat: range.numberFormat,
+    fillColor: range.format.fill.color,
+    fontBold: range.format.font.bold,
+    fontColor: range.format.font.color,
+    horizontalAlignment: String(range.format.horizontalAlignment),
+    verticalAlignment: String(range.format.verticalAlignment),
+    wrapText: range.format.wrapText,
+    rowHeight: range.format.rowHeight,
+    columnWidth: range.format.columnWidth,
+    indentLevel: range.format.indentLevel,
+    fontName: range.format.font.name,
+    fontSize: range.format.font.size,
+    fontItalic: range.format.font.italic,
+    fontUnderline: String(range.format.font.underline),
+    borders: borders.map(({ sideIndex, border }) => [
+      String(sideIndex),
+      String(border.style),
+      normalizedColor(border.color),
+      String(border.weight)
+    ])
+  });
+}
+
+/**
+ * 第三代判据的逐字段摘要：**只含本次撤销真正会写回的字段**（`scope` 为真的那几项）。
+ *
+ * 与 `extendedFormatDigest` 的区别是**覆盖范围跟着动作走**而非固定的全属性集合。
+ * 只改行高的动作不会因为用户改了字色而拒绝撤销（字色根本不会被写回，保留即可）；
+ * 但只要用户在**会被写回**的字段上动过手，摘要立刻就变，撤销在写入前报冲突。
+ */
+type UndoScopeFieldDigests = Partial<Record<keyof UndoRestoreScope, string>>;
+
+/**
+ * 读一次撤销守卫现场，同时给出三代判据。
+ *
+ * 边框必须逐条 `getItem().load()` —— `range.load()` 的路径串表达不了集合元素，
+ * 所以这里先 load 范围属性、再把六条边框挂上，最后**一次** `context.sync()`。
+ *
+ * 第三代判据（`scopeFieldDigests`/`scopeDigest`）**按 `scope` 决定读什么**：
+ *  - `cellFormat` ⇒ 逐格读一遍（显示值或直接格式，与采集同源），摘要按**逐格矩阵**算，
+ *    这样"区域里某一格被改过"也能被发现（区域级单值在混合状态下会钝化）；
+ *  - `rowHeight`/`columnWidth` ⇒ 逐行/逐列读，摘要按**逐行/逐列数组**算；
+ *  - `formulas`/`numberFormat` ⇒ 直接摘要矩阵。
+ * 前两代判据照旧算，供**旧恢复点**走原判据。
+ */
+async function readUndoGuardState(
+  context: Excel.RequestContext,
+  range: Excel.Range,
+  scope: UndoRestoreScope,
+  formatFields?: readonly string[]
+): Promise<{
+  postFingerprint: string;
+  extendedFormatDigest: string;
+  scopeFieldDigests: UndoScopeFieldDigests;
+  /** 逐格式属性摘要（键为 `ExcelFormatField`）：冲突文案指名具体属性用。 */
+  cellFormatFieldDigests: Record<string, string>;
+  scopeDigest: string;
+  /** 兼容路径下顺带读回的**当前逐格直接格式**（撤销时用来保住非本动作属性的后续编辑）。 */
+  observedDirectCells: DirectCellFormatValues[][] | null;
+}> {
+  range.load(UNDO_GUARD_RANGE_LOAD);
+  const borders = undoBorderSides().map((sideIndex) => {
+    const border = range.format.borders.getItem(sideIndex);
+    border.load("style,color,weight");
+    return { sideIndex, border };
+  });
+  // 逐格格式摘要：与采集同源（显示值路径 / 直接格式兼容路径二选一）。宿主连 1.9 都没有时
+  // 读不了 ⇒ 该字段不进摘要（它的恢复本来也不可能发生）。
+  const capability = currentExcelFormatCapability();
+  const displayed = capability.path === "displayed";
+  const cellProperties =
+    scope.cellFormat && capability.path !== "unavailable"
+      ? displayed
+        ? range.getDisplayedCellProperties({ format: DISPLAYED_FORMAT_LOAD_OPTIONS })
+        : range.getCellProperties(DIRECT_CELL_PROPERTIES_LOAD)
+      : null;
+  const rowProperties = scope.rowHeight
+    ? range.getRowProperties({ format: { rowHeight: true, useStandardHeight: true } })
+    : null;
+  const columnProperties = scope.columnWidth
+    ? range.getColumnProperties({ format: { columnWidth: true, useStandardWidth: true } })
+    : null;
+  await context.sync();
+
+  const fieldDigests: UndoScopeFieldDigests = {};
+  // 逐**格式属性**摘要：冲突文案要指名具体属性（"加粗"），而不是笼统的"单元格格式"。
+  // 它与聚合摘要读**同一份**中间表示，因此两者不可能互相矛盾。
+  const cellFormatFieldDigests: Record<string, string> = {};
+  if (scope.formulas) {
+    fieldDigests.formulas = localStateFingerprint(
+      range.formulas.map((row) => row.map(normalizeValue))
+    );
+  }
+  if (scope.numberFormat) {
+    fieldDigests.numberFormat = localStateFingerprint(range.numberFormat);
+  }
+  let observedDirectCells: DirectCellFormatValues[][] | null = null;
+  if (cellProperties) {
+    // **摘要只覆盖本动作真正会写回的属性**（`formatFields`；旧记录没有这份信息就按全集）。
+    // 于是"用户改了某个本动作没碰过的属性"不会让摘要变化 ⇒ 撤销照常执行且**保留**该编辑；
+    // 只有用户改了**会被写回**的属性，摘要才会变 ⇒ 在写入前报冲突。
+    const scopedFields = formatFields ?? ALL_DIRECT_FORMAT_FIELDS;
+    const rows = cellProperties.value;
+    // 先把每格归一成一份中间表示（显示值路径 / 直接格式路径二选一），再按键集合投影。
+    // 聚合摘要与逐属性摘要都从这份中间表示派生 —— 同一个源，不会互相矛盾。
+    let sources: (Record<string, unknown> | null)[][];
+    if (displayed) {
+      sources = rows.map((row) =>
+        row.map((cell) => {
+          const projected = displayedCellFormatOf((cell as Excel.CellProperties).format);
+          return projected ? (projected as unknown as Record<string, unknown>) : null;
+        })
+      );
+    } else {
+      observedDirectCells = rows.map((row) =>
+        row.map((cell) => {
+          const properties = cell as Excel.CellProperties;
+          return readDirectCellFormat(properties.format, properties.style);
+        })
+      );
+      sources = observedDirectCells.map((row) =>
+        row.map((direct) => direct as unknown as Record<string, unknown>)
+      );
+    }
+    const projectAll = (keys: ReadonlySet<string>) =>
+      sources.map((row) =>
+        row.map((source) => (source ? projectKeys(source, keys) : null))
+      );
+    const keysOfFields = (fields: readonly string[]) =>
+      asKeySet(displayed ? displayedKeysOfFields(fields) : directKeysOfFields(fields));
+    fieldDigests.cellFormat = localStateFingerprint(projectAll(keysOfFields(scopedFields)));
+    for (const field of scopedFields) {
+      cellFormatFieldDigests[field] = localStateFingerprint(projectAll(keysOfFields([field])));
+    }
+  }
+  if (rowProperties) {
+    fieldDigests.rowHeight = localStateFingerprint(
+      rowProperties.value.map((row) => row.format?.rowHeight ?? null)
+    );
+  }
+  if (columnProperties) {
+    fieldDigests.columnWidth = localStateFingerprint(
+      columnProperties.value.map((column) => column.format?.columnWidth ?? null)
+    );
+  }
+  return {
+    postFingerprint: loadedRangePostFingerprint(range),
+    extendedFormatDigest: extendedFormatDigest(range, borders),
+    scopeFieldDigests: fieldDigests,
+    cellFormatFieldDigests,
+    // 字段名集合本身也进摘要：范围收窄/放宽都不是"现场没变"。
+    scopeDigest: localStateFingerprint(fieldDigests),
+    observedDirectCells
+  };
+}
+
+/**
  * 出网身份字符串。归一规则已下沉到 core 的 `officeIdentityFromUrl`,
  * 这里不再自行拼接 `url:` 前缀 —— 两份实现一旦漂移,已落盘账本里的旧记录
  * 就会因身份对不上而失去续跑与撤销入口。
@@ -4026,7 +5162,13 @@ const OFFICE_RECOVERY_ACTION_TYPES = new Set<ExcelAction["type"]>([
   "writeFormulas",
   "setFill",
   "setFont",
-  "setNumberFormat"
+  "setNumberFormat",
+  // 这三个只改格式，`recoverableActionRange` 与 `captureRangeFormat` 都已覆盖它们；
+  // 之前漏在这里，表现是"能执行、能撤销，但重启后无法核对在途动作"。
+  // `autofit` 仍不在名单里：它的结果由宿主按内容算，没有确定性期望值可比对。
+  "setBorders",
+  "setAlignment",
+  "resizeRange"
 ]);
 
 export interface OfficeRecoverySupport {
@@ -4035,8 +5177,23 @@ export interface OfficeRecoverySupport {
 }
 
 export function officeRecoverySupport(plan: AnalysisPlan): OfficeRecoverySupport {
+  /*
+   * 读写重叠只看**实际来源依赖**，不看指纹覆盖范围。
+   *
+   * 指纹覆盖范围端上取的是本次授权范围（含写入目标），拿它判重叠会把每一个
+   * 正常计划都判成"会修改来源表"，登记断点恢复因此永远不可达。来源依赖由
+   * `sourceDependencySheets` 承载，只来自本端可信记账（确定性本地读取／工具
+   * 执行记录／已保存工具模板声明）；缺失时**退回指纹范围** —— 也就是既有的
+   * 保守拒绝条件原样保留：依赖不确定就说不确定，不猜，也绝不用"授权范围减去
+   * 写入目标"伪造来源集合。
+   */
+  const declaredDependency = plan.sourceDependencySheets?.length
+    ? plan.sourceDependencySheets
+    : null;
   const sourceSheets = new Set(
-    (plan.sourceFingerprintSheets ?? []).map((name) => name.toLocaleLowerCase())
+    (declaredDependency ?? plan.sourceFingerprintSheets ?? []).map((name) =>
+      name.toLocaleLowerCase()
+    )
   );
   for (const [index, action] of plan.actions.entries()) {
     if (!OFFICE_RECOVERY_ACTION_TYPES.has(action.type)) {
@@ -4054,13 +5211,18 @@ export function officeRecoverySupport(plan: AnalysisPlan): OfficeRecoverySupport
     if (sourceSheets.has(action.sheet.toLocaleLowerCase())) {
       return {
         supported: false,
-        reason: `第 ${index + 1} 步会修改来源工作表，暂不能区分任务自身修改与恢复期间的外部修改`
+        reason: declaredDependency
+          ? `第 ${index + 1} 步会修改来源工作表，暂不能区分任务自身修改与恢复期间的外部修改`
+          : `第 ${index + 1} 步会修改本次覆盖的来源范围，而这次没有"本机实际读过哪些表"的可信记账，无法确定来源与目标是否重叠`
       };
     }
     if (
       action.type === "setFont" &&
-      action.bold === undefined &&
-      !action.color
+      action.bold == null &&
+      action.italic == null &&
+      action.name == null &&
+      action.size == null &&
+      action.color == null
     ) {
       return {
         supported: false,
@@ -4079,6 +5241,22 @@ export interface OfficeRangeObservedState {
   fillColor: string;
   fontBold: boolean;
   fontColor: string;
+  /**
+   * 扩展格式现场。**全部可选**：`observedRangeFingerprint` 的载荷刻意保持不变
+   * （改它会让已经落盘的在途检查点指纹对不上），所以这些字段只服务于
+   * `classifyOfficeActionState` 对格式动作的判定，不参与指纹。
+   */
+  fontItalic?: boolean;
+  fontName?: string;
+  fontSize?: number;
+  horizontal?: string;
+  vertical?: string;
+  wrapText?: boolean;
+  rowHeight?: number;
+  columnWidth?: number;
+  borders?: Partial<
+    Record<BorderSide, { style: string; color: string; weight: string }>
+  >;
 }
 
 export type OfficeActionReconciliationOutcome =
@@ -4092,6 +5270,18 @@ function sameMatrix(left: unknown[][], right: unknown[][]): boolean {
 
 function sameColor(left: string, right: string): boolean {
   return left.trim().toLocaleUpperCase() === right.trim().toLocaleUpperCase();
+}
+
+/**
+ * 数值比较的"现场缺值 ⇒ 不通过"版本。
+ *
+ * `closeEnough` 收的是两个 `number`，而格式动作的现场值是按需读取的可选字段：
+ * 没读到就是 `undefined`。把 `undefined` 直接喂给 `closeEnough` 在类型上过不去，
+ * 用 `?? 0` 之类去凑更糟 —— 那会把"没读到"当成"读到 0"，判成通过。
+ * 所以这里显式表达"没读到就不算匹配"。
+ */
+function closeEnoughObserved(left: number | undefined, right: number): boolean {
+  return typeof left === "number" && closeEnough(left, right);
 }
 
 function observedRangeFingerprint(state: OfficeRangeObservedState): string {
@@ -4135,9 +5325,42 @@ export function classifyOfficeActionState(
       matchesExpected = sameColor(observed.fillColor, action.color);
       break;
     case "setFont":
+      // 五个属性各自独立判：`!= null` 表示"这次要改它"。
       matchesExpected =
-        (action.bold === undefined || observed.fontBold === action.bold) &&
-        (!action.color || sameColor(observed.fontColor, action.color));
+        (action.bold == null || observed.fontBold === action.bold) &&
+        (action.italic == null || observed.fontItalic === action.italic) &&
+        (action.name == null || observed.fontName === action.name) &&
+        (action.size == null || closeEnoughObserved(observed.fontSize, action.size)) &&
+        (action.color == null || sameColor(observed.fontColor, action.color));
+      break;
+    case "setBorders": {
+      const expected = normalizeBorderAction(action);
+      matchesExpected = expected.sides.every((side) => {
+        const seen = observed.borders?.[side];
+        if (!seen) return false;
+        return (
+          normalizedEnum(seen.style) === normalizedEnum(expected.style) &&
+          sameColor(seen.color, expected.color) &&
+          normalizedEnum(seen.weight) === normalizedEnum(expected.weight)
+        );
+      });
+      break;
+    }
+    case "setAlignment":
+      matchesExpected =
+        (action.horizontal == null ||
+          normalizedEnum(observed.horizontal) ===
+            normalizedEnum(action.horizontal)) &&
+        (action.vertical == null ||
+          normalizedEnum(observed.vertical) === normalizedEnum(action.vertical)) &&
+        (action.wrapText == null || observed.wrapText === action.wrapText);
+      break;
+    case "resizeRange":
+      matchesExpected =
+        (action.rowHeight == null ||
+          closeEnoughObserved(observed.rowHeight, action.rowHeight)) &&
+        (action.columnWidth == null ||
+          closeEnoughObserved(observed.columnWidth, action.columnWidth));
       break;
     case "setNumberFormat":
       matchesExpected = observed.numberFormat.every((row) =>
@@ -4216,15 +5439,41 @@ export async function reconcileOfficeRangeAction(input: {
     if (sheet.isNullObject) return { outcome: "unknown" as const };
     const range = sheet.getRange(address);
     range.load(
-      "formulas,numberFormat,format/fill/color,format/font/bold,format/font/color"
+      "formulas,numberFormat,format/fill/color,format/font/bold,format/font/color," +
+        "format/font/name,format/font/size,format/font/italic," +
+        "format/horizontalAlignment,format/verticalAlignment,format/wrapText," +
+        "format/rowHeight,format/columnWidth"
     );
+    const borderObjects = undoBorderSides().map((sideIndex) => {
+      const border = range.format.borders.getItem(sideIndex);
+      border.load("style,color,weight");
+      return { sideIndex, border };
+    });
     await context.sync();
     const observed: OfficeRangeObservedState = {
       formulas: range.formulas.map((row) => row.map(normalizeValue)),
       numberFormat: range.numberFormat,
       fillColor: range.format.fill.color,
       fontBold: range.format.font.bold,
-      fontColor: range.format.font.color
+      fontColor: range.format.font.color,
+      fontItalic: range.format.font.italic,
+      fontName: String(range.format.font.name),
+      fontSize: range.format.font.size,
+      horizontal: String(range.format.horizontalAlignment),
+      vertical: String(range.format.verticalAlignment),
+      wrapText: range.format.wrapText,
+      rowHeight: range.format.rowHeight,
+      columnWidth: range.format.columnWidth,
+      borders: Object.fromEntries(
+        borderObjects.map(({ sideIndex, border }) => [
+          borderSideName(sideIndex),
+          {
+            style: String(border.style),
+            color: border.color,
+            weight: String(border.weight)
+          }
+        ])
+      )
     };
     const outcome = classifyOfficeActionState(action, input.before, observed);
     if (outcome !== "applied") return { outcome };
@@ -4298,11 +5547,19 @@ async function captureUndoPostState(
       continue;
     }
     const range = sheet.getRange(saved.range);
-    range.load(
-      "formulas,numberFormat,format/fill/color,format/font/bold,format/font/color"
+    const observed = await readUndoGuardState(
+      context,
+      range,
+      scopeOf(saved),
+      saved.formatFields
     );
-    await context.sync();
-    saved.postFingerprint = loadedRangePostFingerprint(range);
+    saved.postFingerprint = observed.postFingerprint;
+    saved.extendedFormatDigest = observed.extendedFormatDigest;
+    // 第三代判据（按恢复范围、逐格/逐行）—— 新记录的主判据。
+    saved.scopeFieldDigests = observed.scopeFieldDigests;
+    // 主判据的按属性再拆分：只用于冲突文案指名具体属性，不参与判定。
+    saved.cellFormatFieldDigests = observed.cellFormatFieldDigests;
+    saved.scopeDigest = observed.scopeDigest;
   }
 
   const createdWorksheetStates: UndoCreatedWorksheetState[] = [];
@@ -4386,7 +5643,61 @@ async function buildExecutionUndoSnapshot(
   };
 }
 
-async function assertUndoPostState(
+/** 恢复范围字段的中文名，仅用于冲突报错**指名到底哪一项对不上**。 */
+const UNDO_SCOPE_FIELD_LABELS: Record<keyof UndoRestoreScope, string> = {
+  formulas: "值/公式",
+  numberFormat: "数字格式",
+  cellFormat: "单元格格式",
+  rowHeight: "行高",
+  columnWidth: "列宽"
+};
+
+/** `ExcelFormatField` → 冲突文案里的中文属性名。 */
+const FORMAT_FIELD_LABELS: Record<string, string> = {
+  fill: "填充",
+  fontName: "字体",
+  fontSize: "字号",
+  fontBold: "加粗",
+  fontItalic: "斜体",
+  fontColor: "字色",
+  fontUnderline: "下划线",
+  horizontalAlignment: "水平对齐",
+  verticalAlignment: "垂直对齐",
+  wrapText: "自动换行",
+  indentLevel: "缩进",
+  borders: "边框"
+};
+
+/**
+ * 列出两代按字段摘要里**对不上**的字段名（供冲突文案指名）。
+ *
+ * `cellFormat` 一项还会再往下拆到具体属性 —— "单元格格式对不上"对用户没有可操作性，
+ * 而"单元格格式（加粗）"直接指出该去哪一格看什么。
+ */
+function changedScopeFields(
+  saved: UndoScopeFieldDigests | undefined,
+  observed: UndoScopeFieldDigests,
+  savedFormatFields?: Record<string, string>,
+  observedFormatFields?: Record<string, string>
+): string {
+  const keys = Object.keys(observed) as (keyof UndoRestoreScope)[];
+  const changed = keys.filter((key) => saved?.[key] !== observed[key]);
+  if (changed.length === 0) return "未知字段";
+  return changed
+    .map((key) => {
+      const label = UNDO_SCOPE_FIELD_LABELS[key] ?? String(key);
+      if (key !== "cellFormat") return label;
+      const current = observedFormatFields ?? {};
+      const fields = Object.keys(current).filter(
+        (field) => (savedFormatFields?.[field] ?? null) !== current[field]
+      );
+      if (fields.length === 0) return label;
+      return `${label}（${fields.map((field) => FORMAT_FIELD_LABELS[field] ?? field).join("、")}）`;
+    })
+    .join("、");
+}
+
+export async function assertUndoPostState(
   context: Excel.RequestContext,
   snapshot: ExecutionUndoSnapshot
 ): Promise<void> {
@@ -4414,14 +5725,33 @@ async function assertUndoPostState(
       throw new Error(`工作表「${saved.sheet}」已不存在，已停止撤销。`);
     }
     const range = sheet.getRange(saved.range);
-    range.load(
-      "formulas,numberFormat,format/fill/color,format/font/bold,format/font/color"
-    );
-    await context.sync();
-    if (loadedRangePostFingerprint(range) !== saved.postFingerprint) {
-      throw new Error(
-        `「${saved.sheet}」${saved.range} 在执行后又发生了变化，已停止撤销以免覆盖后续编辑。`
-      );
+    const scope = scopeOf(saved);
+    const observed = await readUndoGuardState(context, range, scope, saved.formatFields);
+    // 判据优先级（由强到弱）：
+    //  1. 第三代 `scopeDigest` —— 覆盖范围**恰好等于实际恢复范围**，逐格/逐行；
+    //  2. 第二代 `extendedFormatDigest` —— 旧记录，固定的全属性集合（载荷是第三代的超集）；
+    //  3. 第一代 `postFingerprint` —— 最旧的记录，只看值/公式/数字格式/填充色/加粗/字色。
+    // 逐级退回是为了"升级不把旧恢复点判成执行后又被改过"，而不是为了放行。
+    if (saved.scopeDigest) {
+      if (observed.scopeDigest !== saved.scopeDigest) {
+        throw new Error(
+          `「${saved.sheet}」${saved.range} 在本次撤销将要写回的字段（${changedScopeFields(
+            saved.scopeFieldDigests,
+            observed.scopeFieldDigests,
+            saved.cellFormatFieldDigests,
+            observed.cellFormatFieldDigests
+          )}）上又发生了变化，已停止撤销以免覆盖后续编辑。`
+        );
+      }
+    } else {
+      const stale = saved.extendedFormatDigest
+        ? observed.extendedFormatDigest !== saved.extendedFormatDigest
+        : observed.postFingerprint !== saved.postFingerprint;
+      if (stale) {
+        throw new Error(
+          `「${saved.sheet}」${saved.range} 在执行后又发生了变化，已停止撤销以免覆盖后续编辑。`
+        );
+      }
     }
   }
 
@@ -4452,20 +5782,223 @@ async function assertUndoPostState(
   }
 }
 
-/** 恢复完整格式；捕获时因区域过大而降级的（null）直接跳过。 */
+/**
+ * 读取区域内**此刻**的逐格直接格式（兼容路径专用）。
+ *
+ * 为什么必须"此刻重新读"：撤销是**反序**执行的，而 `clear(Formats)` 之后要把
+ * "非本动作属性"的当前值补回去（否则会连带清掉其它属性）。这个"当前"必须是
+ * **每个动作恢复的那一刻**的现场 —— 反序恢复时，较早的动作看到的是较晚动作
+ * **刚刚恢复过**的状态。若沿用"复核阶段一次性读回"的那份快照，较早的动作会把
+ * 较晚动作刚撤销掉的属性又写回来（同区域"先加粗、后居中"就是这样：加粗恢复时
+ * 用旧快照把居中写回，撤销后居中仍在）。
+ *
+ * 与 `readUndoGuardState` 用**同一套原语**（`DIRECT_CELL_PROPERTIES_LOAD` +
+ * `readDirectCellFormat`），两份表示不可能漂移。
+ */
+async function readCurrentDirectCells(
+  context: Excel.RequestContext,
+  range: Excel.Range
+): Promise<DirectCellFormatValues[][] | null> {
+  // 只有兼容（直接格式）路径需要它；显示值路径与不可用宿主都返回 null。
+  if (currentExcelFormatCapability().path !== "direct") return null;
+  const properties = range.getCellProperties(DIRECT_CELL_PROPERTIES_LOAD);
+  await context.sync();
+  return properties.value.map((row) =>
+    row.map((cell) => {
+      const typed = cell as Excel.CellProperties;
+      return readDirectCellFormat(typed.format, typed.style);
+    })
+  );
+}
+
+/**
+ * 把捕获到的**直接格式子集**翻译成 `setCellProperties` 的载荷。
+ *
+ * 只写**确实出现过**的字段：没有的字段一律不出现在载荷里 ⇒ 该属性保持"未直接设置"。
+ * 这一点是"未采集 ≠ 默认值"的执行侧体现 —— 绝不在这里补默认值。
+ *
+ * `style`（单元格命名样式）是 `SettableCellProperties` 的同级字段，**不进 `format`**；
+ * 拼错层级不会报错，只会静默不生效。
+ */
+function buildDirectCellProperties(
+  direct: DirectCellFormatValues
+): Excel.SettableCellProperties {
+  const format: Record<string, unknown> = {};
+  const fill: Record<string, unknown> = {};
+  if (direct.fillPattern != null) fill.pattern = direct.fillPattern;
+  if (direct.fillColor != null) fill.color = direct.fillColor;
+  if (direct.fillPatternColor != null) fill.patternColor = direct.fillPatternColor;
+  if (direct.fillPatternTintAndShade != null) {
+    fill.patternTintAndShade = direct.fillPatternTintAndShade;
+  }
+  if (direct.fillTintAndShade != null) fill.tintAndShade = direct.fillTintAndShade;
+  if (Object.keys(fill).length > 0) format.fill = fill;
+  const font: Record<string, unknown> = {};
+  if (direct.fontName != null) font.name = direct.fontName;
+  if (direct.fontSize != null) font.size = direct.fontSize;
+  if (direct.fontBold != null) font.bold = direct.fontBold;
+  if (direct.fontItalic != null) font.italic = direct.fontItalic;
+  if (direct.fontColor != null) font.color = direct.fontColor;
+  if (direct.fontUnderline != null) font.underline = direct.fontUnderline;
+  if (direct.fontStrikethrough != null) font.strikethrough = direct.fontStrikethrough;
+  if (direct.fontSubscript != null) font.subscript = direct.fontSubscript;
+  if (direct.fontSuperscript != null) font.superscript = direct.fontSuperscript;
+  if (direct.fontTintAndShade != null) font.tintAndShade = direct.fontTintAndShade;
+  if (Object.keys(font).length > 0) format.font = font;
+  if (direct.horizontalAlignment != null) format.horizontalAlignment = direct.horizontalAlignment;
+  if (direct.verticalAlignment != null) format.verticalAlignment = direct.verticalAlignment;
+  if (direct.wrapText != null) format.wrapText = direct.wrapText;
+  if (direct.indentLevel != null) format.indentLevel = direct.indentLevel;
+  if (direct.shrinkToFit != null) format.shrinkToFit = direct.shrinkToFit;
+  if (direct.textOrientation != null) format.textOrientation = direct.textOrientation;
+  if (direct.readingOrder != null) format.readingOrder = direct.readingOrder;
+  if (direct.autoIndent != null) format.autoIndent = direct.autoIndent;
+  if (direct.locked != null || direct.formulaHidden != null) {
+    const protection: Record<string, unknown> = {};
+    if (direct.locked != null) protection.locked = direct.locked;
+    if (direct.formulaHidden != null) protection.formulaHidden = direct.formulaHidden;
+    format.protection = protection;
+  }
+  if (direct.borders) format.borders = direct.borders;
+  const properties: Excel.SettableCellProperties = {};
+  if (direct.style != null) properties.style = direct.style;
+  properties.format = format as Excel.CellPropertiesFormat;
+  return properties;
+}
+
+/**
+ * 恢复完整格式；捕获时因区域过大而降级的（null）直接跳过。
+ *
+ * 优先走**按粒度**字段：兼容路径的 `directCells`（直接格式集合）优先于显示值 `cells`，
+ * 两者都没有才退回旧版区域级单值。
+ */
 function restoreRangeFormat(
   range: Excel.Range,
-  saved: UndoRangeFormat | null | undefined
+  saved: UndoRangeFormat | null | undefined,
+  scope: UndoRestoreScope,
+  formatFields?: readonly string[],
+  observedDirectCells?: DirectCellFormatValues[][] | null
 ): void {
   if (!saved) return;
+  // **只写本次动作真正会影响的部分**（`scope`）。写回"执行前的值"看起来无害，实则会把
+  // 用户在执行之后对这些属性做的编辑一起抹掉 —— 本动作没改过的属性就不该被写。
+  if (scope.cellFormat) restoreCellFormats(range, saved, formatFields, observedDirectCells);
+  if (scope.rowHeight) restoreRowHeights(range, saved);
+  if (scope.columnWidth) restoreColumnWidths(range, saved);
+}
+
+/**
+ * 显示值路径下按**属性子集**拼 `setCellProperties` 载荷。
+ *
+ * 只含被请求的键：显示值路径不需要 `clear`（每格写的是确定的显示值），所以没被写回的
+ * 属性**原样保留** —— 包括用户在本动作之后自己改的那些。
+ */
+function buildDisplayedCellFormat(
+  cell: UndoCellFormat,
+  keys: ReadonlySet<keyof UndoCellFormat>
+): Record<string, unknown> {
+  const format: Record<string, unknown> = {};
+  if (keys.has("fillPattern") || keys.has("fillColor")) {
+    const fill: Record<string, unknown> = { pattern: cell.fillPattern };
+    if (cell.fillColor != null) fill.color = cell.fillColor;
+    format.fill = fill;
+  }
+  const font: Record<string, unknown> = {};
+  if (keys.has("fontName")) font.name = cell.fontName;
+  if (keys.has("fontSize")) font.size = cell.fontSize;
+  if (keys.has("fontBold")) font.bold = cell.fontBold;
+  if (keys.has("fontItalic")) font.italic = cell.fontItalic;
+  if (keys.has("fontColor")) font.color = cell.fontColor;
+  if (keys.has("fontUnderline")) font.underline = cell.fontUnderline;
+  if (Object.keys(font).length > 0) format.font = font;
+  if (keys.has("horizontalAlignment")) format.horizontalAlignment = cell.horizontalAlignment;
+  if (keys.has("verticalAlignment")) format.verticalAlignment = cell.verticalAlignment;
+  if (keys.has("wrapText")) format.wrapText = cell.wrapText;
+  if (keys.has("indentLevel")) format.indentLevel = cell.indentLevel;
+  if (keys.has("borders")) {
+    format.borders = {
+      top: cell.borders.top,
+      bottom: cell.borders.bottom,
+      left: cell.borders.left,
+      right: cell.borders.right
+    };
+  }
+  return format;
+}
+
+/**
+ * 逐格格式恢复（`scope.cellFormat` 为真时才会被调用）。
+ *
+ * **只写回本动作实际修改的属性**（`formatFields`）。写回"执行前的整份格式"看起来更保险，
+ * 实则会把用户在本动作之后对**别的属性**（文字方向、收缩适应、保护……）做的编辑一起抹掉；
+ * 而"本动作没碰过的属性"根本不该出现在恢复写入里。
+ */
+function restoreCellFormats(
+  range: Excel.Range,
+  saved: UndoRangeFormat,
+  formatFields?: readonly string[],
+  observedDirectCells?: DirectCellFormatValues[][] | null
+): void {
   const format = range.format;
+  // 旧恢复点没有 `formatFields` ⇒ 按全集处理（保守，且与旧行为一致）。
+  const fields = formatFields ?? ALL_DIRECT_FORMAT_FIELDS;
+  // 按粒度恢复优先：逐格格式矩阵优先，都没有才退回旧版区域级单值。
+  // 新捕获（有 `cells`/`directCells`）时绝不走区域级单值路径 —— 否则"先拍平成单值、
+  // 再逐格覆盖"不仅冗余，还会把"未逐格采集却因旧单值而短暂写坏"的隐患带进来。
+  if (saved.directCells) {
+    const directKeys = directKeysOfFields(fields);
+    if (directKeys.size === 0) return;
+    // —— 兼容路径（宿主 < ExcelApi 1.19）：恢复的是**格式的来源语义**，不是显示值。
+    //
+    // 只有当本动作确实把某个"执行前**未**直接设置"的属性设上过，才必须先 `clear(Formats)`：
+    // Excel 没有"只取消某一个属性的直接设置"的 API，要让那个属性回到继承态只能整格清掉。
+    // 其余情况**一律不清**（用户要求：不能动不动就 clear），按属性写回即可。
+    const needsClear = saved.directCells.some((row) =>
+      row.some((cell) => cell.inherited.length > 0)
+    );
+    const matrix = saved.directCells.map((row, rowIndex) =>
+      row.map((cell, columnIndex) => {
+        // 本动作管辖的属性 ⇒ 回到执行前的取值；当初没直接设置的键就**不出现**（保持继承）。
+        const restored = pickKeys(cell.direct, directKeys) as DirectCellFormatValues;
+        if (!needsClear) return buildDirectCellProperties(restored);
+        // `clear` 会带走**整格**直接格式（含数字格式与命名样式），所以必须把
+        // "非本动作属性"的**当前**取值补回去 —— 否则执行前就有的其它属性、以及用户在本动作
+        // 之后的编辑都会一起丢。这就是"撤销只覆盖实际恢复范围"在 clear 路径上的落实。
+        const current = observedDirectCells?.[rowIndex]?.[columnIndex] ?? {};
+        const merged: Record<string, unknown> = { ...current };
+        for (const key of Object.keys(restored)) {
+          merged[key] = (restored as Record<string, unknown>)[key];
+        }
+        // 本动作管辖但当初未直接设置的键 ⇒ 显式剔除（清空后保持"未直接设置"）。
+        for (const key of directKeys) {
+          if ((restored as Record<string, unknown>)[key] === undefined) delete merged[key];
+        }
+        return buildDirectCellProperties(merged as DirectCellFormatValues);
+      })
+    );
+    if (needsClear) range.clear(Excel.ClearApplyTo.formats);
+    range.setCellProperties(matrix as Excel.SettableCellProperties[][]);
+    return;
+  }
+  if (saved.cells) {
+    const displayedKeys = displayedKeysOfFields(fields);
+    if (displayedKeys.size === 0) return;
+    // 逐格写回**执行前的显示值**里、属于本动作属性的那一部分。其余属性不写 ⇒ 原样保留。
+    range.setCellProperties(
+      saved.cells.map((row) =>
+        row.map((cell) => ({
+          format: buildDisplayedCellFormat(cell, displayedKeys)
+        }))
+      ) as Excel.SettableCellProperties[][]
+    );
+    return;
+  }
+  // 旧恢复点（无逐格矩阵）退回区域级单值。
   format.horizontalAlignment =
     saved.horizontalAlignment as Excel.HorizontalAlignment;
   format.verticalAlignment =
     saved.verticalAlignment as Excel.VerticalAlignment;
   if (saved.wrapText !== null) format.wrapText = saved.wrapText;
-  format.rowHeight = saved.rowHeight;
-  format.columnWidth = saved.columnWidth;
   format.indentLevel = saved.indentLevel;
   format.font.name = saved.fontName;
   format.font.size = saved.fontSize;
@@ -4476,6 +6009,54 @@ function restoreRangeFormat(
     target.style = border.style as Excel.BorderLineStyle;
     target.color = border.color;
     target.weight = border.weight as Excel.BorderWeight;
+  }
+}
+
+/**
+ * 行高恢复（`scope.rowHeight` 为真时才会被调用）。三态：
+ *  - 全部 `number`（直接设置值）：逐行写回。
+ *  - 全部 `"standard"`（未直接设置，标准行高）：`SettableRowProperties` 无
+ *    `useStandardHeight` 字段，无法逐行写"标准"，只能整区域 `format.useStandardHeight=true`
+ *    一次性重置。
+ *  - 混合 / 含 null：`captureUndoRange` 已对 resizeRange 执行前拒绝，不会走到撤销；
+ *    这里仅作旧恢复点兼容（退回区域级单值兜底）。
+ */
+function restoreRowHeights(range: Excel.Range, saved: UndoRangeFormat): void {
+  const format = range.format;
+  if (saved.rowHeights) {
+    const allStandard = saved.rowHeights.every((h) => h === "standard");
+    const allNumber = saved.rowHeights.every((h) => typeof h === "number");
+    if (allStandard) {
+      format.useStandardHeight = true;
+    } else if (allNumber) {
+      range.setRowProperties(
+        saved.rowHeights.map((height) => ({ format: { rowHeight: height as number } }))
+      );
+    } else {
+      format.rowHeight = saved.rowHeight;
+    }
+  } else {
+    format.rowHeight = saved.rowHeight;
+  }
+}
+
+/** 列宽恢复（`scope.columnWidth` 为真时才会被调用）。三态语义同 `restoreRowHeights`。 */
+function restoreColumnWidths(range: Excel.Range, saved: UndoRangeFormat): void {
+  const format = range.format;
+  if (saved.columnWidths) {
+    const allStandard = saved.columnWidths.every((w) => w === "standard");
+    const allNumber = saved.columnWidths.every((w) => typeof w === "number");
+    if (allStandard) {
+      format.useStandardWidth = true;
+    } else if (allNumber) {
+      range.setColumnProperties(
+        saved.columnWidths.map((width) => ({ format: { columnWidth: width as number } }))
+      );
+    } else {
+      format.columnWidth = saved.columnWidth;
+    }
+  } else {
+    format.columnWidth = saved.columnWidth;
   }
 }
 
@@ -4500,17 +6081,38 @@ export async function undoExecution(
       ws.position = saved.position;
     }
     await context.sync();
-    // 再恢复单元格值/公式/常用格式。
+    // 再恢复单元格值/公式/常用格式。**每一项都按本次动作实际影响的范围来写**：
+    // 只改行高的动作不写值、不写格式；只改值的动作不写任何格式。
     for (const saved of [...snapshot.ranges].reverse()) {
       const range = context.workbook.worksheets
         .getItem(saved.sheet)
         .getRange(saved.range);
-      range.formulas = saved.formulas;
-      range.numberFormat = saved.numberFormat;
-      range.format.fill.color = saved.fillColor;
-      range.format.font.bold = saved.fontBold;
-      range.format.font.color = saved.fontColor;
-      restoreRangeFormat(range, saved.format);
+      const scope = scopeOf(saved);
+      if (scope.formulas) range.formulas = saved.formulas;
+      // `clear(Formats)` 之后要补回的"非本动作属性当前值"必须是**此刻**的现场：
+      // 反序恢复时较早的动作会看到较晚动作刚恢复过的状态。用复核阶段那份一次性
+      // 旧快照，就会把较晚动作刚撤销掉的属性又写回来。
+      const observedDirect = scope.cellFormat
+        ? await readCurrentDirectCells(context, range)
+        : null;
+      restoreRangeFormat(
+        range,
+        saved.format,
+        scope,
+        saved.formatFields,
+        observedDirect
+      );
+      // 旧恢复点（区域过大而未逐格采集）退回区域级常用格式；新记录一律逐格恢复，
+      // **不再做区域级重写**（那正是把"没被本动作改过的格式"拍平的来源）。
+      const hasCellMatrix = saved.format?.cells != null || saved.format?.directCells != null;
+      if (scope.cellFormat && !hasCellMatrix) {
+        range.format.fill.color = saved.fillColor;
+        range.format.font.bold = saved.fontBold;
+        range.format.font.color = saved.fontColor;
+      }
+      // 数字格式放在**格式恢复之后**：兼容路径的 `clear(Formats)` 会把直接设置的数字格式
+      // 一并清掉（Excel 的"清除格式"就包含数字格式），写在它前面会被清没。
+      if (scope.numberFormat) range.numberFormat = saved.numberFormat;
     }
     // 最后移除本次执行新建的工作表。
     for (const name of snapshot.createdWorksheets) {

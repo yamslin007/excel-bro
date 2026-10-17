@@ -1,22 +1,29 @@
-"""Bounded Windows-only layout of an original window and one NEW review copy.
+"""Local Excel review layout and workbook-scoped cleanup.
 
-No document writes, application creation, cell access, scripts, keystrokes,
-subprocesses or persistence. Native Office accessibility reads identity metadata
-and performs bounded window comparison/viewport operations on the verified pair.
-Positioning or scrolling is never evidence of cell verification.
+The compatibility copy is archived locally before closing the same verified COM
+workbook. No window close messages, application creation or arbitrary execution.
 """
 from __future__ import annotations
 
 import hashlib
 import ntpath
+import re
+import zipfile
 import secrets
 import sys
 import threading
 import time
 from dataclasses import dataclass
 
+from .app_data import application_data_root
 from .capabilities import capability_float, capability_int
-from .models import ExcelReviewLayoutPrepareRequest, ExcelReviewLayoutResult, ExcelReviewPaneMeasurement
+from .models import (
+    ExcelReviewCopyCloseRequest,
+    ExcelReviewCopyCloseResult,
+    ExcelReviewLayoutPrepareRequest,
+    ExcelReviewLayoutResult,
+    ExcelReviewPaneMeasurement,
+)
 
 
 class WindowLayoutError(Exception):
@@ -44,6 +51,12 @@ class WindowInfo:
     sheet_hash: str
     sheet_name: str
     unsaved: bool
+
+
+@dataclass(frozen=True)
+class CopyCloseReceipt:
+    accepted: bool
+    recovery_path: str | None = None
 
 
 @dataclass
@@ -99,9 +112,59 @@ class ExcelWindowLayout:
                 raise WindowLayoutError("LAYOUT_MEASUREMENT_AMBIGUOUS")
             original, copy = originals[0], copies[0]
             width = native.client_width_css_px(original.key)
+            work_area = native.work_area_width_css_px(original.key)
             if native.describe(original.key) != original or native.describe(copy.key) != copy:
                 raise WindowLayoutError("LAYOUT_WINDOW_CHANGED")
-            return ExcelReviewPaneMeasurement(clientWidthCssPx=width)
+            return ExcelReviewPaneMeasurement(clientWidthCssPx=width, workAreaWidthCssPx=work_area)
+
+    def close_copy(self, request: ExcelReviewLayoutPrepareRequest | ExcelReviewCopyCloseRequest) -> ExcelReviewCopyCloseResult:
+        """Close only the identified copy; retain a recovery file before discarding it.
+
+        Protocol v4 is required at the HTTP boundary so a new pane cannot invoke
+        an older bridge with unsafe window-level or unarchived close behavior.
+        """
+        native = self._native()
+        if not hasattr(native, "close_workbook"):
+            # The platform/host offers no verified workbook-close primitive. Degrade to
+            # manual close rather than guessing (no TerminateProcess, no scripts, and
+            # deliberately **no** WM_CLOSE fallback — that message targets a window,
+            # not a workbook, and once aimed wrong it prompts to save the user's
+            # original workbook).
+            return ExcelReviewCopyCloseResult(status="unsupported", layoutVersion=4, copyClosed=False)
+        observations = [native.describe(key) for key in native.keys()]
+        # A saved workbook whose active sheet carries this review's nonce is the user's
+        # own "save as"/replace of the copy. That file is theirs: never auto-discard it.
+        if any(info and not info.unsaved and info.sheet_name == request.copySheetName for info in observations):
+            return ExcelReviewCopyCloseResult(status="user_saved", layoutVersion=4, copyClosed=False)
+        copies = [info for info in observations if info and info.unsaved and info.sheet_name == request.copySheetName]
+        if len(copies) > 1:
+            # Two distinct windows claim this session's nonce: refusing is the only safe
+            # answer (guessing which is ours could close an unrelated workbook).
+            return ExcelReviewCopyCloseResult(status="ambiguous", layoutVersion=4, copyClosed=False)
+        if not copies:
+            # Idempotent: repeat cleanup, or the user already closed the copy themselves.
+            return ExcelReviewCopyCloseResult(status="already_closed", layoutVersion=4, copyClosed=True)
+        originals = [info for info in observations if self._original(info, request)]
+        if len(originals) != 1:
+            return ExcelReviewCopyCloseResult(status="identity_lost", layoutVersion=4, copyClosed=False)
+        copy, original = copies[0], originals[0]
+        # Re-verify both identities before handing the copy to the workbook adapter.
+        if native.describe(copy.key) != copy or native.describe(original.key) != original:
+            return ExcelReviewCopyCloseResult(status="identity_lost", layoutVersion=4, copyClosed=False)
+        receipt = native.close_workbook(copy.key, copy)
+        if not receipt.accepted:
+            return ExcelReviewCopyCloseResult(status="failed", layoutVersion=4, copyClosed=False,
+                                             recoveryCopyPath=receipt.recovery_path)
+        deadline = self.clock() + capability_float("reviewCopyLifecycle", "closeWaitSeconds")
+        interval = capability_int("reviewCopyLifecycle", "closePollIntervalMs") / 1000
+        while self.clock() < deadline:
+            if native.describe(copy.key) is None:
+                return ExcelReviewCopyCloseResult(status="closed", layoutVersion=4, copyClosed=True, recoveryCopyPath=receipt.recovery_path)
+            self.sleep(interval)
+        # Still on screen after the deadline. We have NO dialog evidence, so we must not
+        # infer that the host is asking to save: a slow close or an unrelated modal looks
+        # exactly the same from here. Report "close not confirmed" and let the user look.
+        return ExcelReviewCopyCloseResult(status="close_unconfirmed", layoutVersion=4, copyClosed=False, recoveryCopyPath=receipt.recovery_path)
 
     def arrange(self, token: str, origin: str) -> ExcelReviewLayoutResult:
         with self._lock:
@@ -182,6 +245,88 @@ class WindowsExcelWindows:
                 kernel.CloseHandle(handle)
         except Exception:
             return None
+
+    def request_close(self, key: WindowKey) -> bool:
+        """**已停用**：面向窗口的 `WM_CLOSE`，不是面向文档的关闭。
+
+        保留仅为让历史测试与文档里的旧结论仍可追溯。**任何调用点都不得使用它** ——
+        顶层窗口句柄与副本工作簿在 Excel 真实拓扑下不是 1:1，实机上曾打到**原表**
+        的保存提示（见 `docs/REVIEW_COPY_LIFECYCLE_ACCEPTANCE_2026-10-14.md` §11）。
+        现行关闭原语是 `close_workbook`。
+        """
+        raise WindowLayoutError("LAYOUT_WINDOW_CLOSE_PRIMITIVE_DISABLED")
+
+    @staticmethod
+    def _copy_book_matches(book, expected: WindowInfo) -> bool:
+        # Read the retained Workbook itself, never reacquire ActiveWorkbook/Parent.
+        # Generated review copies contain exactly one worksheet and are not saved.
+        return (expected.unsaved and re.fullmatch(r"EB_[0-9a-f]{20}", expected.sheet_name) is not None
+                and str(book.Path) == "" and int(book.Sheets.Count) == 1
+                and str(book.Sheets.Item(1).Name) == expected.sheet_name
+                and int(book.FileFormat) == 51)
+
+    @staticmethod
+    def _archive_review_book(book) -> str:
+        # Server-chosen unique path only. Never overwrite or delete a user's file.
+        base = application_data_root().resolve()
+        root = base / "review-copies"
+        root.mkdir(parents=True, exist_ok=True)
+        if root.resolve() != root or root.is_symlink():
+            raise WindowLayoutError("COPY_ARCHIVE_PATH_UNSAFE")
+        directory = root / secrets.token_hex(16)
+        directory.mkdir(exist_ok=False)
+        path = directory / "review-copy.xlsx"
+        book.SaveCopyAs(str(path))
+        # A returned COM call is not enough: require a readable XLSX archive.
+        with zipfile.ZipFile(path) as package:
+            if "xl/workbook.xml" not in package.namelist() or package.testzip() is not None:
+                raise WindowLayoutError("COPY_ARCHIVE_INVALID")
+        return str(path)
+
+    def close_workbook(self, key: WindowKey, expected: WindowInfo) -> CopyCloseReceipt:
+        """Archive then close the SAME verified Workbook, never a window frame.
+
+        SaveCopyAs preserves any extra edits without changing the open book's path.
+        Failure to archive or recheck identity leaves the workbook open. Saved-as
+        copies belong to the user and are never closed here. No global prompt flags.
+        """
+        recovery_path = None
+        try:
+            if self._is_excel(key.hwnd) != key or not expected.unsaved:
+                return CopyCloseReceipt(False)
+            children: list[int] = []
+            self.gui.EnumChildWindows(key.hwnd, lambda h, _: children.append(h)
+                                       if self.gui.GetClassName(h) == "EXCEL7" else None, None)
+            if not children:
+                return CopyCloseReceipt(False)
+            self.com.CoInitialize()
+            try:
+                if any(self._document_metadata(child, key) != expected for child in children):
+                    return CopyCloseReceipt(False)
+                book = self._document_workbook(children[0], key)
+                if book is None or not self._copy_book_matches(book, expected):
+                    return CopyCloseReceipt(False)
+                recovery_path = self._archive_review_book(book)
+                if self._is_excel(key.hwnd) != key or not self._copy_book_matches(book, expected):
+                    return CopyCloseReceipt(False, recovery_path)
+                book.Close(False)
+                return CopyCloseReceipt(True, recovery_path)
+            finally:
+                self.com.CoUninitialize()
+        except Exception:
+            return CopyCloseReceipt(False, recovery_path)
+
+    def _document_workbook(self, child: int, key: WindowKey):
+        """取该文档窗口的 **Workbook** COM 对象（`ActiveSheet.Parent`）。
+
+        这条链与 `_window_metadata` 读的是同一批白名单成员，所以它给出的就是
+        已被复核过身份的那一本工作簿，而不是"某个活动工作簿"。
+        """
+        holder: list = []
+        window = self._document_window(child, lambda w: holder.append(w) or w)
+        if not holder:
+            return None
+        return holder[0].ActiveSheet.Parent
 
     def keys(self) -> list[WindowKey]:
         keys: list[WindowKey] = []
@@ -335,6 +480,35 @@ class WindowsExcelWindows:
         finally:
             user.SetThreadDpiAwarenessContext(previous)
 
+    def work_area_width_css_px(self, key: WindowKey) -> float:
+        """The whole monitor work area (taskbar excluded) in 96-DPI logical pixels.
+
+        This is the single shared reference for the AI pane fraction on both hosts,
+        so it must NOT be a single document window's client width.
+        """
+        import ctypes as ct
+        from ctypes import wintypes as wt
+        user = ct.WinDLL("user32", use_last_error=True)
+        user.SetThreadDpiAwarenessContext.argtypes = [ct.c_void_p]
+        user.SetThreadDpiAwarenessContext.restype = ct.c_void_p
+        user.GetDpiForWindow.argtypes, user.GetDpiForWindow.restype = [ct.c_void_p], ct.c_uint
+        previous = user.SetThreadDpiAwarenessContext(ct.c_void_p(-4))
+        if not previous:
+            raise WindowLayoutError("LAYOUT_DPI_UNAVAILABLE")
+        try:
+            if self._is_excel(key.hwnd) != key:
+                raise WindowLayoutError("LAYOUT_WINDOW_CHANGED")
+            dpi = user.GetDpiForWindow(key.hwnd)
+            if not dpi:
+                raise WindowLayoutError("LAYOUT_SIZE_UNAVAILABLE")
+            monitor = self.api.MonitorFromWindow(key.hwnd, self.con.MONITOR_DEFAULTTONEAREST)
+            left, _, right, _ = self.api.GetMonitorInfo(monitor)["Work"]
+            if right - left <= 0:
+                raise WindowLayoutError("LAYOUT_SIZE_UNAVAILABLE")
+            return (right - left) * 96 / dpi
+        finally:
+            user.SetThreadDpiAwarenessContext(previous)
+
     @staticmethod
     def _visible_rect(hwnd: int) -> tuple[int, int, int, int]:
         import ctypes as ct
@@ -368,7 +542,9 @@ class WindowsExcelWindows:
             x, y, right, bottom = self.api.GetMonitorInfo(monitor)["Work"]
             width, height = right - x, bottom - y
             dpi = user.GetDpiForWindow(original.hwnd)
-            fraction = capability_float("excelWindowLayout", "originalWidthFraction")
+            # Single source of truth for the outer split: the shared copy fraction.
+            # The AI pane fraction is applied by the frontend against this same work area.
+            fraction = 1.0 - capability_float("reviewPaneSizing", "reviewCopyWidthFraction")
             gap = int(round(capability_float("excelWindowLayout", "windowGapDip") * dpi / 96))
             if not dpi or not 0 < fraction < 1 or height <= 0 or gap < 0 or width <= gap:
                 raise WindowLayoutError("LAYOUT_SIZE_UNAVAILABLE")

@@ -17,13 +17,38 @@ export interface ExcelReviewLayoutPrepareRequest {
   copySheetName: string;
 }
 export interface ExcelReviewLayoutTicket { token: string; layoutVersion: 3 }
-export interface ExcelReviewPaneMeasurement { clientWidthCssPx: number }
+export interface ExcelReviewPaneMeasurement {
+  /** 原表窗口内容区宽度（Win32 client rect；诊断/兼容用，不用于计算 AI 比例）。 */
+  clientWidthCssPx: number;
+  /** 原表所在显示器的整个工作区宽度 —— AI 窗格比例的唯一参照。 */
+  workAreaWidthCssPx: number;
+}
 export interface ExcelReviewLayoutResult {
   status: "arranged";
   layoutVersion: 3;
   copySide: "left";
   originalSide: "right";
   synchronousScrolling: "enabled" | "different_instance" | "unavailable";
+}
+/**
+ * 关闭本次审阅副本的结果。**不包含**原表写回结果 —— 那是业务事实，
+ * 由前端持有；副本关闭失败绝不允许把"原表写回成功"改写成"执行失败"。
+ * `already_closed` 是**成功**收尾（重复清理或用户自己已关掉）。
+ */
+export interface ExcelReviewCopyCloseRequest {
+  closeVersion: 4;
+  workbookPathHash: string;
+  worksheetNameHash: string;
+  copySheetName: string;
+}
+export type ExcelReviewCopyCloseStatus =
+  | "closed" | "already_closed" | "close_unconfirmed" | "user_saved"
+  | "identity_lost" | "ambiguous" | "unsupported" | "failed";
+export interface ExcelReviewCopyCloseResult {
+  status: ExcelReviewCopyCloseStatus;
+  layoutVersion: 4;
+  copyClosed: boolean;
+  recoveryCopyPath: string | null;
 }
 
 // /function 短链：AI 生成原生 Excel 公式（主路径）
@@ -80,13 +105,118 @@ export interface WorksheetSnapshot {
 
 export interface WorkbookSnapshot {
   name: string;
+  /** Metadata directory only; dimensions/fields have not been captured. */
+  catalogOnly?: boolean;
   capturedAt: string;
   activeWorksheet: string;
   selectedRange?: string | null;
   sourceFingerprint?: string | null;
   sourceFingerprintSheets?: string[];
+  /**
+   * 稳定工作簿身份，沿用既有 ``url:`` / ``wps-path:`` 命名空间。
+   * 名字相同但身份不同的两个工作簿必须彼此隔离，桥归属按此判定。
+   */
+  workbookIdentity?: string | null;
   worksheets: WorksheetSnapshot[];
 }
+
+/**
+ * 格式动作的封闭取值域 —— **与 `server/app/models.py` 里的 `Literal` 逐字一致**。
+ *
+ * 抽成具名别名的两个原因：
+ *   1. 同一个枚举在 action 与 criterion 两处出现，字面量写两遍迟早会漂；
+ *   2. 跨语言一致性测试（`server/tests/test_protocol_consistency.py`）要能从
+ *      TS 源码里把这几组取值抠出来跟 Python 的 `Literal` 逐项比对，
+ *      具名别名让"抠哪一段"是确定的，不用去猜。
+ *
+ * 改这里**必须**同步改 `models.py`，否则一致性测试会红。
+ */
+export type BorderSide =
+  | "top"
+  | "bottom"
+  | "left"
+  | "right"
+  | "insideHorizontal"
+  | "insideVertical";
+export type BorderLineStyle =
+  | "continuous"
+  | "dash"
+  | "dashDot"
+  | "dot"
+  | "double"
+  | "none";
+export type BorderWeight = "hairline" | "thin" | "medium" | "thick";
+export type HorizontalAlignmentRule =
+  | "general"
+  | "left"
+  | "center"
+  | "right"
+  | "fill"
+  | "justify"
+  | "centerAcrossSelection";
+export type VerticalAlignmentRule =
+  | "top"
+  | "center"
+  | "bottom"
+  | "justify"
+  | "distributed";
+
+export const BORDER_SIDES: readonly BorderSide[] = [
+  "top",
+  "bottom",
+  "left",
+  "right",
+  "insideHorizontal",
+  "insideVertical"
+];
+export const BORDER_LINE_STYLES: readonly BorderLineStyle[] = [
+  "continuous",
+  "dash",
+  "dashDot",
+  "dot",
+  "double",
+  "none"
+];
+export const BORDER_WEIGHTS: readonly BorderWeight[] = [
+  "hairline",
+  "thin",
+  "medium",
+  "thick"
+];
+export const HORIZONTAL_ALIGNMENTS: readonly HorizontalAlignmentRule[] = [
+  "general",
+  "left",
+  "center",
+  "right",
+  "fill",
+  "justify",
+  "centerAcrossSelection"
+];
+export const VERTICAL_ALIGNMENTS: readonly VerticalAlignmentRule[] = [
+  "top",
+  "center",
+  "bottom",
+  "justify",
+  "distributed"
+];
+
+/**
+ * 颜色一律 `#RRGGBB`。Python 侧用 `StringConstraints(pattern=...)` 强制，
+ * TS 侧在 `assertEditablePlan` 里用同一条 pattern 做运行时校验 ——
+ * 只在类型上写 `string` 等于放行 `red`、`#fff`、`rgb(...)`，
+ * 那些值到了宿主才失败，会把失败点推到手已经动过之后。
+ */
+export const HEX_COLOR_PATTERN = /^#[0-9A-Fa-f]{6}$/;
+
+/** 行高/列宽与宿主一致的上下界（Excel 与 WPS 都用磅 / 字符宽，取 Office.js 的值域）。 */
+export const ROW_HEIGHT_RANGE = { min: 0, max: 409 } as const;
+export const COLUMN_WIDTH_RANGE = { min: 0, max: 255 } as const;
+/** 字体名的长度上限，与 Python `Field(min_length=1, max_length=255)` 对齐。 */
+export const FONT_NAME_MAX_LENGTH = 255;
+/** 字号值域，与 Python `Field(ge=1, le=409)` 对齐。 */
+export const FONT_SIZE_RANGE = { min: 1, max: 409 } as const;
+/** 数字格式码长度上限，与 Python `Field(min_length=1, max_length=100)` 对齐。 */
+export const NUMBER_FORMAT_MAX_LENGTH = 100;
 
 export type ExcelAction =
   | { type: "createWorksheet"; sheet: string }
@@ -110,11 +240,26 @@ export type ExcelAction =
       color: string;
     }
   | {
+      /**
+       * 字体动作。**只改这里显式给出的属性**，其余属性与值/公式保持不变。
+       *
+       * 五个属性各自可选且互相独立：`bold`/`italic` 只动字形，`name`/`size` 只动
+       * 字族与字号，`color` 只动字色。模型可以只给其中一项。
+       *
+       * 每个字段都允许 `null`：服务端 `response_model_exclude_none=True` 会把未设置
+       * 的字段整个省略，但计划编辑器与手工构造的计划可能显式给 `null`，
+       * 两者语义相同 —— 都是"这一项不要动"。执行侧一律用 `!= null` 判空。
+       */
       type: "setFont";
       sheet: string;
       range: string;
-      bold?: boolean;
-      color?: string;
+      bold?: boolean | null;
+      italic?: boolean | null;
+      /** 字体名（如 `"微软雅黑"`）。长度上限见 `FONT_NAME_MAX_LENGTH`。 */
+      name?: string | null;
+      /** 字号（磅）。值域见 `FONT_SIZE_RANGE`。 */
+      size?: number | null;
+      color?: string | null;
     }
   | { type: "autofit"; sheet: string; range: string }
   | { type: "activateWorksheet"; sheet: string }
@@ -218,22 +363,26 @@ export type ExcelAction =
     }
   | { type: "setNumberFormat"; sheet: string; range: string; formatCode: string }
   | {
+      /**
+       * 边框。`style`/`color`/`weight` 与 Python 侧一样**可以省略**（服务端有默认值
+       * `continuous` / `#000000` / `thin`），执行侧用 `normalizeBorderAction` 补齐 ——
+       * 类型层写必填而实现层要兼容缺省，中间那段空档就是"模型少给一个字段、
+       * 计划在校验期通过、执行期才炸"的来源。
+       */
       type: "setBorders";
       sheet: string;
       range: string;
-      sides: Array<
-        "top" | "bottom" | "left" | "right" | "insideHorizontal" | "insideVertical"
-      >;
-      style: string;
-      color: string;
-      weight: string;
+      sides: BorderSide[];
+      style?: BorderLineStyle | null;
+      color?: string | null;
+      weight?: BorderWeight | null;
     }
   | {
       type: "setAlignment";
       sheet: string;
       range: string;
-      horizontal?: string | null;
-      vertical?: string | null;
+      horizontal?: HorizontalAlignmentRule | null;
+      vertical?: VerticalAlignmentRule | null;
       wrapText?: boolean | null;
     }
   | { type: "mergeCells"; sheet: string; range: string; across: boolean }
@@ -384,15 +533,22 @@ export type VerificationCriterion =
       hasHeaders: boolean;
     }
   | {
+      /**
+       * 格式回读核对。**至少给一项**，给到的每一项都必须与真实格式属性一致
+       * —— 判据是"读宿主当前格式"，不是"值没变"。
+       */
       type: "rangeFormatMatches";
       sheet: string;
       range: string;
       fillColor?: string | null;
       bold?: boolean | null;
       fontColor?: string | null;
+      fontName?: string | null;
+      fontSize?: number | null;
+      fontItalic?: boolean | null;
       numberFormat?: string | null;
-      horizontal?: string | null;
-      vertical?: string | null;
+      horizontal?: HorizontalAlignmentRule | null;
+      vertical?: VerticalAlignmentRule | null;
       wrapText?: boolean | null;
       rowHeight?: number | null;
       columnWidth?: number | null;
@@ -401,12 +557,10 @@ export type VerificationCriterion =
       type: "bordersMatch";
       sheet: string;
       range: string;
-      sides: Array<
-        "top" | "bottom" | "left" | "right" | "insideHorizontal" | "insideVertical"
-      >;
-      style: string;
+      sides: BorderSide[];
+      style: BorderLineStyle;
       color: string;
-      weight: string;
+      weight: BorderWeight;
     }
   | {
       type: "dataValidationMatches";
@@ -462,11 +616,38 @@ export interface AnalysisPlan {
   title: string;
   summary: string;
   sourceFingerprint?: string | null;
+  /**
+   * **指纹覆盖范围**：生成这份计划时对它做了来源指纹的工作表。
+   *
+   * 它可能**宽于**计划的实际依赖（App 取的是本次授权范围）—— 变更检测宁可宽，
+   * 但"宽"的代价是它不能用来回答"这份计划到底依赖了谁"。
+   */
   sourceFingerprintSheets?: string[];
+  /**
+   * **实际来源依赖**：这份计划的值实际是从哪些工作表读出来的。
+   *
+   * 与 `sourceFingerprintSheets` 刻意分开建模，三者口径互不冒充：
+   * 授权范围（`authorizedSheetNames`，边界）／实际来源依赖（本字段）／写入目标
+   * （`actions[].sheet`）。
+   *
+   * 只由本端写入，且只来自**可信记录**：确定性本地读取、工具执行记录
+   * （`DataToolResult.sourceSheets`）、已保存工具模板的声明来源。服务端或模型
+   * 在计划里带回来的值一律由 `attestSourceDependency` 覆盖或剥离 —— 依赖是
+   * "本机读了什么"的记账，不是可以被声明出来的东西。也**不**由"授权范围减去
+   * 写入目标"推出来。
+   *
+   * 缺失 = 依赖不确定 = 不登记断点恢复（fail-closed，退回既有的保守口径）。
+   */
+  sourceDependencySheets?: string[];
   assumptions: string[];
   warnings: string[];
   actions: ExcelAction[];
   acceptanceCriteria?: VerificationCriterion[];
+  /**
+   * 本地结果引用：计划由本机查询结果编译而来时只带这个句柄。
+   * 持久侧（规划账本 / 恢复副本）保存的是带引用、不带值的投影。
+   */
+  localResultRef?: string | null;
 }
 
 export interface PlanValidateRequest {
@@ -512,9 +693,34 @@ export interface IntentScopeContext {
   sheets: IntentSheetContext[];
 }
 
+/** First semantic stage: intentionally has no workbook/schema/result fields. */
+export interface MessageUnderstandingRequest {
+  prompt: string;
+  imageCount?: number;
+  conversation?: Array<{ role: "user" | "assistant"; text: string }>;
+  modelId?: string | null;
+}
+
+export type MessageUnderstandingResponse =
+  | { kind: "conversation"; message: string; provider: "model" }
+  | { kind: "needs_workbook_context"; summary: string; provider: "model" };
+
+export function assertMessageUnderstandingResponse(value: unknown): asserts value is MessageUnderstandingResponse {
+  if (!value || typeof value !== "object") throw new Error("消息理解响应格式无效");
+  const item = value as Record<string, unknown>;
+  const key = item.kind === "conversation" ? "message" : item.kind === "needs_workbook_context" ? "summary" : null;
+  if (!key || item.provider !== "model" || typeof item[key] !== "string" || !(item[key] as string).trim()
+      || (item[key] as string).length > (key === "message" ? 1500 : 500)
+      || Object.keys(item).some((field) => !["kind", key, "provider"].includes(field))) {
+    throw new Error("消息理解响应格式无效；未读取工作表结构");
+  }
+}
+
 export interface IntentCheckRequest {
   turnId?: string | null;
   prompt: string;
+  /** Explicit semantic decisions, never authorization or local source values. */
+  taskContext?: import("@excel-bro/core/agentTaskContext").AgentTaskContext | null;
   scope: IntentScopeContext;
   imageCount?: number;
   intentConfirmed?: boolean;
@@ -748,6 +954,114 @@ export function assertDataToolResult(
   }
 }
 
+// ---------------------------------------------------------------------------
+// 任务工具桥协议（本机回环）：SDK handler ⇄ 本地宿主适配器。
+// 与 server/app/models.py 的 Bridge* 模型一一对应。请求参数只经本回环通道，
+// 不进模型提示、不进持久进度账本；值矩阵只在本通道与本地结果端点出现。
+// ---------------------------------------------------------------------------
+
+export type SdkBridgeHostId = "excel-office" | "wps-et" | "folder";
+export type SdkBridgeToolName = "query_table" | "prepare_python_data";
+
+/**
+ * 进度事件里携带的桥指针：**只有操作 ID 与工具名**。
+ * 请求参数留在本机易失桥里由宿主适配器拉取，不进模型提示、不进持久账本。
+ */
+export interface SdkBridgeToolPointer {
+  operationId: string;
+  tool: SdkBridgeToolName;
+}
+
+export interface SdkBridgeBindingRequest {
+  taskId: string;
+  hostId: SdkBridgeHostId;
+  workbookName: string;
+  /** 稳定工作簿身份；服务端缺省时退回 ``name:<工作簿名>``。 */
+  workbookIdentity?: string | null;
+  sourceFingerprint?: string | null;
+}
+
+export interface SdkBridgePendingCall {
+  operationId: string;
+  tool: SdkBridgeToolName;
+  arguments: QueryTableArguments;
+  requestFingerprint: string;
+  expiresAt: number;
+}
+
+export interface SdkBridgePollResponse {
+  calls: SdkBridgePendingCall[];
+  generation: number;
+}
+
+/** ``prepare_python_data`` 宿主回执里的单块原始值矩阵（对应服务端 BridgeDatasetReceipt）。 */
+export interface SdkBridgeDatasetReceipt {
+  sourceIndex: number;
+  values: CellValue[][];
+}
+
+export interface SdkBridgeToolReceipt {
+  result?: DataToolResult | null;
+  datasets?: SdkBridgeDatasetReceipt[] | null;
+  errorCode?: string | null;
+}
+
+export interface SdkBridgeReceiptRequest extends SdkBridgeBindingRequest {
+  operationId: string;
+  requestFingerprint: string;
+  receipt: SdkBridgeToolReceipt;
+}
+
+export interface SdkBridgeReceiptResponse {
+  status: "accepted" | "duplicate" | "rejected";
+  code?: string | null;
+}
+
+export interface SdkBridgeRegisterRequest extends SdkBridgeBindingRequest {
+  result: DataToolResult;
+}
+
+export interface SdkBridgeRegisterResponse {
+  resultRef: string;
+  structure: {
+    headers: CellValue[];
+    rowCount: number;
+    columnCount: number;
+    complete: boolean;
+  };
+}
+
+export interface SdkBridgeResultRequest extends SdkBridgeBindingRequest {
+  resultRef: string;
+}
+
+/** 本地结果卡的完整载荷（含值），仅本机回环端点返回，不进模型/历史/账本。 */
+export interface SdkBridgeResultResponse {
+  resultRef: string;
+  title: string;
+  headers: CellValue[];
+  rows: CellValue[][];
+  sourceSheets: string[];
+  warnings: string[];
+  complete: boolean;
+  calculation: string;
+  scannedRows: number;
+}
+
+/**
+ * 结果卡指针：只带引用与结构，**不含任何值**。
+ * 真实值由本机回环端点按 `resultRef` 取回后由本地渲染器展示。
+ */
+export interface LocalResultCard {
+  resultRef: string;
+  title: string;
+  headers: string[];
+  rowCount: number;
+  columnCount: number;
+  sourceSheets: string[];
+  complete: boolean;
+}
+
 export interface ClarificationField {
   id: string;
   label: string;
@@ -773,6 +1087,7 @@ export type IntentCheckResponse =
     }
   | {
       kind: "proceed";
+      planningGoal?: "read_only" | "write_preview";
       summary: string;
       confirmedPrompt: string;
       provider: "model" | "local";
@@ -786,6 +1101,7 @@ export type IntentCheckResponse =
     }
   | {
       kind: "tool_request";
+      planningGoal?: "read_only" | "write_preview";
       summary: string;
       confirmedPrompt: string;
       request: DataToolRequest;
@@ -794,12 +1110,19 @@ export type IntentCheckResponse =
     };
 
 export interface PlanRequest {
+  planningGoal?: "read_only" | "write_preview" | null;
   turnId?: string | null;
   prompt: string;
+  taskContext?: import("@excel-bro/core/agentTaskContext").AgentTaskContext | null;
   workbook: WorkbookSnapshot;
   lastResult?: ResultContext | null;
   images?: ImageAttachment[];
   dataResults?: DataToolResult[];
+  /**
+   * 本地已登记结果的不透明引用。SDK 后端据此让模型引用本地结果，
+   * 而值始终留在本机易失登记器；`dataResults` 的数据行守卫仍然有效。
+   */
+  localResultRefs?: string[];
   planningReadPolicy?: "ifNeeded" | "none";
   modelId?: string | null;
   /**
@@ -910,6 +1233,16 @@ export interface FolderCatalog {
 export interface FolderSelection {
   fileId: string;
   sheets: string[];
+}
+
+/** Local selection preflight, not data-read consent or a write approval. */
+export interface FolderAdmissionRequest {
+  sessionId: string;
+  selections: FolderSelection[];
+}
+export interface FolderAdmissionResponse {
+  items: import("@excel-bro/core/scopeAdmission").ScopeAdmissionItem[];
+  fingerprint: string | null;
 }
 
 export interface FolderExecuteResult {
@@ -1132,6 +1465,34 @@ export interface PlanExecutionResult {
 }
 
 /**
+ * 一次撤销动作**实际要恢复**的字段集合，由动作的**实际影响**派生（纯函数 `undoRestoreScope`）。
+ *
+ * 存在的理由：旧实现无差别地"恢复值 + 恢复填充 + 恢复字体 + 恢复全部格式 + 恢复行高列宽"，
+ * 于是一个只改行高的动作撤销时会顺带把单元格格式写一遍。用户对不被本动作改过的属性的后续编辑
+ * 就被静默覆盖了。按范围恢复后：
+ *  - 只有 `formulas` 为真的动作才写回值/公式；
+ *  - 只有 `cellFormat` 为真的动作才碰逐格格式；
+ *  - 只有 `rowHeight`/`columnWidth` 为真的动作才碰行高/列宽。
+ *
+ * **`cellFormat` ⇒ 隐含 `numberFormat`**：兼容路径（宿主无 ExcelApi 1.19）恢复逐格格式用的
+ * 是 `clear(Formats)`，而"清除格式"**连数字格式一起清**。所以只要动作会走那条路径，
+ * 数字格式就必须一并捕获与写回，否则恢复完数字格式反而丢了。这是机制约束，不是动作影响，
+ * 在 `undoRestoreScope` 里显式注明。
+ */
+export interface UndoRestoreScope {
+  /** 是否写回值/公式（`writeValues`/`writeFormulas`/`writeTable`/`clearRange(contents)`）。 */
+  formulas: boolean;
+  /** 是否写回数字格式（`setNumberFormat`，或被 `cellFormat` 的 `clear(Formats)` 连带）。 */
+  numberFormat: boolean;
+  /** 是否恢复逐格格式（`setFill`/`setFont`/`setBorders`/`setAlignment`）。 */
+  cellFormat: boolean;
+  /** 是否恢复行高（`resizeRange` 且该动作确实给了 `rowHeight`）。 */
+  rowHeight: boolean;
+  /** 是否恢复列宽（`resizeRange` 且该动作确实给了 `columnWidth`）。 */
+  columnWidth: boolean;
+}
+
+/**
  * 单个区域的撤销快照。
  *
  * 格式分两层：value/formula 与常用格式总是记录；`format` 里的完整格式（边框、
@@ -1147,13 +1508,72 @@ export interface UndoRangeSnapshot {
   fillColor: string;
   fontBold: boolean;
   fontColor: string;
+  /**
+   * 本动作**实际恢复范围**。缺失 = 旧恢复点，按"全范围恢复"（旧行为）处理，
+   * 以免升级本身把已落盘的恢复点判成范围不符。
+   */
+  scope?: UndoRestoreScope;
+  /**
+   * 本动作实际修改的格式属性名（`excelFormatActionFields`）。缺失 = 未知（旧记录）。
+   * 冲突检测用它定位"到底哪个属性不是我们最后写的那个值"。
+   */
+  formatFields?: string[];
   /** 本次执行完成后该范围的确定性指纹；撤销前用于阻止覆盖后续人工修改。 */
   postFingerprint?: string;
+  /**
+   * 本次执行完成后该范围的**扩展格式摘要**（第二代判据，覆盖对齐/自动换行/行高列宽/
+   * 字体名・字号・斜体・下划线/六条边框）。
+   *
+   * `postFingerprint` 是**第一代**判据，只看 值/公式/数字格式/填充色/加粗/字色；
+   * 执行完一个格式动作之后用户手动改了"对齐"或"边框"，第一代一点都察觉不到。
+   * 所以新记录同时写这一项，撤销前优先比它。
+   *
+   * 字段保持可选：已经落盘的旧恢复点是按第一代载荷算的，改载荷会让它们一律对不上、
+   * 撤销被误判成"执行后又被改过"而全部拒绝。缺失 ⇒ 退回第一代判据（安全性略弱，
+   * 但不会把旧记录变成不可撤销）。
+   */
+  extendedFormatDigest?: string;
+  /**
+   * **按恢复范围、逐格/逐行**计算的执行后状态摘要（第三代判据）。
+   *
+   * 载荷恰好是 `scope` 为真的那几项 —— 只比"这次撤销真正会写回去的字段"。这样：
+   *  - 用户在**不会被写回**的属性上的后续编辑 ⇒ 摘要不变 ⇒ 撤销照常执行且**保留**该编辑；
+   *  - 用户在**会被写回**的属性上的后续编辑 ⇒ 摘要变化 ⇒ 在**任何写入之前**报冲突。
+   *
+   * 与 `extendedFormatDigest` 的区别是**覆盖范围**而非粒度：后者是固定的全属性集合，
+   * 前者跟着动作走。只改行高的动作不会因为用户改了字色而拒绝撤销。
+   */
+  scopeDigest?: string;
+  /**
+   * 第三代判据的按字段拆分（`formulas`/`numberFormat`/`cellFormat`/`rowHeight`/`columnWidth`），
+   * 只用于在冲突时**指名到底哪一项对不上**，不参与是否冲突的判定。
+   */
+  scopeFieldDigests?: Record<string, string>;
+  /**
+   * 第三代判据里 `cellFormat` 那一项的**按属性再拆分**（键为 `ExcelFormatField`，
+   * 如 `fontBold`/`fill`/`borders`）。
+   *
+   * `scopeFieldDigests` 只能说到"单元格格式对不上"，用户在一大片格式里仍然不知道该看哪个；
+   * 这份拆分让冲突文案能指名**具体属性**（如"单元格格式（加粗）"）。同样只用于呈报，
+   * 不参与是否冲突的判定（判定仍只比 `scopeDigest`）。
+   */
+  cellFormatFieldDigests?: Record<string, string>;
   /** 完整格式快照；区域过大而降级捕获时为 null。 */
   format?: UndoRangeFormat | null;
 }
 
-/** 超出常用格式之外、逐格恢复的格式属性。 */
+/**
+ * 超出常用格式之外、按**属性实际粒度**恢复的格式快照。
+ *
+ * 粒度分三类（缺一就会把"混合格式"恢复成单一值，属于不可接受的静默降级）：
+ *  - 逐格：字体（名/号/粗/斜/字色/下划线）、对齐（水平/垂直/换行/缩进）、填充色、六条边框；
+ *  - 逐行：行高（行级属性，落在 B3:D5 上真实改的是第 3–5 整行）；
+ *  - 逐列：列宽（列级属性）。
+ *
+ * 旧字段（`horizontalAlignment`/`rowHeight`/`borders`…）是**第一版区域级单值**，
+ * 保留只为兼容已落盘的旧恢复点；新捕获一律写 `cells`/`rowHeights`/`columnWidths`，
+ * 恢复时优先走按粒度字段，缺失才退回旧单值。
+ */
 export interface UndoRangeFormat {
   horizontalAlignment: string;
   verticalAlignment: string;
@@ -1166,6 +1586,196 @@ export interface UndoRangeFormat {
   fontItalic: boolean;
   fontUnderline: string;
   borders: UndoBorderState[];
+  /** 逐格格式矩阵（与目标区域同形）。新捕获时必填；区域过大降级捕获时为 null。 */
+  cells?: UndoCellFormat[][] | null;
+  /**
+   * 逐行行高（按目标区域的行序）。元素三态：
+   *  - `number`：该行行高**直接设置**为这个值（撤销写回该值）；
+   *  - `"standard"`：该行未直接设置行高（`useStandardHeight === true`），撤销走标准行高恢复；
+   *  - `null`：该行行高状态**无法确定**（宿主异常）。含 `null` 且动作会改行高时应执行前拒绝。
+   * 缺失数组表示未逐行采集，退回区域级 `rowHeight`（仅旧恢复点兼容）。
+   */
+  rowHeights?: Array<number | "standard" | null>;
+  /**
+   * 逐列列宽（按目标区域的列序）。元素三态语义同 `rowHeights`：
+   *  - `number`：直接设置；`"standard"`：未直接设置（`useStandardWidth === true`）；`null`：无法确定。
+   */
+  columnWidths?: Array<number | "standard" | null>;
+  /**
+   * **兼容路径**（宿主 < ExcelApi 1.19，批量许可永久版最高到 1.17）的逐格
+   * **直接格式**矩阵，与 `cells` 互斥：`cells` 是"显示值"，本字段是"直接设置集合"。
+   *
+   * 恢复语义（`restoreRangeFormat` 走这条分支时）：先 `range.clear(Formats)` 清掉
+   * 目标区域的直接格式，再 `setCellProperties` 写回这里的直接格式集合。于是
+   * **直接设置过的属性逐格精确还原**，而**未直接设置的属性回到继承样式/默认**——
+   * 恢复的是"格式的来源语义"，不是"把显示效果写成显式值"。
+   *
+   * 为空（null/缺失）表示未走兼容路径。
+   */
+  directCells?: UndoCellDirectFormat[][] | null;
+  /**
+   * 兼容路径下，本次动作实际修改的属性里**未直接设置**（继承样式/条件格式/默认）
+   * 的那部分属性名并集（去重排序）。只用于如实呈报来源，不参与写入。
+   */
+  inheritedFields?: string[];
+  /** 标记该快照由兼容路径（无 ExcelApi 1.19）采集。 */
+  compatPath?: boolean;
+}
+
+/**
+ * 兼容路径下单个单元格的**直接格式**快照（来自 `Range.getCellProperties`，ExcelApi 1.9）。
+ *
+ * 语义与 `UndoCellFormat`（显示值）刻意不同：
+ *  - `UndoCellFormat` 每个字段都是一个**确定的显示值**；
+ *  - 本类型只装**直接设置在单元格上**的属性。未直接设置的属性**不出现**在 `direct` 里 ——
+ *    这是"继承样式/条件格式/默认"这一**确定状态**，不是"未知"，因此**不允许**
+ *    填一个默认值冒充"采集到了"（那会把继承语义写成显式值）。
+ *
+ * 真正的"未知"只发生在矩阵形状不符/元素非对象时，那种情况在写入前直接拒绝，
+ * 不会生成这个结构。
+ */
+export interface UndoCellDirectFormat {
+  /** 该格直接设置的属性子集；未直接设置的属性不出现。 */
+  direct: DirectCellFormatValues;
+  /** 本次动作实际修改的属性里，该格**未直接设置**的那些（供如实呈报来源）。 */
+  inherited: string[];
+}
+
+/**
+ * 直接格式属性子集。字段缺席 = 该属性在该格上未直接设置。
+ *
+ * **字段清单不是"我们想到哪算哪"**，而是与 `Excel.CellPropertiesLoadOptions` /
+ * `CellPropertiesFormatLoadOptions` / `CellPropertiesFontLoadOptions` /
+ * `CellPropertiesFillLoadOptions` / `CellPropertiesBorderLoadOptions`
+ * 逐项对齐 —— 因为兼容路径的恢复要先 `clear(Formats)`，**凡是能读的都要读**，
+ * 否则"清空再写回"会把读不到的属性静默丢掉。
+ *
+ * **已知无法完整保存的场景（如实限制，不冒充覆盖）**：单元格**内部富文本**
+ * （`CellPropertiesLoadOptions.textRuns`，ExcelApi 1.18）在 1.17 宿主上**读不到也写不回**，
+ * 因此本机既无法判断某格是否含富文本，也无法在富文本被改变时还原。
+ *
+ * 关于 `clear(Formats)`：官方 Excel 语义说它**不清除**单元格内字符级格式
+ * （"Clear Formats 不改单元格内单个字符的格式"）。这只是**那一步操作的语义依据**，
+ * **不构成"含富文本的区域可以安全执行并撤销"的整体结论** —— 完整的写入与撤销链路
+ * **未经真实宿主验证**，且一旦宿主实际行为与官方语义不符，本机既发现不了也修复不了。
+ * 不在这里补默认值、也不声称"已覆盖全部格式"。
+ */
+export interface DirectCellFormatValues {
+  /**
+   * 单元格**命名样式**（`CellPropertiesLoadOptions.style`，ExcelApi 1.9）。
+   *
+   * 它不是 `format` 的子字段，而是 `SettableCellProperties.style`（与 `format` 同级）。
+   * `clear(Formats)` 会把命名样式退回 `Normal`，所以必须捕获并在恢复时写回 ——
+   * 这是"非 Normal 单元格样式 + 直接格式覆盖"能被正确还原的前提。
+   * 缺席 = 未采到（旧快照），恢复时不写。
+   */
+  style?: string;
+  /** 直接设置的填充样式（如 `"Solid"`）；缺席 = 未直接设置填充。 */
+  fillPattern?: string;
+  fillColor?: string;
+  /** 图案色（`CellPropertiesFill.patternColor`），如斜线图案的线条色。 */
+  fillPatternColor?: string;
+  fillPatternTintAndShade?: number;
+  fillTintAndShade?: number;
+  fontName?: string;
+  fontSize?: number;
+  fontBold?: boolean;
+  fontItalic?: boolean;
+  fontColor?: string;
+  fontUnderline?: string;
+  /** 字体删除线（`CellPropertiesFont.strikethrough`）。 */
+  fontStrikethrough?: boolean;
+  /** 下标 / 上标（`CellPropertiesFont`）。两者互斥，但都如实捕获。 */
+  fontSubscript?: boolean;
+  fontSuperscript?: boolean;
+  fontTintAndShade?: number;
+  horizontalAlignment?: string;
+  verticalAlignment?: string;
+  wrapText?: boolean;
+  indentLevel?: number;
+  shrinkToFit?: boolean;
+  textOrientation?: number;
+  readingOrder?: string;
+  /** 自动缩进（`CellPropertiesFormat.autoIndent`）。 */
+  autoIndent?: boolean;
+  /** 单元格保护（`locked` / `formulaHidden`）。`clear(Formats)` 会重置它，必须一并捕获。 */
+  locked?: boolean;
+  formulaHidden?: boolean;
+  /**
+   * 逐边直接格式。**八条边**（`Excel.CellBorderCollection`：top/bottom/left/right/
+   * horizontal/vertical/diagonalDown/diagonalUp），不是旧实现里的四条 —— 斜线边框
+   * 正是靠 `diagonalDown`/`diagonalUp` 表达，漏采就会被 `clear(Formats)` 清掉。
+   */
+  borders?: Partial<Record<DirectBorderSide, CellBorderState>>;
+}
+
+/**
+ * 单个单元格的格式快照。所有字段都在**捕获那一刻**被逐格读取，混合值不会被折叠成区域级单值。
+ *
+ * 语义（撤销恢复的是**执行前那一刻的实际显示值**，不是"直接设置状态"）：
+ * 逐格属性用 `getDisplayedCellProperties`（ExcelApi 1.19）捕获，它返回单元格**实际显示**
+ * 的格式 —— 无论该格式是直接设置在单元格上，还是来自表格样式 / 命名样式 / 条件格式的
+ * 间接来源。因此这里的每个字段都是一个**确定的显示值**：
+ *
+ *  - `fillPattern: "None"` = 明确无填充（显示上没有填充）；`"Solid"` 等 = 显示上有填充，
+ *    无论其来源是直接设置还是样式/条件格式（此时 `fillColor` 是显示色）。
+ *  - `fontBold: false` = 显示为不加粗（可能是直接设 false，也可能继承样式默认不加粗），
+ *    撤销写回 `bold: false` 以恢复"执行前显示为不加粗"。
+ *
+ * 之所以存"显示值"而非"直接设置值"：`getCellProperties` 对未直接设置的属性返回 `undefined`，
+ * 它**不告诉你**该属性当前显示是什么（可能正被样式/条件格式影响）。用 `undefined`（存 null）
+ * 并在撤销时跳过，会把"执行动作临时写上的显式值"留在单元格上，无法恢复执行前的显示。
+ * 唯一可靠、可恢复的依据是**显示值**。
+ *
+ * `fillColor` 是唯一的 `null` 合法值：当 `fillPattern === "None"` 时显示上没有填充色，存
+ * `null` 表示"无填充色"（这是确定状态，不是"未采集"）。
+ */
+export interface UndoCellFormat {
+  /** 显示填充样式：`"None"` = 明确无填充；`"Solid"`/`"LinearGradient"` 等 = 显示有填充。 */
+  fillPattern: string;
+  /** 显示填充色。`null` = 无填充色（`fillPattern === "None"`）。非 `None` 时必有值。 */
+  fillColor: string | null;
+  fontName: string;
+  fontSize: number;
+  fontBold: boolean;
+  fontItalic: boolean;
+  fontColor: string;
+  fontUnderline: string;
+  horizontalAlignment: string;
+  verticalAlignment: string;
+  wrapText: boolean;
+  indentLevel: number;
+  /** 逐格边框：单元格四条边的显示状态。每条边都是确定的显示值。 */
+  borders: Record<CellBorderSide, CellBorderState>;
+}
+
+/** 逐格边框的四条边名（与 `Excel.CellBorderCollection` 的 top/bottom/left/right 对应）。 */
+export type CellBorderSide = "top" | "bottom" | "left" | "right";
+
+/**
+ * 直接格式路径的逐边边名：`Excel.CellBorderCollection` 的**八条**边。
+ *
+ * 与显示值路径的 `CellBorderSide`（四条）刻意分开：显示值路径只读四边，
+ * 直接格式路径要连同内部边（`horizontal`/`vertical`）与斜线（`diagonalDown`/`diagonalUp`）
+ * 一起捕获 —— 漏任何一条，`clear(Formats)` 都会把它清掉且还原不回来。
+ */
+export type DirectBorderSide =
+  | "top"
+  | "bottom"
+  | "left"
+  | "right"
+  | "horizontal"
+  | "vertical"
+  | "diagonalDown"
+  | "diagonalUp";
+
+/** 逐格边框单边的显示状态。字段都是确定的显示值（来自 `getDisplayedCellProperties`）。 */
+export interface CellBorderState {
+  style: string;
+  color: string;
+  weight: string;
+  /** 底纹深浅（`CellBorder.tintAndShade`）；仅直接格式路径可能带上。 */
+  tintAndShade?: number;
 }
 
 export interface UndoBorderState {
@@ -1275,6 +1885,12 @@ export function assertOfficeExecutionState(
  * 只带恢复判定必需的元数据：动作类型、目标工作表与区域、目标形状、目标指纹，
  * 以及 `clearRange` 的 `applyTo` / `writeFormulas` 的 `formulaR1C1`（服务端据此
  * 拒绝不支持的变体）。**不含 `values` / `formulas` 矩阵** —— 目标值只停在本机内存。
+ *
+ * 格式动作（`setFont` / `setAlignment` / `resizeRange`）多一个 `formatFields`：
+ * 本次声明要改的**属性名**（`bold`/`size`/`horizontalAlignment`/`rowHeight` 等）。
+ * 它让服务端能做属性级校验，也让"这两个指纹是按格式状态算的"可判定 —— 值动作的
+ * 指纹是值矩阵指纹，格式动作的是格式证据指纹（格式动作不改值，值矩阵指纹在写前
+ * 写后完全一样，没有区分力）。`formatFields` 里**不含单元格内容**，它只是属性名。
  */
 export interface WpsRecoveryActionDescriptor {
   actionIndex: number;
@@ -1284,11 +1900,12 @@ export interface WpsRecoveryActionDescriptor {
   rowCount: number;
   columnCount: number;
   cellCount: number;
-  /** 写前逻辑指纹（WpsPreparedAction.previewFingerprint）；校验不是加密，不保证抵御枚举。 */
+  /** 写前逻辑指纹（值动作：写前值；格式动作：写前格式证据）。校验不是加密。 */
   previewFingerprint: string;
   applyTo?: string | null;
   expectedFingerprint?: string | null;
   formulaR1C1?: boolean;
+  formatFields?: string[];
 }
 
 /**
@@ -1302,6 +1919,36 @@ export interface WpsRecoveryDescriptor {
   actions: WpsRecoveryActionDescriptor[];
 }
 
+/**
+ * WPS 恢复账本认可的**动作类型**（唯一来源）。
+ *
+ * 与 `config/capabilities.json` 的 `wpsWrite.allowedActions` 同口径（`clearRange`
+ * 在那里按 `clearRange:contents` 细分），也与执行器 `WPS_SUPPORTED_ACTION_KEYS`
+ * 一致。曾经这里硬编码成"只认三个值动作"，于是**格式动作在 fetch 之前就被拒**，
+ * 表现成真实 WPS 上"确认写回"时提示「恢复描述的动作定位或形状无效」。
+ */
+export const WPS_RECOVERABLE_ACTION_TYPES = [
+  "writeValues",
+  "writeFormulas",
+  "clearRange",
+  "setFont",
+  "setAlignment",
+  "resizeRange"
+] as const;
+
+/**
+ * 每个格式动作**可以声明**的属性名（= 执行器 `declaredFormatFields` 的输出集合，
+ * 也与 `wpsFormatSnapshot.ALL_WPS_FORMAT_FIELDS` 的字段名同源）。
+ *
+ * 未通过实机验证的属性（`underline` / `vertical` / `columnWidth`）**不在任何一行里**：
+ * 它们在投影阶段就产不出来，这里是第二道闸 —— 服务端还有第三道。
+ */
+export const WPS_FORMAT_ACTION_FIELDS: Record<string, readonly string[]> = {
+  setFont: ["bold", "italic", "name", "size", "color"],
+  setAlignment: ["horizontalAlignment", "wrapText"],
+  resizeRange: ["rowHeight"]
+};
+
 export function assertWpsEvidence(value: unknown): void {
   if (!value || typeof value !== "object" ||
       Object.keys(value).some((key) => !["sheetName", "range", "type", "beforeFingerprint", "afterFingerprint"].includes(key)))
@@ -1310,6 +1957,8 @@ export function assertWpsEvidence(value: unknown): void {
   if (["sheetName", "range", "type", "beforeFingerprint"].some((key) => typeof evidence[key] !== "string") ||
       (evidence.afterFingerprint != null && typeof evidence.afterFingerprint !== "string"))
     throw new Error("WPS 动作证据必须只含定位和指纹文本");
+  if (!(WPS_RECOVERABLE_ACTION_TYPES as readonly string[]).includes(String(evidence.type)))
+    throw new Error("WPS 动作证据的动作类型不在可恢复范围内");
 }
 
 export function assertWpsExecutionResult(value: unknown): void {
@@ -1327,11 +1976,11 @@ export function assertWpsRecoveryDescriptor(value: unknown): asserts value is Wp
       !Array.isArray((value as WpsRecoveryDescriptor).actions) || !(value as WpsRecoveryDescriptor).actions.length)
     throw new Error("WPS 恢复描述无效");
   const keys = ["actionIndex", "type", "sheet", "range", "rowCount", "columnCount", "cellCount",
-    "previewFingerprint", "expectedFingerprint", "applyTo", "formulaR1C1"];
+    "previewFingerprint", "expectedFingerprint", "applyTo", "formulaR1C1", "formatFields"];
   for (const [index, action] of (value as WpsRecoveryDescriptor).actions.entries()) {
     if (!action || Object.keys(action).some((key) => !keys.includes(key)))
       throw new Error("WPS 恢复描述含未知字段或单元格矩阵，已拒绝接收");
-    if (action.actionIndex !== index || !["writeValues", "writeFormulas", "clearRange"].includes(action.type) ||
+    if (action.actionIndex !== index || !(WPS_RECOVERABLE_ACTION_TYPES as readonly string[]).includes(action.type) ||
         typeof action.sheet !== "string" || typeof action.range !== "string" ||
         !Number.isInteger(action.rowCount) || action.rowCount < 1 ||
         !Number.isInteger(action.columnCount) || action.columnCount < 1 ||
@@ -1340,7 +1989,29 @@ export function assertWpsRecoveryDescriptor(value: unknown): asserts value is Wp
         (action.applyTo != null && typeof action.applyTo !== "string") ||
         (action.formulaR1C1 != null && typeof action.formulaR1C1 !== "boolean"))
       throw new Error("WPS 恢复描述的动作定位或形状无效");
+    assertWpsFormatFields(action.type, (action as { formatFields?: unknown }).formatFields);
   }
+}
+
+/**
+ * 格式属性声明的形状与白名单校验。
+ *
+ * 值动作**不得**声明格式属性（否则"这个指纹是值指纹还是格式指纹"会变得不可判定）；
+ * 格式动作**必须**至少声明一个，且只能取已验证的属性名。要求"至少一个"不是形式主义：
+ * 空的格式动作本来就被协议层拒绝，这里再兜一次，避免登记出一份"目标指纹等于写前指纹"
+ * 的记录 —— 那样的记录对恢复判定没有区分力。
+ */
+function assertWpsFormatFields(type: string, declared: unknown): void {
+  const allowed = WPS_FORMAT_ACTION_FIELDS[type];
+  if (!allowed) {
+    if (declared != null && (!Array.isArray(declared) || declared.length))
+      throw new Error("WPS 恢复描述的值动作不允许声明格式属性");
+    return;
+  }
+  if (!Array.isArray(declared) || !declared.length ||
+      declared.some((field) => typeof field !== "string" || !allowed.includes(field)) ||
+      new Set(declared).size !== declared.length)
+    throw new Error("WPS 恢复描述的格式属性声明无效");
 }
 
 /**
@@ -1571,6 +2242,8 @@ export type AssistantResponse =
       outcome?: "completed" | "failed";
       stopReason?: "max_turns" | "max_tokens" | "timeout" | "consecutive_errors" | "output_length" | null;
       resultContext?: ResultContext | null;
+      /** SDK 本地结果卡指针：只带引用与结构，值由本机回环端点取回。 */
+      localResult?: LocalResultCard | null;
       turnId?: string | null;
     }
   | {
@@ -1603,7 +2276,11 @@ export interface PlanningPauseResult {
   maximumExtensions: number;
   canContinue: boolean;
   requiresExtension: boolean;
-  pauseType: "budget" | "model_error" | "interrupted";
+  /**
+   * 暂停原因。`budget_exhausted` 是 2026-10-10 新增：累计活跃执行时间已达
+   * 总时限，恢复能力受引用是否仍然有效限制，**不能**显示成"必然可以继续"。
+   */
+  pauseType: "budget" | "budget_exhausted" | "model_error" | "interrupted";
   currentModelId?: string | null;
   modelSwitchCount: number;
   canSwitchModel: boolean;
@@ -1619,6 +2296,22 @@ export interface PlanningPauseResult {
 
 export type PlanningStreamResult = AssistantResponse | PlanningPauseResult;
 
+/**
+ * 持久账本里的**版本化恢复描述**。
+ *
+ * 落盘的规划记录**不是**一个 `AssistantResponse`：值矩阵被省略过，回放出来会是
+ * 一个"矩阵全空"的假计划。所以要靠 `valuesOmitted` 分辨这条记录能不能当完整
+ * 响应回放，靠 `resultRef` 指出要取真值该走哪个本地结果引用。
+ */
+export interface PlanningRecoveryDescriptor {
+  schemaVersion: number;
+  kind: string | null;
+  /** true = 有值被省略，`response` 只能当结构参考；false = 可当完整响应回放。 */
+  valuesOmitted: boolean;
+  resultRef: string | null;
+  response: Record<string, unknown>;
+}
+
 export type PlanningTaskStatusResult =
   | (Omit<PlanningPauseResult, "status"> & {
       status: "running" | "waiting_user" | "interrupted";
@@ -1628,7 +2321,13 @@ export type PlanningTaskStatusResult =
       status: "completed";
       revision: number;
       lastSequence: number;
-      result: AssistantResponse;
+      /**
+       * **没有值被省略**时才有：可直接回放的完整响应。
+       * 两个字段互斥 —— 有 `recovery` 就不会有 `result`。
+       */
+      result?: AssistantResponse;
+      /** 值被省略过：只给版本化恢复描述，绝不冒充完整响应。 */
+      recovery?: PlanningRecoveryDescriptor | null;
       canContinue: false;
     }
   | {
@@ -1719,6 +2418,10 @@ export interface TaskProgressEvent {
   facts?: TaskProgressFact[] | null;
   target?: TaskProgressTarget | null;
   trace?: TaskProgressTrace | null;
+  /** 桥指针：收到即表示服务端在等本机执行一次本地查询并回执。 */
+  bridgeTool?: SdkBridgeToolPointer | null;
+  /** Python 分析结果卡：包含引用与结构，值由前端另行查询。 */
+  pythonResult?: LocalResultCard | null;
   timestamp: string;
 }
 
@@ -2025,6 +2728,7 @@ export function assertPlanningPauseResult(
     typeof result.canContinue !== "boolean" ||
     typeof result.requiresExtension !== "boolean" ||
     (result.pauseType !== "budget" &&
+      result.pauseType !== "budget_exhausted" &&
       result.pauseType !== "model_error" &&
       result.pauseType !== "interrupted") ||
     typeof result.modelSwitchCount !== "number" ||
@@ -2055,13 +2759,224 @@ export function assertPlanningPauseResult(
 }
 
 /**
+ * 六个**格式动作**的联合类型。
+ *
+ * 抽出来是因为它们共享两件事：`sheet` + `range` 定位，以及"只改指定属性"的语义。
+ * 字段级校验、预览的属性清单、影响范围说明都只对这一段做，用 `ExcelAction` 全量
+ * 去 switch 会连 `createWorksheet`（根本没有 `range`）一起卷进来。
+ */
+export type FormatAction = Extract<
+  ExcelAction,
+  {
+    type:
+      | "setFill"
+      | "setFont"
+      | "setBorders"
+      | "setAlignment"
+      | "setNumberFormat"
+      | "resizeRange";
+  }
+>;
+
+const FORMAT_ACTION_TYPES = new Set<string>([
+  "setFill",
+  "setFont",
+  "setBorders",
+  "setAlignment",
+  "setNumberFormat",
+  "resizeRange"
+]);
+
+export function isFormatAction(action: ExcelAction): action is FormatAction {
+  return FORMAT_ACTION_TYPES.has(action.type);
+}
+
+/** `setBorders` 的缺省值。服务端 `models.py` 给的是同一组，执行器与回读判据都从这里取。 */
+export const BORDER_DEFAULTS = {
+  style: "continuous",
+  color: "#000000",
+  weight: "thin"
+} as const satisfies { style: BorderLineStyle; color: string; weight: BorderWeight };
+
+/**
+ * 补齐 `setBorders` 的缺省值。
+ *
+ * 类型层把 `style`/`color`/`weight` 标成可选（对齐 Python 的默认值），所以**不能**
+ * 在执行器里直接 `action.style` —— 那会得到 `undefined` 并写成非法值。执行与回读
+ * 必须走同一条补齐逻辑，否则"写入用的 style"和"核对用的 style"会在缺省时对不上。
+ */
+export function normalizeBorderAction(
+  action: Extract<ExcelAction, { type: "setBorders" }>
+): { sides: BorderSide[]; style: BorderLineStyle; color: string; weight: BorderWeight } {
+  return {
+    sides: action.sides,
+    style: action.style ?? BORDER_DEFAULTS.style,
+    color: action.color ?? BORDER_DEFAULTS.color,
+    weight: action.weight ?? BORDER_DEFAULTS.weight
+  };
+}
+
+function assertHexColor(value: unknown, label: string): void {
+  if (typeof value !== "string" || !HEX_COLOR_PATTERN.test(value)) {
+    throw new Error(`${label}必须是 #RRGGBB 形式的颜色，收到 ${JSON.stringify(value)}`);
+  }
+}
+
+function assertInClosedSet<T extends string>(
+  value: unknown,
+  allowed: readonly T[],
+  label: string
+): void {
+  if (typeof value !== "string" || !(allowed as readonly string[]).includes(value)) {
+    throw new Error(`${label}只能是 ${allowed.join(" / ")}，收到 ${JSON.stringify(value)}`);
+  }
+}
+
+function assertOptionalBoolean(value: unknown, label: string): void {
+  if (value != null && typeof value !== "boolean") {
+    throw new Error(`${label}必须是布尔值`);
+  }
+}
+
+/**
+ * 格式动作的**字段级**校验（与 `server/app/models.py` 的 `Literal` / `Field` 等价）。
+ *
+ * 动作名白名单只保证"这个动作被允许"，不保证"参数是宿主能接受的"。颜色写成 `red`、
+ * 对齐写成 `middle`、列宽写成 900，白名单一条都不拦 —— 但它们会一路走到宿主才失败，
+ * 而那一刻前面的动作可能已经落盘了。所以格式参数必须在**动任何单元格之前**查完。
+ *
+ * 这条校验对**模型生成的计划**和**用户手改的 JSON** 一视同仁：手改的不该更宽松。
+ */
+export function assertFormatActionFields(action: ExcelAction): void {
+  // 非格式动作没有 `sheet`/`range` 这两个定位字段，直接跳过。
+  if (!isFormatAction(action)) return;
+  const where = `「${action.sheet}!${action.range}」`;
+  switch (action.type) {
+    case "setFill":
+      assertHexColor(action.color, `${where}的填充色`);
+      return;
+    case "setFont": {
+      const font = action;
+      assertOptionalBoolean(font.bold, `${where}的加粗标记`);
+      assertOptionalBoolean(font.italic, `${where}的斜体标记`);
+      if (font.color != null) assertHexColor(font.color, `${where}的字色`);
+      if (font.name != null) {
+        if (
+          typeof font.name !== "string" ||
+          !font.name.trim() ||
+          font.name.length > FONT_NAME_MAX_LENGTH
+        ) {
+          throw new Error(`${where}的字体名无效`);
+        }
+      }
+      if (font.size != null) {
+        if (
+          typeof font.size !== "number" ||
+          !Number.isFinite(font.size) ||
+          font.size < FONT_SIZE_RANGE.min ||
+          font.size > FONT_SIZE_RANGE.max
+        ) {
+          throw new Error(
+            `${where}的字号必须在 ${FONT_SIZE_RANGE.min}–${FONT_SIZE_RANGE.max} 之间`
+          );
+        }
+      }
+      // 一个属性都没给 = 这个动作什么也不做。放过去会让计划"看起来成功、实际没改"，
+      // 与"只有指定属性被改变"的承诺正好相反，所以当场拒绝。
+      if (
+        font.bold == null &&
+        font.italic == null &&
+        font.name == null &&
+        font.size == null &&
+        font.color == null
+      ) {
+        throw new Error(`${where}的 setFont 没有指定任何要修改的字体属性`);
+      }
+      return;
+    }
+    case "setBorders": {
+      const borders = action;
+      if (!Array.isArray(borders.sides) || borders.sides.length === 0) {
+        throw new Error(`${where}的 setBorders 至少需要一条边`);
+      }
+      if (new Set(borders.sides).size !== borders.sides.length) {
+        throw new Error(`${where}的 setBorders 里有重复的边`);
+      }
+      borders.sides.forEach((side) =>
+        assertInClosedSet(side, BORDER_SIDES, `${where}的边框位置`)
+      );
+      const normalized = normalizeBorderAction(borders);
+      assertInClosedSet(normalized.style, BORDER_LINE_STYLES, `${where}的线型`);
+      assertInClosedSet(normalized.weight, BORDER_WEIGHTS, `${where}的线宽`);
+      assertHexColor(normalized.color, `${where}的边框颜色`);
+      return;
+    }
+    case "setAlignment": {
+      const alignment = action;
+      if (alignment.horizontal != null) {
+        assertInClosedSet(alignment.horizontal, HORIZONTAL_ALIGNMENTS, `${where}的水平对齐`);
+      }
+      if (alignment.vertical != null) {
+        assertInClosedSet(alignment.vertical, VERTICAL_ALIGNMENTS, `${where}的垂直对齐`);
+      }
+      assertOptionalBoolean(alignment.wrapText, `${where}的自动换行标记`);
+      if (
+        alignment.horizontal == null &&
+        alignment.vertical == null &&
+        alignment.wrapText == null
+      ) {
+        throw new Error(`${where}的 setAlignment 没有指定任何要修改的对齐属性`);
+      }
+      return;
+    }
+    case "setNumberFormat": {
+      const numberFormat = action;
+      if (
+        typeof numberFormat.formatCode !== "string" ||
+        numberFormat.formatCode.length === 0 ||
+        numberFormat.formatCode.length > NUMBER_FORMAT_MAX_LENGTH
+      ) {
+        throw new Error(
+          `${where}的数字格式码必须是 1–${NUMBER_FORMAT_MAX_LENGTH} 个字符`
+        );
+      }
+      return;
+    }
+    case "resizeRange": {
+      const resize = action;
+      const checkRange = (
+        value: unknown,
+        range: { min: number; max: number },
+        label: string
+      ) => {
+        if (value == null) return;
+        if (
+          typeof value !== "number" ||
+          !Number.isFinite(value) ||
+          value < range.min ||
+          value > range.max
+        ) {
+          throw new Error(`${label}必须在 ${range.min}–${range.max} 之间`);
+        }
+      };
+      checkRange(resize.rowHeight, ROW_HEIGHT_RANGE, `${where}的行高`);
+      checkRange(resize.columnWidth, COLUMN_WIDTH_RANGE, `${where}的列宽`);
+      if (resize.rowHeight == null && resize.columnWidth == null) {
+        throw new Error(`${where}的 resizeRange 没有指定行高或列宽`);
+      }
+      return;
+    }
+  }
+}
+
+/**
  * 校验一份计划的动作白名单与验收条件结构。
  *
  * 模型返回的计划和用户手改的 JSON 走同一道门 —— 手改的不该比模型生成的宽松，
  * 否则「能编辑」就变成了绕过白名单的后门。
  *
- * 这里只做结构与白名单校验，不查 title/summary 之类的必填字段：那些交给服务端
- * Pydantic 规范化，前端多加一层只会和既有调用方打架。
+ * 这里只做结构、白名单与**格式动作的字段级**校验，不查 title/summary 之类的必填
+ * 字段：那些交给服务端 Pydantic 规范化，前端多加一层只会和既有调用方打架。
  */
 export function assertEditablePlan(
   value: unknown
@@ -2078,6 +2993,7 @@ export function assertEditablePlan(
     if (!action.type || !allowedActionTypes.has(action.type as ExcelAction["type"])) {
       throw new Error(`计划包含未授权动作：${action.type ?? "unknown"}`);
     }
+    assertFormatActionFields(action as ExcelAction);
   }
 
   const criteria = response.plan.acceptanceCriteria;
@@ -2147,6 +3063,9 @@ export function assertEditablePlan(
         criterion.fillColor,
         criterion.bold,
         criterion.fontColor,
+        criterion.fontName,
+        criterion.fontSize,
+        criterion.fontItalic,
         criterion.numberFormat,
         criterion.horizontal,
         criterion.vertical,
@@ -2506,6 +3425,44 @@ export function parseTaskProgressEvent(
     ),
     target: parseProgressTarget(candidate.target),
     trace,
+    bridgeTool: parseBridgeToolPointer(
+      (candidate as TaskProgressEvent & { bridgeTool?: unknown }).bridgeTool
+    ),
+    pythonResult: parseLocalResultCard(candidate.pythonResult),
     timestamp: candidate.timestamp
   };
+}
+
+const BRIDGE_OPERATION_ID = /^op_[0-9a-f]{32}$/;
+
+/** Rebuild metadata only; never persist arbitrary fields from a progress frame. */
+export function parseLocalResultCard(value: unknown): LocalResultCard | null {
+  if (!value || typeof value !== "object") return null;
+  const card = value as Partial<LocalResultCard>;
+  if (typeof card.resultRef !== "string" || !/^res_[0-9a-f]{32}$/.test(card.resultRef) ||
+      typeof card.title !== "string" || !card.title || card.title.length > 300 ||
+      !Array.isArray(card.headers) || !card.headers.length || card.headers.length > 50 ||
+      !card.headers.every((header) => typeof header === "string") ||
+      !Number.isInteger(card.rowCount) || card.rowCount! < 0 ||
+      !Number.isInteger(card.columnCount) || card.columnCount! < 1 ||
+      !Array.isArray(card.sourceSheets) || card.sourceSheets.length > 100 ||
+      !card.sourceSheets.every((sheet) => typeof sheet === "string") ||
+      typeof card.complete !== "boolean") return null;
+  return { resultRef: card.resultRef, title: card.title, headers: [...card.headers],
+    rowCount: card.rowCount!, columnCount: card.columnCount!,
+    sourceSheets: [...card.sourceSheets], complete: card.complete };
+}
+
+/** 严格解析桥指针：形状不符就当没有，绝不把半成品指针交给宿主。 */
+export function parseBridgeToolPointer(value: unknown): SdkBridgeToolPointer | null {
+  if (value === null || typeof value !== "object") return null;
+  const pointer = value as Partial<SdkBridgeToolPointer>;
+  if (
+    typeof pointer.operationId !== "string" ||
+    !BRIDGE_OPERATION_ID.test(pointer.operationId) ||
+    (pointer.tool !== "query_table" && pointer.tool !== "prepare_python_data")
+  ) {
+    return null;
+  }
+  return { operationId: pointer.operationId, tool: pointer.tool };
 }

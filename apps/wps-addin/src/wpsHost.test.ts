@@ -35,6 +35,13 @@ function fakeApplication(overrides: Partial<WpsApplication> = {}): WpsApplicatio
 }
 
 describe("WPS host probe", () => {
+  it("the scope picker metadata probe does not touch selected cell contents", () => {
+    const application = fakeApplication();
+    Object.defineProperty(application, "Selection", { get() { throw new Error("no business data before consent"); } });
+    const result = readWpsHostProbe(application, { includeSelectionPreview: false });
+    expect(result.workbookName).toBe("测试.xlsx");
+    expect(result.selectionPreview).toBeNull();
+  });
   it("rejects pages that are not connected to WPS", () => {
     expect(() => getWpsApplication({ Application: undefined })).toThrow(WpsHostUnavailableError);
   });

@@ -46,7 +46,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
   padding: 24px;
   background:
     radial-gradient(circle at 85% 10%, rgba(86, 160, 112, 0.18), transparent 34%),
-    linear-gradient(150deg, #f8fbf9, #e8f3ec);
+    linear-gradient(150deg, var(--color-brand-bg), var(--color-brand-bg));
 }
 
 .connection-shell { flex-wrap: wrap; }
@@ -59,23 +59,40 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
   border-radius: var(--radius-sm);
   corner-shape: squircle;
   background: var(--brand);
-  color: #fff;
+  color: var(--color-background);
   padding: 8px 14px;
 }
 .connection-shell.error { color: var(--danger); }
 
-.probe-logo,
+/*
+ * 「EB 字标」时代的遗留类名：全仓已无渲染点（只有 excel-addin 的
+ * styles.test.ts 圆角契约在引用它）。这里**故意只保留原样**，不做与本次
+ * logo 替换无关的清理，以免顺手改动一个没人渲染的类的观感。
+ */
 .eb-brand-mark {
   display: inline-grid;
   place-items: center;
   flex: 0 0 auto;
   border-radius: var(--radius-full);
   background: var(--brand);
-  color: #fff;
+  color: var(--color-background);
   font-weight: 750;
   letter-spacing: -0.02em;
 }
-.probe-logo { width: 46px; height: 46px; font-size: 18px; }
+
+/*
+ * 探针 / 设置面板的品牌徽标。与 Excel 的 `.brand-mark` 同步换成图片 logo，
+ * 故去掉底色、字色与字号：留着会在图片下面垫一层品牌绿、把边缘染绿。
+ * `--radius-full` 同样保留以维持「真圆元素」契约。
+ */
+.probe-logo {
+  display: block;
+  flex: 0 0 auto;
+  width: 46px;
+  height: 46px;
+  object-fit: contain;
+  border-radius: var(--radius-full);
+}
 
 .probe-shell,
 .wps-chat-shell {
@@ -173,7 +190,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
   height: 7px;
   flex: 0 0 7px;
   border-radius: 50%;
-  background: #2d9b63;
+  background: var(--color-brand-text);
   box-shadow: 0 0 0 3px rgba(45, 155, 99, 0.12);
 }
 .eb-brand-copy .offline i { background: #c46052; box-shadow: 0 0 0 3px rgba(196, 96, 82, 0.12); }
@@ -194,7 +211,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .eb-new-chat {
   border-color: var(--brand);
   background: var(--brand);
-  color: #fff;
+  color: var(--color-background);
   padding: 0 12px;
   white-space: nowrap;
 }
@@ -253,7 +270,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .eb-message.welcome .eb-message-bubble { max-width: 100%; }
 .eb-message.user .eb-message-bubble {
   background: rgba(47, 118, 81, 0.94);
-  color: #fff;
+  color: var(--color-background);
   border-bottom-right-radius: 6px;
 }
 .eb-message.system .eb-message-bubble {
@@ -269,17 +286,17 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   corner-shape: squircle;
-  background: #fff;
+  background: var(--color-background);
 }
 .preview-table-wrap table { width: 100%; border-collapse: collapse; font-size: 12px; }
 .preview-table-wrap th,
 .preview-table-wrap td {
-  border: 1px solid #e2e9e4;
+  border: 1px solid var(--color-brand-hover);
   padding: 7px 8px;
   text-align: left;
   white-space: nowrap;
 }
-.preview-table-wrap th { background: #edf5f0; color: #40594b; }
+.preview-table-wrap th { background: var(--color-brand-bg); color: var(--color-brand-text); }
 
 .clarification-card,
 .agent-progress {
@@ -331,7 +348,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
   width: 100%;
   min-width: 0;
   padding: 8px 10px;
-  border: 1px solid #cbdacf;
+  border: 1px solid var(--color-brand-hover);
   border-radius: var(--radius-sm);
   corner-shape: squircle;
   font: inherit;
@@ -342,10 +359,10 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
   gap: 8px;
   min-width: 0;
   padding: 12px;
-  border: 1px solid #d8e3dc;
+  border: 1px solid var(--color-brand-hover);
   border-radius: var(--radius-sm);
   corner-shape: squircle;
-  background: #f6faf7;
+  background: var(--color-brand-bg);
 }
 .local-mapping-priority-item {
   display: flex;
@@ -371,7 +388,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
   align-items: center;
   gap: 9px;
   padding: 10px 13px;
-  color: #4d6256;
+  color: var(--color-brand-text);
 }
 .progress-dot {
   width: 8px;
@@ -468,7 +485,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   corner-shape: squircle;
-  background: #fff;
+  background: var(--color-background);
   color: var(--brand-strong);
   padding: 6px 9px;
   font-size: 12px;
@@ -498,7 +515,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
   border-radius: var(--radius-sm);
   corner-shape: squircle;
   background: var(--brand);
-  color: #fff;
+  color: var(--color-background);
   font-weight: 750;
 }
 .read-status-text { margin: 8px 0 0; color: var(--muted); font-size: 12px; }
@@ -540,7 +557,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   corner-shape: squircle;
-  background: #f5f8f6;
+  background: var(--color-brand-bg);
   color: #8b9991;
   padding: 4px 8px;
   font-size: 12px;
@@ -563,7 +580,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
   border: 0;
   border-radius: 50%;
   background: var(--brand);
-  color: #fff;
+  color: var(--color-background);
   font-size: 20px;
 }
 .wps-capability-note {
@@ -645,7 +662,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 }
 .eb-brand-copy strong { font-size: var(--font-size-body); letter-spacing: -0.02em; }
 .eb-brand-copy span { color: var(--color-text-secondary, #787774); font-size: var(--font-size-caption); }
-.eb-brand-copy span.online { color: #216f3d; }
+.eb-brand-copy span.online { color: var(--color-brand-text); }
 .eb-header-actions { min-width: 0; gap: 6px; }
 .eb-new-chat,
 .eb-pet-button,
@@ -663,13 +680,13 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
   padding: 0 9px;
   border-color: var(--color-brand-text, #2f6b47);
   background: var(--color-brand-text, #2f6b47);
-  color: #fff;
+  color: var(--color-background);
   font-weight: 750;
 }
 .eb-pet-button { width: 28px; }
 .eb-pet-button svg { width: 16px; height: 16px; }
 .eb-readonly-chip { min-width: 40px; padding: 0 6px; background: var(--color-brand-bg, #edf3ec); }
-.eb-readonly-chip.writable { border-color: #b8d8c2; background: #e7f5eb; color: #216f3d; }
+.eb-readonly-chip.writable { border-color: var(--color-brand-hover); background: var(--color-brand-bg); color: var(--color-brand-text); }
 
 .eb-message-stream { padding: 16px 14px 4px; }
 .eb-message { margin-bottom: 14px; }
@@ -811,14 +828,14 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .theme-preview { display: grid; gap: var(--spacing-sm); border: 1px solid var(--color-border, #e9e9e7); border-radius: var(--radius-md);
   corner-shape: squircle; background: var(--color-background-subtle, #fff); padding: var(--spacing-md); }
 .theme-preview-bubble { width: fit-content; border-radius: var(--radius-md);
-  corner-shape: squircle; background: var(--color-brand-text, #2f6b47); color: #fff; padding: var(--spacing-sm) var(--spacing-md); font-size: var(--font-size-body); }
+  corner-shape: squircle; background: var(--color-brand-text, #2f6b47); color: var(--color-background); padding: var(--spacing-sm) var(--spacing-md); font-size: var(--font-size-body); }
 .theme-preview-button { width: fit-content; border: 0; border-radius: var(--radius-md);
-  corner-shape: squircle; background: var(--color-brand-text, #2f6b47); color: #fff; padding: 6px 12px; font-size: var(--font-size-caption); font-weight: 800; }
+  corner-shape: squircle; background: var(--color-brand-text, #2f6b47); color: var(--color-background); padding: 6px 12px; font-size: var(--font-size-caption); font-weight: 800; }
 .theme-actions { display: flex; justify-content: flex-end; gap: var(--spacing-sm); border-top: 1px solid var(--color-border, #e9e9e7); padding-top: var(--spacing-md); }
 .theme-actions button,
 .theme-upload-row button { min-height: 30px; border: 1px solid var(--color-border, #e9e9e7); border-radius: var(--radius-md);
   corner-shape: squircle; background: var(--color-surface, #fafaf9); color: var(--color-text-primary, #37352f); padding: 5px 10px; font-size: var(--font-size-caption); }
-.theme-actions .primary-button { border-color: var(--color-brand-text, #2f6b47); background: var(--color-brand-text, #2f6b47); color: #fff; }
+.theme-actions .primary-button { border-color: var(--color-brand-text, #2f6b47); background: var(--color-brand-text, #2f6b47); color: var(--color-background); }
 
 @media (max-width: 620px) {
   .eb-chat-header { align-items: center; padding: 8px 10px; }
@@ -1171,7 +1188,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
   border: 1px solid var(--color-border, #d9e4dc);
   border-radius: var(--radius-sm);
   corner-shape: squircle;
-  background: #fff;
+  background: var(--color-background);
   color: var(--color-brand-text, #2f6b47);
   padding: 0 12px;
   font-weight: 750;
@@ -1183,7 +1200,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
   /* 窄窗格（含真机 350/430 CSS px）：两枚按钮各自占满整行，纵向排列。 */
   .wps-native-review-actions button { flex-basis: 100%; }
 }
-.wps-native-review-actions button.primary { border-color: var(--color-brand-text, #2f6b47); background: var(--color-brand-text, #2f6b47); color: #fff; }
+.wps-native-review-actions button.primary { border-color: var(--color-brand-text, #2f6b47); background: var(--color-brand-text, #2f6b47); color: var(--color-background); }
 .wps-native-review-actions button:disabled,
 .wps-undo-card button:disabled { opacity: 0.55; }
 .wps-undo-card button {
@@ -1191,7 +1208,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
   border: 1px solid var(--color-border, #d9e4dc);
   border-radius: var(--radius-sm);
   corner-shape: squircle;
-  background: #fff;
+  background: var(--color-background);
   color: var(--color-brand-text, #2f6b47);
   padding: 0 12px;
   font-weight: 750;
@@ -1268,7 +1285,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
   place-items: center;
   border: 0;
   border-radius: var(--radius-full);
-  background: radial-gradient(circle at 30% 26%, #fff, transparent 42%), #eef7f1;
+  background: radial-gradient(circle at 30% 26%, var(--color-background), transparent 42%), var(--color-brand-bg);
   padding: 0;
   box-shadow: 0 6px 18px rgba(39, 83, 51, 0.22);
   transition: transform 0.16s ease;
@@ -1297,7 +1314,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
   border: 1px solid var(--color-brand-hover, #e3ebe2);
   border-radius: var(--radius-lg);
   corner-shape: squircle;
-  background: radial-gradient(circle at 12% 14%, rgba(115, 197, 139, 0.16), transparent 40%), linear-gradient(135deg, #fbfefc, #eef7f1);
+  background: radial-gradient(circle at 12% 14%, rgba(115, 197, 139, 0.16), transparent 40%), linear-gradient(135deg, var(--color-brand-bg), var(--color-brand-bg));
   padding: 12px 14px 14px;
   box-shadow: var(--shadow-md, 0 2px 4px rgba(0, 0, 0, 0.06));
   animation: pet-bubble-in 0.16s ease;
@@ -1311,7 +1328,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
   height: 14px;
   border-left: 1px solid var(--color-brand-hover, #e3ebe2);
   border-top: 1px solid var(--color-brand-hover, #e3ebe2);
-  background: #fbfefc;
+  background: var(--color-brand-bg);
   transform: rotate(45deg);
 }
 @keyframes pet-bubble-in {
@@ -1325,19 +1342,19 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
   justify-content: space-between;
   gap: 8px;
 }
-.pet-bubble-eyebrow { color: #2f7b4a; font-size: var(--font-size-caption); font-weight: 700; letter-spacing: 0.03em; }
-.pet-bubble strong { color: #24513a; font-size: var(--font-size-body); }
+.pet-bubble-eyebrow { color: var(--color-brand-text); font-size: var(--font-size-caption); font-weight: 700; letter-spacing: 0.03em; }
+.pet-bubble strong { color: var(--color-brand-text); font-size: var(--font-size-body); }
 .pet-bubble p { margin: 1px 0 0; color: #6c7a72; font-size: var(--font-size-caption); line-height: 17px; }
 .pet-shortcut {
   justify-self: start;
   margin-top: 8px;
-  border: 1px solid #bcd9c6;
+  border: 1px solid var(--color-brand-hover);
   border-bottom-width: 2px;
   border-radius: var(--radius-sm);
   corner-shape: squircle;
-  background: #fff;
+  background: var(--color-background);
   padding: 2px 8px;
-  color: #276d42;
+  color: var(--color-brand-text);
   font-family: var(--font-family-mono);
   font-size: var(--font-size-caption);
   font-weight: 600;
@@ -1345,16 +1362,16 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .pet-next {
   flex: 0 0 auto;
   margin-left: auto;
-  border: 1px solid #bcd9c6;
+  border: 1px solid var(--color-brand-hover);
   border-radius: var(--radius-sm);
   corner-shape: squircle;
-  background: #fff;
+  background: var(--color-background);
   padding: 3px 10px;
-  color: #276d42;
+  color: var(--color-brand-text);
   font-size: var(--font-size-caption);
   font-weight: 600;
 }
-.pet-next:hover { background: #eaf4ed; }
+.pet-next:hover { background: var(--color-brand-bg); }
 
 @media (prefers-reduced-motion: reduce) {
   .pet-jelly-shape,
@@ -1507,7 +1524,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .model-primary-action {
   border-color: var(--color-brand-text, #2f6b47) !important;
   background: var(--color-brand-text, #2f6b47) !important;
-  color: #fff !important;
+  color: var(--color-background) !important;
 }
 .api-key-settings > .model-primary-action { justify-self: start; min-height: 34px; border: 0; border-radius: var(--radius-md);
   corner-shape: squircle; padding: 6px 11px; font-size: var(--font-size-caption); font-weight: 750; }
@@ -1653,11 +1670,11 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
   display: flex;
   align-items: flex-start;
   gap: 7px;
-  border: 1px solid #c8dfcf;
+  border: 1px solid var(--color-brand-hover);
   border-radius: var(--radius-md);
   corner-shape: squircle;
-  background: #eef7f1;
-  color: #2f6b47;
+  background: var(--color-brand-bg);
+  color: var(--color-brand-text);
   padding: 8px 10px;
   font-size: var(--font-size-caption);
   line-height: 1.45;
@@ -1730,170 +1747,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 }
 .wps-chat-shell .composer-shortcut-hint { text-align: left; }
 
-.wps-chat-shell .wps-verification-card {
-  width: 100%;
-  margin-top: 8px;
-  line-height: 1.45;
-}
-
-/*
- * 正常成功的结果卡：**中性底 + 绿色标记**，不再整块品牌绿。
- *
- * 同一次会话里成功卡会累积很多张，整卡着色会把消息流刷成一片绿，反而削弱了
- * 真正需要用户关注的那几张（失败 / 未获证实 / 冲突）。成功由左侧的绿色竖条
- * 与标题文案表达，**不靠整卡变色**。
- */
-.wps-chat-shell .wps-verification-card.verified {
-  position: relative;
-  border-color: var(--color-border, #e9e9e7);
-  background: var(--color-background, #ffffff);
-  color: var(--color-text-primary, #37352f);
-  padding-left: 12px;
-}
-.wps-chat-shell .wps-verification-card.verified::before {
-  content: "";
-  position: absolute;
-  top: 8px;
-  bottom: 8px;
-  left: 0;
-  width: 3px;
-  border-radius: var(--radius-sm);
-  corner-shape: squircle;
-  background: var(--color-brand-text, #2f6b47);
-}
-.wps-chat-shell .wps-verification-card.verified strong { color: var(--color-brand-text, #2f6b47); }
-
-/*
- * 失败 / 冲突 / 需用户处理的卡片要**更醒目**，但**不能只靠颜色**：
- * 左侧竖条用更粗的警示色，并在标题前加一个文字标记，色盲用户同样能分辨。
- */
-.wps-chat-shell .wps-verification-card.failed,
-.wps-chat-shell .wps-verification-card.unverified,
-.wps-chat-shell .wps-verification-card.partial {
-  position: relative;
-  padding-left: 12px;
-}
-.wps-chat-shell .wps-verification-card.failed::before,
-.wps-chat-shell .wps-verification-card.unverified::before,
-.wps-chat-shell .wps-verification-card.partial::before {
-  content: "";
-  position: absolute;
-  top: 6px;
-  bottom: 6px;
-  left: 0;
-  width: 4px;
-  border-radius: var(--radius-sm);
-  corner-shape: squircle;
-  background: var(--color-warning-text, #9a6328);
-}
-.wps-chat-shell .wps-verification-card.failed::before { background: var(--color-danger-text, #a33f34); }
-.wps-chat-shell .wps-verification-card.failed strong,
-.wps-chat-shell .wps-verification-card.unverified strong,
-.wps-chat-shell .wps-verification-card.partial strong {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-/* 非颜色线索：一个圆圈里的惊叹号，和文字一起出现。 */
-.wps-chat-shell .wps-verification-card.failed strong::before,
-.wps-chat-shell .wps-verification-card.unverified strong::before,
-.wps-chat-shell .wps-verification-card.partial strong::before {
-  content: "!";
-  display: inline-grid;
-  width: 16px;
-  height: 16px;
-  flex: 0 0 16px;
-  place-items: center;
-  border-radius: 50%;
-  background: var(--color-warning-bg, #fffbf3);
-  color: var(--color-warning-text, #9a6328);
-  font-size: 12px;
-  font-weight: 800;
-}
-.wps-chat-shell .wps-verification-card.failed strong::before {
-  background: var(--color-danger-bg, #fdeceb);
-  color: var(--color-danger-text, #a33f34);
-}
-
-.wps-chat-shell .wps-verification-card li {
-  overflow-wrap: anywhere;
-}
-
-.wps-chat-shell .wps-verification-card small {
-  color: var(--color-text-secondary);
-}
-
-.wps-chat-shell .wps-verification-card.undone {
-  background: var(--color-background-subtle);
-  color: var(--color-text-secondary);
-}
-
-/*
- * 「未获证实 / 部分写入」的结果卡不能被看成"验证通过"。
- * 色调只是辅助：真正的判据在 `WPS_EXECUTION_OUTCOME_LABEL` 的文案上。
- */
-.wps-chat-shell .wps-verification-card.unverified,
-.wps-chat-shell .wps-verification-card.partial {
-  border-color: var(--color-warning-border, #d9bb7d);
-  background: var(--color-warning-bg, #fffbf3);
-}
-
-/*
- * 执行结果卡**内部**的撤销行。
- *
- * 它必须待在自己那张卡里：早先那张无条件挂在消息流末尾的全局撤销卡，会让
- * 上一轮写入留下的恢复点看起来像本轮唯一能做的下一步。这个类名存在的意义
- * 就是让"按钮属于哪张卡"在 DOM 上可断言。
- */
-.wps-chat-shell .wps-verification-card .wps-undo-inline {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  margin-top: 10px;
-  padding-top: 9px;
-  border-top: 1px dashed var(--color-border, #e9e9e7);
-}
-
-.wps-chat-shell .wps-verification-card .wps-undo-inline > span {
-  min-width: 0;
-  color: var(--color-text-secondary);
-  font-size: var(--font-size-caption);
-  font-weight: 700;
-}
-
-.wps-chat-shell .wps-verification-card .wps-undo-inline button {
-  min-height: 34px;
-  flex: 0 0 auto;
-  border: 1px solid var(--color-border, #e9e9e7);
-  border-radius: var(--radius-sm);
-  corner-shape: squircle;
-  background: #fff;
-  color: var(--color-brand-text, #2f6b47);
-  padding: 0 12px;
-  font-weight: 750;
-  /* 窄窗格里也保持整句，不靠截断文案或缩小字号塞进一行。 */
-  white-space: nowrap;
-}
-
-.wps-chat-shell .wps-verification-card .wps-undo-inline button:disabled {
-  opacity: 0.55;
-}
-
-.wps-chat-shell .wps-verification-card .wps-undo-inline.conflict > span,
-.wps-chat-shell .wps-verification-card .wps-undo-inline.unavailable > span {
-  color: var(--color-warning-text, #805f21);
-}
-
-/* 窄窗格（含真机 350/430 CSS px）：状态与按钮各占整行。 */
-@media (max-width: 430px) {
-  .wps-chat-shell .wps-verification-card .wps-undo-inline {
-    align-items: stretch;
-    flex-direction: column;
-    gap: 7px;
-  }
-}
-
+/* 执行结果与撤销入口共用 ExecutionResultCard 的样式。 */
 .wps-query-result-meta {
   display: flex;
   flex-wrap: wrap;
@@ -1936,7 +1790,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
   font-weight: 700;
   white-space: nowrap;
 }
-.wps-write-recovery-completed { background: #e3f1e8; color: #2f6b47; }
+.wps-write-recovery-completed { background: var(--color-brand-bg); color: var(--color-brand-text); }
 .wps-write-recovery-reconcile { background: #e8f0fa; color: #2c5c9e; }
 .wps-write-recovery-replan { background: #e8eef8; color: #3a4a6b; }
 .wps-write-recovery-blocked { background: #fbf0df; color: #925f2d; }
@@ -1952,7 +1806,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
   border: 1px solid var(--color-border, #e9e9e7);
   border-radius: var(--radius-sm);
   corner-shape: squircle;
-  background: #fff;
+  background: var(--color-background);
   color: var(--color-brand-text, #2f6b47);
   padding: 0 12px;
   font-weight: 750;
@@ -1987,7 +1841,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
   border-radius: var(--radius-sm);
   corner-shape: squircle;
   background: var(--color-brand-text);
-  color: #fff;
+  color: var(--color-background);
   font-size: var(--font-size-caption);
   font-weight: 800;
 }
@@ -2058,12 +1912,22 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
   gap: 7px;
 }
 
+/*
+ * 首列 20px = 勾选框（共享 `.sheet-checkbox`）的宽度。
+ * 行高读与模式卡（跟随当前 / 选择多个 / 工作目录）同一个 token：
+ * 列表行原先自定 38px，比上面那几张卡矮一大截，列表看着"太细"。
+ *
+ * 声明顺序有意让 `grid-template-columns` 紧挨 `min-height`：这一对是反向变异
+ * (`scripts/mutate_scope_option_rows.mjs` M5) 的定点锚 —— 单独一行
+ * `min-height: 38px;` 在本文件里并非唯一（`.connection-shell > button` 也是它），
+ * 沿用旧串会让"还原"顺手改掉无关规则。
+ */
 .wps-sheet-picker-options > button {
   display: grid;
-  grid-template-columns: 22px minmax(0, 1fr) auto;
+  grid-template-columns: 20px minmax(0, 1fr) auto;
+  min-height: var(--scope-option-height);
   align-items: center;
   gap: 8px;
-  min-height: 38px;
   border: 1px solid var(--color-border);
   border-radius: var(--radius-md);
   corner-shape: squircle;
@@ -2078,42 +1942,31 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
   background: var(--color-brand-bg);
 }
 
-.wps-sheet-picker-options > button i {
-  display: grid;
-  width: 20px;
-  height: 20px;
-  place-items: center;
-  border: 1px solid var(--color-border-strong);
-  border-radius: var(--radius-xs);
-  corner-shape: squircle;
-  color: var(--color-brand-text);
-  font-style: normal;
-}
-
-.wps-sheet-picker-options > button.selected i {
-  border-color: var(--color-brand-text);
-  background: var(--color-brand-text);
-  color: #fff;
-}
-
 .wps-sheet-picker-options > button span {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+/*
+ * 行内**不再**各写一套勾选框样式：勾选框统一用共享的 `.sheet-checkbox`
+ * （与 Excel 同一份声明）。这里若再写 `.wps-sheet-picker-options > button i`
+ * （特异度 0-1-2 > `.sheet-checkbox` 的 0-1-0）就会把共享声明整个盖掉，
+ * 两端又变成各写一套 —— 那正是观感/行高漂移的来源。
+ * 授权状态徽标同理不再进这一行，改由列表下方的 ScopeAdmissionSummary 汇总。
+ */
+
 .wps-sheet-picker-options > button small {
   color: var(--color-text-secondary);
 }
 
-.wps-scope-actions {
-  display: flex;
-  flex: 0 0 auto;
-  justify-content: flex-end;
-  gap: 7px;
-  border-top: 1px solid var(--color-border);
-  padding: 10px var(--spacing-md);
-}
+/*
+ * 动作条的样式**不在这里**：`.wps-scope-actions` 与 Excel 的 `.scope-action-buttons`
+ * 共用共享样式表里的同一份声明（`flex: 0 0 auto` + `border-top` + `padding`）。
+ * 这里若再留一条同名规则，两端就又变成各写一套 —— 那正是"层不一样"的来路：
+ * 层的差别不是 padding 差几个像素，而是动作条在不在滚动容器里面；
+ * 样式一旦分叉，这种结构差异就会被各自的小修补永久掩盖。
+ */
 
 .wps-backup-content {
   min-height: 0;
@@ -2143,7 +1996,7 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
   border-radius: var(--radius-md);
   corner-shape: squircle;
   background: var(--color-brand-text);
-  color: #fff;
+  color: var(--color-background);
   padding: 6px 12px;
   font-weight: 750;
 }
@@ -2271,6 +2124,94 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .poc-dialog-shell { min-width: 720px; }
 .poc-dialog-hint { color: var(--muted); }
 
+/* WPS 格式能力探测面板（#/dev-format-probe） */
+.poc-panel-confirm {
+  display: grid;
+  gap: 8px;
+  border: 1px solid var(--brand);
+  border-radius: var(--radius-sm);
+  corner-shape: squircle;
+  background: var(--brand-soft);
+  padding: 12px;
+}
+
+.poc-panel-result-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.poc-panel-result-actions button {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  corner-shape: squircle;
+  background: var(--surface-soft);
+  padding: 4px 10px;
+  cursor: pointer;
+}
+
+.format-probe-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.format-probe-table th,
+.format-probe-table td {
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+  padding: 4px 6px;
+  overflow-wrap: anywhere;
+}
+
+.format-probe-table th { color: var(--muted); font-weight: 600; }
+
+.format-probe-table tr.probe-restore_verified td:nth-child(2) { color: var(--ok, #2e7d32); }
+.format-probe-table tr.probe-failed td:nth-child(2) { color: var(--danger); }
+.format-probe-table tr.probe-skipped td:nth-child(2) { color: var(--muted); }
+
+.format-probe-json {
+  max-height: 320px;
+  overflow: auto;
+  background: var(--surface-soft);
+  border-radius: var(--radius-sm);
+  corner-shape: squircle;
+  padding: 8px;
+  font-size: 11px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.probe-group-select {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.probe-group-select label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  corner-shape: squircle;
+  background: var(--surface-soft);
+  padding: 6px 8px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.probe-group-select label.probe-group-checked {
+  border-color: var(--brand);
+  background: var(--brand-soft);
+}
+
+.probe-group-select input:disabled + span {
+  opacity: 0.6;
+}
+
 .clarification-fields { display: grid; gap: 12px; margin-top: 14px; }
 .clarification-fields label { display: grid; gap: 6px; font-weight: 600; }
 .clarification-fields textarea {
@@ -2281,3 +2222,32 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 }
 .clarification-fields small { color: var(--muted); }
 .clarification-fields button { justify-self: start; padding: 10px 14px; }
+
+/*
+ * 执行方式选择（直接执行 / 副本比对）。与 Excel 端同一套结构与措辞，
+ * 样式也刻意保持一致 —— 两端卡片长得不一样会让人以为是两个功能。
+ */
+.wps-execution-mode {
+  margin: 10px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--color-border, #e1dfdd);
+  border-radius: var(--radius-sm);
+}
+.wps-execution-mode legend { font-size: 12px; font-weight: 700; padding: 0 4px; }
+.wps-execution-mode-preface { margin: 0 0 8px; font-size: 12px; color: var(--color-text-secondary, #787774); }
+.wps-execution-mode-option {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  grid-template-areas: "radio label" ". detail";
+  gap: 2px 8px;
+  padding: 8px 8px 8px 6px;
+  border-left: 3px solid transparent;
+  cursor: pointer;
+}
+.wps-execution-mode-option + .wps-execution-mode-option { margin-top: 4px; }
+.wps-execution-mode-option.selected { border-left-color: var(--color-accent, #2b6cb0); background: var(--color-subtle, rgba(0, 0, 0, 0.03)); }
+.wps-execution-mode-option.unavailable { cursor: not-allowed; opacity: 0.7; }
+.wps-execution-mode-option input { grid-area: radio; margin-top: 3px; }
+.wps-execution-mode-label { grid-area: label; font-size: 13px; font-weight: 700; }
+.wps-execution-mode-detail { grid-area: detail; font-size: 12px; line-height: 1.5; color: var(--color-text-secondary, #787774); }
+.wps-execution-mode-blocked { grid-area: detail; font-size: 12px; color: var(--color-warning, #a4262c); }

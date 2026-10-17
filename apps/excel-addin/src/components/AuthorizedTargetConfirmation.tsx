@@ -1,21 +1,26 @@
-import { useEffect, useId, useRef, useState } from "react";
-import { targetScopeLabel, type AuthorizedTarget, type TargetCheck } from "@excel-bro/core/authorizedTarget";
+import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
+import { targetScopeLabel, type AuthorizedTarget, type TargetNoticeReason } from "@excel-bro/core/authorizedTarget";
 
-export function AuthorizedTargetConfirmation({ notice, error, busy, onConfirm, onCancel }: {
-  notice: { bound: AuthorizedTarget; current: AuthorizedTarget | null; reason: TargetCheck;
+export function AuthorizedTargetConfirmation({ notice, error, busy, onConfirm, onCancel, onRecheck }: {
+  notice: { bound: AuthorizedTarget; current: AuthorizedTarget | null; reason: TargetNoticeReason;
     round: number; retrySelection?: string[] };
   error: string; busy: boolean;
   onConfirm: (choice: "original" | "current", selected: string[]) => void;
   onCancel: () => void;
+  onRecheck?: () => void;
 }) {
   const id = useId();
   const dialog = useRef<HTMLElement>(null);
   const [choice, setChoice] = useState<"original" | "current" | null>(null);
   const [selected, setSelected] = useState<string[]>([]);
+  const confirmationOnly = notice.reason === "confirmation_required";
+  const unavailable = notice.reason === "unavailable";
   // Reset only when a genuinely new round starts. A rejected retry keeps the user's choice,
   // so re-confirming is one click instead of re-selecting every sheet.
-  const appliedRound = useRef<number | null>(null);
-  useEffect(() => {
+  // The initial state already belongs to this round. Do not queue a redundant
+  // passive reset that can erase the user's first click after the dialog opens.
+  const appliedRound = useRef(notice.round);
+  useLayoutEffect(() => {
     if (appliedRound.current === notice.round) {
       if (notice.retrySelection) setSelected(notice.retrySelection);
       return;
@@ -53,13 +58,24 @@ export function AuthorizedTargetConfirmation({ notice, error, busy, onConfirm, o
           </svg>
         </span>
         <div className="authorized-target-heading">
-          <h3 id={id}>{notice.reason === "unavailable" ? "需要重新确认操作目标" : "检测到文件或工作表变化"}</h3>
-          <p>操作已暂停，需求与回答仍保留。请选择目标，确认后才会读取和生成预览；不会直接写入。</p>
+          <h3 id={id}>{confirmationOnly ? "确认本次操作范围" : unavailable ? "暂时无法核实操作目标" : "检测到文件或工作表变化"}</h3>
+          <p>{confirmationOnly ? "确认允许读取以下工作表并生成预览；不会直接写入。范围不变时，后续提问无需重复确认。"
+            : unavailable ? "需求与回答仍保留。请重新检查，核实成功前不会读取字段或数据，也不会写入。"
+            : "操作已暂停，需求与回答仍保留。请选择目标，确认后才会读取和生成预览；不会直接写入。"}</p>
         </div>
       </div>
-      {notice.current?.name === notice.bound.name && notice.reason !== "scope_changed"
+      {unavailable && <p className="authorized-target-note">
+        暂时无法核实身份，不代表文件已经变化。重新检查不会扩大授权范围。
+      </p>}
+      {notice.current?.name === notice.bound.name && notice.reason === "file_changed"
         && <p className="authorized-target-note">名称相同不代表同一份文件，请确认你要操作的目标。</p>}
-      <div className="authorized-target-options">
+      {(confirmationOnly || unavailable) && <div className="authorized-target-options">
+        <div className="authorized-target-option authorized-target-summary">
+          <span>{targetScopeLabel(notice.bound)}</span>
+          <span className="authorized-target-badge">{confirmationOnly ? "本次范围" : "待核实范围"}</span>
+        </div>
+      </div>}
+      {!confirmationOnly && !unavailable && <div className="authorized-target-options">
         <div className={choice === "original" ? "authorized-target-option is-selected" : "authorized-target-option"}
           onClick={() => { if (!busy) setChoice("original"); }}>
           <label>
@@ -87,12 +103,16 @@ export function AuthorizedTargetConfirmation({ notice, error, busy, onConfirm, o
             <p>重新读取并生成预览；旧计划和文件专属映射不会套用到新目标。</p>
           </fieldset>}
         </div>}
-      </div>
+      </div>}
       {error && <p role="alert" className="authorized-target-error">{error}</p>}
       <div className="authorized-target-actions">
         <button type="button" disabled={busy} onClick={onCancel}>暂不操作</button>
-        <button type="button" className="primary" disabled={busy || !choice || (choice === "current" && !selected.length)}
-          onClick={() => choice && onConfirm(choice, selected)}>确认目标并继续</button>
+        {unavailable ? <button type="button" className="primary" disabled={busy || !onRecheck}
+          onClick={onRecheck}>{busy ? "正在检查…" : "重新检查"}</button>
+          : confirmationOnly ? <button type="button" className="primary" disabled={busy || !notice.bound.selected.length}
+            onClick={() => onConfirm("original", [])}>确认范围并继续</button>
+          : <button type="button" className="primary" disabled={busy || !choice || (choice === "current" && !selected.length)}
+            onClick={() => choice && onConfirm(choice, selected)}>确认目标并继续</button>}
       </div>
     </section>
   </div>;

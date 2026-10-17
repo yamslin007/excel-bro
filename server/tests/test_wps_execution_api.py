@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 from pathlib import Path
 
@@ -11,7 +12,10 @@ from fastapi.testclient import TestClient
 import server.app.main as main_module
 import server.app.llm.config as llm_config
 from server.app.main import app
+from server.app.models import WPS_FORMAT_FIELD_NAMES, WPS_RECOVERY_ACTION_TYPES
 from server.app.turn_state import turn_registry
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 @pytest.fixture(autouse=True)
@@ -336,3 +340,465 @@ def test_wps_no_matrix_in_any_persisted_receipt(route: str, field: str) -> None:
     assert row is not None
     assert "PRIVATE-RECEIPT-SENTINEL" not in str(row)
     assert client.get("/api/wps/executions/wps-execution-0001").json()["revision"] == registered["revision"]
+
+
+# ---------------------------------------------------------------------------
+# 格式动作（setFont / setAlignment / resizeRange）的恢复账本链路
+# ---------------------------------------------------------------------------
+#
+# 这一组用例复现的是真实 WPS 验收里失败的那条链路：格式动作在**登记**这一步就被拒，
+# 界面提示「无法持久登记本次写入现场，已取消写入；原表未被修改。WPS 恢复描述的动作
+# 定位或形状无效」。直接原因是三处动作白名单只认三个值动作，格式动作在 fetch 之前
+# （`contracts.ts`）或登记之前（`main.py`）就没了。
+#
+# 指纹用 `f1:` 前缀的**格式证据指纹**：格式动作不改值，值矩阵指纹在写前写后完全
+# 一样，对"到底改没改到"没有区分力。这里传的是与执行器同一口径的字符串形态；服务端
+# 只做命名空间与属性级校验 —— 它算不出也不需要算出真实指纹，那要求上传格式快照，
+# 而快照含逐格属性值，正是协议不许出站的东西。
+
+_WPS_FORMAT_ACTIONS: list[dict] = [
+    {
+        "actionIndex": 0,
+        "type": "setFont",
+        "sheet": "Sheet1",
+        "range": "A2:B3",
+        "rowCount": 2,
+        "columnCount": 2,
+        "cellCount": 4,
+        "previewFingerprint": "f1:88:0a0a0a0a",
+        "expectedFingerprint": "f1:88:1b1b1b1b",
+        "formatFields": ["bold", "size"],
+    },
+    {
+        "actionIndex": 1,
+        "type": "setAlignment",
+        "sheet": "Sheet1",
+        "range": "A2:B3",
+        "rowCount": 2,
+        "columnCount": 2,
+        "cellCount": 4,
+        "previewFingerprint": "f1:72:2c2c2c2c",
+        "expectedFingerprint": "f1:72:3d3d3d3d",
+        "formatFields": ["horizontalAlignment"],
+    },
+    {
+        # 行高是**行级**动作：两行两列，写入只落在整行上。
+        "actionIndex": 2,
+        "type": "resizeRange",
+        "sheet": "Sheet1",
+        "range": "A3:B4",
+        "rowCount": 2,
+        "columnCount": 2,
+        "cellCount": 4,
+        "previewFingerprint": "f1:60:4e4e4e4e",
+        "expectedFingerprint": "f1:60:5f5f5f5f",
+        "formatFields": ["rowHeight"],
+    },
+]
+
+
+def _wps_format_register_payload(operation_id: str = "wps-format-0001") -> dict:
+    """格式动作的登记载荷：三个动作共 12 格，`f1:` 格式证据指纹 + 属性名。
+
+    载荷里**没有**任何快照字段 —— 只有"改了哪些属性"的名字，没有属性取值。
+    """
+    return {
+        "operationId": operation_id,
+        "taskId": "task-format",
+        "confirmed": True,
+        "workbookIdentity": "wps-path:c:/work/report.xlsx",
+        "authorizedSheetNames": ["Sheet1"],
+        "descriptor": {"actions": [dict(action) for action in _WPS_FORMAT_ACTIONS]},
+    }
+
+
+def _format_evidence(action: dict, *, after: bool = False, fingerprint: str | None = None) -> dict:
+    evidence = {
+        "sheetName": action["sheet"],
+        "range": action["range"],
+        "type": action["type"],
+        "beforeFingerprint": action["previewFingerprint"],
+    }
+    if after:
+        evidence["afterFingerprint"] = fingerprint or action["expectedFingerprint"]
+    return evidence
+
+
+def _wps_single_format_payload(action: dict, operation_id: str) -> dict:
+    """只含一个格式动作的登记载荷（动作必须落在 0 号位：在途动作只能是下一个待办）。
+
+    用于"这个动作自己的证据判据"这类用例 —— 要让 2 号动作成为在途动作，得先把 0、
+    1 号走完；那属于另一条用例（`test_wps_format_actions_register_...`）的职责。
+    """
+    payload = _wps_format_register_payload(operation_id)
+    payload["descriptor"]["actions"] = [{**action, "actionIndex": 0}]
+    return payload
+
+
+def test_wps_format_actions_register_start_complete_and_finish() -> None:
+    """格式动作在**真实服务端账本**上跑通 登记 → 逐动作写前检查点 → 写后回执 → 完成。"""
+    client = TestClient(app)
+    registered = client.post("/api/wps/executions/register", json=_wps_format_register_payload())
+    assert registered.status_code == 200, registered.text
+    state = registered.json()
+    assert state["totalActions"] == 3
+    owner = state["ownerToken"]
+    revision = state["revision"]
+
+    for index, action in enumerate(_WPS_FORMAT_ACTIONS):
+        started = client.post(
+            "/api/wps/executions/wps-format-0001/actions/start",
+            json={
+                "expectedRevision": revision,
+                "ownerToken": owner,
+                "actionIndex": index,
+                "beforeSnapshot": _format_evidence(action),
+            },
+        )
+        assert started.status_code == 200, f"第 {index + 1} 步写前检查点被拒：{started.text}"
+        owner = started.json()["ownerToken"]
+        revision = started.json()["revision"]
+        completed = client.post(
+            "/api/wps/executions/wps-format-0001/actions/complete",
+            json={
+                "expectedRevision": revision,
+                "ownerToken": owner,
+                "actionIndex": index,
+                "checkpoint": _format_evidence(action, after=True),
+            },
+        )
+        assert completed.status_code == 200, f"第 {index + 1} 步写后回执被拒：{completed.text}"
+        owner = completed.json()["ownerToken"]
+        revision = completed.json()["revision"]
+        assert completed.json()["nextActionIndex"] == index + 1
+
+    finished = client.post(
+        "/api/wps/executions/wps-format-0001/complete",
+        json={
+            "expectedRevision": revision,
+            "ownerToken": owner,
+            "result": {"actionCount": 3, "cellCount": 12, "backfilled": True},
+        },
+    )
+    assert finished.status_code == 200, finished.text
+    assert finished.json()["status"] == "completed"
+
+
+def test_wps_format_status_discloses_only_property_names() -> None:
+    """状态读取认识格式动作，但下发的只有**属性名**，没有任何快照或取值。"""
+    client = TestClient(app)
+    payload = _wps_format_register_payload("wps-format-status")
+    assert client.post("/api/wps/executions/register", json=payload).status_code == 200
+
+    status = client.get("/api/wps/executions/wps-format-status")
+    assert status.status_code == 200, status.text
+    body = status.json()
+    actions = body["descriptor"]["actions"]
+    assert [action["formatFields"] for action in actions] == [
+        ["bold", "size"],
+        ["horizontalAlignment"],
+        ["rowHeight"],
+    ]
+    assert "plan" not in body
+    # 下发的载荷里不许出现快照 / 取值载体。
+    serialized = json.dumps(body, ensure_ascii=False)
+    for forbidden in ("cells", "rowHeights", "values", "formulas", "snapshot"):
+        assert forbidden not in serialized, f"状态下发里出现了不该出站的字段：{forbidden}"
+    # 直接读持久账本，不看接口说了什么。
+    database = Path(os.environ["EXCEL_BRO_CONFIG_DIR"]) / "tasks" / "state.sqlite3"
+    with sqlite3.connect(database) as connection:
+        row = connection.execute(
+            "SELECT plan_json FROM office_executions WHERE operation_id = ?",
+            ("wps-format-status",),
+        ).fetchone()
+    assert row is not None
+    persisted = str(row[0])
+    for forbidden in ("cells", "rowHeights", "values", "formulas"):
+        assert forbidden not in persisted, f"落盘账本里出现了不该出站的字段：{forbidden}"
+    assert "horizontalAlignment" in persisted  # 属性名本身是登记必须的信息。
+
+
+@pytest.mark.parametrize("index", [0, 1, 2])
+def test_wps_format_checkpoint_after_fingerprint_must_match_target(index: int) -> None:
+    """写后回执必须精确等于登记的目标指纹 —— 多一格、少一格、换一个现场都拒。
+
+    三种现场（写前 / 写后 / 都不是）在指纹上是三个不同的值：写前指纹能通过写前
+    检查点，写后目标能通过写后回执，而"都不是"（= 期间被外部改过，或部分写入）
+    两个都过不了。
+    """
+    client = TestClient(app)
+    action = _WPS_FORMAT_ACTIONS[index]
+    registered = client.post(
+        "/api/wps/executions/register",
+        json=_wps_single_format_payload(action, "wps-format-drift"),
+    ).json()
+    started = client.post(
+        "/api/wps/executions/wps-format-drift/actions/start",
+        json={
+            "expectedRevision": registered["revision"],
+            "ownerToken": registered["ownerToken"],
+            "actionIndex": 0,
+            "beforeSnapshot": _format_evidence(action),
+        },
+    )
+    assert started.status_code == 200, started.text
+
+    def complete(fingerprint: str) -> int:
+        response = client.post(
+            "/api/wps/executions/wps-format-drift/actions/complete",
+            json={
+                "expectedRevision": started.json()["revision"],
+                "ownerToken": started.json()["ownerToken"],
+                "actionIndex": 0,
+                "checkpoint": _format_evidence(action, after=True, fingerprint=fingerprint),
+            },
+        )
+        return response.status_code
+
+    # 外部改过 / 部分写入：既不是写前现场，也不是登记的目标现场。
+    assert complete("f1:88:deadbeef") == 422
+    # 写前现场冒充写后：格式动作不改值，值矩阵指纹恰好会一直"自洽"，这条正是它挡不住的。
+    assert complete(action["previewFingerprint"]) == 422
+    # 精确的目标指纹才通过。
+    assert complete(action["expectedFingerprint"]) == 200
+
+
+def test_wps_format_action_reconcile_and_resume_recognize_formats() -> None:
+    """失败恢复与对账也走同一套格式证据，不是只认值动作。"""
+    client = TestClient(app)
+    action = _WPS_FORMAT_ACTIONS[2]  # 行高动作：对账/恢复同样按整行语义走
+    registered = client.post(
+        "/api/wps/executions/register",
+        json=_wps_single_format_payload(action, "wps-format-recover"),
+    ).json()
+    started = client.post(
+        "/api/wps/executions/wps-format-recover/actions/start",
+        json={
+            "expectedRevision": registered["revision"],
+            "ownerToken": registered["ownerToken"],
+            "actionIndex": 0,
+            "beforeSnapshot": _format_evidence(action),
+        },
+    ).json()
+    assert started["inFlightActionIndex"] == 0
+
+    def reconcile(fingerprint: str) -> int:
+        return client.post(
+            "/api/wps/executions/wps-format-recover/actions/reconcile",
+            json={
+                "expectedRevision": started["revision"],
+                "actionIndex": 0,
+                "outcome": "applied",
+                "confirmed": True,
+                "checkpoint": _format_evidence(action, after=True, fingerprint=fingerprint),
+            },
+        ).status_code
+
+    # 主人的租约还在 ⇒ 先要空闲；不能凭"我记得写了"就把在途动作记成已应用。
+    assert reconcile(action["expectedFingerprint"]) == 409
+    _expire_owner()
+    # 空下来之后，错误的写后格式指纹照样不许把在途动作记成已应用。
+    assert reconcile("f1:60:deadbeef") == 422
+    assert reconcile(action["previewFingerprint"]) == 422
+    reconciled = client.post(
+        "/api/wps/executions/wps-format-recover/actions/reconcile",
+        json={
+            "expectedRevision": started["revision"],
+            "actionIndex": 0,
+            "outcome": "applied",
+            "confirmed": True,
+            "checkpoint": _format_evidence(action, after=True),
+        },
+    )
+    assert reconciled.status_code == 200, reconciled.text
+    assert reconciled.json()["nextActionIndex"] == 1
+
+    # 中断 → 状态可续跑 → 重新接管，全程都认得格式动作。
+    suspended = client.post(
+        "/api/wps/executions/wps-format-recover/suspend",
+        json={
+            "expectedRevision": reconciled.json()["revision"],
+            "ownerToken": reconciled.json()["ownerToken"],
+            "code": "WPS_WRITE_INTERRUPTED",
+            "message": "宿主在写回过程中被关闭。",
+        },
+    )
+    assert suspended.status_code == 200, suspended.text
+    _expire_owner()
+    status = client.get("/api/wps/executions/wps-format-recover").json()
+    assert status["canResume"] is True
+    assert status["descriptor"]["actions"][0]["formatFields"] == ["rowHeight"]
+    claimed = client.post(
+        "/api/wps/executions/wps-format-recover/resume",
+        json={"expectedRevision": status["revision"], "confirmed": True},
+    )
+    assert claimed.status_code == 200, claimed.text
+    assert claimed.json()["descriptor"]["actions"][0]["formatFields"] == ["rowHeight"]
+
+
+@pytest.mark.parametrize(
+    ("action_index", "mutation", "expected_status"),
+    [
+        # 格式动作没声明属性：指纹是按什么算的变得不可判定。
+        (0, {"formatFields": []}, 422),
+        (0, {"formatFields": None}, 422),
+        # 值动作声明格式属性：两个命名空间混在一起。
+        (0, {"type": "writeValues", "formatFields": ["bold"]}, 422),
+    ],
+)
+def test_wps_format_property_declaration_is_required_and_exclusive(
+    action_index: int, mutation: dict, expected_status: int
+) -> None:
+    client = TestClient(app)
+    payload = _wps_format_register_payload("wps-format-decl")
+    payload["descriptor"]["actions"][action_index].update(mutation)
+    response = client.post("/api/wps/executions/register", json=payload)
+    assert response.status_code == expected_status, response.text
+
+
+@pytest.mark.parametrize(
+    ("action_type", "declared"),
+    [
+        # 未通过实机验证的属性：哨兵没过，不许"忽略后照常登记"。
+        ("setFont", ["bold", "underline"]),
+        ("setAlignment", ["vertical"]),
+        ("resizeRange", ["rowHeight", "columnWidth"]),
+        # 属性名合法，但不属于这个动作。
+        ("setFont", ["rowHeight"]),
+        ("setAlignment", ["bold"]),
+        ("resizeRange", ["horizontalAlignment"]),
+    ],
+)
+def test_wps_format_action_rejects_properties_outside_its_whitelist(
+    action_type: str, declared: list[str]
+) -> None:
+    client = TestClient(app)
+    payload = _wps_format_register_payload("wps-format-props")
+    payload["descriptor"]["actions"][0].update({"type": action_type, "formatFields": declared})
+    response = client.post("/api/wps/executions/register", json=payload)
+    assert response.status_code == 422, response.text
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        # 忘了 expectedFingerprint：格式动作的"写后目标"缺了，写后回执无从核对。
+        {"expectedFingerprint": None},
+        # 用值矩阵指纹登记格式动作：值矩阵指纹在写前写后一样，没有区分力。
+        {"previewFingerprint": "v2:20:0a0a0a0a", "expectedFingerprint": "v2:20:1b1b1b1b"},
+        # 一半格式、一半值，同样是不可判定的混合体。
+        {"expectedFingerprint": "v2:20:1b1b1b1b"},
+    ],
+)
+def test_wps_format_action_requires_format_evidence_fingerprints(mutation: dict) -> None:
+    client = TestClient(app)
+    payload = _wps_format_register_payload("wps-format-fp")
+    payload["descriptor"]["actions"][0].update(mutation)
+    response = client.post("/api/wps/executions/register", json=payload)
+    assert response.status_code == 422, response.text
+
+
+def test_wps_value_action_requires_value_fingerprints() -> None:
+    """反向：值动作不许拿格式证据指纹登记（命名空间不能互相冒充）。"""
+    client = TestClient(app)
+    payload = _wps_register_payload("wps-value-fp")
+    payload["descriptor"]["actions"][0]["previewFingerprint"] = "f1:88:0a0a0a0a"
+    assert client.post("/api/wps/executions/register", json=payload).status_code == 422
+
+
+@pytest.mark.parametrize("field", ["cells", "rowHeights", "snapshot", "formatSnapshot"])
+def test_wps_format_descriptor_refuses_snapshot_smuggling(field: str) -> None:
+    """格式快照不许出站 —— 它不是"用格式指纹绕过协议"的许可。
+
+    判据落在**落盘**上，不落在回显上：422 的响应体本来就会把请求原样带回去（数据
+    来自调用方自己，没有跨信任边界），而会话记录的权威副本是 SQLite 账本 ——
+    看不进账本才算真的没被接收。
+    """
+    client = TestClient(app)
+    sentinel = "SNEAKED-FORMAT-SNAPSHOT-2b7c14"
+    payload = _wps_format_register_payload("wps-format-snap")
+    payload["descriptor"]["actions"][0][field] = [[sentinel]]
+    assert sentinel in json.dumps(payload, ensure_ascii=False)  # 锚点：确实传过
+    response = client.post("/api/wps/executions/register", json=payload)
+    assert response.status_code == 422, response.text
+    database = Path(os.environ["EXCEL_BRO_CONFIG_DIR"]) / "tasks" / "state.sqlite3"
+    if database.exists():
+        with sqlite3.connect(database) as connection:
+            count = connection.execute("SELECT COUNT(*) FROM office_executions").fetchone()
+        assert count is not None and count[0] == 0, "被拒的登记不得在账本里留下任何记录"
+
+
+@pytest.mark.parametrize("action_type", ["setFill", "setNumberFormat", "setBorders", "autofit"])
+def test_wps_unopened_format_actions_are_still_refused(action_type: str) -> None:
+    """端上没接通的动作（fail-closed 拒绝）连登记都不该放行。
+
+    它们曾经被错误地列在服务端白名单里 —— "能登记"读起来像"能执行"。
+    """
+    client = TestClient(app)
+    payload = _wps_format_register_payload("wps-format-unopened")
+    payload["descriptor"]["actions"][0].update({"type": action_type, "formatFields": ["bold"]})
+    response = client.post("/api/wps/executions/register", json=payload)
+    assert response.status_code == 422, response.text
+
+
+_TS_CONTRACTS = REPO_ROOT / "apps" / "excel-addin" / "src" / "contracts.ts"
+
+
+def _ts_recoverable_action_types() -> list[str]:
+    source = _TS_CONTRACTS.read_text(encoding="utf-8")
+    match = re.search(
+        r"export const WPS_RECOVERABLE_ACTION_TYPES\s*=\s*\[(?P<body>[^\]]*)\]\s*as const;",
+        source,
+        re.S,
+    )
+    assert match is not None, "contracts.ts 里找不到 WPS_RECOVERABLE_ACTION_TYPES"
+    return re.findall(r'"([^"]+)"', match.group("body"))
+
+
+def _ts_format_action_fields() -> dict[str, list[str]]:
+    source = _TS_CONTRACTS.read_text(encoding="utf-8")
+    match = re.search(
+        r"export const WPS_FORMAT_ACTION_FIELDS\s*:\s*Record<string,\s*readonly string\[\]>\s*=\s*\{(?P<body>.*?)\n\};",
+        source,
+        re.S,
+    )
+    assert match is not None, "contracts.ts 里找不到 WPS_FORMAT_ACTION_FIELDS"
+    return {
+        name: re.findall(r'"([^"]+)"', body)
+        for name, body in re.findall(r"(\w+)\s*:\s*\[([^\]]*)\]", match.group("body"))
+    }
+
+
+def test_wps_action_whitelist_matches_capabilities() -> None:
+    """四份动作/属性白名单必须逐字一致（任一处漂移都是真实故障形态）。
+
+    `config/capabilities.json` 是**客户端打包**用的那一份（`wpsPlanExecutor` 直接
+    `import` 它）；`main._WPS_RECOVERABLE_ACTION_TYPES` 是服务端闸；`contracts.ts`
+    是出站契约闸；`models.WPS_RECOVERY_ACTION_TYPES` 是模型层闸。少同步一处就会出现
+    「端上放行、服务端 422」（本轮的故障）或反过来「服务端放行、端上根本执行不了」。
+    """
+    capabilities = json.loads(
+        (REPO_ROOT / "config" / "capabilities.json").read_text(encoding="utf-8")
+    )
+    # `clearRange:contents` 的 `:contents` 是变体细分，不在动作类型命名空间里。
+    from_capabilities = {
+        name.split(":", 1)[0] for name in capabilities["wpsWrite"]["allowedActions"]
+    }
+    assert from_capabilities == set(WPS_RECOVERY_ACTION_TYPES)
+    assert set(main_module._WPS_RECOVERABLE_ACTION_TYPES) == set(WPS_RECOVERY_ACTION_TYPES)
+    assert set(_ts_recoverable_action_types()) == set(WPS_RECOVERY_ACTION_TYPES)
+
+    ts_fields = _ts_format_action_fields()
+    assert set(ts_fields) == set(main_module._WPS_FORMAT_ACTION_PROPERTIES)
+    for action_type, names in ts_fields.items():
+        assert len(names) == len(set(names)), f"{action_type} 的属性名有重复"
+        assert set(names) == set(
+            main_module._WPS_FORMAT_ACTION_PROPERTIES[action_type]
+        ), f"{action_type} 的属性白名单两端不一致"
+        assert set(names) <= WPS_FORMAT_FIELD_NAMES, f"{action_type} 声明了未验证的属性"
+
+    # 未通过实机验证的属性一个都不许在名单里（它们就是曾经被错误放行的那三个）。
+    assert not (WPS_FORMAT_FIELD_NAMES & {"underline", "vertical", "columnWidth"})
+    assert not (set(ts_fields["setFont"]) & {"underline"})
+    assert not (set(ts_fields["setAlignment"]) & {"vertical"})
+    assert not (set(ts_fields["resizeRange"]) & {"columnWidth"})

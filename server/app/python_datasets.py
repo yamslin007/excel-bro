@@ -170,6 +170,29 @@ class PythonDatasetRegistry:
             self._grant(token, scope, origin)
             del self._grants[token]
 
+    def drop_task(self, task_id: str, origin: str | None = None) -> int:
+        """让某个任务的**全部**数据登记当场失效（取消 / 重授权 / 换簿 / 迟到回执）。
+
+        为什么要按任务整体作废，而不是等 TTL：取消之后跑完的那次隔离执行拿到的
+        是一份**已经作废的授权**下的数据，登记它等于发布迟到结果；换簿之后旧的
+        ``dataset://`` 句柄指向的是**另一本工作簿**的值。靠 TTL 慢慢过期是
+        不行的时间窗问题，必须当场删。
+
+        ``origin`` 为空表示两个命名空间一起作废（桥取消时宿主已不可信）；
+        给定则只作废该命名空间（宿主自己的登记路径）。
+        """
+        with self._lock:
+            dropped = 0
+            for token in list(self._grants):
+                grant = self._grants[token]
+                if grant.scope.get("taskId") != task_id:
+                    continue
+                if origin is not None and grant.origin != origin:
+                    continue
+                del self._grants[token]
+                dropped += 1
+            return dropped
+
     def valid(self, token: str, scope: PythonDataScope, origin: str,
               receipts: list[PythonDatasetReceipt]) -> bool:
         """Cheap cancellation/publication guard; never deserializes cell data."""

@@ -1,0 +1,231 @@
+/**
+ * WPS 格式属性的**逐格 / 逐行快照**采集与恢复（Task #53 的宿主适配层）。
+ *
+ * 这一层只做 WPS JSAPI 的读写，不做「该属性是否已验证」的判定（那是
+ * `wpsFormatCapability.ts` 的职责），也不做「改了哪些属性」的语义（那是共享层
+ * `formatActions.ts` 的职责）。
+ *
+ * 为什么必须逐格/逐行，而不是区域级单值：
+ * - WPS 区域级 `range.Font.Bold` 对**混合格式**（区域内有的格加粗有的不加粗）返回的
+ *   值不确定（可能是 null / 第一个格 / 折中值）。用它做撤销快照会把混合格式拍平成
+ *   单一值，恢复时把「有的加粗有的不加粗」写坏成「全加粗或全不加粗」。
+ * - **单格探测（Sheet1!A1）不证明混合格式恢复**。因此这里一律逐格读 `range.Item(r,c)`
+ *   的字体/对齐/换行，逐行读行高，恢复时逐格/逐行写回。
+ *
+ * 关键语义（与 Excel 端 `captureRangeFormat` 同一条规矩，对象从单元格值换成属性）：
+ * - **未采集 ≠ 默认值**：读不到（undefined/null）的属性存成 `null`，恢复时**跳过**该
+ *   字段，绝不写回一个"看起来像默认值"的具体值（否则会把"继承的加粗"写成"显式不加粗"）。
+ * - 只要**任一格**的**任一目标属性**读不到，整份快照判 `captured:false`，由调用方对
+ *   纯格式动作在**修改前**拒绝执行（不产生不可撤销的修改）。
+ *
+ * **采集粒度铁律（Task #53 阻断点 3）**：多格（或多行）区域**必须**能逐格 / 逐行定位
+ * （`range.Item(r,c)` 可用）。缺 `Item` 时**绝不**回退到整块区域读取 —— 那会把整块的
+ * 单一格式值伪装成"逐格已采集"，恢复时把混合格式写坏。多格/多行缺 `Item` ⇒
+ * `captured:false`，调用方据此在写入前拒绝。
+ */
+
+import type { WpsRange } from "./wpsHost";
+
+/** 快照覆盖的全部格式字段名（用于属性级恢复的字段集合）。 */
+export const ALL_WPS_FORMAT_FIELDS = [
+  "bold",
+  "italic",
+  "name",
+  "size",
+  "color",
+  "horizontalAlignment",
+  "wrapText",
+  "rowHeight"
+] as const;
+
+export type WpsFormatField = (typeof ALL_WPS_FORMAT_FIELDS)[number];
+
+/** 单格的字体/对齐/换行快照。`null` = 未直接设置或未采集，恢复时跳过。 */
+export type WpsCellFormatSnapshot = {
+  bold: boolean | null;
+  italic: boolean | null;
+  name: string | null;
+  size: number | null;
+  color: number | null;
+  horizontalAlignment: number | null;
+  wrapText: boolean | null;
+};
+
+/** 整块区域的格式快照：逐格字体/对齐/换行 + 逐行行高。 */
+export type WpsFormatSnapshot = {
+  /** [row][column] 的逐格格式。 */
+  cells: WpsCellFormatSnapshot[][];
+  /** 逐行行高（行级属性）。`null` = 未采集。 */
+  rowHeights: Array<number | null>;
+  /** 整份快照是否完整采集（所有目标属性都读到了）。false = 不可用于撤销。 */
+  captured: boolean;
+};
+
+function readNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function readBoolean(value: unknown): boolean | null {
+  return typeof value === "boolean" ? value : null;
+}
+
+function readString(value: unknown): string | null {
+  return typeof value === "string" ? value : null;
+}
+
+/** 读单格（`range.Item(r+1, c+1)`）的格式快照。**不回退到整块**。 */
+function readCellFormat(cell: WpsRange): WpsCellFormatSnapshot {
+  const font = cell.Font;
+  return {
+    bold: readBoolean(font?.Bold),
+    italic: readBoolean(font?.Italic),
+    name: readString(font?.Name),
+    size: readNumber(font?.Size),
+    color: readNumber(font?.Color),
+    horizontalAlignment: readNumber(cell.HorizontalAlignment),
+    wrapText: readBoolean(cell.WrapText)
+  };
+}
+
+/**
+ * 取单格。**单格区域（rows===1 && columns===1）时 `range` 本身就是单元格**，
+ * 直接返回 range（单格区域没有 `Item` 是正常的）；多格/多行时调用方已保证
+ * `range.Item` 可用，才用 `Item(r+1, c+1)` 逐格定位。
+ */
+function cellAt(range: WpsRange, row: number, column: number, singleCell: boolean): WpsRange {
+  return singleCell ? range : range.Item!(row + 1, column + 1);
+}
+
+/**
+ * 采集整块区域的格式快照（逐格字体/对齐/换行 + 逐行行高）。
+ *
+ * 采集粒度铁律：多格（`rows * columns > 1`）或多行（`rows > 1`，行高是行级属性）
+ * 时，`range.Item` 缺失 ⇒ 无法逐格 / 逐行定位 ⇒ `captured:false`，**不回退到整块**。
+ *
+ * 任一格的目标属性读不到（`null`）时，该格的快照仍保留，但整份 `captured` 置 false
+ * —— 调用方据此对纯格式动作执行前拒绝。行高逐行读（行级属性，读该行第一个单元格
+ * 的 `RowHeight` 即可）。
+ */
+export function captureWpsFormatSnapshot(range: WpsRange, rows: number, columns: number): WpsFormatSnapshot {
+  const singleCell = rows === 1 && columns === 1;
+  const multiCell = rows * columns > 1;
+  const multiRow = rows > 1;
+  // 多格需要逐格定位、多行需要逐行定位；缺 `Item` 一律 captured=false，不回退整块。
+  // （单格时 `range` 本身就是单元格，不需要 `Item`。）
+  if ((multiCell || multiRow) && typeof range.Item !== "function") {
+    return { cells: [], rowHeights: [], captured: false };
+  }
+
+  const cells: WpsCellFormatSnapshot[][] = [];
+  let captured = true;
+
+  for (let r = 0; r < rows; r += 1) {
+    const rowCells: WpsCellFormatSnapshot[] = [];
+    for (let c = 0; c < columns; c += 1) {
+      const cell = cellAt(range, r, c, singleCell);
+      const cellSnapshot = readCellFormat(cell);
+      // 字体五个属性 + 对齐 + 换行，任一为 null 即该格未完整采集。
+      if (
+        cellSnapshot.bold === null ||
+        cellSnapshot.italic === null ||
+        cellSnapshot.name === null ||
+        cellSnapshot.size === null ||
+        cellSnapshot.color === null ||
+        cellSnapshot.horizontalAlignment === null ||
+        cellSnapshot.wrapText === null
+      ) {
+        captured = false;
+      }
+      rowCells.push(cellSnapshot);
+    }
+    cells.push(rowCells);
+  }
+
+  const rowHeights: Array<number | null> = [];
+  for (let r = 0; r < rows; r += 1) {
+    const cell = cellAt(range, r, 0, singleCell);
+    const height = readNumber(cell.RowHeight);
+    if (height === null) captured = false;
+    rowHeights.push(height);
+  }
+
+  return { cells, rowHeights, captured };
+}
+
+/** 逐格写回字体/对齐/换行（恢复执行前快照）。`null` 字段跳过，不写默认值。 */
+function restoreCellFormat(
+  cell: WpsRange,
+  saved: WpsCellFormatSnapshot,
+  fields: ReadonlySet<WpsFormatField>
+): void {
+  const font = cell.Font;
+  if (font) {
+    if (fields.has("bold") && saved.bold !== null) font.Bold = saved.bold;
+    if (fields.has("italic") && saved.italic !== null) font.Italic = saved.italic;
+    if (fields.has("name") && saved.name !== null) font.Name = saved.name;
+    if (fields.has("size") && saved.size !== null) font.Size = saved.size;
+    if (fields.has("color") && saved.color !== null) font.Color = saved.color;
+  }
+  if (fields.has("horizontalAlignment") && saved.horizontalAlignment !== null) {
+    cell.HorizontalAlignment = saved.horizontalAlignment;
+  }
+  if (fields.has("wrapText") && saved.wrapText !== null) {
+    cell.WrapText = saved.wrapText;
+  }
+}
+
+/**
+ * 恢复整块区域的格式快照（逐格 + 逐行）。
+ *
+ * `fields` 控制**只恢复哪些属性**（属性级恢复，Task #53 阻断点 2）：撤销时传
+ * "本次动作实际改动过的属性"，从而**保留用户对其他属性的后续修改**，不整块覆盖。
+ * 缺省恢复全部字段（`ALL_WPS_FORMAT_FIELDS`），用于快照测试与"整块恢复"语义。
+ */
+export function restoreWpsFormatSnapshot(
+  range: WpsRange,
+  snapshot: WpsFormatSnapshot,
+  fields: readonly WpsFormatField[] = ALL_WPS_FORMAT_FIELDS
+): void {
+  const fieldSet = new Set<WpsFormatField>(fields);
+  const singleCell = snapshot.cells.length === 1 && snapshot.cells[0]?.length === 1;
+  for (let r = 0; r < snapshot.cells.length; r += 1) {
+    for (let c = 0; c < snapshot.cells[r].length; c += 1) {
+      restoreCellFormat(cellAt(range, r, c, singleCell), snapshot.cells[r][c], fieldSet);
+    }
+  }
+  if (fieldSet.has("rowHeight")) {
+    for (let r = 0; r < snapshot.rowHeights.length; r += 1) {
+      const height = snapshot.rowHeights[r];
+      if (height === null) continue;
+      cellAt(range, r, 0, singleCell).RowHeight = height;
+    }
+  }
+}
+
+/** 两份格式快照是否等价（用于回读比对 / 撤销后核对）。逐格逐行严格比对。 */
+export function sameWpsFormatSnapshot(left: WpsFormatSnapshot, right: WpsFormatSnapshot): boolean {
+  if (left.cells.length !== right.cells.length) return false;
+  for (let r = 0; r < left.cells.length; r += 1) {
+    if (left.cells[r].length !== right.cells[r].length) return false;
+    for (let c = 0; c < left.cells[r].length; c += 1) {
+      const a = left.cells[r][c];
+      const b = right.cells[r][c];
+      if (
+        a.bold !== b.bold ||
+        a.italic !== b.italic ||
+        a.name !== b.name ||
+        a.size !== b.size ||
+        a.color !== b.color ||
+        a.horizontalAlignment !== b.horizontalAlignment ||
+        a.wrapText !== b.wrapText
+      ) {
+        return false;
+      }
+    }
+  }
+  if (left.rowHeights.length !== right.rowHeights.length) return false;
+  for (let r = 0; r < left.rowHeights.length; r += 1) {
+    if (left.rowHeights[r] !== right.rowHeights[r]) return false;
+  }
+  return true;
+}

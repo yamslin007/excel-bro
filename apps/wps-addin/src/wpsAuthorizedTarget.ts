@@ -5,6 +5,10 @@ import type { WpsNativeComparison } from "./wpsNativeComparison";
 import { listWpsWorksheets, workbookFullName } from "./wpsWorkbookReader";
 import { captureWpsObjectIdentity, verifyWpsObjectIdentity } from "./wpsObjectIdentity";
 import { wpsConfirmationTargetKey } from "./wpsClarificationTargetConfirmation";
+import { checkAuthorizedTarget } from "@excel-bro/core/authorizedTarget";
+import { admissionItem, type ScopeAdmissionReport, type ScopeAdmissionReason } from "@excel-bro/core/scopeAdmission";
+import { wpsWriteVersionStatus } from "./wpsWriteVersionGate";
+import capabilities from "../../../config/capabilities.json";
 
 /** Review role recognition only, never an authorization grant; commit still verifies snapshots. */
 export function isWpsReviewCopyTarget(target: AuthorizedTarget, review: WpsNativeComparison | null): boolean {
@@ -43,4 +47,39 @@ export async function wpsAnalysisTargetEvidence(target: AuthorizedTarget) {
   const conclusive = verifyWpsObjectIdentity(getWpsApplication(), identity) === "same";
   const key = wpsConfirmationTargetKey(identity);
   return key ? { key, conclusive } : conclusive ? { key: "session-object-reference", conclusive } : null;
+}
+
+/** No cells, data rows, model calls or consent mutations. Only the selected sheets are inspected. */
+export async function inspectWpsScopeAdmission(selected: readonly number[], expected?: AuthorizedTarget): Promise<ScopeAdmissionReport> {
+  const target = await inspectWpsAuthorizedTarget(selected);
+  const ids = selected.map(String);
+  if (expected && checkAuthorizedTarget(expected, target) !== "same") {
+    return { items: ids.map((id) => admissionItem(id, target.sheets.some((s) => s.id === id) ? "target_changed" : "missing")) };
+  }
+  if (ids.some((id) => !target.sheets.some((sheet) => sheet.id === id))) {
+    return { items: ids.map((id) => admissionItem(id, target.sheets.some((s) => s.id === id) ? "write_unverified" : "missing")) };
+  }
+  const evidence = await wpsAnalysisTargetEvidence(target);
+  if (!evidence) return { items: ids.map((id) => admissionItem(id, "identity_unverified")) };
+  const app = getWpsApplication();
+  const book = app.ActiveWorkbook;
+  const items = ids.map((id) => {
+    let reason: ScopeAdmissionReason = "write_unverified";
+    try {
+      const sheet = book!.Worksheets.Item(Number(id));
+      if (book!.ReadOnly === true) reason = "read_only";
+      else if (sheet.ProtectContents === true) reason = "protected";
+      else if (book!.ReadOnly === false && sheet.ProtectContents === false) {
+        reason = capabilities.wpsWrite.enabled && wpsWriteVersionStatus(app.Version) !== "blocked" ? "none" : "host_write_blocked";
+      }
+    } catch { /* Unknown write capability is not a false writable promise. */ }
+    return admissionItem(id, reason);
+  });
+  const after = await inspectWpsAuthorizedTarget(selected);
+  const repeated = await wpsAnalysisTargetEvidence(after);
+  if (checkAuthorizedTarget(target, after) !== "same" || !repeated || evidence.key !== repeated.key ||
+      (evidence.conclusive && target.fileRef !== after.fileRef)) {
+    return { items: ids.map((id) => admissionItem(id, "target_changed")) };
+  }
+  return { items, target, evidenceKey: evidence.key, conclusive: evidence.conclusive };
 }

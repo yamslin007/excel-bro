@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createHash, webcrypto } from 'node:crypto';
-import { localWindowsPath, prepareLocalExcelWindows, arrangeLocalExcelWindows } from './excelWindowLayout';
+import { localWindowsPath, prepareLocalExcelWindows, arrangeLocalExcelWindows, closeLocalExcelWindows } from './excelWindowLayout';
 import { prepareExcelReviewLayout, measureExcelReviewPane, ExcelReviewLayoutVersionError } from './api';
 import type { AnalysisPlan, ExcelReviewLayoutPrepareRequest, ExcelReviewLayoutTicket } from './contracts';
 
@@ -17,16 +17,28 @@ describe('local-only window bridge', () => {
     expect(JSON.stringify(privatePlan)).toContain('LOCAL_PRIVATE_SENTINEL');
     const request = {workbookPathHash:hash('e:/original.xlsx'),worksheetNameHash:hash('Ledger'),copySheetName,
       plan:privatePlan,fullPath:'E:/SECRET/Original.xlsx',hwnd:123};
-    const fetch=vi.fn(async (_url:string,_init:RequestInit)=>({ok:true,json:async()=>({clientWidthCssPx:1200})}));
+    const fetch=vi.fn(async (_url:string,_init:RequestInit)=>({ok:true,json:async()=>({clientWidthCssPx:1200,workAreaWidthCssPx:2000})}));
     vi.stubGlobal('fetch',fetch);
-    expect(await measureExcelReviewPane(request)).toEqual({clientWidthCssPx:1200});
+    expect(await measureExcelReviewPane(request)).toEqual({clientWidthCssPx:1200,workAreaWidthCssPx:2000});
     expect(JSON.parse(String(fetch.mock.calls[0][1].body))).toEqual({workbookPathHash:request.workbookPathHash,worksheetNameHash:request.worksheetNameHash,copySheetName});
     expect(fetch.mock.calls[0][0]).toMatch(/review-layout\/measure$/);
     expect(fetch.mock.calls[0][1].redirect).toBe('error');
     expect(JSON.stringify(fetch.mock.calls)).not.toMatch(/LOCAL_PRIVATE_SENTINEL|SECRET|hwnd|plan|values/);
   });
   it.each([0,-1,NaN,Infinity,'1200',32769])('rejects invalid measured width %s', async width => {
-    vi.stubGlobal('fetch',vi.fn(async()=>({ok:true,json:async()=>({clientWidthCssPx:width})})));
+    vi.stubGlobal('fetch',vi.fn(async()=>({ok:true,json:async()=>({clientWidthCssPx:1200,workAreaWidthCssPx:width})})));
+    await expect(measureExcelReviewPane({workbookPathHash:hash('e:/original.xlsx'),worksheetNameHash:hash('Ledger'),copySheetName})).rejects.toThrow();
+  });
+  it.each([-1,NaN,Infinity,'2000',32769])('rejects invalid work-area width %s', async workAreaWidthCssPx => {
+    vi.stubGlobal('fetch',vi.fn(async()=>({ok:true,json:async()=>({clientWidthCssPx:1200,workAreaWidthCssPx})})));
+    await expect(measureExcelReviewPane({workbookPathHash:hash('e:/original.xlsx'),worksheetNameHash:hash('Ledger'),copySheetName})).rejects.toThrow();
+  });
+  it.each([
+    ['legacy single-field measurement', {clientWidthCssPx:1200}],
+    ['work area smuggled behind extra keys', {clientWidthCssPx:1200,workAreaWidthCssPx:2000,note:'x'}],
+    ['client width missing', {workAreaWidthCssPx:2000}],
+  ])('refuses to accept a %s as verified geometry', async (_label, payload) => {
+    vi.stubGlobal('fetch',vi.fn(async()=>({ok:true,json:async()=>payload})));
     await expect(measureExcelReviewPane({workbookPathHash:hash('e:/original.xlsx'),worksheetNameHash:hash('Ledger'),copySheetName})).rejects.toThrow();
   });
   it.each([
@@ -92,6 +104,67 @@ describe('local-only window bridge', () => {
     vi.stubEnv('VITE_API_BASE_URL','https://example.com'); vi.resetModules();
     const api = await import('./api'), fetch = vi.fn(); vi.stubGlobal('fetch',fetch);
     await expect(api.arrangeExcelReviewLayout(ticket)).rejects.toThrow('仅能连接本机');
+    expect(fetch).not.toHaveBeenCalled(); vi.resetModules();
+  });
+});
+
+/*
+ * 兼容副本的**关闭**走同一条本机桥，但语义完全不同：
+ * 它回答的是"副本关没关"，绝不是"原表写回成没成"。任何自相矛盾、缺字段、
+ * 版本过旧或越界的回执都不许被解释成"已关闭"。
+ */
+const CLOSE_STATUSES = ['closed','already_closed','close_unconfirmed','user_saved','identity_lost','ambiguous','unsupported','failed'] as const;
+const receipt = (status: string, copyClosed = status === 'closed' || status === 'already_closed') => ({status, layoutVersion:4, copyClosed, recoveryCopyPath: 'E:/recovery/review-copy.xlsx'});
+describe('review copy close bridge', () => {
+  it('sends metadata only and projects the versioned close receipt and local archive path', async () => {
+    const fetch = vi.fn(async (_url:string,_init:RequestInit) => ({ok:true, json: async () => receipt('closed')}));
+    vi.stubGlobal('fetch', fetch);
+    expect(await closeLocalExcelWindows('url:file:///E:/Original.xlsx','Ledger',copySheetName))
+      .toEqual({status:'closed', layoutVersion:4, copyClosed:true, recoveryCopyPath:'E:/recovery/review-copy.xlsx'});
+    expect(JSON.parse(String(fetch.mock.calls[0][1].body)))
+      .toEqual({closeVersion:4,workbookPathHash:hash('e:/original.xlsx'), worksheetNameHash:hash('Ledger'), copySheetName});
+    expect(fetch.mock.calls[0][0]).toMatch(/review-layout\/close$/);
+    expect(fetch.mock.calls[0][1].redirect).toBe('error');
+    expect(JSON.stringify(fetch.mock.calls)).not.toMatch(/LOCAL_PRIVATE_SENTINEL|SECRET|plan|values|hwnd/);
+  });
+  it('never lets an attached local plan or full path reach the close request', async () => {
+    const plan: AnalysisPlan = {id:'private',title:'PRIVATE_TITLE',summary:'',assumptions:[],warnings:[],actions:[{type:'writeValues',sheet:'Ledger',range:'C2',values:[['LOCAL_PRIVATE_SENTINEL']]}]};
+    expect(JSON.stringify(plan)).toContain('LOCAL_PRIVATE_SENTINEL'); // positive anchor
+    const fetch = vi.fn(async (_url:string,_init:RequestInit) => ({ok:true, json: async () => receipt('closed')})); vi.stubGlobal('fetch', fetch);
+    const request = {closeVersion:4,workbookPathHash:hash('e:/original.xlsx'),worksheetNameHash:hash('Ledger'),copySheetName,plan,values:plan.actions,fullPath:'E:/SECRET/Original.xlsx'} as never;
+    const api = await import('./api');
+    await api.closeExcelReviewCopy(request);
+    expect(JSON.parse(String(fetch.mock.calls[0][1].body)))
+      .toEqual({closeVersion:4,workbookPathHash:hash('e:/original.xlsx'),worksheetNameHash:hash('Ledger'),copySheetName});
+    expect(JSON.stringify(fetch.mock.calls)).not.toMatch(/LOCAL_PRIVATE_SENTINEL|PRIVATE_TITLE|SECRET|writeValues/);
+  });
+  it.each(CLOSE_STATUSES)('preserves the real close outcome %s and its copyClosed flag', async status => {
+    for (const copyClosed of [true, false]) {
+      vi.stubGlobal('fetch', vi.fn(async () => ({ok:true, json: async () => receipt(status, copyClosed)})));
+      expect(await closeLocalExcelWindows('url:E:/Original.xlsx','Ledger',copySheetName)).toEqual({status, layoutVersion:4, copyClosed, recoveryCopyPath: 'E:/recovery/review-copy.xlsx'});
+    }
+  });
+  it.each([
+    ['unknown status', {status:'done', layoutVersion:4, copyClosed:true}],
+    ['missing copyClosed', {status:'closed', layoutVersion:4}],
+    ['non-boolean copyClosed', {status:'closed', layoutVersion:4, copyClosed:'yes'}],
+    ['extra smuggled keys', {status:'closed', layoutVersion:4, copyClosed:true, written:true}],
+    ['writeback claim leaking into the receipt', {status:'closed', layoutVersion:4, copyClosed:true, originalWritten:true}],
+    ['legacy version', {status:'closed', layoutVersion:3, copyClosed:true}],
+    ['empty body', {}]
+  ])('refuses a malformed close receipt: %s', async (_label, payload) => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({ok:true, json: async () => payload})));
+    await expect(closeLocalExcelWindows('url:E:/Original.xlsx','Ledger',copySheetName)).rejects.toThrow();
+  });
+  it('reports the legacy server as a version error rather than as a closed copy', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({ok:true, json: async () => ({status:'closed', layoutVersion:2, copyClosed:true})})));
+    await expect(closeLocalExcelWindows('url:E:/Original.xlsx','Ledger',copySheetName)).rejects.toBeInstanceOf(ExcelReviewLayoutVersionError);
+  });
+  it('does not send close metadata to a configured remote server', async () => {
+    vi.stubEnv('VITE_API_BASE_URL','https://example.com'); vi.resetModules();
+    const api = await import('./api'), fetch = vi.fn(); vi.stubGlobal('fetch',fetch);
+    await expect(api.closeExcelReviewCopy({closeVersion:4,workbookPathHash:hash('e:/original.xlsx'),worksheetNameHash:hash('Ledger'),copySheetName}))
+      .rejects.toThrow('仅能连接本机');
     expect(fetch).not.toHaveBeenCalled(); vi.resetModules();
   });
 });

@@ -1,76 +1,118 @@
 import { useRef, useState } from "react";
 import type { AnalysisPlan } from "../contracts";
-import {
-  assertExcelNativeComparisonUnchanged, closeExcelNativeComparison,
-  stageExcelNativeComparison, type ExcelNativeComparison
-} from "../excelNativeComparison";
+import { assertExcelNativeComparisonUnchanged, closeExcelNativeComparison,
+  stageExcelNativeComparison, type ExcelNativeComparison } from "../excelNativeComparison";
+import { rearrangeLocalExcelWindows } from "../excelWindowLayout";
+import { reviewCopyCleanupState, type ReviewCopyCleanupState, type ReviewCopyCloseOutcome } from "../../../../packages/core/src/reviewCopyLifecycle";
+import type { ReviewOutcome } from "../../../../packages/core/src/reviewCardPresentation";
 
-type Review = { messageId: string; session: ExcelNativeComparison; phase: "review" | "committed" | "blocked" };
+export type ExcelReview = {
+  messageId: string;
+  session: ExcelNativeComparison;
+  outcome: ReviewOutcome;
+  copy: ReviewCopyCleanupState['copy'] | null;
+  note: string | null;
+};
+export function excelReviewBlocksNewCopy(review: ExcelReview | null): boolean {
+  return Boolean(review && ['reviewing', 'write_failed', 'partial_or_unknown'].includes(review.outcome));
+}
 type Feedback = { messageId: string; text: string } | null;
+
 export function useExcelNativeComparison() {
-  // Never attach snapshots to ChatMessage/history/storage. One live copy per panel.
-  const live = useRef<Review | null>(null);
+  // Host snapshots are deliberately transient: never put them in chat history.
+  const live = useRef<ExcelReview | null>(null);
   const running = useRef(false);
-  const [review, setReview] = useState<Review | null>(null);
+  const [review, setReview] = useState<ExcelReview | null>(null);
   const [pending, setPending] = useState(false);
   const [feedback, setFeedback] = useState<Feedback>(null);
-  const publish = (value: Review | null) => { live.current = value; setReview(value); };
-  async function operation(messageId: string, job: () => Promise<void>) {
-    if (running.current) return;
+  const publish = (value: ExcelReview | null) => { live.current = value; setReview(value); };
+  async function operation(messageId: string, job: () => Promise<void>): Promise<boolean> {
+    if (running.current) return false;
     running.current = true; setPending(true); setFeedback(null);
-    try { await job(); } catch (reason) {
-      setFeedback({ messageId, text: reason instanceof Error ? reason.message : "原生并排审阅失败。" });
+    try { await job(); return true; }
+    catch (reason) {
+      setFeedback({ messageId, text: reason instanceof Error ? reason.message : "审阅操作未完成。" });
+      return false;
     } finally { running.current = false; setPending(false); }
+  }
+  async function close(current: ExcelReview) {
+    if (current.outcome === 'reviewing') return;
+    let outcome: ReviewCopyCloseOutcome = 'failed';
+    try { outcome = await closeExcelNativeComparison(current.session); } catch { /* Keep business outcome. */ }
+    const copy = reviewCopyCleanupState({ business: current.outcome, copy: outcome }).copy;
+    if (live.current === current) publish({ ...current, copy });
   }
   async function stage(messageId: string, plan: AnalysisPlan, authorization: readonly string[]) {
     return operation(messageId, async () => {
-      if (live.current) throw new Error("请先保存或放弃上一份审阅副本，再生成新的副本。");
-      let session: ExcelNativeComparison;
-      try { session = await stageExcelNativeComparison(plan, authorization); }
-      catch (reason) { throw new Error(`${reason instanceof Error ? reason.message : "副本打开失败。"} 原表未写入；若临时副本已打开，请关闭且不保存后重试。`); }
-      publish({ messageId, session, phase: "review" });
+      if (excelReviewBlocksNewCopy(live.current)) throw new Error("请先结束上一份审阅，再生成新的副本。");
+      // Freeze input identities before yielding: plan edits cannot inherit the trial.
+      const planKey = JSON.stringify(plan), scopeKey = JSON.stringify([...authorization].sort());
+      const session = await stageExcelNativeComparison(plan, authorization);
+      if (planKey !== JSON.stringify(plan) || scopeKey !== JSON.stringify([...authorization].sort())) {
+        publish({ messageId, session, outcome: 'write_failed', copy: null, note: '生成期间计划或授权已变化，请保留副本核对并重新生成。' });
+        throw new Error('生成期间计划或授权已变化，未开放写回。');
+      }
+      publish({ messageId, session, outcome: 'reviewing', copy: null, note: null });
     });
   }
   async function discard(messageId: string) {
     return operation(messageId, async () => {
       const current = live.current;
       if (!current || current.messageId !== messageId) throw new Error("这张卡片没有活跃审阅副本。");
-      if (current.session.mode === "manual") {
+      if (current.outcome === 'write_failed' || current.outcome === 'partial_or_unknown') {
         publish(null);
-        setFeedback({ messageId, text: current.phase === "blocked"
-          ? "已结束本次兼容审阅。关闭副本不撤销既有写入，请按执行结果与恢复点核对原表；请手动关闭临时副本且不保存。"
-          : "已放弃本次兼容审阅，未写回原表。请手动关闭临时副本且不保存；加载项不能自动关闭此窗口。" });
+        setFeedback({ messageId, text: '已保留审阅副本供你核对。请按执行记录检查原表；结束审阅不撤销既有写入。' });
         return;
       }
-      if (!await closeExcelNativeComparison(current.session)) throw new Error("副本尚未关闭；如 Excel 询问是否保存临时副本，请选择不保存。原表未因此改变。");
-      publish(null);
-      setFeedback({ messageId, text: current.phase === "committed" ? "原表已写回，临时副本已关闭。" : current.phase === "blocked" ? "临时副本已关闭。关闭副本不撤销既有写入，请按执行结果与恢复点核对原表。" : "已放弃审阅副本，未写回原表。" });
+      // Revoke confirmation synchronously, before any asynchronous cleanup.
+      const ended: ExcelReview = { ...current, outcome: current.outcome === 'verified' ? 'verified' : 'discarded' };
+      publish(ended);
+      await close(ended);
     });
   }
   async function save(messageId: string, plan: AnalysisPlan, authorization: readonly string[],
-    commit: (session: ExcelNativeComparison) => Promise<boolean>, manualReviewed = false) {
+    commit: (session: ExcelNativeComparison) => Promise<boolean>, acknowledgedCopy: string | null = null,
+    isCurrent: () => boolean = () => true) {
     return operation(messageId, async () => {
       const current = live.current;
-      if (!current || current.messageId !== messageId || current.phase !== "review") throw new Error("没有可保存的已审阅副本。");
-      if (current.session.mode === "manual" && !manualReviewed) throw new Error("请先在 Excel 中审阅兼容副本，并勾选确认；原表未写入。");
+      if (!current || current.messageId !== messageId || current.outcome !== 'reviewing') throw new Error("没有可保存的已审阅副本。");
+      if (!isCurrent()) throw new Error('确认现场已变化，原表未写入。');
+      if (acknowledgedCopy !== current.session.copySheetName) {
+        throw new Error(current.session.mode === 'manual'
+          ? '请先在 Excel 中审阅兼容副本，并确认本次副本；原表未写入。'
+          : '确认不属于当前审阅副本，原表未写入。');
+      }
+      const planKey = JSON.stringify(plan), scopeKey = JSON.stringify([...authorization].sort());
+      let commitStarted = false;
       try {
         await Excel.run(context => assertExcelNativeComparisonUnchanged(context, current.session, authorization, plan));
-        const completed = await commit(current.session);
-        if (!completed) { publish({ ...current, phase: "blocked" }); throw new Error("写回未完成，不能重复提交。请查看执行结果与恢复点，核对原表后再生成新预览。"); }
-      } catch (reason) { publish({ ...current, phase: "blocked" }); throw reason; }
-      publish({ ...current, phase: "committed" });
-      if (current.session.mode === "manual") {
-        publish(null);
-        setFeedback({ messageId, text: "变更已按审阅计划写回原表。兼容副本未自动回读或关闭，请手动关闭且不保存；原文件是否保存请按 Excel 的正常保存流程操作。" });
-        return;
+        if (!isCurrent() || live.current !== current || planKey !== JSON.stringify(plan) || scopeKey !== JSON.stringify([...authorization].sort())) {
+          throw new Error('计划、授权或审阅现场已变化，请重新核对；原表未写入。');
+        }
+        commitStarted = true;
+        if (!(await commit(current.session))) throw new Error('执行结果未确认，请检查执行记录与恢复点，不能重复提交。');
+      } catch (reason) {
+        const outcome = commitStarted ? 'partial_or_unknown' : 'write_failed';
+        if (live.current === current) publish({ ...current, outcome,
+          copy: reviewCopyCleanupState({ business: outcome, copy: 'not_attempted' }).copy,
+          note: reason instanceof Error ? reason.message : '执行结果未确认。' });
+        throw reason;
       }
-      // A close failure must not make an already committed write look failed or allow replay.
-      try {
-        if (await closeExcelNativeComparison(current.session)) {
-          publish(null); setFeedback({ messageId, text: "变更已写回原表，审阅副本已关闭。是否保存文件请按 Excel 的正常保存流程操作。" });
-        } else setFeedback({ messageId, text: "变更已写回原表；副本尚未关闭，请关闭且不保存临时副本。" });
-      } catch { setFeedback({ messageId, text: "变更已写回原表；请手动关闭临时副本。" }); }
+      const verified: ExcelReview = { ...current, outcome: 'verified' };
+      publish(verified);
+      await close(verified);
     });
   }
-  return { review, pending, feedback, stage, save, discard };
+  // Internal layout operation; there is deliberately no "重新排列" UI button.
+  async function rearrange(messageId: string): Promise<boolean> {
+    return operation(messageId, async () => {
+      const current = live.current;
+      if (!current || current.messageId !== messageId || current.outcome !== 'reviewing') throw new Error('没有活跃审阅副本可排列。');
+      const layout = await rearrangeLocalExcelWindows(current.session.workbookIdentity, current.session.original.name, current.session.copySheetName);
+      if (live.current !== current) throw new Error('审阅现场已变化，未更新排列状态。');
+      publish({ ...current, session: { ...current.session, windowLayout: 'arranged', synchronousScrolling: layout.synchronousScrolling } });
+    });
+  }
+  const rejectStaleRequest = (messageId: string) => setFeedback({ messageId, text: '没有可保存的已审阅副本：计划、授权或确认现场已变化，请重新核对。' });
+  return { review, pending, feedback, stage, save, discard, rearrange, rejectStaleRequest };
 }

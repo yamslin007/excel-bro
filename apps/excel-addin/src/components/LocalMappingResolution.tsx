@@ -6,7 +6,9 @@ import {
   addExactMapping,
   addSplitMapping,
   applyBlankPolicy,
+  declaredMappingPriority,
   localMappingSourceKey,
+  mappingInputError,
   mappingTargets,
   suggestMappingDelimiter,
   uncoveredSplitItems
@@ -68,8 +70,10 @@ export function LocalMappingResolution(props: {
     suggestMappingDelimiter(props.rule, props.values)
   );
   const [splitTargets, setSplitTargets] = useState<Record<string, string>>({});
-  const [priorityOrder, setPriorityOrder] = useState<string[]>(() => mappingTargets(props.rule));
+  const knownPriority = useMemo(() => declaredMappingPriority(props.rule), [props.rule]);
+  const [priorityOrder, setPriorityOrder] = useState<string[]>(() => declaredMappingPriority(props.rule) ?? mappingTargets(props.rule));
   const [priorityConfirmed, setPriorityConfirmed] = useState(false);
+  const [priorityEdited, setPriorityEdited] = useState(false);
   const [error, setError] = useState("");
   const [scopeChecking, setScopeChecking] = useState(Boolean(props.checkScope));
   const [scopeBlocked, setScopeBlocked] = useState(false);
@@ -106,9 +110,16 @@ export function LocalMappingResolution(props: {
       ...unique.filter((target) => !priorityOrder.includes(target))
     ];
   }, [props.rule, missingItems, splitTargets, priorityOrder]);
+  const priorityNeedsConfirmation = priorityEdited || !knownPriority || targets.some((target) => !knownPriority.includes(target));
+  const priorityReady = !priorityNeedsConfirmation || priorityConfirmed;
+  const inputErrors = mode === "exact"
+    ? props.values.map((value, index) => mappingInputError(localMappingSourceKey(value), exactTargets[index] ?? "", props.rule))
+    : missingItems.map((item) => mappingInputError(item, splitTargets[item] ?? "", props.rule));
+  const mappingReady = inputErrors.every((item) => item === null) &&
+    (mode === "exact" || (Boolean(delimiter.trim()) && priorityReady));
 
   const submit = async () => {
-    if (submitLock.current || submitDisabled) return;
+    if (submitLock.current || submitDisabled || (reason !== "blank" && !mappingReady)) return;
     submitLock.current = true;
     try {
     // Recheck the existing target before reading. This form never grants target authorization.
@@ -132,7 +143,7 @@ export function LocalMappingResolution(props: {
             delimiter,
             missingItems,
             targets: missingItems.map((item) => splitTargets[item] ?? ""),
-            priorityTargets: priorityConfirmed ? targets : []
+            priorityTargets: priorityReady ? targets : []
           });
     } catch (failure) {
       // 这里只显示本地输入校验错误，不能把宿主异常原文混进持久化界面。
@@ -249,10 +260,12 @@ export function LocalMappingResolution(props: {
                 aria-label={`来源值 ${localMappingSourceKey(value)} 的目标值`}
                 type="text"
                 value={exactTargets[index] ?? ""}
+                aria-invalid={Boolean(inputErrors[index])}
                 placeholder="填写该整格对应的目标值"
                 disabled={props.busy}
                 onChange={(event) => setExactTargets((current) => ({ ...current, [index]: event.target.value }))}
               />
+              {inputErrors[index] && <span role="alert" className="local-mapping-error">{inputErrors[index]}</span>}
             </label>
           ))}
         </>
@@ -270,13 +283,14 @@ export function LocalMappingResolution(props: {
               placeholder="输入实际使用的分隔符"
             />
           </label>
-          {missingItems.map((item) => (
+          {missingItems.map((item, index) => (
             <label key={item} className="editable">
               <span>未覆盖的拆分项：{item}</span>
               <input
                 aria-label={`拆分项 ${item} 的目标值`}
                 type="text"
                 value={splitTargets[item] ?? ""}
+                aria-invalid={Boolean(inputErrors[index])}
                 disabled={props.busy}
                 onChange={(event) => {
                   setSplitTargets((current) => ({ ...current, [item]: event.target.value }));
@@ -284,11 +298,14 @@ export function LocalMappingResolution(props: {
                 }}
                 placeholder="填写此项的目标值"
               />
+              {inputErrors[index] && <span role="alert" className="local-mapping-error">{inputErrors[index]}</span>}
             </label>
           ))}
           <div className="local-mapping-priority" aria-label="目标优先顺序">
             <strong>多个类别同时出现时，从高到低取目标：</strong>
-            <span>初始顺序只是草稿，不代表业务上的高低；请按实际规则调整后再确认。</span>
+            <span>{priorityNeedsConfirmation
+              ? "以下仍需你决定优先顺序；标签名称和映射顺序不代表业务上的高低。"
+              : "已沿用已确认的优先顺序；只有改变顺序或新增目标等级时才需要再次确认。"}</span>
             {targets.map((target, index) => (
               <div key={target} className="local-mapping-priority-item">
                 <span>{index + 1}. {target}</span>
@@ -296,20 +313,22 @@ export function LocalMappingResolution(props: {
                   const next = [...targets];
                   [next[index - 1], next[index]] = [next[index], next[index - 1]];
                   setPriorityOrder(next);
+                  setPriorityEdited(true);
                   setPriorityConfirmed(false);
                 }}>上移</button>
                 <button type="button" disabled={props.busy || index === targets.length - 1} onClick={() => {
                   const next = [...targets];
                   [next[index], next[index + 1]] = [next[index + 1], next[index]];
                   setPriorityOrder(next);
+                  setPriorityEdited(true);
                   setPriorityConfirmed(false);
                 }}>下移</button>
               </div>
             ))}
-            <label>
+            {priorityNeedsConfirmation && <label>
               <input type="checkbox" checked={priorityConfirmed} disabled={props.busy || targets.length === 0} onChange={(event) => setPriorityConfirmed(event.target.checked)} />
               我已核对上述优先顺序（最上方优先）
-            </label>
+            </label>}
           </div>
         </>
       )}
@@ -322,7 +341,7 @@ export function LocalMappingResolution(props: {
         <>
           {error && <p role="alert" className="local-mapping-error">{error}</p>}
           <div className="clarification-actions">
-            <button type="button" disabled={submitDisabled || (mode === "split" && (!delimiter || !priorityConfirmed))} onClick={() => void submit()}>
+            <button type="button" disabled={submitDisabled || !mappingReady} onClick={() => void submit()}>
               按补充映射重新生成预览
             </button>
             {mode === "exact" ? (

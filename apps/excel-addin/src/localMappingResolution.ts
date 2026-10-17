@@ -15,6 +15,29 @@ export function mappingTargets(rule: ColumnMappingRule): string[] {
   return [...new Set(rule.mapping.map((pair) => pair.target))];
 }
 
+/** Reuse only an explicit, complete and unambiguous order. Never infer severity from labels. */
+export function declaredMappingPriority(rule: ColumnMappingRule): string[] | null {
+  const targets = mappingTargets(rule);
+  if (targets.length === 1) return targets;
+  const ranks = new Map(rule.valueRank?.map((entry) => [entry.value, entry.rank]));
+  const targetRanks = new Map<string, number>();
+  for (const pair of rule.mapping) {
+    const rank = ranks.get(pair.source);
+    if (rank === undefined || !Number.isFinite(rank)) return null;
+    if (targetRanks.has(pair.target) && targetRanks.get(pair.target) !== rank) return null;
+    targetRanks.set(pair.target, rank);
+  }
+  if (!targetRanks.size || new Set(targetRanks.values()).size !== targets.length) return null;
+  return targets.sort((left, right) => targetRanks.get(right)! - targetRanks.get(left)!);
+}
+
+export function mappingInputError(source: string, target: string, rule: ColumnMappingRule): string | null {
+  if (!target.trim()) return `请填写「${source}」的目标值`;
+  if (target.trim().startsWith("=")) return `「${source}」不能填写公式，请填写目标标签`;
+  if (rule.mapping.some((pair) => pair.source === source)) return `「${source}」已有映射，不能在补全中覆盖`;
+  return null;
+}
+
 /** 只给候选，不自动采用；无法从已知类别明确推断时留空供用户填写。 */
 export function suggestMappingDelimiter(
   rule: ColumnMappingRule,
@@ -47,8 +70,19 @@ export function uncoveredSplitItems(
   if (!delimiter) return [];
   const known = new Set(rule.mapping.map((pair) => pair.source));
   const missing = new Set<string>();
+  const delimiters = [...new Set([...(rule.delimiters ?? []), delimiter])];
   for (const value of values) {
-    for (const part of localMappingSourceKey(value).split(delimiter)) {
+    const text = localMappingSourceKey(value);
+    if (known.has(text)) continue; // The executor always checks whole-cell mappings first.
+    // Mirror the executor's earliest declared delimiter, not just the newest candidate.
+    let selected = "";
+    let earliest = Infinity;
+    for (const candidate of delimiters) {
+      if (!candidate) continue;
+      const position = text.indexOf(candidate);
+      if (position >= 0 && position < earliest) { earliest = position; selected = candidate; }
+    }
+    for (const part of selected ? text.split(selected) : [text]) {
       const item = part.trim();
       if (item && !known.has(item)) missing.add(item);
     }
@@ -68,9 +102,8 @@ export function addExactMapping(
   const additions = values.map((value, index) => {
     const source = localMappingSourceKey(value);
     const target = targets[index]?.trim() ?? "";
-    if (!source || !target || target.startsWith("=") || existing.has(source)) {
-      throw new Error("目标值不能为空或公式，且不能覆盖已有映射。");
-    }
+    const error = mappingInputError(source, target, rule);
+    if (!source || error || existing.has(source)) throw new Error(error ?? `「${source}」的映射重复`);
     existing.add(source);
     return { source, target };
   });
@@ -112,9 +145,8 @@ export function addSplitMapping(
   const existing = new Set(rule.mapping.map((pair) => pair.source));
   const additions = input.missingItems.map((source, index) => {
     const target = input.targets[index]?.trim() ?? "";
-    if (!source || !target || target.startsWith("=") || existing.has(source)) {
-      throw new Error("拆分项的目标不能为空或公式，也不能覆盖已有映射。");
-    }
+    const error = mappingInputError(source, target, rule);
+    if (!source || error || existing.has(source)) throw new Error(error ?? `「${source}」的映射重复`);
     existing.add(source);
     return { source, target };
   });

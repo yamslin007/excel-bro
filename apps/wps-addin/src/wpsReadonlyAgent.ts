@@ -1,6 +1,7 @@
 import {
   ApiRequestError,
   checkIntent,
+  understandMessage,
   createAssistantResponse,
   isLocalServiceConnectionError,
   type ModelOption
@@ -29,11 +30,14 @@ import type {
   DataToolResult,
   IntentCheckRequest,
   IntentCheckResponse,
+  MessageUnderstandingResponse,
   IntentScopeContext,
   ImageAttachment,
+  LocalResultCard,
   PlanRequest,
   PlanningPauseResult,
   ResultContext,
+  SdkBridgeToolPointer,
   WorkbookSnapshot
 } from "../../excel-addin/src/contracts";
 import {
@@ -41,6 +45,7 @@ import {
   type SheetValues
 } from "../../excel-addin/src/dataTools";
 import { detectSheetFields } from "../../excel-addin/src/tableSchema";
+import { isSdkPlanningModel } from "../../excel-addin/src/modelSelection";
 import {
   buildWpsColumnMappingPlan,
   sliceMappingSource,
@@ -54,6 +59,7 @@ import {
   listWpsWorksheets,
   readAuthorizedWpsSheets,
   readAuthorizedWpsSheetSchemas,
+  wpsWorkbookBridgeIdentity,
   type WpsSheetReadResult
 } from "./wpsWorkbookReader";
 
@@ -106,6 +112,11 @@ export type WpsTurnResult =
        * 有有效检查点才继续 —— 不能靠"重新发一遍需求"冒充续跑。
        */
       turnId?: string | null;
+      /**
+       * SDK 本地结果卡指针：**只带引用与结构，没有任何值**。
+       * 真实值由本机回环端点按 `resultRef` 取回，不进模型/历史/持久账本。
+       */
+      localResult?: LocalResultCard | null;
     }
   | {
       kind: "clarification";
@@ -174,17 +185,31 @@ export type WpsReadonlyTurnProgress = {
    * 要禁止的"重发即重新规划"。
    */
   turnId?: string;
+  /** 客户端实际收到的事件位置；不等于服务端最新位置。 */
+  sequence?: number;
+  /**
+   * SDK 工具桥指针：服务端的模型正在等本机执行一次本地查询。
+   *
+   * **只有操作 ID 与工具名**；请求参数留在本机易失桥里由宿主适配器拉取，
+   * 不进模型提示、不进聊天历史、不进持久账本。原样透传给面板，
+   * 由面板交给桥控制器去轮询/复核/读取/回执。
+   */
+  bridgeTool?: SdkBridgeToolPointer | null;
+  pythonResult?: LocalResultCard | null;
 };
 
 export type WpsReadonlyTurnInput = {
   application: WpsApplication;
   selectedSheetIndexes: readonly number[];
   prompt: string;
+  taskContext?: IntentCheckRequest["taskContext"];
   modelId?: string | null;
   images?: ImageAttachment[];
   conversation?: IntentCheckRequest["conversation"];
   intentConfirmed?: boolean;
   clarificationRound?: number;
+  /** Already classified by the panel; never contains workbook context. */
+  messageUnderstanding?: MessageUnderstandingResponse;
   signal?: AbortSignal;
   /** Metadata-only UI guard, repeated before each source read after model awaits. */
   beforeRead?: () => Promise<void>;
@@ -192,6 +217,7 @@ export type WpsReadonlyTurnInput = {
 };
 
 type WpsReadonlyAgentDependencies = {
+  understandMessage?: typeof understandMessage;
   checkIntent: typeof checkIntent;
   createAssistantResponse: typeof createAssistantResponse;
   streamPlanning: typeof streamWpsPlanning;
@@ -203,6 +229,7 @@ type WpsReadonlyAgentDependencies = {
 };
 
 const DEFAULT_DEPENDENCIES: WpsReadonlyAgentDependencies = {
+  understandMessage,
   checkIntent,
   createAssistantResponse,
   streamPlanning: streamWpsPlanning,
@@ -394,6 +421,12 @@ export function buildWpsReadonlyContexts(
     capturedAt: new Date().toISOString(),
     activeWorksheet,
     selectedRange,
+    /*
+     * 稳定工作簿身份，供 SDK 工具桥判归属。必须与宿主适配器
+     * （`wpsWorkbookBridgeIdentity`）算出来的一致，否则桥上的轮询会
+     * 被判成"不属于本次任务"。
+     */
+    workbookIdentity: wpsWorkbookBridgeIdentity(application),
     worksheets: sheets.map((sheet) => ({
       ...sheet,
       dataRows: [],
@@ -414,7 +447,13 @@ export function buildWpsReadonlyContexts(
   return { scope, workbook };
 }
 
-function sheetsForRequest(
+/**
+ * 把读回来的工作表按请求的 `scope` 收窄成本地计算要吃的矩阵。
+ *
+ * 导出是为了让 SDK 工具桥的宿主适配器**复用同一份**收窄规则 —— 桥上的
+ * `query_table` 与本地分析走的是同一个 `query_table`，两份实现迟早会分叉。
+ */
+export function sheetsForRequest(
   request: DataToolRequest,
   results: WpsSheetReadResult[],
   activeWorksheet: string
@@ -443,6 +482,8 @@ function finalizeResponse(response: AssistantResponse): WpsTurnResult {
       resultContext: response.resultContext,
       provider: response.provider,
       outcome: response.outcome,
+      // SDK 本地结果卡指针原样上抛：面板据此挂卡，值由本机回环按引用取回。
+      localResult: response.localResult ?? null,
       turnId: response.turnId
     };
   }
@@ -460,6 +501,15 @@ export async function runWpsTurn(
 ): Promise<WpsTurnResult> {
   const prompt = input.prompt.trim();
   if (prompt.length < 2) throw new Error("请输入至少两个字符的问题。");
+  input.onProgress?.({ stage: "intent", stepId: "message-intent", title: "理解消息", message: "先理解当前消息，判断是否需要工作簿上下文；尚未读取字段或数据。" });
+  const messageUnderstanding = input.messageUnderstanding ?? await (dependencies.understandMessage ?? understandMessage)({
+    prompt, imageCount: input.images?.length ?? 0,
+    conversation: input.conversation ?? [], modelId: input.modelId || null
+  }, input.signal);
+  if (input.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+  if (messageUnderstanding.kind === "conversation") {
+    return { kind: "answer", message: messageUnderstanding.message, provider: messageUnderstanding.provider, resultContext: null };
+  }
   input.onProgress?.({ stage: "reading", stepId: "read-schemas", title: "读取已授权表结构", message: "只读取字段结构，不向意图模型发送原始数据行。" });
   await input.beforeRead?.();
   const authorization = authorizeWpsSheets(input.application, input.selectedSheetIndexes);
@@ -468,11 +518,12 @@ export async function runWpsTurn(
   });
   const { scope, workbook } = buildWpsReadonlyContexts(input.application, schemas);
 
-  input.onProgress?.({ stage: "intent", stepId: "intent", title: "理解需求", message: "判断是直接回答、澄清、查询还是写入计划。" });
+  input.onProgress?.({ stage: "intent", stepId: "intent", title: "结合字段理解任务", message: "结合已授权字段判断是否需要澄清、查询或写入计划。" });
   const intent = await dependencies.checkIntent(
     {
       prompt,
       scope,
+      taskContext: input.taskContext,
       imageCount: input.images?.length ?? 0,
       intentConfirmed: input.intentConfirmed ?? false,
       clarificationRound: input.clarificationRound ?? 0,
@@ -509,7 +560,16 @@ export async function runWpsTurn(
 
   let dataResults: DataToolResult[] = [];
   let confirmedPrompt = intent.confirmedPrompt;
-if (intent.kind === "tool_request") {
+  /**
+   * SDK 适配器下**不能**预置本地计算结果。
+   *
+   * SDK 只拿得到表结构，模型要自己调 `query_table`，由本机桥在真实宿主上执行
+   * 确定性查询。若这里仍把算好的 `dataResults` 塞进请求，服务端的"不上传数据行"
+   * 守卫会直接拒绝整条请求 —— 新工具桥就永远拿不到执行权（这正是本轮要修的
+   * "旧路径挡住新工具桥"）。跳过预置，读表推迟到桥指针回来的那一刻。
+   */
+  const sdkPlanning = isSdkPlanningModel(input.modelId);
+  if (intent.kind === "tool_request" && !sdkPlanning) {
     await input.beforeRead?.();
     input.onProgress?.({ stage: "reading", stepId: "read-data", title: "读取授权数据", message: "只为已确定的本地查询读取完整数据。" });
     const results = await dependencies.readSheets(input.application, authorization, {
@@ -535,7 +595,9 @@ if (intent.kind === "tool_request") {
   const hostVersion = String(input.application.Version ?? "").trim() || null;
   const planRequest: PlanRequest = {
     turnId: intent.turnId,
+    planningGoal: intent.planningGoal ?? (intent.kind === "tool_request" ? "read_only" : "write_preview"),
     prompt: confirmedPrompt,
+    taskContext: input.taskContext,
     workbook,
     dataResults,
     planningReadPolicy: "none" as const,
@@ -575,9 +637,15 @@ if (intent.kind === "tool_request") {
           onProgress: (event) => {
             input.onProgress?.({
               stage: "answering",
+              turnId: turnIdForStream,
+              sequence: event.sequence,
               stepId: event.stepId || "planning-stream",
               title: event.title,
-              message: event.summary || event.title || "正在规划"
+              message: event.summary || event.title || "正在规划",
+              // 桥指针必须原样透传：丢掉它，本端就再也看不到"模型在等本机读表"，
+              // 服务端会一直等到超时（表现为"分析卡住"而不是报错）。
+              bridgeTool: event.bridgeTool ?? null,
+              pythonResult: event.pythonResult ?? null
             });
           }
         }
@@ -813,9 +881,8 @@ export type WpsPlanningContinueResult = {
  *
  * 三条不可放宽的纪律：
  *
- *  1. **先查状态再继续。** 传入的 `expectedRevision` 与 `afterSequence` 必须
- *     来自**刚查到的真实状态**，不能用界面上那份旧快照 —— 服务端靠
- *     `revision` 做 CAS，用旧值会直接 409。
+   *  1. **先查状态再继续。** `expectedRevision` 用刚查到的真实 revision 做 CAS；
+   *     `afterSequence` 用客户端实际已消费的位置（未知从零补收），不能冒用服务端最新值。
  *  2. **不重发原需求。** 请求体里只有身份与游标（见 `WpsPlanningContinueBody`）。
  *     带 `prompt` 会让服务端把它当成一次新规划，重复调用模型与工具。
  *  3. **写入次数为 0。** 续跑只推进"规划"，产出仍需经过既有的预览与用户确认
@@ -891,7 +958,8 @@ export async function resumeWpsPlanning(
        * 就被**永久跳过** —— 界面上步骤静默缺失，用户看到一份不完整的过程。
        * 传更小的值只会重复补发（幂等，可去重），传更大的值会丢事件（不可逆）。
        */
-      afterSequence: input.afterSequence ?? status.lastSequence,
+      afterSequence: Math.min(Number.isSafeInteger(input.afterSequence) && input.afterSequence! >= 0
+        ? input.afterSequence! : 0, status.lastSequence),
       modelId: input.modelId ?? undefined,
       confirmModelSwitch: input.confirmModelSwitch
     },
@@ -900,6 +968,8 @@ export async function resumeWpsPlanning(
       onProgress: (event) => {
         input.onProgress?.({
           stage: "answering",
+          turnId,
+          sequence: event.sequence,
           stepId: event.stepId || "planning-continue",
           title: event.title,
           message: event.summary || event.title || "正在继续规划"

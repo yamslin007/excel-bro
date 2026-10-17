@@ -1,5 +1,5 @@
-import { prepareExcelReviewLayout, arrangeExcelReviewLayout, measureExcelReviewPane } from './api';
-import type { ExcelReviewLayoutTicket } from './contracts';
+import { prepareExcelReviewLayout, arrangeExcelReviewLayout, measureExcelReviewPane, closeExcelReviewCopy } from './api';
+import type { ExcelReviewLayoutTicket, ExcelReviewCopyCloseResult } from './contracts';
 
 const sha256 = async (text: string) => [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)))].map(x => x.toString(16).padStart(2, '0')).join('');
 
@@ -33,5 +33,27 @@ export async function prepareLocalExcelWindows(identity: string, sourceSheetName
 export { arrangeExcelReviewLayout as arrangeLocalExcelWindows };
 export async function measureLocalExcelWindow(identity: string, sourceSheetName: string, copySheetName: string) {
   return measureExcelReviewPane({workbookPathHash: await sha256(localWindowsPath(identity)),
+    worksheetNameHash: await sha256(sourceSheetName), copySheetName});
+}
+
+/**
+ * 用户主动「重新排列」：重新领一张一次性凭据并重跑默认布局。
+ *
+ * 凭据是**单次使用**的，所以重排必须重新 prepare —— 复用旧 token 会被服务端拒绝
+ * （那是刻意的：不允许重放已经核对过的窗口句柄）。排列失败不影响任何业务状态。
+ */
+export async function rearrangeLocalExcelWindows(identity: string, sourceSheetName: string, copySheetName: string) {
+  return arrangeExcelReviewLayout(await prepareLocalExcelWindows(identity, sourceSheetName, copySheetName));
+}
+
+/**
+ * 请求本机桥关闭本次审阅的**兼容副本**（Office.js 在兼容宿主拿不到窗口句柄）。
+ *
+ * 服务端只会关闭"未保存 + 活动工作表名等于本次 nonce + 唯一 + 不在基线里"的那个窗口，
+ * 且在原表身份无法核实时拒绝执行。返回的是**关闭结果**，不是"原表写回结果"；
+ * 关不掉就如实降级为手动关闭，绝不冒充成功。
+ */
+export async function closeLocalExcelWindows(identity: string, sourceSheetName: string, copySheetName: string): Promise<ExcelReviewCopyCloseResult> {
+  return closeExcelReviewCopy({closeVersion: 4, workbookPathHash: await sha256(localWindowsPath(identity)),
     worksheetNameHash: await sha256(sourceSheetName), copySheetName});
 }

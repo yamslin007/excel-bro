@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ActivityLog } from "../hooks/useActivityProgress";
 import { TaskProgressTimeline } from "./TaskProgressTimeline";
 
@@ -35,6 +35,34 @@ function sampleLog(): ActivityLog {
 }
 
 describe("TaskProgressTimeline", () => {
+  it("labels the non-submitting interruption action as pause", () => {
+    const pause = vi.fn();
+    render(<TaskProgressTimeline log={sampleLog()} live onStop={pause} />);
+    const button = screen.getByRole("button", { name: "暂停" });
+    expect(button.getAttribute("type")).toBe("button");
+    expect(screen.queryByRole("button", { name: "停止" })).toBeNull();
+    fireEvent.click(button);
+    expect(pause).toHaveBeenCalledOnce();
+  });
+
+  it("folds completed ordinary chat after its live phase, but keeps details expandable", () => {
+    const log = { ...sampleLog(), defaultCollapsed: true, outcome: "completed" as const };
+    const view = render(<TaskProgressTimeline log={log} live />);
+    expect(screen.getByText("read_range")).toBeTruthy();
+    view.rerender(<TaskProgressTimeline log={log} />);
+    expect(screen.getByRole("button", { name: "展开" }).getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByText("read_range")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "展开" }));
+    view.rerender(<TaskProgressTimeline log={{ ...log, totalMs: 12000 }} />);
+    expect(screen.getByText("read_range")).toBeTruthy();
+  });
+
+  it.each(["failed", "awaiting_input", "warning", "interrupted", "cancelled"] as const)("does not fold %s even with a chat presentation flag", (outcome) => {
+    render(<TaskProgressTimeline log={{ ...sampleLog(), outcome, defaultCollapsed: true }} />);
+    expect(screen.getByRole("button", { name: "收起" }).getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByText("read_range")).toBeTruthy();
+  });
+
   it("is expanded by default and shows tools, actions, targets and facts", () => {
     render(<TaskProgressTimeline log={sampleLog()} />);
 

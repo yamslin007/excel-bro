@@ -200,6 +200,21 @@ describe("规划继续方案：按钮只由结构化状态推导", () => {
     ).toBe("none");
   });
 
+  it("总时长已用完（budget_exhausted）不提供续跑按钮，也不承诺必然可继续", () => {
+    // 服务端会把这种暂停的 canContinue 置为 false；这里如实核对下游不给按钮。
+    const decision = planningResumeDecision({
+      status: "waiting_user",
+      canContinue: false,
+      hasCheckpoint: true,
+      pauseType: "budget_exhausted",
+      reason: "本轮有效运行总时长已用完，不再启动新的模型或工具调用。"
+    });
+    expect(decision.action).toBe("regenerate");
+    expect(decision.actionLabel).not.toBe("继续任务");
+    // 原因原样透出，不被"进度已安全保存"之类的兜底文案顶掉。
+    expect(decision.detail).not.toContain("从上次保存的进度继续");
+  });
+
   it("真实原因原样透出，不吞掉服务端的 error.message", () => {
     const decision = planningResumeDecision({
       status: "failed",

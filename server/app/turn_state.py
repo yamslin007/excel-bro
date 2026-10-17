@@ -41,6 +41,7 @@ class TurnState:
     updated_at: float
     completion_fingerprint: str | None = None
     completion_response: AssistantResponse | None = None
+    planning_goal: str | None = None
     completion_lock: asyncio.Lock = field(
         default_factory=asyncio.Lock,
         repr=False,
@@ -117,6 +118,9 @@ class TurnRegistry:
         self, turn_id: str, response: IntentCheckResponse
     ) -> None:
         state = self.touch(turn_id)
+        state.planning_goal = (
+            response.planningGoal if response.kind in ("proceed", "tool_request") else None
+        )
         if response.kind == "clarification":
             state.stage = "awaiting_clarification"
         elif response.kind == "tool_request":

@@ -31,6 +31,7 @@ import {
   wpsPlanningResumeDecision
 } from "./wpsPlanningStream";
 import { assertKnownResultKind, isPlanningPause } from "./wpsPlanningTypes";
+import { StreamingToolDeliveryUnavailableError } from "../../excel-addin/src/api";
 import {
   newPlanningCursor,
   planningAfterSequence,
@@ -392,6 +393,77 @@ describe("CAP-02 查询与继续走真实 HTTP", () => {
     )));
     await expect(continueWpsPlanning({ turnId: "t", expectedRevision: 1, requestId: "r", afterSequence: 0 }))
       .rejects.toMatchObject({ code: "PLANNING_REVISION_CONFLICT", status: 409 });
+  });
+});
+
+/*
+ * 无流式工具投递能力 → **提前明确拒绝**。
+ *
+ * WPS 端的取数通道只有一条：服务端经 SSE 投递 `bridgeTool` 指针，本机读表后回执。
+ * 流式通道不可用时若只抛一句笼统的"请求失败"，调用方分不清"后端是旧版"还是
+ * "代理缓冲了 SSE"；而 SDK 适配器恰恰**只能**靠这条通道。这里给出可执行的明确原因，
+ * 并且只打一次请求 —— 绝不退回非流式（那会让服务端为送不到本机的工具请求空等）。
+ */
+describe("CAP-02 SDK 适配器：无流式工具投递能力时明确拒绝", () => {
+  it.each([422, 500, 503])("HTTP %s 保留服务端错误，不误报流式缺失且不重发", async (status) => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ detail: {
+      code: "TASK_STATE_CORRUPT", message: "任务数据库损坏", retryable: false
+    } }), { status }));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(streamWpsPlanning({ modelId: "claude-agent-sdk" }, "turn-error"))
+      .rejects.toMatchObject({ status, code: "TASK_STATE_CORRUPT", message: "任务数据库损坏" });
+    await expect(continueWpsPlanning({ turnId: "turn-error", expectedRevision: 1,
+      requestId: "continue-error", afterSequence: 0, modelId: "claude-agent-sdk" }))
+      .rejects.toMatchObject({ status, code: "TASK_STATE_CORRUPT" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+  it("流式端点缺失时抛固定错误码，且只请求一次（不退回 /api/turn）", async () => {
+    const calls: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+      calls.push(String(url));
+      return new Response("Not Found", { status: 404 });
+    }));
+
+    const rejection = streamWpsPlanning(
+      { turnId: "turn-sdk", prompt: "统计", workbook: {}, dataResults: [], modelId: "claude-agent-sdk" },
+      "turn-sdk"
+    );
+
+    await expect(rejection).rejects.toBeInstanceOf(StreamingToolDeliveryUnavailableError);
+    await expect(rejection).rejects.toMatchObject({
+      code: "streaming_tool_delivery_unavailable"
+    });
+    // 反向变异点：任何第二次请求都意味着服务端已经开始等一个永远到不了的回执。
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toContain("/api/turn/stream");
+  });
+
+  it("续跑流式端点缺失时同样明确拒绝", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("Not Found", { status: 404 })));
+
+    await expect(
+      continueWpsPlanning({
+        turnId: "turn-sdk",
+        expectedRevision: 2,
+        requestId: "r-1",
+        afterSequence: 3,
+        modelId: "claude-agent-sdk:connection-0001"
+      })
+    ).rejects.toMatchObject({ code: "streaming_tool_delivery_unavailable" });
+  });
+
+  it("普通模型在同样的 404 下不被这个闸拦住（仍旧报结构化请求错误）", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(
+      JSON.stringify({ detail: { code: "PLANNING_UNKNOWN", message: "旧后端", retryable: false } }),
+      { status: 404 }
+    )));
+
+    await expect(
+      streamWpsPlanning(
+        { turnId: "turn-1", prompt: "统计", workbook: {}, dataResults: [], modelId: "connection:regular" },
+        "turn-1"
+      )
+    ).rejects.toMatchObject({ code: "PLANNING_UNKNOWN", status: 404 });
   });
 });
 

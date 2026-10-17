@@ -1721,7 +1721,9 @@ def test_folder_execution_rejects_a_target_file_locked_by_another_process(
     original = module._is_locked_for_writing
     module._is_locked_for_writing = deny_write
     try:
-        with pytest.raises(ValueError, match="正在被其他程序占用"):
+        # Selection/write preflight now rejects earlier. The access probe cannot
+        # distinguish an external lock from missing write permission.
+        with pytest.raises(ValueError, match="被占用或无写回权限"):
             execute_folder_plan(
                 FolderExecuteRequest(
                     sessionId=catalog.sessionId,
@@ -1892,6 +1894,82 @@ def test_rebuilt_session_still_rejects_a_plan_whose_source_changed(
     unchanged = load_workbook(source, data_only=True)
     assert unchanged["得分"]["B2"].value == 99
     unchanged.close()
+
+
+def test_folder_snapshot_rejects_changes_during_read_without_publishing_authorization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "scores.xlsx"
+    _create_source(source)
+    catalog = scan_folder(tmp_path)
+    original_load = folder_workbooks_module.load_workbook
+
+    def load_then_change_on_close(path, **options):
+        workbook = original_load(path, **options)
+        if Path(path) == source and options.get("read_only"):
+            original_close = workbook.close
+
+            def close_and_change():
+                original_close()
+                changed = original_load(source)
+                changed["得分"]["B2"] = 99
+                changed.save(source)
+                changed.close()
+
+            workbook.close = close_and_change
+        return workbook
+
+    monkeypatch.setattr(folder_workbooks_module, "load_workbook", load_then_change_on_close)
+    with pytest.raises(ValueError, match="读取.*发生变化"):
+        create_folder_snapshot(FolderSnapshotRequest(
+            sessionId=catalog.sessionId,
+            selections=[FolderSelection(fileId=catalog.files[0].id, sheets=["得分"])],
+        ))
+    session = folder_workbooks_module._session(catalog.sessionId)
+    assert session.selected_targets == {}
+    assert session.selected_sources == {}
+    assert session.source_fingerprint is None
+    unchanged = original_load(source, data_only=True)
+    assert unchanged["得分"]["B2"].value == 99
+    unchanged.close()
+
+
+def test_failed_folder_snapshot_preserves_previous_authorized_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "scores.xlsx"
+    _create_source(source)
+    catalog = scan_folder(tmp_path)
+    request = FolderSnapshotRequest(
+        sessionId=catalog.sessionId,
+        selections=[FolderSelection(fileId=catalog.files[0].id, sheets=["得分"])],
+    )
+    baseline = create_folder_snapshot(request)
+    session = folder_workbooks_module._session(catalog.sessionId)
+    old_targets, old_sources = dict(session.selected_targets), dict(session.selected_sources)
+    fingerprint = folder_workbooks_module._selected_files_fingerprint
+    checks = 0
+
+    def fingerprint_then_change(paths):
+        nonlocal checks
+        checks += 1
+        result = fingerprint(paths)
+        if checks == 1:
+            changed = load_workbook(source)
+            changed["得分"]["B2"] = 99
+            changed.save(source)
+            changed.close()
+        return result
+
+    monkeypatch.setattr(folder_workbooks_module, "_selected_files_fingerprint", fingerprint_then_change)
+    with pytest.raises(ValueError, match="读取.*发生变化"):
+        create_folder_snapshot(FolderSnapshotRequest(
+            sessionId=catalog.sessionId,
+            selections=[FolderSelection(fileId=catalog.files[0].id, sheets=["说明"])],
+        ))
+    assert session.selected_targets == old_targets
+    assert session.selected_sources == old_sources
+    assert session.source_fingerprint == baseline.sourceFingerprint
 
 
 def test_folder_execution_rejects_files_changed_after_preview(

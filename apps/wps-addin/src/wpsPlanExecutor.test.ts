@@ -8,6 +8,7 @@ import type { AnalysisPlan, CellValue } from "../../excel-addin/src/contracts";
 import type { WpsApplication, WpsRange, WpsWorksheet } from "./wpsHost";
 import type { WpsReadAuthorization } from "./wpsWorkbookReader";
 import {
+  WPS_SUPPORTED_ACTION_KEYS,
   executeWpsPlan,
   latestWpsUndo,
   matrixFingerprintV2,
@@ -326,6 +327,45 @@ describe("WPS guarded plan executor", () => {
       { type: "deleteWorksheet", sheet: "明细" }
     ]))).toThrow("当前不执行");
     expect(target.values()).toEqual([["原值"]]);
+  });
+
+  /**
+   * 常用格式操作在 WPS 端的接通状态（Task #53）：
+   * - setFont / setAlignment / resizeRange **已接通**（但只开放已实机验证的属性子集，
+   *   未验证属性在预检里明确拒绝，见 `wpsFormatCapability.test.ts`）。
+   * - setFill / setNumberFormat / setBorders / autofit 仍未接通，必须保持 fail-closed：
+   *   在动工作簿**之前**整份计划被拒，且不留下任何恢复点。
+   *
+   * 这条用例的作用是让"顺手把配置放开了"这件事立刻变红 —— 而不是等到实机上
+   * 出现"计划显示成功、表格格式没变"。
+   */
+  it("refuses still-unwired 常用格式操作 before touching the workbook (setFill/setNumberFormat/setBorders/autofit)", () => {
+    const target = host([["表头", 1200]]);
+    const unwiredActions: AnalysisPlan["actions"] = [
+      { type: "setFill", sheet: "明细", range: "A1:B1", color: "#DDEEFF" },
+      { type: "setNumberFormat", sheet: "明细", range: "B2", formatCode: "#,##0.00" },
+      { type: "setBorders", sheet: "明细", range: "A1:B1", sides: ["top", "bottom"] },
+      { type: "autofit", sheet: "明细", range: "A1:B1" }
+    ];
+    for (const action of unwiredActions) {
+      expect(() => prepareWpsPlan(target.application, [1], plan([action]))).toThrow("当前不执行");
+    }
+    expect(target.values()).toEqual([["表头", 1200]]);
+    // 没有任何写入 ⇒ 不允许留下恢复点；否则撤销列表里会出现一份"什么也没改"的记录。
+    expect(target.storedRecords()).toEqual([]);
+  });
+
+  /**
+   * 配置与执行的漂移检测。
+   *
+   * `capabilities.wpsWrite.allowedActions` 是配置，`WPS_SUPPORTED_ACTION_KEYS`
+   * 是执行器真实实现的集合。两边任意一侧单独改动都会让这条用例变红 ——
+   * 这正是"配置与模型能力目录只声明实际已接通的能力"的机器判据。
+   */
+  it("keeps the write allowlist and the implemented action set in lockstep", async () => {
+    const capabilities = (await import("../../../config/capabilities.json")).default;
+    const allowed = capabilities.wpsWrite.allowedActions as readonly string[];
+    expect([...allowed].sort()).toEqual([...WPS_SUPPORTED_ACTION_KEYS].sort());
   });
 
   it("refuses undo when the verified result was modified again", async () => {

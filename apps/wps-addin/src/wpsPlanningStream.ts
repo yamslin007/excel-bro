@@ -23,10 +23,16 @@
  */
 import type { AssistantResponse, AssistantResponseOrPause } from "./wpsPlanningTypes";
 import {
+  type PlanningRecoveryDescriptor,
   type TaskProgressEvent,
   parseTaskProgressEvent
 } from "../../excel-addin/src/contracts";
-import { API_BASE_URL, ApiRequestError } from "../../excel-addin/src/api";
+import {
+  API_BASE_URL,
+  ApiRequestError,
+  StreamingToolDeliveryUnavailableError
+} from "../../excel-addin/src/api";
+import { requiresStreamingToolDelivery } from "../../excel-addin/src/modelSelection";
 import {
   MODEL_ERROR_CODE_PREFIX,
   applyPlanningEvent,
@@ -34,6 +40,7 @@ import {
   planningResumeDecision,
   reconcilePlanningCursor,
   type PlanningCursor,
+  type PlanningPauseType,
   type PlanningResumeDecision,
   type PlanningStatusView,
   type PlanningTaskStatus
@@ -200,10 +207,17 @@ export interface WpsPlanningTaskStatus {
   status: PlanningTaskStatus;
   revision: number;
   lastSequence: number;
+  /**
+   * **没有值被省略**时的完整响应。
+   * 一旦服务端只给了 `recovery`（值被省略过），这里就是 `undefined` ——
+   * 绝不能拿一个"矩阵全空"的记录冒充完整响应。
+   */
   result?: AssistantResponse;
+  /** 值被省略过时的版本化恢复描述（与 `result` 互斥）。 */
+  recovery?: PlanningRecoveryDescriptor | null;
   error?: { status?: number; code?: string; message?: string; retryable?: boolean } | null;
   canContinue?: boolean;
-  pauseType?: "budget" | "model_error" | "interrupted" | null;
+  pauseType?: PlanningPauseType | null;
   reason?: string | null;
 }
 
@@ -258,6 +272,7 @@ export function normalizeWpsPlanningStatus(
     revision,
     lastSequence,
     result: raw.result as AssistantResponse | undefined,
+    recovery: (raw.recovery ?? null) as WpsPlanningTaskStatus["recovery"],
     error: (raw.error ?? null) as WpsPlanningTaskStatus["error"],
     canContinue: typeof raw.canContinue === "boolean" ? raw.canContinue : undefined,
     pauseType,
@@ -271,7 +286,10 @@ export function normalizeWpsPlanningStatus(
  * `hasCheckpoint` 的判据是**现场证据**，不是"服务端允许继续"：
  *
  *  - `pauseType`：服务端给出了暂停成因，说明它确实存了暂停现场；
- *  - `completed` + `result`：任务已跑完并把结果带回来了。
+ *  - `completed` + 记录：任务已跑完并把记录带回来了。这条记录**可能是**完整响应
+ *    （`result`），也可能只是**版本化恢复描述**（`recovery`，值被省略过）。
+ *    两者都算"服务端确实有一份记录"，但调用方必须自己分辨：只有 `result` 才能
+ *    当完整响应回放，`recovery` 只说明结构在、值没留下。
  *
  * **刻意不把 `canContinue === true` 算作现场证据。** 这次是"能不能继续"的
  * 许可，不是"现场在不在"的事实；两者由服务端分开发两个字段，正是为了让
@@ -284,7 +302,8 @@ export function normalizeWpsPlanningStatus(
 export function planningStatusView(status: WpsPlanningTaskStatus): PlanningStatusView {
   const hasCheckpoint =
     status.pauseType != null ||
-    (status.status === "completed" && status.result != null);
+    (status.status === "completed" &&
+      (status.result != null || status.recovery != null));
   return {
     status: status.status,
     canContinue: status.canContinue,
@@ -335,6 +354,10 @@ export async function continueWpsPlanning(
     signal: hooks.signal
   });
   if (!response.ok || !response.body) {
+    // 续跑只有流式通道；SDK 适配器拿不到流式就等于拿不到工具请求 —— 明确拒绝。
+    if (response.status === 404 || response.status === 405 || response.ok) {
+      refuseIfStreamingToolDeliveryUnavailable(body.modelId);
+    }
     throw await wpsPlanningRequestError(response, "继续规划任务失败");
   }
   return consumeWpsPlanningStream(response, body.turnId, {
@@ -369,6 +392,16 @@ export async function streamWpsPlanning(
     signal: hooks.signal
   });
   if (!response.ok || !response.body) {
+    /*
+     * 流式通道不可用 ≠ 可以退回非流式。
+     *
+     * SDK 适配器（`planningReadPolicy: "none"`）取数的唯一通道，就是服务端经这条
+     * SSE 投递 `bridgeTool` 指针；退回非流式后服务端仍会启动这一轮并等本机回执，
+     * 于是干等到超时 —— "无人回执的等待"。这里明确拒绝，把原因说清楚。
+     */
+    if (response.status === 404 || response.status === 405 || response.ok) {
+      refuseIfStreamingToolDeliveryUnavailable(request.modelId);
+    }
     throw await wpsPlanningRequestError(response, "本地 AI 服务流式请求失败");
   }
   return consumeWpsPlanningStream(response, turnId, {
@@ -400,6 +433,18 @@ export function isModelErrorPause(status: WpsPlanningTaskStatus): boolean {
     (typeof status.error?.code === "string" &&
       status.error.code.startsWith(MODEL_ERROR_CODE_PREFIX))
   );
+}
+
+/**
+ * 流式通道不可用时的**闸**：本轮请求需不需要"流式工具投递"。
+ *
+ * 需要（SDK 适配器）→ 抛与 Excel 端**同一个**错误类型和同一句话，绝不静默退化；
+ * 不需要 → 原样返回，让调用方按原来的方式报错（旧后端/普通模型不受影响）。
+ */
+function refuseIfStreamingToolDeliveryUnavailable(modelId: unknown): void {
+  if (typeof modelId === "string" && requiresStreamingToolDelivery(modelId)) {
+    throw new StreamingToolDeliveryUnavailableError();
+  }
 }
 
 /** 请求错误：与 Excel 端 `requestError` 同口径，保留服务端 code 供 UI 归因。 */

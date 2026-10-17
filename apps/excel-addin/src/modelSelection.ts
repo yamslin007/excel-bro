@@ -35,12 +35,45 @@ export const LEGACY_LOCAL_MODEL_ID = "local";
 /** 没有任何可用模型时使用的显式空选择状态。 */
 export const NO_MODEL_SELECTED = "";
 
+/**
+ * 这条连接是不是 **Claude Agent SDK** 适配器。
+ *
+ * SDK 适配器只拿得到表结构（`planningReadPolicy: "none"`），需要数据时必须由
+ * 模型经本机工具桥调 `query_table` 去读真实宿主。因此它的判据是**两件事**的
+ * 唯一来源，不能各写一份：
+ *
+ * - 规划读策略是否收窄到 `"none"`；
+ * - 本地意图路径是否要**放弃预置计算**（预置的 `dataResults` 会被服务端的
+ *   "不上传数据行"守卫拒绝，新工具桥就永远拿不到执行权）。
+ */
+export function isSdkPlanningModel(modelId: string | null | undefined): boolean {
+  const value = (modelId ?? "").trim().toLocaleLowerCase();
+  return value === "claude-agent-sdk" || value.startsWith("claude-agent-sdk:");
+}
+
 /** The SDK adapter currently supports header-only planning, including free-text continuation. */
 export function planningReadPolicyForModel(
   modelId: string | null | undefined, requested: "ifNeeded" | "none"
 ): "ifNeeded" | "none" {
-  return modelId === "claude-agent-sdk" || modelId?.startsWith("claude-agent-sdk:")
-    ? "none" : requested;
+  return isSdkPlanningModel(modelId) ? "none" : requested;
+}
+
+/**
+ * 这轮规划是否**必须**有"流式工具投递"能力。
+ *
+ * SDK 适配器拿不到数据行（`planningReadPolicy: "none"`），模型要取数只能经本机
+ * 工具桥下发 `query_table`；而工具请求**只能**经 SSE 进度流投递到面板。一旦传输
+ * 降级成非流式（旧后端没有 `/api/turn/stream`、或代理缓冲 SSE），服务端会为一次
+ * 永远送不到本机的工具请求干等到 `agentToolBridge.waitTimeoutSeconds` 超时 ——
+ * 那正是"进入无人回执的等待"。
+ *
+ * 所以这类请求在**退回非流式之前**就要被明确拒绝，而不是静默降级。
+ * 判据与 `isSdkPlanningModel` 同源：适配器一旦能走别的取数通道，这里跟着一起改。
+ */
+export function requiresStreamingToolDelivery(
+  modelId: string | null | undefined
+): boolean {
+  return isSdkPlanningModel(modelId);
 }
 
 export function isRealModelId(modelId: string | null | undefined): boolean {

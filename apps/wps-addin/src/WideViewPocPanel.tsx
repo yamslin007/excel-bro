@@ -8,6 +8,7 @@
  * 窗格内浮层 —— 那会把"没有这个能力"粉饰成"能打开"。
  */
 
+import { brandLogoUrl } from "../../excel-addin/src/brandLogo";
 import { useState } from "react";
 import { getWpsApplication } from "./wpsHost";
 import {
@@ -52,7 +53,7 @@ export default function WideViewPocPanel() {
   return (
     <main className="poc-panel-shell">
       <header>
-        <span className="probe-logo">EB</span>
+        <img className="probe-logo" src={brandLogoUrl} alt="" />
         <div>
           <strong>宽幅审阅 · 能力探针</strong>
           <p>只读探测，不读取任何工作表内容</p>

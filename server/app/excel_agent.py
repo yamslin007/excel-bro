@@ -12,6 +12,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from .task_context import TASK_CONTEXT_PROMPT, task_context_payload
 from .agent_loop_protection import (
     LoopConfig,
     LoopState,
@@ -32,6 +33,9 @@ from .action_capability import (
     resolve_host_action_bound,
 )
 from .capabilities import capabilities, capability_float, capability_int, capability_optional_int
+from .agent_tools import (
+    LOCAL_NON_TERMINAL_PROJECTIONS as _LOCAL_NON_TERMINAL_PROJECTIONS,
+)
 from .column_mapping import (
     BlankPolicyNeededError,
     DEFAULT_MAX_MAPPING_ACTIONS,
@@ -41,6 +45,22 @@ from .column_mapping import (
     validate_column_mapping_shape,
 )
 from .llm import ModelConnection, OpenAICompatibleClient
+from .assistant_identity import PRODUCT_IDENTITY_PROMPT, with_runtime_model_identity
+from .agent_tools import (
+    PREPARE_PYTHON_DATA_TOOL,
+    SUBMIT_LOCAL_RESULT_TOOL,
+    SUBMIT_RESULT_PLAN_TOOL,
+    local_terminal_tool_definitions,
+    prepare_python_data_tool_definition,
+)
+from .result_submission import (
+    ResultSubmissionError,
+    build_local_result_answer,
+    build_result_plan_response,
+    evaluate_local_result_submission,
+    normalize_planning_goal,
+    resolve_result_ref,
+)
 from .python_analysis import (
     PYTHON_ANALYSIS_OLD_RECEIPT_RECONSTRUCTED_CONTENT,
     PYTHON_ANALYSIS_UNATTRIBUTABLE_RESUME_MESSAGE,
@@ -108,8 +128,9 @@ def _default_loop_config() -> LoopConfig:
         warning_turn=capability_int("agent", "warningTurn"),
     )
 
-AGENT_SYSTEM_PROMPT = """
-你是 Excel Bro 的规划 Agent。你的工作是理解目标、按需查看工作簿，再提交一个
+AGENT_SYSTEM_PROMPT = PRODUCT_IDENTITY_PROMPT + """
+
+本轮内部任务：理解目标、按需查看工作簿，再提交一个
 可预览、可验证的 Excel 操作计划；你不能直接声称已经修改工作簿。
 
 工作原则：
@@ -201,6 +222,22 @@ map_column_values 的匹配顺序是**先整格、后拆分**：
   （submit_answer），不必再调 read_range 重复读取，也不要自行改变计算口径。
   但要**写回工作表**时，不要把这些 rows 当静态值塞进 writeValues —— 改用
   computeValues 复述同一套查询条件，让 Excel 在执行时重算。
+
+- 当**本机查询或隔离分析的受控回执**给出了结果引用（res_…）时，用引用而不是
+  数值继续：“只把结果展示给用户”调用 submit_local_result；“把结果写到某个已
+  明确的目标区域”调用 submit_result_plan。后者由本机按结果尺寸与授权范围校验
+  并编译成白名单写入计划，**进入预览**——提交不等于执行，用户确认前不会写入
+  任何单元格。两个工具都只接受**本轮回执真实给出过**的引用；引用无效或已过期
+  会返回固定错误码，此时应重新查询，不要凭记忆拼一个引用，也不要改用
+  submit_plan 自己抄写结果值。
+
+  调用 submit_local_result 时**必须**在 planningGoal 里声明你读出的本轮目标：
+  用户只要看结果就填 read_only；用户要求把结果生成写入预览就填 write_preview。
+  填 write_preview 会被拒绝——展示结果卡只是中间成果，你要在同一轮里改用
+  submit_result_plan 提交**同一结果引用**与明确目标区域。目标区域或范围不明确
+  时先 submit_clarification；确实做不到（工具不支持、编译失败、预算耗尽）时
+  如实说明“分析完成，写入预览未完成”，不要把它说成完整成功。只读任务照常
+  直接返回结果，不会被迫生成写入计划。
 
 缺少用户决定时必须调用 submit_clarification，不要把问题写进 submit_answer。
 fields 为每项必须补充的信息提供一个独立输入框（id、label、placeholder）；
@@ -1343,10 +1380,10 @@ def _planning_tools(request: PlanRequest, template: list[dict[str, Any]], select
     for tool in template:
         if tool["function"]["name"] != "submit_plan":
             result.append(tool)
-        elif selected or template is PLAN_ONLY_TOOLS:
+        elif available and (selected or template is PLAN_ONLY_TOOLS):
             projected = copy.deepcopy(tool)
             projected["function"]["parameters"]["properties"]["plan"]["properties"]["actions"]["items"] = {
-                "anyOf": [variants[name] for name in selected] if selected else list(variants.values())
+                "anyOf": [variants[name] for name in (selected or available) if name in available]
             }
             result.append(projected)
     if template is not PLAN_ONLY_TOOLS and available:
@@ -1458,9 +1495,10 @@ def _execute_tool(
     if name == "select_plan_actions":
         return {"selectedActionTypes": _select_plan_actions(request, arguments), "next": "submit_plan"}
     if name == "run_python_analysis":
-        # 隔离 Python 分析（设计授权，运行时未实现）：失败关闭，
-        # 没有已验证执行器时只返回固定的不可用回执，不做任何执行。
-        return execute_python_analysis(request, arguments)
+        # 隔离 Python 分析：优先走可信协调器（开关+运行器+数据登记都就绪时
+        # 真的执行）；未接通时失败关闭，只返回固定不可用回执，不做任何执行。
+        from .python_coordinator import execute_python_analysis as _coord_execute
+        return _coord_execute(request, arguments)
     if request.planningReadPolicy == "none" and name in READONLY_TOOLS:
         raise ValueError("本轮源值仅在客户端读取，不允许调用规划只读工具")
     if name == "get_workbook_context":
@@ -1484,6 +1522,7 @@ def _execute_tool(
         _enforce_action_capabilities(request, plan)
         return PlanResponse(provider="model", plan=plan)
     if name == "submit_answer":
+        evaluate_local_result_submission("read_only", bound_goal=request.planningGoal)
         return AnswerResponse(
             provider="model",
             message=str(arguments.get("message", "")),
@@ -1494,7 +1533,140 @@ def _execute_tool(
             provider="model", turnId=request.turnId,
             clarification=IntentClarification.model_validate(arguments.get("clarification")),
         )
+    # 本地结果终局工具：按引用取回**本任务**已登记的结果，语义与 SDK 后端同源
+    # （``result_submission``）。归属 / TTL / 授权版本都在注册表里判；拒绝时抛
+    # ``ValueError``，由主循环转成模型可见的修正提示，不落到"未知工具"。
+    if name == SUBMIT_LOCAL_RESULT_TOOL:
+        item = resolve_result_ref(request.turnId or "", arguments.get("resultRef"))
+        # 完成判据（共享层）：模型声明本轮目标是"生成写入预览"时，只交结果卡
+        # 不算完成 —— 抛出未完成信号，由主循环转成模型可见的修正提示，让它在
+        # 剩余预算内改用 submit_result_plan。只读目标不受影响。
+        evaluate_local_result_submission(
+            normalize_planning_goal(arguments.get("planningGoal")),
+            bound_goal=request.planningGoal,
+        )
+        return build_local_result_answer(item, message=arguments.get("message") or "")
+    if name == SUBMIT_RESULT_PLAN_TOOL:
+        item = resolve_result_ref(request.turnId or "", arguments.get("resultRef"))
+        return build_result_plan_response(
+            item,
+            request,
+            target=arguments.get("target"),
+            include_header=bool(arguments.get("includeHeader", True)),
+        )
     raise ValueError(f"未知工具：{name}")
+
+
+async def _execute_tool_async(
+    request: PlanRequest,
+    name: str,
+    arguments: dict[str, Any],
+    *,
+    bridge_session=None,
+    on_event=None,
+) -> AssistantResponse | dict[str, Any]:
+    """工具执行的**唯一**事件循环友好入口。
+
+    普通后端的主循环是 ``async def``，绝大多数工具是本地确定性计算（微秒级），
+    同步调用没问题；但 ``run_python_analysis`` 是一次同步容器运行（最长
+    ``maxWallTimeSeconds``），同步调用会把整个事件循环 —— 本轮流式事件、其它
+    轮次、工具桥 ``/poll``、取消 —— 全冻住。所以只有它走 offload 版本。
+
+    ``prepare_python_data`` 必须走易失桥：宿主（Office.js / WPS）读授权表 →
+    回执 → 服务端登记。没有会话就失败关闭，绝不在服务端凭模型自报的区域"假装
+    读过表"。
+    """
+    if name == "run_python_analysis":
+        from .python_coordinator import execute_python_analysis_async
+
+        return await execute_python_analysis_async(request, arguments, on_event=on_event)
+    if name == PREPARE_PYTHON_DATA_TOOL:
+        if bridge_session is None:
+            # 没有可信读表通道 → 不能登记任何数据（失败关闭，不伪造来源）。
+            return {"status": "error", "errorCode": "bridge_unavailable"}
+        sources = arguments.get("sources")
+        if not isinstance(sources, list) or not sources:
+            return {"status": "error", "errorCode": "invalid_arguments"}
+        return await bridge_session.request(name, {"sources": sources})
+    return _execute_tool(request, name, arguments)
+
+
+def python_tool_definitions() -> list[dict[str, Any]]:
+    """隔离 Python 工具集：数据登记 + 分析，**两条必须一起给**。
+
+    只给 ``run_python_analysis`` 而不给登记通道，模型拿不到任何 ``dataset://``
+    句柄，那条工具永远只能失败关闭 —— 等于告诉模型"有这个能力"却不可能用成。
+    总开关未开则返回空列表（不注册、不派发）。
+    """
+    if not python_execution_enabled():
+        return []
+    return [prepare_python_data_tool_definition(), python_analysis_tool_definition()]
+
+
+def planning_tool_definitions(base: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """普通后端一轮规划下发给模型的工具目录（在规范列表上追加）。
+
+    ``base`` 是规范列表本身（``AGENT_TOOLS`` / ``AGENT_TOOLS_WITH_DATA`` /
+    ``PLAN_ONLY_TOOLS``）；``plan_only`` 模式的定义是"只允许提交计划"，不追加
+    任何工具，也不破坏调用方对规范列表做的身份判断（``current_tool_mode``）。
+
+    追加项：
+
+    * 本地结果终局工具（``submit_local_result`` / ``submit_result_plan``）——
+      与 SDK 后端**同一份定义**。没有它们，普通后端拿到 ``res_...`` 引用后无路
+      可走（只能提交一个自己抄写的 writeValues），"结果 → 白名单计划 → 预览"
+      这条在线链路就是断的。
+    * 隔离 Python 工具（``prepare_python_data`` / ``run_python_analysis``）——
+      总开关开启时才有；无执行器时工具仍失败关闭。
+    """
+    if base is PLAN_ONLY_TOOLS:
+        return base
+    extra = list(local_terminal_tool_definitions())
+    if python_execution_enabled():
+        extra.extend(python_tool_definitions())
+    return [*base, *extra]
+
+
+def open_planning_bridge(
+    request: PlanRequest,
+    on_event: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+) -> tuple[str | None, Any]:
+    """为**普通后端**一轮规划开启任务工具桥会话（隔离 Python 的数据登记通道）。
+
+    返回 ``(task_id, session)``；不开通道时返回 ``(None, None)``（总开关未开或
+    请求没有 turnId —— 此时 ``prepare_python_data`` 只能失败关闭）。
+
+    会话必须由调用方在轮次结束时 ``task_tool_bridge.close(task_id)``：数据登记
+    只活到本轮结束（结果本身另有生命周期，不受影响）。
+    """
+    if not python_execution_enabled():
+        return None, None
+    task_id = request.turnId or ""
+    if not task_id:
+        return None, None
+    from .task_bridge import BridgeBinding, task_tool_bridge
+
+    async def on_bridge_request(
+        operation_id: str, tool: str, arguments: dict[str, Any], fingerprint: str
+    ) -> None:
+        # 只发一个不透明指针事件；请求参数留在易失桥里由宿主拉取，不写进
+        # 会落盘的进度事件/账本。
+        if on_event is None:
+            return
+        await on_event({
+            "phase": "planning",
+            "stepId": f"bridge.{tool}",
+            "status": "started",
+            "title": "正在本机执行数据查询",
+            "toolName": tool,
+            "bridgeTool": {"operationId": operation_id, "tool": tool},
+        })
+
+    session = task_tool_bridge.open(
+        BridgeBinding.from_request(request, task_id=task_id),
+        on_request=on_bridge_request,
+    )
+    return task_id, session
 
 
 def _project_non_terminal_result(name: str, result: dict[str, Any]) -> dict[str, Any]:
@@ -1798,6 +1970,9 @@ NON_TERMINAL_TOOL_PROJECTIONS: dict[str, Callable[[dict[str, Any]], dict[str, An
     "find_fields": _passthrough_structure,
     "read_range": _project_read_range,
     "run_python_analysis": project_python_analysis_receipt,
+    # 本地查询工具（表结构 / query_table）的出站投影与普通后端同源，
+    # 定义在 agent_tools，两条后端共用同一份白名单投影。
+    **_LOCAL_NON_TERMINAL_PROJECTIONS,
 }
 
 
@@ -2108,10 +2283,26 @@ async def run_excel_agent(
     on_event: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     on_checkpoint: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     resume_checkpoint: dict[str, Any] | None = None,
+    reminder_seconds: float | None = None,
     approved_wall_time_seconds: float | None = None,
     config: LoopConfig | None = None,
+    bridge_session=None,
 ) -> AssistantResponse:
-    """运行受预算和循环检测保护的 Excel 规划 Agent。"""
+    """运行受预算和循环检测保护的 Excel 规划 Agent。
+
+    ``bridge_session`` 是易失任务工具桥会话（由 :func:`open_planning_bridge`
+    开启），``prepare_python_data`` 靠它让宿主读表并回执；缺省为 ``None``，
+    此时数据登记一律失败关闭。
+
+    ``reminder_seconds`` 是**非阻塞**的耗时提醒阈值：超过它只发一条限频进度
+    事件，循环继续。真正的停止阈值是 ``config.max_wall_time_seconds``（总预算）。
+
+    ``approved_wall_time_seconds`` 是旧参数名的兼容别名（2026-10-10 改造前它
+    是"到期即暂停"的硬预算，现在语义等同 ``reminder_seconds``）；两者同时给出
+    时以 ``reminder_seconds`` 为准。
+    """
+    if reminder_seconds is None:
+        reminder_seconds = approved_wall_time_seconds
     cache = tool_cache
     loop_config = config or _default_loop_config()
     if resume_checkpoint is not None:
@@ -2128,6 +2319,8 @@ async def run_excel_agent(
         state = LoopState()
     elapsed_before_run = state.elapsed_time
     start_time = time.monotonic()
+    # 提醒限频用：上一次发提醒时的累计活跃耗时（跨恢复沿用，避免恢复后立刻重发）。
+    last_reminder_at = elapsed_before_run
 
     async def emit(
         step_id: str,
@@ -2164,6 +2357,8 @@ async def run_excel_agent(
         await on_event(event)
     user_text = (
         f"用户需求：\n{request.prompt}\n\n"
+        f"本轮已确定的规划目标（不可在终局工具里降级）：{request.planningGoal or '尚未提供'}\n"
+        f"本件任务已确认信息：\n{json.dumps(task_context_payload(request), ensure_ascii=False)}\n{TASK_CONTEXT_PROMPT}\n"
         f"初始工作簿上下文：\n"
         f"{json.dumps(_workbook_context(request), ensure_ascii=False)}\n\n"
         f"上一轮结构化结果：\n"
@@ -2229,7 +2424,7 @@ async def run_excel_agent(
     else:
         pending_assistant_message = None
         messages = [
-            {"role": "system", "content": AGENT_SYSTEM_PROMPT},
+            {"role": "system", "content": with_runtime_model_identity(AGENT_SYSTEM_PROMPT, connection)},
             {
                 "role": "user",
                 "content": user_content,
@@ -2258,13 +2453,10 @@ async def run_excel_agent(
         raise ValueError("规划检查点包含未知工具集合")
 
     def model_tools() -> list[dict[str, Any]]:
-        # 隔离 Python 分析：总开关默认关闭；开启后在传给模型的列表上追加。
-        # 无执行器时工具本身仍失败关闭（只返回固定不可用回执）。绝不替换
-        # tools 本身——current_tool_mode、修复降级与只读批次降级都依赖
+        # 本地结果终局工具与隔离 Python 工具都只在规范列表上**追加**，绝不替换
+        # ``tools`` 本身 —— current_tool_mode、修复降级与只读批次降级都依赖
         # 规范列表的身份判断；plan_only 模式不追加（该模式只允许提交计划）。
-        if python_execution_enabled() and tools is not PLAN_ONLY_TOOLS:
-            return [*tools, python_analysis_tool_definition()]
-        return tools
+        return planning_tool_definitions(tools)
 
     repairing_submission = bool(
         resume_checkpoint.get("repairingSubmission")
@@ -2332,18 +2524,37 @@ async def run_excel_agent(
             await on_checkpoint(checkpoint)
         return checkpoint
 
-    async def pause_if_needed(
+    async def note_progress(
         stage: str,
         *,
         upcoming_turn: int,
         pending_message: dict[str, Any] | None = None,
         upcoming_tool: int = 0,
         tool_batch_state: dict[str, bool] | None = None,
+        enforce_total_wall_time: bool = False,
     ) -> None:
-        # Every resumable boundary is committed, not only the boundary that
-        # happens to cross the soft time budget.  A process can exit before the
-        # reminder is due, and recovery still needs the latest complete model
-        # response or tool batch instead of falling back to a fresh run.
+        """提交一个可恢复边界，并在超过提醒阈值时发**非阻塞**进度事件。
+
+        这是原来 ``pause_if_needed`` 的正职：每个可恢复边界都要落检查点
+        （进程可能在提醒到期前就退出，恢复需要最近一次完整的模型响应或工具批），
+        但**不因耗时停止执行** —— 超过 ``planningReminderSeconds`` 只说明这一轮
+        跑得比预期久，发一条限频的进度提示让用户知道还在推进，循环继续往下走。
+
+        真正到总时限的收口由本函数的 ``enforce_total_wall_time``（仅
+        ``before_model`` 传 True，判定 ``LoopConfig.max_wall_time_seconds``）在
+        **启动下一次模型调用之前**完成：达到后不再启动新的模型或工具调用，并如实
+        告知用户。
+
+        **同一个边界只落一次检查点**：总时限收口曾经单独调 ``save_boundary``，
+        与这里重复落盘，污染了检查点序列（``before_model`` 出现两次）。现在两者
+        共用**这一次**保存结果。
+
+        2026-10-10 改造：此前该函数直接把 ``planningReminderSeconds``（60 秒）当成
+        硬预算，一到期就抛 ``AgentBudgetPause`` 并弹出"继续任务"，真实多步任务被
+        反复打断。提醒与预算暂停现已分离 —— **删除的只是"到期即停"这一件事**，
+        检查点保存、错误恢复与中断恢复的语义原样保留。
+        """
+        nonlocal last_reminder_at
         checkpoint = await save_boundary(
             stage,
             upcoming_turn=upcoming_turn,
@@ -2351,18 +2562,37 @@ async def run_excel_agent(
             upcoming_tool=upcoming_tool,
             tool_batch_state=tool_batch_state,
         )
-        if approved_wall_time_seconds is None:
-            return
         update_elapsed()
-        if state.elapsed_time < approved_wall_time_seconds:
+        if enforce_total_wall_time and state.elapsed_time >= loop_config.max_wall_time_seconds:
+            # 总时限收口：与提醒共用同一次检查点保存，避免重复落盘。
+            await emit(
+                "planning.budget_exhausted",
+                "已达到本轮有效运行总时长上限",
+                status="warning",
+                summary=(
+                    "本轮有效运行总时长已用完，不再启动新的模型或工具调用。"
+                    "已完成的步骤与现场已保存，可在此继续或重新发起任务。"
+                ),
+            )
+            raise AgentBudgetPause(checkpoint, loop_config.max_wall_time_seconds)
+        if reminder_seconds is None or reminder_seconds <= 0:
             return
+        if state.elapsed_time < reminder_seconds:
+            return
+        # 限频：同一条提醒每个提醒周期最多发一次，避免每轮都刷屏。
+        # 不重置任何已完成步骤，也不伪造进度百分比。
+        if state.elapsed_time < last_reminder_at + reminder_seconds:
+            return
+        last_reminder_at = state.elapsed_time
         await emit(
-            "planning.budget_pause",
-            "已安全保存当前进度",
-            status="warning",
-            summary="本轮处理时间已用完；继续前不会启动新的模型或工具调用。",
+            f"planning.reminder.{int(state.elapsed_time // reminder_seconds)}",
+            "任务仍在推进",
+            status="progress",
+            summary=(
+                "本轮已花费较长时间，仍在继续执行；无需操作。"
+                "若需要停止，请使用面板上的取消按钮。"
+            ),
         )
-        raise AgentBudgetPause(checkpoint, approved_wall_time_seconds)
 
     async with OpenAICompatibleClient(connection, timeout=timeout) as client:
         for turn_index in range(next_turn_index, loop_config.max_turns):
@@ -2429,8 +2659,14 @@ async def run_excel_agent(
                     summary="已复用暂停前完整返回的模型响应。",
                 )
             else:
-                await pause_if_needed(
-                    "before_model", upcoming_turn=turn_index
+                # 总时限收口：只有到达累计活跃执行总时长上限时才停止启动新的
+                # 模型调用；未到上限时只落检查点 + 发限频的非阻塞提醒，循环继续。
+                # 同一个边界只落一次检查点 —— enforce_total_wall_time 复用这次
+                # save_boundary 的结果，避免 before_model 序列出现重复落盘。
+                await note_progress(
+                    "before_model",
+                    upcoming_turn=turn_index,
+                    enforce_total_wall_time=True,
                 )
                 await emit(
                     model_step_id,
@@ -2469,7 +2705,7 @@ async def run_excel_agent(
             # 消息历史、检查点、恢复现场从此只见占位，不见代码字面量。
             raw_python_arguments = _capture_raw_python_arguments(message)
             _withhold_python_code_in_assistant_message(assistant_message)
-            await pause_if_needed(
+            await note_progress(
                 "model_response_saved",
                 upcoming_turn=turn_index,
                 pending_message=assistant_message,
@@ -2493,6 +2729,8 @@ async def run_excel_agent(
                     if assistant_message.get("_incomplete"):
                         raise ValueError("模型输出达到长度限制" if assistant_message["_incomplete"] == "length" else "模型输出被上游拦截")
                     parsed = _parse_content(content)
+                    if isinstance(parsed, AnswerResponse):
+                        evaluate_local_result_submission("read_only", bound_goal=request.planningGoal)
                     if isinstance(parsed, PlanResponse):
                         _enforce_action_capabilities(request, parsed.plan)
                         action_types = "、".join(
@@ -2687,7 +2925,10 @@ async def run_excel_agent(
                                 tool_content, conflict_warning
                             )
                     else:
-                        result = _execute_tool(request, name, arguments)
+                        result = await _execute_tool_async(
+                            request, name, arguments, bridge_session=bridge_session,
+                            on_event=on_event,
+                        )
                         if name == "select_plan_actions" and isinstance(result, dict):
                             selected_action_types = list(result["selectedActionTypes"])
                         if isinstance(
@@ -2889,7 +3130,7 @@ async def run_excel_agent(
                         "content": tool_content,
                     }
                 )
-                await pause_if_needed(
+                await note_progress(
                     "tool_completed",
                     upcoming_turn=turn_index,
                     pending_message=assistant_message,
@@ -2910,7 +3151,7 @@ async def run_excel_agent(
                     "工作簿只读探索已完成。下一轮必须基于现有工作簿上下文和"
                     "工具结果直接调用 submit_plan、submit_clarification 或 submit_answer；不要继续读取数据。",
                 )
-            await pause_if_needed(
+            await note_progress(
                 "tool_batch_completed", upcoming_turn=turn_index + 1
             )
             next_tool_index = 0

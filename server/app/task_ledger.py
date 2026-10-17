@@ -1362,12 +1362,21 @@ class FolderOperationLedger:
             encoded_switches = self._encode({"items": switch_items})
             added = 0.0
             if row["status"] == "waiting_user" and extension_seconds > 0:
-                if extension_count >= max(maximum_extensions, 0):
+                # 2026-10-10 改造：一次"继续"即**结清到总活跃执行时限**，而不是
+                # 每次只加 ``extension_seconds``（60 秒）。旧语义下初批预算就等于
+                # 提醒阈值（60 秒），若仍按 60 秒递增，用户要点几十次才能跑到真实
+                # 任务需要的时长 —— 那正是"被短时预算反复打断"的另一面。
+                # 现在一次点击进入新策略：批准预算抬到 hard_wall_time，仍受
+                # hard_wall_time 硬封顶，且累计耗时继续累加、不复位。
+                already_settled = approved >= hard_wall_time_seconds
+                if already_settled and extension_count >= max(maximum_extensions, 0):
+                    # 只有**已经**结清到总时限的任务才继续受次数上限约束。
+                    # 旧短时预算暂停的任务（approved 仍是 60 秒）不受此限，
+                    # 否则它会被历史次数卡住，永远进不了新策略。
                     connection.rollback()
                     raise RuntimeError("规划任务已达到允许的继续次数上限")
-                remaining_hard = hard_wall_time_seconds - approved
-                added = min(extension_seconds, max(remaining_hard, 0.0))
-                if added <= 0 or active_elapsed >= hard_wall_time_seconds:
+                added = max(hard_wall_time_seconds - approved, 0.0)
+                if active_elapsed >= hard_wall_time_seconds:
                     connection.rollback()
                     raise RuntimeError("规划任务已达到有效运行总时长上限")
             elif active_elapsed >= hard_wall_time_seconds:

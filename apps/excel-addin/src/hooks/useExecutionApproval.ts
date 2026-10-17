@@ -35,6 +35,18 @@ export function useExecutionApproval() {
     });
   }, []);
 
+  // 计划被编辑后，旧版本「已验证」资格作废：只有重新执行并通过结果验证才能再次保存为工具。
+  const unmarkPlanVerified = useCallback((planId: string) => {
+    setVerifiedPlanIds((current) => {
+      if (!current.has(planId)) {
+        return current;
+      }
+      const next = new Set(current);
+      next.delete(planId);
+      return next;
+    });
+  }, []);
+
   const beginSaveCandidate = useCallback((plan: AnalysisPlan) => {
     setSaveCandidate(plan);
     setApproveFixedContent(false);
@@ -56,6 +68,7 @@ export function useExecutionApproval() {
     setApproveDestructive,
     verifiedPlanIds,
     markPlanVerified,
+    unmarkPlanVerified,
     saveEligibility,
     beginSaveCandidate,
     closeSaveCandidate

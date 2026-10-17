@@ -187,8 +187,11 @@ def should_stop(
         return True, "consecutive_errors"
     if config.max_total_tokens is not None and state.total_tokens >= config.max_total_tokens:
         return True, "max_tokens"
-    if state.elapsed_time >= config.max_wall_time_seconds:
-        return True, "timeout"
+    # 墙上时间（累计活跃执行时间）的收口**不在这里**：它由 ``run_excel_agent`` 的
+    # ``note_progress(..., enforce_total_wall_time=True)`` 在"启动下一次模型/工具调用
+    # 之前"判定，并抛出 ``AgentBudgetPause``（现场已保存、可按真实恢复能力继续）。
+    # 放在这里会被当成普通熔断走 ``safe_degradation``，出现"一边说现场已保存、
+    # 一边说规划超时"的双重口径。``config.max_wall_time_seconds`` 仍由那一处消费。
     return False, None
 
 

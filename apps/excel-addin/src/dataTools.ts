@@ -8,6 +8,11 @@ import type {
 } from "./contracts";
 import capabilities from "../../../config/capabilities.json";
 import { detectHeaderIndex, normalizeField } from "./tableSchema";
+import {
+  assertPythonPrepareRectWithin,
+  parsePythonPrepareRect,
+  PythonPrepareRegionRefused
+} from "@excel-bro/core/pythonPrepare";
 import { normalizeCellValue } from "./cellNormalization";
 
 const MAX_TOOL_ROWS = capabilities.queryTable.maxRows;
@@ -606,7 +611,7 @@ export function createQueryTableAccumulator(
           complete: warnings.length === 0,
           calculation: `筛选后按 ${groupBy.join("、") || "全部记录"} 分组，执行 ${metrics
             .map((metric) => `${metric.outputName}=${metric.operation}`)
-            .join("；")}。`,
+            .join("；")}。${warnings.length === 0 ? "筛选后总记录数" : "已处理记录数（结果不完整）"}：${filteredRows}。`,
           warnings
         };
       }
@@ -849,7 +854,7 @@ function executeQueryTableDataLegacy(
       complete: warnings.length === 0,
       calculation: `筛选后按 ${groupBy.join("、") || "全部记录"} 分组，执行 ${metrics
         .map((metric) => `${metric.outputName}=${metric.operation}`)
-        .join("；")}。`,
+        .join("；")}。${warnings.length === 0 ? "筛选后总记录数" : "已处理记录数（结果不完整）"}：${filteredRows}。`,
       warnings
     };
   }
@@ -971,3 +976,127 @@ export async function executeQueryTableTool(
     return accumulator.finish();
   });
 }
+
+/** ``prepare_python_data`` 的单个来源：授权工作表名 + A1 区域。 */
+export interface PreparePythonDataSource {
+  sheet: string;
+  range: string;
+}
+
+/**
+ * 读授权表指定区域的**原始值矩阵**（供隔离 Python 数据登记）。
+ *
+ * 与 ``query_table`` 不同：这里不做表头识别、不做分组/画像，直接按来源声明
+ * 的 A1 区域读原始值。每个来源的 sheet 必须落在已授权工作表内（复核由桥的
+ * ``verify`` 端口兜底，这里再做一次防御性拒绝）。返回与服务端
+ * ``BridgeDatasetReceipt`` 对齐的 ``sourceIndex → values`` 块。
+ */
+export async function executePreparePythonData(
+  sources: PreparePythonDataSource[],
+  allowedSheetNames: string[],
+  options: QueryToolOptions = {}
+): Promise<{ sourceIndex: number; values: CellValue[][] }[]> {
+  if (!Array.isArray(sources) || sources.length === 0) {
+    throw new DataToolExecutionError(
+      "UNSUPPORTED_TOOL",
+      "数据登记缺少来源",
+      false
+    );
+  }
+  const allowed = new Set(allowedSheetNames);
+  for (const source of sources) {
+    if (
+      source === null ||
+      typeof source !== "object" ||
+      typeof source.sheet !== "string" ||
+      typeof source.range !== "string"
+    ) {
+      throw new DataToolExecutionError(
+        "SCOPE_VIOLATION",
+        "数据登记来源无效",
+        false
+      );
+    }
+    if (!allowed.has(source.sheet)) {
+      throw new DataToolExecutionError(
+        "SCOPE_VIOLATION",
+        "数据登记请求超出了用户选择的工作表范围",
+        false
+      );
+    }
+  }
+
+  const rects = sources.map((source) => {
+    const rect = parsePythonPrepareRect(source.range);
+    if (!rect) {
+      throw new DataToolExecutionError(
+        "SCOPE_VIOLATION",
+        "数据登记区域无效",
+        false
+      );
+    }
+    return rect;
+  });
+
+  return Excel.run(async (context) => {
+    const worksheets = context.workbook.worksheets;
+    const blocks: { sourceIndex: number; values: CellValue[][] }[] = [];
+    for (let index = 0; index < sources.length; index++) {
+      if (options.signal?.aborted) {
+        throw new DataToolExecutionError(
+          "CANCELLED",
+          "本地数据登记已取消",
+          false
+        );
+      }
+      const source = sources[index];
+      const worksheet = worksheets.getItem(source.sheet);
+      /*
+       * 先用**已用区域**把越界请求挡掉，再读精确区域。
+       *
+       * `getRange` 拿绝对地址，落在已用区域之外时会**静默返回空白**而不是报错 ——
+       * WPS 侧是明确拒绝。不先挡，同一张表在两端就会一个给空值、一个拒绝，
+       * 语义分叉且不可见。挡掉之后，"表外"在两端都是拒绝，"表内的真空白"
+       * 才是空值 —— 两者不再互相冒充。
+       */
+      const used = worksheet.getUsedRange();
+      used.load("rowIndex,columnIndex,rowCount,columnCount");
+      await context.sync();
+      try {
+        assertPythonPrepareRectWithin(
+          rects[index],
+          {
+            startRow: Number(used.rowIndex ?? 0) + 1,
+            startColumn: Number(used.columnIndex ?? 0) + 1
+          },
+          Number(used.rowCount ?? 0),
+          Number(used.columnCount ?? 0)
+        );
+      } catch (error) {
+        if (error instanceof PythonPrepareRegionRefused) {
+          throw new DataToolExecutionError(
+            "SCOPE_VIOLATION",
+            error.message,
+            false
+          );
+        }
+        throw error;
+      }
+      const range = worksheet.getRange(source.range);
+      range.load("values,text,numberFormat");
+      await context.sync();
+      const values: CellValue[][] = range.values.map((row, rowIndex) =>
+        row.map((value, columnIndex) =>
+          normalizeCellValue(
+            value,
+            range.text[rowIndex]?.[columnIndex] ?? "",
+            range.numberFormat[rowIndex]?.[columnIndex] ?? "General"
+          )
+        )
+      );
+      blocks.push({ sourceIndex: index, values });
+    }
+    return blocks;
+  });
+}
+

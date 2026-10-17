@@ -1,56 +1,121 @@
+import { useRef, useState } from "react";
 import type { AnalysisPlan } from "../contracts";
-import type { ExcelNativeComparison } from "../excelNativeComparison";
-import type { useExcelNativeComparison } from "../hooks/useExcelNativeComparison";
-import { useState } from "react";
-import { excelNativeReviewMode } from "../excelNativeComparison";
-import capabilities from "../../../../config/capabilities.json";
+import { excelNativeReviewMode, type ExcelNativeComparison } from "../excelNativeComparison";
+import { excelReviewBlocksNewCopy, type useExcelNativeComparison } from "../hooks/useExcelNativeComparison";
+import { excelFormatCapabilityNotice, resolveExcelFormatCapability } from "../excelFormatCapability";
+import { reviewCardView, reviewCardHasDiagnostics, reviewChangeSummary, reviewScopeLocations,
+  planTargetCells, REVIEW_CARD_COMPAT_DETAIL, REVIEW_CARD_COMPAT_NOTICE,
+  REVIEW_CARD_COMPAT_DETAIL_TITLE, REVIEW_CARD_DIAGNOSTICS_TITLE } from "../../../../packages/core/src/reviewCardPresentation";
 
 export function ExcelNativeReviewActions({ messageId, plan, authorization, controller, disabled, commit, paneNeedsResize = false, beforeOperation }: {
   messageId: string; plan: AnalysisPlan; authorization: readonly string[];
   controller: ReturnType<typeof useExcelNativeComparison>; disabled: boolean;
-  commit: (session: ExcelNativeComparison) => Promise<boolean>;
+  commit: (session: ExcelNativeComparison | null) => Promise<boolean>;
   paneNeedsResize?: boolean;
   beforeOperation?: () => Promise<boolean>;
 }) {
   const [acknowledgedCopy, setAcknowledgedCopy] = useState<string | null>(null);
   const review = controller.review?.messageId === messageId ? controller.review : null;
   const feedback = controller.feedback?.messageId === messageId ? controller.feedback.text : null;
-  const manual = review?.session.mode === "manual";
-  const manualReviewed = Boolean(review && acknowledgedCopy === review.session.copySheetName);
+  const current = useRef({ review, plan, authorization, acknowledgedCopy });
+  current.current = { review, plan, authorization, acknowledgedCopy };
+  const manual = review?.session.mode === 'manual';
   const mode = excelNativeReviewMode();
-  return <section className="excel-native-review" aria-label="Excel 原生并排审阅">
-    {review ? <>
-      {paneNeedsResize && review.phase === "review" && <p role="status">AI 窗格自动比例尚未确认。请拖动「Excel Bro」左侧分隔线，将 AI 调到右侧 Excel 窗口约 {Math.round(capabilities.reviewPaneSizing.reviewTaskPaneWidthFraction * 100)}%，为原表留出空间。若刚更新代码，请先重启 Python 服务并刷新加载项。</p>}
-      <p>{review.phase === "review" ? manual
-        ? `原表未修改 · 已请求打开兼容副本，工作表「${review.session.copySheetName}」，标记 ${review.session.changedCells} 处计划变化。${review.session.windowLayout === 'arranged' ? '已自动排列：左侧审阅副本，右侧原表与 AI 对话；请核对副本。' : '自动排列未完成。请切到副本，在 Excel「视图 → 并排查看」中选择原工作簿；若窗口分属不同实例，请手动将副本放左侧、原表与 AI 放右侧。'}`
-        : `原表未修改 · 独立副本已标记 ${review.session.changedCells} 处变化。请在 Excel 原生并排窗口中核对。` : review.phase === "committed" ? "本次计划已写回原表，不可重复提交。" : "审阅已停止。请核对执行结果，再关闭副本并重新生成预览。"}</p>
-      {manual && <p>公式由 Excel 打开副本后重算；加载项不能自动回读或关闭兼容副本。副本内的人工修改不会写回，保存只执行本卡已审阅的计划，随后验证原表实际结果。</p>}
-      {review.phase === "review" && review.session.windowLayout === 'arranged' && <p>{review.session.synchronousScrolling === 'enabled'
-        ? '已启用 Excel 原生并排比较与同步滚动，拖动任一表的滚动条可联动查看。'
+  const capability = resolveExcelFormatCapability((set, version) =>
+    typeof Office !== 'undefined' && Boolean(Office.context?.requirements?.isSetSupported(set, version)));
+  const formatNotice = excelFormatCapabilityNotice(plan.actions, capability);
+  const reviewing = review?.outcome === 'reviewing';
+  const view = review ? reviewCardView({
+    outcome: review.outcome,
+    scope: { locations: reviewScopeLocations(plan.actions), changes: reviewChangeSummary(plan.actions), totalCells: planTargetCells(plan.actions) },
+    compatNotice: manual ? REVIEW_CARD_COMPAT_NOTICE : null,
+    compatDetail: manual ? REVIEW_CARD_COMPAT_DETAIL['excel-compat'] : [],
+    paneNeedsResize: Boolean(reviewing && paneNeedsResize), paneWidthSettable: true, copy: review.copy,
+    syncScrollingEnabled: review.session.synchronousScrolling === 'enabled',
+    syncScrollingStatus: '已启用 Excel 原生并排比较与同步滚动，拖动任一表的滚动条可联动查看。',
+    diagnostics: {
+      restart: review.session.windowLayout === 'service_outdated' ? ['本地窗口服务版本过旧，请重启 Python 服务并刷新加载项。'] : [],
+      arrangement: review.session.windowLayout !== 'arranged'
+        ? ['可在 Excel「视图 → 并排查看」中选择本次副本与原表，或手动排列窗口。']
         : review.session.synchronousScrolling === 'different_instance'
-          ? '两份工作簿属于不同 Excel 实例：目前仅贴齐排列，未启用同步滚动。请将审阅副本保存到本机后，在原表所在 Excel 实例中打开，再选择「视图 → 并排查看 → 同步滚动」。不要将副本另存为原文件。'
-          : '窗口已贴齐排列，但同步滚动未能确认。请在 Excel「视图 → 并排查看」中选择本次副本，并启用「同步滚动」。若还有其他工作簿打开，请先保存并关闭无关工作簿再生成副本。'}</p>}
-      {manual && review.session.windowLayout === 'service_outdated' && <p role="status">本地窗口排列服务版本过旧。请停止并重启 Python 服务、刷新加载项，关闭旧副本且不保存，再重新生成副本；新版排列为左侧副本、右侧原表与 AI。</p>}
-      {manual && review.phase === "review" && <label className="excel-manual-review-confirm">
-        <input type="checkbox" checked={manualReviewed} disabled={disabled}
+          ? ['两份工作簿属于不同 Excel 实例，未启用同步滚动。']
+          : review.session.synchronousScrolling !== 'enabled' ? ['同步滚动未能确认，请在 Excel 中检查。'] : [],
+      identity: ['本次副本工作表名：' + review.session.copySheetName, '原表工作簿标识：' + review.session.workbookIdentity],
+      close: review.copy ? [review.copy.detail] : [],
+      cleanup: review.session.recoveryCopyPath
+        ? ['已保留本次副本的恢复文件；不会覆盖原文件或删除用户另存文件。']
+        : ['尚无已确认的恢复文件。']
+    }
+  }) : null;
+  async function confirm() {
+    // Capture the exact card, nonce, plan and scope before the external authorization await.
+    const issued = { review, plan, authorization, acknowledgedCopy };
+    const scope = JSON.stringify([...issued.authorization].sort());
+    const planKey = JSON.stringify(issued.plan);
+    if (!issued.review || issued.review.outcome !== 'reviewing') return;
+    const stillCurrent = () => {
+      const now = current.current;
+      return now.review === issued.review && now.plan === issued.plan && planKey === JSON.stringify(now.plan) &&
+        scope === JSON.stringify([...now.authorization].sort()) && now.acknowledgedCopy === issued.acknowledgedCopy;
+    };
+    if (!stillCurrent()) { controller.rejectStaleRequest(messageId); return; }
+    if (beforeOperation && !(await beforeOperation())) return;
+    if (!stillCurrent()) {
+      controller.rejectStaleRequest(messageId);
+      return;
+    }
+    await controller.save(messageId, plan, authorization, commit,
+      manual ? acknowledgedCopy : issued.review.session.copySheetName, stillCurrent);
+  }
+  return <section className="excel-native-review" aria-label="Excel 原生并排审阅">
+    {formatNotice && <div className="excel-format-capability-notice" role="status">
+      <p className="excel-format-capability-summary">{formatNotice.summary}</p>
+      <details><summary>技术原因</summary><p>{formatNotice.detail}</p></details>
+    </div>}
+    {view && review ? <>
+      <h4 className="excel-review-title">{view.title}</h4>
+      <p className="excel-review-description">{view.description}</p>
+      {view.scopeLine && <p className="excel-review-scope">范围：{view.scopeLine}</p>}
+      {reviewing && view.compatNotice && <p className="excel-review-compat">{view.compatNotice}</p>}
+      {view.paneHint && <details><summary>{view.paneHint.summary}</summary><p>{view.paneHint.detail}</p></details>}
+      {reviewing && manual && <label className="excel-manual-review-confirm">
+        <input type="checkbox" checked={acknowledgedCopy === review.session.copySheetName} disabled={disabled}
           onChange={event => setAcknowledgedCopy(event.target.checked ? review.session.copySheetName : null)} />
-        我已在 Excel 中核对副本，确认按此计划写回原表
+        {view.confirmLabel}
       </label>}
-      <div className="excel-native-review-buttons">
-        <button className="secondary-button" disabled={disabled} onClick={() => void controller.discard(messageId)}>{review.phase === "review" ? "放弃变更" : "关闭副本"}</button>
-        {review.phase === "review" && <button className="primary-button" disabled={disabled || (manual && !manualReviewed)} onClick={() => void (async () => {
-          if (beforeOperation && !(await beforeOperation())) return;
-          await controller.save(messageId, plan, authorization, commit, manualReviewed);
-        })()}>保存变更到原表</button>}
-      </div>
+      {reviewing && <div className="excel-native-review-buttons">
+        <button className="secondary-button" disabled={disabled} onClick={() => void controller.discard(messageId)}>放弃变更</button>
+        <button className="primary-button" disabled={disabled || Boolean(manual && acknowledgedCopy !== review.session.copySheetName)}
+          onClick={() => void confirm()}>确认写回原表</button>
+      </div>}
+      {view.copyStatus && <p className="excel-review-copy-status">{view.copyStatus.headline}</p>}
+      {view.copyOpenNotice && <p>{view.copyOpenNotice}</p>}
+      {review.session.recoveryCopyPath && <p className="excel-review-recovery">副本恢复文件：<code>{review.session.recoveryCopyPath}</code></p>}
+      {view.secondaryAction && <button className="secondary-button" disabled={disabled}
+        onClick={() => void controller.discard(messageId)}>{view.secondaryAction.label}</button>}
+      {view.syncScrolling && <p>{view.syncScrolling}</p>}
+      {view.compatDetail.length > 0 && <details><summary>{REVIEW_CARD_COMPAT_DETAIL_TITLE}</summary>
+        {view.compatDetail.map(line => <p key={line}>{line}</p>)}</details>}
+      {reviewCardHasDiagnostics(view.diagnostics) && <details><summary>{REVIEW_CARD_DIAGNOSTICS_TITLE}</summary>
+        {Object.entries(view.diagnostics).map(([group, entries]) => <div key={group}>{entries.map(line => <p key={line}>{line}</p>)}</div>)}
+      </details>}
     </> : <>
-      <button className="primary-button" disabled={disabled || Boolean(controller.review) || mode === "unavailable"} onClick={() => void (async () => {
-        if (beforeOperation && !(await beforeOperation())) return;
-        await controller.stage(messageId, plan, authorization);
-      })()}>生成副本并排审阅</button>
-      <p>原表保持不变，副本试算并标记变化；确认后仅写回已审阅的计划，不导入副本中的人工修改。</p>
-      {mode === "manual" && <p>本地服务将尝试把副本放左侧、原表与 AI 放右侧。窗口无法确认时会提示手动并排；审阅后勾选确认，再写回原表。</p>}
-      {mode === "unavailable" && <p>当前 Excel 缺少创建兼容副本所需的基础 API，未生成副本、未写入原表。</p>}
+      <button className="primary-button" disabled={disabled || excelReviewBlocksNewCopy(controller.review) || mode === 'unavailable'}
+        onClick={() => void (async () => {
+          const issued = current.current;
+          const planKey = JSON.stringify(plan), scopeKey = JSON.stringify([...authorization].sort());
+          if (issued.plan !== plan || JSON.stringify([...issued.authorization].sort()) !== scopeKey) return;
+          if (beforeOperation && !(await beforeOperation())) return;
+          const now = current.current;
+          if (now.review !== issued.review || now.plan !== plan || JSON.stringify(now.plan) !== planKey ||
+              JSON.stringify([...now.authorization].sort()) !== scopeKey) {
+            controller.rejectStaleRequest(messageId); return;
+          }
+          setAcknowledgedCopy(null);
+          await controller.stage(messageId, plan, authorization);
+        })()}>生成副本并排审阅</button>
+      <p>原表保持不变，副本展示待确认结果；确认后只写回本卡计划。</p>
+      {mode === 'unavailable' && <p>当前 Excel 缺少创建副本所需的 API，未生成副本、未写入原表。</p>}
     </>}
     {feedback && <p role="status">{feedback}</p>}
   </section>;

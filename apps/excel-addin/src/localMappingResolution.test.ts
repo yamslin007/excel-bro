@@ -3,6 +3,7 @@ import type { ColumnMappingRule } from "./contracts";
 import {
   addExactMapping,
   addSplitMapping,
+  declaredMappingPriority,
   suggestMappingDelimiter,
   uncoveredSplitItems
 } from "./localMappingResolution";
@@ -24,6 +25,19 @@ const rule: ColumnMappingRule = {
 };
 
 describe("本地映射结构化补全（Excel/WPS 共用）", () => {
+  it("优先级只能来自完整且无歧义的显式等级，不从标签或声明顺序猜测", () => {
+    expect(declaredMappingPriority(rule)).toBeNull();
+    expect(declaredMappingPriority({ ...rule, valueRank: [{ value: "甲", rank: 10 }, { value: "乙", rank: 2 }] }))
+      .toEqual(["低", "高"]); // 标签字面含义不代表已确认规则。
+    expect(declaredMappingPriority({ ...rule, valueRank: [{ value: "甲", rank: 2 }] })).toBeNull();
+    expect(declaredMappingPriority({ ...rule, valueRank: [{ value: "甲", rank: 2 }, { value: "乙", rank: 2 }] })).toBeNull();
+    expect(declaredMappingPriority({ ...rule, valueRank: [{ value: "甲", rank: Infinity }, { value: "乙", rank: 1 }] })).toBeNull();
+  });
+  it("缺项检测沿用实际执行器的整格优先与最早分隔符语义", () => {
+    const declared = { ...rule, delimiters: ["；"], mapping: [...rule.mapping, { source: "整格，别拆", target: "高" }] };
+    expect(uncoveredSplitItems(declared, ["整格，别拆"], "，")).toEqual([]);
+    expect(uncoveredSplitItems(declared, ["甲；乙，丙"], "，")).toEqual(["乙，丙"]);
+  });
   it("重开时使仅存于内存的规则草稿失效，不留一张可误点的澄清卡", () => {
     const pending: ChatMessage = {
       id: "local-1",

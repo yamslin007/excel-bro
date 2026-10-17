@@ -51,21 +51,3 @@ export function workbookFolderFromDocumentUrl(
     : folderPath;
   return normalized ? { kind: "local", folderPath: normalized } : { kind: "unsaved" };
 }
-
-function normalizedDate(year: string, month: string, day: string): string {
-  return `${year}-${month.padStart(2, "0")}-${day.padStart(2, "0")}`;
-}
-
-export function extractWorkbookDataPeriod(
-  workbookName: string
-): string | null {
-  const matches = [
-    ...workbookName.matchAll(
-      /(\d{4})\s*(?:-|\/|\.|年)\s*(\d{1,2})\s*(?:-|\/|\.|月)\s*(\d{1,2})\s*日?/g
-    )
-  ].map((match) => normalizedDate(match[1], match[2], match[3]));
-
-  if (matches.length === 0) return null;
-  if (matches.length === 1 || matches[0] === matches[1]) return matches[0];
-  return `${matches[0]} 至 ${matches[1]}`;
-}

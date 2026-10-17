@@ -8,12 +8,14 @@ export type AuthorizedTarget = {
 };
 
 export type TargetCheck = "same" | "file_changed" | "scope_changed" | "unavailable";
+/** Local UI state only: needing consent is not a failed identity check. */
+export type TargetNoticeReason = Exclude<TargetCheck, "same"> | "confirmation_required";
 
 /** An early change detector, NOT a replacement for execution/clarification identity proofs. */
 export function checkAuthorizedTarget(bound: AuthorizedTarget, current: AuthorizedTarget | null): TargetCheck {
   if (!current) return "unavailable";
   if (bound.fileKey && current.fileKey) {
-if (bound.fileKey !== current.fileKey) return "file_changed";
+    if (bound.fileKey !== current.fileKey) return "file_changed";
   } else if (bound.fileKey !== current.fileKey || !bound.fileRef || bound.fileRef !== current.fileRef) {
     // New host wrapper / missing identity is absence of evidence, not proof of a changed file.
     return "unavailable";

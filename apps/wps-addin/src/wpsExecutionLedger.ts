@@ -1,5 +1,14 @@
 import type { WpsRecoveryDescriptor } from "../../excel-addin/src/contracts";
-import { matrixFingerprintV2, type WpsPreparedPlan } from "./wpsPlanExecutor";
+import {
+  asFormatFields,
+  composedFormatSnapshot,
+  declaredFormatFields,
+  formatEvidenceFingerprint,
+  formatExpectedFingerprint,
+  isFormatActionType,
+  matrixFingerprintV2,
+  type WpsPreparedPlan
+} from "./wpsPlanExecutor";
 import {
   registerWpsExecution,
   getWpsExecutionStatus,
@@ -139,12 +148,23 @@ export function clearPendingWpsExecution(
  *
  * `applyTo` / `formulaR1C1` 取自 `AnalysisPlan` 的原始动作：服务端要靠它们拒绝
  * 不受支持的变体（`clearRange` 非 contents、`writeFormulas` 用 R1C1）。
+ *
+ * **格式动作的指纹是格式证据，不是值矩阵指纹**：值动作的 `previewFingerprint`
+ * 是"写前值"、`expectedFingerprint` 是"写后目标值"；格式动作不改值（值矩阵指纹在
+ * 写前/写后完全一样，没有区分力），所以走 `formatEvidenceFingerprint`（写前现场，
+ * 由预览时采集的逐格/逐行快照算出）与 `formatExpectedFingerprint`（写后目标，
+ * 只由声明的属性与目标值加形状算出）。两者都**不含任何单元格内容**，也**不传格式
+ * 快照本身** —— 快照含逐格属性值，属于本机现场。
+ *
+ * 同时投影出 `formatFields`（本次声明要改的属性名）：服务端按它做**属性级**校验，
+ * 未验证属性（`underline` / `vertical` / `columnWidth`）在这里根本不会出现，
+ * 因为 `declaredFormatFields` 只会产出已验证的属性。
  */
 export function wpsRecoveryDescriptor(prepared: WpsPreparedPlan): WpsRecoveryDescriptor {
   return {
-    actions: prepared.actions.map((action) => {
+    actions: prepared.actions.map((action, index) => {
       const source = prepared.plan.actions[action.actionIndex];
-      return {
+      const shared = {
         actionIndex: action.actionIndex,
         type: action.type,
         sheet: action.sheetName,
@@ -152,10 +172,41 @@ export function wpsRecoveryDescriptor(prepared: WpsPreparedPlan): WpsRecoveryDes
         rowCount: action.rowCount,
         columnCount: action.columnCount,
         cellCount: action.cellCount,
-        previewFingerprint: action.previewFingerprint,
-        expectedFingerprint: matrixFingerprintV2(action.values, action.values),
         ...(source && "applyTo" in source ? { applyTo: source.applyTo } : {}),
         ...(source && "formulaR1C1" in source ? { formulaR1C1: Boolean(source.formulaR1C1) } : {})
+      };
+      if (isFormatActionType(action.type)) {
+        // 格式动作必须有预览快照：没有它就无从证明"写前现场"，宁可拒绝登记。
+        const expectedBefore = composedFormatSnapshot(prepared.actions, index);
+        if (!expectedBefore) {
+          throw new Error("格式动作缺少预览时采集的格式快照，无法生成恢复证据，已拒绝登记。");
+        }
+        const formatAction = asFormatFields(action);
+        const formatFields = declaredFormatFields(formatAction);
+        if (!formatFields.length) {
+          throw new Error("格式动作没有声明任何可恢复属性，无法生成恢复证据，已拒绝登记。");
+        }
+        return {
+          ...shared,
+          /*
+           * 写前证据取**合成后**的现场（前序同区域格式动作的声明值已叠加）：执行器在
+           * 真正写这一笔之前看到的现场就是这个。若直接用预览原始快照，登记出的
+           * `previewFingerprint` 会**永远达不到**，服务端随后以"证据与登记的写前状态
+           * 不一致"拒掉写前检查点 —— 恢复链整条断在登记上。
+           */
+          previewFingerprint: formatEvidenceFingerprint(formatAction, expectedBefore),
+          expectedFingerprint: formatExpectedFingerprint(
+            formatAction,
+            action.rowCount,
+            action.columnCount
+          ),
+          formatFields: [...formatFields]
+        };
+      }
+      return {
+        ...shared,
+        previewFingerprint: action.previewFingerprint,
+        expectedFingerprint: matrixFingerprintV2(action.values, action.values)
       };
     })
   };

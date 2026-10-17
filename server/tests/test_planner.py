@@ -152,10 +152,52 @@ def test_direct_formula_and_clear_commands_create_focused_plans() -> None:
 
     assert formula.kind == "plan"
     assert formula.plan.actions[0].type == "writeFormulas"
-    assert formula.plan.actions[0].formulas == [["=sum(b2:b4)"]]
+    assert formula.plan.actions[0].formulas == [["=SUM(B2:B4)"]]
     assert clearing.kind == "plan"
     assert clearing.plan.actions[0].type == "clearRange"
     assert clearing.plan.actions[0].range == "B2:B4"
+
+
+@pytest.mark.parametrize("prompt", [
+    "G1 写入标签“无问题数量”，G2 写入上述统计结果（数值），仅写入 G1:G2 两个单元格。展示预览，等待用户确认后再执行写入",
+    "将这次统计结果写入 Sheet1 的 G1:G2：G1 为“无问题数量”，G2 为统计结果。",
+    "G1 写入上述统计结果",
+    "G1 写入 2，然后清空 A1",
+    "不要清空 A1",
+    "清空 A1 后写入汇总结果",
+])
+def test_compound_or_semantic_commands_do_not_become_literal_writes(prompt: str) -> None:
+    assert planner_module._local_address_plan(_score_request(prompt)) is None
+
+
+def test_literal_write_preserves_text_case_and_quoted_numeric_type() -> None:
+    for prompt, expected in [("G1 写入“AbC，G2 写入结果”", "AbC，G2 写入结果"),
+                             ('G1 写入"001"', "001")]:
+        response = planner_module._local_address_plan(_score_request(prompt))
+        assert response is not None and response.kind == "plan"
+        assert response.plan.actions[0].values == [[expected]]
+
+
+@pytest.mark.parametrize("adapter", ["claude_agent_sdk", "openai"])
+def test_compound_write_reaches_selected_model_unchanged(monkeypatch, adapter) -> None:
+    from types import SimpleNamespace
+    from server.app.models import AnswerResponse
+    import server.app.claude_sdk_agent as sdk
+
+    request = _score_request("G1 写入标签“无问题数量”，G2 写入上述统计结果，先预览，确认后再写入")
+    request.modelId = _CONFIGURED_MODEL_ID
+    config = SimpleNamespace(adapter=adapter)
+    calls = []
+
+    async def run(received, *args, **kwargs):
+        calls.append(received)
+        return AnswerResponse(provider="local", message="模型路径测试")
+
+    monkeypatch.setattr(planner_module, "selected_model_config", lambda model_id: config)
+    monkeypatch.setattr(sdk, "run_sdk_plan", run)
+    monkeypatch.setattr(planner_module, "run_excel_agent", run)
+    asyncio.run(create_plan(request))
+    assert calls == [request]
 
 
 def test_bulk_sheet_deletion_creates_only_authorized_delete_actions() -> None:

@@ -96,9 +96,10 @@ export function isAbortError(reason: unknown): boolean {
 }
 
 // 文件夹模式下的工作表标识键：文件 id + 表名合成，供 folderSheetKeys 记录勾选。
-export function folderSheetKey(fileId: string, sheetName: string): string {
-  return `${fileId}\u0000${sheetName}`;
-}
+//
+// 判据已搬到共享层（`@excel-bro/core/folderScope`），这里只留一条转发：
+// WPS 端也要拼同样的键，两边各写一份迟早会漂。旧的导入路径（`./utils`）保持不变。
+export { folderSheetKey } from "@excel-bro/core/folderScope";
 
 // /function 试算结果是否算"验算不通过"：Excel 错误值（#REF! 等）或试算异常。
 export function formulaTrialFailed(result: string): boolean {

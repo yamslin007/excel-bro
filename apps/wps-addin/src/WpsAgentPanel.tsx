@@ -1,5 +1,12 @@
-import { Fragment, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, type ReactNode, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { ResultReview } from '@excel-bro/core/resultReview';
+import { ResultReviewBar } from '../../excel-addin/src/components/ResultReviewBar';
+import { markWpsResult, clearWpsResultMarks, type WpsResultMarks } from './wpsResultReviewMarkers';
+import { rearrangeWpsComparison } from './wpsNativeComparison';
 import { flushSync } from "react-dom";
+import { createAgentTaskContext, confirmAgentTaskDecision, type AgentTaskContext } from "@excel-bro/core/agentTaskContext";
+// 工作目录范围的发送判据：共享层唯一一份声明（Excel 端读同一份）。
+import { workDirectorySendRefusal } from "@excel-bro/core/folderScope";
 import {
   newTaskId,
   PLAN_NOTE_SECTIONS,
@@ -11,7 +18,6 @@ import {
   TASK_RESUME_SCHEMA_VERSION,
   TASK_WRITE_STATE_LABEL,
   taskResumeDecision,
-  withTaskResumeConfirmation,
   withTaskResumeState,
   type TaskBlocker,
   type TaskPhase,
@@ -27,15 +33,17 @@ import {
   remainingLegacyCredentialConversationIds,
   replaceRestoredSecrets
 } from "../../excel-addin/src/conversation";
+import { brandLogoUrl } from "../../excel-addin/src/brandLogo";
 import {
   ApiRequestError,
   apiErrorCategory,
   listModels,
+  understandMessage,
   validatePlan,
   type ModelCatalogStatus,
   type ModelOption
 } from "../../excel-addin/src/api";
-import { assertEditablePlan, type ClarificationField, type IntentOption, type ResultContext } from "../../excel-addin/src/contracts";
+import { assertEditablePlan, type AnalysisPlan, type ClarificationField, type IntentOption, type ResultContext } from "../../excel-addin/src/contracts";
 import { ClarificationFields } from "../../excel-addin/src/components/ClarificationFields";
 import { useTheme } from "../../excel-addin/src/hooks/useTheme";
 import { useLongPress } from "../../excel-addin/src/hooks/useLongPress";
@@ -48,16 +56,25 @@ import ThemePanel from "../../excel-addin/src/components/ThemePanel";
 import PetCompanion from "../../excel-addin/src/PetCompanion";
 import { RuleManager } from "../../excel-addin/src/RuleManager";
 import {
+  analyzeToolEligibility,
+  createTool,
+  deleteTool,
   instantiateTool,
   instantiateQueryTool,
   loadQueryTools,
   loadTools,
+  saveTool,
+  updateToolPlanTemplate,
   type SavedQueryTool,
-  type SavedTool
+  type SavedTool,
+  type ToolRiskApproval
 } from "../../excel-addin/src/storage";
 import { executeQueryTableData } from "../../excel-addin/src/dataTools";
 import TaskProgressTimeline from "../../excel-addin/src/components/TaskProgressTimeline";
+import { SaveToolDialog } from "../../excel-addin/src/components/SaveToolDialog";
 import MessageCopyButton from "../../excel-addin/src/components/MessageCopyButton";
+import { ExecutionResultCard, ExecutionResultDetails } from "../../excel-addin/src/components/ExecutionResultCard";
+import ScrollToLatestButton from "../../excel-addin/src/components/ScrollToLatestButton";
 import { ChangeReviewUndoNote } from "../../excel-addin/src/components/ChangeReviewPresentation";
 import ChangeReviewSummaryCard from "../../excel-addin/src/components/ChangeReviewSummaryCard";
 import { LocalMappingResolution } from "../../excel-addin/src/components/LocalMappingResolution";
@@ -77,9 +94,11 @@ import type { ActivityLog, ActivityOutcome } from "../../excel-addin/src/hooks/u
 import { useMessageAutoFollow } from "../../excel-addin/src/hooks/useMessageAutoFollow";
 import { useComposerResize } from "../../excel-addin/src/hooks/useComposerResize";
 import { useAuthorizedTarget } from "../../excel-addin/src/hooks/useAuthorizedTarget";
+import { useExecutionApproval } from "../../excel-addin/src/hooks/useExecutionApproval";
 import { AuthorizedTargetConfirmation } from "../../excel-addin/src/components/AuthorizedTargetConfirmation";
+import { TargetScopeNotice } from "../../excel-addin/src/components/TargetScopeNotice";
 import { inspectWpsAuthorizedTarget, isWpsReviewCopyTarget, wpsAnalysisTargetEvidence } from "./wpsAuthorizedTarget";
-import { checkAuthorizedTarget, TargetConfirmationRequiredError } from "@excel-bro/core/authorizedTarget";
+import { checkAuthorizedTarget, TargetConfirmationRequiredError, type AuthorizedTarget } from "@excel-bro/core/authorizedTarget";
 import { copyTextToClipboard } from "../../excel-addin/src/utils";
 import WpsModelSettingsPanel from "./WpsModelSettingsPanel";
 import { ModelPickerIcon } from "../../excel-addin/src/components/ModelPickerIcon";
@@ -90,6 +109,38 @@ import {
 import { getWpsApplication } from "./wpsHost";
 import { useWpsReviewPaneRatio } from './useWpsReviewPaneRatio';
 import { REVIEW_PANE_LIMITS } from '@excel-bro/core/reviewPaneSizing';
+// 审阅副本生命周期：与 Excel 端同一套状态/文案，只把宿主适配留在本端。
+import { reviewCopyCleanupState, type ReviewCopyBusinessOutcome, type ReviewCopyCleanupState } from "@excel-bro/core/reviewCopyLifecycle";
+// 审阅卡的信息层级与文案口径：与 Excel 端**共用**，只把宿主差异当入参喂进去。
+import {
+  REVIEW_CARD_COMPAT_DETAIL,
+  REVIEW_CARD_COMPAT_DETAIL_TITLE,
+  REVIEW_CARD_DIAGNOSTICS_TITLE,
+  planTargetCells,
+  reviewCardBusiness,
+  reviewCardCompatNotice,
+  reviewCardHasDiagnostics,
+  reviewCardView,
+  reviewChangeSummary,
+  reviewScopeLocations,
+  type ReviewCardDiagnostics,
+  type ReviewCardScope,
+  type ReviewCardView,
+  type ReviewOutcome
+} from "@excel-bro/core/reviewCardPresentation";
+// 写回请求的现场身份（同一次审阅 / 同一计划版本 / 同一原工作簿）：两端共用同一套判据。
+import { reviewWriteBackTargetChanged, type ReviewWriteBackTarget } from "@excel-bro/core/reviewWriteBackGate";
+// 执行方式选择（直接执行 / 副本比对）：与 Excel 端**共用同一套语义与文案**。
+import {
+  EXECUTION_MODE_PREFACE,
+  DIRECT_EXECUTION_DETAIL,
+  executionModeOptions,
+  executionModeSwitchDecision,
+  executionModeTargetChanged,
+  type ExecutionModeAvailability,
+  type ExecutionModeWriteBackTarget as DirectExecutionTarget,
+  type PlanExecutionMode
+} from "@excel-bro/core/executionMode";
 import { probeWideViewDialog, type WideViewDialogProbe } from "./wpsWideViewPoc";
 import {
   createProbeNonce,
@@ -130,7 +181,7 @@ import {
   type WpsPreparedPlan,
   type WpsUndoRecord
 } from "./wpsPlanExecutor";
-import { buildPlanChangePreview } from "./wpsPlanChangePreview";
+import { buildPlanChangePreview, planActionLabel } from "./wpsPlanChangePreview";
 import {
   classifyWpsWriteEvidence,
   normalizeWpsExecutionOutcome,
@@ -152,6 +203,7 @@ import {
   type WpsNativeComparison
 } from "./wpsNativeComparison";
 import { fixedValueFallbackFromFormula } from "./wpsColumnMappingPlan";
+import { describeWpsFormatAction } from "./wpsFormatCapability";
 import {
   advanceWpsActivity,
   executionActivityUpdate,
@@ -207,7 +259,23 @@ import {
 } from "./wpsReadonlyAgent";
 import type { WpsPlanningTaskStatus } from "./wpsPlanningStream";
 import type { PlanningPauseResult } from "../../excel-addin/src/contracts";
-import { planningPausedEntriesFromHistory } from "@excel-bro/core";
+import {
+  attestResultSourceDependency,
+  attestSourceDependency,
+  planningPausedEntriesFromHistory,
+  trustedToolReads
+} from "@excel-bro/core";
+import { LocalResultCard as LocalResultCardView } from "../../excel-addin/src/components/LocalResultCard";
+import { useSdkToolBridge } from "../../excel-addin/src/hooks/useSdkToolBridge";
+import type { BridgeResultLookup } from "../../excel-addin/src/sdkBridgeHost";
+import type { LocalResultCard } from "../../excel-addin/src/contracts";
+import {
+  createWpsBridgeLiveContext,
+  createWpsSdkBridgeHostPorts,
+  loadWpsBridgeResult,
+  type WpsSdkBridgeLiveContext
+} from "./wpsSdkBridgeHost";
+import { wpsWorkbookBridgeIdentity } from "./wpsWorkbookReader";
 
 type ChatMessage = {
   id: string;
@@ -216,6 +284,16 @@ type ChatMessage = {
   attachmentNames?: string[];
   hasImageAttachments?: boolean;
   resultContext?: ResultContext | null;
+  /**
+   * SDK 本地查询结果卡：**只有引用与结构，没有任何值**。
+   * 真实值由本机回环端点按 `resultRef` 取回后渲染，不进模型/历史/持久账本。
+   */
+  localResult?: LocalResultCard;
+  /**
+   * 产生该结果那一轮的桥绑定。会话关闭后服务端按**授权归属**校验，
+   * 所以要回带这一轮的绑定，不能用"当前"绑定顶替。
+   */
+  localResultBinding?: BridgeResultLookup;
   activityLog?: ActivityLog;
   planPreview?: {
     title: string;
@@ -278,12 +356,15 @@ type ChatMessage = {
    */
   planningPause?: {
     turnId: string;
-    pauseType: "budget" | "model_error" | "interrupted";
+    pauseType: "budget" | "budget_exhausted" | "model_error" | "interrupted";
     reason: string;
     canContinue: boolean;
     action: "continue_checkpoint" | "regenerate" | "none";
     actionLabel: string;
     detail: string;
+    awaitingStatus?: boolean;
+    clientLastSequence?: number;
+    resolved?: boolean;
   };
   clarification?: {
     summary: string;
@@ -374,28 +455,44 @@ type WpsAgentPanelProps = {
   selectedSheetIndexes: readonly number[];
   resolveSelectedSheetIndexes?: () => readonly number[];
   scopeMode?: "auto" | "manual";
+  /**
+   * 这次对话的数据来源。
+   *
+   * `"folder"`（工作目录）时，数据由**本机服务端**读取，跟当前打开的 WPS 工作簿
+   * 毫无关系。下游因此**不得**把 `selectedSheetIndexes` 当成这次的范围 ——
+   * 那等于用一个用户没授权的工作簿顶替他要的目录。
+   */
+  scopeSource?: "workbook" | "folder";
+  /** 工作目录范围摘要；`null` = 这次不是工作目录范围（或还没确认）。 */
+  folderScope?: { folderName: string; sheetCount: number } | null;
   onAuthorizeTarget?: (indexes: number[]) => void;
+  onScopeConfirmationReady?: (handler: ((target: AuthorizedTarget) => Promise<boolean>) | null) => void;
+  onOpenScope?: () => void;
+  scopePickerOpen?: boolean;
   scopeDock: ReactNode;
 };
 
 const WPS_CHAT_STORAGE_KEY = "excel-bro.wps.chat.v1";
 const LEGACY_MODEL_CATALOG_NOTICE =
   "暂时无法读取模型配置，请点击上方模型菜单里的「重试」。已输入的内容仍保留在输入框中。";
+/** AI 窗格占**整个可用工作区**的目标百分比。与 Excel 共用同一份 `reviewAiWidthFraction`。 */
 
 /**
  * 规划暂停的成因文案（CAP-02）。
  *
  * 只按服务端给的 `pauseType` 取值 —— 这是结构化判据，不是从助手文本里读出来的。
- * 三种成因的**处置方式不同**，所以文案必须分开：
+ * 各成因的**处置方式不同**，所以文案必须分开：
  *  - `budget`：本轮计算量达到上限，可继续或换模型；
+ *  - `budget_exhausted`：累计活跃执行时间已达总时限，**不再承诺"必然可以继续"**；
  *  - `model_error`：模型连接故障，通常需要换一个可用连接；
  *  - `interrupted`：被打断（如刷新/断线），现场仍在。
  */
 const WPS_PLANNING_PAUSE_LABEL: Record<
-  "budget" | "model_error" | "interrupted",
+  "budget" | "budget_exhausted" | "model_error" | "interrupted",
   string
 > = {
   budget: "本轮处理时间已达上限，进度已保存",
+  budget_exhausted: "本轮有效运行总时长已用完，现场已保存",
   model_error: "模型连接中断，进度已保存",
   interrupted: "规划被中断，进度已保存"
 };
@@ -467,6 +564,220 @@ function turnErrorMessage(error: unknown): string {
   return redacted.length > 500 ? `${redacted.slice(0, 500)}…` : redacted;
 }
 
+/**
+ * 把「业务结果 × 关闭结果」映射成共享文案（与 Excel 端逐字同源）。
+ *
+ * 分开陈述的理由：写回成功与副本关没关是**两件事**。
+ * "副本未能自动关闭"绝不能读成"执行失败"，"原表已写回"也绝不能冒充"副本已清理"。
+ */
+export function wpsCopyCleanupState(business: ReviewCopyBusinessOutcome, copy: Parameters<typeof reviewCopyCleanupState>[0]["copy"]): ReviewCopyCleanupState {
+  return reviewCopyCleanupState({ business, copy, tempFilePath: null });
+}
+export function wpsCopyCleanupText(state: ReviewCopyCleanupState): string {
+  return [state.copy.headline, state.copy.detail, state.file.headline].filter(Boolean).join(" ");
+}
+/** 副本是否已确认收尾（可以安全释放审阅会话）。其余结果都保留现场让用户决定。 */
+export function wpsCopyRetired(state: ReviewCopyCleanupState): boolean {
+  return state.copy.outcome === "closed" || state.copy.outcome === "already_closed";
+}
+
+/**
+ * 副本状态**独立**陈述：不带业务前缀。
+ *
+ * 写回成功时业务结论已经由执行结果卡说了，这里再念一遍"已写回并验证"就是把
+ * 同一件事说两遍，还会让人以为副本状态是业务结论的一部分。
+ */
+export function wpsCopyStatusLine(state: ReviewCopyCleanupState): string {
+  return [state.copy.statusText, state.copy.detail].filter(Boolean).join(" ");
+}
+
+/**
+ * 终态的对话陈述：业务结论在前，副本处理指引与副本状态在**后**（次要）。
+ *
+ * 顺序就是主次：先回答"我的计划怎么了"，再说"副本还要你做什么"。
+ */
+export function wpsReviewOutcomeText(view: ReviewCardView): string {
+  return [
+    view.business.headline,
+    view.business.detail,
+    view.actualResult,
+    view.copyOpenNotice,
+    view.copyStatus ? `${view.copyStatus.headline} ${view.copyStatus.detail}` : null
+  ].filter(Boolean).join(" ");
+}
+
+/**
+ * WPS 端审阅卡：主卡口径与 Excel 端**共用**，只把宿主差异当入参。
+ *
+ * 真实宿主差异（不是文案推断）：WPS 的 `Window` 没有可写宽度成员，
+ * 所以 AI 窗格宽度**只能手动拖** —— `paneWidthSettable: false`。
+ */
+export function wpsReviewCard(input: {
+  outcome: ReviewOutcome;
+  scope: ReviewCardScope | null;
+  compatNotice: string | null;
+  paneNeedsResize: boolean;
+  copy: ReviewCopyCleanupState["copy"] | null;
+  executionDetail?: string | null;
+  syncScrollingEnabled?: boolean;
+  diagnostics?: Partial<ReviewCardDiagnostics>;
+}): ReviewCardView {
+  return reviewCardView({
+    ...input,
+    paneWidthSettable: false,
+    compatDetail: REVIEW_CARD_COMPAT_DETAIL["wps-native"]
+  });
+}
+
+/**
+ * 终态审阅卡：放弃 / 写回成功 / 写回失败。
+ *
+ * 它只用来生成**对话里那段陈述**（WPS 的审阅卡在终态会被撤下），所以
+ * 不再讲兼容模式怎么核对，也不带任何审阅入口。
+ */
+export function wpsTerminalCard(input: {
+  outcome: Exclude<ReviewOutcome, "reviewing">;
+  scope: ReviewCardScope | null;
+  copy: ReviewCopyCleanupState["copy"] | null;
+  staged: WpsNativeComparison;
+  executionDetail?: string | null;
+  developmentWrite: boolean;
+}): ReviewCardView {
+  return wpsReviewCard({
+    outcome: input.outcome,
+    scope: input.scope,
+    compatNotice: null,
+    paneNeedsResize: false,
+    copy: input.copy,
+    executionDetail: input.executionDetail ?? null,
+    diagnostics: wpsReviewDiagnostics(input.staged, false, input.developmentWrite)
+  });
+}
+
+/**
+ * 诊断层信息：开发环境提示、排列指引、副本标识、关闭诊断、磁盘清理。
+ *
+ * **不进首屏** —— 它们是排查用的，不是"要不要按确认"需要的。
+ */
+/**
+ * 写回入口的**唯一闸门**判据。
+ *
+ * 返回值是"为什么现在不能写回"（`null` = 可以写）。抽成纯函数是为了让它**可被直测**：
+ * 「放弃之后拿着旧回调来点」与「没勾选就来点」都必须在**同一处**被拦下 ——
+ * 只要判据只有一份，就不存在"界面拦了、回调没拦"的缝隙。
+ *
+ * 前两项是**终态**：计划或副本已经不在场（已放弃 / 已写回），写回入口整体失效。
+ * 它们必须排在授权检查之前：已经决定不写的时候，连"要不要确认授权范围"都不该发起。
+ */
+export type WpsWriteBackBlock = "no_review" | "busy" | "editing_plan" | "not_acknowledged";
+
+export function wpsWriteBackBlockReason(state: {
+  acknowledged: boolean;
+  hasPlan: boolean;
+  hasReview: boolean;
+  editingPlan: boolean;
+  busy: boolean;
+}): WpsWriteBackBlock | null {
+  if (!state.hasPlan || !state.hasReview) return "no_review";
+  if (state.busy) return "busy";
+  if (state.editingPlan) return "editing_plan";
+  if (!state.acknowledged) return "not_acknowledged";
+  return null;
+}
+
+/**
+ * **直接执行**路径的写回闸门判据（与 `wpsWriteBackBlockReason` 分工明确）。
+ *
+ * 与副本路径的差别只有一条：**不要求审阅副本在场**。其余每一条都相同 ——
+ * 没计划、忙、正在编辑计划，一样挡。
+ *
+ * 为什么不直接把 `hasReview` 改成可选：副本路径"必须先有副本"是那条路径的
+ * **全部意义**（用户核对的是副本）。放松它会让"没核对就写回"重新变成可达状态。
+ * 两条判据分开，直接执行才敢声明自己只跳过副本比对。
+ */
+export type WpsDirectWriteBackBlock = "no_plan" | "busy" | "editing_plan";
+
+export function wpsDirectWriteBackBlockReason(state: {
+  hasPlan: boolean;
+  editingPlan: boolean;
+  busy: boolean;
+}): WpsDirectWriteBackBlock | null {
+  if (!state.hasPlan) return "no_plan";
+  if (state.busy) return "busy";
+  if (state.editingPlan) return "editing_plan";
+  return null;
+}
+
+/**
+ * **异步等待回来之后**的复核：这一次写回请求还能不能继续？
+ *
+ * 与 `wpsWriteBackBlockReason` 分工不同 —— 那是**发起点**的闸门（能不能发起），
+ * 这里是**回来后**的复核（还能不能继续）。两者不可互相顶替：
+ *
+ *  - 发起时"有审阅"是真的，等回来时那份审阅可能已经被放弃了；
+ *  - 更险的是"有审阅"仍然为真，但已经**换成了另一份** —— 用户放弃之后又生成了
+ *    新副本并勾了新的确认框。此时"计划与副本都在场 + 已勾选"全部成立，
+ *    旧请求若据此继续写回，就是把**新副本的确认状态借过来**写进原表：
+ *    用户核对过的那一份从来没被写，没核对过的那一份反而被写了。
+ *
+ * 所以除了"现场还在"，还必须逐项比对身份三元组：同一次审阅、同一计划版本、
+ * 同一原工作簿。任一侧拿不到身份（`null`）一律按"已变化"处理（fail-closed）。
+ *
+ * 导出是为了让这条判据能被**直接**判定 —— 面板里"旧请求在途期间换副本"这条复合
+ * 路径目前被 `busy` 闸门整个挡在界面之外（`busy` 含 `targetGuard.checking`：写回
+ * 等待期间放弃 / 生成副本 / 发新任务的入口全是禁用的），端到端造不出来。所以它是
+ * **纵深防御**：等哪天 `busy` 不再覆盖这个窗口（或出现已排队的点击 / 快捷键 /
+ * 程序直调），判据已经在位，并被单独判定。
+ *
+ * 「现场还在」那一半由调用点判（顺带把 `plan` / `review` 的 null 收窄），这里只判
+ * **还是不是同一份现场** —— 两半都在调用点各占一行，缺一不可。
+ */
+export function wpsWriteBackStillCurrent(
+  issued: ReviewWriteBackTarget | null,
+  now: { target: ReviewWriteBackTarget | null }
+): boolean {
+  return !reviewWriteBackTargetChanged(issued, now.target);
+}
+
+/**
+ * 直接执行请求回来之后的复核：**计划版本 + 原工作簿 + 执行方式**三项全同才继续。
+ *
+ * 与副本路径的差别是"同一次审阅"换成了"同一种执行方式"：直接执行没有副本，
+ * 但它仍必须确认"我发起时看到的计划与授权，就是现在要写的那份"。
+ * 方式也必须进身份：用户在途期间切到副本比对再回来，旧请求不该按旧前提继续。
+ */
+export function wpsDirectWriteBackStillCurrent(
+  issued: DirectExecutionTarget | null,
+  now: { target: DirectExecutionTarget | null }
+): boolean {
+  return !executionModeTargetChanged(issued, now.target);
+}
+
+export function wpsReviewDiagnostics(
+  staged: WpsNativeComparison,
+  paneNeedsResize: boolean,
+  developmentWrite: boolean
+): Partial<ReviewCardDiagnostics> {
+  const restart: string[] = [];
+  if (developmentWrite) restart.push("当前 WPS JSAPI 版本仅在开发调试模式开放写入；请先在独立测试工作簿验收写入与撤销。");
+  const arrangement = [
+    "WPS 不能由代码设置 AI 窗格宽度。若两张表的可见宽度差得多，请拖动「Excel Bro」左侧分隔线手动调整。",
+    "未确认窗口重新排列时，请在 WPS「视图 → 并排比较」中手动选择本次副本。"
+  ];
+  if (paneNeedsResize) arrangement.push("AI 窗格宽度尚未确认落到目标比例。");
+  return {
+    restart,
+    arrangement,
+    identity: [
+      `原表：${redactCredentials(staged.original.Name)}`,
+      `副本：${redactCredentials(staged.copy.Name)}`,
+      `副本差异格数：${staged.changedCells.length}`
+    ],
+    close: [],
+    cleanup: ["本次没有需要清理的磁盘文件：审阅副本是宿主内存中的未保存工作簿。"]
+  };
+}
+
 function conversationTitle(messages: readonly ChatMessage[]): string {
   const firstQuestion = messages.find((message) => message.role === "user")?.text.trim();
   if (!firstQuestion) return "新对话";
@@ -514,7 +825,7 @@ function authorizationKeyOf(indexes: readonly number[]): string {
  * 因此"重新规划"不会把用户确认过的参数丢掉，也不会把它们当成新的语义。
  */
 function resumePrompt(record: TaskResumeRecord): string {
-  // 同一道题只出现**最后一次**的答案（替换发生在 `withTaskResumeConfirmation`）。
+  // 同一道题只出现**最后一次**的答案（合并由共享 agentTaskContext 完成）。
   // 早期实现直接把历史确认全部追加，于是改过答案的用户会送进去两条
   // 互相冲突的"补充确认"，模型只能替他挑一个。
   return renderConfirmedPrompt(record.originalPrompt, record.confirmations);
@@ -897,11 +1208,32 @@ function formatConversationTime(value: string): string {
   });
 }
 
+/** 是否为格式动作（走格式快照路径，预览显示格式变化而非"写入值"）。 */
+function isFormatActionType(type: string): type is "setFont" | "setAlignment" | "resizeRange" {
+  return type === "setFont" || type === "setAlignment" || type === "resizeRange";
+}
+
+/** 动作类型的短标签（预览标题用）。格式动作给明确描述，不冒充"写入值"。 */
+function actionTypeLabel(type: string): string {
+  if (type === "clearRange") return "清空内容";
+  if (type === "writeFormulas") return "写入公式";
+  if (type === "writeValues") return "写入值";
+  if (type === "setFont") return "设置字体";
+  if (type === "setAlignment") return "设置对齐";
+  if (type === "resizeRange") return "调整尺寸";
+  return "写入值";
+}
+
 export default function WpsAgentPanel({
   selectedSheetIndexes,
   resolveSelectedSheetIndexes,
   scopeMode = "manual",
+  scopeSource = "workbook",
+  folderScope = null,
   onAuthorizeTarget,
+  onScopeConfirmationReady,
+  onOpenScope,
+  scopePickerOpen = false,
   scopeDock
 }: WpsAgentPanelProps) {
   // 模型目录只包含用户真实配置的连接。初始列表为空、状态单独表达，
@@ -953,8 +1285,23 @@ export default function WpsAgentPanel({
   const [activeActivityMessageId, setActiveActivityMessageId] = useState<string | null>(null);
   const [writeProgress, setWriteProgress] = useState<string | null>(null);
   const [pendingPlan, setPendingPlan] = useState<WpsPreparedPlan | null>(null);
+  type ResultReceipt = { executionId: string; verified: boolean; undoable: boolean; record: WpsUndoRecord };
+  const [resultReview] = useState(() => new ResultReview<WpsNativeComparison, ResultReceipt, WpsResultMarks, WpsNativeComparison>());
+  const resultReviewState = useSyncExternalStore(resultReview.subscribe, resultReview.getSnapshot, resultReview.getSnapshot);
+  const [resultTitle, setResultTitle] = useState('');
+  const resultUndoRef = useRef<(id: string) => Promise<boolean>>(async () => false);
   // 原生左右子窗口只活在本次面板会话；副本矩阵绝不进入聊天历史或持久存储。
   const [stagedReview, setStagedReview] = useState<WpsNativeComparison | null>(null);
+  /**
+   * 审阅确认。**换一份副本就要重新确认** —— 用副本名做键，名字变了就归零。
+   * 与 Excel 端同一套语义：没勾选就不是"已核对"。
+   */
+  const [reviewAcknowledged, setReviewAcknowledged] = useState(false);
+  /** 执行方式：默认副本比对（多一道预览），用户可改为直接执行。 */
+  const [executionMode, setExecutionModeState] = useState<PlanExecutionMode>("copy-compare");
+  const stagedCopyKey = stagedReview ? stagedReview.copy.Name ?? null : null;
+  useEffect(() => { setReviewAcknowledged(false); }, [stagedCopyKey]);
+  // 首次生成副本时调整窗格；消息更新不会主动重新排列。
   const reviewPaneNeedsResize = useWpsReviewPaneRatio(stagedReview);
   const [pendingPlanMessageId, setPendingPlanMessageId] = useState<string | null>(null);
   const [planEditDraft, setPlanEditDraft] = useState<string | null>(null);
@@ -1022,6 +1369,7 @@ export default function WpsAgentPanel({
     checking: boolean;
     /** 核对结论：服务端说不能继续时的真实原因（展示用，不参与判定）。 */
     blockedReason: string | null;
+    canRecheck?: boolean;
   } | null>(null);
   /**
    * 续跑请求的幂等键（CAP-02 第 2 条）。
@@ -1061,6 +1409,12 @@ export default function WpsAgentPanel({
    * 这条任务" —— 那会把"我不知道"谎报成"它不存在"，进而放行一次重复规划。
    */
   const turnIdRefForStream = useRef<string | null>(null);
+  const streamCursorRef = useRef<{ turnId: string; sequence: number } | null>(null);
+  const pauseRequestedRef = useRef<AbortController | null>(null);
+  const planningInspectionRef = useRef<AbortController | null>(null);
+  const pendingInspectionMessageRef = useRef<string | null>(null);
+  // 原任务的宿主身份只驻内存，不落盘、不传给模型。
+  const planningTargetRef = useRef<WpsObjectIdentity | null>(null);
   /**
    * 当前用户任务的**稳定身份**。
    *
@@ -1090,7 +1444,7 @@ export default function WpsAgentPanel({
     identity: ReturnType<typeof captureWpsObjectIdentity> | null;
   } | null>(null);
   const retryTurnRef = useRef<(question: string, options?: {
-    intentConfirmed?: boolean; clarificationRound?: number; showUser?: boolean; targetConfirmedRetry?: boolean; images?: PendingImage[];
+    intentConfirmed?: boolean; clarificationRound?: number; showUser?: boolean; targetConfirmedRetry?: boolean; images?: PendingImage[]; messageUnderstanding?: Awaited<ReturnType<typeof understandMessage>>; taskContext?: AgentTaskContext;
   }) => void>(() => {});
   const resumeTaskRef = useRef<(message: ChatMessage) => void>(() => {});
   const targetGuard = useAuthorizedTarget({
@@ -1117,6 +1471,12 @@ export default function WpsAgentPanel({
             ? { ...message, planPreview: { ...message.planPreview, status: "cancelled" as const } } : message) })) }));
     }
   });
+  const scopeConfirmationRef = useRef<(target: AuthorizedTarget) => Promise<boolean>>(targetGuard.confirmScope);
+  scopeConfirmationRef.current = (target) => targetGuard.confirmScope(target, { continuePendingAnalysis: true });
+  useEffect(() => {
+    onScopeConfirmationReady?.((target) => scopeConfirmationRef.current(target));
+    return () => onScopeConfirmationReady?.(null);
+  }, [onScopeConfirmationReady]);
   /**
    * 这一轮该用的任务身份与要携带的确认信息：从历史继续时取自原记录，
    * 否则用当前任务的。**集中在这里**而不是散在各调用点 —— 漏掉任何一处，
@@ -1162,8 +1522,30 @@ export default function WpsAgentPanel({
   const wideViewChannelStopRef = useRef<(() => void) | null>(null);
   useEffect(() => () => wideViewChannelStopRef.current?.(), []);
   const [ruleManagerOpen, setRuleManagerOpen] = useState(false);
-  const [tools] = useState(loadTools);
+  const [tools, setTools] = useState(loadTools);
   const [queryTools] = useState(loadQueryTools);
+  // 已保存工具的「编辑计划模板」抽屉：非空表示正在编辑某个固化工具的计划 JSON。
+  const [toolPlanEdit, setToolPlanEdit] = useState<{ toolId: string; draft: string; error: string | null } | null>(null);
+  // 验证通过后、可供「保存为工具」的最新计划（绑定实际已验证的执行身份）。
+  const verifiedPlanForSaveRef = useRef<{ plan: AnalysisPlan; sourceSheetNames: string[]; executionId: string } | null>(null);
+  // 保存为工具的候选上下文（执行身份 + 授权表名），与共用的 saveCandidate 配套。
+  const saveToolContextRef = useRef<{ executionId: string; sourceSheetNames: string[] } | null>(null);
+  const [toolName, setToolName] = useState("");
+  const [toolDescription, setToolDescription] = useState("");
+  /**
+   * 保存为工具的资格与批准状态，复用 Excel 同一套状态机（`useExecutionApproval`）：
+   * `beginSaveCandidate` 重置确认项、`saveEligibility` 由 `analyzeToolEligibility` 派生。
+   */
+  const {
+    saveCandidate: saveToolCandidate,
+    approveFixedContent,
+    setApproveFixedContent,
+    approveDestructive,
+    setApproveDestructive,
+    saveEligibility,
+    beginSaveCandidate,
+    closeSaveCandidate
+  } = useExecutionApproval();
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const [copyError, setCopyError] = useState(false);
   const [newConversationNotice, setNewConversationNotice] = useState<{
@@ -1172,6 +1554,47 @@ export default function WpsAgentPanel({
   } | null>(null);
   const [newConversationConfirmOpen, setNewConversationConfirmOpen] = useState(false);
   const controllerRef = useRef<AbortController | null>(null);
+  /** 每次执行前重读的宿主现场；由 runTurn 在发起本轮规划前填好。 */
+  const wpsBridgeLiveContextRef = useRef<() => WpsSdkBridgeLiveContext>(() => ({
+    workbookName: "",
+    workbookIdentity: "",
+    sourceFingerprint: null,
+    authorizedSheetNames: [],
+    selectedSheetIndexes: [],
+    activeWorksheet: ""
+  }));
+  /**
+   * SDK 工具桥（WPS 端）。
+   *
+   * 与 Excel 端共用同一个 hook 与同一份状态机，只把"怎么读宿主"换成 JSAPI。
+   * 桥只做**读**：轮询 → 复核当前授权 → 真实读取 + 确定性计算 → 回执。
+   */
+  const sdkBridge = useSdkToolBridge({
+    hostId: "wps-et",
+    createPorts: (options, binding) =>
+      createWpsSdkBridgeHostPorts(
+        {
+          ...options,
+          liveContext: () => wpsBridgeLiveContextRef.current()
+        },
+        binding
+      )
+  });
+  const pauseCurrentTurn = () => {
+    if (!controllerRef.current) return;
+    pauseRequestedRef.current = controllerRef.current;
+    controllerRef.current.abort();
+  };
+  const recordPlanningProgress = (update: WpsReadonlyTurnProgress) => {
+    if (!update.turnId) return;
+    turnIdRefForStream.current = update.turnId;
+    const previous = streamCursorRef.current;
+    const sequence = Number.isSafeInteger(update.sequence) && update.sequence! >= 0 ? update.sequence! : 0;
+    streamCursorRef.current = { turnId: update.turnId,
+      sequence: Math.max(previous?.turnId === update.turnId ? previous.sequence : 0, sequence) };
+  };
+  const receivedSequence = (turnId: string) => streamCursorRef.current?.turnId === turnId
+    ? streamCursorRef.current.sequence : 0;
   /**
    * 建卡时用的**授权表序号**。
    *
@@ -1252,13 +1675,14 @@ export default function WpsAgentPanel({
   ].join(":");
   const {
     containerRef: messageStreamRef,
-    hasUnseenProgress,
+    awayFromBottom,
     handleScroll: handleMessageStreamScroll,
     scrollToLatest
-  } = useMessageAutoFollow(scrollSignal);
+  } = useMessageAutoFollow(scrollSignal, chatHistory.activeConversationId);
   const theme = useTheme();
   const logoLongPress = useLongPress(() => setThemeOpen(true));
-  const busy = progress !== null || writeProgress !== null || targetGuard.checking;
+  const baseBusy = progress !== null || writeProgress !== null || targetGuard.checking;
+  const busy = baseBusy || resultReviewState.pending || resultReviewState.phase === 'reviewing';
 
   /**
    * 读取模型目录。
@@ -1323,6 +1747,7 @@ export default function WpsAgentPanel({
     return () => {
       active = false;
       controllerRef.current?.abort();
+      planningInspectionRef.current?.abort();
     };
   }, [refreshModelCatalog]);
 
@@ -1421,9 +1846,9 @@ export default function WpsAgentPanel({
      * 只挑暂停、同 `turnId` 取最后一条。本函数只负责"查回来挂到卡上"。
      */
     const paused = planningPausedEntriesFromHistory(
-      messages,
+      messages.filter((message) => !message.planningPause?.resolved),
       (turnId) => {
-        const message = messages.find(
+        const message = [...messages].reverse().find(
           (item) => item.planningPause?.turnId === turnId
         );
         return message?.planningPause ?? null;
@@ -1472,6 +1897,9 @@ export default function WpsAgentPanel({
             originalPrompt: "",
             sourceMessageId: latest.messageId
           });
+          streamCursorRef.current = { turnId: latest.turnId,
+            sequence: Number.isSafeInteger(latest.payload.clientLastSequence) && latest.payload.clientLastSequence! >= 0
+              ? latest.payload.clientLastSequence! : 0 };
           setPlanningPauseReload({
             turnId: latest.turnId,
             checking: false,
@@ -1480,6 +1908,7 @@ export default function WpsAgentPanel({
           return;
         }
         setPlanningPause(null);
+        pendingInspectionMessageRef.current = latest.messageId;
         setPlanningPauseReload({
           turnId: latest.turnId,
           checking: false,
@@ -1487,17 +1916,21 @@ export default function WpsAgentPanel({
            * 不放行时如实转述服务端的拒绝理由；放行但只能重新规划时**不编理由** ——
            * 卡片会落到"已被新的任务取代"之外的中性说明，不冒充服务端的结论。
            */
-          blockedReason: inspected.view.canContinue ? null : inspected.view.reason
+          blockedReason: inspected.view.canContinue ? null : inspected.view.reason,
+          canRecheck: inspected.status.status === "running" ||
+            (inspected.status.status === "completed" && latest.payload.awaitingStatus === true)
         });
       } catch {
         // 查不到（服务重启 / 这条任务的服务端记录已不在）时保持"核对中"的
         // 保守结论：既不说"能继续"，也不说"任务没了" —— 没有证据的事不下结论。
         if (!active) return;
         setPlanningPause(null);
+        pendingInspectionMessageRef.current = latest.messageId;
         setPlanningPauseReload({
           turnId: latest.turnId,
           checking: false,
-          blockedReason: "暂时读不到这条任务的真实进度，请确认本地 AI 服务仍在运行后重试。"
+          blockedReason: "暂时读不到这条任务的真实进度，请确认本地 AI 服务仍在运行后重试。",
+          canRecheck: true
         });
       }
     })();
@@ -1761,13 +2194,9 @@ export default function WpsAgentPanel({
   useEffect(() => {
     if (authorizationKeyRef.current === authorizationKey) return;
     if (stagedReview) {
-      try {
-        discardWpsNativeComparison(stagedReview);
-        setStagedReview(null);
-      } catch {
-        // Keep the pending plan and the owned copy visible so the user can resolve it.
-        return;
-      }
+      // 授权范围变了 ⇒ 旧的审阅作废。副本已确认收尾才继续；否则保留现场让用户决定。
+      if (!wpsCopyRetired(wpsCopyCleanupState("discarded", discardWpsNativeComparison(stagedReview)))) return;
+      setStagedReview(null);
     }
     authorizationKeyRef.current = authorizationKey;
     setPendingPlan(null);
@@ -1931,9 +2360,12 @@ export default function WpsAgentPanel({
       : message));
   };
 
-  const endActivity = (activity: { id: string; startedAt: number }, outcome: ActivityOutcome) => {
+  const endActivity = (activity: { id: string; startedAt: number }, outcome: ActivityOutcome, presentation: { defaultCollapsed?: boolean } = {}) => {
     updateMessages((current) => current.map((message) => message.id === activity.id && message.activityLog
-      ? { ...message, activityLog: finishWpsActivity(message.activityLog, outcome, activity.startedAt) }
+      ? { ...message, activityLog: {
+          ...finishWpsActivity(message.activityLog, outcome, activity.startedAt),
+          ...(outcome === "completed" && presentation.defaultCollapsed === true ? { defaultCollapsed: true } : {})
+        } }
       : message));
     setActiveActivityMessageId((current) => current === activity.id ? null : current);
   };
@@ -1949,14 +2381,21 @@ export default function WpsAgentPanel({
 
   const completeNewConversation = () => {
     if (stagedReview) {
-      try {
-        discardWpsNativeComparison(stagedReview);
-        setStagedReview(null);
-      } catch {
-        append({ role: "system", text: "审阅副本未能自动关闭。请先处理副本，再新建对话；原表尚未写入。" });
+      const cleanup = wpsCopyCleanupState("discarded", discardWpsNativeComparison(stagedReview));
+      if (!wpsCopyRetired(cleanup)) {
+        append({ role: "system", text: `请先处理右侧审阅副本，再新建对话；原表尚未写入。${wpsCopyCleanupText(cleanup)}` });
         return;
       }
+      setStagedReview(null);
     }
+    planningInspectionRef.current?.abort();
+    planningInspectionRef.current = null;
+    pendingInspectionMessageRef.current = null;
+    setPlanningPause(null);
+    setPlanningPauseReload(null);
+    pauseCarryRef.current = null;
+    streamCursorRef.current = null;
+    planningTargetRef.current = null;
     const previousSaved = messages.some((message) => message.role === "user");
     if (previousSaved) {
       const conversation = createWpsConversation();
@@ -2014,6 +2453,14 @@ export default function WpsAgentPanel({
       append({ role: "system", text: "请先保存或放弃右侧审阅副本，再切换对话。" });
       return;
     }
+    planningInspectionRef.current?.abort();
+    planningInspectionRef.current = null;
+    pendingInspectionMessageRef.current = null;
+    setPlanningPause(null);
+    setPlanningPauseReload(null);
+    pauseCarryRef.current = null;
+    streamCursorRef.current = null;
+    planningTargetRef.current = null;
     clearImages();
     taskImagesRef.current.clear();
     setChatHistory((current) =>
@@ -2085,7 +2532,7 @@ export default function WpsAgentPanel({
 
   const runTurn = async (
     question: string,
-    options: { intentConfirmed?: boolean; clarificationRound?: number; showUser?: boolean; targetConfirmedRetry?: boolean; images?: PendingImage[] } = {}
+    options: { intentConfirmed?: boolean; clarificationRound?: number; showUser?: boolean; targetConfirmedRetry?: boolean; images?: PendingImage[]; messageUnderstanding?: Awaited<ReturnType<typeof understandMessage>>; taskContext?: AgentTaskContext } = {}
   ) => {
     const sentImages = options.images ?? (options.showUser === false && !pendingImages.length
       ? taskImagesRef.current.get(taskIdRef.current) ?? [] : pendingImages);
@@ -2096,29 +2543,6 @@ export default function WpsAgentPanel({
       setModelMenuOpen(true);
       return;
     }
-    if (pendingPlan) {
-      append({ role: "system", text: "请先确认或取消当前写入计划，再开始新的任务。" });
-      return;
-    }
-    // A new task cannot inherit a weak-wrapper consent from a different task.
-    // The queued retry is the SAME request after explicit target consent, not an old write.
-    if (options.showUser !== false && !options.targetConfirmedRetry) targetGuard.clearAnalysisConsent();
-    if (!(await targetGuard.checkForAnalysis(() => retryTurnRef.current(text, {
-      ...options, images: sentImages, targetConfirmedRetry: true
-    })))) return;
-    const turnSheetIndexes = [
-      ...(resolveSelectedSheetIndexes?.() ?? selectedSheetIndexes)
-    ];
-    /**
-     * 这一轮的授权身份与表头指纹。
-     *
-     * 在**发起请求之前**取：`sheetIdentity` 是建卡时的身份，`headerFingerprint`
-     * 是这一轮结构扫描实际读到的表头（响应回来后再取，所以下面才赋值）。
-     * 两者都写进澄清卡，用户作答时逐项比对。
-     */
-    const sheetIdentity = currentWpsSheetIdentity();
-    let headerFingerprint: string | undefined;
-    if (!text || busy || turnSheetIndexes.length === 0) return;
     if (pendingPlan) {
       append({ role: "system", text: "请先确认或取消当前写入计划，再开始新的任务。" });
       return;
@@ -2143,40 +2567,115 @@ export default function WpsAgentPanel({
       setModelMenuOpen(true);
       return;
     }
-    if (options.showUser !== false) {
+    /**
+     * 工作目录范围下的发送闸。
+     *
+     * 这一轮**没有**把服务端的查询/执行链路接到 WPS 上，所以这里必须明确拒绝，
+     * 而不是拿当前打开的工作簿顶上 —— 那会让用户以为"问的是目录里的文件"，
+     * 实际读的却是他屏幕上那本，属于用未经授权的对象冒充他要的数据。
+     * 判据与文案都在共享层 `workDirectorySendRefusal`（两端同一份声明）。
+     * 输入框里的字**原样保留**，用户切个范围就能直接发。
+     */
+    const folderRefusal = workDirectorySendRefusal({
+      sourceMode: scopeSource,
+      folderName: folderScope?.folderName,
+      sheetCount: folderScope?.sheetCount
+    });
+    if (folderRefusal) {
+      append({ role: "system", text: folderRefusal });
+      setPrompt(text);
+      return;
+    }
+    const conversation = messages
+      .filter((message) => message.role !== "system" && message.text.trim().length > 0)
+      .slice(-6)
+      .map((message) => ({ role: message.role as "user" | "assistant", text: message.text.slice(0, 1000) }));
+    if (options.showUser !== false && !options.targetConfirmedRetry) {
+      planningInspectionRef.current?.abort();
+      planningInspectionRef.current = null;
+      pendingInspectionMessageRef.current = null;
+      setPlanningPause(null);
+      setPlanningPauseReload(null);
+      streamCursorRef.current = null;
+      planningTargetRef.current = null;
+      pauseRequestedRef.current = null;
       localMappingResumeRef.current = null;
-      // 新的一次用户请求 = 新的一件任务。同一任务内的重新规划不会走到这里
-      // （续答、重新授权都带 `showUser: false`），所以 taskId 在任务内保持稳定。
       taskIdRef.current = newTaskId();
-      /*
-       * 上一轮的服务端任务身份作废。
-       *
-       * 留着它会让本轮断线后去查**上一件任务**的状态 —— 查到了、还"可以继续"，
-       * 于是把旧任务的结果接回本轮，用户看到的是一份不属于这次需求的东西。
-       * 身份必须与任务同生命周期：新任务 = 身份清空，等本轮的意图阶段重新上报。
-       */
       turnIdRefForStream.current = null;
       pauseCarryRef.current = null;
       resumeRequestRef.current = null;
       taskImagesRef.current.set(taskIdRef.current, sentImages);
-      // 明确放弃"旧记录"拦截：用户真的开始输入新内容了，这段历史翻篇，
-      // 后续是新写的、不再携带原始凭据。**只有这里**会清掉陈旧标记 ——
-      // 系统提示之类的追加写入不能清，否则发送闸被拦一次就失效。
-      updateMessages(
-        (current) => [
-          ...current,
-          { id: messageId(), role: "user", text, attachmentNames: sentImages.map((image) => image.name),
-            hasImageAttachments: sentImages.length > 0, createdAt: new Date().toISOString() }
-        ],
-        true
-      );
+      updateMessages((current) => [...current, {
+        id: messageId(), role: "user", text,
+        attachmentNames: sentImages.map((image) => image.name),
+        hasImageAttachments: sentImages.length > 0, createdAt: new Date().toISOString()
+      }], true);
     }
     const activity = beginActivity({
-      id: "read-schemas",
-      label: "读取已授权表结构",
-      phase: "preflight",
-      detail: "只读取字段结构，不向意图模型发送原始数据行。"
+      id: "message-intent", label: "理解消息", phase: "intent",
+      detail: "先判断是否需要工作簿上下文；尚未读取字段或数据。"
     });
+    const messageController = new AbortController();
+    controllerRef.current = messageController;
+    setProgress({ stage: "intent", message: "正在理解消息…" });
+    let messageUnderstanding: Awaited<ReturnType<typeof understandMessage>>;
+    let needsContext = false;
+    try {
+      messageUnderstanding = options.messageUnderstanding ?? await understandMessage({
+        prompt: text, conversation, imageCount: sentImages.length, modelId: effectiveModelId
+      }, messageController.signal);
+      if (messageController.signal.aborted) throw new DOMException("Aborted", "AbortError");
+      if (messageUnderstanding.kind === "conversation") {
+        append({ role: "assistant", text: messageUnderstanding.message });
+        setPrompt("");
+        clearImages();
+        endActivity(activity, "completed", { defaultCollapsed: true });
+        return;
+      }
+      needsContext = true;
+    } catch (error) {
+      endActivity(activity, error instanceof DOMException && error.name === "AbortError" ? "cancelled" : "failed");
+      if (messageController.signal.aborted && pauseRequestedRef.current === messageController) {
+        setPrompt((current) => current.trim() === text ? "" : current);
+        clearImages();
+        append({ role: "system", text: "已暂停；尚未形成可续跑检查点，不能从断点继续。原需求保留在对话中，如需处理请重新开始；未修改工作表。" });
+        pauseRequestedRef.current = null;
+      } else setPrompt(text);
+      if (!(error instanceof DOMException && error.name === "AbortError")) append({ role: "system", text: turnErrorMessage(error) });
+      return;
+    } finally {
+      if (!needsContext) {
+        if (controllerRef.current === messageController) controllerRef.current = null;
+        setProgress(null);
+      }
+    }
+    const pauseBeforeContext = () => {
+      if (controllerRef.current === messageController) controllerRef.current = null;
+      setProgress(null);
+    };
+    // The message-only model call grants no data access. Recheck the live scope now,
+    // before reading fields, including changes that happened while understanding.
+    if (!(await targetGuard.checkForAnalysis(() => retryTurnRef.current(text, {
+      ...options, images: sentImages, targetConfirmedRetry: true, messageUnderstanding
+    })))) {
+      endActivity(activity, "awaiting_input");
+      pauseBeforeContext();
+      return;
+    }
+    if (messageController.signal.aborted) {
+      endActivity(activity, "cancelled");
+      pauseBeforeContext();
+      return;
+    }
+    const turnSheetIndexes = [...(resolveSelectedSheetIndexes?.() ?? selectedSheetIndexes)];
+    const sheetIdentity = currentWpsSheetIdentity();
+    let headerFingerprint: string | undefined;
+    if (!turnSheetIndexes.length) {
+      endActivity(activity, "awaiting_input");
+      append({ role: "system", text: "请先选择需要操作的工作表。" });
+      pauseBeforeContext();
+      return;
+    }
     taskImagesRef.current.set(taskIdRef.current, sentImages);
     setPrompt("");
     clearImages();
@@ -2188,36 +2687,84 @@ export default function WpsAgentPanel({
       ));
     }
     setClarification(null);
-    const controller = new AbortController();
-    controllerRef.current?.abort();
-    controllerRef.current = controller;
-    setProgress({ stage: "reading", message: "正在读取表结构并理解消息…" });
+    const controller = messageController;
+    setProgress({ stage: "reading", message: "消息需要工作簿上下文，正在读取授权表结构…" });
     lastTurnFailedRef.current = false;
     try {
+      planningTargetRef.current = captureWpsObjectIdentity(getWpsApplication(), turnSheetIndexes);
       const result = await runWpsReadonlyTurn({
         application: getWpsApplication(),
         selectedSheetIndexes: turnSheetIndexes,
         prompt: text,
         images: sentImages,
+        taskContext: options.taskContext ?? createAgentTaskContext(
+          options.showUser === false ? resumeCarryRef.current?.originalPrompt ?? text : text,
+          options.showUser === false ? resumeCarryRef.current?.confirmations ?? [] : []
+        ),
         modelId: effectiveModelId || null,
         intentConfirmed: options.intentConfirmed,
         clarificationRound: options.clarificationRound,
-        conversation: messages
-          .filter((message) => message.role !== "system" && message.text.trim().length > 0)
-          .slice(-6)
-          .map((message) => ({
-            role: message.role as "user" | "assistant",
-            text: message.text.slice(0, 1000)
-          })),
+        messageUnderstanding,
+        conversation,
         signal: controller.signal,
         beforeRead: async () => {
           if (!(await targetGuard.checkForAnalysis())) throw new TargetConfirmationRequiredError();
         },
-        onProgress: (update) => {
+        onProgress: async (update) => {
           // 意图阶段一旦拿到服务端 taskId 就记下：断线恢复要靠它查真实状态。
-          if (update.turnId) turnIdRefForStream.current = update.turnId;
+          recordPlanningProgress(update);
           setProgress(update);
           updateActivity(activity, readonlyActivityUpdate(update));
+          // Keep the result attached to its producing task, even if planning
+          // later fails. Receiving a result never confirms or executes a plan.
+          if (update.pythonResult && update.turnId === sdkBridge.binding()?.taskId &&
+              !controller.signal.aborted) {
+            const card = update.pythonResult;
+            const binding = localResultBindingOf(card);
+            const id = `python-result-${update.turnId}-${card.resultRef}`;
+            updateMessages((messages) => messages.some((message) => message.id === id)
+              ? messages : [...messages, { id, role: "assistant", text: "隔离 Python 分析结果已生成。", createdAt: new Date().toISOString(),
+                localResult: card, localResultBinding: binding }]);
+          }
+          /*
+           * SDK 工具桥：服务端正等本机读表。
+           *
+           * 绑定**惰性**建立，且必须用**服务端给的** `turnId` —— WPS 的 turnId
+           * 由 `checkIntent` 生成，本轮开始前客户端根本拿不到，所以不能像 Excel
+           * 那样提前 begin。
+           *
+           * 同一轮内**只建一次**：`begin` 会清空 `delivered`，重建会让同一次
+           * 调用被再执行一遍（重复读表、重复算）。
+           */
+          if (!update.bridgeTool) return;
+          const turnId = update.turnId ?? turnIdRefForStream.current;
+          if (!turnId) return;
+          try {
+            const existing = sdkBridge.binding();
+            if (!existing || existing.taskId !== turnId) {
+              wpsBridgeLiveContextRef.current = () =>
+                createWpsBridgeLiveContext(getWpsApplication(), turnSheetIndexes);
+              const live = wpsBridgeLiveContextRef.current();
+              await sdkBridge.begin({
+                taskId: turnId,
+                workbookName: live.workbookName,
+                workbookIdentity: live.workbookIdentity,
+                sourceFingerprint: live.sourceFingerprint,
+                signal: controller.signal,
+                liveContext: () => wpsBridgeLiveContextRef.current(),
+                onProgress: ({ scannedRows, totalRows, sheet }) => {
+                  setProgress({
+                    stage: "reading",
+                    message: `正在读取「${sheet}」：${scannedRows} / ${totalRows} 行`
+                  });
+                }
+              });
+            }
+            sdkBridge.handleProgressEvent(update);
+          } catch {
+            // 读不到宿主现场就不建桥：复核会一律拒绝，模型拿到固定错误码继续，
+            // 而不是把这一轮规划卡死。
+          }
         }
       });
       headerFingerprint = await applyTurnResult(result, {
@@ -2228,13 +2775,27 @@ export default function WpsAgentPanel({
         images: sentImages
       });
     } catch (error) {
-      if (sentImages.length) { setPendingImages(sentImages); setPrompt(text); }
+      const manualPause = error instanceof DOMException && error.name === "AbortError" && pauseRequestedRef.current === controller;
+      if (sentImages.length && !manualPause) { setPendingImages(sentImages); setPrompt(text); }
       if (error instanceof TargetConfirmationRequiredError) {
         endActivity(activity, "awaiting_input");
         setPrompt(text);
       } else if (error instanceof DOMException && error.name === "AbortError") {
-        endActivity(activity, "cancelled");
-        append({ role: "system", text: "任务已停止；未确认的计划不会修改工作表。" });
+        endActivity(activity, manualPause ? "awaiting_input" : "cancelled");
+        if (manualPause) {
+          // 已提交需求保留在原任务，不重新塞进普通发送入口。
+          setPrompt((current) => current.trim() === text ? "" : current);
+          clearImages();
+          pauseRequestedRef.current = null;
+          if (turnIdRefForStream.current) {
+            const turnId = turnIdRefForStream.current;
+            const cardId = rememberPlanningInterruption(turnId, text, turnSheetIndexes, options.clarificationRound ?? 0);
+            // 自动核对一次，只查询/取回原结果；续跑仍由用户单独确认。
+            await reconcileInterruptedTurn(turnId, text, turnSheetIndexes, cardId);
+          } else {
+            append({ role: "system", text: "已暂停；尚未形成可续跑检查点，不能从断点继续。原需求保留在对话中，如需处理请重新开始；未修改工作表。" });
+          }
+        } else append({ role: "system", text: "任务已停止；未确认的计划不会修改工作表。" });
       } else {
         endActivity(activity, "failed");
         lastTurnFailedRef.current = true;
@@ -2265,8 +2826,13 @@ export default function WpsAgentPanel({
         }
       }
     } finally {
-      if (controllerRef.current === controller) controllerRef.current = null;
-      setProgress(null);
+      // 停轮询但**保留绑定**：本轮结果卡要在会话关闭之后按引用取值，
+      // 服务端校验的是授权归属（claim）而不是活跃会话。
+      sdkBridge.end();
+      if (controllerRef.current === controller) {
+        controllerRef.current = null;
+        setProgress(null);
+      }
     }
   };
 
@@ -2285,111 +2851,183 @@ export default function WpsAgentPanel({
    * 查询本身失败（后端仍未起）→ 保守处理：既不重发也不谎称任务不存在，
    * 只提示"稍后重试核对"。
    */
+  // 中断只是客户端事实，不伪造服务端检查点。先留身份，再核对真实状态。
+  const rememberPlanningInterruption = (
+    turnId: string, text: string, indexes: readonly number[], round: number,
+    sourceMessageId?: string
+  ) => {
+    pauseCarryRef.current = { turnId, originalPrompt: text, selectedSheetIndexes: [...indexes], clarificationRound: round };
+    const metadata: NonNullable<ChatMessage["planningPause"]> = {
+      turnId, pauseType: "interrupted", reason: "已暂停接收进度，正在核对原任务；未写入工作表。",
+      canContinue: false, action: "none", actionLabel: "核对任务状态", detail: "只查询原任务，不重发需求。",
+      awaitingStatus: true, clientLastSequence: receivedSequence(turnId)
+    };
+    const id = sourceMessageId ?? append({ role: "assistant", text: "", planningPause: metadata });
+    if (sourceMessageId) updateMessages((items) => items.map((item) => item.id === id ? { ...item, planningPause: metadata } : item));
+    pendingInspectionMessageRef.current = id;
+    setPlanningPause(null);
+    setPlanningPauseReload({ turnId, checking: false, blockedReason: null, canRecheck: true });
+    return id;
+  };
+
+  const checkOriginalPlanningTarget = async (indexes: readonly number[]) => {
+    if (!(await targetGuard.check())) return false;
+    const selected = [...(resolveSelectedSheetIndexes?.() ?? selectedSheetIndexes)].sort((a, b) => a - b);
+    const original = [...indexes].sort((a, b) => a - b);
+    if (JSON.stringify(selected) !== JSON.stringify(original) ||
+        (planningTargetRef.current && verifyWpsObjectIdentity(getWpsApplication(), planningTargetRef.current) !== "same")) {
+      append({ role: "system", text: "原任务的工作簿或授权范围已变化；不会继续旧任务或写入原表。请按当前范围重新生成预览。" });
+      return false;
+    }
+    return true;
+  };
+
   const reconcileInterruptedTurn = async (
     turnId: string,
     text: string,
-    turnSheetIndexes: readonly number[]
+    turnSheetIndexes: readonly number[],
+    sourceMessageId?: string
   ) => {
-    setProgress({ stage: "answering", message: "连接中断，正在核对该任务的真实进度…" });
-    let status: WpsPlanningTaskStatus;
+    if (planningInspectionRef.current) return;
+    const inspection = new AbortController();
+    planningInspectionRef.current = inspection;
+    controllerRef.current = inspection;
+    if (!sourceMessageId) {
+      rememberPlanningInterruption(turnId, text, turnSheetIndexes, 0);
+      sourceMessageId = pendingInspectionMessageRef.current ?? undefined;
+    }
+    const current = () => !inspection.signal.aborted && planningInspectionRef.current === inspection;
+    const settleInspection = (reason: string | null, canRecheck: boolean) => {
+      setPlanningPauseReload({ turnId, checking: false, blockedReason: reason, canRecheck });
+    };
+    const replaceCard = (metadata: NonNullable<ChatMessage["planningPause"]>) => {
+      updateMessages((items) => items.map((item) => item.id === sourceMessageId ? { ...item, planningPause: metadata } : item));
+    };
+    setPlanningPauseReload({ turnId, checking: true, blockedReason: null });
+    setProgress({ stage: "answering", message: "正在核对原任务的真实进度…" });
     try {
-      status = await inspectWpsPlanningTask(turnId);
-    } catch (error) {
-      /*
-       * 区分两件事：**服务端说没有这条任务**（404，可以重发）与
-       * **读不到服务端**（后端没起，禁止重发 —— 那只是把同样的失败再跑一遍）。
-       * 只有前者才放行"重新发送"。
-       */
-      const notFound =
-        error instanceof ApiRequestError &&
-        (error.status === 404 || error.code === "PLANNING_TASK_NOT_FOUND");
-      append({
-        role: "system",
-        text: notFound
-          ? "服务端没有这条任务的记录，可以重新发送需求。本次未修改工作表。"
-          : "连接中断，且暂时读不到该任务的真实进度。请先确认本地 AI 服务已启动，稍后重试核对；在核对清楚之前请不要重复发送同一需求，以免与原任务重复规划。"
-      });
-      if (!notFound) setPrompt(text);
-      return;
-    }
-    const view = wpsPlanningResumeView(status);
-    if (status.status === "completed" && status.result) {
-      // 任务其实跑完了，只是回程断线：把结果接回同一条处理链，不重发。
-      const activity = beginActivity({
-        id: "planning-recover",
-        label: "取回已完成的规划结果",
-        phase: "preflight",
-        detail: "任务在服务端已完成；直接取回结果，不重新规划、不写单元格。"
-      });
+      let status: WpsPlanningTaskStatus;
       try {
-        await applyTurnResult(status.result as WpsTurnResult, {
-          activity,
-          text,
-          turnSheetIndexes: [...turnSheetIndexes],
-          clarificationRound: 0,
-          images: []
+        status = await inspectWpsPlanningTask(turnId, inspection.signal);
+        if (!current()) return;
+      } catch (error) {
+        if (!current()) return;
+        /*
+         * 区分两件事：**服务端说没有这条任务**（404，可以重发）与
+         * **读不到服务端**（后端没起，禁止重发 —— 那只是把同样的失败再跑一遍）。
+         * 只有前者才放行"重新发送"。
+         */
+        const notFound =
+          error instanceof ApiRequestError &&
+          (error.status === 404 || error.code === "PLANNING_TASK_NOT_FOUND");
+        append({
+          role: "system",
+          text: notFound
+            ? "服务端没有这条任务的记录，可以重新发送需求。本次未修改工作表。"
+            : "连接中断，且暂时读不到该任务的真实进度。请先确认本地 AI 服务已启动，稍后重试核对；在核对清楚之前请不要重复发送同一需求，以免与原任务重复规划。"
         });
-      } catch (applyError) {
-        endActivity(activity, applyError instanceof TargetConfirmationRequiredError ? "awaiting_input" : "failed");
-        append({ role: "system", text: turnErrorMessage(applyError) });
+        if (notFound) replaceCard({ turnId, pauseType: "interrupted", reason: "服务端没有该任务记录，不能从检查点继续。",
+          canContinue: false, action: "none", actionLabel: "", detail: "原需求保留在对话中；如需处理请重新开始任务。",
+          awaitingStatus: false, clientLastSequence: receivedSequence(turnId) });
+        settleInspection(notFound ? "服务端没有该任务记录，不能从检查点继续。" : "暂时读不到原任务状态，请稍后核对。", !notFound);
+        return;
       }
-      return;
-    }
-    if (status.status === "running") {
+      const view = wpsPlanningResumeView(status);
+      if (status.status === "completed" && status.result) {
+        if (!(await checkOriginalPlanningTarget(turnSheetIndexes)) || !current()) {
+          if (current()) settleInspection("请先核对原任务的数据范围，再取回结果。", true);
+          return;
+        }
+        // 任务其实跑完了，只是回程断线：把结果接回同一条处理链，不重发。
+        const activity = beginActivity({
+          id: "planning-recover",
+          label: "取回已完成的规划结果",
+          phase: "preflight",
+          detail: "任务在服务端已完成；直接取回结果，不重新规划、不写单元格。"
+        });
+        try {
+          await applyTurnResult(status.result as WpsTurnResult, {
+            activity,
+            text,
+            turnSheetIndexes: [...turnSheetIndexes],
+            clarificationRound: pauseCarryRef.current?.clarificationRound ?? 0,
+            images: []
+          });
+          settleInspection("任务已完成，结果已取回。", false);
+          replaceCard({ turnId, pauseType: "interrupted", reason: "任务已完成，结果已取回。", canContinue: false,
+            action: "none", actionLabel: "", detail: "未自动写入。", resolved: true, clientLastSequence: receivedSequence(turnId) });
+          pendingInspectionMessageRef.current = null;
+          pauseCarryRef.current = null;
+        } catch (applyError) {
+          endActivity(activity, applyError instanceof TargetConfirmationRequiredError ? "awaiting_input" : "failed");
+          append({ role: "system", text: turnErrorMessage(applyError) });
+          settleInspection("未能接回结果；请核对原任务的数据范围后重试。", true);
+        }
+        return;
+      }
+      if (status.status === "running") {
+        settleInspection("原任务仍在服务端处理中；稍后核对，不重复规划。", true);
+        append({
+          role: "system",
+          text: "原任务仍在服务端处理中。已保留它的身份，**请不要重复发送同一需求**；稍后可在本卡片上核对状态或取回结果。"
+        });
+        return;
+      }
+      if (view.canContinue && view.action === "continue_checkpoint") {
+        if (!(await checkOriginalPlanningTarget(turnSheetIndexes)) || !current()) {
+          if (current()) settleInspection("请先核对原任务的数据范围。", true);
+          return;
+        }
+        /*
+         * 可续跑：落一张暂停卡，而不是让用户重发。
+         *
+         * 用**服务端刚返回的真实状态**建卡，并记下续跑上下文 —— 与正常暂停
+         * 路径共用同一张卡与同一个处理链。
+         */
+        pauseCarryRef.current = {
+          turnId,
+          originalPrompt: text,
+          selectedSheetIndexes: [...turnSheetIndexes],
+          clarificationRound: pauseCarryRef.current?.clarificationRound ?? 0
+        };
+        const metadata: NonNullable<ChatMessage["planningPause"]> = {
+          turnId, pauseType: status.pauseType ?? "interrupted", reason: status.reason ?? "已核实可续跑检查点。",
+          canContinue: true, action: view.action, actionLabel: view.actionLabel, detail: view.detail,
+          clientLastSequence: receivedSequence(turnId)
+        };
+        replaceCard(metadata);
+        setPlanningPause({
+          turnId,
+          payload: planningPauseFromStatus(status, null),
+          view,
+          originalPrompt: text,
+          sourceMessageId: sourceMessageId!
+        });
+        settleInspection(null, false);
+        pendingInspectionMessageRef.current = null;
+        append({
+          role: "system",
+          text: "已核实原任务的可续跑检查点。点击继续才会接续规划；**不必重复发送需求**，写入仍需另行确认。"
+        });
+        return;
+      }
       append({
         role: "system",
-        text: "连接中断，但该任务仍在服务端处理中。已保留它的身份，**请不要重复发送同一需求**；稍后可在本卡片上继续或查看结果。"
+        text: `该任务当前不能精确续跑：${view.reason} 原需求仍保留；不会自动重新规划。`
       });
-      return;
+      replaceCard({ turnId, pauseType: status.pauseType ?? "interrupted", reason: view.reason,
+        canContinue: false, action: "none", actionLabel: "", detail: view.detail, awaitingStatus: false,
+        clientLastSequence: receivedSequence(turnId) });
+      settleInspection(view.reason, false);
+    } finally {
+      if (planningInspectionRef.current === inspection) {
+        if (inspection.signal.aborted) settleInspection("已暂停状态核对；尚未继续原任务。", true);
+        if (pauseRequestedRef.current === inspection) pauseRequestedRef.current = null;
+        planningInspectionRef.current = null;
+        if (controllerRef.current === inspection) controllerRef.current = null;
+        setProgress(null);
+      }
     }
-    if (view.canContinue && view.action === "continue_checkpoint") {
-      /*
-       * 可续跑：落一张暂停卡，而不是让用户重发。
-       *
-       * 用**服务端刚返回的真实状态**建卡，并记下续跑上下文 —— 与正常暂停
-       * 路径共用同一张卡与同一个处理链。
-       */
-      pauseCarryRef.current = {
-        turnId,
-        originalPrompt: text,
-        selectedSheetIndexes: [...turnSheetIndexes],
-        clarificationRound: 0
-      };
-      setPlanningPause({
-        turnId,
-        payload: planningPauseFromStatus(status, null),
-        view,
-        originalPrompt: text,
-        sourceMessageId: append({
-          role: "assistant",
-          text: "",
-          planningPause: {
-            turnId,
-            /*
-             * 落盘的暂停卡字段必须**非空**：`ChatMessage.planningPause` 是
-             * 结构化记录，界面据此渲染状态文案。服务端没给 `pauseType` 时
-             * 归为 `interrupted`（执行器中断，现场完整）——这是"有任务但
-             * 成因未知"里最保守的一档，不等于"预算用完"。
-             */
-            pauseType: status.pauseType ?? "interrupted",
-            reason: status.reason ?? "本轮处理暂停，当前进度已保存。",
-            canContinue: status.canContinue === true,
-            action: view.action,
-            actionLabel: view.actionLabel,
-            detail: view.detail
-          }
-        })
-      });
-      append({
-        role: "system",
-        text: "连接中断，但该任务的规划现场已安全保存在服务端。已为你保留它，**不必重复发送需求**。"
-      });
-      return;
-    }
-    append({
-      role: "system",
-      text: `连接中断。该任务当前不能精确续跑：${view.reason} 请不要重复发送同一需求，以免重复规划。`
-    });
   };
 
   /**
@@ -2598,6 +3236,9 @@ export default function WpsAgentPanel({
           headerFingerprint
         });
       } else if (result.kind === "plan") {
+        if (sdkBridge.binding()?.taskId === result.turnId && sdkBridge.failure()) {
+          throw new Error('本轮本地读取未通过现场核对，请重新读取后生成结果；原表未写入。');
+        }
         setProgress({ stage: "answering", message: "正在校验写入计划和授权边界…" });
         updateActivity(activity, {
           id: "preflight-plan",
@@ -2619,11 +3260,25 @@ export default function WpsAgentPanel({
               selectedNames,
               metadata.sheets.map((sheet) => sheet.name)
             );
+        /*
+         * 计划的**实际来源依赖**（与 Excel 端逐字同源）：
+         * - 由本地结果编译出的计划（带 `localResultRef`）：来源由服务端按"实际
+         *   交给执行器的输入句柄"认定，取它与本端记账的**交集**；
+         * - 其余计划：只认本端这一轮桥上的确定性读取记录（`recordTrustedToolReads`
+         *   在读取那一刻记账）。没有记录 = 依赖不确定 = 删掉该字段。
+         * 缺失这条，WPS 端的恢复登记会恒判"依赖不确定"，与 Excel 端分叉。
+         */
+        const trustedReads = trustedToolReads(
+          result.turnId ?? turnIdRefForStream.current ?? ""
+        );
+        const planWithDependency = normalizedPlan.localResultRef
+          ? attestResultSourceDependency(normalizedPlan, trustedReads ? [trustedReads] : [])
+          : attestSourceDependency(normalizedPlan, trustedReads);
         if (result.computedLocally && !result.sourceSnapshots?.length) {
           throw new Error("本地映射计划缺少源区域快照，不能安全预览写入。");
         }
         if (!(await targetGuard.check())) throw new TargetConfirmationRequiredError();
-        const prepared = prepareWpsPlan(application, turnSheetIndexes, normalizedPlan, result.sourceSnapshots);
+        const prepared = prepareWpsPlan(application, turnSheetIndexes, planWithDependency, result.sourceSnapshots);
         endActivity(activity, "awaiting_input");
         setPendingPlan(prepared);
         setPendingPlanMessageId(append({
@@ -2650,6 +3305,8 @@ export default function WpsAgentPanel({
          * （`wpsPlanningResumeView`），不看助手文本、不猜业务关键词。
          */
         endActivity(activity, "awaiting_input");
+        setPrompt((current) => current.trim() === text ? "" : current);
+        if (sentImages.length) clearImages();
         const pauseView = wpsPlanningResumeView(result.pause);
         /*
          * 记下"这是哪一件事"的上下文，供续跑结果回接处理链时使用。
@@ -2676,7 +3333,8 @@ export default function WpsAgentPanel({
               canContinue: result.pause.canContinue,
               action: pauseView.action,
               actionLabel: pauseView.actionLabel,
-              detail: pauseView.detail
+              detail: pauseView.detail,
+              clientLastSequence: receivedSequence(result.pause.turnId)
             }
           })
         });
@@ -2692,10 +3350,33 @@ export default function WpsAgentPanel({
         append({
           role: result.outcome === "failed" ? "system" : "assistant",
           text: result.message,
-          resultContext: result.resultContext
+          resultContext: result.resultContext,
+          // SDK 本地结果卡：只带引用与结构，值由本机回环按引用取回后渲染。
+          localResult: result.localResult ?? undefined,
+          // 会话关闭后服务端按授权归属校验，所以要带上**这一轮**的绑定。
+          localResultBinding: localResultBindingOf(result.localResult)
         });
       }
     return headerFingerprint;
+  };
+
+  /**
+   * 把"这一轮"的桥绑定固化到消息上。
+   *
+   * 结果卡的取值发生在**会话结束之后**，此时不能再问控制器"当前绑定是谁"——
+   * 下一轮可能已经换了绑定。所以按消息快照一份：任务身份 + 工作簿身份 + 源指纹。
+   */
+  const localResultBindingOf = (card: unknown): BridgeResultLookup | undefined => {
+    if (!card) return undefined;
+    const binding = sdkBridge.binding();
+    if (!binding) return undefined;
+    return {
+      taskId: binding.taskId,
+      hostId: binding.hostId,
+      workbookName: binding.workbookName,
+      workbookIdentity: binding.workbookIdentity,
+      sourceFingerprint: binding.sourceFingerprint
+    };
   };
 
   retryTurnRef.current = (question, options) => { void runTurn(question, options); };
@@ -2756,7 +3437,9 @@ export default function WpsAgentPanel({
          * 谎报成"重新跑了一遍"）。
          */
         setPlanningPause((current) => (current ? { ...current, view: { ...current.view, detail: "暂时读不到服务端进度，尚未做任何继续操作。" } } : current));
-        setProgress(null);
+        pendingInspectionMessageRef.current = pause.sourceMessageId;
+        setPlanningPauseReload({ turnId: pause.turnId, checking: false, blockedReason: "暂时读不到原任务状态。", canRecheck: true });
+                setProgress(null);
         append({
           role: "system",
           text: "无法读取该任务的真实进度，未做任何继续操作。请确认本地 AI 服务仍在运行后重试。"
@@ -2767,6 +3450,9 @@ export default function WpsAgentPanel({
       const view = wpsPlanningResumeView(status);
       if (!view.canContinue || view.action !== "continue_checkpoint") {
         setPlanningPause((current) => (current ? { ...current, view } : current));
+        pendingInspectionMessageRef.current = pause.sourceMessageId;
+        setPlanningPauseReload({ turnId: pause.turnId, checking: false, blockedReason: view.reason,
+          canRecheck: status.status === "running" || status.status === "completed" });
         append({
           role: "system",
           text: `该任务当前不能精确续跑：${view.reason}`
@@ -2781,22 +3467,25 @@ export default function WpsAgentPanel({
        * 上，等于用 A 表的意图去写 B 表。这里对着**当下**的宿主重新核对，
        * 与"重新预览"走同一个判据（`checkAuthorizedTarget`），不另立一套。
        */
-      if (!(await targetGuard.check())) {
+      if (!(await checkOriginalPlanningTarget(pauseCarryRef.current?.selectedSheetIndexes ?? selectedSheetIndexes))) {
         append({
           role: "system",
           text: "数据范围在继续前发生了变化，已停止本次继续；原表未写入。请重新确认数据范围后再继续。"
         });
         return;
       }
+      if (controller.signal.aborted) throw new DOMException("Aborted", "AbortError");
       setProgress({ stage: "answering", message: "正在从上次保存的进度继续…" });
       // 第 3 步：按检查点继续。`resumeWpsPlanning` 内部再查一次状态并取
       // revision/游标；这里不再自己拼请求体，避免"界面拿一份旧 revision 去 CAS"。
       const continued = await resumeWpsPlanning({
         turnId: pause.turnId,
         requestId,
-        modelId: modelManagement.selectedModelId ?? undefined,
+        // 不传 modelId = 保留原模型。换模型必须另行明确确认，不能跟随全局选择。
+        afterSequence: Math.min(receivedSequence(pause.turnId), status.lastSequence),
         signal: controller.signal,
         onProgress: (event) => {
+          recordPlanningProgress(event);
           setProgress({
             stage: "answering",
             stepId: event.stepId || "planning-continue",
@@ -2812,11 +3501,16 @@ export default function WpsAgentPanel({
       if (!continued.outcome) {
         const refusedView = wpsPlanningResumeView(continued.status);
         setPlanningPause((current) => (current ? { ...current, view: refusedView } : current));
+        pendingInspectionMessageRef.current = pause.sourceMessageId;
+        setPlanningPauseReload({ turnId: pause.turnId, checking: false, blockedReason: refusedView.reason,
+          canRecheck: continued.status.status === "running" || continued.status.status === "completed" });
         append({ role: "system", text: `未能继续该任务：${refusedView.reason}` });
         return;
       }
       // 继续成功后这条暂停卡退役：任务已经重新动起来了。
       setPlanningPause(null);
+      updateMessages((items) => items.map((item) => item.id === pause.sourceMessageId && item.planningPause
+        ? { ...item, planningPause: { ...item.planningPause, resolved: true, clientLastSequence: receivedSequence(pause.turnId) } } : item));
       resumeRequestRef.current = null;
       const outcome = continued.outcome;      if (outcome.kind === "planning_pause") {
         // 又暂停了（例如再次触发预算闸）：落一张新卡，而不是复用旧卡。
@@ -2844,10 +3538,12 @@ export default function WpsAgentPanel({
               canContinue: outcome.canContinue,
               action: nextView.action,
               actionLabel: nextView.actionLabel,
-              detail: nextView.detail
+              detail: nextView.detail,
+              clientLastSequence: receivedSequence(outcome.turnId)
             }
           })
         });
+        // 再次暂停仍沿用原任务的授权与需求；不能在 finally 清掉。
         return;
       }
       /*
@@ -2880,6 +3576,7 @@ export default function WpsAgentPanel({
           clarificationRound: carry?.clarificationRound ?? 0,
           images: []
         });
+        pauseCarryRef.current = null;
       } catch (error) {
         endActivity(activity, error instanceof TargetConfirmationRequiredError ? "awaiting_input" : "failed");
         throw error;
@@ -2891,17 +3588,26 @@ export default function WpsAgentPanel({
           text: "数据范围在继续过程中发生了变化，已暂停本次继续；原表未写入。请重新确认数据范围。"
         });
       } else if (error instanceof DOMException && error.name === "AbortError") {
-        append({ role: "system", text: "已停止继续；未确认的计划不会修改工作表。" });
+        if (pauseRequestedRef.current === controller) {
+          const carry = pauseCarryRef.current;
+          const text = carry?.originalPrompt ?? pause.originalPrompt;
+          const indexes = carry?.selectedSheetIndexes ?? selectedSheetIndexes;
+          const cardId = rememberPlanningInterruption(pause.turnId, text,
+            carry?.selectedSheetIndexes ?? selectedSheetIndexes, carry?.clarificationRound ?? 0, pause.sourceMessageId);
+          pauseRequestedRef.current = null;
+          await reconcileInterruptedTurn(pause.turnId, text, indexes, cardId);
+        } else append({ role: "system", text: "已停止继续；未确认的计划不会修改工作表。" });
       } else {
         append({ role: "system", text: turnErrorMessage(error) });
       }
     } finally {
-      if (controllerRef.current === controller) controllerRef.current = null;
+      if (controllerRef.current === controller) {
+        controllerRef.current = null;
+        setProgress(null);
+      }
       resumingPauseRef.current = false;
-      // 续跑上下文只在"这一次继续"期间有意义：无论成败都清掉，
-      // 免得下一张卡带着上一件的原需求/授权范围去回接结果。
-      pauseCarryRef.current = null;
-      setProgress(null);
+      updateMessages((items) => items.map((item) => item.id === pause.sourceMessageId && item.planningPause
+        ? { ...item, planningPause: { ...item.planningPause, clientLastSequence: receivedSequence(pause.turnId) } } : item));
     }
   };
 
@@ -2953,32 +3659,198 @@ export default function WpsAgentPanel({
 
   const discardStagedPlan = () => {
     if (!stagedReview || busy) return;
-    try {
-      discardWpsNativeComparison(stagedReview);
-      setStagedReview(null);
-      markPlanPreview("cancelled");
-      /*
-       * 用户显式放弃：这是**终态**，而且是在任何宿主写入之前。
-       * 置成 `unavailable` 之后，重开面板也不会再把它摆成"可以继续"。
-       */
-      advanceTaskResume(pendingPlanMessageId, {
-        phase: "preview_ready",
-        blocker: "none",
-        resumability: "unavailable",
-        writeState: "not_written"
-      });
-      setPendingPlan(null);
-      setPendingPlanMessageId(null);
-      append({ role: "assistant", text: "已放弃右侧审阅副本；左侧原表未写入。" });
-    } catch (error) {
-      append({ role: "system", text: turnErrorMessage(error) });
-    }
+    /*
+     * 「放弃变更」是**终态**：确认框与写回入口立刻撤下，同一份副本此后不可能再写回。
+     *
+     * 副本清理失败**不恢复审阅状态** —— 它只作为**次要**状态跟在"计划已取消"后面，
+     * 绝不冲淡主结论。
+     */
+    const cleanup = wpsCopyCleanupState("discarded", discardWpsNativeComparison(stagedReview));
+    const outcomeText = wpsReviewOutcomeText(wpsTerminalCard({
+      outcome: "discarded",
+      scope: pendingPlan ? {
+        locations: reviewScopeLocations(pendingPlan.plan.actions),
+        changes: reviewChangeSummary(pendingPlan.plan.actions),
+        totalCells: pendingPlan.totalCells
+      } : null,
+      copy: cleanup.copy,
+      staged: stagedReview,
+      developmentWrite
+    }));
+    setStagedReview(null);
+    markPlanPreview("cancelled");
+    /*
+     * 用户显式放弃：这是**终态**，而且是在任何宿主写入之前。
+     * 置成 `unavailable` 之后，重开面板也不会再把它摆成"可以继续"。
+     */
+    advanceTaskResume(pendingPlanMessageId, {
+      phase: "preview_ready",
+      blocker: "none",
+      resumability: "unavailable",
+      writeState: "not_written"
+    });
+    setPendingPlan(null);
+    setPendingPlanMessageId(null);
+    append({ role: "assistant", text: outcomeText });
   };
 
-  const confirmPendingPlan = async () => {
+  /**
+   * 写回入口的**实时**事实。
+   *
+   * `confirmPendingPlan` 是渲染期闭包：旧闭包会一直看到它诞生那一刻的
+   * `pendingPlan` / `stagedReview` / `reviewAcknowledged`。放弃之后若有人拿着
+   * 放弃之前那个闭包再调用一次（已排队的点击、快捷键、程序直调），闭包里的
+   * "计划还在"就是**过期事实** —— 拿它当判据会把已经放弃的计划写进原表。
+   *
+   * 所以写回闸门**只读这里的实时值**，闭包变量一个字都不参与判断。
+   * 每次渲染都会刷新，包括放弃（计划与副本被清空）那一次。
+   *
+   * `target` 是这份现场的**身份三元组**（同一次审阅 / 同一计划版本 / 同一原工作簿），
+   * 供异步授权检查回来后复核用：光看"当前有审阅"会把**新副本**的确认状态借给旧请求。
+   */
+  const liveWriteBack = useRef({
+    acknowledged: reviewAcknowledged,
+    plan: pendingPlan,
+    review: stagedReview,
+    editingPlan: planEditDraft !== null,
+    busy: baseBusy,
+    executionMode,
+    target: null as ReviewWriteBackTarget | null,
+    directTarget: null as DirectExecutionTarget | null
+  });
+  liveWriteBack.current = {
+    acknowledged: reviewAcknowledged,
+    plan: pendingPlan,
+    review: stagedReview,
+    editingPlan: planEditDraft !== null,
+    busy: baseBusy,
+    executionMode,
+    // 计划与副本都在场才谈得上"同一份现场"；任一缺席 ⇒ 身份为 null ⇒ 一律按已变化处理。
+    target: stagedReview && pendingPlan
+      ? {
+          review: stagedReview,
+          plan: pendingPlan,
+          workbookIdentity: String(pendingPlan.authorization.workbookFullName ?? "")
+        }
+      : null,
+    // 直接执行的身份里**没有审阅**（没有副本），但有执行方式：切到副本比对再回来时前提已变。
+    directTarget: pendingPlan
+      ? {
+          review: null,
+          plan: pendingPlan,
+          workbookIdentity: String(pendingPlan.authorization.workbookFullName ?? ""),
+          mode: executionMode
+        }
+      : null
+  };
+
+  /**
+   * 一次写回正在跑。
+   *
+   * `busy` 是渲染期派生值：同一 tick 里的第二次调用读到的还是 false
+   * （`setWriteProgress` 要等下一次渲染才生效）。这个 ref 同步置位，
+   * 重复派发（双击、旧闭包连点）在这里就断掉，写不了两次。
+   */
+  const writeBackInFlight = useRef(false);
+
+  /**
+   * 异步等待回来之后，这一次写回请求还能不能继续？
+   *
+   * 判两件事，缺一不可：
+   *  1. 现场还在（勾选未撤、计划与副本都在场）；
+   *  2. **还是同一份现场** —— 同一次审阅、同一计划版本、同一原工作簿
+   *     （`reviewWriteBackTargetChanged`）。
+   *
+   * 只判第 1 条是不够的：用户放弃之后又生成了**新副本**并勾了新的确认框时，现场
+   * 同样"在"，但那是**别人的**确认 —— 旧请求借它继续写回，结果是用户核对过的那一份
+   * 从来没被写，没核对过的那一份反而被写进原表。
+   *
+   * 导出是为了让这条判据能被**直接**判定：面板里"旧请求在途期间换副本"这条复合路径
+   * 目前被 `busy` 闸门整个挡在界面之外（`busy` 含 `targetGuard.checking`：写回等待期间
+   * 放弃 / 生成副本 / 发新任务的入口全是禁用的，`runTurn` 自己也挡 `busy`），端到端
+   * 造不出来。所以这段防护是**纵深防御**：等哪天 `busy` 不再覆盖这个窗口（或出现
+   * 已排队的点击 / 快捷键 / 程序直调），判据已经在位并被单独判定。
+   */
+  /**
+ * 一次 WPS 写入。
+ *
+ * `direct = true` 表示「直接执行到原表」：**只**跳过副本比对这一步 ——
+ * 不做 `verifyWpsNativeComparison`、不做与副本的最终对照、不关任何副本。
+ * 授权闸、执行前计划复核、授权范围复核、恢复标记、服务端账本首写前登记、
+ * 动作回读、撤销入口、失败证据分级**全部共用同一段代码**，这是"直接执行没跳过
+ * 任何守卫"唯一可靠的证据形式：守卫只有一份实现，副本路径也没有多跑一步。
+ *
+ * 参数化而不是复制一份函数，就是为这个：复制出来的"直接执行版"迟早会少一两道闸，
+ * 而且没人能一眼看出少在哪。
+ */
+const confirmPendingPlan = async (direct = false, afterExecutionReview = false): Promise<WpsUndoRecord | undefined> => {
+    /*
+     * 写回入口的**唯一闸门**（见 `wpsWriteBackBlockReason`）。
+     *
+     * 本地判据先跑、授权检查后跑：
+     *  - 「没勾选就是没核对」——确认框是真闸，不是装饰；按钮已禁用，这里再挡一次，
+     *    旧闭包、快捷键、测试直调都绕不过去。
+     *  - 「放弃 / 写回已成功」是终态：计划与副本都不在场，写回入口整体失效 ——
+     *    这条路径连授权确认都不该发起。
+     */
+    const block = direct
+      ? wpsDirectWriteBackBlockReason({
+        hasPlan: liveWriteBack.current.plan !== null,
+        editingPlan: liveWriteBack.current.editingPlan,
+        busy: liveWriteBack.current.busy || writeBackInFlight.current
+      })
+      : wpsWriteBackBlockReason({
+        acknowledged: liveWriteBack.current.acknowledged,
+        hasPlan: liveWriteBack.current.plan !== null,
+        hasReview: liveWriteBack.current.review !== null,
+        editingPlan: liveWriteBack.current.editingPlan,
+        busy: liveWriteBack.current.busy || writeBackInFlight.current
+      });
+    if (block === "not_acknowledged") {
+      append({ role: "system", text: "请先勾选确认已核对副本，再写回原表；原表尚未写入。" });
+      return;
+    }
+    if (block) return;
+    /*
+     * **发起点**的现场身份：这一次请求只认这一份审阅 / 这个计划版本 / 这一本原工作簿。
+     * 必须在 `await` **之前**取，`await` 之后再取就等于"跟着新副本走"了。
+     */
+    // 发起点的现场身份：**按本次走的那条路径**取，不能两条都取再挑一条用 ——
+    // 直接执行没有副本，取副本身份会得到 null，回来后一律判"已变化"，直接执行永远发不出去。
+    const issuedTarget = direct
+      ? liveWriteBack.current.directTarget
+      : liveWriteBack.current.target;
     if (!(await targetGuard.check())) return;
-    if (!pendingPlan || !stagedReview || busy || planEditDraft !== null) return;
-    const plan = pendingPlan;
+    /*
+     * 授权检查是异步的：等它回来时用户可能已经点了「放弃变更」，甚至放弃之后又生成了
+     * 一份**新副本**并勾了新的确认框。
+     *
+     * 所以这里做两件事，缺一不可：
+     *  1. 再判一次实时事实（放弃之后计划与副本都不在场）；
+     *  2. **核对身份三元组**：仍是同一次审阅、同一计划版本、同一原工作簿。
+     *     只判"当前有审阅"是不够的 —— 新副本的确认状态会被旧请求借走：用户核对过的
+     *     那一份从来没被写，没核对过的那一份反而被写进了原表。
+     */
+    const now = liveWriteBack.current;
+    if (!now.plan) return;
+    // 副本路径：勾选未撤、计划与副本都在场（顺带把类型收窄）。
+    // 直接执行：没有副本，只需计划在场 —— 但**执行方式必须仍是 direct**。
+    if (direct) {
+      // ② 直接执行的身份：同一计划版本、同一原工作簿、**同一种执行方式**。
+      //    方式进身份是因为在途期间切到副本比对再回来时，前提已经变了。
+      if (!afterExecutionReview && now.executionMode !== "direct") return;
+      if (!wpsDirectWriteBackStillCurrent(issuedTarget as DirectExecutionTarget | null,
+        { target: now.directTarget })) return;
+    } else {
+      if (!now.acknowledged || !now.review) return;
+      // ② 副本路径的身份三元组：同一次审阅、同一计划版本、同一原工作簿。
+      if (!wpsWriteBackStillCurrent(issuedTarget, now)) return;
+    }
+    if (writeBackInFlight.current) return;
+    writeBackInFlight.current = true;
+    const plan = now.plan;
+    // 直接执行没有副本会话：`review` 为 null，后续所有副本专属步骤都据此跳过。
+    const review = direct ? null : now.review!;
     const activity = beginActivity({
       id: "preflight",
       label: "复核计划与授权范围",
@@ -2992,7 +3864,8 @@ export default function WpsAgentPanel({
     let operationId: string | null = null;
     let wpsLedgerState: Awaited<ReturnType<typeof registerWpsWriteIntent>> | null = null;
     try {
-      verifyWpsNativeComparison(getWpsApplication(), stagedReview);
+      // 副本未被改动这一项只属于副本路径；直接执行没有副本可核对。
+      if (review) verifyWpsNativeComparison(getWpsApplication(), review);
       const currentSheetIndexes = [...(resolveSelectedSheetIndexes?.() ?? selectedSheetIndexes)].sort((a, b) => a - b);
       const previewSheetIndexes = plan.authorization.sheets.map((sheet) => sheet.index).sort((a, b) => a - b);
       if (JSON.stringify(currentSheetIndexes) !== JSON.stringify(previewSheetIndexes)) {
@@ -3149,18 +4022,24 @@ export default function WpsAgentPanel({
         operationId);
       let comparison: "matched" | "different" | "unavailable" = "unavailable";
       let comparisonFailed = false;
-      try {
-        comparison = compareCommittedWpsResultToCopy(stagedReview);
-      } catch {
-        comparisonFailed = true;
+      if (review) {
+        try {
+          comparison = compareCommittedWpsResultToCopy(review);
+        } catch {
+          comparisonFailed = true;
+        }
       }
       updateActivity(activity, {
         id: "verified-result",
-        label: comparison === "matched" ? "写入与回读核对完成" : "写入完成，计算结果仍需核对",
+        label: !review
+          ? "写入与回读核对完成"
+          : comparison === "matched" ? "写入与回读核对完成" : "写入完成，计算结果仍需核对",
         phase: "verifying",
-        note: comparison === "matched"
-          ? "目标与审阅副本的公式和值均匹配；恢复点仅保证当前加载项会话内可用。"
-          : "动作回读已完成，但无法证明原表计算值与审阅副本一致；请检查并按需撤销。",
+        note: !review
+          ? "本次直接执行未生成副本，因此没有与副本比对；动作回读与恢复点已核对。"
+          : comparison === "matched"
+            ? "目标与审阅副本的公式和值均匹配；恢复点仅保证当前加载项会话内可用。"
+            : "动作回读已完成，但无法证明原表计算值与审阅副本一致；请检查并按需撤销。",
         facts: [
           { label: "操作", value: `${record.actions.length} 步` },
           { label: "已核对", value: `${plan.totalCells} 个单元格` },
@@ -3183,17 +4062,23 @@ export default function WpsAgentPanel({
           append({ role: "system", text: `写入已完成，但完成回执提交失败；重开面板后可核对本次执行。${turnErrorMessage(error)}` });
         }
       }
-      if (comparisonFailed) {
+      if (!review) {
+        // 直接执行：如实说"没有副本可比"，而不是让"与副本不同"这类话缺席 ——
+        // 缺席会被读成"核对过了"。
+        append({ role: "system", text: "原表已按计划写入并完成动作回读；本次直接执行未生成副本，未与副本比对。" });
+      } else if (comparisonFailed) {
         append({ role: "system", text: "原表已按计划写入，但无法完成与审阅副本的最终逐格对照；请检查原表。" });
       } else if (comparison === "different") {
         append({ role: "system", text: "原表已按计划写入并通过动作回读，但计算结果与右侧副本不同。请检查原表；如不符合预期，可使用本次恢复点撤销。" });
       } else if (comparison === "unavailable") {
         append({ role: "system", text: "原表已按计划写入，但宿主未提供完整显示值，无法证明计算结果与审阅副本完全相同。" });
       }
-      try {
-        discardWpsNativeComparison(stagedReview);
-      } catch {
-        append({ role: "system", text: "原表已写入并回读核对，但审阅副本未能自动关闭；请手动关闭副本且不要保存。" });
+      /*
+       * 业务结论已由上面的执行结果卡说了；这里**只**陈述副本状态，独立成一条。
+       * 副本关不掉绝不能把上面那条"原表已按计划写入"改写掉 —— 两者是两件事。
+       */
+      if (review) {
+        append({ role: "assistant", text: wpsCopyStatusLine(wpsCopyCleanupState("verified", discardWpsNativeComparison(review))) });
       }
       /*
        * 写入与回读都完成了：这条任务到此**结束**，不再是"可以继续的任务"。
@@ -3211,12 +4096,24 @@ export default function WpsAgentPanel({
       setPendingPlan(null);
       setPendingPlanMessageId(null);
       /*
-       * 只有**动作回读一致 且 与副本计算值一致**才算完全通过；其余如实记成
-       * "未获证实"。但不受影响的是：这次执行留下了恢复点，所以**卡一定在**，
-       * 撤销入口就挂在这张卡里（归属靠 `executionId`）。
+       * 「完全通过」的判据按**执行方式**取，两条都要求动作回读一致：
+       *  - 副本路径：还要与副本计算值一致（多一道比对才敢说得更满）；
+       *  - 直接执行：没有副本可比，只以动作回读为准 —— 少了那一层就说"未获证实"，
+       *    会让用户以为直接执行跳过了验证，而它并没有。
+       * 两种情况下失败 / 部分完成 / 回读未过都记成 `unverified`。
        */
       const outcome: WpsExecutionOutcome =
-        comparison === "matched" && !comparisonFailed ? "readback_passed" : "unverified";
+        !comparisonFailed && (review ? comparison === "matched" : true) ? "readback_passed" : "unverified";
+      // 只有「完全通过」（回读一致且与副本计算值一致）才具备保存为工具的资格：
+      // 把已实际验证的计划版本连同其执行身份一并记下，供结果卡里的「保存为工具」使用。
+      // 失败 / 部分完成 / 未验证的写入绝不写入这里，也就拿不到保存入口。
+      if (outcome === "readback_passed" && !afterExecutionReview) {
+        verifiedPlanForSaveRef.current = {
+          plan: plan.plan,
+          sourceSheetNames: plan.authorization.sheets.map((sheet) => sheet.name),
+          executionId: record.executionId
+        };
+      }
       append({
         role: "assistant",
         text: outcome === "readback_passed"
@@ -3237,6 +4134,7 @@ export default function WpsAgentPanel({
           }))
         }
       });
+      return record;
     } catch (error) {
       // CAP-03：写失败时把服务端账本挂起（有在途动作则 needs_reconciliation）。
       // 挂起失败只提示，不掩盖已经发生的写入 —— 账本里 in_flight 状态仍可核对。
@@ -3336,11 +4234,54 @@ export default function WpsAgentPanel({
           : {})
       });
     } finally {
+      writeBackInFlight.current = false;
       setWriteProgress(null);
     }
   };
 
-  const applyEditedPlan = async () => {
+  /**
+ * 切换执行方式。判定走共享层，本函数只把结果落到现场。
+ *
+ * 副本已在场时切到 `direct` ⇒ 旧审阅立即失效（`setStagedReview(null)` +
+ * 撤掉确认）。这是安全边界：留着旧确认就等于同时有两个有效写回入口。
+ * **绝不**在这里顺手关副本 —— 那份工作簿是用户眼前的，可能有他要留的内容。
+ */
+const switchExecutionMode = (next: PlanExecutionMode) => {
+  const decision = executionModeSwitchDecision({
+    current: executionMode,
+    next,
+    copyExists: stagedReview !== null,
+    inFlight: busy || writeBackInFlight.current,
+    editingPlan: planEditDraft !== null
+  }, WPS_EXECUTION_MODE_AVAILABILITY);
+  if (!decision.allowed) {
+    append({
+      role: "system",
+      text: decision.reason === "in_flight"
+        ? "本次执行正在进行，暂不能切换执行方式。"
+        : decision.reason === "editing_plan"
+          ? "请先完成或取消计划编辑，再切换执行方式。"
+          : "当前 WPS 无法生成审阅副本，不能选择「先生成副本比对」。"
+    });
+    return;
+  }
+  setExecutionModeState(next);
+  setReviewAcknowledged(false);
+  if (decision.invalidatesReview && stagedReview) {
+    setStagedReview(null);
+    append({
+      role: "assistant",
+      text: `${decision.reviewNotice ?? "上一份副本的确认已失效。"}原表尚未写入。`
+    });
+  }
+};
+
+/** WPS 的副本路径可用性：WPS 有 `Worksheet.Copy()`，副本路径始终可用。 */
+const WPS_EXECUTION_MODE_AVAILABILITY: ExecutionModeAvailability = {
+  "copy-compare": { available: true, reason: null }
+};
+
+const applyEditedPlan = async () => {
     if (!pendingPlan || planEditDraft === null || busy) return;
     if (!(await targetGuard.check())) return;
     setWriteProgress("正在重新校验修改后的计划…");
@@ -3382,11 +4323,11 @@ export default function WpsAgentPanel({
    * 只有当前会话里活跃的那个恢复点本人才可点，所以这里再核一次 id：
    * 卡片上的按钮万一因历史/重开而残留，也不会撤销到别的执行上去。
    */
-  const undoExecution = async (executionId: string) => {
-    if (busy) return;
+  const undoExecution = async (executionId: string, fromResultReview = false): Promise<boolean> => {
+    if (fromResultReview ? baseBusy : busy) return false;
     const record = undoRecord && undoRecord.executionId === executionId ? undoRecord : null;
-    if (!record) return;
-    if (!(await targetGuard.check())) return;
+    if (!record) return false;
+    if (!(await targetGuard.check())) return false;
     const activity = beginActivity({
       id: "undo-preflight",
       label: "核对撤销条件",
@@ -3429,7 +4370,21 @@ export default function WpsAgentPanel({
           ? { ...message, verification: { ...message.verification, status: "undone" } }
           : message
       ));
+      /*
+       * 该执行已被撤销 ⇒ 它的「保存为工具」资格一并作废。
+       * 不能拿"已经被撤销的写入"去固化工具：清掉已验证身份，让任何仍开着的保存
+       * 对话框进入"资格已失效"（确认按钮禁用；`saveToolInvalidationReason` 在确认
+       * 时再拦一道），并复位已勾选的风险确认项，不留任何已批准的状态。
+       */
+      if (verifiedPlanForSaveRef.current?.executionId === record.executionId) {
+        verifiedPlanForSaveRef.current = null;
+      }
+      if (saveToolContextRef.current?.executionId === record.executionId) {
+        setApproveFixedContent(false);
+        setApproveDestructive(false);
+      }
       append({ role: "assistant", text: `已撤销「${record.planTitle}」，并回读确认恢复成功。` });
+      return true;
     } catch (error) {
       endActivity(activity, "failed");
       try {
@@ -3438,10 +4393,63 @@ export default function WpsAgentPanel({
         setUndoRecord(null);
       }
       append({ role: "system", text: error instanceof Error ? error.message : "WPS 撤销失败。" });
+      return false;
     } finally {
       setWriteProgress(null);
     }
   };
+  resultUndoRef.current = id => undoExecution(id, true);
+  const resultFacts = useRef({ pendingPlan, authorizationRevision });
+  resultFacts.current = { pendingPlan, authorizationRevision };
+  useEffect(() => {
+    if (!pendingPlan || !pendingPlanMessageId || baseBusy || resultReviewState.pending || resultReviewState.phase === 'reviewing') return;
+    const prepared = pendingPlan, key = pendingPlanMessageId, revision = authorizationRevision;
+    const planKey = JSON.stringify(prepared.plan);
+    const isCurrent = () => {
+      const now = resultFacts.current;
+      return now.authorizationRevision === revision && (!now.pendingPlan || now.pendingPlan === prepared) &&
+        JSON.stringify(prepared.plan) === planKey &&
+        String(getWpsApplication().ActiveWorkbook?.FullName ?? '') === prepared.authorization.workbookFullName;
+    };
+    setResultTitle(prepared.plan.title);
+    void resultReview.start(key, {
+      isCurrent,
+      prepare: async () => {
+        if (!isCurrent()) throw new Error('当前计划或授权已变化，未执行。');
+        return stageWpsNativeComparison(getWpsApplication(), prepared, true);
+      },
+      execute: async () => {
+        const record = await confirmPendingPlan(true, true);
+        if (!record) throw new Error('执行未完成，请检查执行记录与恢复入口；不会自动重试。');
+        return { record, executionId: record.executionId, verified: true, undoable: true };
+      },
+      mark: () => Promise.resolve(markWpsResult(getWpsApplication(), prepared)),
+      clearMarker: marks => Promise.resolve(clearWpsResultMarks(getWpsApplication(), marks)),
+      showBefore: async before => {
+        if (rearrangeWpsComparison(getWpsApplication(), before) !== 'arranged') throw new Error('未能打开双视图，请手动查看本次执行前副本。');
+        return before;
+      },
+      closeBefore: async before => {
+        const outcome = discardWpsNativeComparison(before);
+        return outcome === 'closed' || outcome === 'already_closed' ? null : '执行前副本仍保留，请手动核对；原表不会被关闭。';
+      },
+      disposePrepared: async before => {
+        const outcome = discardWpsNativeComparison(before);
+        return outcome === 'closed' || outcome === 'already_closed' ? null : '执行前副本仍保留，请手动核对；原表不会被关闭。';
+      },
+      restore: async receipt => {
+        if (!(await resultUndoRef.current(receipt.executionId))) throw new Error('本次结果未恢复，未声明已放弃。');
+      },
+      validateResult: async receipt => {
+        const inspection = inspectWpsUndoRecord(getWpsApplication(), receipt.executionId);
+        if (inspection.kind !== 'completed') throw new Error('本次结果已变化或无法核对，未确认变更。');
+      },
+      accepted: receipt => {
+        verifiedPlanForSaveRef.current = { plan: prepared.plan,
+          sourceSheetNames: prepared.authorization.sheets.map(sheet => sheet.name), executionId: receipt.executionId };
+      }
+    });
+  }, [pendingPlan, pendingPlanMessageId, baseBusy, resultReviewState.pending, resultReviewState.phase]);
 
   /**
    * 某张执行结果卡此刻该显示的恢复点状态。
@@ -3505,6 +4513,147 @@ export default function WpsAgentPanel({
       });
       setToolsOpen(false);
     }
+  };
+
+  // —— 个人工具管理（保存 / 编辑模板 / 删除），对齐 Excel 的既有任务 ——
+
+  /**
+   * 打开「保存为工具」确认对话框。
+   *
+   * 保存资格绑定**实际已验证的计划版本与执行身份**（`verifiedPlanForSaveRef`）：
+   * 只有完全通过（`readback_passed`）的写入才会被记进来；失败、部分完成、
+   * 未验证的计划根本拿不到入口。打开时把当前计划设为候选并**重置确认项**
+   * （`beginSaveCandidate` 会把固定内容/破坏性勾选复位为未勾选）。
+   */
+  const openSaveToolDialog = (executionId: string) => {
+    const verified = verifiedPlanForSaveRef.current;
+    if (!verified || verified.executionId !== executionId) {
+      append({ role: "system", text: "这份计划当前没有可保存为工具的已验证版本。" });
+      return;
+    }
+    saveToolContextRef.current = {
+      executionId,
+      sourceSheetNames: verified.sourceSheetNames
+    };
+    setToolName(verified.plan.title);
+    setToolDescription(verified.plan.summary);
+    beginSaveCandidate(verified.plan);
+  };
+
+  /** 取消保存：清空候选与上下文，不留任何批准状态。 */
+  const cancelSaveTool = () => {
+    saveToolContextRef.current = null;
+    closeSaveCandidate();
+  };
+
+  /**
+   * 候选在打开对话框后是否已失效。确认为**必检项**，不只是界面禁用：
+   * 计划被替换（新执行）、或该执行已被撤销，都会让旧候选失去保存资格。
+   */
+  const saveToolInvalidationReason = (): string | null => {
+    const candidate = saveToolCandidate;
+    const context = saveToolContextRef.current;
+    const verified = verifiedPlanForSaveRef.current;
+    if (!candidate || !context) return "没有可保存的候选计划。";
+    if (!verified || verified.executionId !== context.executionId || verified.plan !== candidate) {
+      return "这份计划的可保存资格已失效（执行已被新的执行替换，或本次执行已撤销）。请重新执行并通过验证后再保存。";
+    }
+    return null;
+  };
+
+  /** 确认保存：确认时**重新检查**资格，再调用 createTool（其固化的审批门不放宽）。 */
+  const confirmSaveToolForWps = () => {
+    const candidate = saveToolCandidate;
+    const context = saveToolContextRef.current;
+    if (!candidate || !context) {
+      cancelSaveTool();
+      return;
+    }
+    const invalidReason = saveToolInvalidationReason();
+    if (invalidReason) {
+      append({ role: "system", text: invalidReason });
+      return;
+    }
+    try {
+      // createTool 内部会重新跑 analyzeToolEligibility 并校验审批是否齐全；
+      // 这里绝不把确认项预先置真、也不放宽它的守卫。
+      const tool = createTool(candidate, toolName, toolDescription, context.sourceSheetNames, {
+        fixedContent: approveFixedContent,
+        destructive: approveDestructive
+      });
+      setTools(saveTool(tool));
+      cancelSaveTool();
+      append({ role: "system", text: `已把「${tool.name}」保存为个人工具。` });
+    } catch (reason) {
+      append({
+        role: "system",
+        text: reason instanceof Error ? reason.message : "无法保存工具"
+      });
+    }
+  };
+
+  /** 打开固化工具的「编辑计划模板」JSON 抽屉。 */
+  const openToolPlanEditor = (tool: SavedTool) => {
+    setToolPlanEdit({
+      toolId: tool.id,
+      draft: JSON.stringify(tool.planTemplate, null, 2),
+      error: null
+    });
+  };
+
+  /**
+   * 应用编辑后的工具模板：本地 JSON + 白名单校验，写回后按当前能力/授权重新校验才可运行。
+   *
+   * 编辑会重算**保存资格**（`updateToolPlanTemplate` 内部重新跑 `analyzeToolEligibility`），
+   * 不会沿用旧版本不再适用的批准；若所需审批项发生变化，如实告知用户。
+   */
+  const applyEditedToolTemplate = () => {
+    if (!toolPlanEdit) return;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(toolPlanEdit.draft);
+    } catch {
+      setToolPlanEdit({ ...toolPlanEdit, error: "JSON 格式有误，请检查括号和引号是否匹配" });
+      return;
+    }
+    try {
+      assertEditablePlan(parsed);
+    } catch (reason) {
+      setToolPlanEdit({
+        ...toolPlanEdit,
+        error: reason instanceof Error ? reason.message : "计划结构不合法"
+      });
+      return;
+    }
+    const previous = tools.find((tool) => tool.id === toolPlanEdit.toolId);
+    const before = new Set<ToolRiskApproval>(previous?.approvals ?? []);
+    try {
+      const updated = updateToolPlanTemplate(toolPlanEdit.toolId, parsed as AnalysisPlan);
+      const after = new Set<ToolRiskApproval>(
+        analyzeToolEligibility(parsed as AnalysisPlan).requiredApprovals
+      );
+      const changed =
+        before.size !== after.size || [...after].some((approval) => !before.has(approval));
+      setTools(updated);
+      setToolPlanEdit(null);
+      append({
+        role: "system",
+        text: changed
+          ? "已更新工具计划，并重新分析了保存资格：所需风险确认项有变化，运行前仍会按当前工作簿与授权重新校验、预览并让你确认。"
+          : "已更新工具计划。运行前仍会按当前授权重新校验并预览。"
+      });
+    } catch (reason) {
+      setToolPlanEdit({
+        ...toolPlanEdit,
+        error: reason instanceof Error ? reason.message : "写回工具失败"
+      });
+    }
+  };
+
+  /** 删除个人工具（对齐 Excel 的工具管理）。 */
+  const deleteSavedTool = (tool: SavedTool) => {
+    setTools(deleteTool(tool.id));
+    append({ role: "system", text: `已删除工具「${tool.name}」。` });
   };
 
   const runSavedQuery = async (tool: SavedQueryTool) => {
@@ -3909,9 +5058,15 @@ export default function WpsAgentPanel({
     if (!(await targetGuard.check())) return;
     const option = clarification.options[optionIndex];
     if (!option) return;
-    const answeredRecord = settleTaskAnswer(clarification.messageId, {
-      label: option.label, value: option.resolution, questionId: clarification.questionId
-    });
+    let answeredRecord: TaskResumeRecord | null;
+    try {
+      answeredRecord = settleTaskAnswer(clarification.messageId, {
+        label: option.label, value: option.resolution, questionId: clarification.questionId
+      }, option.resolutionMode);
+    } catch {
+      append({ role: "system", text: "任务确认内容为空或过长，请缩短说明后继续；原表未写入。" });
+      return;
+    }
     if ((await reviewClarificationScope(clarification, option.label)) !== "same") {
       setClarification(null);
       return;
@@ -3933,7 +5088,8 @@ export default function WpsAgentPanel({
     try {
       await runTurn(option.resolutionMode === "replace" || !answeredRecord
         ? resolvedPrompt : resumePrompt(answeredRecord), {
-        intentConfirmed: true, clarificationRound: clarification.round + 1, showUser: false
+        intentConfirmed: true, clarificationRound: clarification.round + 1, showUser: false,
+        ...(option.resolutionMode === "replace" ? { taskContext: createAgentTaskContext(resolvedPrompt) } : {})
       });
     } finally { resumeCarryRef.current = null; }
     if (lastTurnFailedRef.current) markTaskInterrupted(targetMessageId);
@@ -3943,9 +5099,15 @@ export default function WpsAgentPanel({
     if (!clarification || !submittedAnswer.trim() || busy) return;
     if (!(await targetGuard.check())) return;
     const answer = submittedAnswer.trim();
-    const answeredRecord = settleTaskAnswer(clarification.messageId, {
-      label: "补充说明", value: answer, questionId: clarification.questionId
-    });
+    let answeredRecord: TaskResumeRecord | null;
+    try {
+      answeredRecord = settleTaskAnswer(clarification.messageId, {
+        label: "补充说明", value: answer, questionId: clarification.questionId
+      });
+    } catch {
+      append({ role: "system", text: "任务确认内容为空或过长，请缩短说明后继续；原表未写入。" });
+      return;
+    }
     if ((await reviewClarificationScope(clarification, answer)) !== "same") {
       setClarification(null);
       return;
@@ -4313,23 +5475,26 @@ export default function WpsAgentPanel({
    */
   const settleTaskAnswer = (
     messageIdValue: string,
-    confirmation: TaskResumeConfirmation
+    confirmation: TaskResumeConfirmation,
+    mode: "append" | "replace" = "append"
   ) => {
     const previous = messages.find((item) => item.id === messageIdValue)?.taskResume;
     const record = previous ? sanitizeTaskResumeRecord(previous) : null;
-    const answered = record ? withTaskResumeState(
-      withTaskResumeConfirmation(record, confirmation), { phase: "answer_submitted" }
+    const context = record ? confirmAgentTaskDecision(
+      createAgentTaskContext(record.originalPrompt, record.confirmations), confirmation, mode
     ) : null;
+    // Replacement must reset the recovery record, not just one outgoing
+    // request. Otherwise the next question revives the old task and rules.
+    const sanitized = record && context ? sanitizeTaskResumeRecord({
+      ...record, originalPrompt: context.originalPrompt, confirmations: context.confirmations
+    }) : null;
+    const answered = sanitized ? withTaskResumeState(sanitized, { phase: "answer_submitted" }) : null;
     updateMessages((current) => current.map((item) => {
       if (item.id !== messageIdValue || !item.taskResume) return item;
-      const record = sanitizeTaskResumeRecord(item.taskResume);
-      if (!record) return item;
+      if (!answered) return item;
       return {
         ...item,
-        taskResume: withTaskResumeState(
-          withTaskResumeConfirmation(record, confirmation),
-          { phase: "answer_submitted" }
-        )
+        taskResume: answered
       };
     }));
     return answered;
@@ -4422,40 +5587,42 @@ export default function WpsAgentPanel({
     ? buildPlanChangePreview(pendingPlan)
     : { actions: [], totalCells: 0 };
 
-  const planCard = pendingPlan && (
-    <section className="wps-plan-card" aria-label="WPS 写入计划预览">
-      <span className="clarification-eyebrow">写入前确认</span>
-      <strong>{pendingPlan.plan.title}</strong>
-      <p>{pendingPlan.plan.summary}</p>
-      {planRevised && (
-        <p className="wps-plan-revised">已按你的修改更新；写入前请重新核对下面的目标与内容。</p>
-      )}
-      {developmentWrite && <p>当前 WPS JSAPI 版本仅在开发调试模式开放写入；请先在独立测试工作簿验收写入与撤销。</p>}
-      {/*
-        目标与规模是决策必需信息，留在主卡（默认可见）。
-        长说明不再与按钮同排 —— 那正是真机上按钮被压到逐字折行的原因。
-      */}
-      <div className="wps-plan-target" title={planTargetLine}>
-        <span>{planTargetLine}</span>
-        <small>{pendingPlan.totalCells} 格 · {pendingPlan.actions.length} 个操作</small>
-      </div>
-      <div className="wps-plan-meta">
-        <span>{SESSION_RECOVERY_LABEL}</span>
-      </div>
-      {/*
-        决策必需的事实提到首屏：**到底改了什么**。
-        此前只有"预计写入内容"整段收在 `<details>` 里，用户要在按下
-        「生成右侧副本并排审阅」之前做决定，却看不到实际改动。
-        数据全部来自已在内存里的计划与授权读取快照 —— 这里**不做**额外宿主读取。
-      */}
-      <div className="wps-plan-change-preview" aria-label="本次修改的修改前与修改后">
-        <strong className="wps-plan-change-title">修改前 → 修改后</strong>
-        {planChangePreview.actions.map((action) => (
-          <div className="wps-plan-change-block" key={action.key}>
-            <span className="wps-plan-change-head">
-              {action.label} · {action.sheetName}!{action.range}
-              <small>共 {action.totalCells} 格</small>
-            </span>
+  /**
+   * 审阅卡视图。**只在副本已生成后**才有 —— 没生成副本时展示的是"写入前确认"，
+   * 那不是审阅卡，不能套用审阅中的标题与确认框。
+   *
+   * `reviewPaneNeedsResize` 是真实回读结论：为假时首屏一句调宽提示都不出现。
+   */
+  const reviewCard: ReviewCardView | null = pendingPlan && stagedReview
+    ? wpsReviewCard({
+      outcome: "reviewing",
+      scope: {
+        locations: reviewScopeLocations(pendingPlan.plan.actions),
+        changes: reviewChangeSummary(pendingPlan.plan.actions),
+        // 已备好的计划里 `totalCells` 是权威计数；测试另有一条守卫断言它与
+        // 按范围重算的面积一致，防止两个口径悄悄漂移。
+        totalCells: pendingPlan.totalCells
+      },
+      compatNotice: reviewCardCompatNotice("WPS"),
+      paneNeedsResize: reviewPaneNeedsResize,
+      copy: null,
+      diagnostics: wpsReviewDiagnostics(stagedReview, reviewPaneNeedsResize, developmentWrite)
+    })
+    : null;
+
+  /** 「修改前 → 修改后」预览体。审阅中会被折叠，所以单独抽出来复用。 */
+  const planChangePreviewBody = (
+    <>
+      <strong className="wps-plan-change-title">修改前 → 修改后</strong>
+      {planChangePreview.actions.map((action) => (
+        <div className="wps-plan-change-block" key={action.key}>
+          <span className="wps-plan-change-head">
+            {action.label} · {action.sheetName}!{action.range}
+            <small>共 {action.totalCells} 格</small>
+          </span>
+          {action.formatDescription != null ? (
+            <p className="wps-plan-change-format">{action.formatDescription}</p>
+          ) : (
             <table className="wps-plan-change-table">
               <thead>
                 <tr>
@@ -4478,45 +5645,120 @@ export default function WpsAgentPanel({
                 ))}
               </tbody>
             </table>
-            {action.truncated && (
-              <small className="wps-plan-change-more">
-                此处仅展示代表性样例（前几行、前几列）；完整内容可展开下方「查看预计结果」。
-              </small>
-            )}
+          )}
+          {action.truncated && (
+            <small className="wps-plan-change-more">
+              此处仅展示代表性样例（前几行、前几列）；完整内容可展开下方「查看预计结果」。
+            </small>
+          )}
+        </div>
+      ))}
+    </>
+  );
+
+  const planCard = pendingPlan && (
+    <section className="wps-plan-card" aria-label="WPS 写入计划预览">
+      {/*
+        执行方式选择。**两条路径共用同一份计划、同一套守卫**，差别只有
+        "要不要先生成副本比对"。
+        副本已生成时**仍然可达**：用户可能审阅到一半改主意，这时切换按共享层判定
+        让旧审阅失效，而不是把他锁在副本路径里、或留下两个有效写回入口。
+      */}
+      {planEditDraft === null && (
+        <fieldset className="wps-execution-mode" aria-label="执行方式">
+          <legend>执行方式</legend>
+          <p className="wps-execution-mode-preface">{EXECUTION_MODE_PREFACE}</p>
+          {executionModeOptions(executionMode, WPS_EXECUTION_MODE_AVAILABILITY).map((option) => (
+            <label key={option.mode}
+              className={`wps-execution-mode-option${option.mode === executionMode ? " selected" : ""}${option.available ? "" : " unavailable"}`}>
+              <input type="radio" name="wps-execution-mode" value={option.mode}
+                checked={option.mode === executionMode} disabled={busy || !option.available}
+                onChange={() => switchExecutionMode(option.mode)} />
+              <span className="wps-execution-mode-label">{option.label}</span>
+              <span className="wps-execution-mode-detail">{option.detail}</span>
+              {!option.available && option.blockedReason &&
+                <span className="wps-execution-mode-blocked">{option.blockedReason}</span>}
+            </label>
+          ))}
+        </fieldset>
+      )}
+      <span className="clarification-eyebrow">写入前确认</span>
+      <strong>{pendingPlan.plan.title}</strong>
+      <p>{pendingPlan.plan.summary}</p>
+      {planRevised && (
+        <p className="wps-plan-revised">已按你的修改更新；写入前请重新核对下面的目标与内容。</p>
+      )}
+      {/*
+        开发环境提示**只在诊断入口**展示：它是排查用的，不是"要不要按确认"需要的。
+        见下面的「诊断详情」。
+      */}
+      {/*
+        目标与规模是决策必需信息，留在主卡（默认可见）。
+        长说明不再与按钮同排 —— 那正是真机上按钮被压到逐字折行的原因。
+      */}
+      <div className="wps-plan-target" title={planTargetLine}>
+        <span>{planTargetLine}</span>
+        <small>{pendingPlan.totalCells} 格 · {pendingPlan.actions.length} 个操作</small>
+      </div>
+      <div className="wps-plan-meta">
+        <span>{SESSION_RECOVERY_LABEL}</span>
+      </div>
+      {/*
+        决策必需的事实：**到底改了什么**。
+        未生成副本时留在首屏 —— 用户要在按下「生成右侧副本并排审阅」之前做决定。
+        **审阅中**则收进折叠：那时首屏留给审阅卡（标题/说明/范围/确认框/按钮），
+        否则"改了什么"会把真正的决策项挤下去。
+        数据全部来自已在内存里的计划与授权读取快照 —— 这里**不做**额外宿主读取。
+      */}
+      {stagedReview ? (
+        <details className="wps-plan-disclosure">
+          <summary>查看本次计划的改动（修改前 → 修改后）</summary>
+          <div className="wps-plan-change-preview" aria-label="本次修改的修改前与修改后">
+            {planChangePreviewBody}
           </div>
-        ))}
-      </div>
-      <div className="wps-native-review-status" role="status">
-        {stagedReview ? (
-          <>
-            {/*
-              先说用户能懂的结论，再说技术依据。
-              结论与依据都要**准确**：副本核对通过 ≠ 原表已写入，所以结论是
-              "副本已核对，原表还没有动"，不是"写入成功"。
-            */}
-            <strong className="wps-review-outcome">
-              副本已核对通过，<em>原表还没有动</em>
-            </strong>
-            <p className="wps-review-line">
-              请在 WPS 并排窗口比一眼实际值；你确认后才写回原表。
-            </p>
-            <p className="wps-review-line wps-review-detail">
-              {stagedWriteKind === "formula" ? "副本已试算公式并回读计算值" : "副本已写入固定值并回读"}
-              ；
-              <span className="wps-review-name" title={redactCredentials(stagedReview.original.Name)}>「{redactCredentials(stagedReview.original.Name)}」</span>
-              未写入，副本
-              <span className="wps-review-name" title={redactCredentials(stagedReview.copy.Name)}>「{redactCredentials(stagedReview.copy.Name)}」</span>
-              标记了 {stagedReview.changedCells.length} 处差异。此处是<strong>副本回读</strong>结果，不是预计值。
-            </p>
-            {reviewPaneNeedsResize && <p className="wps-review-line">AI 窗格自动比例尚未确认。请拖动「Excel Bro」左侧分隔线，将 AI 调到 WPS 主窗口约 {Math.round(REVIEW_PANE_LIMITS.reviewTaskPaneWidthFraction * 100)}%，为两张表留出空间。</p>}
-          </>
-        ) : (
-          <>
-            <strong className="wps-review-outcome">待你确认：尚未写回原表</strong>
-            <p className="wps-review-line">生成右侧独立副本后会在副本上试算并回读；只有核对通过、你确认之后才会写回原表。</p>
-          </>
-        )}
-      </div>
+        </details>
+      ) : (
+        <div className="wps-plan-change-preview" aria-label="本次修改的修改前与修改后">
+          {planChangePreviewBody}
+        </div>
+      )}
+      {/*
+        审阅中：**首屏只留主卡**。
+        标题 / 说明 / 范围 / 兼容模式必要说明 / 可收起提示 / 确认框 / 按钮 ——
+        其余（重启提示、副本标识、关闭诊断、磁盘清理）全部下沉到「诊断详情」。
+      */}
+      {reviewCard ? (
+        <div className="wps-native-review-status" role="status">
+          <h4 className="wps-review-title">{reviewCard.title}</h4>
+          <p className="wps-review-line">{reviewCard.description}</p>
+          {reviewCard.scopeLine && <p className="wps-review-scope">范围：{reviewCard.scopeLine}</p>}
+          {reviewCard.compatNotice && <p className="wps-review-compat">{reviewCard.compatNotice}</p>}
+          {reviewCard.paneHint && (
+            <details className="wps-review-pane-hint" role="status">
+              <summary>{reviewCard.paneHint.summary}</summary>
+              <p>{reviewCard.paneHint.detail}</p>
+            </details>
+          )}
+          {/*
+            确认框：与 Excel 端**同一句文案**。WPS 副本虽能逐格回读，但"写入的是
+            你眼前这份副本所代表的计划"仍然只能由用户确认，加载项不替他回答。
+          */}
+          <label className="wps-review-confirm">
+            <input type="checkbox" checked={reviewAcknowledged} disabled={busy}
+              onChange={(event) => setReviewAcknowledged(event.target.checked)} />
+            {reviewCard.confirmLabel}
+          </label>
+          {/*
+            副本回读事实（公式试算 / 标记了多少处差异）是"你正在看的这份副本是怎么来的"，
+            属于技术依据，收进下面的「副本回读结果」折叠；首屏不再重复。
+          */}
+        </div>
+      ) : (
+        <div className="wps-native-review-status" role="status">
+          <strong className="wps-review-outcome">待你确认：尚未写回原表</strong>
+          <p className="wps-review-line">生成右侧独立副本后会在副本上试算并回读；只有核对通过、你确认之后才会写回原表。</p>
+        </div>
+      )}
       {pendingPlan.plan.assumptions.length > 0 && (
         <div className="wps-plan-notes">
           <strong>{PLAN_NOTE_SECTIONS.assumptions}</strong>
@@ -4539,19 +5781,25 @@ export default function WpsAgentPanel({
         <div className="wps-plan-preview">
           {pendingPlan.actions.map((action) => (
             <div key={`expected:${action.actionIndex}:${action.sheetName}:${action.range}`}>
-              <strong>{action.type === "clearRange" ? "清空内容" : action.type === "writeFormulas" ? "写入公式" : "写入值"} · {action.sheetName}!{action.range}</strong>
-              <div className="wps-plan-values">
-                <table><tbody>
-                  {action.values.map((row, rowIndex) => (
-                    <tr key={rowIndex}>
-                      <th scope="row">{rowIndex + 1}</th>
-                      {row.map((value, columnIndex) => (
-                        <td key={columnIndex}>{value === null ? "空单元格" : value === "" ? "空字符串" : String(value)}</td>
-                      ))}
-                    </tr>
-                  ))}
-                </tbody></table>
-              </div>
+              <strong>{actionTypeLabel(action.type)} · {action.sheetName}!{action.range}</strong>
+              {isFormatActionType(action.type) ? (
+                <div className="wps-plan-values" aria-label={`${action.sheetName}!${action.range} 待应用格式`}>
+                  <p>{describeWpsFormatAction(action.formatAction ?? (action as unknown as Parameters<typeof describeWpsFormatAction>[0]))}</p>
+                </div>
+              ) : (
+                <div className="wps-plan-values">
+                  <table><tbody>
+                    {action.values.map((row, rowIndex) => (
+                      <tr key={rowIndex}>
+                        <th scope="row">{rowIndex + 1}</th>
+                        {row.map((value, columnIndex) => (
+                          <td key={columnIndex}>{value === null ? "空单元格" : value === "" ? "空字符串" : String(value)}</td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody></table>
+                </div>
+              )}
             </div>
           ))}
         </div>
@@ -4561,22 +5809,28 @@ export default function WpsAgentPanel({
         <div className="wps-plan-actions-list">
           {pendingPlan.actions.map((action) => (
             <div key={`${action.actionIndex}:${action.sheetName}:${action.range}`}>
-              <strong>{action.type === "clearRange" ? "清空内容" : action.type === "writeFormulas" ? "写入公式" : "写入值"}</strong>
+              <strong>{actionTypeLabel(action.type)}</strong>
               <span>{action.sheetName}!{action.range}</span>
               <small>{action.rowCount} 行 × {action.columnCount} 列</small>
-              <div className="wps-plan-values" aria-label={`${action.sheetName}!${action.range} 待写内容预览`}>
-                <table><tbody>
-                  {action.preview.map((row, rowIndex) => (
-                    <tr key={rowIndex}>
-                      <th scope="row">{rowIndex + 1}</th>
-                      {row.map((value, columnIndex) => (
-                        <td key={columnIndex}>{value === null ? "空单元格" : value === "" ? "空字符串" : String(value)}</td>
-                      ))}
-                    </tr>
-                  ))}
-                </tbody></table>
-                {(action.rowCount > 5 || action.columnCount > 5) && <small>此处仅显示前 5 行、前 5 列；编辑计划可查看完整矩阵。</small>}
-              </div>
+              {isFormatActionType(action.type) ? (
+                <div className="wps-plan-values" aria-label={`${action.sheetName}!${action.range} 待应用格式`}>
+                  <p>{describeWpsFormatAction(action.formatAction ?? (action as unknown as Parameters<typeof describeWpsFormatAction>[0]))}</p>
+                </div>
+              ) : (
+                <div className="wps-plan-values" aria-label={`${action.sheetName}!${action.range} 待写内容预览`}>
+                  <table><tbody>
+                    {action.preview.map((row, rowIndex) => (
+                      <tr key={rowIndex}>
+                        <th scope="row">{rowIndex + 1}</th>
+                        {row.map((value, columnIndex) => (
+                          <td key={columnIndex}>{value === null ? "空单元格" : value === "" ? "空字符串" : String(value)}</td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody></table>
+                  {(action.rowCount > 5 || action.columnCount > 5) && <small>此处仅显示前 5 行、前 5 列；编辑计划可查看完整矩阵。</small>}
+                </div>
+              )}
             </div>
           ))}
         </div>
@@ -4586,6 +5840,8 @@ export default function WpsAgentPanel({
           <summary>查看副本回读结果（已试算）</summary>
           <p className="wps-plan-disclosure-note">
             以下是<strong>副本</strong>试算后的真实回读值 —— 与上面的"预计"是两回事，原表尚未写入。
+            {stagedWriteKind === "formula" ? "本次副本已试算公式并回读计算值。" : "本次副本已写入固定值并回读。"}
+            副本共标记 {stagedReview.changedCells.length} 处差异；此处是副本回读结果，不是预计值。
           </p>
           <div className="wps-plan-preview">
             {stagedReview.copyAfter.map((after, index) => (
@@ -4632,6 +5888,33 @@ export default function WpsAgentPanel({
         </div>
       )}
       {/*
+        兼容模式说明：格式恢复与"为什么加载项读不回副本"的技术解释。
+        默认收起 —— 它是"为什么"，不是"要不要按确认"。
+      */}
+      {reviewCard && reviewCard.compatDetail.length > 0 && (
+        <details className="wps-plan-disclosure">
+          <summary>{REVIEW_CARD_COMPAT_DETAIL_TITLE}</summary>
+          <ul className="wps-plan-diagnostics-list">
+            {reviewCard.compatDetail.map((entry) => <li key={entry}>{entry}</li>)}
+          </ul>
+        </details>
+      )}
+      {/*
+        诊断详情：重启/开发环境提示、排列指引、副本标识、关闭诊断、磁盘清理。
+        **只在**这里出现 —— 首屏不摆排查材料。
+      */}
+      {reviewCard && reviewCardHasDiagnostics(reviewCard.diagnostics) && (
+        <details className="wps-plan-disclosure">
+          <summary>{REVIEW_CARD_DIAGNOSTICS_TITLE}</summary>
+          {(["restart", "arrangement", "identity", "close", "cleanup"] as const).map((group) =>
+            reviewCard.diagnostics[group].length > 0 && (
+              <ul key={group} className={`wps-plan-diagnostics-list ${group}`}>
+                {reviewCard.diagnostics[group].map((entry) => <li key={entry}>{entry}</li>)}
+              </ul>
+            ))}
+        </details>
+      )}
+      {/*
         操作区**只放按钮**：长说明留在上面的 `.wps-native-review-status`。
         宽窗格水平排列、窄窗格整行纵排（见 styles.css），按钮文案不逐字断行。
       */}
@@ -4639,14 +5922,20 @@ export default function WpsAgentPanel({
         {planEditDraft === null ? (
           stagedReview ? (
             <>
-              <button type="button" disabled={busy} onClick={discardStagedPlan}>放弃副本</button>
-              <button className="primary" type="button" disabled={busy} onClick={() => void confirmPendingPlan()}>确认写回原表</button>
+              <button type="button" disabled={busy} onClick={discardStagedPlan}>放弃变更</button>
+              {/* 未勾选确认就是未核对：写回入口保持禁用，加载项不替用户确认。 */}
+              <button className="primary" type="button" disabled={busy || !reviewAcknowledged} onClick={() => void confirmPendingPlan()}>确认写回原表</button>
             </>
           ) : (
             <>
               <button type="button" disabled={busy} onClick={() => { setPlanEditDraft(JSON.stringify(pendingPlan.plan, null, 2)); setPlanEditError(null); }}>编辑计划</button>
               <button type="button" disabled={busy} onClick={() => { markPlanPreview("cancelled"); setPendingPlan(null); setPendingPlanMessageId(null); }}>取消</button>
-              <button className="primary" type="button" disabled={busy} onClick={stagePendingPlan}>生成右侧副本并排审阅</button>
+              {executionMode === "copy-compare" ? (
+                <button className="primary" type="button" disabled={busy} onClick={stagePendingPlan}>生成右侧副本并排审阅</button>
+              ) : (
+                // 按钮名用「直接执行到原表」：这次写的是当前这本工作簿，不是"保存到文件"。
+                <button className="primary" type="button" disabled={busy || writeBackInFlight.current} onClick={() => void confirmPendingPlan(true)}>确认并直接执行到原表</button>
+              )}
             </>
           )
         ) : (
@@ -4669,20 +5958,21 @@ export default function WpsAgentPanel({
         <span className="progress-dot" aria-hidden="true" />
         <strong>{writeProgress ? "执行与校验" : "处理中"}</strong>
         <span>{writeProgress ?? progress?.message}</span>
-        {!writeProgress && <button type="button" onClick={() => controllerRef.current?.abort()}>停止</button>}
+        {!writeProgress && <button type="button" onClick={pauseCurrentTurn}>暂停</button>}
       </div>
     </section>
   );
 
   return (
     <section className="wps-chat-shell chat-shell">
-      {targetGuard.notice && <AuthorizedTargetConfirmation notice={targetGuard.notice}
+      {targetGuard.notice && !onOpenScope && <AuthorizedTargetConfirmation notice={targetGuard.notice}
         error={targetGuard.error} busy={targetGuard.confirming}
-        onConfirm={(choice, selected) => void targetGuard.confirm(choice, selected)} onCancel={targetGuard.cancel} />}
+        onConfirm={(choice, selected) => void targetGuard.confirm(choice, selected)} onCancel={targetGuard.cancel}
+        onRecheck={() => void targetGuard.recheck()} />}
       <header
         className={`chat-header${modelMenuOpen || moreMenuOpen ? " menu-open" : ""}`}
       >
-        <div className="brand-mark">EB</div>
+        <img className="brand-mark" src={brandLogoUrl} alt="" />
         <div className="brand-copy">
             <strong className="app-logo" {...logoLongPress}>Excel Bro</strong>
             {brandStatusText && <span className={modelCatalogFailed ? "offline" : "model-online online"}>
@@ -4941,7 +6231,13 @@ export default function WpsAgentPanel({
                           <small>工作流</small><strong>{tool.name}</strong><span>{tool.description}</span>
                         </span>
                       </button>
-                      <div className="tool-card-footer"><span className="tool-card-meta">{tool.planTemplate.actions.length} 个步骤 · 点击后预览</span></div>
+                      <div className="tool-card-footer">
+                        <span className="tool-card-meta">{tool.planTemplate.actions.length} 个步骤 · 点击后预览</span>
+                        <span className="tool-card-actions">
+                          <button type="button" className="tool-card-edit" onClick={() => openToolPlanEditor(tool)}>编辑计划</button>
+                          <button type="button" className="tool-card-delete" onClick={() => deleteSavedTool(tool)}>删除</button>
+                        </span>
+                      </div>
                     </article>
                   ))}
                   {queryTools.map((tool) => (
@@ -4962,6 +6258,33 @@ export default function WpsAgentPanel({
                 </div>
               </>
             )}
+          </div>
+        </aside>
+      )}
+
+      {toolPlanEdit && (
+        <aside className="tool-drawer plan-editor-drawer" aria-label="编辑工具计划模板">
+          <div className="tool-drawer-header">
+            <div>
+              <strong>编辑工具计划模板</strong>
+              <span>保存会检查 JSON 格式与白名单结构；运行前仍会按当前授权重新校验并预览</span>
+            </div>
+            <button type="button" aria-label="关闭" onClick={() => setToolPlanEdit(null)}>×</button>
+          </div>
+          <div className="plan-editor-body">
+            <textarea
+              className="plan-editor-textarea"
+              aria-label="编辑工具计划 JSON"
+              rows={14}
+              value={toolPlanEdit.draft}
+              disabled={busy}
+              onChange={(event) => setToolPlanEdit({ ...toolPlanEdit, draft: event.target.value, error: null })}
+            />
+            {toolPlanEdit.error && <p role="alert" className="plan-editor-error">{toolPlanEdit.error}</p>}
+            <div className="inline-plan-buttons">
+              <button type="button" className="secondary-button" onClick={() => setToolPlanEdit(null)}>放弃修改</button>
+              <button type="button" className="primary-button" onClick={applyEditedToolTemplate}>保存</button>
+            </div>
           </div>
         </aside>
       )}
@@ -5167,6 +6490,16 @@ export default function WpsAgentPanel({
               ) : message.text ? (
                 <p className="message-text">{message.text}</p>
               ) : null}
+              {message.localResult && (
+                <LocalResultCardView
+                  card={message.localResult}
+                  load={(resultRef) =>
+                    message.localResultBinding
+                      ? loadWpsBridgeResult(message.localResultBinding, resultRef)
+                      : Promise.resolve(null)
+                  }
+                />
+              )}
               {message.clarification && (
                 <section className={`clarification-card ${message.clarification.status}`} aria-label="需求澄清">
                   <div className="clarification-heading">
@@ -5253,7 +6586,7 @@ export default function WpsAgentPanel({
                 </section>
               )}
               {message.planPreview && (
-                pendingPlan && pendingPlanMessageId === message.id
+                pendingPlan && pendingPlanMessageId === message.id && resultReviewState.key !== message.id
                   ? planCard
                   : <div className="wps-plan-outcome" role="status">
                       <strong>{message.planPreview.title}</strong>
@@ -5276,7 +6609,7 @@ export default function WpsAgentPanel({
                  *  3. 文案全部来自结构化字段（`pauseType` / `reason` / `actionLabel`），
                  *     不看助手文本、不猜关键词。
                  */
-                const active = planningPause?.turnId === message.planningPause!.turnId;
+                const active = planningPause?.sourceMessageId === message.id;
                 const view = active ? planningPause!.view : null;
                 /*
                  * 面板刚重开、还在这条任务的核对中。
@@ -5300,7 +6633,11 @@ export default function WpsAgentPanel({
                   >
                     <div className="wps-planning-pause-status" role="status">
                       <strong>
-                        {WPS_PLANNING_PAUSE_LABEL[message.planningPause!.pauseType]}
+                        {message.planningPause!.resolved ? "任务已完成"
+                          : reloading ? "已暂停接收，正在核对原任务"
+                          : message.planningPause!.awaitingStatus ? "已暂停接收，待核对原任务"
+                          : message.planningPause!.awaitingStatus === false && !message.planningPause!.canContinue ? "任务不能继续"
+                          : WPS_PLANNING_PAUSE_LABEL[message.planningPause!.pauseType]}
                       </strong>
                       <span>{message.planningPause!.reason}</span>
                     </div>
@@ -5308,6 +6645,16 @@ export default function WpsAgentPanel({
                       <small className="wps-planning-pause-note">
                         正在核对该任务的真实进度…
                       </small>
+                    ) : planningPauseReload?.turnId === message.planningPause!.turnId && planningPauseReload.canRecheck &&
+                        pendingInspectionMessageRef.current === message.id ? (
+                      <div className="wps-planning-pause-actions">
+                        <button type="button" disabled={busy} onClick={() => {
+                          const carry = pauseCarryRef.current;
+                          void reconcileInterruptedTurn(message.planningPause!.turnId,
+                            carry?.originalPrompt ?? "", carry?.selectedSheetIndexes ?? selectedSheetIndexes, message.id);
+                        }}>核对任务状态</button>
+                        <small>{reloadBlocked ?? "先核对原任务；只查询，不自动继续、不写入。"}</small>
+                      </div>
                     ) : active && view && view.canContinue && view.action === "continue_checkpoint" ? (
                       <div className="wps-planning-pause-actions">
                         <button
@@ -5321,8 +6668,10 @@ export default function WpsAgentPanel({
                       </div>
                     ) : (
                       <small className="wps-planning-pause-note">
-                        {reloadBlocked
+                        {message.planningPause!.resolved ? message.planningPause!.detail : reloadBlocked
                           ? `该任务当前不能精确续跑：${reloadBlocked}`
+                          : message.planningPause!.awaitingStatus === false && !message.planningPause!.canContinue
+                            ? `${message.planningPause!.detail} 如需处理请重新开始任务。`
                           : active && view && !view.canContinue
                             ? `该任务当前不能精确续跑：${view.reason}`
                             : "这条任务的暂停现场已被新的任务取代；如需继续，请重新发送需求。"}
@@ -5332,39 +6681,47 @@ export default function WpsAgentPanel({
                 );
               })()}
               {message.verification && (
-                <section
-                  className={`verification-card wps-verification-card ${wpsExecutionCardTone({
+                <ExecutionResultCard
+                  className="wps-verification-card"
+                  tone={wpsExecutionCardTone({
                     outcome: normalizeWpsExecutionOutcome(message.verification.outcome),
                     undone: message.verification.status === "undone"
-                  })}`}
-                  aria-label="写入执行结果"
-                >
-                  <strong>
-                    {message.verification.status === "undone"
+                  })}
+                  title={message.verification.status === "undone"
                       ? "已撤销并核对恢复"
                       : WPS_EXECUTION_OUTCOME_LABEL[normalizeWpsExecutionOutcome(message.verification.outcome)]}
-                  </strong>
-                  <span>
+                  summary={<>
                     {message.verification.actionCount} 个动作 · {message.verification.cellCount}{" "}
                     {WPS_EXECUTION_OUTCOME_DETAIL_SUFFIX[normalizeWpsExecutionOutcome(message.verification.outcome)]}
-                  </span>
+                  </>}
+                >
+                  {message.changeReviewExecutionId && (
+                    <ChangeReviewSummaryCard
+                      reviews={changeReviewsRef.current.get(message.changeReviewExecutionId) ?? []}
+                    />
+                  )}
+                  <ExecutionResultDetails open={!["verified", "undone"].includes(wpsExecutionCardTone({
+                    outcome: normalizeWpsExecutionOutcome(message.verification.outcome),
+                    undone: message.verification.status === "undone"
+                  }))}>
                   <ul>
                     {message.verification.targets.slice(0, 5).map((target, index) => (
                       <li key={`${message.id}-target-${index}`}>
-                        {target.type === "clearRange" ? "清空内容" : target.type === "writeFormulas" ? "写入公式" : "写入值"} · {target.sheetName}!{target.range}
+                        {planActionLabel(target.type)} · {target.sheetName}!{target.range}
                       </li>
                     ))}
                   </ul>
                   {message.verification.targets.length > 5 && (
                     <small>另有 {message.verification.targets.length - 5} 个目标，详见执行过程。</small>
                   )}
+                  </ExecutionResultDetails>
                   <small>{SESSION_RECOVERY_NOTICE_PREFIX}；关闭后不能从此卡片撤销。</small>
                   {/*
                     撤销入口就挂在这张卡里，归属靠 `executionId`。
                     只有"当前会话里的活跃恢复点正是这一次、且允许撤销"才给可点按钮；
                     被新执行取代、面板重开、或已撤销之后，这里只会留一句状态说明。
                   */}
-                  <div className={`wps-undo-inline ${wpsRecoveryCardStateFor(message.verification)}`}>
+                  <div className={`wps-undo-inline execution-recovery-footer ${wpsRecoveryCardStateFor(message.verification)}`}>
                     <span>{WPS_RECOVERY_CARD_LABEL[wpsRecoveryCardStateFor(message.verification)]}</span>
                     {wpsRecoveryCardStateFor(message.verification) === "undoable" && (
                       <button
@@ -5377,9 +6734,28 @@ export default function WpsAgentPanel({
                       </button>
                     )}
                   </div>
-                </section>
+                  {/*
+                    只有「完全通过」且尚未撤销的写入才提供保存为工具入口。
+                    资格绑定实际已验证的计划版本与执行身份（verifiedPlanForSaveRef）；
+                    同 planId 的旧版本验证通过也不放行已修改的版本。
+                  */}
+                  {message.verification.status !== "undone" &&
+                    normalizeWpsExecutionOutcome(message.verification.outcome) === "readback_passed" &&
+                    verifiedPlanForSaveRef.current?.executionId === message.verification.executionId && (
+                    <div className="wps-save-tool-inline">
+                      <button
+                        type="button"
+                        className="secondary-button"
+                        disabled={busy}
+                        onClick={() => openSaveToolDialog(message.verification!.executionId)}
+                      >
+                        保存为工具
+                      </button>
+                    </div>
+                  )}
+                </ExecutionResultCard>
               )}
-              {message.changeReviewExecutionId && (
+              {!message.verification && message.changeReviewExecutionId && (
                 <ChangeReviewSummaryCard
                   reviews={changeReviewsRef.current.get(message.changeReviewExecutionId) ?? []}
                 />
@@ -5397,7 +6773,7 @@ export default function WpsAgentPanel({
                   log={message.activityLog}
                   live={activeActivityMessageId === message.id}
                   onStop={activeActivityMessageId === message.id && progress
-                    ? () => controllerRef.current?.abort()
+                    ? pauseCurrentTurn
                     : undefined}
                 />
               )}
@@ -5423,14 +6799,15 @@ export default function WpsAgentPanel({
 
         {(progress || writeProgress) && !activeActivityMessageId && progressCard}
       </main>
-      {hasUnseenProgress && (
-        <button type="button" className="new-progress-button" onClick={scrollToLatest} aria-label="查看最新执行进度" title="查看最新进度">
-          <span className="progress-dots" aria-hidden="true">
-            <span />
-            <span />
-            <span />
-          </span>
-        </button>
+      {/*
+        用户往上滚离底部时出现，判据是 `useMessageAutoFollow` 的 `awayFromBottom`
+        —— **只看位置**，不要求"期间又来了一次新内容"。旧口径（`hasUnseenProgress`）
+        只在"离底 **且** 有新内容"时才亮，于是往上翻历史时什么都不出现。
+        字形跟着**本轮是否在跑**走：跑着是三点动效，跑完换成锚。判据用 `busy`
+        （进度/写入/目标核对任一在途），与 Excel 端同一个组件、同一套语义。
+      */}
+      {awayFromBottom && (
+        <ScrollToLatestButton running={busy} onClick={scrollToLatest} />
       )}
       </div>
 
@@ -5453,6 +6830,13 @@ export default function WpsAgentPanel({
       )}
 
       <footer className="composer">
+        <ResultReviewBar state={resultReviewState} title={resultTitle}
+          onCompare={() => void resultReview.compare(resultReviewState.key ?? '')}
+          onConfirm={() => void resultReview.confirm(resultReviewState.key ?? '')}
+          onDiscard={() => void resultReview.discard(resultReviewState.key ?? '')} />
+        {targetGuard.notice && onOpenScope && !scopePickerOpen && <TargetScopeNotice notice={targetGuard.notice}
+          error={targetGuard.error} busy={targetGuard.confirming} onOpenScope={onOpenScope}
+        />}
         {scopeDock}
         {/*
           与 Excel 端同构：把手放在 `.composer-input-region` 的上内边距里（在输入框
@@ -5521,9 +6905,9 @@ export default function WpsAgentPanel({
                 <button
                   className="send-button composer-send-button wps-stop-button"
                   type="button"
-                  aria-label="停止任务"
-                  title="停止当前读取或规划任务"
-                  onClick={() => controllerRef.current?.abort()}
+                  aria-label="暂停任务"
+                  title="暂停接收规划进度，保留需求；核对检查点后才可继续"
+                  onClick={pauseCurrentTurn}
                 >
                   ■
                 </button>
@@ -5578,6 +6962,25 @@ export default function WpsAgentPanel({
             </div>
           </section>
         </div>
+      )}
+
+      {saveToolCandidate && (
+        <SaveToolDialog
+          toolName={toolName}
+          toolDescription={toolDescription}
+          eligibility={saveEligibility}
+          approveFixedContent={approveFixedContent}
+          approveDestructive={approveDestructive}
+          onToolNameChange={setToolName}
+          onToolDescriptionChange={setToolDescription}
+          onApproveFixedContentChange={setApproveFixedContent}
+          onApproveDestructiveChange={setApproveDestructive}
+          onCancel={cancelSaveTool}
+          onConfirm={confirmSaveToolForWps}
+          blockedReason={saveToolInvalidationReason()}
+          subtitle="验证后可从「我的工具」重复使用"
+          note="只保存 WPS 白名单操作，不会保存 API Key，也不会执行系统命令。"
+        />
       )}
 
       {petVisible && <PetCompanion busy={busy} />}

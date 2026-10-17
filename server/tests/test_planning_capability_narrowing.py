@@ -214,3 +214,78 @@ def test_rejection_message_names_the_offending_action() -> None:
     with pytest.raises(ValueError) as error:
         _enforce_action_capabilities(request, _plan([WRITE_VALUES, add_shape]))
     assert "addShape" in str(error.value)
+
+
+# ---------------------------------------------------------------------------
+# 收窄后的 **schema 合法性**（与上面的"拒绝语义"是两件事）
+#
+# 上面锁的是"未验收动作进不了计划"；下面锁的是"收窄后的工具定义本身能发出去"。
+# 二者必须分开：把"收窄到空集"实现成 `{"anyOf": []}`，语义上也是拒绝，
+# 但**空 anyOf 是非法 JSON Schema**，多数模型网关（实测 DeepSeek 的
+# anthropic 兼容端点）会直接拒绝**整轮请求**：
+#   API Error: 400 Invalid schema for function 'submit_plan':
+#   [] has less than 1 item
+# 结果不是"submit_plan 不可用"，而是**整次规划请求 400**，
+# 表现为"请求莫名失败"，把真正的协商失败原因（漏报 / 版本不匹配）完全掩盖。
+# ---------------------------------------------------------------------------
+
+
+def test_empty_bound_never_emits_empty_any_of() -> None:
+    """红线：上界为空集时不得产出 `{"anyOf": []}`。
+
+    空集的三条真实来路 —— 漏报 `selfReportedActions`、`hostVersion` 不匹配、
+    未知宿主 —— 都必须走到"schema 合法 + 整轮能发出去 + 提交时被第二道防线拒绝"，
+    而不是"schema 非法 + 整轮 400"。
+    """
+    from server.app.agent_tools import host_pruned_terminal_definitions
+
+    for overrides in (
+        {"hostId": "wps-et", "hostVersion": "12.0", "selfReportedActions": []},
+        {"hostId": "wps-et", "hostVersion": "99.0", "selfReportedActions": ["writeValues"]},
+        {"hostId": "office-online", "hostVersion": "12.0", "selfReportedActions": ["writeValues"]},
+    ):
+        request = _request(**overrides)
+        definitions = host_pruned_terminal_definitions(request)
+        names = {tool["function"]["name"] for tool in definitions}
+        assert "submit_plan" not in names
+        assert "submit_clarification" in names
+        assert "submit_answer" in names
+
+
+def test_pruned_schema_is_legal_json_schema_when_narrowed() -> None:
+    """正向锚点：收窄**非空**时仍是原来的收窄语义（不是恒回落全量）。
+
+    没有这一条，`test_empty_bound_never_emits_empty_any_of` 可以被
+    "无条件回落到全部变体"蒙过去 —— 那样虽然不再有空 `anyOf`，
+    但"排除必须发生在规划前"就整条失效了。
+    """
+    from server.app.agent_tools import host_pruned_terminal_definitions
+
+    request = _request(
+        hostId="wps-et", hostVersion="12.0", selfReportedActions=["writeValues"],
+    )
+    items = _submit_plan_action_items(host_pruned_terminal_definitions(request))
+    types = {variant["properties"]["type"]["const"] for variant in items["anyOf"]}
+    # WPS 支持集是 ['clearRange:contents','writeFormulas','writeValues']，
+    # 自报只有 writeValues ⇒ 交集只应剩它一个。
+    assert types == {"writeValues"}
+    # 未验收动作不得出现为候选
+    assert "createChart" not in types
+
+
+def test_unpruned_definition_is_returned_unchanged_without_host_id() -> None:
+    """未声明宿主 → 定义逐字不变，不引入任何新的 schema 形状。"""
+    from server.app.agent_tools import host_pruned_terminal_definitions
+    from server.app.excel_agent import AGENT_TOOLS_WITH_DATA
+
+    request = _request()
+    assert host_pruned_terminal_definitions(request) == AGENT_TOOLS_WITH_DATA
+
+
+def _submit_plan_action_items(definitions: list[dict]) -> dict:
+    for definition in definitions:
+        if definition["function"]["name"] == "submit_plan":
+            return definition["function"]["parameters"]["properties"]["plan"][
+                "properties"
+            ]["actions"]["items"]
+    raise AssertionError("定义里没有 submit_plan")

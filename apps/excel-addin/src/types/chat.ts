@@ -2,7 +2,10 @@ import type {
   AnalysisPlan,
   IntentClarification,
   IntentMemory,
+  LocalResultCard,
+  PlanningPauseResult,
   ResultContext,
+  SdkBridgeBindingRequest,
   VerificationReport
 } from "../contracts";
 import type { CrossTableMatchProposal } from "../crossTableFormula";
@@ -18,6 +21,7 @@ export interface MessageClarification extends IntentClarification {
   turnId?: string;
   planningReadPolicy?: "ifNeeded" | "none";
   originalPrompt: string;
+  taskContext?: import("@excel-bro/core/agentTaskContext").AgentTaskContext;
   scopeFingerprint: string;
   hadImages?: boolean;
   round: number;
@@ -58,6 +62,16 @@ export interface ChatMessage {
   attachmentNames?: string[];
   plan?: AnalysisPlan;
   resultContext?: ResultContext;
+  /**
+   * SDK 本地结果卡指针：只有引用与结构，**没有值**。
+   * 因此可以安全地随消息持久化；真实值由本机回环端点按引用取回渲染。
+   */
+  localResult?: LocalResultCard;
+  /**
+   * 取回结果值时要回带的绑定（产生该结果那一轮的任务 + 工作簿身份）。
+   * 会话关闭后服务端按**授权归属**校验，因此不能用"当前"绑定顶替。
+   */
+  localResultBinding?: SdkBridgeBindingRequest;
   intentMemory?: IntentMemory;
   verification?: VerificationReport;
   clarification?: MessageClarification;
@@ -76,6 +90,8 @@ export interface ChatMessage {
   querySourceSheetIds?: string[];
   functionPreview?: FunctionPreview;
   executedPlanId?: string;
+  /** Set only after the corresponding recovery operation succeeds. */
+  executionUndone?: boolean;
   /** 当前工作簿模式下实际执行的唯一 ID，避免同一 plan 重复执行时选错撤销记录。 */
   executedExecutionId?: string;
   /** 文件夹模式下对应的恢复点 ID。 */
@@ -104,17 +120,20 @@ export interface ChatMessage {
     turnId: string;
     /** Retain the full request when a resumed planner asks for user input. */
     originalPrompt?: string;
+    taskContext?: import("@excel-bro/core/agentTaskContext").AgentTaskContext;
     /** 原规划任务的过程消息，用于续跑时复用同一张时间线卡片。 */
     activityMessageId?: string;
     /** 前端最后实际收到并归并的服务端事件序号。 */
     clientLastSequence?: number;
+    /** 客户端主动暂停/断线，尚不能声称服务端已有可续跑现场。 */
+    awaitingStatus?: boolean;
     expectedRevision: number;
     lastSequence: number;
     status: "pending" | "resuming" | "completed" | "failed";
     reason: string;
     extensionSeconds: number;
     activeElapsedSeconds: number;
-    pauseType?: "budget" | "model_error" | "interrupted";
+    pauseType?: PlanningPauseResult["pauseType"];
     currentModelId?: string | null;
     modelSwitchCount?: number;
     canSwitchModel?: boolean;

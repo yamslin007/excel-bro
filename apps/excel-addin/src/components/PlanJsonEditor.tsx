@@ -56,10 +56,10 @@ export function PlanJsonEditor({
   if (state.phase === "closed") return null;
 
   return (
-    <aside className="tool-drawer plan-editor-drawer" aria-label="编辑执行脚本">
+    <aside className="tool-drawer plan-editor-drawer" aria-label="编辑计划">
       <div className="tool-drawer-header">
         <div>
-          <strong>编辑执行脚本</strong>
+          <strong>编辑计划</strong>
           <span>保存前会检查 JSON 格式与白名单结构</span>
         </div>
         <button onClick={onClose} aria-label="关闭">

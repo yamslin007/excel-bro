@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { inspectOfficeAuthorizedTarget, officeAnalysisTargetEvidence } from "./officeAuthorizedTarget";
+import { inspectOfficeAuthorizedTarget, inspectOfficeScopeAdmission, officeAnalysisTargetEvidence } from "./officeAuthorizedTarget";
 afterEach(() => vi.unstubAllGlobals());
 function host() {
   const document = { url: "file:///C:/Data/Original.xlsx" };
@@ -12,6 +12,45 @@ function host() {
   return { document, sheet, sync };
 }
 describe("Office target metadata adapter", () => {
+  it("a picker catalog is not reused for a different document with the same filename", async () => {
+    const h = host();
+    const visible = await inspectOfficeAuthorizedTarget(["Sheet1"]);
+    vi.stubGlobal("Office", { context: { document: { url: h.document.url } } });
+    const report = await inspectOfficeScopeAdmission(["Sheet1"], visible);
+    expect(report.items).toEqual([{ id: "Sheet1", status: "unavailable", reason: "target_changed" }]);
+    expect(h.sheet.getRange).not.toHaveBeenCalled();
+  });
+  it("a missing selected sheet gets a precise unavailable result, not a reduced authorization", async () => {
+    const h = host();
+    const report = await inspectOfficeScopeAdmission(["Sheet1", "Deleted"]);
+    expect(report.items).toEqual([
+      { id: "Sheet1", status: "read_only", reason: "write_unverified" },
+      { id: "Deleted", status: "unavailable", reason: "missing" }
+    ]);
+    expect(report.target).toBeUndefined();
+    expect(h.sheet.getRange).not.toHaveBeenCalled();
+  });
+  it.each([[true, false, "read_only"], [false, true, "protected"], [false, false, "none"]])(
+    "selection checks read-only/protection metadata without reading cells: %s/%s", async (readOnly, protectedSheet, reason) => {
+      const h = host();
+      const protection = { protected: protectedSheet, load: vi.fn() };
+      const workbook = { readOnly, load: vi.fn(), worksheets: {
+        items: [h.sheet], load: vi.fn(), getActiveWorksheet: () => h.sheet,
+        getItem: vi.fn((id: string) => { expect(id).toBe(h.sheet.id); return { protection }; })
+      } };
+      vi.stubGlobal("Office", { context: { document: h.document, requirements: { isSetSupported: () => true } } });
+      vi.stubGlobal("Excel", { run: async (job: (context: unknown) => unknown) => job({ workbook, sync: h.sync }) });
+      const report = await inspectOfficeScopeAdmission(["Sheet1"]);
+      expect(report.items).toEqual([{ id: "Sheet1", reason, status: reason === "none" ? "ready" : "read_only" }]);
+      expect(h.sheet.getRange).not.toHaveBeenCalled();
+      expect(workbook.worksheets.getItem).toHaveBeenCalledWith("stable-1");
+    });
+  it("unknown write capability is not falsely advertised as writable", async () => {
+    const h = host();
+    const report = await inspectOfficeScopeAdmission(["Sheet1"]);
+    expect(report.items[0]).toMatchObject({ status: "read_only", reason: "write_unverified" });
+    expect(h.sheet.getRange).not.toHaveBeenCalled();
+  });
   it("analysis evidence is document-scoped, needs no source cells, and cannot authorize a same-URL replacement document", async () => {
     const h = host(); const target = await inspectOfficeAuthorizedTarget(["Sheet1"]);
     expect(await officeAnalysisTargetEvidence(target)).toMatchObject({ conclusive: true });

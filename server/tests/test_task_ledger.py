@@ -458,9 +458,14 @@ def test_planning_pause_survives_restart_and_extension_request_is_idempotent(
     )
     assert should_run is True
     assert claimed.status == "running"
-    assert claimed.approved_wall_time_seconds == 120
+    # 2026-10-10 时间策略改造：一次"继续"即**结清到总活跃执行时限**
+    # （hard_wall_time_seconds），不再每次只加 extension_seconds。旧语义下初批
+    # 预算等于提醒阈值（60 秒），按 60 秒递增会让用户被迫点几十次 —— 那正是
+    # "被短时预算反复打断"的另一面。
+    assert claimed.approved_wall_time_seconds == 300
     assert claimed.extension_count == 1
 
+    # 同一 request_id 重复领取是幂等的：不重复加预算，也不重复计次数。
     duplicate, duplicate_should_run = restarted.claim_planning_continuation(
         record.turn_id,
         expected_revision=paused.revision,
@@ -470,7 +475,7 @@ def test_planning_pause_survives_restart_and_extension_request_is_idempotent(
         hard_wall_time_seconds=300,
     )
     assert duplicate_should_run is True
-    assert duplicate.approved_wall_time_seconds == 120
+    assert duplicate.approved_wall_time_seconds == 300
     assert duplicate.extension_count == 1
 
 

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { ActivityLog } from "./hooks/useActivityProgress";
 import type { ChatMessage } from "./types/chat";
+import { parseTaskProgressEvent } from "./contracts";
 import {
   insertChatMessage,
   persistActivityMessage
@@ -33,6 +34,41 @@ const log: ActivityLog = {
 };
 
 describe("activityMessages", () => {
+  const card = { resultRef: "res_" + "a".repeat(32), title: "Python 分析结果",
+    headers: ["列1"], rowCount: 2, columnCount: 1, sourceSheets: ["Sheet1"], complete: true };
+  const binding = { taskId: "turn-python", hostId: "excel-office" as const,
+    workbookName: "test.xlsx", workbookIdentity: "url:test.xlsx", sourceFingerprint: null };
+
+  it("preserves Python metadata through the shared parser without carrying values", () => {
+    const event = parseTaskProgressEvent({ schemaVersion: 1, operationId: "turn-python",
+      sequence: 1, phase: "planning", stepId: "python.completed", status: "completed",
+      title: "完成", timestamp: "2026-10-11T00:00:00Z", pythonResult: { ...card, values: [["SECRET"]] } });
+    expect(event?.pythonResult).toEqual(card);
+    expect(JSON.stringify(event)).not.toContain("SECRET");
+  });
+
+  it("keeps existing result and binding when an activity has no Python result", () => {
+    const result = persistActivityMessage([message("activity", "assistant", {
+      localResult: card, localResultBinding: binding })], log, "activity", message("fallback", "assistant"));
+    expect(result[0].localResult).toEqual(card);
+    expect(result[0].localResultBinding).toEqual(binding);
+  });
+
+  it("attaches the newest Python result to fallback messages too", () => {
+    const newer = { ...card, resultRef: "res_" + "b".repeat(32) };
+    const result = persistActivityMessage([], { ...log, steps: [
+      { label: "first", elapsedMs: 1, pythonResult: card },
+      { label: "second", elapsedMs: 1, pythonResult: newer }] }, null,
+      message("fallback", "assistant"), binding);
+    expect(result[0].localResult).toEqual(newer);
+    expect(result[0].localResultBinding).toEqual(binding);
+  });
+
+  it("does not attach an unbound result", () => {
+    const result = persistActivityMessage([], { ...log, steps: [
+      { label: "python", elapsedMs: 1, pythonResult: card }] }, null, message("fallback", "assistant"));
+    expect(result[0].localResult).toBeUndefined();
+  });
   it("places a late user message immediately before the active process message", () => {
     const result = insertChatMessage(
       [

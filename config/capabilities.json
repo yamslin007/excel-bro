@@ -1,7 +1,20 @@
 {
   "version": 1,
+  "taskContext": {
+    "maxConfirmations": 8,
+    "maxAnswerChars": 1000,
+    "maxLabelChars": 80,
+    "maxQuestionIdChars": 80,
+    "maxPromptChars": 4000
+  },
   "authorizedTarget": {
-    "monitorIntervalMs": 2000
+    "monitorIntervalMs": 2000,
+    "verificationAttempts": 2
+  },
+  "scopeAdmission": {
+    "timeoutMs": 15000,
+    "maxSelections": 256,
+    "maxMetadataBytes": 8388608
   },
   "excelNativeComparison": {
     "maxCells": 20000,
@@ -13,18 +26,23 @@
     "copyWaitSeconds": 12,
     "pollIntervalMs": 250,
     "requestTimeoutMs": 20000,
-    "originalWidthFraction": 0.6,
     "windowGapDip": 0,
     "maxFrameInsetDip": 32,
     "positionTolerancePixels": 4
   },
   "reviewPaneSizing": {
-    "reviewTaskPaneWidthFraction": 0.4,
+    "reviewCopyWidthFraction": 0.35,
+    "reviewAiWidthFraction": 0.3,
     "reviewTaskPaneMinWidthCssPx": 320,
+    "reviewSheetMinWidthCssPx": 280,
     "reviewPaneMeasureIntervalMs": 1500,
     "reviewPaneResizeDebounceMs": 200,
     "taskPaneWidthToleranceCssPx": 8,
     "maxHostWidthCssPx": 32768
+  },
+  "reviewCopyLifecycle": {
+    "closeWaitSeconds": 3,
+    "closePollIntervalMs": 200
   },
   "wpsReviewPane": {
     "leaseTtlMs": 6000,
@@ -57,7 +75,7 @@
     "chunkRows": 100,
     "verifiedVersionPrefixes": [],
     "developmentVersionPrefixes": ["12.0"],
-    "allowedActions": ["writeValues", "writeFormulas", "clearRange:contents"]
+    "allowedActions": ["writeValues", "writeFormulas", "clearRange:contents", "setFont", "setAlignment", "resizeRange"]
   },
   "columnMappingFormula": {
     "maxCases": 32,
@@ -132,13 +150,13 @@
           "clearFilter": { "state": "unverified", "reason": "WPS 清除筛选的规则状态回读尚未验收。" },
           "computeValues": { "state": "unverified", "reason": "执行时求值路径尚未接入 WPS 执行器。" },
           "splitGroupAggregate": { "state": "unverified", "reason": "WPS 上多表输出与动态验收条件尚未验收。" },
-          "setFill": { "state": "unverified", "reason": "WPS 格式属性快照与回读尚未验收。" },
-          "setFont": { "state": "unverified", "reason": "WPS 字体属性回读尚未验收。" },
+          "setFill": { "state": "unverified", "reason": "WPS 填充（Interior.Color/Pattern）尚未实机探测（因前置失败被 abort），保持未验证。" },
+          "setFont": { "state": "supported", "reason": "WPS 字体 bold/italic/name/size/color 已实机验证（underline 未验证，由执行器属性级守卫拒绝）。" },
           "setNumberFormat": { "state": "unverified", "reason": "WPS 数字格式回读尚未验收。" },
-          "setBorders": { "state": "unverified", "reason": "WPS 边框属性回读尚未验收。" },
-          "setAlignment": { "state": "unverified", "reason": "WPS 对齐属性回读尚未验收。" },
+          "setBorders": { "state": "unverified", "reason": "WPS 边框属性回读尚未验收（未实机探测）。" },
+          "setAlignment": { "state": "supported", "reason": "WPS 水平对齐/自动换行已实机验证（垂直对齐未验证，由执行器属性级守卫拒绝）。" },
           "autofit": { "state": "unverified", "reason": "WPS 自适应列宽的效果无法稳定回读。" },
-          "resizeRange": { "state": "unverified", "reason": "WPS 行高/列宽回读尚未验收。" },
+          "resizeRange": { "state": "supported", "reason": "WPS 行高已实机验证（列宽有量化漂移未验证，由执行器属性级守卫拒绝）。" },
           "setDataValidation": { "state": "unverified", "reason": "WPS 数据验证规则回读尚未验收。" },
           "setConditionalFormat": { "state": "unverified", "reason": "WPS 条件格式规则回读尚未验收。" },
           "freezePanes": { "state": "unverified", "reason": "WPS 冻结窗格状态回读尚未验收。" },
@@ -327,6 +345,22 @@
   "turns": {
     "maxActive": 500,
     "ttlSeconds": 86400
+  },
+  "agentToolBridge": {
+    "maxToolCallsPerTask": 8,
+    "waitTimeoutSeconds": 120,
+    "maxPendingPerTask": 4,
+    "operationTtlSeconds": 900,
+    "resultTtlSeconds": 1800,
+    "maxSessions": 500,
+    "maxRetainedResults": 200,
+    "maxReceiptBytes": 2097152,
+    "maxResultsPerTask": 12,
+    "maxResultRows": 500,
+    "maxResultColumns": 50,
+    "maxResultCells": 20000,
+    "maxResultCellChars": 32767,
+    "maxTotalReadCells": 400000
   },
   "progress": {
     "heartbeatSeconds": 10,

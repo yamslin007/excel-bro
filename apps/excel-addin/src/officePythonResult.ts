@@ -36,6 +36,23 @@ export async function prepareOfficePythonResult(session: PythonResultSession, ho
     await preview.assertCurrent();
     if (JSON.stringify(preview.prepared) !== original ||
         JSON.stringify(await readTarget()) !== JSON.stringify(preview.prepared.before)) throw new PythonResultUnavailable();
+    /*
+     * 来源核对必须在**写前那一刻**重跑，与 WPS 端同语义。
+     *
+     * `stagePythonResultPreview` 只在生成预览时核对一次来源快照；预览到用户确认
+     * 之间，来源表可能已经被改。只复读目标是不够的 —— 那会让"来源变了、结果却是
+     * 基于旧源算的"这种计划照样通过写前复核。这里按 `preview.prepared.sources`
+     * 的**声明快照**重读一遍：快照与现场不一致即拒绝（fail-closed）。
+     */
+    const current = await session.captureSources();
+    const expected = preview.prepared.sources;
+    if (current.length !== expected.length ||
+        current.some((snapshot, index) =>
+          snapshot.source.sheetId !== expected[index].source.sheetId ||
+          snapshot.source.sheetName !== expected[index].source.sheetName ||
+          snapshot.source.range !== expected[index].source.range ||
+          JSON.stringify(snapshot.values) !== JSON.stringify(expected[index].values)
+        )) throw new PythonResultUnavailable();
   };
   await assertCurrent();
   return {...preview,assertCurrent};

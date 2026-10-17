@@ -21,6 +21,51 @@ const rule: ColumnMappingRule = {
 };
 
 describe("本地映射补全卡 · 两宿主共用", () => {
+  it("新增目标等级仍须确认它的位置，不能借旧优先级自动通过", async () => {
+    const ranked = { ...rule, delimiters: ["，"], valueRank: [{ value: "甲", rank: 1 }, { value: "乙", rank: 2 }] };
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    render(<LocalMappingResolution rule={ranked} values={["丙"]} allowExactMapping={false} busy={false}
+      onResolve={onResolve} onCancel={vi.fn()} />);
+    fireEvent.change(screen.getByLabelText("拆分项 丙 的目标值"), { target: { value: "中" } });
+    const button = screen.getByRole("button", { name: "按补充映射重新生成预览" });
+    expect(button).toHaveProperty("disabled", true);
+    fireEvent.click(screen.getByLabelText("我已核对上述优先顺序（最上方优先）"));
+    expect(button).toHaveProperty("disabled", false);
+    fireEvent.click(button);
+    await waitFor(() => expect(onResolve).toHaveBeenCalledOnce());
+  });
+  it("已有显式优先级直接沿用；缺的只是新类别映射", async () => {
+    const ranked = { ...rule, delimiters: ["，"], valueRank: [{ value: "甲", rank: 1 }, { value: "乙", rank: 2 }] };
+    const onResolve = vi.fn().mockResolvedValue(undefined);
+    render(<LocalMappingResolution rule={ranked} values={["丙"]} allowExactMapping={false} busy={false}
+      onResolve={onResolve} onCancel={vi.fn()} />);
+    expect(document.body.textContent).toContain("已沿用已确认的优先顺序");
+    const button = screen.getByRole("button", { name: "按补充映射重新生成预览" });
+    expect(button).toHaveProperty("disabled", true);
+    fireEvent.change(screen.getByLabelText("拆分项 丙 的目标值"), { target: { value: "高" } });
+    expect(button).toHaveProperty("disabled", false);
+    fireEvent.click(button);
+    await waitFor(() => expect(onResolve).toHaveBeenCalledTimes(1));
+    expect(onResolve.mock.calls[0][0].valueRank).toEqual([
+      { value: "甲", rank: 1 }, { value: "乙", rank: 2 }, { value: "丙", rank: 2 }
+    ]);
+  });
+
+  it("缺项与公式就地指出；勾选优先级不能让缺项提交", () => {
+    const onResolve = vi.fn();
+    render(<LocalMappingResolution rule={rule} values={["甲，丙"]} allowExactMapping={false} busy={false}
+      onResolve={onResolve} onCancel={vi.fn()} />);
+    fireEvent.change(screen.getByLabelText("拆分符"), { target: { value: "，" } });
+    fireEvent.click(screen.getByLabelText("我已核对上述优先顺序（最上方优先）"));
+    const button = screen.getByRole("button", { name: "按补充映射重新生成预览" });
+    expect(button).toHaveProperty("disabled", true);
+    expect(document.body.textContent).toContain("请填写「丙」的目标值");
+    fireEvent.change(screen.getByLabelText("拆分项 丙 的目标值"), { target: { value: "=1+1" } });
+    expect(button).toHaveProperty("disabled", true);
+    expect(screen.getByLabelText("拆分项 丙 的目标值").getAttribute("aria-invalid")).toBe("true");
+    expect(document.body.textContent).toContain("不能填写公式");
+    expect(onResolve).not.toHaveBeenCalled();
+  });
   it("目标读取失败不调用计算；恢复后原答案仍可提交", async () => {
     const checkScope = vi.fn().mockRejectedValueOnce(new Error("私有路径不显示"))
       .mockResolvedValue(null);
@@ -41,8 +86,8 @@ describe("本地映射补全卡 · 两宿主共用", () => {
     const onResolve = vi.fn();
     const view = render(<LocalMappingResolution rule={rule} values={["甲，乙"]} allowExactMapping busy={false}
       checkScope={checkScope} onResolve={onResolve} onCancel={vi.fn()} />);
-    await waitFor(() => expect(screen.getByRole("button", { name: "按补充映射重新生成预览" })).toHaveProperty("disabled", false));
     fireEvent.change(screen.getByLabelText("来源值 甲，乙 的目标值"), { target: { value: "高" } });
+    await waitFor(() => expect(screen.getByRole("button", { name: "按补充映射重新生成预览" })).toHaveProperty("disabled", false));
     fireEvent.click(screen.getByRole("button", { name: "按补充映射重新生成预览" }));
     view.unmount();
     resolveCheck(null);
@@ -55,6 +100,7 @@ describe("本地映射补全卡 · 两宿主共用", () => {
     render(<LocalMappingResolution rule={rule} values={["甲，乙"]} allowExactMapping busy={false}
       checkScope={checkScope} onResolve={onResolve} onCancel={vi.fn()} />);
     const button = screen.getByRole("button", { name: "按补充映射重新生成预览" });
+    fireEvent.change(screen.getByLabelText("来源值 甲，乙 的目标值"), { target: { value: "高" } });
     await waitFor(() => expect(button).toHaveProperty("disabled", false));
     expect(screen.queryByRole("checkbox")).toBeNull();
     expect(document.body.textContent).not.toContain("确认当前操作目标");
@@ -71,8 +117,8 @@ describe("本地映射补全卡 · 两宿主共用", () => {
     const onResolve = vi.fn();
     render(<LocalMappingResolution rule={rule} values={["甲，乙"]} allowExactMapping busy={false}
       checkScope={checkScope} onResolve={onResolve} onCancel={vi.fn()} />);
-    await waitFor(() => expect(screen.getByRole("button", { name: "按补充映射重新生成预览" })).toHaveProperty("disabled", false));
     fireEvent.change(screen.getByLabelText("来源值 甲，乙 的目标值"), { target: { value: "高" } });
+    await waitFor(() => expect(screen.getByRole("button", { name: "按补充映射重新生成预览" })).toHaveProperty("disabled", false));
     fireEvent.click(screen.getByRole("button", { name: "按补充映射重新生成预览" }));
     await screen.findByRole("alert");
     expect(screen.queryByRole("checkbox")).toBeNull();
@@ -85,6 +131,7 @@ describe("本地映射补全卡 · 两宿主共用", () => {
     const onResolve = vi.fn().mockResolvedValue(undefined);
     render(<LocalMappingResolution rule={rule} values={["甲，乙"]} allowExactMapping busy={false}
       checkScope={checkScope} onResolve={onResolve} onCancel={vi.fn()} />);
+    fireEvent.change(screen.getByLabelText("来源值 甲，乙 的目标值"), { target: { value: "高" } });
     await waitFor(() => expect(screen.getByRole("button", { name: "按补充映射重新生成预览" })).toHaveProperty("disabled", false));
     expect(screen.queryByRole("checkbox")).toBeNull();
     fireEvent.change(screen.getByLabelText("来源值 甲，乙 的目标值"), { target: { value: "高" } });
@@ -140,7 +187,8 @@ describe("本地映射补全卡 · 两宿主共用", () => {
     />);
     fireEvent.click(screen.getByRole("button", { name: "按补充映射重新生成预览" }));
     expect(onResolve).not.toHaveBeenCalled();
-    expect(screen.getByRole("alert").textContent).toContain("目标值不能为空");
+    expect(screen.getByRole("button", { name: "按补充映射重新生成预览" })).toHaveProperty("disabled", true);
+    expect(screen.getByRole("alert").textContent).toContain("请填写「甲，乙」的目标值");
     fireEvent.change(screen.getByLabelText("来源值 甲，乙 的目标值"), { target: { value: "高" } });
     fireEvent.click(screen.getByRole("button", { name: "按补充映射重新生成预览" }));
     expect(onResolve).toHaveBeenCalledTimes(1);

@@ -437,6 +437,9 @@ beforeEach(() => {
       if (url.includes("/api/settings/model")) {
         return jsonResponse({ connectionCount: 1 });
       }
+      if (url.includes("/api/intent/message")) {
+        return jsonResponse({ kind: "needs_workbook_context", summary: "需要字段结构", provider: "model" });
+      }
       if (url.includes("/api/turn")) {
         turnCallCount += 1;
         // Distinguish by the real request shape, including subsequent clarification turns.
@@ -575,8 +578,9 @@ async function ask(
 async function confirmBeforeAnalysis(container: HTMLElement) {
   await until(() => Boolean(container.querySelector('[role="dialog"]')), "需求分析前应先显示独立目标确认");
   const dialog = container.querySelector('[role="dialog"]')!;
-  await click(dialog.querySelector('input[type="radio"]'));
-  await click(findButton(container, "确认目标并继续"));
+  expect(dialog.querySelector('input[type="radio"]')).toBeNull();
+  expect(dialog.textContent).toContain("确认本次操作范围");
+  await click(findButton(container, "确认范围并继续"));
 }
 
 describe("local_plan_rule 的真实出站请求体", () => {
@@ -605,16 +609,21 @@ describe("local_plan_rule 的真实出站请求体", () => {
       expect(host.headerValueCount()).toBe(0);
       expect(host.dataValueCount()).toBe(0);
       expect(host.writeCount()).toBe(0);
-      expect(textOf(container)).not.toContain("需求分析过程");
+      expect(textOf(container)).toContain("理解消息");
+      expect(textOf(container)).not.toContain("读取已授权表结构");
+      const firstRouting = captured.filter((item) => item.url.includes("/api/intent/message"));
+      expect(firstRouting).toHaveLength(1);
+      expect(Object.keys(JSON.parse(firstRouting[0].body)).sort()).toEqual(["conversation", "imageCount", "modelId", "prompt"]);
       expect(textOf(container)).not.toContain(PRIVATE_SENTINEL);
       await confirmBeforeAnalysis(container);
       await until(() => textOf(container).includes(PRIVATE_SENTINEL), "应展示本地未知来源值");
       const requestCount = captured.length;
       const target = "用户本地答案-6K9B";
-      await until(() => !findButton(container, "按补充映射重新生成预览")!.disabled, "已授权的补全表单应可作答");
+      expect(findButton(container, "按补充映射重新生成预览")!.disabled).toBe(true); // Missing input, not missing authorization.
       expect(container.querySelector('.local-mapping-scope-confirmation')).toBeNull();
       expect(textOf(container)).not.toContain("确认当前操作目标：");
       await typeInput(container.querySelector<HTMLInputElement>('.wps-local-mapping-values input[type="text"]'), target);
+      await until(() => !findButton(container, "按补充映射重新生成预览")!.disabled, "填写完整后应可预览");
       await click(findButton(container, "按补充映射重新生成预览"));
       await until(() => textOf(container).includes("写入前确认"), "确认后必须进入新预览，而不是重问同一道题");
       expect(textOf(container)).not.toContain("无法确认当前工作簿和授权工作表");
@@ -650,8 +659,8 @@ describe("local_plan_rule 的真实出站请求体", () => {
       await confirmBeforeAnalysis(container);
       await until(() => textOf(container).includes(PRIVATE_SENTINEL), "应展示本地澄清");
       const target = "禁止跨文件挪用-4Q1C";
-      await until(() => !findButton(container, "按补充映射重新生成预览")!.disabled, "已有前置授权");
       await typeInput(container.querySelector<HTMLInputElement>('.wps-local-mapping-values input[type="text"]'), target);
+      await until(() => !findButton(container, "按补充映射重新生成预览")!.disabled, "已有前置授权且输入有效");
       const count = captured.length;
       fullName = "C:\\Other\\测试.xlsx";
       await click(findButton(container, "按补充映射重新生成预览"));
@@ -682,7 +691,7 @@ describe("local_plan_rule 的真实出站请求体", () => {
       await ask(container);
       await confirmBeforeAnalysis(container);
       await until(() => textOf(container).includes(PRIVATE_SENTINEL) &&
-        !findButton(container, "按补充映射重新生成预览")!.disabled, "前置确认后应展示业务缺口");
+        Boolean(container.querySelector('.wps-local-mapping-values input[type="text"]')), "前置确认后应展示业务缺口");
       const count = captured.length;
       host.setRow3Value("新的私有来源-8F2H");
       await typeInput(container.querySelector<HTMLInputElement>('.wps-local-mapping-values input[type="text"]'), "旧值目标-4J2H");

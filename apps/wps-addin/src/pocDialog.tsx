@@ -9,6 +9,7 @@
  * 把"实际拿到了多宽"显示给用户；不能再除以 devicePixelRatio。
  */
 
+import { brandLogoUrl } from "../../excel-addin/src/brandLogo";
 import { useEffect, useState } from "react";
 import { reportDevProbe } from "./devProbe";
 import { startChildChannelProbe, type ChannelProbeStatus } from "./wpsWideViewChannelPoc";
@@ -53,7 +54,7 @@ export default function PocDialog() {
   return (
     <main className="poc-dialog-shell">
       <header>
-        <span className="probe-logo">EB</span>
+        <img className="probe-logo" src={brandLogoUrl} alt="" />
         <strong>变更审阅宽视图 · 能力探针</strong>
       </header>
       <p>

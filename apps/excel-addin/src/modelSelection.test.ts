@@ -4,6 +4,7 @@ import {
   planningReadPolicyForModel,
   connectionModelSuffix,
   isRealModelId,
+  requiresStreamingToolDelivery,
   LEGACY_LOCAL_MODEL_ID,
   NO_MODEL_SELECTED,
   resolveDisplayedModelId,
@@ -19,6 +20,23 @@ describe("planningReadPolicyForModel", () => {
     expect(planningReadPolicyForModel("connection:id", "ifNeeded")).toBe("ifNeeded");
     expect(planningReadPolicyForModel("connection:id", "none")).toBe("none");
     expect(planningReadPolicyForModel(null, "ifNeeded")).toBe("ifNeeded");
+  });
+});
+
+describe("requiresStreamingToolDelivery", () => {
+  it("只有 SDK 适配器需要（取数唯一通道是流式投递的工具请求）", () => {
+    expect(requiresStreamingToolDelivery("claude-agent-sdk")).toBe(true);
+    expect(requiresStreamingToolDelivery("claude-agent-sdk:connection-0001")).toBe(true);
+    expect(requiresStreamingToolDelivery("  Claude-Agent-SDK  ")).toBe(true);
+  });
+
+  it("普通模型/未选择不需要（仍旧可以退回非流式端点）", () => {
+    expect(requiresStreamingToolDelivery("connection:regular")).toBe(false);
+    expect(requiresStreamingToolDelivery("deepseek-chat")).toBe(false);
+    expect(requiresStreamingToolDelivery(null)).toBe(false);
+    expect(requiresStreamingToolDelivery("")).toBe(false);
+    // 前缀相像但不是 SDK 适配器：不许误伤。
+    expect(requiresStreamingToolDelivery("claude-agent-sdkx")).toBe(false);
   });
 });
 

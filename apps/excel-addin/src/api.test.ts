@@ -4,6 +4,7 @@ import {
   apiErrorCategory,
   checkHealth,
   checkIntent,
+  checkFolderAdmission,
   deleteFolderBackup,
   deleteModelConnection,
   cleanupFolderBackups,
@@ -31,6 +32,7 @@ import {
   scanFolderByPath,
   startOfficeAction,
   streamAssistantResponse,
+  StreamingToolDeliveryUnavailableError,
   setFolderBackupPinned,
   testModelConnection,
   undoFolderExecution,
@@ -89,6 +91,19 @@ function sseStreamResponse(chunks: string[]): Response {
     headers: { "Content-Type": "text/event-stream" }
   });
 }
+
+it("folder selection preflight sends registered ids and selected names only", async () => {
+  const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+    items: [{ id: "registered-id\u0000Chosen", status: "ready", reason: "none" }], fingerprint: "local-fingerprint"
+  }), { status: 200 }));
+  vi.stubGlobal("fetch", fetchMock);
+  await checkFolderAdmission("registered-session", [{ fileId: "registered-id", sheets: ["Chosen"],
+    path: "PRIVATE_PATH", dataRows: [["PRIVATE_ROW"]] } as never]);
+  expect(String(fetchMock.mock.calls[0][0])).toContain("/api/folders/admission");
+  expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({
+    sessionId: "registered-session", selections: [{ fileId: "registered-id", sheets: ["Chosen"] }]
+  });
+});
 
 it("preserves interactive fields in a streamed planning clarification", async () => {
   const response = { kind: "clarification", turnId: "turn-stream-test", provider: "model", clarification: {
@@ -991,6 +1006,127 @@ describe("streaming assistant response", () => {
       expect.objectContaining({ method: "POST" })
     );
     expect(response).toMatchObject({ kind: "answer", message: "回退结果" });
+  });
+
+  /*
+   * 无流式工具投递能力时必须**提前明确拒绝**，而不是退回非流式。
+   *
+   * 退回非流式 = 服务端照样启动这一轮、照样等本机回执，可投递工具请求的唯一通道
+   * 就是那条被判不可用的 SSE —— 于是它干等到 `agentToolBridge.waitTimeoutSeconds`。
+   * 所以这里不只断言"抛错"，还必须断言**没有发出第二次请求**：只要发了，服务端就
+   * 已经进入无人回执的等待了。
+   */
+  it("SDK 适配器在流式端点缺失时明确拒绝，且不退回非流式端点", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response("Not Found", { status: 404 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      streamAssistantResponse({ ...streamPlanRequest, modelId: "claude-agent-sdk" })
+    ).rejects.toBeInstanceOf(StreamingToolDeliveryUnavailableError);
+
+    // 只打了流式端点这一次：没有退回 `/api/turn`（回退本身就是"无人回执的等待"）。
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      expect.stringContaining("/api/turn/stream"),
+      expect.objectContaining({ method: "POST" })
+    );
+    const urls = fetchMock.mock.calls.map((call) => String(call[0]));
+    expect(urls.some((url) => url.endsWith("/api/turn"))).toBe(false);
+  });
+
+  it("SDK 适配器的拒绝带可执行的固定错误码，不是笼统失败", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(new Response("Not Found", { status: 404 }))
+    );
+
+    const rejection = streamAssistantResponse({
+      ...streamPlanRequest,
+      modelId: "claude-agent-sdk:connection-0001"
+    });
+
+    await expect(rejection).rejects.toBeInstanceOf(StreamingToolDeliveryUnavailableError);
+    await expect(rejection).rejects.toMatchObject({
+      code: "streaming_tool_delivery_unavailable",
+      retryable: false
+    });
+    await expect(rejection).rejects.toThrow(/流式/);
+  });
+
+  it.each([422, 500, 503])("SDK HTTP %s 不掩盖成流式不可用", async (status) => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ detail: {
+      code: "TASK_STATE_CORRUPT", message: "任务数据库损坏", retryable: false
+    } }), { status }));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(streamAssistantResponse({ ...streamPlanRequest, modelId: "claude-agent-sdk" }))
+      .rejects.toMatchObject({ status, code: "TASK_STATE_CORRUPT" });
+    await expect(continuePlanningTask({ turnId: "turn-error", expectedRevision: 1,
+      requestId: "continue-error", afterSequence: 0, modelId: "claude-agent-sdk" }))
+      .rejects.toMatchObject({ status, code: "TASK_STATE_CORRUPT" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("续跑流式端点缺失时，SDK 适配器同样明确拒绝（无回退通道）", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(new Response("Not Found", { status: 404 }))
+    );
+
+    const rejection = continuePlanningTask({
+      turnId: "turn-sdk-continue",
+      expectedRevision: 2,
+      requestId: "continue-sdk-0001",
+      afterSequence: 3,
+      modelId: "claude-agent-sdk"
+    });
+
+    await expect(rejection).rejects.toBeInstanceOf(StreamingToolDeliveryUnavailableError);
+    await expect(rejection).rejects.toMatchObject({
+      code: "streaming_tool_delivery_unavailable"
+    });
+  });
+
+  it("普通模型在同样的 404 下仍旧回退（拒绝只针对需要工具投递的请求）", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response("Not Found", { status: 404 }))
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            kind: "answer",
+            message: "普通模型回退结果",
+            provider: "model",
+            turnId: "turn-stream-test"
+          }),
+          { status: 200 }
+        )
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await streamAssistantResponse({
+      ...streamPlanRequest,
+      modelId: "connection:regular"
+    });
+
+    expect(response).toMatchObject({ kind: "answer", message: "普通模型回退结果" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(String(fetchMock.mock.calls[1]?.[0])).toContain("/api/turn");
+  });
+
+  it("连接失败时 SDK 适配器不退回非流式（服务端连请求都还没收到）", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockRejectedValueOnce(new TypeError("Failed to fetch"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(
+      streamAssistantResponse({ ...streamPlanRequest, modelId: "claude-agent-sdk" })
+    ).rejects.toBeInstanceOf(StreamingToolDeliveryUnavailableError);
+
+    expect(fetchMock).toHaveBeenCalledOnce();
   });
 });
 

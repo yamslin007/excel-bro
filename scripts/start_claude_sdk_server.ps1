@@ -25,6 +25,11 @@ try {
 
     Push-Location $projectRoot
     try {
+        # SDK availability does not imply that isolated Python tools are enabled.
+        & $pythonPath -c "from server.app.python_analysis import python_execution_enabled; enabled = python_execution_enabled(); print('Isolated Python tools enabled:', enabled); print('For Python analysis use scripts/start_manual_python_acceptance.ps1' if not enabled else 'Python tools will use the configured verified isolated runner.')"
+        if ($LASTEXITCODE -ne 0) {
+            throw "Unable to read the effective Python capability configuration."
+        }
         # Windows reload/multiple workers use a Selector loop without subprocess support.
         & $pythonPath -m uvicorn server.app.main:app --host 127.0.0.1 --port 8765 --loop asyncio --workers 1
         if ($LASTEXITCODE -ne 0) {

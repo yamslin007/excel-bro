@@ -2267,6 +2267,15 @@ def _display_openpyxl_value(cell):
 
 def create_folder_snapshot(request: FolderSnapshotRequest) -> WorkbookSnapshot:
     session = _session(request.sessionId)
+    selected_paths: set[Path] = set()
+    for selection in request.selections:
+        try:
+            selected_paths.add(session.files[selection.fileId])
+        except KeyError as error:
+            raise ValueError("选择中包含未知文件，请重新扫描文件夹") from error
+    # Bind the rows to the same file contents before and after the whole read.
+    # Do not publish a partial/new authorization if a file changes mid-snapshot.
+    source_fingerprint = _selected_files_fingerprint(selected_paths)
     snapshots: list[WorksheetSnapshot] = []
     selected_targets: dict[str, tuple[Path, str]] = {}
     selected_sources: dict[str, tuple[str, str, Path, str]] = {}
@@ -2347,11 +2356,11 @@ def create_folder_snapshot(request: FolderSnapshotRequest) -> WorkbookSnapshot:
 
     if not snapshots:
         raise ValueError("请至少选择一个可读取的工作表")
+    if _selected_files_fingerprint(selected_paths) != source_fingerprint:
+        raise ValueError("读取所选文件期间文件发生变化，请重新读取并生成预览")
     session.selected_targets = selected_targets
     session.selected_sources = selected_sources
-    session.source_fingerprint = _selected_files_fingerprint(
-        {path for path, _ in selected_targets.values()}
-    )
+    session.source_fingerprint = source_fingerprint
     return WorkbookSnapshot(
         name=f"文件夹：{session.root.name}",
         capturedAt=datetime.now().astimezone().isoformat(),
@@ -2810,6 +2819,7 @@ def validate_plan_for_folder(
     created_sheets: set[tuple[Path, str]] = set()
     sheet_names: dict[Path, set[str]] = {}
     object_names: dict[Path, set[str]] = {}
+    write_eligibility: dict[tuple[Path, str], str] = {}
 
     def names_for(path: Path) -> set[str]:
         existing = sheet_names.get(path)
@@ -2896,6 +2906,26 @@ def validate_plan_for_folder(
                 f"「{action.sheet}」。"
             )
             continue
+        if existed_before_plan and action.type != "splitGroupAggregate":
+            # openpyxl does not enforce Excel sheet protection. Never turn an
+            # analysis-only selection into a write permit; recheck before backups.
+            from .folder_admission import inspect_file_selection
+            eligibility_key = (path, sheet_name)
+            if eligibility_key not in write_eligibility:
+                try:
+                    write_eligibility[eligibility_key] = inspect_file_selection(path, [sheet_name])[sheet_name]
+                except Exception:
+                    write_eligibility[eligibility_key] = "unreadable"
+            reason = write_eligibility[eligibility_key]
+            if reason != "none":
+                detail = {
+                    "protected": "工作表受保护，请先在宿主中解除保护",
+                    "read_only": "文件只读",
+                    "directory_not_writable": "保存目录不可写",
+                    "locked": "文件被占用或无写回权限",
+                }.get(reason, "无法核实文件与工作表的写入状态")
+                issues.append(f"第 {index + 1} 步：{detail}；本次仅可分析，不执行写入。")
+                continue
         creates_sheet = not path.exists() or sheet_name not in current_names
         invalid_range = False
         shapes: dict[str, tuple[int, int]] = {}
@@ -3429,28 +3459,47 @@ def _verify_folder_plan(
                 and criterion.fillColor.casefold() == action.color.casefold()
             )
         elif action.type == "setFont":
-            verified = (
-                action.bold is None
-                or any(
-                    later.bold is not None
-                    for later in later_same_range("setFont")
-                )
-                or has_criterion(
+            later_fonts = later_same_range("setFont")
+
+            def font_property_covered(
+                action_field: str, criterion_field: str
+            ) -> bool:
+                """一个字体属性要么没被声明，要么必须有人兜底。
+
+                兜底只有两条路：后面还有同范围的 setFont 覆盖了同一属性，或者
+                计划里带了对应的 rangeFormatMatches 期望。两条都没有 ⇒ 这条
+                声明没人验证。
+                """
+                value = getattr(action, action_field)
+                if value is None:
+                    return True
+                if any(
+                    getattr(later, action_field) is not None for later in later_fonts
+                ):
+                    return True
+                if criterion_field == "fontColor":
+                    return has_criterion(
+                        lambda criterion: criterion.type == "rangeFormatMatches"
+                        and same_range(criterion, action.sheet, action.range)
+                        and criterion.fontColor is not None
+                        and criterion.fontColor.casefold() == str(value).casefold()
+                    )
+                return has_criterion(
                     lambda criterion: criterion.type == "rangeFormatMatches"
                     and same_range(criterion, action.sheet, action.range)
-                    and criterion.bold == action.bold
+                    and getattr(criterion, criterion_field) == value
                 )
-            ) and (
-                action.color is None
-                or any(
-                    later.color is not None
-                    for later in later_same_range("setFont")
-                )
-                or has_criterion(
-                    lambda criterion: criterion.type == "rangeFormatMatches"
-                    and same_range(criterion, action.sheet, action.range)
-                    and criterion.fontColor is not None
-                    and criterion.fontColor.casefold() == action.color.casefold()
+
+            # 五条独立判据。此前只覆盖 bold / color，italic|name|size 会被
+            # 判成"已验证"却没有任何验收条件兜底 —— 静默的假通过。
+            verified = all(
+                font_property_covered(action_field, criterion_field)
+                for action_field, criterion_field in (
+                    ("bold", "bold"),
+                    ("italic", "fontItalic"),
+                    ("name", "fontName"),
+                    ("size", "fontSize"),
+                    ("color", "fontColor"),
                 )
             )
         elif action.type == "setNumberFormat":
@@ -5370,13 +5419,18 @@ def _execute_folder_plan(
                 max_col=max_column,
             ):
                 for cell in row:
+                    # 只改动作**显式给出**的属性，其余从单元格现值原样带过。
+                    # 五项必须一项不漏：漏掉哪项，模型声明的那处修改就会静默丢失，
+                    # 而计划仍会被判成成功。
                     cell.font = Font(
-                        name=cell.font.name,
-                        size=cell.font.size,
+                        name=action.name if action.name is not None else cell.font.name,
+                        size=action.size if action.size is not None else cell.font.size,
                         bold=action.bold
                         if action.bold is not None
                         else cell.font.bold,
-                        italic=cell.font.italic,
+                        italic=action.italic
+                        if action.italic is not None
+                        else cell.font.italic,
                         color=action.color.removeprefix("#")
                         if action.color
                         else cell.font.color,

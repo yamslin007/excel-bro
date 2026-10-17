@@ -5,7 +5,7 @@ import { getWpsApplication } from './wpsHost';
 import { createWpsReviewPaneAdapter } from './wpsReviewPaneSizing';
 import { readReviewPaneLease, refreshReviewPaneLease, REVIEW_PANE_LEASE_KEY } from './wpsReviewPaneLease';
 
-export function useWpsReviewPaneRatio(review: WpsNativeComparison | null) {
+export function useWpsReviewPaneRatio(review: WpsNativeComparison | null, rearm = 0) {
   const [needsResize, setNeedsResize] = useState(false);
   useEffect(() => {
     setNeedsResize(false);
@@ -55,7 +55,9 @@ export function useWpsReviewPaneRatio(review: WpsNativeComparison | null) {
       document.removeEventListener('visibilitychange', visible);
       if (app && adapter && readReviewPaneLease(app, true)?.owner === owner) {
         try {
-          if (getWpsApplication().Hwnd === app.Hwnd) adapter.restore();
+          // 只恢复**本次流程自动改过**的宽度。用户中途手动拖过的宽度是他自己的选择，
+          // 退出审阅时不得强行覆盖（那会把用户的布局当成我们的临时布局抹掉）。
+          if (!manual && getWpsApplication().Hwnd === app.Hwnd) adapter.restore();
         } catch { /* Never resize a replaced/hidden pane. */ }
         try {
           app.PluginStorage.removeItem?.(REVIEW_PANE_LEASE_KEY);
@@ -63,6 +65,6 @@ export function useWpsReviewPaneRatio(review: WpsNativeComparison | null) {
         } catch { /* TTL expires a stale marker. */ }
       }
     };
-  }, [review]);
+  }, [review, rearm]);
   return needsResize;
 }

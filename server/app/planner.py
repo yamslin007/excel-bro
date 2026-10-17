@@ -133,12 +133,14 @@ def _local_address_plan(request: PlanRequest) -> AssistantResponse | None:
     白名单 ``AnalysisPlan``，照旧先预览、再由用户确认后才执行。
     """
 
-    text = _canonical_text(request.prompt).strip()
-    clear_match = re.search(
+    # Normalize syntax only; preserve literal text and reject substring commands.
+    text = request.prompt.strip()
+    syntax = text.translate(COMMAND_VARIANT_TRANSLATION)
+    clear_match = re.fullmatch(
         r"(?:清空|清除)\s*(?:(?P<sheet>[^!，,\s]+)!)?"
         r"(?P<range>\$?[a-z]{1,3}\$?\d+(?::\$?[a-z]{1,3}\$?\d+)?)"
-        r"(?:\s*(?:单元格|区域|范围))?",
-        text,
+        r"(?:\s*(?:单元格|区域|范围))?\s*[。！!？?]?",
+        syntax, re.IGNORECASE,
     )
     if clear_match:
         sheet_name = _resolve_target_sheet(request, clear_match.group("sheet"))
@@ -163,13 +165,13 @@ def _local_address_plan(request: PlanRequest) -> AssistantResponse | None:
         )
         return PlanResponse(plan=plan, provider="local")
 
-    match = re.search(
+    match = re.fullmatch(
         r"(?:把|将|在|向)?\s*(?:(?P<sheet>[^!，,\s]+)!)?"
         r"(?P<range>\$?[a-z]{1,3}\$?\d+(?::\$?[a-z]{1,3}\$?\d+)?)"
         r"(?:\s*(?:单元格|区域|范围))?\s*"
         r"(?:填入|写入|输入|设置为|设为|填上|写上)\s*"
         r"(?:(?:数字|数值|内容|公式)\s*)?(?P<value>.+?)\s*[。！!？?]?$",
-        text,
+        syntax, re.IGNORECASE,
     )
     if not match:
         return None
@@ -177,7 +179,19 @@ def _local_address_plan(request: PlanRequest) -> AssistantResponse | None:
     if not sheet_name:
         return AnswerResponse(provider="local", message="没有找到要写入的工作表。")
     address = match.group("range").upper().replace("$", "")
-    raw_value = _strip_edit_value(match.group("value"))
+    # Translation is one code point per character; extract the original literal.
+    literal = text[match.start("value"):match.end("value")].strip()
+    quoted = re.fullmatch(r'"[^"\r\n]*"|\'[^\'\r\n]*\'|“[^”\r\n]*”|‘[^’\r\n]*’|`[^`\r\n]*`', literal)
+    raw_value = literal[1:-1] if quoted else literal
+    literal_formula = not quoted and re.fullmatch(
+        r'''=(?:[A-Za-z0-9_.$!:()+*/^%<>=,&;\-]|"(?:[^"]|"")*"|'(?:[^']|'')*')+''',
+        raw_value,
+    )
+    if not quoted and not literal_formula and not re.fullmatch(
+        r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?|true|false|是|否|空白|空|null|none",
+        raw_value, re.IGNORECASE,
+    ):
+        return None
     if not raw_value:
         return AnswerResponse(provider="local", message="请告诉我要写入的具体内容。")
     range_match = re.fullmatch(
@@ -202,9 +216,9 @@ def _local_address_plan(request: PlanRequest) -> AssistantResponse | None:
             )
             + 1
         )
-    is_formula = raw_value.startswith("=")
+    is_formula = bool(literal_formula)
     matrix = [
-        [raw_value if is_formula else _parse_edit_value(raw_value)] * column_count
+        [raw_value if is_formula or quoted else _parse_edit_value(raw_value)] * column_count
         for _ in range(row_count)
     ]
     action = (
@@ -391,6 +405,7 @@ async def create_plan(
     on_checkpoint: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     resume_checkpoint: dict[str, Any] | None = None,
     approved_wall_time_seconds: float | None = None,
+    reminder_seconds: float | None = None,
 ) -> AssistantResponse:
     structural_plan = None if request.images else _local_bulk_worksheet_deletion_plan(request)
     if structural_plan is not None:
@@ -436,6 +451,12 @@ async def create_plan(
 
         return await run_sdk_plan(request, config, on_event=on_event)
     timeout = model_timeout_seconds()
+    # 普通后端也要有数据登记通道：否则 ``run_python_analysis`` 在上面被注册了，
+    # 却永远拿不到 dataset:// 句柄（没有宿主读表回执），只能失败关闭。
+    from .excel_agent import open_planning_bridge
+    from .task_bridge import task_tool_bridge
+
+    bridge_task_id, bridge_session = open_planning_bridge(request, on_event)
     try:
         return await run_excel_agent(
             request,
@@ -445,9 +466,15 @@ async def create_plan(
             on_event=on_event,
             on_checkpoint=on_checkpoint,
             resume_checkpoint=resume_checkpoint,
+            reminder_seconds=reminder_seconds,
             approved_wall_time_seconds=approved_wall_time_seconds,
+            bridge_session=bridge_session,
         )
     except (KeyError, IndexError, TypeError, ValidationError) as error:
         raise ValueError(f"模型计划无法通过安全校验：{error}") from error
+    finally:
+        # 本轮结束即收口：数据登记只活到本轮（已登记的结果另有生命周期）。
+        if bridge_task_id:
+            task_tool_bridge.close(bridge_task_id)
 
 

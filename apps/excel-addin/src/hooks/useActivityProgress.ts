@@ -5,7 +5,8 @@ import type {
   TaskProgressPhase,
   TaskProgressStatus,
   TaskProgressTarget,
-  TaskProgressTrace
+  TaskProgressTrace,
+  LocalResultCard
 } from "../contracts";
 import { recordProgressDiagnosticEvent } from "../diagnostics";
 
@@ -40,6 +41,8 @@ export interface ActivityStep {
   target?: TaskProgressTarget | null;
   facts?: TaskProgressFact[] | null;
   trace?: (TaskProgressTrace & { id: string }) | null;
+  /** Python 分析完成时的结果卡（只含引用与结构，值由前端另行查询）。 */
+  pythonResult?: LocalResultCard | null;
   startedAt?: number;
 }
 
@@ -69,6 +72,8 @@ export interface ActivityProgress {
 
 export interface ActivityLog {
   outcome?: ActivityOutcome;
+  /** Local presentation only: completed ordinary chat keeps details available but closed. */
+  defaultCollapsed?: boolean;
   operationId?: string | null;
   /** 前端最后成功归并的服务端事件序号；旧日志可能没有。 */
   sequence?: number;
@@ -474,6 +479,7 @@ export function useActivityProgress({
         target: event.target ?? existing?.target ?? null,
         facts: event.facts ?? existing?.facts ?? null,
         trace: trace ?? existing?.trace ?? null,
+        pythonResult: event.pythonResult ?? existing?.pythonResult ?? null,
         startedAt: existing?.startedAt ?? now
       };
       if (existingIndex === -1) {
@@ -577,7 +583,8 @@ export function useActivityProgress({
     (
       finalStatus: TaskProgressStatus = "completed",
       finalSummary?: string,
-      outcome?: ActivityOutcome
+      outcome?: ActivityOutcome,
+      presentation: { defaultCollapsed?: boolean } = {}
     ) => {
       const current = activityRef.current;
       if (!current) {
@@ -622,6 +629,7 @@ export function useActivityProgress({
       if (steps.length > 0) {
         const log: ActivityLog = {
           outcome: effectiveOutcome,
+          ...(effectiveOutcome === "completed" && presentation.defaultCollapsed === true ? { defaultCollapsed: true } : {}),
           operationId: current.operationId,
           sequence: current.sequence,
           steps: steps.map(persistableStep),

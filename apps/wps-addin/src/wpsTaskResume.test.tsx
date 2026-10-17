@@ -25,7 +25,7 @@ import { getWpsApplication } from "./wpsHost";
 
 vi.mock("../../excel-addin/src/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../excel-addin/src/api")>();
-  return { ...actual, listModels: vi.fn(), getModelSettings: vi.fn(), validatePlan: vi.fn() };
+  return { ...actual, understandMessage: vi.fn(async () => ({ kind: "needs_workbook_context", summary: "需要字段结构", provider: "model" })), listModels: vi.fn(), getModelSettings: vi.fn(), validatePlan: vi.fn() };
 });
 vi.mock("./wpsReadonlyAgent", () => ({ runWpsReadonlyTurn: vi.fn() }));
 vi.mock("./wpsHost", async (importOriginal) => {
@@ -709,10 +709,9 @@ describe("重新授权不是澄清答案", () => {
     await click(recoveryButton(container, "确认此范围并继续"));
     await until(() => Boolean(container.querySelector('.authorized-target-dialog')), "恢复先确认弱宿主目标证据");
     expect(runTurnMock).toHaveBeenCalledTimes(1);
-    await click(container.querySelector<HTMLInputElement>('.authorized-target-dialog input[value="original"]') ??
-      container.querySelector<HTMLInputElement>('.authorized-target-dialog input[type="radio"]'));
+    expect(container.querySelector('.authorized-target-dialog input[type="radio"]')).toBeNull();
     await click(Array.from(container.querySelectorAll<HTMLButtonElement>('.authorized-target-dialog button'))
-      .find((button) => button.textContent === "确认目标并继续") ?? null);
+      .find((button) => button.textContent === "确认范围并继续") ?? null);
     await until(() => runTurnMock.mock.calls.length === 2, "确认后发起新一轮");
     expect(runTurnMock.mock.calls[1][0].prompt).toContain("补充确认：逐行映射，空白不写入");
     expect(storedTaskResumes().at(-1)?.confirmations).toHaveLength(1);

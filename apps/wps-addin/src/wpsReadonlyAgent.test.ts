@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import type { PlanRequest } from "../../excel-addin/src/contracts";
+import type { PlanRequest, IntentCheckRequest, MessageUnderstandingRequest } from "../../excel-addin/src/contracts";
 import type { WpsApplication, WpsRange, WpsWorksheet } from "./wpsHost";
 import {
   buildWpsReadonlyContexts,
@@ -11,6 +11,11 @@ import {
 import { ApiRequestError } from "../../excel-addin/src/api";
 import type { WpsSheetReadResult } from "./wpsWorkbookReader";
 import { TargetConfirmationRequiredError } from "@excel-bro/core/authorizedTarget";
+
+vi.mock("../../excel-addin/src/api", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../../excel-addin/src/api")>(),
+  understandMessage: vi.fn(async () => ({ kind: "needs_workbook_context", summary: "需要字段结构", provider: "model" }))
+}));
 
 function makeApplication(): WpsApplication {
   const sheets: WpsWorksheet[] = [{ Name: "明细" }, { Name: "未授权" }];
@@ -45,6 +50,25 @@ const readResult: WpsSheetReadResult = {
 };
 
 describe("WPS readonly agent", () => {
+  it("passes one explicit task context through intent and planning without reading rows", async () => {
+    const taskContext = { schemaVersion: 1 as const, originalPrompt: "根据类别填写等级", confirmations: [
+      { questionId: "mode", label: "口径", value: "逐行填写" },
+      { questionId: "blank", label: "空值", value: "不写入" }
+    ] };
+    const checkIntent = vi.fn(async (_request: IntentCheckRequest) => ({ kind: "proceed" as const, provider: "model" as const,
+      summary: "填写", confirmedPrompt: "根据类别逐行填写，空值不写入" }));
+    const createAssistantResponse = vi.fn(async (_request: PlanRequest) => ({ kind: "answer" as const,
+      provider: "model" as const, message: "完整规则已收到" }));
+    const readSheets = vi.fn();
+    await runWpsReadonlyTurn({ application: makeApplication(), selectedSheetIndexes: [1], prompt: "根据类别填写等级", taskContext }, {
+      checkIntent, createAssistantResponse, readSchemas: vi.fn(async () => [{ ...readResult, values: [readResult.values[0]] }]),
+      readSheets, executeQuery: vi.fn(), streamPlanning: vi.fn(), getPlanningStatus: vi.fn(), continuePlanning: vi.fn()
+    });
+    expect(checkIntent.mock.calls[0][0].taskContext).toEqual(taskContext);
+    expect(createAssistantResponse.mock.calls[0][0].taskContext).toEqual(taskContext);
+    expect(readSheets).not.toHaveBeenCalled();
+    expect(JSON.stringify(createAssistantResponse.mock.calls[0][0])).not.toContain('["甲",2]');
+  });
   it("local mapping resume checks target before reading source rows", async () => {
     const readSheets = vi.fn(async () => [readResult]);
     await expect(resumeWpsLocalMapping({ application: makeApplication(), selectedSheetIndexes: [1],
@@ -186,6 +210,55 @@ describe("WPS readonly agent", () => {
     const plannerRequest = createAssistantResponse.mock.calls[0][0];
     expect(plannerRequest.workbook.worksheets[0].dataRows).toEqual([]);
     expect(plannerRequest.dataResults?.[0].rows).toEqual([[2]]);
+  });
+
+  it("SDK 规划下 tool_request 不预置 dataResults（执行改由工具桥驱动）", async () => {
+    // 缺陷复现：SDK 适配器只看表结构，模型要自己调 query_table 经工具桥读表。
+    // 旧路径若把本地算好的 dataResults 塞进请求，会被服务端的"不上传数据行"
+    // 守卫直接拒绝 —— 新工具桥永远拿不到执行权。
+    const executeQuery = vi.fn();
+    const readSheets = vi.fn(async () => [readResult]);
+    const createAssistantResponse = vi.fn(async (_request: PlanRequest) => ({
+      kind: "answer" as const,
+      provider: "model" as const,
+      message: "已按工具桥结果作答"
+    }));
+    await runWpsReadonlyTurn(
+      {
+        application: makeApplication(),
+        selectedSheetIndexes: [1],
+        prompt: "有多少条记录",
+        modelId: "claude-agent-sdk"
+      },
+      {
+        checkIntent: vi.fn(async () => ({
+          kind: "tool_request" as const,
+          summary: "统计记录",
+          confirmedPrompt: "有多少条记录",
+          provider: "model" as const,
+          request: {
+            id: "q1",
+            tool: "query_table" as const,
+            arguments: {
+              mode: "aggregate" as const,
+              metrics: [{ operation: "countRows" as const, outputName: "记录数" }]
+            }
+          }
+        })),
+        executeQuery,
+        streamPlanning: vi.fn(),
+        getPlanningStatus: vi.fn(),
+        continuePlanning: vi.fn(),
+        createAssistantResponse,
+        readSchemas: vi.fn(async () => [readResult]),
+        readSheets
+      }
+    );
+    const plannerRequest = createAssistantResponse.mock.calls[0][0];
+    expect(plannerRequest.dataResults).toEqual([]);
+    // 本地预置计算与全表读取都不该发生：读表要等到桥指针回来那一刻。
+    expect(executeQuery).not.toHaveBeenCalled();
+    expect(readSheets).not.toHaveBeenCalled();
   });
 
   it("returns a model-generated write plan for guarded preview and confirmation", async () => {
@@ -474,14 +547,17 @@ describe("WPS readonly agent", () => {
     });
   });
 
-  it("answers a greeting without reading full rows or invoking the planner", async () => {
+  it("answers a greeting before authorization, schema reads or field-aware intent", async () => {
     const readSchemas = vi.fn(async () => [{ ...readResult, values: [readResult.values[0]] }]);
     const readSheets = vi.fn(async () => [readResult]);
     const createAssistantResponse = vi.fn();
+    const checkIntent = vi.fn();
+    const beforeRead = vi.fn();
     const result = await runWpsReadonlyTurn(
-      { application: makeApplication(), selectedSheetIndexes: [1], prompt: "你好" },
+      { application: makeApplication(), selectedSheetIndexes: [], prompt: "你好", beforeRead },
       {
-        checkIntent: vi.fn(async () => ({ kind: "conversation" as const, message: "你好，有什么需要我帮忙？", provider: "model" as const })),
+        understandMessage: vi.fn(async () => ({ kind: "conversation" as const, message: "你好，有什么需要我帮忙？", provider: "model" as const })),
+        checkIntent,
         executeQuery: vi.fn(),
         streamPlanning: vi.fn(),
         getPlanningStatus: vi.fn(),
@@ -493,9 +569,74 @@ describe("WPS readonly agent", () => {
     );
 
     expect(result).toEqual({ kind: "answer", message: "你好，有什么需要我帮忙？", provider: "model", resultContext: null });
-    expect(readSchemas).toHaveBeenCalledOnce();
+    expect(readSchemas).not.toHaveBeenCalled();
+    expect(beforeRead).not.toHaveBeenCalled();
+    expect(checkIntent).not.toHaveBeenCalled();
     expect(readSheets).not.toHaveBeenCalled();
     expect(createAssistantResponse).not.toHaveBeenCalled();
+  });
+
+  it("understands first, then checks authorization and reads fields before field-aware intent", async () => {
+    const order: string[] = [];
+    const progress: string[] = [];
+    const readSchemas = vi.fn(async () => { order.push("schema"); return [readResult]; });
+    const readSheets = vi.fn();
+    const result = await runWpsReadonlyTurn({
+      application: makeApplication(), selectedSheetIndexes: [1], prompt: "检查当前表",
+      beforeRead: async () => { order.push("authorization"); },
+      onProgress: (event) => progress.push(event.stepId ?? "")
+    }, {
+      understandMessage: vi.fn(async (request: MessageUnderstandingRequest) => {
+        order.push("message");
+        expect(request).not.toHaveProperty("scope");
+        return { kind: "needs_workbook_context", summary: "检查当前表", provider: "model" } as const;
+      }),
+      checkIntent: vi.fn(async () => { order.push("field-intent"); return { kind: "conversation", message: "已理解字段", provider: "model" } as const; }),
+      readSchemas, readSheets, executeQuery: vi.fn(), createAssistantResponse: vi.fn(),
+      streamPlanning: vi.fn(), getPlanningStatus: vi.fn(), continuePlanning: vi.fn()
+    });
+    expect(result.kind).toBe("answer");
+    expect(order).toEqual(["message", "authorization", "schema", "field-intent"]);
+    expect(progress.slice(0, 3)).toEqual(["message-intent", "read-schemas", "intent"]);
+    expect(readSheets).not.toHaveBeenCalled();
+  });
+
+  it("cannot read fields if message understanding fails or is cancelled", async () => {
+    for (const cancel of [false, true]) {
+      const controller = new AbortController();
+      const beforeRead = vi.fn();
+      const readSchemas = vi.fn();
+      await expect(runWpsReadonlyTurn({
+        application: makeApplication(), selectedSheetIndexes: [1], prompt: "检查当前表", beforeRead, signal: controller.signal
+      }, {
+        understandMessage: vi.fn(async () => {
+          if (!cancel) throw new Error("消息理解失败");
+          controller.abort();
+          return { kind: "needs_workbook_context", summary: "检查当前表", provider: "model" } as const;
+        }),
+        readSchemas, readSheets: vi.fn(), executeQuery: vi.fn(), checkIntent: vi.fn(),
+        createAssistantResponse: vi.fn(), streamPlanning: vi.fn(), getPlanningStatus: vi.fn(), continuePlanning: vi.fn()
+      })).rejects.toThrow();
+      expect(beforeRead).not.toHaveBeenCalled();
+      expect(readSchemas).not.toHaveBeenCalled();
+    }
+  });
+
+  it("a target change during message understanding is rejected before the first schema read", async () => {
+    let changed = false;
+    const readSchemas = vi.fn();
+    await expect(runWpsReadonlyTurn({
+      application: makeApplication(), selectedSheetIndexes: [1], prompt: "检查当前表",
+      beforeRead: async () => { if (changed) throw new TargetConfirmationRequiredError(); }
+    }, {
+      understandMessage: vi.fn(async () => {
+        changed = true;
+        return { kind: "needs_workbook_context", summary: "检查当前表", provider: "model" } as const;
+      }),
+      readSchemas, readSheets: vi.fn(), checkIntent: vi.fn(), executeQuery: vi.fn(),
+      createAssistantResponse: vi.fn(), streamPlanning: vi.fn(), getPlanningStatus: vi.fn(), continuePlanning: vi.fn()
+    })).rejects.toBeInstanceOf(TargetConfirmationRequiredError);
+    expect(readSchemas).not.toHaveBeenCalled();
   });
 
   /**
@@ -541,8 +682,9 @@ describe("WPS readonly agent", () => {
 
     it("有 turnId 时优先走流式，且事件进增量进度（变异点：跳过流式直接一次性）", async () => {
       const progress: string[] = [];
-      const streamPlanning = vi.fn(async (_req: unknown, _turnId: string, hooks: { onProgress?: (e: { stepId: string; title: string; summary?: string }) => void }) => {
-        hooks.onProgress?.({ stepId: "s1", title: "读取结构", summary: "正在读取" });
+      const received = vi.fn();
+      const streamPlanning = vi.fn(async (_req: unknown, _turnId: string, hooks: { onProgress?: (e: { stepId: string; title: string; summary?: string; sequence: number }) => void }) => {
+        hooks.onProgress?.({ stepId: "s1", title: "读取结构", summary: "正在读取", sequence: 7 });
         return { kind: "answer" as const, provider: "model" as const, message: "流式回答", resultContext: null };
       });
       const deps = baseDeps({ streamPlanning });
@@ -551,7 +693,7 @@ describe("WPS readonly agent", () => {
           application: makeApplication(),
           selectedSheetIndexes: [1],
           prompt: "生成预览",
-          onProgress: (p) => progress.push(p.title ?? "")
+          onProgress: (p) => { progress.push(p.title ?? ""); received(p); }
         },
         deps
       );
@@ -559,6 +701,67 @@ describe("WPS readonly agent", () => {
       expect((deps as { createAssistantResponse: ReturnType<typeof vi.fn> }).createAssistantResponse)
         .not.toHaveBeenCalled();
       expect(progress).toContain("读取结构");
+      expect(received).toHaveBeenCalledWith(expect.objectContaining({ turnId: "turn-stream-1", sequence: 7 }));
+    });
+
+    it("桥指针必须原样透传到面板（丢掉它会让服务端一直等到超时）", async () => {
+      const seen: unknown[] = [];
+      const cards: unknown[] = [];
+      const pythonResult = { resultRef: "res_" + "c".repeat(32), title: "Python 分析结果",
+        headers: ["列1"], rowCount: 1, columnCount: 1, sourceSheets: ["Sheet1"], complete: true };
+      const streamPlanning = vi.fn(async (_req: unknown, _turnId: string, hooks: {
+        onProgress?: (e: Record<string, unknown>) => void;
+      }) => {
+        hooks.onProgress?.({
+          stepId: "bridge.query_table",
+          title: "正在本机执行数据查询",
+          sequence: 9,
+          bridgeTool: { operationId: "op_" + "a".repeat(32), tool: "query_table" },
+          pythonResult
+        });
+        return { kind: "answer" as const, provider: "model" as const, message: "ok", resultContext: null };
+      });
+      const deps = baseDeps({ streamPlanning });
+      await runWpsReadonlyTurn(
+        {
+          application: makeApplication(),
+          selectedSheetIndexes: [1],
+          prompt: "生成预览",
+          onProgress: (p) => { seen.push(p.bridgeTool); cards.push(p.pythonResult); }
+        },
+        deps
+      );
+      // 只有操作 ID 与工具名，没有任何请求参数/值。
+      // 其余进度事件（意图、读结构…）本来就不带指针 —— 这里只挑出带指针的那些。
+      expect(seen.filter((item) => item !== undefined && item !== null)).toEqual([
+        { operationId: "op_" + "a".repeat(32), tool: "query_table" }
+      ]);
+      expect(cards.filter(Boolean)).toEqual([pythonResult]);
+    });
+
+    it("本地结果卡指针随回答一路上抛，且不夹带值", async () => {
+      const card = {
+        resultRef: "res_" + "b".repeat(32),
+        title: "按类别汇总",
+        headers: ["类别", "数量"],
+        rowCount: 2,
+        columnCount: 2,
+        sourceSheets: ["明细"],
+        complete: true
+      };
+      const deps = baseDeps({
+        streamPlanning: vi.fn(async () => ({
+          kind: "answer" as const,
+          provider: "model" as const,
+          message: "已在本机算出结果。",
+          resultContext: null,
+          localResult: card
+        }))
+      });
+      const result = await run(deps);
+      expect(result).toMatchObject({ kind: "answer", localResult: card });
+      // 指针里只有引用与结构：一个数据行都没有。
+      expect(JSON.stringify(result)).not.toContain("rows");
     });
 
     it("端点不存在（404）才回退一次性通道", async () => {
@@ -647,7 +850,7 @@ describe("WPS readonly agent", () => {
    * 这两个断言钉的是"续跑不会变成重跑"与"续跑不写单元格"。
    */
   describe("CAP-02 续跑入口", () => {
-    it("先查状态再继续：用真实 revision/游标做 CAS，而不是界面上的旧值", async () => {
+    it("先查状态再继续：revision 用服务端最新值，游标用客户端收到的位置", async () => {
       const order: string[] = [];
       const getPlanningStatus = vi.fn(async () => {
         order.push("status");
@@ -664,11 +867,11 @@ describe("WPS readonly agent", () => {
       const continuePlanning = vi.fn(async (body: { expectedRevision: number; afterSequence: number }) => {
         order.push("continue");
         expect(body.expectedRevision).toBe(8);
-        expect(body.afterSequence).toBe(21);
+        expect(body.afterSequence).toBe(5);
         return { kind: "answer" as const, provider: "model" as const, message: "继续完成", resultContext: null };
       });
       const result = await resumeWpsPlanning(
-        { turnId: "turn-r" },
+        { turnId: "turn-r", afterSequence: 5 },
         { getPlanningStatus, continuePlanning } as never
       );
       expect(order).toEqual(["status", "continue"]);
@@ -778,7 +981,7 @@ describe("WPS readonly agent", () => {
       expect(continuePlanning.mock.calls[0][0]).toMatchObject({ afterSequence: 4 });
     });
 
-    it("未给游标时退回服务端最新序号（本端从未消费过事件）", async () => {
+    it("未给游标时从零补收，不能把服务端最新序号当作已收到", async () => {
       const continuePlanning = vi.fn(async (_input: { afterSequence?: number }) => ({
         kind: "answer" as const, provider: "model" as const, message: "好", resultContext: null
       }));
@@ -797,7 +1000,20 @@ describe("WPS readonly agent", () => {
           continuePlanning
         } as never
       );
-      expect(continuePlanning.mock.calls[0][0]).toMatchObject({ afterSequence: 20 });
+      expect(continuePlanning.mock.calls[0][0]).toMatchObject({ afterSequence: 0 });
+    });
+
+    it("续跑进度向面板转发原任务身份和实际事件序号", async () => {
+      const onProgress = vi.fn();
+      await resumeWpsPlanning({ turnId: "turn-events", afterSequence: 3, onProgress }, {
+        getPlanningStatus: vi.fn(async () => ({ turnId: "turn-events", status: "interrupted", revision: 7,
+          lastSequence: 20, canContinue: true, pauseType: "interrupted", reason: null })),
+        continuePlanning: vi.fn(async (_body, hooks) => {
+          hooks.onProgress({ stepId: "resume-1", title: "继续规划", sequence: 8 });
+          return { kind: "answer", provider: "model", message: "完成" };
+        })
+      } as never);
+      expect(onProgress).toHaveBeenCalledWith(expect.objectContaining({ turnId: "turn-events", sequence: 8 }));
     });
   });
 /**

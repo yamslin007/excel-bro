@@ -325,6 +325,111 @@ describe("natural organic style", () => {
     expect(dialogRule).toContain("outline: none");
   });
 
+  it("expands and collapses the manual sheet picker with a motion-safe height transition", () => {
+    const source = css("./styles.css");
+    const ruleStart = source.indexOf(".scope-picker-reveal {");
+    expect(ruleStart).toBeGreaterThan(-1);
+    const baseRule = source.slice(ruleStart, source.indexOf("}", ruleStart));
+    // 收起态是"真源"：0fr + 透明 + 不可见。
+    // visibility:hidden 还负责把收起态的控件移出 Tab 序（不能只靠 0 高度）。
+    expect(baseRule).toContain("grid-template-rows: 0fr");
+    expect(baseRule).toContain("opacity: 0");
+    expect(baseRule).toContain("visibility: hidden");
+
+    const openStart = source.indexOf(".scope-picker-reveal.open {");
+    expect(openStart).toBeGreaterThan(-1);
+    const openRule = source.slice(openStart, source.indexOf("}", openStart));
+    expect(openRule).toContain("grid-template-rows: 1fr");
+    expect(openRule).toContain("opacity: 1");
+    expect(openRule).toContain("visibility: visible");
+
+    // 过渡**只在**媒体块里声明：默认（含 prefers-reduced-motion: reduce）瞬时收放。
+    expect(baseRule).not.toContain("transition");
+    expect(openRule).not.toContain("transition");
+
+    const mediaStart = source.indexOf("@media (prefers-reduced-motion: no-preference) {", ruleStart);
+    expect(mediaStart).toBeGreaterThan(-1);
+    const mediaBody = source.slice(mediaStart, source.indexOf("\n}", mediaStart));
+    // 两个方向都必须有过渡 —— 只给其中一个方向，收起时就会"啪"地消失（本次修复点）。
+    expect(mediaBody).toContain(".scope-picker-reveal {");
+    expect(mediaBody).toContain(".scope-picker-reveal.open {");
+    expect([...mediaBody.matchAll(/transition:/g)].length).toBe(2);
+    expect([...mediaBody.matchAll(/var\(--motion-picker-duration\)/g)].length).toBeGreaterThanOrEqual(5);
+    // 时长/曲线必须走 token（"太快/太慢"只改一处），不在规则里写死毫秒数。
+    expect(baseRule).not.toMatch(/\d+ms/);
+    expect(openRule).not.toMatch(/\d+ms/);
+    expect(source).toMatch(/--motion-picker-duration:\s*\d+ms/);
+    expect(source).toMatch(/--motion-picker-ease:\s*cubic-bezier\(/);
+    // 下限写进契约：260ms + 强 ease-out 的初版被反馈"太快、像瞬间出现"，
+    // 收放不要退回 300ms 以下。
+    const duration = Number(source.match(/--motion-picker-duration:\s*(\d+)ms/)![1]);
+    expect(duration).toBeGreaterThanOrEqual(300);
+  });
+
+  it("spins the refresh glyph on click, motion-gated", () => {
+    const source = css("./styles.css");
+    expect(source).toContain("@keyframes scope-refresh-spin");
+    expect(source).toContain("transform: rotate(360deg)");
+
+    // 基础规则默认不转：动画只在 `.spinning`（点击时挂上）+ 媒体块里。
+    const glyphStart = source.indexOf(".scope-refresh-glyph {");
+    expect(glyphStart).toBeGreaterThan(-1);
+    const glyphRule = source.slice(glyphStart, source.indexOf("}", glyphStart));
+    expect(glyphRule).toContain("display: inline-block");
+    expect(glyphRule).not.toContain("animation");
+
+    const mediaStart = source.indexOf("@media (prefers-reduced-motion: no-preference) {", glyphStart);
+    expect(mediaStart).toBeGreaterThan(-1);
+    const mediaBody = source.slice(mediaStart, source.indexOf("\n}", mediaStart));
+    expect(mediaBody).toContain(".scope-refresh-glyph.spinning");
+    // 时长走 token（"转得快慢"只改一处）。
+    expect(mediaBody).toContain("animation: scope-refresh-spin var(--motion-refresh-duration)");
+    expect(source).toMatch(/--motion-refresh-duration:\s*\d+ms/);
+  });
+
+  it("routes every brand-family colour through theme tokens", () => {
+    // 「全面换肤」：品牌绿系（绿/青绿色相且有饱和度）一律走 `--color-brand-*`。
+    // 否则切到暖米色 / 石板蓝 / 鼠尾草绿预设时，界面仍是一整片默认绿。
+    // 只允许三处保留字面量：`:root` token 定义、主题预设色板（本身就是"预览色"）、
+    // 代码编辑器深色皮肤（不是主题色）。`var(...)` 的兜底值不算——它不阻止主题生效。
+    const hsl = (hex: string) => {
+      const raw = hex.replace("#", "");
+      const full = raw.length === 3 ? raw.split("").map((c) => c + c).join("") : raw;
+      if (full.length !== 6) return null;
+      const [r, g, b] = [0, 2, 4].map((i) => parseInt(full.slice(i, i + 2), 16) / 255);
+      const max = Math.max(r, g, b);
+      const min = Math.min(r, g, b);
+      const lightness = (max + min) / 2;
+      const saturation = max === min
+        ? 0
+        : (max - min) / (lightness > 0.5 ? 2 - max - min : max + min);
+      let hue = 0;
+      if (max !== min) {
+        if (max === r) hue = ((g - b) / (max - min) + (g < b ? 6 : 0)) * 60;
+        else if (max === g) hue = ((b - r) / (max - min) + 2) * 60;
+        else hue = ((r - g) / (max - min) + 4) * 60;
+      }
+      return { hue, saturation: saturation * 100 };
+    };
+    const isBrandFamily = (hex: string) => {
+      const c = hsl(hex);
+      return Boolean(c && c.saturation >= 12 && c.hue >= 95 && c.hue <= 185);
+    };
+
+    for (const sheet of [css("./styles.css"), wpsStylesheet()]) {
+      const scoped = sheet
+        .replace(/:root\s*\{[^}]*\}/g, "")
+        .replace(
+          /\.(?:preset-(?:default|warm-orange|calm-blue|vivid-green)|json-editor|tool-dsl)[^{}]*\{[^{}]*\}/g,
+          ""
+        )
+        .replace(/var\([^()]*\)/g, "");
+      const offenders = [...new Set([...scoped.matchAll(/#[0-9a-fA-F]{3,8}\b/g)].map((m) => m[0].toLowerCase()))]
+        .filter(isBrandFamily);
+      expect(offenders, `未走主题 token 的品牌色：${offenders.join(", ")}`).toEqual([]);
+    }
+  });
+
   it("keeps the Apple-style radius scale global: no stray literal radii, exceptions declared", () => {
     const source = css("./styles.css");
     const wps = wpsStylesheet();
@@ -410,8 +515,8 @@ describe("natural organic style", () => {
     const panel = css("../../wps-addin/src/WpsProbePanel.tsx");
 
     // 面板里同排出现的三个按钮类名都必须有样式规则。
-    // 背景：`.scope-discard`（放弃修改）此前**完全没有 CSS**，浏览器默认样式
-    // 直接露出来（方角 + 原生描边），和「刷新 / 确认范围」不像一套 UI。
+    // 背景：`.scope-discard`（「取消」）此前**完全没有 CSS**，浏览器默认样式
+    // 直接露出来（方角 + 原生描边），和「刷新 / 确认」不像一套 UI。
     for (const selector of [".scope-refresh", ".scope-confirm", ".scope-discard"]) {
       // TSX 里写的是 `className="scope-discard"`（无点），样式表里是 `.scope-discard`。
       expect(panel, `面板没有用到 ${selector}`).toContain(`"${selector.slice(1)}"`);
@@ -429,7 +534,7 @@ describe("natural organic style", () => {
       expect(rule, selector).toContain("var(--font-size-caption)");
     }
 
-    // 次要按钮的可辨识度：放弃修改**不能**长得像主按钮（实心品牌绿）。
+    // 次要按钮的可辨识度：取消**不能**长得像主按钮（实心品牌绿）。
     const discard = [...source.matchAll(/\.scope-discard\s*\{([^}]*)\}/g)]
       .map((m) => m[1])
       .join("\n");
@@ -498,6 +603,288 @@ describe("natural organic style", () => {
       expect(rule, "chip 图标缺少样式规则").not.toBe("");
       expect(rule).toContain("fill: none");
       expect(rule).toContain("stroke: currentColor");
+    }
+  });
+
+  it("keeps the progress-dot contrast above the graphics threshold in every preset", () => {
+    // 「有新进度」浮标 = **跟随主题的品牌浅色渐变圆**，字行走**主题色**：
+    // 运行中是三颗圆点，跑完是锚图标，两者共用同一个前景令牌。
+    //
+    // 这条断言防的是这个组合最容易出的错：浅底 + 浅品牌色在中调色相的预设上会糊。
+    // 实测过 —— 直接拿 `--color-brand-text` 当圆点，warm-orange 只有 2.58、
+    // vivid-green 2.93，都过不了非文本 UI 图形 3:1 的门槛（WCAG 1.4.11）；
+    // 而且 warm-orange 的品牌色压在**纯白**上也才 3.16，所以不是"底太深"能解释的，
+    // 必须把前景色压深。
+    //
+    // **压深是显式令牌，不是 `color-mix()` 现算**。这是踩过的坑：`background:` 上
+    // 写"降级行 + color-mix 行"看似安全，其实**救不了** —— 两条是同一个属性，
+    // color-mix 那条赢在层叠、只是算不出值（引擎不支持 / 变量无效），于是
+    // `background` 落到初始值 `transparent`，圆点**整个消失**，界面上表现为
+    // "外圈正常、里面空的"。改成读令牌后没有任何运行时色彩函数参与，任何引擎
+    // 都拿得到确定值；而且这个值可以被下面这些断言直接算。
+    //
+    // **读的都是真实数据源**，没有任何期望值写死：
+    //   ① 渐变用了哪些**令牌** —— 从 styles.css 的规则本体里抽 `var(--color-*)`；
+    //   ② 那些令牌在四个预设里各是什么**色值** —— 从 useTheme.ts 的色板里解析；
+    //   ③ 两个字形各自引用的令牌名 —— 从 styles.css 的圆点 / 锚规则里解析；
+    //   ④ 前景色的**色值** —— 从 `:root` 与四个预设的 `progressGlyph` 里解析。
+    // 所以改预设、换令牌、改色值，都会让这条断言跟着重算；真的过不了就变红。
+    const source = css("./styles.css");
+    const hook = css("./hooks/useTheme.ts");
+    const stripComments = (text: string) => text.replace(/\/\*[\s\S]*?\*\//g, "");
+
+    // ---- ① 外圈：必须是"跟随主题的浅色渐变"，不能再退回写死的深色药丸 ----
+    const buttonRules = [
+      ...source.matchAll(/\.new-progress-button(?::[-a-z()]+)?\s*\{([^}]*)\}/gs)
+    ].map((match) => stripComments(match[1]));
+    expect(buttonRules.length, "找不到 .new-progress-button 规则").toBeGreaterThan(0);
+    const buttonRule = buttonRules[0];
+
+    expect(buttonRule, "外圈的渐变不再走品牌令牌了").toContain("var(--color-brand-bg)");
+    // 两个端点都必须是品牌令牌：起点曾经是 `--color-background-subtle`，而它在
+    // default 预设下就是**纯白 `#ffffff`**，42px 的圆上有一半是白的，整个控件
+    // 读成"白圆圈"（用户原话："你这个怎么一个白的了"）。
+    expect(buttonRule, "外圈的渐变不再走品牌令牌了").toContain("var(--color-brand-hover)");
+
+    // ---- ①b 外圈**不许画边**（2026-10-12 用户裁决）----
+    //
+    // 两次原话：「去掉这个圆形边缘线条」，随后「去掉边框颜色，改为透明即可」。
+    // 曾经是 `border: 1px solid var(--color-border-strong)`：在浅色渐变外面再套一圈
+    // 灰线，42px 的小圆上那一圈比圆本身还抢眼，读成"一个描了边的灰圈"。圆的轮廓
+    // 现在由渐变本身 + `--shadow-md` 的投影撑（那是"影子"，不是"线"）。
+    //
+    // **判据是"值会不会真的画出一条线"，不是"有没有出现 `border` 这个词"。**
+    // 这个区分是本轮用血换的：作者把边框声明删干净之后，浏览器 UA 样式接手了
+    // `<button>`（Chrome 默认 `2px outset ButtonBorder`），浅绿圆外面冒出一圈**黑环**
+    // —— 于是必须显式写一条"关掉边框"的声明把它按回去。那条声明**不画线**，
+    // 必须放行；只有真会画出线的（带 `solid`/`dashed`/… 或非零宽度）才拦。
+    // 所以按**属性名 + 值**一起判，而不是只看属性名：
+    //   · 属性名：`border` 与 `border-*`（除 `*radius`，那是圆角形状必须留）；
+    //     `outline` 不算（那是 `:focus-visible` 的键盘聚焦环，要留）。
+    //   · 值：只有 `none` / `hidden` / `0` 这些才是"一个像素都不画"。
+    // 变异 M4（把 `border: 1px solid var(--color-border-strong)` 画回来）打这一条。
+    const IS_BORDER_PROPERTY = (property: string) =>
+      property === "border" || (property.startsWith("border-") && !property.includes("radius"));
+    const TURNS_THE_EDGE_OFF = (value: string) =>
+      /^(?:none|hidden|0|0px|0em|0rem|0pt)$/.test(value.trim());
+    for (const rule of buttonRules) {
+      const paintedEdges = [...rule.matchAll(/([a-z-]+)\s*:\s*([^;}]+)[;}]/g)]
+        .filter(([, property, value]) => IS_BORDER_PROPERTY(property) && !TURNS_THE_EDGE_OFF(value))
+        .map(([, property, value]) => `${property}: ${value.trim()}`);
+      expect(
+        paintedEdges,
+        `浮标外圈不许再画边（用户已裁决去掉那圈边缘线），但 ` +
+          `${rule.trim().split("\n")[0]} 里有：${paintedEdges.join("、")}`
+      ).toEqual([]);
+    }
+    // 负向锚点：**凡是上色的声明，值里一个 `#`/`rgb(` 都不许有**。曾经的
+    // `background: #1f1f1f` 与 `border: 1px solid rgba(255,255,255,0.14)` 都是
+    // "为深底写死"的写法 —— 不随主题走，换个预设就露馅。
+    //
+    // 两个容易漏的地方：
+    //   ① 必须扫**整条值**而不是只看开头。把 hex 藏进渐变里
+    //      （`linear-gradient(145deg, #1f1f1f, var(--color-brand-bg))`）同样绕过主题，
+    //      只匹配 `background:` 后面紧跟的字符就会漏。
+    //   ② **不能只扫 `background`**。边框曾是另一处被写死的地方（为深底准备的
+    //      白色描边），只盯背景会把它整个漏掉 —— 所以 `border*` 继续留在名单里，
+    //      万一以后又加回边（先得改上面 ①b 那条裁决），它也必须走令牌。
+    //      `box-shadow`/`outline`/`color` 一并纳入，口径统一成"颜色只准走令牌"。
+    //      `stroke`/`fill` 是 SVG 字形的上色入口（锚图标现在只走 `fill` —— 它是
+    //      实心剪影；`stroke` 留着是为了别的 svg 字形，漏了它们等于字形可以随便
+    //      写死颜色）。
+    const COLOR_BEARING =
+      /^(background|border|border-color|border-block|border-block-color|border-inline|border-inline-color|outline|outline-color|color|box-shadow|stroke|fill)$/;
+    for (const rule of buttonRules) {
+      for (const declaration of rule.matchAll(/([a-z-]+)\s*:\s*([^;]+);/g)) {
+        if (!COLOR_BEARING.test(declaration[1])) continue;
+        expect(
+          /#|rgba?\(|hsla?\(/.test(declaration[2]),
+          `外圈的 ${declaration[1]} 里出现了字面色值（应全部走主题令牌）：\n` +
+            `  ${declaration[1]}: ${declaration[2].trim()}`
+        ).toBe(false);
+      }
+    }
+
+    // 所有被当作背景端点的令牌里，**最暗的那个**才是圆点对比度的最坏情况
+    // （悬停/按下会把渐变整体压深，所以不能只算常态）。
+    const backgroundTokens = new Set(
+      buttonRules
+        .flatMap((rule) => [...rule.matchAll(/background:\s*([^;]+);/g)].map((m) => m[1]))
+        .flatMap((value) => [...value.matchAll(/var\((--color-[a-z-]+)\)/g)].map((m) => m[1]))
+    );
+    expect(backgroundTokens.size, "外圈背景没有引用任何主题令牌").toBeGreaterThan(1);
+
+    // ---- ② 圆点：先降级再 color-mix ----
+    const dotRule = stripComments(
+      source.match(/\.new-progress-button \.progress-dots span \{([^}]*)\}/s)?.[1] ?? ""
+    );
+    expect(dotRule, "找不到圆点规则").not.toBe("");
+    // ---- ② 圆点：**只准是一条令牌声明** ----
+    //
+    // 这里刻意**禁止** `color-mix()`。原因不是"怕老引擎"，而是"降级写法在同一个
+    // 属性上是假的"：`background: var(--x)` 与 `background: color-mix(...)` 是同一个
+    // 属性，后者赢在层叠、只是**算不出值**（引擎不支持、或里面的变量无效），
+    // 于是 `background` 落到初始值 `transparent` —— 圆点整个消失，而不是"退回
+    // 浅一点的主题色"。用户看到的现象正是"外圈正常、里面空的"。
+    expect(
+      dotRule,
+      "圆点不要用 color-mix() 现算：同属性上的降级行救不了\"算不出值\"，" +
+        "无效时 background 会落到 transparent、圆点直接消失。请改读显式令牌。"
+    ).not.toContain("color-mix(");
+
+    const dotRef = dotRule.match(/background:\s*var\((--color-[a-z-]+)\);/);
+    expect(dotRef, "圆点的背景应当是一条 var(--color-*) 令牌声明").not.toBeNull();
+    const dotToken = dotRef![1];
+    expect(dotToken, "圆点应当以「进度浮标前景」专用令牌取色").toBe("--color-progress-glyph");
+
+    // 圆点规则里也不许出现字面色值（口径与上面的外圈一致）。
+    for (const declaration of dotRule.matchAll(/([a-z-]+)\s*:\s*([^;]+);/g)) {
+      if (!COLOR_BEARING.test(declaration[1])) continue;
+      expect(
+        /#|rgba?\(|hsla?\(/.test(declaration[2]),
+        `圆点的 ${declaration[1]} 里出现了字面色值：\n  ${declaration[1]}: ${declaration[2].trim()}`
+      ).toBe(false);
+    }
+
+    // ---- ②b 锚图标（EB 停下后的字形）：必须与圆点**同一个令牌** ----
+    //
+    // 两个字形是同一个控件、同一层浅色底的两个状态，换个字形不该换种颜色；
+    // 而且上面那四组 3:1 结论是按这个令牌算的，换成别的令牌就得重算。
+    //
+    // 判别点与"是不是令牌"分开：M6（换成 `--color-brand-text`，是令牌但不是同一个）
+    // 打前半句，M7（写成与令牌**同值**的 `#265639`）打后半句 —— 同值也不行，
+    // 必须走引用，否则主题一换就漂移。
+    //
+    // 取色入口是 **`fill` 而不是 `stroke`**：锚已经换成**实心剪影**（2026-10-12
+    // 用户裁决），形状由 svg 里的 `d`/几何决定、CSS 只负责填色。所以下面除了
+    // 盯 `fill` 走令牌，还要**反向确认没有任何描边声明** —— 挂着 `stroke` 会让
+    // 实心形的边缘再糊一圈，改回描边就等于把换字形的裁决撤了。
+    const anchorRule = stripComments(
+      source.match(/\.new-progress-button \.progress-anchor-icon \{([^}]*)\}/s)?.[1] ?? ""
+    );
+    expect(anchorRule, "找不到锚图标规则").not.toBe("");
+    const anchorDeclarations = [...anchorRule.matchAll(/([a-z-]+)\s*:\s*([^;}]+)[;}]/g)];
+    const anchorRef = anchorRule.match(/fill:\s*var\((--color-[a-z-]+)\);/);
+    expect(anchorRef, "锚图标的填充应当是一条 var(--color-*) 令牌声明").not.toBeNull();
+    expect(
+      anchorRef![1],
+      "锚图标必须与圆点用同一个前景令牌（同一控件、同一底色，只换字形）"
+    ).toBe(dotToken);
+    // 实心剪影**不吃描边**：`fill: none` 会把它掏空、任何 `stroke*` 都是多余的糊边。
+    expect(anchorRule, "锚已是实心剪影，不该再关掉填充").not.toContain("fill: none");
+    expect(
+      anchorDeclarations.map(([, property]) => property).filter((property) => property.startsWith("stroke")),
+      "锚已是实心剪影，形状由 path 的 d 决定，不该再出现描边声明"
+    ).toEqual([]);
+    for (const declaration of anchorDeclarations) {
+      if (!COLOR_BEARING.test(declaration[1])) continue;
+      expect(
+        /#|rgba?\(|hsla?\(/.test(declaration[2]),
+        `锚图标的 ${declaration[1]} 里出现了字面色值：\n  ${declaration[1]}: ${declaration[2].trim()}`
+      ).toBe(false);
+    }
+
+    // ---- ③ 色板：按预设解析出每个令牌的色值 ----
+    const presetsBlock = hook.match(/const PRESETS[^{]*\{([\s\S]*?)\n\};/)?.[1] ?? "";
+    expect(presetsBlock, "useTheme.ts 里找不到 PRESETS").not.toBe("");
+
+    const palettes: Record<string, Record<string, string>> = {};
+    // 顶层预设键可能是裸标识符（default）或带引号（"warm-orange"），按行首顶层
+    // 缩进切块 —— 不能按 `{` 全局切，否则内层每个令牌都会被当成一个预设。
+    const blocks = [...presetsBlock.matchAll(/^ {2}(?:"([^"]+)"|([A-Za-z_$][\w$]*)):\s*\{/gm)];
+    blocks.forEach((block, index) => {
+      const name = block[1] ?? block[2];
+      const start = block.index! + block[0].length;
+      const end = index + 1 < blocks.length ? blocks[index + 1].index! : presetsBlock.length;
+      const tokens: Record<string, string> = {};
+      for (const token of presetsBlock
+        .slice(start, end)
+        .matchAll(/([A-Za-z_$][\w$]*):\s*"(#[0-9a-fA-F]{6})"/g)) {
+        tokens[token[1]] = token[2];
+      }
+      palettes[name] = tokens;
+    });
+    const presetNames = Object.keys(palettes);
+    expect(presetNames, "预设色板数量变了，请同步核对").toHaveLength(4);
+
+    const luminance = (hex: string) => {
+      const channels = [0, 2, 4].map((i) => parseInt(hex.slice(1 + i, 3 + i), 16) / 255);
+      const linear = channels.map((v) =>
+        v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4
+      );
+      return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2];
+    };
+    const contrast = (a: string, b: string) => {
+      const [hi, lo] = [luminance(a), luminance(b)].sort((x, y) => y - x);
+      return (hi + 0.05) / (lo + 0.05);
+    };
+    const channelsOf = (hex: string) =>
+      [0, 2, 4].map((i) => parseInt(hex.slice(1 + i, 3 + i), 16));
+
+    // `:root` 里也有一份 `--color-progress-glyph`，必须在 default 预设下与 JS 那份
+    // **一致**：面板启动前、以及独立窗口（`poc-dialog`）里只有 CSS 这条生效。
+    // 两处漂移过一次就会是"面板里正常、弹窗里看不见"这种最难查的现象。
+    const rootBlock = source.slice(source.indexOf(":root {"));
+    const rootGlyph = new RegExp(`--color-progress-glyph:\\s*(#[0-9a-fA-F]{6})`).exec(rootBlock)?.[1];
+    expect(rootGlyph, `:root 里找不到 ${dotToken}`).toBeTruthy();
+    expect(
+      rootGlyph,
+      ":root 的前景色与 default 预设的 progressGlyph 不一致（两处必须同改）"
+    ).toBe(palettes.default?.progressGlyph);
+
+    for (const preset of presetNames) {
+      const tokens = palettes[preset];
+      const fieldOf = (token: string) =>
+        token.replace(/^--color-/, "").replace(/-([a-z])/g, (_, c: string) => c.toUpperCase());
+
+      const stops: { token: string; hex: string }[] = [];
+      for (const token of backgroundTokens) {
+        const hex = tokens[fieldOf(token)];
+        expect(hex, `预设 ${preset} 的色板里没有 ${token}（${fieldOf(token)}）`).toBeTruthy();
+        stops.push({ token, hex });
+      }
+      const darkest = stops.reduce((a, b) => (luminance(b.hex) < luminance(a.hex) ? b : a));
+
+      const brandText = tokens.brandText;
+      expect(brandText, `预设 ${preset} 的色板里没有 brandText`).toBeTruthy();
+      const dot = tokens.progressGlyph;
+      expect(dot, `预设 ${preset} 的色板里没有 progressGlyph`).toBeTruthy();
+
+      // (a) 前景色必须**比本主题色更深**。这一条直接编码了踩过的那个坑：图形若
+      //     落到近白色（或压根没上色），压在品牌浅色上就是"看不见"，而界面上
+      //     表现为"外圈正常、里面空的"。比主题色还浅的图形在浅底上不可能过 3:1。
+      expect(
+        luminance(dot),
+        `预设 ${preset}：前景色 ${dot} 比主题色 ${brandText} 还浅 —— ` +
+          "浅底上的图形只会更看不清，请压深"
+      ).toBeLessThan(luminance(brandText));
+
+      // (b) 必须是**同色相压深**，不是随便换个颜色：逐通道都与 brandText 成同一
+      //     比例（实测 20% 压深下四组都落在 0.79–0.81）。这样"前景 = 主题色"这个
+      //     用户可见的语义才成立，也挡住了"为了过对比度而改成黑/灰"这类退法。
+      const base = channelsOf(brandText);
+      const actual = channelsOf(dot);
+      actual.forEach((value, index) => {
+        const ratio = value / base[index];
+        expect(
+          ratio,
+          `预设 ${preset}：前景色 ${dot} 的第 ${index + 1} 个通道不是 brandText ` +
+            `${brandText} 的同比例压深（比值 ${ratio.toFixed(3)}，应在 0.75–0.85）`
+        ).toBeGreaterThanOrEqual(0.75);
+        expect(
+          ratio,
+          `预设 ${preset}：前景色 ${dot} 的第 ${index + 1} 个通道不是 brandText ` +
+            `${brandText} 的同比例压深（比值 ${ratio.toFixed(3)}，应在 0.75–0.85）`
+        ).toBeLessThanOrEqual(0.85);
+      });
+
+      // (c) 真正的门槛：压在**最暗**背景端点上的非文本 UI 图形对比度。
+      const ratio = contrast(dot, darkest.hex);
+      expect(
+        ratio,
+        `预设 ${preset}：前景色 ${dot} 压在最暗背景端点 ${darkest.token}=${darkest.hex} 上` +
+          `只有 ${ratio.toFixed(2)}:1，低于 3:1`
+      ).toBeGreaterThanOrEqual(3);
     }
   });
 

@@ -2,6 +2,9 @@ import capabilities from "../../../config/capabilities.json";
 import {
   assertTestModelConnectionResponse,
   assertIntentCheckResponse,
+  assertMessageUnderstandingResponse,
+  type MessageUnderstandingRequest,
+  type MessageUnderstandingResponse,
   assertAssistantResponse,
   assertPlanningPauseResult,
   assertDataToolResult,
@@ -53,10 +56,20 @@ import {
   type SetFormulaModelRequest,
   type WorkbookSnapshot,
   type GenerateFormulaRequest,
-  type GenerateFormulaResponse
+  type GenerateFormulaResponse,
+  type SdkBridgeBindingRequest,
+  type SdkBridgePollResponse,
+  type SdkBridgeReceiptRequest,
+  type SdkBridgeReceiptResponse,
+  type SdkBridgeRegisterRequest,
+  type SdkBridgeRegisterResponse,
+  type SdkBridgeResultRequest,
+  type SdkBridgeResultResponse
 } from "./contracts";
-import type { ExcelReviewLayoutPrepareRequest, ExcelReviewLayoutTicket, ExcelReviewLayoutResult, ExcelReviewPaneMeasurement } from "./contracts";
+import type { ExcelReviewLayoutPrepareRequest, ExcelReviewLayoutTicket, ExcelReviewLayoutResult, ExcelReviewPaneMeasurement,
+  ExcelReviewCopyCloseRequest, ExcelReviewCopyCloseResult, ExcelReviewCopyCloseStatus } from "./contracts";
 import { recordModelCall } from "./diagnostics";
+import { requiresStreamingToolDelivery } from "./modelSelection";
 
 export interface PlanChatRequest {
   plan: AnalysisPlan;
@@ -83,7 +96,7 @@ export class ExcelReviewLayoutVersionError extends Error {
   }
 }
 
-async function reviewLayoutRequest(path: "prepare" | "arrange" | "measure", body: ExcelReviewLayoutPrepareRequest | Pick<ExcelReviewLayoutTicket, 'token'>): Promise<unknown> {
+async function reviewLayoutRequest(path: "prepare" | "arrange" | "measure" | "close", body: ExcelReviewCopyCloseRequest | ExcelReviewLayoutPrepareRequest | Pick<ExcelReviewLayoutTicket, 'token'>): Promise<unknown> {
   const endpoint = new URL(API_BASE_URL);
   if (!['localhost', '127.0.0.1', '[::1]'].includes(endpoint.hostname) || !['http:', 'https:'].includes(endpoint.protocol)) {
     throw new Error('自动窗口排列仅能连接本机服务，请手动并排查看。');
@@ -98,11 +111,18 @@ async function reviewLayoutRequest(path: "prepare" | "arrange" | "measure", body
 export async function measureExcelReviewPane(request: ExcelReviewLayoutPrepareRequest): Promise<ExcelReviewPaneMeasurement> {
   const value = await reviewLayoutRequest('measure', {workbookPathHash: request.workbookPathHash,
     worksheetNameHash: request.worksheetNameHash, copySheetName: request.copySheetName});
-  if (!value || typeof value !== 'object' || Object.keys(value).length !== 1 ||
-    !('clientWidthCssPx' in value) || typeof value.clientWidthCssPx !== 'number' ||
-    !Number.isFinite(value.clientWidthCssPx) || value.clientWidthCssPx <= 0 || value.clientWidthCssPx > 32768)
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('审阅窗口宽度未核实，请手动调整。');
+  const record = value as Record<string, unknown>;
+  const width = (field: 'clientWidthCssPx' | 'workAreaWidthCssPx') => {
+    const candidate = record[field];
+    return typeof candidate === 'number' && Number.isFinite(candidate) && candidate > 0 && candidate <= 32768;
+  };
+  // 必须**两个**字段齐备且合法：AI 比例只认工作区宽度，缺了它宁可降级为手动，
+  // 也不能拿原表窗口的内容区宽度顶替（那正是此前把原表挤没的根因）。
+  if (Object.keys(record).length !== 2 || !width('clientWidthCssPx') || !width('workAreaWidthCssPx'))
     throw new Error('审阅窗口宽度未核实，请手动调整。');
-  return value as ExcelReviewPaneMeasurement;
+  // 显式投影，不把响应的其他键带出去。
+  return { clientWidthCssPx: record.clientWidthCssPx as number, workAreaWidthCssPx: record.workAreaWidthCssPx as number };
 }
 
 export async function prepareExcelReviewLayout(request: ExcelReviewLayoutPrepareRequest): Promise<ExcelReviewLayoutTicket> {
@@ -124,6 +144,22 @@ export async function arrangeExcelReviewLayout(ticket: ExcelReviewLayoutTicket):
       !('originalSide' in value) || value.originalSide !== 'right' ||
       !('synchronousScrolling' in value) || typeof value.synchronousScrolling !== 'string' || !['enabled', 'different_instance', 'unavailable'].includes(value.synchronousScrolling)) throw new Error('窗口排列结果未核实，请手动并排查看。');
   return value as ExcelReviewLayoutResult;
+}
+const CLOSE_STATUSES: readonly ExcelReviewCopyCloseStatus[] =
+  ['closed', 'already_closed', 'close_unconfirmed', 'user_saved', 'identity_lost', 'ambiguous', 'unsupported', 'failed'];
+export async function closeExcelReviewCopy(request: ExcelReviewCopyCloseRequest): Promise<ExcelReviewCopyCloseResult> {
+  // Required v4 discriminator: older servers reject it before any close mutation.
+  const value = await reviewLayoutRequest('close', {closeVersion: 4, workbookPathHash: request.workbookPathHash,
+    worksheetNameHash: request.worksheetNameHash, copySheetName: request.copySheetName});
+  if (value && typeof value === 'object' && (!('layoutVersion' in value) || value.layoutVersion !== 4)) throw new ExcelReviewLayoutVersionError();
+  if (!value || typeof value !== 'object' || Object.keys(value).length !== 4 ||
+      !('status' in value) || typeof value.status !== 'string' || !CLOSE_STATUSES.includes(value.status as ExcelReviewCopyCloseStatus) ||
+      !('copyClosed' in value) || typeof value.copyClosed !== 'boolean' ||
+      !('recoveryCopyPath' in value) || !(value.recoveryCopyPath === null ||
+        (typeof value.recoveryCopyPath === 'string' && value.recoveryCopyPath.trim().length > 0)) ||
+      (value.status === 'closed' && !value.recoveryCopyPath)) throw new Error('副本关闭结果未核实，请检查副本窗口。');
+  return {status: value.status as ExcelReviewCopyCloseStatus, layoutVersion: 4,
+    copyClosed: value.copyClosed, recoveryCopyPath: value.recoveryCopyPath as string | null};
 }
 
 export interface ServiceHealth {
@@ -194,6 +230,42 @@ export function apiErrorCategory(
     return "model";
   }
   return "service";
+}
+
+/**
+ * 当前链路无法把模型发起的工具请求投递到本机（缺流式通道）。
+ *
+ * 这不是"网络不通可以重试"那类错误：退回非流式端点后，服务端仍会启动这一轮、
+ * 仍会等本机回执，而投递工具请求的唯一通道就是被判定不可用的那条 SSE —— 于是
+ * 服务端干等到 `agentToolBridge.waitTimeoutSeconds` 才拿到一个 `timeout`。
+ * 与其进入这种"无人回执的等待"，不如在**退回之前**就明确拒绝。
+ */
+export class StreamingToolDeliveryUnavailableError extends Error {
+  readonly code = "streaming_tool_delivery_unavailable";
+  readonly retryable = false;
+  constructor() {
+    super(
+      "当前链路无法把模型发起的表格查询请求投递到本机：该后端未提供流式接口，或代理/网关没有透传流式响应。" +
+        "请更新并重启本地 Python 服务、确认代理不缓冲 SSE，或改用非 SDK 模型。"
+    );
+    this.name = "StreamingToolDeliveryUnavailableError";
+  }
+}
+
+/**
+ * 流式通道不可用时的**唯一**出口。
+ *
+ * 需要工具投递的请求（SDK 适配器）绝不能退回非流式端点 —— 那会让服务端为一轮
+ * 送不到本机的工具请求空等；其余请求保持原来的回退行为，旧后端照旧可用。
+ */
+function fallbackOrRefuseToolDelivery(
+  request: PlanRequest,
+  signal?: AbortSignal
+): Promise<PlanningStreamResult> {
+  if (requiresStreamingToolDelivery(request.modelId)) {
+    throw new StreamingToolDeliveryUnavailableError();
+  }
+  return createAssistantResponse(request, signal);
 }
 
 interface ErrorEnvelope {
@@ -373,16 +445,18 @@ export async function streamAssistantResponse(
     });
   } catch (reason) {
     // 网络/连接错误发生在收到任何事件之前：回退到非流式端点。
+    // 但需要工具投递的请求不能回退（服务端这一轮根本还没开始，回退毫无意义）。
     if (isLocalServiceConnectionError(reason)) {
-      return createAssistantResponse(request, signal);
+      return fallbackOrRefuseToolDelivery(request, signal);
     }
     throw reason;
   }
 
   if (!response.ok || !response.body) {
     // 旧后端无此端点（404）或代理不支持流式：回退到非流式端点。
-    if (response.status === 404 || response.status === 405 || !response.body) {
-      return createAssistantResponse(request, signal);
+    if (response.status === 404 || response.status === 405 || (response.ok && !response.body)) {
+      // SDK 适配器**只能**经流式通道拿工具请求：回退 = 服务端空等，故明确拒绝。
+      return fallbackOrRefuseToolDelivery(request, signal);
     }
     throw await requestError(response, "本地 AI 服务流式请求失败");
   }
@@ -427,9 +501,37 @@ export async function continuePlanningTask(
     signal: hooks.signal
   });
   if (!response.ok || !response.body) {
+    // 续跑没有非流式回退通道；对 SDK 适配器给出可执行的明确原因，而不是笼统一句失败。
+    if ((response.status === 404 || response.status === 405 || response.ok) &&
+        requiresStreamingToolDelivery(request.modelId)) {
+      throw new StreamingToolDeliveryUnavailableError();
+    }
     throw await requestError(response, "继续规划任务失败");
   }
   return consumePlanningStream(response, request.turnId, hooks);
+}
+
+export async function understandMessage(
+  request: MessageUnderstandingRequest,
+  signal?: AbortSignal
+): Promise<MessageUnderstandingResponse> {
+  recordModelCall();
+  const response = await fetch(`${API_BASE_URL}/api/intent/message`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    // Project explicitly: even an over-wide runtime object cannot leak workbook context.
+    body: JSON.stringify({
+      prompt: request.prompt,
+      imageCount: request.imageCount ?? 0,
+      conversation: request.conversation?.map(({ role, text }) => ({ role, text })) ?? [],
+      modelId: request.modelId ?? null
+    }),
+    signal
+  });
+  if (!response.ok) throw await requestError(response, "消息理解服务请求失败；请确认后端已更新并重启。");
+  const value: unknown = await response.json();
+  assertMessageUnderstandingResponse(value);
+  return value;
 }
 
 export async function checkIntent(
@@ -945,6 +1047,14 @@ export async function createFolderSnapshot(
   return responseJson<WorkbookSnapshot>(response);
 }
 
+export async function checkFolderAdmission(sessionId: string, selections: FolderSelection[]): Promise<import("./contracts").FolderAdmissionResponse> {
+  const response = await fetch(`${API_BASE_URL}/api/folders/admission`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sessionId, selections: selections.map((s) => ({ fileId: s.fileId, sheets: [...s.sheets] })) })
+  });
+  return responseJson<import("./contracts").FolderAdmissionResponse>(response);
+}
+
 interface FolderExecuteHooks {
   operationId?: string;
   onProgress?: (event: TaskProgressEvent) => void;
@@ -1373,4 +1483,84 @@ export async function chatModifyPlan(
     throw await requestError(response, "AI 辅助修改计划失败");
   }
   return responseJson<PlanChatResponse>(response);
+}
+
+// ---------------------------------------------------------------------------
+// 任务工具桥（本机回环）：请求参数与值矩阵只走这条通道，不进模型/历史/账本。
+// ---------------------------------------------------------------------------
+
+function bridgeBody(binding: SdkBridgeBindingRequest): SdkBridgeBindingRequest {
+  return {
+    taskId: binding.taskId,
+    hostId: binding.hostId,
+    workbookName: binding.workbookName,
+    workbookIdentity: binding.workbookIdentity ?? null,
+    sourceFingerprint: binding.sourceFingerprint ?? null
+  };
+}
+
+/** 拉取本次会话待执行的本地查询调用。 */
+export async function pollSdkBridgeTool(
+  binding: SdkBridgeBindingRequest,
+  signal?: AbortSignal
+): Promise<SdkBridgePollResponse> {
+  const response = await fetch(`${API_BASE_URL}/api/sdk/tool-bridge/poll`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(bridgeBody(binding)),
+    signal
+  });
+  return responseJson<SdkBridgePollResponse>(response);
+}
+
+/** 回执：本机已在真实宿主上跑完确定性查询。 */
+export async function postSdkBridgeReceipt(
+  request: SdkBridgeReceiptRequest,
+  signal?: AbortSignal
+): Promise<SdkBridgeReceiptResponse> {
+  const response = await fetch(`${API_BASE_URL}/api/sdk/tool-bridge/receipt`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...bridgeBody(request), operationId: request.operationId,
+      requestFingerprint: request.requestFingerprint, receipt: request.receipt }),
+    signal
+  });
+  return responseJson<SdkBridgeReceiptResponse>(response);
+}
+
+/**
+ * 登记**已经算好**的本地结果（不重跑查询）。
+ *
+ * 服务端要求存在活跃且归属一致的会话：只凭可猜的 taskId 不能替别人登记值。
+ */
+export async function registerSdkBridgeResult(
+  request: SdkBridgeRegisterRequest,
+  signal?: AbortSignal
+): Promise<SdkBridgeRegisterResponse> {
+  const response = await fetch(`${API_BASE_URL}/api/sdk/tool-bridge/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...bridgeBody(request), result: request.result }),
+    signal
+  });
+  return responseJson<SdkBridgeRegisterResponse>(response);
+}
+
+/**
+ * 按引用取回结果值（本地结果卡渲染路径）。
+ *
+ * 跨轮读取：此时会话可能已关闭，服务端校验的是**授权归属**而不是活跃会话；
+ * 授权变化 / 换簿 / 同名不同工作簿都会被拒绝。
+ */
+export async function fetchSdkBridgeResult(
+  request: SdkBridgeResultRequest,
+  signal?: AbortSignal
+): Promise<SdkBridgeResultResponse> {
+  const response = await fetch(`${API_BASE_URL}/api/sdk/tool-bridge/result`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...bridgeBody(request), resultRef: request.resultRef }),
+    signal
+  });
+  return responseJson<SdkBridgeResultResponse>(response);
 }

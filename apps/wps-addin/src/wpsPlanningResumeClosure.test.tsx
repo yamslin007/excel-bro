@@ -40,7 +40,7 @@ vi.mock("./wpsPlanningStream", async (importOriginal) => {
 
 vi.mock("../../excel-addin/src/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../excel-addin/src/api")>();
-  return { ...actual, listModels: vi.fn(), getModelSettings: vi.fn() };
+  return { ...actual, understandMessage: vi.fn(async () => ({ kind: "needs_workbook_context", summary: "需要字段结构", provider: "model" })), listModels: vi.fn(), getModelSettings: vi.fn() };
 });
 
 vi.mock("./wpsHost", async (importOriginal) => {
@@ -272,6 +272,7 @@ async function clickContinue(container: HTMLElement): Promise<void> {
 }
 
 beforeEach(() => {
+  vi.clearAllMocks();
   mounted = [];
   localStorage.clear();
 });
@@ -283,6 +284,147 @@ afterEach(() => {
 });
 
 describe("CAP-02 续跑结果闭环：三分支接回正常处理链", () => {
+  async function manuallyPaused(waitForInspection = true) {
+    const { host, writes } = writeCountingHost();
+    getWpsApplicationMock.mockReturnValue(host);
+    listModelsMock.mockResolvedValue({ defaultModelId: connection.id, models: [connection] });
+    getModelSettingsMock.mockResolvedValue({} as never);
+    runTurnMock.mockImplementation(({ signal, onProgress }) => new Promise((_resolve, reject) => {
+      onProgress?.({ stage: "answering", turnId: "turn-manual-pause", sequence: 4, message: "正在规划" });
+      signal?.addEventListener("abort", () => reject(new DOMException("paused", "AbortError")));
+    }));
+    const entry = await mount(panel());
+    const { container } = entry;
+    await until(() => Boolean(container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型")), "目录就绪");
+    const input = container.querySelector<HTMLTextAreaElement>("textarea");
+    await type(input, "继续这个统计任务"); await submit(input);
+    await until(() => runTurnMock.mock.calls.length === 1 && Boolean(container.querySelector('[aria-label="暂停任务"]')), "应进入规划");
+    await act(async () => { container.querySelector<HTMLButtonElement>('[aria-label="暂停任务"]')!.click(); });
+    await until(() => statusMock.mock.calls.length > 0 && (!waitForInspection || !container.querySelector('[aria-label="暂停任务"]')), "暂停后自动核对原任务");
+    return { ...entry, writes };
+  }
+
+  it.each(["running", "unavailable", "no_checkpoint", "completed"])("manual pause status %s never triggers another planner or write", async (kind) => {
+    if (kind === "unavailable") statusMock.mockRejectedValue(new TypeError("Failed to fetch"));
+    else statusMock.mockResolvedValue({ turnId: "turn-manual-pause", status: kind === "no_checkpoint" ? "interrupted" : kind,
+      revision: 6, lastSequence: 8, canContinue: false, pauseType: "interrupted", reason: "没有可续跑检查点",
+      ...(kind === "completed" ? { result: { kind: "answer", provider: "model", message: "已取回原任务结果" } } : {}) } as never);
+    const { container, writes } = await manuallyPaused();
+    expect(statusMock).toHaveBeenCalledOnce();
+    expect(container.querySelector<HTMLTextAreaElement>("textarea")?.value).toBe("");
+    expect(resumeMock).not.toHaveBeenCalled();
+    expect(runTurnMock).toHaveBeenCalledOnce();
+    expect(findButton(container, "继续任务")).toBeNull();
+    if (kind === "running" || kind === "unavailable") expect(findButton(container, "核对任务状态")).not.toBeNull();
+    if (kind === "completed") expect(container.textContent).toContain("已取回原任务结果");
+    expect(writes).toEqual([]);
+  });
+
+  it("a resumed stream can be paused again and keeps its latest received cursor", async () => {
+    const { container, writes } = await reachPauseCard(pauseResult());
+    resumeMock.mockImplementation(({ signal, onProgress }) => new Promise((_resolve, reject) => {
+      onProgress?.({ stage: "answering", turnId: "turn-pause-1", sequence: 14, message: "继续中" });
+      signal?.addEventListener("abort", () => reject(new DOMException("paused", "AbortError")));
+    }));
+    await clickContinue(container);
+    await until(() => resumeMock.mock.calls.length === 1, "继续开始");
+    await act(async () => { container.querySelector<HTMLButtonElement>('[aria-label="暂停任务"]')!.click(); });
+    await until(() => Boolean(findButton(container, "继续任务")), "再次核对检查点");
+    resumeMock.mockResolvedValue({ status: {} as never, outcome: { kind: "answer", provider: "model", message: "两次暂停后完成" } as never });
+    await clickContinue(container);
+    await until(() => (container.textContent ?? "").includes("两次暂停后完成"), "完成");
+    expect(resumeMock.mock.calls[1][0]).toMatchObject({ turnId: "turn-pause-1", afterSequence: 14 });
+    expect(runTurnMock).toHaveBeenCalledOnce();
+    expect(writes).toEqual([]);
+  });
+
+  it("reload queries a manually paused task but never automatically resumes it", async () => {
+    statusMock.mockResolvedValue({ turnId: "turn-manual-pause", status: "running", revision: 4, lastSequence: 4, canContinue: false });
+    const entry = await manuallyPaused();
+    entry.unmount();
+    mounted = mounted.filter((item) => item.container !== entry.container);
+    statusMock.mockResolvedValue({ turnId: "turn-manual-pause", status: "interrupted", revision: 5, lastSequence: 10,
+      canContinue: true, pauseType: "interrupted", reason: "检查点可用" });
+    const { container } = await mount(panel());
+    await until(() => Boolean(findButton(container, "继续任务")), "重载后核对可继续现场");
+    expect(resumeMock).not.toHaveBeenCalled();
+    resumeMock.mockResolvedValue({ status: {} as never, outcome: { kind: "answer", provider: "model", message: "重载后原断点完成" } as never });
+    await clickContinue(container);
+    await until(() => (container.textContent ?? "").includes("重载后原断点完成"), "原任务完成");
+    expect(resumeMock.mock.calls[0][0]).toMatchObject({ turnId: "turn-manual-pause", afterSequence: 4 });
+    expect(runTurnMock).toHaveBeenCalledOnce();
+  });
+  it("real continue request keeps the original model and replays only after the received cursor", async () => {
+    const { container, writes } = await reachPauseCard(pauseResult());
+    const actual = await vi.importActual<typeof import("./wpsReadonlyAgent")>("./wpsReadonlyAgent");
+    resumeMock.mockImplementation(actual.resumeWpsPlanning);
+    const fetchMock = vi.fn(async (_url: unknown, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      if ("modelId" in body || "confirmModelSwitch" in body) return new Response("{}", { status: 422 });
+      return new Response('event: result\ndata: {"kind":"answer","provider":"model","message":"真实续跑完成"}\n\n', {
+        headers: { "Content-Type": "text/event-stream" }
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    await clickContinue(container);
+    await until(() => (container.textContent ?? "").includes("真实续跑完成"), "普通续跑不应被模型切换校验拒绝");
+    const body = JSON.parse(String(fetchMock.mock.calls[0][1]?.body));
+    expect(body.afterSequence).toBe(0);
+    expect(body.turnId).toBe("turn-pause-1");
+    expect(body.prompt).toBeUndefined();
+    expect(writes).toEqual([]);
+  });
+
+  it("manual pause retains the task, checks status, then continues without resending or writing", async () => {
+    const { host, writes } = writeCountingHost();
+    getWpsApplicationMock.mockReturnValue(host);
+    listModelsMock.mockResolvedValue({ defaultModelId: connection.id, models: [connection] });
+    getModelSettingsMock.mockResolvedValue({} as never);
+    runTurnMock.mockImplementation(({ signal, onProgress }) => new Promise((_resolve, reject) => {
+      onProgress?.({ stage: "answering", turnId: "turn-manual-pause", sequence: 4, message: "正在规划" });
+      signal?.addEventListener("abort", () => reject(new DOMException("paused", "AbortError")));
+    }));
+    statusMock.mockResolvedValue({ turnId: "turn-manual-pause", status: "interrupted", revision: 3,
+      lastSequence: 9, canContinue: true, pauseType: "interrupted", reason: "已找到检查点" });
+    resumeMock.mockResolvedValue({ status: {} as never,
+      outcome: { kind: "answer", provider: "model", message: "从原断点完成" } as never });
+    const { container } = await mount(panel());
+    await until(() => Boolean(container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型")), "目录就绪");
+    const input = container.querySelector<HTMLTextAreaElement>("textarea");
+    await type(input, "继续这个统计任务"); await submit(input);
+    await until(() => runTurnMock.mock.calls.length === 1 && Boolean(container.querySelector('[aria-label="暂停任务"]')), "应有暂停入口");
+    await act(async () => { container.querySelector<HTMLButtonElement>('[aria-label="暂停任务"]')!.click(); });
+    await until(() => Boolean(findButton(container, "继续任务")), "暂停后自动核对检查点");
+    expect(statusMock).toHaveBeenCalledOnce();
+    expect(resumeMock).not.toHaveBeenCalled();
+    expect(input?.value).toBe("");
+    await submit(input);
+    await act(async () => { input!.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true })); });
+    expect(runTurnMock).toHaveBeenCalledOnce();
+    expect(container.querySelectorAll(".message-row.user")).toHaveLength(1);
+    expect(resumeMock).not.toHaveBeenCalled();
+    await clickContinue(container);
+    await until(() => (container.textContent ?? "").includes("从原断点完成"), "续跑完成");
+    expect(resumeMock.mock.calls[0][0]).toMatchObject({ turnId: "turn-manual-pause", afterSequence: 4 });
+    expect(runTurnMock).toHaveBeenCalledOnce();
+    expect(writes).toEqual([]);
+  });
+
+  it("an automatic status check cannot overwrite a new draft or start the planner", async () => {
+    let resolveStatus!: (status: never) => void;
+    statusMock.mockImplementation(() => new Promise((resolve) => { resolveStatus = resolve; }));
+    const { container, writes } = await manuallyPaused(false);
+    const input = container.querySelector<HTMLTextAreaElement>("textarea");
+    await type(input, "尚未发送的新问题");
+    await act(async () => { resolveStatus({ turnId: "turn-manual-pause", status: "interrupted", revision: 6,
+      lastSequence: 9, canContinue: true, pauseType: "interrupted", reason: "检查点可用" } as never); });
+    await until(() => Boolean(findButton(container, "继续任务")), "核对完成");
+    expect(input?.value).toBe("尚未发送的新问题");
+    expect(findButton(container, "继续任务")).not.toBeNull();
+    expect(resumeMock).not.toHaveBeenCalled();
+    expect(runTurnMock).toHaveBeenCalledOnce();
+    expect(writes).toEqual([]);
+  });
   /**
    * 分支 1：**计划**。
    *
@@ -538,8 +680,9 @@ describe("CAP-02 续跑前授权复核（第 5 条）", () => {
    *
    * 做法：让查状态那一步**挂起**，在挂起期间改掉勾选范围，再放行。
    */
-  it("等待核对期间授权范围收窄 → 停止继续，不写原表", async () => {
-    const { container } = await reachPauseCard(pauseResult());
+  it("等待核对期间换成同名文件 → 停止继续，不写原表", async () => {
+    const { container, writes } = await reachPauseCard(pauseResult());
+    const originalHost = getWpsApplicationMock();
     let releaseStatus: ((value: unknown) => void) | null = null;
     statusMock.mockReturnValue(
       new Promise((resolve) => { releaseStatus = resolve as (value: unknown) => void; })
@@ -551,9 +694,10 @@ describe("CAP-02 续跑前授权复核（第 5 条）", () => {
 
     await clickContinue(container);
     await until(() => statusMock.mock.calls.length > 0, "应进入核对状态");
-    // 核对还悬着的时候，勾选范围发生变化。
+    // 真正改变宿主对象/路径；派发一个无人监听的自定义事件不能证明守卫生效。
     await act(async () => {
-      container.dispatchEvent(new CustomEvent("wps-scope-change", { bubbles: true }));
+      getWpsApplicationMock.mockReturnValue({ ...originalHost,
+        ActiveWorkbook: { ...originalHost.ActiveWorkbook!, FullName: "C:\\Other\\测试.xlsx", Path: "C:\\Other" } });
     });
     await act(async () => {
       releaseStatus?.({ turnId: "turn-pause-1", status: "waiting_user", revision: 12, lastSequence: 30, canContinue: true, pauseType: "budget", reason: null });
@@ -561,6 +705,8 @@ describe("CAP-02 续跑前授权复核（第 5 条）", () => {
     await settle();
     // 无论面板最终如何表达"范围变了"，都**不能**出现"继续成功"的迹象。
     expect(container.textContent ?? "").not.toContain("继续后的结果需要重新发起处理");
+    expect(resumeMock).not.toHaveBeenCalled();
+    expect(writes).toEqual([]);
   });
 
   /**

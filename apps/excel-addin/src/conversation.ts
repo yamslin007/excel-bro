@@ -156,6 +156,7 @@ export function normalizeStoredMessage(message: ChatMessage): ChatMessage {
     ...message,
     plan: message.plan ?? staleSourceConfirm?.plan,
     verification: normalizeStoredVerification(message.verification),
+    executionUndone: message.executionUndone === true,
     staleSourceConfirm,
     planningResume
   };

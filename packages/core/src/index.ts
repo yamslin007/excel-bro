@@ -64,6 +64,42 @@ export {
   onlyChangedRows
 } from "./changeReview";
 
+// 常用格式操作的宿主无关语义：要改哪些属性、真实影响范围（行高=整行 / 列宽=整列）、
+// 以及「属性 × 修改前/修改后」对照。三端共用，宿主 API 差异留在各端适配层。
+export type {
+  FormatActionType,
+  FormatActionLike,
+  FormatPropertyKey,
+  FormatScalar,
+  FormatEdit,
+  FormatImpact,
+  FormatSnapshot,
+  FormatChangeRow,
+  FormatChangeReview,
+  FormatChangeSummary,
+  BuildFormatChangeReviewInput,
+  FormatPlanPropertyGroup,
+  FormatPlanPreviewEntry
+} from "./formatActions";
+export {
+  FORMAT_PROPERTY_ORDER,
+  FORMAT_PROPERTY_LABELS,
+  FORMAT_VALUE_NOT_CAPTURED_TEXT,
+  FORMAT_IMPACT_UNRESOLVED_TEXT,
+  isFormatActionType,
+  asFormatAction,
+  selectFormatActions,
+  borderDescription,
+  formatActionEdits,
+  formatActionImpact,
+  formatImpactNotice,
+  formatValueText,
+  buildFormatChangeReview,
+  formatChangeSummary,
+  formatPlanPropertyGroups,
+  formatPlanPreview
+} from "./formatActions";
+
 // L2 semantics：身份折叠是唯一允许拼接/解析 `url:` 前缀的地方。
 export {
   officeIdentityFromUrl,
@@ -155,6 +191,8 @@ export {
 // Excel/WPS 两端共用，避免同一句话在两处各自漂移；证据内容不在此列。
 export {
   PLAN_NOTE_SECTIONS,
+  PLAN_FORMAT_SECTION,
+  PLAN_FORMAT_IMPACT_LABEL,
   SESSION_RECOVERY_LABEL,
   SESSION_RECOVERY_NOTICE_PREFIX,
   VERIFICATION_PASSED_LABEL
@@ -166,6 +204,47 @@ export type {
   ClarificationAnswerCard,
   KeyedConfirmation
 } from "./clarificationAnswers";
+export type { AgentTaskContext } from "./agentTaskContext";
+export { createAgentTaskContext, confirmAgentTaskDecision } from "./agentTaskContext";
+// SDK 任务工具桥的共享状态机：把不透明进度指针翻译成轮询、跟踪待回执调用，
+// 并在发网络请求之前判定 accepted / duplicate / conflict / late。两端面板共用。
+export type {
+  BridgeHostId,
+  BridgeToolName,
+  SdkBridgeBinding,
+  BridgeToolPointer,
+  PendingBridgeCall,
+  BridgePollResponse,
+  BridgeReceiptResponse,
+  BridgeReceiptDecision,
+  SdkBridgeState,
+  BridgeCallOutcome,
+  BridgeAuthorizationVerdict,
+  BridgeLiveAuthorization,
+  BridgeHostPorts,
+  BridgeOutcomeEntry,
+  BridgeServiceResult
+} from "./sdkToolBridge";
+export {
+  createSdkBridgeState,
+  isBridgeToolName,
+  bridgeToolPointer,
+  applyBridgeProgressEvent,
+  assertBridgePollResponse,
+  applyBridgePollResponse,
+  pendingBridgeCall,
+  decideBridgeReceipt,
+  markBridgeDelivered,
+  cancelBridge,
+  shouldPollBridge,
+  bridgeWorkbookIdentity,
+  bridgeRequestedSheetNames,
+  BRIDGE_UNVERIFIABLE_ERROR_CODE,
+  verifyBridgeAuthorization,
+  verifyBridgeAuthorizationOrRefuse,
+  serviceBridgeOnce,
+  runBridgeUntilIdle
+} from "./sdkToolBridge";
 export {
   REAUTHORIZATION_NOTICE,
   clarificationAfterReauthorization,
@@ -231,3 +310,15 @@ export {
   closeDanglingSteps,
   planningPausedEntriesFromHistory
 } from "./planningStream";
+
+export type {
+  SourceDependencyOrigin,
+  SourceDependencyRecord
+} from "./planSourceDependency";
+export {
+  recordTrustedToolReads,
+  trustedToolReads,
+  resetTrustedSourceReads,
+  attestSourceDependency
+} from "./planSourceDependency";
+export { attestResultSourceDependency } from "./planSourceDependency";

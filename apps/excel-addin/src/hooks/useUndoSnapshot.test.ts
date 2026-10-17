@@ -271,4 +271,98 @@ describe("useUndoSnapshot", () => {
     expect(undoExecutionMock).toHaveBeenCalledWith(second);
     expect(result.current.undoStack).toEqual([first]);
   });
+
+  it("onRestored fires only for snapshots that actually succeeded", async () => {
+    const onRestored = vi.fn();
+    const { result } = renderHook(() =>
+      useUndoSnapshot({
+        isBusy: false,
+        onStatusChange: vi.fn(),
+        onMessage: vi.fn(),
+        onRestored
+      })
+    );
+    const first = makeSnapshot("plan-1", "execution-1");
+    const second = makeSnapshot("plan-2", "execution-2");
+    const third = makeSnapshot("plan-3", "execution-3");
+    act(() => {
+      result.current.pushUndoSnapshot(first);
+      result.current.pushUndoSnapshot(second);
+      result.current.pushUndoSnapshot(third);
+    });
+
+    // 逆序撤销 third → second → first；让 second（较早、较后执行）失败。
+    undoExecutionMock
+      .mockResolvedValueOnce(undefined) // third 成功
+      .mockRejectedValueOnce(new Error("undo failed")); // second 失败
+    await act(async () => {
+      await result.current.undoExecutionTo("plan-1");
+    });
+
+    // 只有真正成功的 third 触发 onRestored；失败的 second 与未执行的 first 都不触发。
+    expect(onRestored).toHaveBeenCalledTimes(1);
+    expect(onRestored).toHaveBeenCalledWith(third);
+  });
+
+  it("onRestored fires once per successfully undone snapshot, in reverse order", async () => {
+    const onRestored = vi.fn();
+    const { result } = renderHook(() =>
+      useUndoSnapshot({
+        isBusy: false,
+        onStatusChange: vi.fn(),
+        onMessage: vi.fn(),
+        onRestored
+      })
+    );
+    const first = makeSnapshot("plan-1", "execution-1");
+    const second = makeSnapshot("plan-2", "execution-2");
+    act(() => {
+      result.current.pushUndoSnapshot(first);
+      result.current.pushUndoSnapshot(second);
+    });
+
+    await act(async () => {
+      await result.current.undoExecutionTo("plan-1");
+    });
+
+    // 逆序：second 先成功、first 后成功。
+    expect(onRestored.mock.calls.map((call) => call[0])).toEqual([second, first]);
+  });
+
+  it("onRestored is not fired on conflict/failure (no partial 'undone' marking)", async () => {
+    const onRestored = vi.fn();
+    undoExecutionMock.mockRejectedValue(new Error("在本次撤销将要写回的字段上又发生了变化，已停止撤销"));
+    const { result } = renderHook(() =>
+      useUndoSnapshot({
+        isBusy: false,
+        onStatusChange: vi.fn(),
+        onMessage: vi.fn(),
+        onRestored
+      })
+    );
+    act(() => result.current.pushUndoSnapshot(snapshot));
+
+    await act(async () => {
+      await result.current.undoLastExecution();
+    });
+
+    expect(onRestored).not.toHaveBeenCalled();
+    expect(result.current.lastUndoSnapshot).toBe(snapshot);
+  });
+
+  it("clearUndoSnapshot does not fire onRestored (clearing the stack is not an undo)", async () => {
+    const onRestored = vi.fn();
+    const { result } = renderHook(() =>
+      useUndoSnapshot({
+        isBusy: false,
+        onStatusChange: vi.fn(),
+        onMessage: vi.fn(),
+        onRestored
+      })
+    );
+    act(() => result.current.pushUndoSnapshot(snapshot));
+    act(() => result.current.clearUndoSnapshot());
+
+    expect(onRestored).not.toHaveBeenCalled();
+  });
 });

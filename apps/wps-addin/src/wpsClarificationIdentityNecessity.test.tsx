@@ -35,7 +35,7 @@ vi.mock("../../excel-addin/src/hooks/useAuthorizedTarget", () => ({
 
 vi.mock("../../excel-addin/src/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../excel-addin/src/api")>();
-  return { ...actual, listModels: vi.fn(), getModelSettings: vi.fn(), validatePlan: vi.fn() };
+  return { ...actual, understandMessage: vi.fn(async () => ({ kind: "needs_workbook_context", summary: "需要字段结构", provider: "model" })), listModels: vi.fn(), getModelSettings: vi.fn(), validatePlan: vi.fn() };
 });
 vi.mock("./wpsReadonlyAgent", () => ({ runWpsReadonlyTurn: vi.fn() }));
 vi.mock("./wpsHost", async (importOriginal) => {

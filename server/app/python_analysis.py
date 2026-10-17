@@ -42,14 +42,25 @@ PYTHON_ANALYSIS_CODE_NOT_PRESERVED_MESSAGE = (
 PYTHON_ANALYSIS_EXECUTION_ERROR_MESSAGE = (
     "隔离 Python 分析在执行环节发生内部错误；本轮未运行任何代码，请改用只读工具或直接提交计划。"
 )
+# 正向成功：结果已登记为本地结果，模型可引用 resultHandle 走结果卡/结果计划。
+PYTHON_ANALYSIS_COMPLETED_MESSAGE = (
+    "隔离 Python 分析完成，结果已登记为本地结果。"
+)
 
 # 工具回执允许出站给模型的字段白名单。投影在可信侧完成，代码不可修改。
-RECEIPT_KEYS = ("status", "runId", "reasonCategory", "message", "resultHandle")
+RECEIPT_KEYS = ("status", "runId", "reasonCategory", "message", "resultHandle", "resultCard")
 
 # 回执是有类型的：状态与原因都是封闭枚举，组合白名单唯一决定公开文案。
 RECEIPT_STATUS_UNAVAILABLE = "unavailable"
 RECEIPT_STATUS_REJECTED = "rejected"
-RECEIPT_STATUSES = (RECEIPT_STATUS_UNAVAILABLE, RECEIPT_STATUS_REJECTED)
+# 正向执行成功：结果已登记为本地结果（含 resultHandle）。只有可信协调器
+# （python_coordinator）能产生该状态；入参校验/投影仍失败关闭。
+RECEIPT_STATUS_COMPLETED = "completed"
+RECEIPT_STATUSES = (
+    RECEIPT_STATUS_UNAVAILABLE,
+    RECEIPT_STATUS_REJECTED,
+    RECEIPT_STATUS_COMPLETED,
+)
 
 REASON_DISABLED = "disabled"
 REASON_RUNNER_MISSING = "runner_missing"
@@ -57,6 +68,8 @@ REASON_PRODUCT_NOT_READY = "product_not_ready"
 REASON_INVALID_REQUEST = "invalid_request"
 REASON_CODE_NOT_PRESERVED = "code_not_preserved"
 REASON_EXECUTION_ERROR = "execution_error"
+# 正向成功：completed 状态不携带失败原因，用固定占位类别表示"无原因"。
+REASON_NONE = "none"
 # 第八批新增：端点非本机 / 镜像非不可变 / 清理无法核实——都失败关闭、不外泄细节。
 REASON_ENDPOINT_NOT_LOCAL = "endpoint_not_local"
 REASON_IMAGE_NOT_IMMUTABLE = "image_not_immutable"
@@ -73,6 +86,8 @@ _ALLOWED_RECEIPT_COMBINATIONS: dict[tuple[str, str], str] = {
     (RECEIPT_STATUS_UNAVAILABLE, REASON_IMAGE_NOT_IMMUTABLE): PYTHON_ANALYSIS_UNAVAILABLE_MESSAGE,
     (RECEIPT_STATUS_UNAVAILABLE, REASON_CLEANUP_UNVERIFIED): PYTHON_ANALYSIS_EXECUTION_ERROR_MESSAGE,
     (RECEIPT_STATUS_REJECTED, REASON_INVALID_REQUEST): PYTHON_ANALYSIS_REJECTED_MESSAGE,
+    # 正向成功：completed 状态无 reasonCategory，message 由可信协调器固定生成。
+    (RECEIPT_STATUS_COMPLETED, REASON_NONE): PYTHON_ANALYSIS_COMPLETED_MESSAGE,
 }
 
 # 安全历史投影占位：代码字面量在消息历史/检查点中的唯一合法形态。
@@ -402,10 +417,10 @@ def project_python_analysis_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
     规则（全部失败关闭，非法即抛 ValueError，调用出口必须转固定安全文案）：
     - 回执必须是对象；字段集合 ⊆ :data:`RECEIPT_KEYS`，白名单外字段拒绝；
     - ``status``/``reasonCategory`` 必须是封闭枚举，且组合在登记表内；
-    - 产品工具尚无可信结果发布通道（内部登记不等于模型授权）：
-      ``runId``/``resultHandle`` 出现即拒绝；
-      将来支持句柄时必须由可信协调器生成并核对任务归属，不能只验证
-      字符串前缀或正则；
+    - ``runId`` 一律拒绝（产品不暴露运行标识）；``resultHandle`` 只允许在
+      ``status == completed`` 时出现，且必须由**可信协调器**生成（本地结果
+      ``res_`` 句柄、登记于 ``local_results``）——不能只验证字符串前缀。
+      非 completed 状态下出现 ``resultHandle`` 一律拒绝；
     - ``message`` 不读取输入——按可信状态组合重新生成固定公开文案。
     """
     if not isinstance(receipt, dict):
@@ -420,13 +435,24 @@ def project_python_analysis_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("回执原因类别非法")
     if (status, reason_category) not in _ALLOWED_RECEIPT_COMBINATIONS:
         raise ValueError("回执状态组合非法")
-    if receipt.get("runId") is not None or receipt.get("resultHandle") is not None:
-        raise ValueError("回执携带未登记的运行标识或结果句柄")
-    return {
+    if receipt.get("runId") is not None:
+        raise ValueError("回执携带未登记的运行标识")
+    result_handle = receipt.get("resultHandle")
+    if status != RECEIPT_STATUS_COMPLETED:
+        if result_handle is not None:
+            raise ValueError("非成功回执不得携带结果句柄")
+    else:
+        # 成功状态必须有可信结果句柄，且由本地结果登记器签发（res_ 前缀）。
+        if not isinstance(result_handle, str) or not result_handle.startswith("res_"):
+            raise ValueError("成功回执缺少可信结果句柄")
+    projected: dict[str, Any] = {
         "status": status,
         "reasonCategory": reason_category,
         "message": _fixed_receipt_message(status, reason_category),
     }
+    if status == RECEIPT_STATUS_COMPLETED:
+        projected["resultHandle"] = result_handle
+    return projected
 
 
 def withheld_python_arguments(arguments_json: str | None) -> str:
@@ -483,6 +509,15 @@ def python_analysis_tool_definition() -> dict[str, Any]:
     入参不含路径、命令行、包安装指令、宿主对象或密钥；数据只能通过
     任务内 ``datasetHandles`` 不透明句柄引用，句柄由可信协调器核对
     （登记核对尚未实现；形状校验不冒充授权检查）。
+
+    **代码契约必须写进 description**（真实缺陷修复，2026-10-10）：容器内固定
+    工作程序按"分析代码在**模块级**给 ``result`` 赋值"这一约定取值
+    （``docker_worker._run_code``）。此前 description 只说了"运行分析代码"，
+    没交代这个契约，模型无从得知，于是写出"定义函数但不给模块级 ``result``
+    赋值"的代码 —— 容器里照样退出码 0、状态 ``completed``，但 ``result`` 为
+    None，被 ``_matrix_result_to_data_tool_result`` 判为不可转换，最终对模型
+    呈现为固定的"内部错误/执行环节错误"回执。契约不写在工具描述里，等于让
+    模型靠猜；这是产品缺陷，不是模型能力问题。
     """
     return {
         "type": "function",
@@ -492,13 +527,29 @@ def python_analysis_tool_definition() -> dict[str, Any]:
                 "在已验证的隔离执行器中运行 Python 分析代码。只能使用预装分析库"
                 "与本任务授权数据的句柄；不能读写工作簿、宿主文件或网络。"
                 "执行器未就绪时返回不可用回执，此时请改用只读工具或直接提交计划。"
+                "\n\n代码契约（必须遵守，否则本工具返回不可用回执、拿不到任何结果）："
+                "\n1. 输入数据只从代码顶层变量 input 读取：input[\"datasets\"] 是数组，"
+                "每一项形如 {\"source\": {...}, \"values\": [[表头行], [数据行], ...]}，"
+                "其顺序与你传给 prepare_python_data 的 sources 顺序一致。"
+                "\n2. 代码必须在**模块级（顶层）**给变量 result 赋值；不要用函数返回值"
+                "或 print 传递结果 —— 只认模块级 result。"
+                "\n3. result 必须是对象 {\"kind\": \"matrix\", \"values\": [[...], ...]}："
+                "kind 固定为字符串 \"matrix\"，values 是二维矩阵（字符串/数字/布尔/null），"
+                "且每一行长度相同、至少一行一列。"
+                "\n4. 把要展示的列名作为 values 的第一行；汇总、总计、明细都应作为普通"
+                "行写进同一个矩阵（结果会以固定值矩阵的形式进入结果卡与写入计划）。"
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "code": {
                         "type": "string",
-                        "description": "要运行的 Python 分析代码",
+                        "description": (
+                            "要运行的 Python 分析代码。从 input[\"datasets\"][i][\"values\"] "
+                            "读取数据，并在模块级给 result 赋值："
+                            "result = {\"kind\": \"matrix\", \"values\": [[...], ...]}。"
+                            "只认模块级 result（不用函数返回值、不靠 print）。"
+                        ),
                     },
                     "datasetHandles": {
                         "type": "array",

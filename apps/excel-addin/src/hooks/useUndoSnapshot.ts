@@ -11,6 +11,7 @@ interface UseUndoSnapshotOptions {
   onStatusChange: (status: "executing" | "idle") => void;
   onMessage: (text: string) => void;
   onAfterUndo?: () => Promise<void> | void;
+  onRestored?: (snapshot: ExecutionUndoSnapshot) => void;
   beforeOperation?: () => Promise<boolean>;
 }
 
@@ -55,6 +56,7 @@ export function useUndoSnapshot({
   onStatusChange,
   onMessage,
   onAfterUndo,
+  onRestored,
   beforeOperation
 }: UseUndoSnapshotOptions) {
   const [undoStack, setUndoStack] = useState<ExecutionUndoSnapshot[]>([]);
@@ -76,7 +78,7 @@ export function useUndoSnapshot({
   /** 撤销到指定 executionId；旧消息没有 executionId 时兼容 planId。 */
   const undoExecutionTo = useCallback(
     async (executionIdOrPlanId?: string) => {
-      if (isBusy || !isRunningInExcel()) return;
+      if (isBusy || !isRunningInExcel()) return false;
       const index =
         executionIdOrPlanId === undefined
           ? undoStack.length - 1
@@ -85,18 +87,21 @@ export function useUndoSnapshot({
                 entry.executionId === executionIdOrPlanId ||
                 entry.planId === executionIdOrPlanId
             );
-      if (index < 0) return;
-      if (beforeOperation && !(await beforeOperation())) return;
+      if (index < 0) return false;
+      if (beforeOperation && !(await beforeOperation())) return false;
       // 逆序撤销：先撤最近的，再往前退，保证每一步的上下文都是它执行完的状态。
       const targets = undoStack.slice(index).reverse();
 
       onStatusChange("executing");
       let undone = 0;
+      let restored = false;
       try {
         for (const snapshot of targets) {
           await undoExecution(snapshot);
           undone += 1;
+          onRestored?.(snapshot);
         }
+        restored = true;
         onMessage(
           undone > 1
             ? `已撤销最近 ${undone} 次执行中记录的单元格值、公式和格式。`
@@ -114,8 +119,9 @@ export function useUndoSnapshot({
         }
         onStatusChange("idle");
       }
+      return restored;
     },
-    [undoStack, isBusy, onStatusChange, onMessage, onAfterUndo, beforeOperation]
+    [undoStack, isBusy, onStatusChange, onMessage, onAfterUndo, onRestored, beforeOperation]
   );
 
   const undoLastExecution = useCallback(

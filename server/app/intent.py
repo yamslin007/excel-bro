@@ -10,7 +10,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from .capabilities import capability_int, capability_optional_int, model_timeout_seconds
-from .llm import ModelConnection, ModelNotConfiguredError, OpenAICompatibleClient
+from .llm import ModelConnection, ModelNotConfiguredError, OpenAICompatibleClient, LLMResponseError
 from .models import (
     IntentCheckRequest,
     IntentCheckResponse,
@@ -18,14 +18,93 @@ from .models import (
     IntentConversationResponse,
     IntentProceedResponse,
     IntentToolResponse,
+    MessageUnderstandingRequest,
+    MessageUnderstandingResponse,
+    MessageConversationResponse,
+    MessageContextResponse,
 )
 from .structural_intent import parse_bulk_worksheet_deletion
+from .assistant_identity import PRODUCT_IDENTITY_PROMPT, with_runtime_model_identity
+from .task_context import TASK_CONTEXT_PROMPT, task_context_payload
 
 logger = logging.getLogger(__name__)
 
 
-INTENT_SYSTEM_PROMPT = """
-你是 Excel Bro 的对话路由器。你判断用户是在普通交谈，还是提出了工作簿任务；
+MESSAGE_UNDERSTANDING_PROMPT = PRODUCT_IDENTITY_PROMPT + """
+
+本轮内部任务：先理解消息。当前没有读取工作簿，也没有字段结构或数据。
+只根据当前消息、最近对话和附件数量，决定是否需要进入工作簿任务流程。
+问候、感谢、普通聊天、能力咨询、无需当前文件即可回答的通用知识问题，直接自然简短回复。
+介绍能力时仅概述已授权表的查询、分析和受控预览；写入需用户另行确认，不承诺未验证的功能。
+涉及当前文件的查询、计算、修改、格式、结构操作，或依赖前文工作簿任务的追问，返回
+needs_workbook_context。这只表示需要核对授权后读取字段，不是生成计划、执行或扩大范围的授权。
+当前消息优先于旧任务；例如完成任务后的感谢不是继续处理原表。
+缺少字段信息不是现在追问的理由：先返回 needs_workbook_context，后续读取授权结构再判断。
+附件数量不代表看到了图片；有图片时交给后续视觉阶段，不猜测图片内容。
+不得声称已经读取、计算或写入工作簿，不要生成工具调用、澄清选项或操作计划。
+只返回以下两种 JSON 之一，不使用 Markdown，内容使用简体中文：
+{"kind":"conversation","message":"直接回复"}
+{"kind":"needs_workbook_context","summary":"需要结合授权表结构理解的任务"}
+"""
+
+
+def message_understanding_payload(request: MessageUnderstandingRequest) -> dict[str, Any]:
+    # Deliberately independent of scope, priorIntent and priorResult projections.
+    return {
+        "prompt": request.prompt,
+        "imageCount": request.imageCount,
+        "conversation": [item.model_dump() for item in request.conversation],
+    }
+
+
+def parse_message_understanding(content: str, request: MessageUnderstandingRequest) -> MessageUnderstandingResponse:
+    text = re.sub(r"^```(?:json)?\s*", "", content.strip())
+    text = re.sub(r"\s*```$", "", text)
+    payload = json.loads(text)
+    if not isinstance(payload, dict):
+        raise ValueError("Invalid message routing response")
+    if payload.get("kind") == "conversation":
+        parsed = MessageConversationResponse.model_validate({**payload, "provider": "model"})
+        if request.imageCount:
+            return MessageContextResponse(summary="结合附件处理本次需求，需进入后续视觉阶段。")
+        return parsed
+    if payload.get("kind") == "needs_workbook_context":
+        return MessageContextResponse.model_validate({**payload, "provider": "model"})
+    raise ValueError("Invalid message routing kind")
+
+
+async def check_message_understanding(
+    request: MessageUnderstandingRequest, *, config: ModelConnection | None
+) -> MessageUnderstandingResponse:
+    if config is None:
+        raise ModelNotConfiguredError("尚未配置模型，无法理解这条消息。请先添加模型。")
+    if getattr(config, "adapter", "openai_compatible") == "claude_agent_sdk":
+        from .claude_sdk_agent import check_sdk_message_understanding
+        return await check_sdk_message_understanding(request, config)
+    user_content = json.dumps(message_understanding_payload(request), ensure_ascii=False)
+    timeout = float(os.getenv("AI_INTENT_TIMEOUT_SECONDS", str(max(10.0, model_timeout_seconds()))))
+    async with OpenAICompatibleClient(config, timeout=timeout) as client:
+        repair_note = ""
+        for _attempt in range(2):
+            payload, _ = await client.chat_completions(
+                messages=[{"role": "system", "content": with_runtime_model_identity(MESSAGE_UNDERSTANDING_PROMPT, config)},
+                          {"role": "user", "content": user_content + repair_note}],
+                max_tokens=capability_optional_int("intentContext", "maxOutputTokens"),
+            )
+            try:
+                choice = payload["choices"][0]
+                if choice.get("finish_reason") == "length":
+                    break
+                return parse_message_understanding(choice["message"].get("content") or "", request)
+            except (KeyError, IndexError, TypeError, ValueError, ValidationError):
+                repair_note = "\n上次输出未通过校验；只返回规定的完整 JSON，不要工具调用或计划。"
+    # Unknown intent must not become an implicit permission to read fields.
+    raise LLMResponseError("未能理解这条消息；尚未读取工作表结构，请重试。")
+
+
+INTENT_SYSTEM_PROMPT = PRODUCT_IDENTITY_PROMPT + """
+
+本轮内部任务：判断用户是在普通交谈，还是提出了工作簿任务；
 不能分析数据、计算结果或生成 Excel 操作计划。
 
 图片数量只说明用户添加了附件，不代表你看到了图片。涉及附件内容的任务必须交给
@@ -93,7 +172,10 @@ clearRange 动作），不要返回 tool_request。如果不明确，只问一�
 只返回 JSON，不要使用 Markdown。格式：
 {"kind":"conversation","message":"直接给用户的简短回复"}
 或
-{"kind":"proceed","summary":"我理解的需求","confirmedPrompt":"明确化后的完整需求"}
+{"kind":"proceed","summary":"我理解的需求","confirmedPrompt":"明确化后的完整需求","planningGoal":"write_preview"}
+proceed 与 tool_request 都必须明确 planningGoal：用户要求生成写入预览时为 write_preview；
+只分析或展示结果（包括图片分析、复杂 Python 计算）时为 read_only。
+这是本轮后续规划的固定目标，不能为了提前结束任务而改成只读。
 或
 {"kind":"clarification","clarification":{"id":"短标识","summary":"当前理解",
 "question":"需要确认的问题","reason":"为什么需要确认","scopeLabel":"数据范围说明",
@@ -102,6 +184,7 @@ clearRange 动作），不要返回 tool_request。如果不明确，只问一�
 "action":"resolve|editScope"}]}}
 或
 {"kind":"tool_request","summary":"准备执行的本地查询",
+"planningGoal":"read_only",
 "confirmedPrompt":"明确化后的完整需求",
 "request":{"id":"短标识","tool":"query_table","arguments":{
 "mode":"rows|aggregate|profile","scope":"selected|active",
@@ -231,6 +314,7 @@ def _parse_model_response(
             return IntentProceedResponse(
                 provider="model", summary="结合附件处理本次需求。",
                 confirmedPrompt=request.prompt,
+                planningGoal="read_only",
             )
         return IntentConversationResponse.model_validate(
             {**payload, "provider": "model"}
@@ -282,6 +366,7 @@ async def check_intent(
     scope_payload: dict[str, Any] = request.scope.model_dump()
     user_content = (
         f"用户需求：{request.prompt}\n"
+        f"本件任务已确认信息：{json.dumps(task_context_payload(request), ensure_ascii=False)}\n"
         f"用户是否回答过澄清问题：{request.intentConfirmed}\n"
         f"当前澄清轮次：{request.clarificationRound}/{MAX_CLARIFICATION_ROUNDS}\n"
         f"附件图片数量：{request.imageCount}\n"
@@ -304,7 +389,7 @@ async def check_intent(
         for _attempt in range(2):
             payload, _ = await client.chat_completions(
                 messages=[
-                    {"role": "system", "content": INTENT_SYSTEM_PROMPT},
+                    {"role": "system", "content": with_runtime_model_identity(INTENT_SYSTEM_PROMPT + TASK_CONTEXT_PROMPT, config)},
                     {
                         "role": "user",
                         "content": f"{user_content}{repair_note}",

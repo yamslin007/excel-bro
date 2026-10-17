@@ -49,8 +49,8 @@ function host(accept = false, scale = 1) {
   return {app,pane,review,storage,widths,range,removeCopy:()=>{books=[original];},
     duplicateOriginal:()=>{books=[original,{...original},copy];}};
 }
-function View({review}:{review:WpsNativeComparison|null}) {
-  const needsResize=useWpsReviewPaneRatio(review);
+function View({review,rearm=0}:{review:WpsNativeComparison|null;rearm?:number}) {
+  const needsResize=useWpsReviewPaneRatio(review,rearm);
   return <output>{needsResize?'manual guidance':'ready'}</output>;
 }
 function mount(element:ReactElement) {
@@ -64,39 +64,61 @@ const resize=(width:number)=>act(()=>{window.innerWidth=width;window.dispatchEve
 
 it('measures this WPS application in points, not the iframe, and restores ordinary width on exit',()=>{
   const h=host(true); const view=mount(<View review={h.review}/>);
-  expect(h.widths).toEqual([480]); expect(view.container.textContent).toBe('manual guidance');
+  // 主窗口 900pt = 1200 CSS px；AI 目标 = 30% × 1200 = 360（不是右侧窗口的比例）。
+  expect(h.widths).toEqual([360]); expect(view.container.textContent).toBe('manual guidance');
   tick(); expect(view.container.textContent).toBe('ready');
-  h.app.Width=1125; tick(); expect(h.widths).toEqual([480,600]);
-  view.render(<View review={null}/>); expect(h.widths).toEqual([480,600,840]);
+  h.app.Width=1125; tick(); expect(h.widths).toEqual([360,450]);
+  view.render(<View review={null}/>); expect(h.widths).toEqual([360,450,840]);
   tick(interval*3); expect(h.widths).toHaveLength(3);
   expect(h.storage.has(REVIEW_PANE_LEASE_KEY)).toBe(false);
 });
 it('calibrates native pane units rather than assuming they equal CSS pixels',()=>{
   const h=host(true,1.5); mount(<View review={h.review}/>);
-  expect(h.widths).toEqual([720]); expect(window.innerWidth).toBe(480);
-  tick(); expect(h.widths).toEqual([720]);
+  expect(h.widths).toEqual([540]); expect(window.innerWidth).toBe(360);
+  tick(); expect(h.widths).toEqual([540]);
 });
 it('manual dragging wins, remains protected from ribbon migration, and new review resets sizing',()=>{
   const h=host(true); const view=mount(<View review={h.review}/>); tick();
   h.pane.Width=430; resize(430); tick();
   h.app.Width=1350; tick(interval*5);
   initializeRestoredTaskPaneWidth(); expect(h.pane.Width).toBe(430);
-  expect(h.widths).toEqual([480,430]);
-  view.render(<View review={{...h.review}}/>); expect(h.widths.slice(-2)).toEqual([840,720]);
+  expect(h.widths).toEqual([360,430]);
+  view.render(<View review={{...h.review}}/>); expect(h.widths).toEqual([360,430,540]);
+});
+it('re-arms the default pane ratio only on an explicit rearrange, never on its own',()=>{
+  const h=host(true); const view=mount(<View review={h.review}/>); tick();
+  h.pane.Width=430; resize(430); tick();
+  expect(h.widths).toEqual([360,430]);
+  h.app.Width=1350; tick(interval*3);
+  act(()=>window.dispatchEvent(new Event('focus'))); tick();
+  expect(h.widths).toEqual([360,430]);       // 用户拖过的宽度：工作区变化不被自动纠正
+  view.render(<View review={h.review}/>);    // 普通重渲染/rearm 未变：不得重排
+  expect(h.widths).toEqual([360,430]);
+  view.render(<View review={h.review} rearm={1}/>);
+  // 主动重排才重套默认比例，而且**不先 restore 840**（用户的宽度不是我们的临时布局）。
+  expect(h.widths).toEqual([360,430,540]);
+  tick(); expect(h.widths).toEqual([360,430,540]);
+});
+it('never force-restores over a width the user dragged during the review',()=>{
+  const h=host(true); const view=mount(<View review={h.review}/>); tick();
+  h.pane.Width=430; resize(430); tick();
+  expect(h.widths).toEqual([360,430]);
+  view.render(<View review={null}/>);
+  expect(h.widths).toEqual([360,430]);
 });
 it('a silently ignored width request does not claim successful sizing or loop',()=>{
   const h=host(false); const view=mount(<View review={h.review}/>); tick(interval*3);
-  expect(h.widths).toEqual([480]); expect(view.container.textContent).toBe('manual guidance');
+  expect(h.widths).toEqual([360]); expect(view.container.textContent).toBe('manual guidance');
 });
 it('debounces resize, pauses hidden measurements, resumes on visibility, and cleans up',()=>{
   const h=host(true); const view=mount(<View review={h.review}/>); tick();
   h.app.Width=1125; resize(470); resize(460);
-  tick(199); expect(h.widths).toEqual([480]); tick(1); expect(h.widths).toEqual([480,600]); tick();
+  tick(199); expect(h.widths).toEqual([360]); tick(1); expect(h.widths).toEqual([360,450]); tick();
   Object.defineProperty(document,'visibilityState',{value:'hidden',configurable:true});
-  h.app.Width=1350; tick(interval*3); expect(h.widths).toEqual([480,600]);
+  h.app.Width=1350; tick(interval*3); expect(h.widths).toEqual([360,450]);
   Object.defineProperty(document,'visibilityState',{value:'visible',configurable:true});
   act(()=>document.dispatchEvent(new Event('visibilitychange'))); tick(200);
-  expect(h.widths).toEqual([480,600,720]);
+  expect(h.widths).toEqual([360,450,540]);
   view.render(<View review={null}/>); const calls=h.widths.length;
   resize(500); tick(interval*3); expect(h.widths).toHaveLength(calls);
 });
@@ -130,9 +152,9 @@ it.each(['closedCopy','ambiguous','savedCopy','otherBook','otherPane','otherHost
   if(kind==='otherPane') h.storage.set(TASK_PANE_STORAGE_KEY,811);
   if(kind==='otherHost') h.app.Hwnd=99;
   h.app.Width=1125; tick();
-  expect(h.widths).toEqual([480]); expect(view.container.textContent).toBe('manual guidance');
+  expect(h.widths).toEqual([360]); expect(view.container.textContent).toBe('manual guidance');
   view.render(<View review={null}/>);
-  if(kind==='otherPane'||kind==='otherHost') expect(h.widths).toEqual([480]);
+  if(kind==='otherPane'||kind==='otherHost') expect(h.widths).toEqual([360]);
 });
 it('does not take width ownership from another live review',()=>{
   const h=host(); h.storage.set(REVIEW_PANE_LEASE_KEY,JSON.stringify({paneId:'810',owner:'other',expiresAt:Date.now()+6000}));
@@ -142,31 +164,31 @@ it('does not take width ownership from another live review',()=>{
 it('restores captured ordinary width after capability failure even if its marker expired',()=>{
   const h=host(true); const view=mount(<View review={h.review}/>); tick();
   h.app.Width=undefined; tick(interval*8); view.render(<View review={null}/>);
-  expect(h.widths).toEqual([480,840]);
+  expect(h.widths).toEqual([360,840]);
 });
 it('rechecks live scope immediately before setting native width',()=>{
   const h=host(); const adapter=createWpsReviewPaneAdapter(h.app,h.review);
-  h.removeCopy(); expect(()=>adapter.resize(480,840)).toThrow(); expect(h.widths).toEqual([]);
+  h.removeCopy(); expect(()=>adapter.resize(360,840)).toThrow(); expect(h.widths).toEqual([]);
 });
 it('does not restore into a disconnected application after the global host was replaced',()=>{
   const h=host(true); const view=mount(<View review={h.review}/>); tick();
   window.Application={...h.app,Hwnd:100}; tick(); view.render(<View review={null}/>);
-  expect(h.widths).toEqual([480]);
+  expect(h.widths).toEqual([360]);
 });
 it('releases sizing ownership without removeItem so the next review can start immediately',()=>{
   const h=host(true); h.app.PluginStorage.removeItem=undefined;
   const view=mount(<View review={h.review}/>); view.render(<View review={null}/>);
   view.render(<View review={{...h.review}}/>);
-  expect(h.widths).toEqual([480,840,480]);
+  expect(h.widths).toEqual([360,840,360]);
 });
 it('StrictMode effect replay neither leaks ownership nor loses the ordinary width',()=>{
   const h=host(true); const view=mount(<StrictMode><View review={h.review}/></StrictMode>);
-  expect(h.widths).toEqual([480,840,480]);
+  expect(h.widths).toEqual([360,840,360]);
   view.render(<StrictMode><View review={null}/></StrictMode>);
-  expect(h.widths).toEqual([480,840,480,840]);
+  expect(h.widths).toEqual([360,840,360,840]);
 });
 it('scale changes require manual adjustment/new review instead of using stale calibration',()=>{
   const h=host(true); const view=mount(<View review={h.review}/>); tick();
   window.devicePixelRatio=1.5; h.app.Width=1125; tick();
-  expect(h.widths).toEqual([480]); expect(view.container.textContent).toBe('manual guidance');
+  expect(h.widths).toEqual([360]); expect(view.container.textContent).toBe('manual guidance');
 });

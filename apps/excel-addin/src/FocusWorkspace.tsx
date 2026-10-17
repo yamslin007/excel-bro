@@ -3,6 +3,7 @@ import {
   FOCUS_PAYLOAD_STORAGE_KEY,
   type FocusPayload
 } from "./focusState";
+import { brandLogoUrl } from "./brandLogo";
 
 function storedPayload(): FocusPayload | null {
   try {
@@ -85,7 +86,7 @@ export default function FocusWorkspace() {
   if (!payload) {
     return (
       <main className="focus-loading">
-        <div className="focus-brand-mark">EB</div>
+        <img className="focus-brand-mark" src={brandLogoUrl} alt="" />
         <strong>正在准备专注窗口</strong>
         <span>正在从任务窗格同步对话与工具说明…</span>
       </main>
@@ -95,7 +96,7 @@ export default function FocusWorkspace() {
   return (
     <main className="focus-shell">
       <header className="focus-header">
-        <div className="focus-brand-mark">EB</div>
+        <img className="focus-brand-mark" src={brandLogoUrl} alt="" />
         <div className="focus-brand-copy">
           <strong>Excel Bro</strong>
           <span>{payload.workbookName || "当前工作簿"} · 专注查看</span>
@@ -278,7 +279,7 @@ export default function FocusWorkspace() {
                   </pre>
                 ) : (
                   <div className="focus-empty-detail">
-                    此工具在本地确定性运行，不包含专家脚本。
+                    此工具在本地确定性运行，不包含专家计划。
                   </div>
                 )}
               </>

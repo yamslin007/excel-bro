@@ -1,73 +1,30 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, type SetStateAction } from "react";
 import type {
   FolderCatalog,
   FolderSelection,
   WorkbookSnapshot
 } from "../contracts";
 import type { SourceMode, WorkbookScopeMode } from "../types/workbook";
-import { folderSheetKey } from "../utils";
-import { isEBSystemSheet } from "../excel";
+import {
+  addedFolderSheetKeys,
+  canPreserveFolderAuthorization,
+  folderScopeDraftDirty,
+  folderSelectionsFromKeys,
+  folderSheetKey,
+  folderSheetKeysOf,
+  isEBSystemSheet,
+  resolveFolderViewAfterFileClear,
+  type FolderViewAfterFileClear
+} from "@excel-bro/core/folderScope";
+
+// 这些判据全在共享层（`@excel-bro/core/folderScope`）。这里原样转发，
+// 让 App.tsx 与既有用例的导入路径（`./useScopeSelection`）不用动，
+// 同时保证两端读到的是**同一份**声明而不是"行为相似的副本"。
+export { addedFolderSheetKeys, resolveFolderViewAfterFileClear };
+export type { FolderViewAfterFileClear };
 
 const FOLDER_CATALOG_KEY = "excelBro.folderCatalog";
 const FOLDER_SHEET_KEYS_KEY = "excelBro.folderSheetKeys";
-
-/** 比较两次文件夹扫描，返回新出现且允许用户选择的工作表。 */
-export function addedFolderSheetKeys(
-  previous: FolderCatalog | null,
-  current: FolderCatalog
-): string[] {
-  if (!previous) return [];
-  const previousKeys = new Set(
-    previous.files.flatMap((file) =>
-      file.worksheets
-        .filter((sheet) => !isEBSystemSheet(sheet.name))
-        .map((sheet) => folderSheetKey(file.id, sheet.name))
-    )
-  );
-  return current.files.flatMap((file) =>
-    file.worksheets
-      .filter((sheet) => !isEBSystemSheet(sheet.name))
-      .map((sheet) => folderSheetKey(file.id, sheet.name))
-      .filter((key) => !previousKeys.has(key))
-  );
-}
-
-export interface FolderViewAfterFileClear {
-  remainingKeys: string[];
-  showSelected: boolean;
-  activeFileId: string;
-}
-
-/**
- * 清空当前文件后修正文件夹选择视图，避免「只看已选」落入无法退出的空结果。
- */
-export function resolveFolderViewAfterFileClear(
-  selectedKeys: string[],
-  clearedFileId: string,
-  orderedFileIds: string[],
-  showSelected: boolean
-): FolderViewAfterFileClear {
-  const clearedPrefix = folderSheetKey(clearedFileId, "");
-  const remainingKeys = selectedKeys.filter(
-    (key) => !key.startsWith(clearedPrefix)
-  );
-  if (!showSelected) {
-    return {
-      remainingKeys,
-      showSelected: false,
-      activeFileId: clearedFileId
-    };
-  }
-  const nextSelectedFileId = orderedFileIds.find((fileId) => {
-    const prefix = folderSheetKey(fileId, "");
-    return remainingKeys.some((key) => key.startsWith(prefix));
-  });
-  return {
-    remainingKeys,
-    showSelected: Boolean(nextSelectedFileId),
-    activeFileId: nextSelectedFileId ?? clearedFileId
-  };
-}
 
 /**
  * 数据范围与工具保存字段 Hook
@@ -86,7 +43,7 @@ export function useScopeSelection() {
    * 当前草稿里的工作表选择。勾选、取消勾选、全选/清空都只改它 ——
    * 这些动作**不构成授权**，所以它们不该顺手作废一件正在等待回答的任务。
    */
-  const [selectedSheetNames, setSelectedSheetNames] = useState<string[]>([]);
+  const [selectedSheetNames, setDraftSheetNames] = useState<string[]>([]);
   /**
    * **已提交**的数据授权。只有点「确认范围」或明确选用某个范围时才变。
    *
@@ -95,6 +52,11 @@ export function useScopeSelection() {
    */
   const [committedSheetNames, setCommittedSheetNames] = useState<string[]>([]);
   const [selectionConfirmed, setSelectionConfirmed] = useState(false);
+  // Exposed selection setters edit a draft, never silently advance authorization.
+  const setSelectedSheetNames = useCallback((update: SetStateAction<string[]>) => {
+    setDraftSheetNames(update);
+    setSelectionConfirmed(false);
+  }, []);
   const [sourceMode, setSourceMode] = useState<SourceMode>("workbook");
   const [workbookScopeMode, setWorkbookScopeMode] =
     useState<WorkbookScopeMode>("auto");
@@ -170,14 +132,10 @@ export function useScopeSelection() {
       let next = selectedSheetNames;
       if (snapshot) {
         const available = new Set(snapshot.worksheets.map((sheet) => sheet.name));
-        const preserved = selectedSheetNames.filter((name) => available.has(name));
-        next =
-          preserved.length > 0
-            ? preserved
-            : snapshot.activeWorksheet
-              ? [snapshot.activeWorksheet]
-              : [];
-        if (next !== selectedSheetNames) setSelectedSheetNames(next);
+        if (!next.length || next.some((name) => !available.has(name))) {
+          setSelectionConfirmed(false);
+          return [];
+        }
       }
       setCommittedSheetNames(next);
       setSelectionConfirmed(next.length > 0);
@@ -201,10 +159,10 @@ export function useScopeSelection() {
    *
    * 界面据此提示"还有未确认的范围修改"，而不是让用户以为改了就已经生效。
    */
-  const scopeDraftDirty =
-    selectedSheetNames.length !== committedSheetNames.length ||
-    [...selectedSheetNames].sort().join("\u0000") !==
-      [...committedSheetNames].sort().join("\u0000");
+  const scopeDraftDirty = folderScopeDraftDirty(
+    selectedSheetNames,
+    committedSheetNames
+  );
 
   /**
    * 凡是把范围标成"已确认"的路径，都同步把当前选择记成**已提交授权**。
@@ -258,20 +216,25 @@ export function useScopeSelection() {
     setSelectionConfirmed(false);
   }, []);
 
-  const applyFolderCatalog = useCallback((catalog: FolderCatalog) => {
+  const applyFolderCatalog = useCallback((
+    catalog: FolderCatalog,
+    options: { preserveAuthorization?: boolean } = {}
+  ) => {
     setFolderCatalog(catalog);
-    // 保留仍然有效的勾选（文件 ID 和表名都能在新 catalog 中找到）
-    const validFileSheets = new Set<string>();
-    for (const file of catalog.files) {
-      for (const sheet of file.worksheets) {
-        validFileSheets.add(folderSheetKey(file.id, sheet.name));
-      }
-    }
+    // 保留仍然有效的勾选（文件 ID 和表名都能在新 catalog 中找到）。
+    // 这里用的是**存在性**名单（不过滤 EB 表）：一个真存在的键被过滤掉
+    // 会让下一次刷新把它误判成「目标已消失」。
+    const validFileSheets = new Set(folderSheetKeysOf(catalog));
     setFolderSheetKeys((current) =>
       current.filter((key) => validFileSheets.has(key))
     );
-    setSelectionConfirmed(false);
-  }, []);
+    // Refresh is not consent. Preserve an existing confirmation only; never
+    // turn a draft or a restored localStorage selection into authorization.
+    // 判据本身在共享层：同根 + 同会话 + 至少勾一张 + 每张都还在。
+    const sameTargets = options.preserveAuthorization === true &&
+      canPreserveFolderAuthorization(folderCatalog, catalog, folderSheetKeys);
+    if (!sameTargets) setSelectionConfirmed(false);
+  }, [folderCatalog, folderSheetKeys]);
 
   const chooseAutomaticScope = useCallback(
     (workbook: WorkbookSnapshot | null) => {
@@ -280,7 +243,7 @@ export function useScopeSelection() {
       if (workbook) {
         setSelectedSheetNames([workbook.activeWorksheet]);
       }
-      setSelectionConfirmed(true);
+      setSelectionConfirmed(false);
     },
     []
   );
@@ -292,7 +255,7 @@ export function useScopeSelection() {
       if (selectedSheetNames.length === 0 && workbook) {
         setSelectedSheetNames([workbook.activeWorksheet]);
       }
-      setSelectionConfirmed(selectedSheetNames.length > 0 || workbook !== null);
+      setSelectionConfirmed(false);
     },
     [selectedSheetNames]
   );
@@ -309,21 +272,12 @@ export function useScopeSelection() {
 
   const chooseFolderScope = useCallback(() => {
     setSourceMode("folder");
-    setSelectionConfirmed(folderSheetKeys.length > 0);
-  }, [folderSheetKeys]);
+    if (sourceMode !== "folder") setSelectionConfirmed(false);
+  }, [sourceMode]);
 
   const folderSelections = useCallback((): FolderSelection[] => {
     if (!folderCatalog) return [];
-    return folderCatalog.files
-      .map((file) => ({
-        fileId: file.id,
-        sheets: file.worksheets
-          .filter((sheet) =>
-            folderSheetKeys.includes(folderSheetKey(file.id, sheet.name))
-          )
-          .map((sheet) => sheet.name)
-      }))
-      .filter((selection) => selection.sheets.length > 0);
+    return folderSelectionsFromKeys(folderCatalog, folderSheetKeys);
   }, [folderCatalog, folderSheetKeys]);
 
   const selectedNamesFor = useCallback(

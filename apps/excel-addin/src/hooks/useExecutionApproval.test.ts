@@ -78,6 +78,22 @@ describe("useExecutionApproval", () => {
     expect(result.current.verifiedPlanIds.size).toBe(1);
   });
 
+  it("should unmark a plan so an edited version loses save-as-tool eligibility", () => {
+    const { result } = renderHook(() => useExecutionApproval());
+
+    act(() => result.current.markPlanVerified("plan-a"));
+    act(() => result.current.markPlanVerified("plan-b"));
+    act(() => result.current.unmarkPlanVerified("plan-a"));
+
+    expect(result.current.verifiedPlanIds.has("plan-a")).toBe(false);
+    expect(result.current.verifiedPlanIds.has("plan-b")).toBe(true);
+
+    // 未标记过的 plan 调用 unmark 不报错、也不新增。
+    act(() => result.current.unmarkPlanVerified("plan-c"));
+    expect(result.current.verifiedPlanIds.has("plan-c")).toBe(false);
+    expect(result.current.verifiedPlanIds.size).toBe(1);
+  });
+
   it("should derive save eligibility from the candidate", () => {
     analyzeToolEligibilityMock.mockReturnValue({
       issues: [

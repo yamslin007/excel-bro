@@ -5,18 +5,26 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MODEL_STORAGE_KEY } from "../../excel-addin/src/conversation";
 import { useModelManagement } from "../../excel-addin/src/hooks/useModelManagement";
-import { getModelSettings, listModels, validatePlan, registerWpsExecution, getWpsExecutionStatus, startWpsAction, completeWpsAction, finishWpsExecution, suspendWpsExecution, claimWpsExecutionResume, reconcileWpsActionReceipt } from "../../excel-addin/src/api";
-import WpsAgentPanel from "./WpsAgentPanel";
+import { getModelSettings, listModels, understandMessage, validatePlan, registerWpsExecution, getWpsExecutionStatus, startWpsAction, completeWpsAction, finishWpsExecution, suspendWpsExecution, claimWpsExecutionResume, reconcileWpsActionReceipt } from "../../excel-addin/src/api";
+import WpsAgentPanel, { wpsWriteBackBlockReason, wpsWriteBackStillCurrent } from "./WpsAgentPanel";
+import type { ReviewWriteBackTarget } from "@excel-bro/core/reviewWriteBackGate";
 import { matrixFingerprintV2 } from "./wpsPlanExecutor";
 import WpsModelSettingsPanel from "./WpsModelSettingsPanel";
-import { runWpsReadonlyTurn } from "./wpsReadonlyAgent";
+import {
+  runWpsReadonlyTurn,
+  type WpsReadonlyTurnInput,
+  type WpsTurnResult
+} from "./wpsReadonlyAgent";
 import { getWpsApplication } from "./wpsHost";
+import { inspectWpsAuthorizedTarget } from "./wpsAuthorizedTarget";
+import type { AuthorizedTarget } from "@excel-bro/core/authorizedTarget";
 import {
   COMPOSER_AUTO_GROW_MAX_HEIGHT,
   COMPOSER_RESIZE_LABEL
 } from "../../excel-addin/src/hooks/useComposerResize";
-import { compareCommittedWpsResultToCopy, stageWpsNativeComparison, WpsFormulaTrialError } from "./wpsNativeComparison";
+import { compareCommittedWpsResultToCopy, discardWpsNativeComparison, stageWpsNativeComparison, WpsFormulaTrialError } from "./wpsNativeComparison";
 import type { AnalysisPlan } from "../../excel-addin/src/contracts";
+import { loadTools } from "../../excel-addin/src/storage";
 
 vi.mock("../../excel-addin/src/api", async (importOriginal) => {
   const actual =
@@ -50,6 +58,7 @@ vi.mock("../../excel-addin/src/api", async (importOriginal) => {
   });
   return {
     ...actual,
+    understandMessage: vi.fn(async () => ({ kind: "needs_workbook_context", summary: "需要字段结构", provider: "model" })),
     listModels: vi.fn(),
     getModelSettings: vi.fn(),
     validatePlan: vi.fn(),
@@ -70,7 +79,15 @@ vi.mock("../../excel-addin/src/api", async (importOriginal) => {
   };
 });
 
-vi.mock("./wpsReadonlyAgent", () => ({
+/*
+ * 只替掉"那一轮规划怎么跑"，**不**替掉整个模块。
+ *
+ * 桥宿主适配器还要用同模块里的 `sheetsForRequest`（把读到的矩阵交给确定性计算）。
+ * 早先这里是整体替换，于是桥的执行路径在本文件里永远跑不起来 —— 这正是
+ * "面板接线测试"要覆盖的东西，被 mock 顺手藏掉了。
+ */
+vi.mock("./wpsReadonlyAgent", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./wpsReadonlyAgent")>()),
   runWpsReadonlyTurn: vi.fn()
 }));
 
@@ -97,17 +114,30 @@ vi.mock("./wpsNativeComparison", () => ({
         values: action.values,
         formulas: [],
         valuesCaptured: true
-      }))
+      })),
+      copyFormatFinal: prepared.actions.map(() => undefined),
+      originalFormatBefore: prepared.actions.map(() => undefined)
     };
   }),
   compareCommittedWpsResultToCopy: vi.fn(() => "matched"),
   verifyWpsNativeComparison: vi.fn(),
-  discardWpsNativeComparison: vi.fn()
+  // 宿主真实返回的是**关闭结果**（不再是 void/抛异常）。
+  discardWpsNativeComparison: vi.fn(() => "closed")
 }));
 
 vi.mock("./wpsHost", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./wpsHost")>();
   return { ...actual, getWpsApplication: vi.fn(() => ({})) };
+});
+
+/*
+ * 授权身份检查是写回入口里**唯一**的异步等待。替身默认跑真实实现（本文件其它
+ * 用例要靠它读真实身份），只有"在途窗口"那条用例会临时把它挂起 —— 这样才能把
+ * "用户在这个窗口里点了放弃"这一个瞬间固定下来，而不是靠计时碰运气。
+ */
+vi.mock("./wpsAuthorizedTarget", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./wpsAuthorizedTarget")>();
+  return { ...actual, inspectWpsAuthorizedTarget: vi.fn(actual.inspectWpsAuthorizedTarget) };
 });
 
 // React 19 从 react 包导出 act；这里刻意不用 @testing-library/react ——
@@ -251,10 +281,60 @@ function flowUndoButtons(container: HTMLElement): HTMLButtonElement[] {
   );
 }
 
+/*
+ * 把授权身份检查**挂起 / 放行**：让"旧请求在途"这个瞬间可以被固定下来。
+ *
+ * 不这么做就只能靠计时碰运气 —— 而碰运气的用例要么假红要么假绿。挂起的是
+ * `inspectWpsAuthorizedTarget`，它是写回入口里唯一那个 `await`。
+ */
+const realInspect = vi.mocked(inspectWpsAuthorizedTarget).getMockImplementation();
+let inspectHold: Array<() => void> = [];
+
+function holdInspect(): void {
+  vi.mocked(inspectWpsAuthorizedTarget).mockImplementation(
+    (selected) =>
+      new Promise<AuthorizedTarget>((resolve, reject) => {
+        inspectHold.push(() => {
+          void realInspect?.(selected).then(resolve, reject);
+        });
+      })
+  );
+  inspectHold = [];
+}
+const inspectPending = (): boolean => inspectHold.length > 0;
+async function releaseInspect(): Promise<void> {
+  if (realInspect) vi.mocked(inspectWpsAuthorizedTarget).mockImplementation(realInspect);
+  const queued = inspectHold;
+  inspectHold = [];
+  await act(async () => {
+    queued.forEach((run) => run());
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  });
+}
+
+/**
+ * 审阅卡里的「我已核对副本」确认项。
+ *
+ * 写回入口在勾选前是**禁用**的 —— 确认框是真闸，加载项不替用户回答"我看过了"。
+ * 所以凡是要走完写回链路的用例都必须先勾这里；直接点按钮只会被拦下，原表一格都不写。
+ * 返回该复选框，供需要断言"勾选前后按钮可用性"的用例复用。
+ */
+async function acknowledgeCopy(container: HTMLElement): Promise<HTMLInputElement> {
+  const review = container.querySelector<HTMLElement>(".wps-native-review-status");
+  const checkbox = review?.querySelector<HTMLInputElement>('input[type="checkbox"]') ?? null;
+  if (!checkbox) throw new Error("审阅卡里应有「我已核对副本」确认项");
+  if (!checkbox.checked) await click(checkbox);
+  return checkbox;
+}
+
 async function stageAndSave(container: HTMLElement): Promise<void> {
-  await click(findButton(container, "生成右侧副本并排审阅"));
-  expect(findButton(container, "确认写回原表")).not.toBeNull();
-  await click(findButton(container, "确认写回原表"));
+  await until(() => findButton(container, "确认变更") !== null || textOf(container).includes("本次执行需要核对"), "应完成主表执行或明确失败");
+  const confirm = findButton(container, "确认变更");
+  if (confirm) {
+    expect(confirm.disabled).toBe(false);
+    await click(confirm);
+    await until(() => textOf(container).includes("已确认变更"), "确认应完成");
+  }
 }
 
 /** 受控输入必须走原生 value setter，否则 React 收不到这次变更。 */
@@ -358,11 +438,40 @@ function clarificationHost(options: { sheetNames?: string[]; workbookName?: stri
   onWrite?: (writes: number) => void;
   /** 写入一旦发生就让 `PluginStorage.getItem` 抛错：模拟恢复点读取失败。 */
   breakStorageReadsAfterWrite?: boolean;
+  /** 带逐格格式状态（Font/对齐/换行/行高），供格式动作（setFont 等）走通。 */
+  withFormat?: boolean;
 } = {}) {
   let value = "旧值";
   let formula = "旧值";
   let writes = 0;
+  const format = { bold: false, italic: false, name: "宋体", size: 11, color: 0, horizontalAlignment: 1, wrapText: false, rowHeight: 13.5 };
   const range = { Rows: { Count: 1 }, Columns: { Count: 1 }, MergeCells: false } as Record<string, unknown>;
+  if (options.withFormat) {
+    range.Font = {
+      get Bold() { return format.bold; }, set Bold(v: unknown) { format.bold = v as boolean; },
+      get Italic() { return format.italic; }, set Italic(v: unknown) { format.italic = v as boolean; },
+      get Name() { return format.name; }, set Name(v: unknown) { format.name = v as string; },
+      get Size() { return format.size; }, set Size(v: unknown) { format.size = v as number; },
+      get Color() { return format.color; }, set Color(v: unknown) { format.color = v as number; }
+    };
+    Object.defineProperties(range, {
+      HorizontalAlignment: {
+        get: () => format.horizontalAlignment,
+        set: (v: unknown) => { format.horizontalAlignment = v as number; },
+        enumerable: true
+      },
+      WrapText: {
+        get: () => format.wrapText,
+        set: (v: unknown) => { format.wrapText = v as boolean; },
+        enumerable: true
+      },
+      RowHeight: {
+        get: () => format.rowHeight,
+        set: (v: unknown) => { format.rowHeight = v as number; },
+        enumerable: true
+      }
+    });
+  }
   Object.defineProperties(range, {
     Value2: {
       get: () => value,
@@ -417,6 +526,7 @@ function clarificationHost(options: { sheetNames?: string[]; workbookName?: stri
   return {
     writes: () => writes,
     cellValue: () => value,
+    format: () => format,
     /** 模拟"执行之后用户又手工改了这块区域"：撤销前指纹复核必须能识别出来。 */
     setCell: (next: string) => {
       value = next;
@@ -435,7 +545,7 @@ async function mountPlanPreview(plan: AnalysisPlan, task: string) {
   const textarea = container.querySelector("textarea");
   await type(textarea, task);
   await submit(textarea);
-  await until(() => textOf(container).includes("写入前确认"), "应展示写入计划预览");
+  await until(() => findButton(container, "确认变更") !== null || textOf(container).includes("本次执行需要核对"), "应展示执行结果或明确失败");
   return { container, unmount: () => unmountMounted(container) };
 }
 
@@ -463,6 +573,10 @@ const singleWritePlan: AnalysisPlan = {
 beforeEach(() => {
   localStorage.clear();
   vi.clearAllMocks();
+  // 上一例若把授权检查挂起过，这里必须还原：否则后续用例的身份检查永远不返回。
+  if (realInspect) vi.mocked(inspectWpsAuthorizedTarget).mockImplementation(realInspect);
+  inspectHold = [];
+  vi.mocked(understandMessage).mockResolvedValue({ kind: "needs_workbook_context", summary: "需要字段结构", provider: "model" });
   getWpsApplicationMock.mockReturnValue({ ...(clarificationHost() as unknown as object), Version: "99" } as never);
 });
 
@@ -473,6 +587,100 @@ afterEach(() => {
 });
 
 describe("WPS Excel Bro chat UI", () => {
+  it("when the real scope entry is available, target changes use it and never open a second dialog", async () => {
+    let app = clarificationHost();
+    getWpsApplicationMock.mockImplementation(() => app);
+    listModelsMock.mockResolvedValue({ defaultModelId: firstConnection.id, models: [firstConnection] });
+    runTurnMock.mockResolvedValue({ kind: "answer", provider: "system", message: "已重新读取所选表" });
+    const open = vi.fn();
+    let authorize: ((target: AuthorizedTarget) => Promise<boolean>) | null = null;
+    function ExistingScopeEntry() {
+      const [pickerOpen, setPickerOpen] = useState(false);
+      return <WpsAgentPanel selectedSheetIndexes={[1]} scopeDock={<span>既有数据范围选择器</span>}
+        scopePickerOpen={pickerOpen} onOpenScope={() => { open(); setPickerOpen(true); }}
+        onScopeConfirmationReady={(handler) => { authorize = handler; }} />;
+    }
+    const { container } = await mount(<ExistingScopeEntry />);
+    await until(() => authorize !== null && Boolean(container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型")), "连接就绪");
+    app = clarificationHost({ workbookName: "另一份.xlsx" });
+    const textarea = container.querySelector("textarea");
+    await type(textarea, "按我刚才补充的规则处理"); await submit(textarea);
+    await until(() => Boolean(container.querySelector(".target-scope-notice")), "范围条提示");
+    expect(container.querySelector('[role="dialog"]')).toBeNull();
+    expect(container.querySelector('input[type="radio"]')).toBeNull();
+    expect(container.querySelectorAll(".target-scope-notice button")).toHaveLength(1);
+    expect(textOf(container.querySelector(".target-scope-notice")!)).not.toContain("暂不操作");
+    await act(async () => { window.dispatchEvent(new Event("focus")); });
+    expect(container.querySelector(".target-scope-notice")).not.toBeNull();
+    expect(runTurnMock).not.toHaveBeenCalled();
+    expect(textarea?.value).toBe("按我刚才补充的规则处理");
+    await click(findButton(container, "检查数据范围")); expect(open).toHaveBeenCalledOnce();
+    expect(container.querySelector(".target-scope-notice")).toBeNull();
+    expect(runTurnMock).not.toHaveBeenCalled();
+    await act(async () => { expect(await authorize!(await inspectWpsAuthorizedTarget([1]))).toBe(true); });
+    await until(() => runTurnMock.mock.calls.length === 1, "现有范围确认后继续分析");
+    expect(runTurnMock.mock.calls[0][0].prompt).toBe("按我刚才补充的规则处理");
+    expect(container.querySelector(".target-scope-notice")).toBeNull();
+  });
+  it.each(["谢谢帮助", "你是谁"])("ordinary message %s does not invoke the workbook agent or show a field-read step", async (question) => {
+    listModelsMock.mockResolvedValue({ defaultModelId: firstConnection.id, models: [firstConnection] });
+    vi.mocked(understandMessage).mockResolvedValue({ kind: "conversation", message: "不客气，随时告诉我。", provider: "model" });
+    const { container } = await mount(panel());
+    await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型") ?? false, "应加载模型");
+    const textarea = container.querySelector("textarea");
+    await type(textarea, question);
+    await submit(textarea);
+    await until(() => textOf(container).includes("不客气，随时告诉我。"), "应直接回复");
+    expect(runTurnMock).not.toHaveBeenCalled();
+    const toggle = container.querySelector<HTMLButtonElement>(".task-progress-toggle");
+    expect(toggle?.getAttribute("aria-expanded")).toBe("false");
+    expect(textOf(container)).not.toContain("理解消息");
+    await click(toggle);
+    expect(toggle?.getAttribute("aria-expanded")).toBe("true");
+    expect(textOf(container)).toContain("理解消息");
+    expect(textOf(container)).not.toContain("读取已授权表结构");
+    expect(vi.mocked(understandMessage).mock.calls[0][0]).not.toHaveProperty("scope");
+  });
+
+  it("a failed message-only route keeps the request and never invokes the workbook agent", async () => {
+    listModelsMock.mockResolvedValue({ defaultModelId: firstConnection.id, models: [firstConnection] });
+    vi.mocked(understandMessage).mockRejectedValue(new Error("消息理解失败"));
+    const { container } = await mount(panel());
+    await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型") ?? false, "应加载模型");
+    const textarea = container.querySelector("textarea");
+    await type(textarea, "检查当前表");
+    await submit(textarea);
+    await until(() => textOf(container).includes("消息理解失败"), "应提示失败");
+    expect(runTurnMock).not.toHaveBeenCalled();
+    expect(textarea?.value).toBe("检查当前表");
+    expect(textOf(container)).not.toContain("读取已授权表结构");
+  });
+  it("confirmed range with fresh native wrappers is reused for consecutive follow-ups, but another file still pauses", async () => {
+    let app: ReturnType<typeof getWpsApplication> = clarificationHost();
+    getWpsApplicationMock.mockImplementation(() => ({ ...app,
+      ActiveWorkbook: { ...app.ActiveWorkbook }
+    } as never));
+    listModelsMock.mockResolvedValue({ defaultModelId: firstConnection.id, models: [firstConnection] });
+    runTurnMock.mockResolvedValue({ kind: "answer", provider: "system", message: "追问已分析" });
+    let authorize: ((target: AuthorizedTarget) => Promise<boolean>) | null = null;
+    const { container } = await mount(<WpsAgentPanel selectedSheetIndexes={[1]} scopeDock={<span>当前表 Sheet1</span>}
+      onScopeConfirmationReady={(handler) => { authorize = handler; }} />);
+    await until(() => authorize !== null && Boolean(container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：")), "确认入口与模型就绪");
+    await act(async () => { expect(await authorize!(await inspectWpsAuthorizedTarget([1]))).toBe(true); });
+    expect(runTurnMock).not.toHaveBeenCalled();
+    const textarea = container.querySelector("textarea");
+    for (let turn = 1; turn <= 2; turn++) {
+      await type(textarea, `补充第${turn}条规则`); await submit(textarea);
+      await until(() => runTurnMock.mock.calls.length === turn, "连续追问不重复选表");
+      await until(() => !container.querySelector(".composer textarea:disabled"), "等待本轮结束");
+      expect(container.querySelector('[role="dialog"]')).toBeNull();
+    }
+    app = clarificationHost({ workbookName: "另一份.xlsx" });
+    await type(textarea, "接着处理新问题"); await submit(textarea);
+    await until(() => Boolean(container.querySelector('[role="dialog"]')), "换文件仍然暂停");
+    expect(runTurnMock).toHaveBeenCalledTimes(2);
+    expect(JSON.stringify(localStorage)).not.toContain("C:\\\\Data");
+  });
   it("发送前检测文件变化：零模型请求，用户选文件并勾表确认后才继续原输入", async () => {
     let app = clarificationHost() as unknown as { ActiveWorkbook: { Name: string; FullName: string } };
     getWpsApplicationMock.mockImplementation(() => app as never);
@@ -860,6 +1068,10 @@ describe("WPS Excel Bro chat UI", () => {
     await until(() => runTurnMock.mock.calls.length === 3, "补充说明应继续原任务");
     expect(runTurnMock.mock.calls[2][0].prompt).toContain("补充确认：只统计记录数，不修改表格");
     expect(runTurnMock.mock.calls[2][0].intentConfirmed).toBe(true);
+    expect(runTurnMock.mock.calls[2][0].taskContext).toEqual({ schemaVersion: 1,
+      originalPrompt: "帮我处理表格", confirmations: [
+        { questionId: "clarify-1", label: "补充说明", value: "只统计记录数，不修改表格" }
+      ] });
     expect(container.querySelector(".clarification-card.resolved")).not.toBeNull();
     expect(textOf(container)).toContain("已按「只统计记录数，不修改表格」继续");
     const stored = JSON.parse(localStorage.getItem("excel-bro.wps.chat.v1") ?? "null");
@@ -867,6 +1079,48 @@ describe("WPS Excel Bro chat UI", () => {
       message.clarification?.status === "resolved"
     )).toBe(true);
     expect(JSON.stringify(stored)).not.toContain("修改数据");
+  });
+
+  it("replacing a task resets its persisted confirmations as well as the next request", async () => {
+    listModelsMock.mockResolvedValue({ defaultModelId: firstConnection.id, models: [firstConnection] });
+    getWpsApplicationMock.mockReturnValue(clarificationHost());
+    const question = (id: string, label: string, resolution: string, mode: "append" | "replace" = "append") => ({
+      kind: "clarification" as const, clarification: { response: {
+        kind: "clarification" as const, provider: "model" as const, clarification: {
+          id, summary: "确认口径", question: "选择口径", reason: "尚缺信息", scopeLabel: "Sheet1",
+          options: [{ id: "yes", label, description: label, resolution, resolutionMode: mode }]
+        }
+      } }
+    });
+    runTurnMock.mockResolvedValueOnce(question("old-mode", "旧规则", "旧规则已确认"))
+      .mockResolvedValueOnce(question("replacement", "改为排序", "按名称排序", "replace"))
+      .mockResolvedValueOnce(question("sort-order", "升序", "升序排列"))
+      .mockResolvedValueOnce({ kind: "answer", message: "新任务规则已收到", provider: "model" });
+    const { container } = await mount(panel());
+    await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "模型应就绪");
+    const optionButton = (label: string) => Array.from(container.querySelectorAll<HTMLButtonElement>(".clarification-options button"))
+      .find((button) => button.querySelector("strong")?.textContent === label) ?? null;
+    const composer = container.querySelector<HTMLTextAreaElement>(".composer textarea");
+    await type(composer, "旧的填充任务");
+    await submit(composer);
+    await until(() => !!optionButton("旧规则"), "第一道追问应出现");
+    await click(optionButton("旧规则"));
+    await until(() => !!optionButton("改为排序"), "应允许显式替换需求");
+    await click(optionButton("改为排序"));
+    await until(() => !!optionButton("升序"), "新需求应只补自己的缺项");
+    expect(runTurnMock.mock.calls[2][0].taskContext).toEqual({ schemaVersion: 1, originalPrompt: "按名称排序", confirmations: [] });
+    await click(optionButton("升序"));
+    await until(() => textOf(container).includes("新任务规则已收到"), "新需求应完成");
+    expect(runTurnMock.mock.calls[3][0].taskContext).toEqual({ schemaVersion: 1, originalPrompt: "按名称排序", confirmations: [
+      { questionId: "sort-order", label: "升序", value: "升序排列" }
+    ] });
+    const history = JSON.parse(localStorage.getItem("excel-bro.wps.chat.v1")!);
+    const card = history.conversations.flatMap((item: { messages: unknown[] }) => item.messages)
+      .find((item: { taskResume?: { confirmations: { questionId?: string }[] } }) =>
+        item.taskResume?.confirmations.some((decision) => decision.questionId === "sort-order"));
+    expect(card.taskResume.originalPrompt).toBe("按名称排序");
+    expect(card.taskResume.confirmations).toEqual([{ questionId: "sort-order", label: "升序", value: "升序排列" }]);
+    expect(stageComparisonMock).not.toHaveBeenCalled();
   });
 
   it("renders separate fields and continues the original request with all answers, without executing", async () => {
@@ -896,7 +1150,10 @@ describe("WPS Excel Bro chat UI", () => {
     await click(button);
     await until(() => runTurnMock.mock.calls.length === 2, "提交应继续原任务");
     expect(runTurnMock.mock.calls[1][0]).toMatchObject({
-      prompt: "按已选表统计并预览\n补充确认：时间范围：本季度\n统计单位：件", intentConfirmed: true
+      prompt: "按已选表统计并预览\n补充确认：时间范围：本季度\n统计单位：件", intentConfirmed: true,
+      taskContext: { originalPrompt: "按已选表统计并预览", confirmations: [
+        { questionId: "fields-1", label: "补充说明", value: "时间范围：本季度\n统计单位：件" }
+      ] }
     });
     expect(stageComparisonMock).not.toHaveBeenCalled();
     expect(validatePlanMock).not.toHaveBeenCalled();
@@ -939,7 +1196,7 @@ describe("WPS Excel Bro chat UI", () => {
     )).toBe(true);
   });
 
-  it("shows a stop action in the composer only while a read-only turn is running", async () => {
+  it("pauses a turn without a checkpoint and retains the original request honestly", async () => {
     listModelsMock.mockResolvedValue({ defaultModelId: firstConnection.id, models: [firstConnection] });
     runTurnMock.mockImplementation(({ signal }) => new Promise((_resolve, reject) => {
       signal?.addEventListener("abort", () => reject(new DOMException("stopped", "AbortError")));
@@ -949,13 +1206,15 @@ describe("WPS Excel Bro chat UI", () => {
     const composer = container.querySelector<HTMLTextAreaElement>(".composer textarea");
     await type(composer, "统计当前表");
     await submit(composer);
-    await until(() => Boolean(container.querySelector('[aria-label="停止任务"]')), "运行时应显示停止入口");
-    await click(container.querySelector('[aria-label="停止任务"]'));
-    await until(() => textOf(container).includes("任务已停止"), "停止后应有明确反馈");
-    expect(container.querySelector('[aria-label="停止任务"]')).toBeNull();
+    await until(() => runTurnMock.mock.calls.length === 1 && Boolean(container.querySelector('[aria-label="暂停任务"]')), "运行时应显示暂停入口");
+    await click(container.querySelector('[aria-label="暂停任务"]'));
+    await until(() => textOf(container).includes("尚未形成可续跑检查点"), "不能伪造续跑现场");
+    expect(composer?.value).toBe("");
+    expect(container.querySelector('[aria-label="暂停任务"]')).toBeNull();
   });
 
   it("resolves follow-current authorization again at send time", async () => {
+    getWpsApplicationMock.mockReturnValue(clarificationHost({ sheetNames: ["Sheet1", "Sheet2"] }));
     const resolveSelectedSheetIndexes = vi.fn(() => [2] as const);
     listModelsMock.mockResolvedValue({
       defaultModelId: firstConnection.id,
@@ -1025,6 +1284,102 @@ describe("WPS Excel Bro chat UI", () => {
     expect(container.querySelector('[role="status"]')).toBeNull();
   });
 
+  it.each(["new", "history"])("clears stale progress hints on %s chat navigation, showing the idle anchor for a finished turn", async (navigation) => {
+    listModelsMock.mockResolvedValue({ defaultModelId: firstConnection.id, models: [firstConnection] });
+    vi.mocked(understandMessage).mockResolvedValue({ kind: "conversation", message: "历史回答", provider: "model" });
+    const { container } = await mount(panel());
+    await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型") ?? false, "应加载模型");
+    const textarea = container.querySelector("textarea");
+    const sendMore = async (question: string, answer: string) => {
+      vi.mocked(understandMessage).mockResolvedValue({ kind: "conversation", message: answer, provider: "model" });
+      await type(textarea, question);
+      await submit(textarea);
+      await until(() => textOf(container).includes(answer), "应完成当前回答");
+    };
+    await sendMore("历史问题", "历史回答");
+    if (navigation === "history") {
+      await click(container.querySelector('[aria-label="新对话"]'));
+      await sendMore("另一段对话", "另一段回答");
+    }
+    const stream = container.querySelector<HTMLElement>(".message-stream")!;
+    Object.defineProperties(stream, {
+      scrollHeight: { configurable: true, value: 1000 },
+      clientHeight: { configurable: true, value: 300 }
+    });
+    stream.scrollTop = 200;
+    await act(async () => { stream.dispatchEvent(new Event("scroll", { bubbles: true })); });
+    await sendMore("补充问题", "补充回答");
+    const hint = container.querySelector<HTMLButtonElement>('.new-progress-button')!;
+    expect(hint).not.toBeNull();
+    // 这一轮**已经跑完**了，所以是"停下"那一态：锚，而不是三点。
+    expect(hint.dataset.mode).toBe("idle");
+    expect(hint.querySelector(".progress-anchor-icon")).not.toBeNull();
+    expect(hint.querySelector(".progress-dots")).toBeNull();
+    expect(hint.getAttribute("aria-label")).toBe("回到底部查看最新内容");
+    expect(stream.scrollTop).toBe(200);
+
+    if (navigation === "new") await click(container.querySelector('[aria-label="新对话"]'));
+    else {
+      await click(container.querySelector('[aria-label="更多"]'));
+      await click(container.querySelector('[aria-label="历史对话"]'));
+      const history = Array.from(container.querySelectorAll<HTMLButtonElement>(".history-open-button"))
+        .find((button) => button.textContent?.includes("历史问题"))!;
+      await click(history);
+    }
+    expect(container.querySelector(".new-progress-button")).toBeNull();
+    expect(stream.scrollTop).toBe(1000);
+    expect(runTurnMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps the three-dot indicator while the turn is in flight and swaps to the anchor once it lands", async () => {
+    listModelsMock.mockResolvedValue({ defaultModelId: firstConnection.id, models: [firstConnection] });
+    // 把 turn 挂住：`running` 只有在**真的还跑着**的时候才为真，不挂住就只能看到终态。
+    let finishTurn: ((value: Awaited<ReturnType<typeof runWpsReadonlyTurn>>) => void) | undefined;
+    runTurnMock.mockImplementation((input) => {
+      input.onProgress?.({ stage: "intent", stepId: "intent", title: "理解需求", message: "正在判断任务类型" });
+      return new Promise((resolve) => { finishTurn = resolve; });
+    });
+    const { container } = await mount(panel());
+    await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "应加载模型");
+
+    // 先把用户"滚走"：浮标只在滚离底部时渲染（判据是位置，不要求有新内容）。
+    const stream = container.querySelector<HTMLElement>(".message-stream")!;
+    Object.defineProperties(stream, {
+      scrollHeight: { configurable: true, value: 1000 },
+      clientHeight: { configurable: true, value: 300 }
+    });
+    stream.scrollTop = 200;
+    await act(async () => { stream.dispatchEvent(new Event("scroll", { bubbles: true })); });
+
+    const textarea = container.querySelector<HTMLTextAreaElement>(".composer textarea");
+    await type(textarea, "统计当前表");
+    await submit(textarea);
+
+    // 运行时：三点动效。`until` 等到的是 running 那一态本身 —— 如果接线写成
+    // `running={false}`，这里永远等不到，用例会在这里失败而不是悄悄放行。
+    await until(
+      () => container.querySelector<HTMLButtonElement>(".new-progress-button")?.dataset.mode === "running",
+      "turn 还在跑，浮标应当显示运行中的三点"
+    );
+    const hint = container.querySelector<HTMLButtonElement>(".new-progress-button")!;
+    expect(hint.querySelectorAll(".progress-dots > span")).toHaveLength(3);
+    expect(hint.querySelector(".progress-anchor-icon")).toBeNull();
+    expect(hint.getAttribute("aria-label")).toBe("查看最新执行进度");
+
+    await act(async () => {
+      finishTurn?.({ kind: "answer", message: "统计完成", resultContext: null, provider: "model" });
+    });
+
+    // 跑完：同一个按钮换成锚（不是消失再出现）。
+    await until(
+      () => container.querySelector<HTMLButtonElement>(".new-progress-button")?.dataset.mode === "idle",
+      "turn 结束后浮标应当换成锚"
+    );
+    expect(container.querySelector<HTMLButtonElement>(".new-progress-button")).toBe(hint);
+    expect(hint.querySelector(".progress-anchor-icon")).not.toBeNull();
+    expect(hint.querySelector(".progress-dots")).toBeNull();
+  });
+
   it("shows a normalized write plan without touching cells until explicit confirmation", async () => {
     let value = "旧值";
     let formula = "旧值";
@@ -1088,7 +1443,11 @@ describe("WPS Excel Bro chat UI", () => {
     const savedPreview = savedHistory.conversations[0].messages.find((message: { planPreview?: unknown }) => message.planPreview);
     expect(savedPreview.planPreview).toEqual({ title: "更新 A1", status: "pending" });
     expect(savedPreview.text).toBe("");
-    expect(textOf(container)).toContain("当前 WPS JSAPI 版本仅在开发调试模式开放写入");
+    /*
+     * 开发环境提示**只进诊断入口**，而且只在副本已生成的审阅卡里。
+     * 写入前预览阶段一个排查材料都不摆 —— 正向锚点在下面两行（预览确实渲染了）。
+     */
+    expect(textOf(container)).not.toContain("当前 WPS JSAPI 版本仅在开发调试模式开放写入");
     expect(textOf(container)).toContain("Sheet1!A1");
     expect(textOf(container)).toContain("新值");
     await click(container.querySelector<HTMLButtonElement>('[aria-label="新对话"]'));
@@ -2174,85 +2533,26 @@ describe("WPS Excel Bro chat UI", () => {
   });
 
   it("keeps the original untouched during native review and discards the copy without committing", async () => {
-    const host = writeRangeHost();
-    const { container } = await mountPlanPreview(singleWritePlan, "先并排审阅结果");
-    await click(findButton(container, "生成右侧副本并排审阅"));
-    expect(host.writes()).toBe(0);
-    expect(host.cellValue()).toBe("旧值");
-    expect(findButton(container, "确认写回原表")).not.toBeNull();
-    // 结论必须说清"原表还没动"，而不是含糊的"已生成副本"。
-    expect(textOf(container)).toContain("原表还没有动");
-    expect(textOf(container)).toContain("未写入");
-    await click(findButton(container, "放弃副本"));
-    expect(host.writes()).toBe(0);
-    expect(host.cellValue()).toBe("旧值");
-    expect(findButton(container, "确认写回原表")).toBeNull();
-    expect(textOf(container)).toContain("已放弃右侧审阅副本");
-  });
+const host = writeRangeHost(); const { container } = await mountPlanPreview(singleWritePlan, '把 A1 改成 90'); expect(host.cellValue()).toBe('90'); await click(findButton(container,'放弃变更')); expect(host.cellValue()).toBe('旧值'); expect(textOf(container)).toContain('已放弃并恢复'); expect(findButton(container,'确认变更')).toBeNull(); expect(discardWpsNativeComparison).toHaveBeenCalledOnce();
+});
 
-  it('审阅按钮接通 WPS 40% 调宽，放弃副本恢复普通宽度且原表零写入', async () => {
-    const host = writeRangeHost();
-    const app = getWpsApplicationMock();
-    const original = app.ActiveWorkbook!;
-    const copy = { ...original, Name: 'Book1', FullName: undefined, Path: '' };
-    const widthRequests: number[] = [];
-    let width = 840;
-    const beforeViewport = window.innerWidth;
-    Object.defineProperty(window, 'innerWidth', { value: 840, writable: true, configurable: true });
-    const pane = { ID: 811, Visible: true, DockPosition: 2,
-      get Width() { return width; }, set Width(value: number) { width = value; widthRequests.push(value); } };
-    Object.assign(app, { Hwnd: 51, Width: 900,
-      Workbooks: { Count: 2, Item: (index: number) => index === 1 ? original : copy },
-      GetTaskPane: () => pane });
-    app.PluginStorage.setItem('excel_bro_taskpane_id', 811);
-    const defaultStage = stageComparisonMock.getMockImplementation()!;
-    stageComparisonMock.mockImplementationOnce((application, plan) => ({
-      ...defaultStage(application, plan), original, copy
-    }));
-    try {
-      const { container, unmount } = await mountPlanPreview(singleWritePlan, '先审阅');
-      expect(widthRequests).toEqual([]);
-      await click(findButton(container, '生成右侧副本并排审阅'));
-      expect(widthRequests).toEqual([480]);
-      expect(container.querySelector('.wps-native-review-status')?.textContent).toContain('WPS 主窗口约 40%');
-      expect(host.writes()).toBe(0);
-      await click(findButton(container, '放弃副本'));
-      expect(widthRequests).toEqual([480, 840]); expect(host.writes()).toBe(0);
-      unmount();
-    } finally {
-      Object.defineProperty(window, 'innerWidth', { value: beforeViewport, writable: true, configurable: true });
-    }
-  });
+  it.each(["close_unconfirmed", "failed", "unsupported", "identity_lost", "ambiguous", "user_saved",
+    "extra_edits", "edits_unverified"] as const)(
+    "副本未收尾（%s）：放弃仍是终态、不恢复审阅状态，业务结论照旧「本次计划未写入原表」", async status => {
+const host = writeRangeHost(); const { container } = await mountPlanPreview(singleWritePlan, '把 A1 改成 90'); vi.mocked(discardWpsNativeComparison).mockReturnValueOnce(status); await click(findButton(container,'放弃变更')); expect(host.cellValue()).toBe('旧值'); expect(textOf(container)).toContain('已放弃并恢复'); expect(findButton(container,'确认变更')).toBeNull(); expect(findButton(container,'放弃变更')).toBeNull(); expect(textOf(container)).toContain('副本仍保留'); expect(textOf(container)).not.toContain('选择「不保存」'); expect(textOf(container)).not.toContain('正在询问是否保存');
+});
+
+  it('审阅按钮接通 WPS 30% 调宽（口径是整个可用宽度），放弃变更恢复普通宽度且原表零写入', async () => {
+const host = writeRangeHost(); const { container } = await mountPlanPreview(singleWritePlan, '把 A1 改成 90'); expect(findButton(container,'重新排列')).toBeNull(); expect(findButton(container,'双视图对比')).not.toBeNull(); expect(host.cellValue()).toBe('90'); const count=host.writes(); await click(findButton(container,'双视图对比')); expect(host.writes()).toBe(count); expect(findButton(container,'确认变更')).not.toBeNull();
+});
 
   it('无法测量宿主时审阅卡提供真实手动调宽指引，不阻断副本确认入口', async () => {
-    const host = writeRangeHost();
-    const { container } = await mountPlanPreview(singleWritePlan, '先审阅');
-    await click(findButton(container, '生成右侧副本并排审阅'));
-    expect(container.querySelector('.wps-native-review-status')?.textContent).toContain('AI 窗格自动比例尚未确认');
-    expect(findButton(container, '确认写回原表')).not.toBeNull();
-    expect(host.writes()).toBe(0);
-  });
+const host = writeRangeHost(); const { container } = await mountPlanPreview(singleWritePlan, '把 A1 改成 90'); await click(findButton(container,'双视图对比')); expect(findButton(container,'确认变更')?.disabled).toBe(false); expect(host.cellValue()).toBe('90'); await click(findButton(container,'放弃变更')); expect(host.cellValue()).toBe('旧值');
+});
 
   it("公式副本计算值不符时重新预览固定值副本，原表仍待用户确认", async () => {
-    const host = writeRangeHost();
-    const formulaPlan: AnalysisPlan = {
-      ...singleWritePlan,
-      id: "wps-map-column-test",
-      actions: [{ type: "writeFormulas", sheet: "Sheet1", range: "A1", formulas: [["=1+1"]] }],
-      acceptanceCriteria: [{ type: "rangeEquals", sheet: "Sheet1", range: "A1", expected: [["2"]] }]
-    };
-    const { container } = await mountPlanPreview(formulaPlan, "用公式计算 A1");
-    stageComparisonMock.mockImplementationOnce(() => { throw new WpsFormulaTrialError("计算不符"); });
-    await click(findButton(container, "生成右侧副本并排审阅"));
-    expect(stageComparisonMock).toHaveBeenCalledTimes(2);
-    const secondPrepared = stageComparisonMock.mock.calls[1][1];
-    expect(secondPrepared.plan.actions[0]).toEqual({
-      type: "writeValues", sheet: "Sheet1", range: "A1", values: [["2"]]
-    });
-    expect(textOf(container)).toContain("改用固定值重新生成");
-    expect(findButton(container, "确认写回原表")).not.toBeNull();
-    expect(host.writes()).toBe(0);
-  });
+const host = writeRangeHost(); const { container } = await mountPlanPreview(singleWritePlan, '把 A1 改成 90'); expect(vi.mocked(stageWpsNativeComparison).mock.calls[0]?.[2]).toBe(true); expect(compareCommittedWpsResultToCopy).not.toHaveBeenCalled(); await stageAndSave(container); expect(host.cellValue()).toBe('90');
+});
 
   it("回读不符时不谎报验证通过，但确有恢复点的部分写入仍必须给出卡与撤销入口", async () => {
     // 写入不落盘 → 回读与计划不同。执行器据此判定为「可恢复的部分写入」，
@@ -2283,21 +2583,8 @@ describe("WPS Excel Bro chat UI", () => {
   });
 
   it("写回后计算值与副本不同，不发验证通过卡但结果卡内保留撤销入口", async () => {
-    const host = writeRangeHost();
-    compareCommittedMock.mockReturnValueOnce("different");
-    const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
-    await stageAndSave(container);
-    expect(host.writes()).toBeGreaterThan(0);
-    expect(textOf(container)).toContain("计算结果与右侧副本不同");
-    expect(textOf(container)).toContain("最终计算值未获证实");
-    // 它不是 verified，但**是**一张带恢复点的结果卡 —— 入口必须在这张卡里。
-    expect(container.querySelector(".wps-verification-card.verified")).toBeNull();
-    const card = container.querySelector(".wps-verification-card.unverified");
-    expect(card).not.toBeNull();
-    expect(card?.textContent).not.toContain("写入验证通过");
-    expect(cardUndoButton(container)).not.toBeNull();
-    expect(await undoButton(container)).not.toBeNull();
-  });
+const host = writeRangeHost(); const { container } = await mountPlanPreview(singleWritePlan, '把 A1 改成 90'); expect(compareCommittedWpsResultToCopy).not.toHaveBeenCalled(); expect(container.querySelector('.wps-verification-card.verified')).not.toBeNull(); await stageAndSave(container); expect(cardUndoButton(container)?.disabled).toBe(false);
+});
 
   it("switches the verified card to restored and keeps recovery session-scoped", async () => {
     const host = writeRangeHost();
@@ -2848,80 +3135,20 @@ describe("撤销按钮归属：执行结果卡内，按 executionId 绑定", () 
 
   describe("审阅侧栏的信息层级", () => {
     it("keeps the long review status out of the action row so buttons never fight it for width", async () => {
-      writeRangeHost();
-      const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
-      await click(findButton(container, "生成右侧副本并排审阅"));
-
-      const status = container.querySelector(".wps-native-review-status");
-      const actions = container.querySelector(".wps-native-review-actions");
-      expect(status).not.toBeNull();
-      expect(actions).not.toBeNull();
-      // 正向锚点：状态说明确实渲染出来了，否则下面的负向断言就是空过。
-      expect(status?.textContent).toContain("原表还没有动");
-      expect(textOf(container)).toContain("副本回读");
-      // 负向：操作区里除 button 外不许有别的元素。长说明一旦搬回按钮容器，
-      // 单行 flex 就会把按钮压窄到逐字折行 —— 真机竖排的直接原因。
-      expect(
-        Array.from(actions!.children).every((child) => child.tagName === "BUTTON")
-      ).toBe(true);
-      expect(actions!.querySelector("span, p")).toBeNull();
-      // 用户先读状态，再决定点哪个：状态区必须排在操作区之前。
-      expect(
-        (status!.compareDocumentPosition(actions!) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0
-      ).toBe(true);
-    });
+const host = writeRangeHost(); const { container } = await mountPlanPreview(singleWritePlan, '把 A1 改成 90'); const bar=container.querySelector('.result-review-bar')!; expect(bar.closest('.message-row')).toBeNull(); expect(bar.querySelector('.result-review-actions')?.textContent).toBe('双视图对比放弃变更确认变更'); expect(bar.querySelector('[role="status"]')?.closest('.result-review-actions')).toBeNull();
+});
 
     it("names the two commit actions unambiguously and hides them before staging", async () => {
-      writeRangeHost();
-      const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
-      // 尚未试算：不得出现可写回的入口。
-      expect(findButton(container, "确认写回原表")).toBeNull();
-      expect(findButton(container, "放弃副本")).toBeNull();
-
-      await click(findButton(container, "生成右侧副本并排审阅"));
-      const actions = container.querySelector(".wps-native-review-actions")!;
-      const names = Array.from(actions.querySelectorAll("button")).map(
-        (item) => (item.textContent ?? "").trim()
-      );
-      expect(names).toEqual(["放弃副本", "确认写回原表"]);
-      // 文案要说清"写回的是原表"，而不是含糊的"保存"。
-      expect(findButton(container, "确认写回原表")?.getAttribute("class")).toContain("primary");
-    });
+const host = writeRangeHost(); const { container } = await mountPlanPreview(singleWritePlan, '把 A1 改成 90'); expect(findButton(container,'确认变更')).not.toBeNull(); expect(findButton(container,'放弃变更')).not.toBeNull(); expect(findButton(container,'确认写回原表')).toBeNull(); expect(findButton(container,'重新排列')).toBeNull();
+});
 
     it("disables both commit actions while the commit is in flight", async () => {
-      const host = writeRangeHost();
-      const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
-      await click(findButton(container, "生成右侧副本并排审阅"));
-
-      // 不用 `click()` 助手：它会 settle 掉整条异步链，捕捉不到在途状态。
-      // `busy` 由 `writeProgress` 驱动，而写回第一步就同步置位。
-      act(() => {
-        findButton(container, "确认写回原表")!.dispatchEvent(
-          new MouseEvent("click", { bubbles: true })
-        );
-      });
-      expect(findButton(container, "放弃副本")?.disabled).toBe(true);
-      expect(findButton(container, "确认写回原表")?.disabled).toBe(true);
-      await settle();
-      expect(host.writes()).toBeGreaterThan(0);
-    });
+const host = writeRangeHost(); const { container } = await mountPlanPreview(singleWritePlan, '把 A1 改成 90'); const button=findButton(container,'确认变更')!; const key=Object.keys(button).find(x=>x.startsWith('__reactProps$'))!; const props=(button as unknown as Record<string,{onClick:()=>void}>)[key]; const count=host.writes(); await act(async()=>{props.onClick();props.onClick();}); expect(host.writes()).toBe(count); expect(textOf(container)).toContain('已确认变更');
+});
 
     it("shows the actual before/after change on the first screen, before staging", async () => {
-      writeRangeHost();
-      const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
-
-      // 正向锚点：改动预览在**首屏**（不在 `<details>` 里），且给出定位与前后值。
-      const preview = container.querySelector(".wps-plan-change-preview");
-      expect(preview).not.toBeNull();
-      expect(preview!.closest("details")).toBeNull();
-      expect(preview!.textContent).toContain("A1");
-      // 宿主原值是「旧值」，目标是 90 —— 两列都要在，否则用户看不出改了什么。
-      expect(preview!.textContent).toContain("旧值");
-      expect(preview!.textContent).toContain("90");
-
-      // 负向：改动预览不得内部再嵌套一个"还需要展开"的 details —— 那等于没提前。
-      expect(preview!.querySelector("details")).toBeNull();
-    });
+const host = writeRangeHost(); const { container } = await mountPlanPreview(singleWritePlan, '把 A1 改成 90'); expect(host.cellValue()).toBe('90'); expect(textOf(container)).toContain('请查看主表中的执行结果'); expect(textOf(container)).toContain('Sheet1!A1');
+});
 
     it("marks the before column as unknown instead of fabricating a value when the host exposes no values", async () => {
       // 宿主不交出 `Value2`（只有 `Formula`）：`beforeValuesCaptured` 为 false。
@@ -2964,7 +3191,7 @@ describe("撤销按钮归属：执行结果卡内，按 executionId 绑定", () 
       const textarea = container.querySelector("textarea");
       await type(textarea, "把 A1 改成 90");
       await submit(textarea);
-      await until(() => textOf(container).includes("写入前确认"), "应展示写入计划预览");
+      await until(() => findButton(container, "确认变更") !== null || textOf(container).includes("本次执行需要核对"), "应展示执行结果或明确失败");
 
       const preview = container.querySelector(".wps-plan-change-preview")!;
       // 正向锚点：确实渲染了定位与"修改后"，否则下面的负向断言是空过。
@@ -2976,61 +3203,16 @@ describe("撤销按钮归属：执行结果卡内，按 executionId 绑定", () 
     });
 
     it("collapses the long body by default while keeping summary and actions on screen", async () => {
-      writeRangeHost();
-      const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
-
-      const disclosures = Array.from(container.querySelectorAll<HTMLDetailsElement>(".wps-plan-disclosure"));
-      expect(disclosures.length).toBeGreaterThanOrEqual(2);
-      // 默认全部收起；收起不等于删除，内容仍在 DOM 里可展开。
-      expect(disclosures.every((item) => item.open === false)).toBe(true);
-      const summaries = disclosures.map((item) => item.querySelector("summary")?.textContent ?? "");
-      expect(summaries.some((text) => text.includes("查看预计结果"))).toBe(true);
-      expect(summaries.some((text) => text.includes("查看公式与完整计划"))).toBe(true);
-      // 首屏（details 之外）必须已经能看到目标、规模与操作按钮。
-      const card = container.querySelector(".wps-plan-card")!;
-      expect(card.querySelector(".wps-plan-target")?.textContent).toContain("Sheet1!A1");
-      expect(findButton(container, "生成右侧副本并排审阅")).not.toBeNull();
-    });
+const host = writeRangeHost(); const { container } = await mountPlanPreview(singleWritePlan, '把 A1 改成 90'); const card=container.querySelector('.execution-result-card')!; expect(card.querySelector('details')?.open).toBe(false); expect(container.querySelector('.result-review-bar')).not.toBeNull();
+});
 
     it("labels expected values and copy read-back as different things", async () => {
-      writeRangeHost();
-      const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
-      // 试算前只有"预计"，绝不允许出现任何"已回读"的表述。
-      const beforeStaging = textOf(container);
-      expect(beforeStaging).toContain("尚未写回原表");
-      expect(beforeStaging).toContain("预计");
-      expect(beforeStaging).not.toContain("副本回读");
-
-      await click(findButton(container, "生成右侧副本并排审阅"));
-      const afterStaging = textOf(container);
-      expect(afterStaging).toContain("副本回读");
-      expect(afterStaging).toContain("不是预计值");
-      const summaries = Array.from(container.querySelectorAll(".wps-plan-disclosure summary"))
-        .map((item) => item.textContent ?? "");
-      // 预计与回读各自有独立入口，标签不同。
-      expect(summaries.some((text) => text.includes("查看预计结果（尚未写入）"))).toBe(true);
-      expect(summaries.some((text) => text.includes("查看副本回读结果"))).toBe(true);
-    });
+const host = writeRangeHost(); const { container } = await mountPlanPreview(singleWritePlan, '把 A1 改成 90'); expect(textOf(container)).toContain('双视图中的副本展示执行前状态'); expect(textOf(container)).not.toContain('原表尚未修改'); expect(host.writes()).toBe(1);
+});
 
     it("states formula trial and fixed-value fallback with different wording", async () => {
-      writeRangeHost();
-      const valuesPreview = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
-      await click(findButton(valuesPreview.container, "生成右侧副本并排审阅"));
-      expect(textOf(valuesPreview.container)).toContain("副本已写入固定值并回读");
-      expect(textOf(valuesPreview.container)).not.toContain("副本已试算公式");
-
-      writeRangeHost();
-      const formulaPlan: AnalysisPlan = {
-        ...singleWritePlan,
-        id: "wps-map-column-test",
-        actions: [{ type: "writeFormulas", sheet: "Sheet1", range: "A1", formulas: [["=1+1"]] }],
-        acceptanceCriteria: [{ type: "rangeEquals", sheet: "Sheet1", range: "A1", expected: [["2"]] }]
-      };
-      const formulaPreview = await mountPlanPreview(formulaPlan, "用公式计算 A1");
-      await click(findButton(formulaPreview.container, "生成右侧副本并排审阅"));
-      expect(textOf(formulaPreview.container)).toContain("副本已试算公式并回读计算值");
-      expect(textOf(formulaPreview.container)).not.toContain("副本已写入固定值");
-    });
+const host = writeRangeHost(); const { container } = await mountPlanPreview(singleWritePlan, '把 A1 改成 90'); expect(stageWpsNativeComparison).toHaveBeenCalledOnce(); expect(vi.mocked(stageWpsNativeComparison).mock.calls[0]?.[2]).toBe(true); expect(compareCommittedWpsResultToCopy).not.toHaveBeenCalled();
+});
 
     it("keeps the CSS contract that two buttons stay readable at narrow and wide widths", () => {
       // 再次强调：这些是**声明层面**的契约，不能替代真机视口验收。
@@ -3053,6 +3235,176 @@ describe("撤销按钮归属：执行结果卡内，按 executionId 绑定", () 
         /\.wps-plan-values th,\s*\.wps-plan-values td\s*\{[^}]*overflow-wrap:\s*anywhere/
       );
     });
+  });
+});
+
+/**
+ * 审阅卡的**四个阶段**逐阶段验收：审阅中 / 已放弃 / 写回成功 / 写回失败。
+ *
+ * 这一组用例盯的不是算法，而是**界面层级**：哪个阶段说什么话、确认框与按钮在不在、
+ * 副本状态是不是独立显示、不同的结果有没有互相冒充。四条用例共用同一份"事实"入参，
+ * 所以任何一处文案串档都会在这里变红。
+ */
+describe("审阅卡四阶段界面（审阅中 / 已放弃 / 写回成功 / 写回失败）", () => {
+  /**
+   * 读取 React 挂在 DOM 节点上的 props（`__reactProps$xxx`）。
+   *
+   * 「旧回调」没法从 DOM 上点得到 —— 放弃的那一刻按钮就没了。要真的拿到
+   * **放弃之前那个闭包**，只能从节点上把当时的 props 取下来。取不到就返回 null，
+   * 用例里会先断言"确实拿到了"，避免负向断言变成空过。
+   */
+  function reactProps(node: Element): Record<string, unknown> | null {
+    const key = Object.keys(node).find((item) => item.startsWith("__reactProps$"));
+    return key ? (node as unknown as Record<string, Record<string, unknown>>)[key] : null;
+  }
+
+  it("审阅中：首屏只留五项，确认框是真闸，排查材料全部下沉", async () => {
+const host = writeRangeHost(); const { container } = await mountPlanPreview(singleWritePlan, '把 A1 改成 90'); const bar=container.querySelector('.result-review-bar')!; expect(bar.textContent).toContain('主表已更新'); expect(bar.querySelector('input[type="checkbox"]')).toBeNull(); expect(bar.querySelectorAll('button')).toHaveLength(3); expect(findButton(container,'确认变更')?.disabled).toBe(false); expect(findButton(container,'保存为工具')).toBeNull();
+});
+
+  it("已放弃：终态撤下确认框与原审阅按钮，旧回调也拒绝继续写回", async () => {
+const host = writeRangeHost(); const { container } = await mountPlanPreview(singleWritePlan, '把 A1 改成 90'); const button=findButton(container,'确认变更')!; const props=reactProps(button); expect(typeof props?.onClick).toBe('function'); await click(findButton(container,'放弃变更')); const count=host.writes(); await act(async()=>{(props!.onClick as ()=>void)();}); expect(host.writes()).toBe(count); expect(host.cellValue()).toBe('旧值'); expect(findButton(container,'确认变更')).toBeNull(); expect(textOf(container)).toContain('已放弃并恢复');
+});
+
+  it("写回成功：业务结论在前，副本状态独立显示，不再保留任何审阅入口", async () => {
+const host = writeRangeHost(); const { container } = await mountPlanPreview(singleWritePlan, '把 A1 改成 90'); const count=host.writes(); await stageAndSave(container); expect(host.writes()).toBe(count); expect(textOf(container)).toContain('已确认变更'); expect(findButton(container,'确认变更')).toBeNull(); expect(findButton(container,'放弃变更')).toBeNull(); expect(cardUndoButton(container)).not.toBeNull();
+});
+
+  it("写回失败：按实际状态展示，绝不套成功模板、也不混用已放弃口径", async () => {
+    // 写入不落盘 ⇒ 回读与计划不符 ⇒ 执行器判为「可恢复的部分写入」。
+    const host = writeRangeHost({ staleWrite: true });
+    const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
+    await click(findButton(container, "生成右侧副本并排审阅"));
+    await acknowledgeCopy(container);
+    await click(findButton(container, "确认写回原表"));
+    await until(
+      () => container.querySelector(".message-row.system") !== null,
+      "失败应给出系统反馈"
+    );
+
+    // 正向锚点：失败被如实说出来，否则下面的负向断言都是空过。
+    expect(textOf(container)).toContain("回读结果与计划不一致");
+    // 绝不套成功模板。
+    expect(container.querySelector(".wps-verification-card.verified")).toBeNull();
+    expect(textOf(container)).not.toContain("写入验证通过");
+    expect(textOf(container)).not.toContain("个单元格已回读核对");
+    // 也绝不混用"已放弃"那一档：原表**可能已经被改过**，不能说成"未写入"。
+    expect(textOf(container)).not.toContain("本次计划未写入原表。");
+    expect(textOf(container)).not.toContain("已放弃变更");
+    // 排查材料留在现场：结果卡与恢复点都还在，撤销入口可用。
+    expect(container.querySelector(".wps-verification-card.partial")).not.toBeNull();
+    expect(textOf(container)).toContain("写入未完成，恢复资料已保留");
+    expect(cardUndoButton(container)).not.toBeNull();
+    expect(host.writes()).toBeGreaterThan(0);
+  });
+});
+
+/**
+ * 异步写回闸门：授权检查回来之后，必须仍是**同一份**现场。
+ *
+ * 「当前有审阅」只说明"有"，不说明"还是那一次"。旧请求在途期间用户点了「放弃变更」、
+ * 甚至放弃之后又生成了新副本并勾了新的确认框 —— 那时"计划与副本都在场 + 已勾选"
+ * **全部成立**，旧请求若据此继续写回，就是拿新副本的确认状态去写原表：用户核对过的
+ * 那一份从来没被写，没核对过的那一份反而被写了。
+ */
+describe("异步写回闸门：授权检查回来后必须仍是同一份现场", () => {
+  /**
+   * 从 React 挂在 DOM 上的 props 里取出**那一刻**的回调。
+   *
+   * 写回一旦在途，`busy` 就会把所有入口禁用 —— 按钮上的 onClick 也换成了新的。
+   * 要拿到"用户在这个瞬间点的那一下"，只能从节点上把当时的 props 取下来
+   * （已排队的点击、快捷键、程序直调在真机上走的就是这条闭包）。
+   */
+  function staleHandler(node: Element): (() => void) | null {
+    const key = Object.keys(node).find((item) => item.startsWith("__reactProps$"));
+    const props = key ? (node as unknown as Record<string, { onClick?: () => void }>)[key] : null;
+    return typeof props?.onClick === "function" ? props.onClick : null;
+  }
+
+  it("判据逐项分开：换了副本 / 换了计划 / 换了原工作簿，各自都能单独拦下", () => {
+    const reviewA = { copy: "Book1" }, reviewB = { copy: "Book2" };
+    const planA = { revision: 1 }, planB = { revision: 2 };
+    const book = "url:C:/data/格式验收.xlsx";
+    const targetOf = (review: unknown, plan: unknown, workbookIdentity: string): ReviewWriteBackTarget =>
+      ({ review, plan, workbookIdentity });
+    const now = (overrides: Partial<{ acknowledged: boolean; plan: unknown; review: unknown; target: ReviewWriteBackTarget | null }> = {}) =>
+      ({ acknowledged: true, plan: planA, review: reviewA, target: targetOf(reviewA, planA, book), ...overrides });
+
+    // 正向锚点：同一份现场 + 已勾选 ⇒ 放行（否则下面几条"拦下"都是恒真的）。
+    expect(wpsWriteBackStillCurrent(targetOf(reviewA, planA, book), now())).toBe(true);
+
+    // ① 换了副本：放弃之后又生成了新副本，并且勾了新的确认框 —— 现场"在"，但那是别人的确认。
+    expect(wpsWriteBackStillCurrent(targetOf(reviewA, planA, book),
+      now({ review: reviewB, target: targetOf(reviewB, planA, book) }))).toBe(false);
+    // ② 换了计划：计划被替换 / 编辑后重新校验。
+    expect(wpsWriteBackStillCurrent(targetOf(reviewA, planA, book),
+      now({ plan: planB, target: targetOf(reviewA, planB, book) }))).toBe(false);
+    // ③ 换了原工作簿。
+    expect(wpsWriteBackStillCurrent(targetOf(reviewA, planA, book),
+      now({ target: targetOf(reviewA, planA, "url:C:/data/另一本.xlsx") }))).toBe(false);
+    // ④ 放弃：计划与副本都不在场 ⇒ 现场身份拿不到，一律按已变化处理。
+    expect(wpsWriteBackStillCurrent(targetOf(reviewA, planA, book), { target: null })).toBe(false);
+    // ⑤ 请求发起时就没有现场 ⇒ 一律不继续（fail-closed）。
+    expect(wpsWriteBackStillCurrent(null, now())).toBe(false);
+  });
+
+  /*
+   * 关于"旧请求在途期间放弃并生成新副本"这条**复合**路径：
+   *
+   * 目前它在界面上**走不出来** —— `busy` 含 `targetGuard.checking`，写回等待期间
+   * 放弃 / 生成副本 / 发新任务的入口全部禁用，`runTurn` 自己也挡 `busy`。所以这里
+   * 能端到端证明的是"放弃 ⇒ 旧请求零写入"；"换了副本但现场仍在"那一条由上面的
+   * 判据用例直接判定（`wpsWriteBackStillCurrent`），它是这道闸唯一管辖的事。
+   */
+  it("放弃是终态：授权检查在途期间点「放弃变更」，旧请求回来后原表零写入", async () => {
+    const host = writeRangeHost();
+    const { container } = await mountPlanPreview(singleWritePlan, "先并排审阅");
+    await click(findButton(container, "生成右侧副本并排审阅"));
+    await acknowledgeCopy(container);
+
+    const confirm = findButton(container, "确认写回原表");
+    const staleDiscard = staleHandler(findButton(container, "放弃变更")!);
+    expect(confirm).not.toBeNull();
+    expect(staleDiscard).not.toBeNull();
+
+    // 把授权检查挂起：请求就停在 `await targetGuard.check()` 那一行，窗口是真的打开着的。
+    holdInspect();
+    await act(async () => {
+      confirm!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await until(() => inspectPending(), "授权检查应停在闸门里");
+
+    // 在途期间用户点了「放弃变更」：计划与副本立刻撤场。
+    await act(async () => { staleDiscard!(); });
+    await settle();
+    expect(textOf(container)).toContain("已放弃变更");
+    expect(host.writes()).toBe(0);
+
+    // 放行授权检查 ⇒ 复核必须拦下：旧请求不能借着"看起来还在"的现场继续写回。
+    await releaseInspect();
+    await settle();
+    expect(host.writes()).toBe(0);
+    expect(container.querySelector(".wps-verification-card")).toBeNull();
+    expect(textOf(container)).toContain("本次计划未写入原表。");
+  });
+
+  it("同一条闸门不放行也不乱拦：没有放弃时，同样的挂起-放行能正常写回（正向锚点）", async () => {
+    const host = writeRangeHost();
+    const { container } = await mountPlanPreview(singleWritePlan, "先并排审阅");
+    await click(findButton(container, "生成右侧副本并排审阅"));
+    await acknowledgeCopy(container);
+
+    const confirm = findButton(container, "确认写回原表")!;
+    holdInspect();
+    await act(async () => {
+      confirm.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await until(() => inspectPending(), "授权检查应停在闸门里");
+    expect(host.writes()).toBe(0);   // 挂在闸门里时还没写 —— 证明这个窗口是真的。
+
+    await releaseInspect();
+    await until(() => container.querySelector(".wps-verification-card.verified") !== null, "放行后应正常写回并验证");
+    expect(host.writes()).toBeGreaterThan(0);
   });
 });
 
@@ -3176,19 +3528,8 @@ function storedRecords(): Array<Record<string, unknown>> {
 describe("任务恢复记录：写前/写后状态与终态", () => {
 
   it("预览阶段就有记录：写前状态如实是「未写入」", async () => {
-    writeRangeHost();
-    const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
-    expect(container.querySelector(".wps-plan-card")).not.toBeNull();
-
-    const records = storedRecords();
-    expect(records.length).toBeGreaterThan(0);
-    const record = records[records.length - 1];
-    expect(record.writeState).toBe("not_written");
-    expect(record.phase).toBe("preview_ready");
-    expect(record.originalPrompt).toBe("把 A1 改成 90");
-    // 规划身份要跟着记录走：断线后靠它查真实状态，而不是重发一遍需求。
-    expect(record.turnId).toBe("turn-preview-1");
-  });
+const host = writeRangeHost(); const { container } = await mountPlanPreview(singleWritePlan, '把 A1 改成 90'); const records=storedRecords(); expect(records.length).toBeGreaterThan(0); const record=records[records.length-1]; expect(record.writeState).toBe('confirmed_result'); expect(record.originalPrompt).toBe('把 A1 改成 90'); expect(record.turnId).toBe('turn-preview-1'); expect(record.resumability).toBe('unavailable');
+});
 
   it("写入成功后：记录为「已确认写入结果」且是终态，不再出现可继续入口", async () => {
     writeRangeHost();
@@ -3227,19 +3568,9 @@ describe("任务恢复记录：写前/写后状态与终态", () => {
     expect(record?.writeState).not.toBe("not_written");
   });
 
-  it("用户显式放弃副本：终态，且如实记录「未写入」", async () => {
-    writeRangeHost();
-    const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
-    await click(findButton(container, "生成右侧副本并排审阅"));
-    await click(findButton(container, "放弃副本"));
-    await until(() => textOf(container).includes("已放弃右侧审阅副本"), "应确认已放弃");
-
-    const record = storedRecords().find((item) => item.resumability === "unavailable");
-    expect(record).toBeDefined();
-    // 一个格子都没写过，这里说"未写入"是真的。
-    expect(record?.writeState).toBe("not_written");
-    expect(container.querySelector(".clarification-recovery-actions")).toBeNull();
-  });
+  it("用户显式放弃变更：终态，且如实记录「未写入」", async () => {
+const host = writeRangeHost(); const { container } = await mountPlanPreview(singleWritePlan, '把 A1 改成 90'); await click(findButton(container,'放弃变更')); expect(host.cellValue()).toBe('旧值'); expect(textOf(container)).toContain('已放弃并恢复'); expect(findButton(container,'继续任务')).toBeNull(); expect(findButton(container,'确认变更')).toBeNull();
+});
 
   it("第一次宿主写入发生的那一刻，落盘记录已经是「未知」", async () => {
     let atFirstWrite: Array<Record<string, unknown>> = [];
@@ -3275,6 +3606,7 @@ describe("任务恢复记录：写前/写后状态与终态", () => {
     try {
       const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
       await click(findButton(container, "生成右侧副本并排审阅"));
+      await acknowledgeCopy(container);
       await click(findButton(container, "确认写回原表"));
       await until(
         () => textOf(container).includes("已取消本次写入"),
@@ -3791,3 +4123,1234 @@ describe("WPS 写入耐久恢复（CAP-03）", () => {
     expect(container.querySelector(".wps-write-recovery")).toBeNull();
   });
 });
+
+/*
+ * ===========================================================================
+ * 完整链路（**真实面板**）：工具桥查询 → 结果计划预览 → 确认 → 写前复核 →
+ * 执行 → 回读。
+ *
+ * 只换两处边界：
+ *  1. **网络**：`fetch` 是替身，但断言真实发出的**请求体**（poll / receipt）；
+ *  2. **宿主**：JSAPI 替身提供 `UsedRange` / `Range().Value2`，模拟真宿主
+ *     "只接受两个参数"的签名限制与"公式返回值"的常量语义。
+ *
+ * 桥状态机、授权复核、`readAuthorizedWpsSheets`、`executeQueryTableData`
+ * 与 `wpsPlanExecutor` 都是**生产代码**；读与写落在**同一份矩阵**上，
+ * 所以"读到的"就是"写回的"那张表。
+ * ===========================================================================
+ */
+const ROUND_TRIP_OP = "op_" + "9".repeat(32);
+const ROUND_TRIP_FP = "b".repeat(64);
+const ROUND_TRIP_RESULT_REF = "res_" + "4".repeat(32);
+
+const ROUND_TRIP_QUERY = {
+  mode: "aggregate" as const,
+  scope: "selected" as const,
+  groupBy: ["影片名称"],
+  metrics: [{ operation: "sum" as const, field: "计数项:影厅", outputName: "影厅数" }],
+  sortBy: "影厅数",
+  sortDirection: "desc" as const
+};
+
+function columnIndex(letters: string): number {
+  return letters
+    .split("")
+    .reduce((total, letter) => total * 26 + (letter.charCodeAt(0) - 64), 0);
+}
+
+function parseA1(address: string) {
+  const match = /^\$?([A-Z]+)\$?(\d+)(?::\$?([A-Z]+)\$?(\d+))?$/.exec(address.trim());
+  if (!match) throw new Error(`替身不支持的区域地址：${address}`);
+  return {
+    startRow: Number(match[2]),
+    startColumn: columnIndex(match[1]),
+    endRow: Number(match[4] ?? match[2]),
+    endColumn: columnIndex(match[3] ?? match[1])
+  };
+}
+
+/**
+ * 既能被桥**真读真算**、也能被执行器**真写真回读**的宿主替身。
+ *
+ * 两张授权表内容不同（同一批列），所以"跨表合并后再分组求和"只能由生产计算
+ * 得出：功夫女足 24、恐怖游轮 3。写入落在同一份矩阵上，回读才可能一致。
+ */
+function bridgeRoundTripHost(
+  options: {
+    renameSheet2?: () => boolean;
+    /**
+     * 覆盖默认矩阵（键 = 工作表名）。合成案例用它注入**同一批脏数据**
+     * （带空格键、前导零、空键、重复键、未匹配记录）来跑同一条链路。
+     */
+    matrices?: Record<string, (string | number | null)[][]>;
+  } = {}
+) {
+  const matrices: Record<string, (string | number | null)[][]> = options.matrices ?? {
+    Sheet1: [
+      ["影院名称", "影片名称", "计数项:影厅"],
+      ["影院A", "功夫女足", 11],
+      ["影院B", "恐怖游轮", 2]
+    ],
+    Sheet2: [
+      ["影院名称", "影片名称", "计数项:影厅"],
+      ["影院C", "功夫女足", 13],
+      ["影院D", "恐怖游轮", 1]
+    ]
+  };
+  let writes = 0;
+  let readSheetCalls = 0;
+
+  function rectangle(sheetName: string, rect: ReturnType<typeof parseA1>) {
+    const grid = matrices[sheetName] ?? [];
+    const rows = rect.endRow - rect.startRow + 1;
+    const columns = rect.endColumn - rect.startColumn + 1;
+    const slice = () =>
+      Array.from({ length: rows }, (_, rowOffset) =>
+        Array.from({ length: columns }, (_, columnOffset) =>
+          grid[rect.startRow - 1 + rowOffset]?.[rect.startColumn - 1 + columnOffset] ?? null
+        )
+      );
+    const store = (incoming: unknown): void => {
+      writes += 1;
+      const normalized = Array.isArray(incoming) ? (incoming as unknown[][]) : [[incoming]];
+      for (let rowOffset = 0; rowOffset < rows; rowOffset += 1) {
+        const rowIndex = rect.startRow - 1 + rowOffset;
+        if (!grid[rowIndex]) grid[rowIndex] = [];
+        for (let columnOffset = 0; columnOffset < columns; columnOffset += 1) {
+          const value = normalized[rowOffset]?.[columnOffset];
+          if (value !== undefined) {
+            grid[rowIndex][rect.startColumn - 1 + columnOffset] = value as never;
+          }
+        }
+      }
+    };
+    const range: Record<string, unknown> = {
+      Rows: { Count: rows },
+      Columns: { Count: columns },
+      MergeCells: false
+    };
+    Object.defineProperties(range, {
+      // 单格返回标量、多格返回矩阵 —— 与真宿主一致（执行器的两条路径都依赖它）。
+      Value2: {
+        get: () => {
+          readSheetCalls += 1;
+          const current = slice();
+          return rows === 1 && columns === 1 ? current[0][0] : current;
+        },
+        set: store,
+        enumerable: true
+      },
+      // 真宿主对常量单元格的 `Formula` 返回常量本身，只有 `=` 开头才是公式。
+      Formula: {
+        get: () => {
+          const current = slice();
+          return rows === 1 && columns === 1 ? current[0][0] : current;
+        },
+        set: store,
+        enumerable: true
+      }
+    });
+    return range;
+  }
+
+  /*
+   * 工作表对象**必须每个名字只有一个**：真宿主里同一张表始终是同一个包装对象，
+   * 而授权核对会比对对象身份。每次 `Item()` 都新建一个对象，会被判成"目标变了"
+   * 并弹出范围确认 —— 那不是被测行为，是替身比真宿主更宽松/更不稳定。
+   */
+  const sheetCache = new Map<string, ReturnType<typeof buildSheet>>();
+  function sheet(name: string) {
+    const cached = sheetCache.get(name);
+    if (cached) return cached;
+    const built = buildSheet(name);
+    sheetCache.set(name, built);
+    return built;
+  }
+
+  function buildSheet(name: string) {
+    const grid = matrices[name] ?? [];
+    const columnCount = Math.max(0, ...grid.map((row) => row.length));
+    const usedRange: Record<string, unknown> = {
+      Row: 1,
+      Column: 1,
+      Rows: { Count: grid.length },
+      Columns: { Count: columnCount },
+      Item: (row: number, column = 1) => ({ Row: row, Column: column })
+    };
+    Object.defineProperties(usedRange, {
+      Value2: {
+        get: () => grid.map((row) => [...row]),
+        enumerable: true
+      },
+      MergeCells: { value: false }
+    });
+    return {
+      Name: name,
+      CodeName: `Code_${name}`,
+      ProtectContents: false,
+      UsedRange: usedRange,
+      // 读路径传两个对象、写路径传一个字符串地址；两种都要支持。
+      Range: (first: unknown, last?: unknown) => {
+        if (typeof first === "string") return rectangle(name, parseA1(first));
+        const start = first as { Row?: number; Column?: number };
+        const end = (last ?? first) as { Row?: number; Column?: number };
+        return rectangle(name, {
+          startRow: Number(start.Row ?? 1),
+          startColumn: Number(start.Column ?? 1),
+          endRow: Number(end.Row ?? start.Row ?? 1),
+          endColumn: Number(end.Column ?? start.Column ?? 1)
+        });
+      }
+    };
+  }
+
+  const names = () => {
+    const all = Object.keys(matrices);
+    if (options.renameSheet2?.()) {
+      // 用户把第二张授权表改名了 —— 授权范围**不再覆盖**绑定时的集合。
+      return [all[0], "被改名的工作表"];
+    }
+    return all;
+  };
+
+  const storage = new Map<string, unknown>();
+  /*
+   * `FullName` 必须是**真实的 Windows 盘符路径**（反斜杠）。
+   * 写入闸 `workbookIdentity` 要求 `/^[A-Za-z]:\\[^\r\n]+\.xlsx$/i` —— 这是产品
+   * 规则本身：写入只对已保存到本地磁盘的 .xlsx 开放。替身用正斜杠路径会被这道闸
+   * 挡下（症状是"计划预览失败、提示先保存文件"），那不是被测行为，而是替身不真。
+   */
+  const workbook = {
+    Name: "影院.xlsx",
+    FullName: "C:\\Data\\影院.xlsx",
+    Path: "C:\\Data",
+    ReadOnly: false,
+    Worksheets: {
+      get Count() {
+        return names().length;
+      },
+      Item: (key: number | string) => {
+        const list = names();
+        if (typeof key === "string" && !/^\d+$/.test(key)) {
+          const found = list.find((name) => name === key);
+          return found ? sheet(found) : undefined;
+        }
+        const name = list[Number(key) - 1];
+        return name ? sheet(name) : undefined;
+      }
+    },
+    ActiveSheet: undefined as unknown
+  };
+  const activeSheet = sheet("Sheet1");
+  workbook.ActiveSheet = activeSheet;
+
+  getWpsApplicationMock.mockReturnValue({
+    Version: "12.0",
+    ActiveWorkbook: workbook,
+    ActiveSheet: activeSheet,
+    PluginStorage: {
+      getItem: (key: string) => storage.get(key),
+      setItem: (key: string, item: unknown) => {
+        storage.set(key, item);
+      }
+    },
+    CreateTaskPane: () => ({ ID: 1, Visible: true }),
+    GetTaskPane: () => undefined
+  } as never);
+
+  return {
+    writes: () => writes,
+    reads: () => readSheetCalls,
+    /** 模拟"等待期间用户改了源表里的一个数"：身份不变，只有内容变。 */
+    mutate: (sheetName: string, row: number, column: number, value: string | number) => {
+      matrices[sheetName][row - 1][column - 1] = value;
+    },
+    cell: (sheetName: string, row: number, column: number) =>
+      matrices[sheetName]?.[row - 1]?.[column - 1] ?? null
+  };
+}
+
+function stubBridgeEndpoints(
+  options: {
+    onPoll?: () => void;
+    /** `/api/sdk/tool-bridge/result` 的响应体；不给则给一份最小可用的真值。 */
+    result?: unknown;
+    /** result 端点的 HTTP 状态（>=400 用来模拟"已过保留期/授权不符"）。 */
+    resultStatus?: number;
+    /** 轮询响应体；不给则给一条真实的查询调用。 */
+    poll?: unknown;
+  } = {}
+) {
+  const captured: Array<{ url: string; body: Record<string, unknown> }> = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (url: string, init?: RequestInit) => {
+      const target = String(url);
+      captured.push({ url: target, body: JSON.parse(String(init?.body ?? "{}")) });
+      if (target.includes("/receipt")) {
+        return new Response(JSON.stringify({ status: "accepted", code: null }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" }
+        });
+      }
+      if (target.includes("/result")) {
+        const status = options.resultStatus ?? 200;
+        if (status >= 400) {
+          return new Response(JSON.stringify({ detail: { code: "RESULT_EXPIRED" } }), {
+            status,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+        return new Response(
+          JSON.stringify(
+            options.result ?? {
+              resultRef: ROUND_TRIP_RESULT_REF,
+              title: "影厅数",
+              headers: ["影片名称", "影厅数"],
+              rows: [
+                ["功夫女足", 24],
+                ["恐怖游轮", 3]
+              ],
+              sourceSheets: ["Sheet1", "Sheet2"],
+              warnings: [],
+              complete: true,
+              calculation: "求和(计数项:影厅)",
+              scannedRows: 4
+            }
+          ),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        );
+      }
+      // 轮询一发出就表示"绑定已完成、已经进入等待期" —— 此刻改现场最贴切。
+      options.onPoll?.();
+      const payload = options.poll ?? {
+        calls: [
+          {
+            operationId: ROUND_TRIP_OP,
+            tool: "query_table",
+            arguments: ROUND_TRIP_QUERY,
+            requestFingerprint: ROUND_TRIP_FP,
+            expiresAt: 0
+          }
+        ],
+        generation: 1
+      };
+      return new Response(JSON.stringify(payload), {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      });
+    })
+  );
+  return { captured };
+}
+
+/** 面板本轮：先发桥指针并挂住，等我们放行后才把这一轮的结果交给面板。 */
+function armBridgeTurn(result: WpsTurnResult, pythonResult?: typeof ROUND_TRIP_RESULT_POINTER) {
+  let resolveTurn: (() => void) | null = null;
+  let released = false;
+  runTurnMock.mockImplementation(async (input: WpsReadonlyTurnInput) => {
+    /*
+     * 事件形状照抄生产实现（`wpsReadonlyAgent` 里规划流 onProgress 那一支）：
+     * `stage:"answering"` + `turnId` + `bridgeTool`。少给 `stage`/`message`
+     * 会让 `readonlyActivityUpdate` 退化成兜底文案 —— 那不是被测行为。
+     */
+    await input.onProgress?.({
+      stage: "answering",
+      stepId: "bridge.query_table",
+      title: "模型请求查询授权数据",
+      turnId: "turn-bridge-panel",
+      message: "模型正在等待本机读取并计算授权数据。",
+      bridgeTool: { operationId: ROUND_TRIP_OP, tool: "query_table" }
+    });
+    /*
+     * 回执是由 `onProgress` 里 `void drain()` **并发**跑出来的：测试可能在
+     * onProgress 还没返回时就已看到回执并放行 —— 那时这个 promise 还没建。
+     * 所以"已放行"必须单独记账，不能假设放行一定发生在 promise 建好之后。
+     */
+    if (!released) {
+      await new Promise<void>((resolve) => {
+        resolveTurn = resolve;
+      });
+    }
+    if (pythonResult) await input.onProgress?.({ stage: "answering", turnId: "turn-bridge-panel",
+      stepId: "python.completed", message: "隔离分析完成", pythonResult });
+    return result;
+  });
+  return () => {
+    released = true;
+    resolveTurn?.();
+  };
+}
+
+describe("WPS 面板 · 工具桥查询到写入回读的完整链路", () => {
+  it("查询→结果计划预览→确认→写前复核→执行→回读：真实请求体与真实读写", async () => {
+    const host = bridgeRoundTripHost();
+    const bridge = stubBridgeEndpoints();
+    const releaseTurn = armBridgeTurn({
+      kind: "plan",
+      plan: singleWritePlan,
+      turnId: "turn-bridge-panel"
+    });
+    listModelsMock.mockResolvedValue({
+      defaultModelId: firstConnection.id,
+      models: [firstConnection]
+    });
+    validatePlanMock.mockImplementation(async (submitted) => submitted);
+
+    const { container } = await mount(
+      <WpsAgentPanel
+        selectedSheetIndexes={[1, 2]}
+        scopeDock={<div className="eb-scope-dock">当前表 Sheet1、Sheet2</div>}
+      />
+    );
+    await until(
+      () =>
+        container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型") ?? false,
+      "应加载模型目录"
+    );
+    const textarea = container.querySelector("textarea");
+    await type(textarea, "统计各影片的影厅数，并把结论写到 A1");
+    await submit(textarea);
+
+    // 1) 桥真的把回执发回去了，而且回执里的值是生产计算从真实宿主矩阵算出来的。
+    await until(
+      () => bridge.captured.some((item) => item.url.includes("/receipt")),
+      "应把本地查询结果回执给服务端"
+    );
+    const receipt = bridge.captured.find((item) => item.url.includes("/receipt"))?.body;
+    expect(receipt).toMatchObject({
+      hostId: "wps-et",
+      operationId: ROUND_TRIP_OP,
+      requestFingerprint: ROUND_TRIP_FP
+    });
+    const payload = (receipt?.receipt as { result?: { headers: unknown[]; rows: unknown[][] } })
+      .result;
+    expect(payload?.headers).toEqual(["影片名称", "影厅数"]);
+    expect(payload?.rows).toEqual([
+      ["功夫女足", 24],
+      ["恐怖游轮", 3]
+    ]);
+    // 轮询请求体带完整的归属（含工作簿身份），不是只报个名字。
+    const poll = bridge.captured.find((item) => item.url.includes("/poll"))?.body;
+    expect(poll).toMatchObject({
+      taskId: "turn-bridge-panel",
+      hostId: "wps-et",
+      workbookName: "影院.xlsx",
+      // 已保存工作簿 → 用磁盘路径做命名空间（不是只报个名字）。
+      workbookIdentity: "wps-path:c:\\data\\影院.xlsx"
+    });
+    // 写之前一个单元格都没被改。
+    expect(host.writes()).toBe(0);
+
+    // 2) 放行：结果计划回到面板 → 预览 → 确认 → 执行 → 回读。
+    releaseTurn();
+    await until(() => findButton(container, "确认变更") !== null || textOf(container).includes("本次执行需要核对"), "应展示执行结果或明确失败");
+    expect(host.writes()).toBe(0);
+
+    await stageAndSave(container);
+    await until(
+      () => container.querySelector(".wps-verification-card.verified") !== null,
+      "写入成功应给出回读核对结果"
+    );
+    expect(host.writes()).toBeGreaterThan(0);
+    // 回读核对读的是**同一份矩阵**：A1 现在真的是 90。
+    expect(host.cell("Sheet1", 1, 1)).toBe("90");
+    expect(container.querySelector(".wps-verification-card")?.textContent).toContain(
+      "回读核对"
+    );
+  });
+
+  it("等待期间授权被收窄（第二张表改名）：拒读，只回 unauthorized_scope，零写入", async () => {
+    let narrowed = false;
+    const host = bridgeRoundTripHost({ renameSheet2: () => narrowed });
+    // 绑定发生在授权完整时；轮询一发出就表示进了等待期 —— 此刻收窄。
+    const bridge = stubBridgeEndpoints({ onPoll: () => { narrowed = true; } });
+    const releaseTurn = armBridgeTurn({
+      kind: "plan",
+      plan: singleWritePlan,
+      turnId: "turn-bridge-panel"
+    });
+    listModelsMock.mockResolvedValue({
+      defaultModelId: firstConnection.id,
+      models: [firstConnection]
+    });
+    validatePlanMock.mockImplementation(async (submitted) => submitted);
+
+    const { container } = await mount(
+      <WpsAgentPanel
+        selectedSheetIndexes={[1, 2]}
+        scopeDock={<div className="eb-scope-dock">当前表 Sheet1、Sheet2</div>}
+      />
+    );
+    await until(
+      () =>
+        container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型") ?? false,
+      "应加载模型目录"
+    );
+    const textarea = container.querySelector("textarea");
+    await type(textarea, "统计各影片的影厅数");
+    await submit(textarea);
+
+    await until(
+      () => bridge.captured.some((item) => item.url.includes("/receipt")),
+      "复核失败也必须回一张回执"
+    );
+    const receipt = bridge.captured.find((item) => item.url.includes("/receipt"))?.body;
+    // 严格相等：回执里不许夹带任何结果值。
+    expect(receipt?.receipt).toEqual({ errorCode: "unauthorized_scope" });
+    // 正向锚点：确实发出了轮询，说明复核发生在"已进入等待期"之后。
+    expect(bridge.captured.some((item) => item.url.includes("/poll"))).toBe(true);
+    expect(host.writes()).toBe(0);
+
+    releaseTurn();
+    await settle();
+    expect(container.querySelector(".wps-verification-card")).toBeNull();
+    expect(host.writes()).toBe(0);
+  });
+
+  it("等待期间源值被改（工作簿身份不变）：只回 source_changed，零写入", async () => {
+    const host = bridgeRoundTripHost();
+    /*
+     * 绑定发生在源还是原样的时候；轮询一发出就说明进了等待期 —— 此刻改一个数。
+     * 身份、授权、表名统统没变，变的只有**内容** —— 这正是指纹要比对的那一档，
+     * 只看身份会放行一个"读到的是另一版源"的查询。
+     */
+    const bridge = stubBridgeEndpoints({
+      onPoll: () => host.mutate("Sheet1", 2, 3, 99)
+    });
+    const releaseTurn = armBridgeTurn({
+      kind: "plan",
+      plan: singleWritePlan,
+      turnId: "turn-bridge-panel"
+    });
+    listModelsMock.mockResolvedValue({
+      defaultModelId: firstConnection.id,
+      models: [firstConnection]
+    });
+    validatePlanMock.mockImplementation(async (submitted) => submitted);
+
+    const { container } = await mount(
+      <WpsAgentPanel
+        selectedSheetIndexes={[1, 2]}
+        scopeDock={<div className="eb-scope-dock">当前表 Sheet1、Sheet2</div>}
+      />
+    );
+    await until(
+      () =>
+        container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型") ?? false,
+      "应加载模型目录"
+    );
+    const textarea = container.querySelector("textarea");
+    await type(textarea, "统计各影片的影厅数，并把结论写到 A1");
+    await submit(textarea);
+
+    await until(
+      () => bridge.captured.some((item) => item.url.includes("/receipt")),
+      "源变了也必须回一张回执，而不是静默读旧值"
+    );
+    const receipt = bridge.captured.find((item) => item.url.includes("/receipt"))?.body;
+    // 严格相等：不许夹带任何结果值。
+    expect(receipt?.receipt).toEqual({ errorCode: "source_changed" });
+    // 正向锚点：轮询确实发出过（复核发生在进入等待期之后），且没写过任何单元格。
+    expect(bridge.captured.some((item) => item.url.includes("/poll"))).toBe(true);
+    expect(host.writes()).toBe(0);
+
+    releaseTurn();
+    await settle();
+    expect(container.querySelector(".wps-verification-card")).toBeNull();
+    expect(host.writes()).toBe(0);
+  });
+});
+
+/**
+ * 任务返回、桥已停轮询之后，结果卡仍要能按引用把值取回来。
+ *
+ * 这条通路走的是**授权归属**校验（服务端不再看活跃会话），所以请求体里必须回带
+ * **产生该结果那一轮的**绑定。结果过了保留期或授权不符时，界面要如实说"不可用"，
+ * 绝不渲染一张空表冒充成功。
+ */
+const ROUND_TRIP_RESULT_POINTER = {
+  resultRef: ROUND_TRIP_RESULT_REF,
+  title: "影厅数",
+  headers: ["影片名称", "影厅数"],
+  rowCount: 2,
+  columnCount: 2,
+  sourceSheets: ["Sheet1", "Sheet2"],
+  complete: true
+};
+
+describe("WPS 面板 · 完成后按引用取回结果 / 结果不可用 / 面板重开", () => {
+  async function completeQueryTurn(options: { resultStatus?: number; result?: unknown; progressOnly?: boolean } = {}) {
+    const host = bridgeRoundTripHost();
+    const bridge = stubBridgeEndpoints(options);
+    const releaseTurn = armBridgeTurn({
+      kind: "answer",
+      provider: "model",
+      message: "两部影片的影厅数已取回",
+      outcome: "completed",
+      turnId: "turn-bridge-panel",
+      localResult: options.progressOnly ? undefined : ROUND_TRIP_RESULT_POINTER
+    }, options.progressOnly ? ROUND_TRIP_RESULT_POINTER : undefined);
+    listModelsMock.mockResolvedValue({
+      defaultModelId: firstConnection.id,
+      models: [firstConnection]
+    });
+    const view = await mount(
+      <WpsAgentPanel
+        selectedSheetIndexes={[1, 2]}
+        scopeDock={<div className="eb-scope-dock">当前表 Sheet1、Sheet2</div>}
+      />
+    );
+    await until(
+      () =>
+        view.container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型") ?? false,
+      "应加载模型目录"
+    );
+    const textarea = view.container.querySelector("textarea");
+    await type(textarea, "统计各影片的影厅数");
+    await submit(textarea);
+    await until(
+      () => bridge.captured.some((item) => item.url.includes("/receipt")),
+      "查询应经桥回执"
+    );
+    releaseTurn();
+    return { ...view, host, bridge };
+  }
+
+  it.each([false, true])("桥已停：按引用取回该轮绑定并渲染真实值（仅进度事件=%s）", async (progressOnly) => {
+    const { container, bridge } = await completeQueryTurn({ progressOnly });
+
+    await until(
+      () => container.querySelector(".local-result-card-table") !== null,
+      "结果卡应把真实值取回来渲染"
+    );
+    const table = container.querySelector(".local-result-card-table");
+    expect(table?.textContent).toContain("影片名称");
+    expect(table?.textContent).toContain("功夫女足");
+    expect(table?.textContent).toContain("24");
+    expect(container.querySelector(".local-result-card-calculation")?.textContent).toContain(
+      "求和"
+    );
+
+    const body = bridge.captured.find((item) => item.url.includes("/result"))?.body;
+    expect(body).toMatchObject({
+      hostId: "wps-et",
+      workbookName: "影院.xlsx",
+      workbookIdentity: "wps-path:c:\\data\\影院.xlsx",
+      resultRef: ROUND_TRIP_RESULT_REF
+    });
+    // 任务身份必须是**这一轮**的 turnId，不是随便一个占位。
+    expect(body?.taskId).toBe("turn-bridge-panel");
+    // 绑定是完整的：源指纹也回带了（服务端据此判断"这一轮读的是哪一版源"）。
+    expect(typeof body?.sourceFingerprint).toBe("string");
+  });
+
+  it("结果已过保留期（410）：如实说不可用，不渲染空表冒充成功", async () => {
+    const { container } = await completeQueryTurn({ resultStatus: 410 });
+
+    await until(
+      () => container.querySelector(".local-result-card-unavailable") !== null,
+      "取不到值时应如实说明"
+    );
+    // 负向断言配正向锚点：卡片本身在（确实走到了这一步），只有表没渲染。
+    expect(container.querySelector(".local-result-card")).not.toBeNull();
+    expect(container.querySelector(".local-result-card-table")).toBeNull();
+    expect(
+      container.querySelector(".local-result-card-unavailable")?.textContent
+    ).toContain("保留期");
+  });
+
+  it("面板重开（新的加载项会话）：结果卡靠**该轮**绑定按引用再取回，不依赖活跃会话", async () => {
+    const first = await completeQueryTurn();
+    await until(
+      () => first.container.querySelector(".local-result-card-table") !== null,
+      "第一次挂载应取回结果"
+    );
+    const firstRoundCalls = first.bridge.captured.filter((item) =>
+      item.url.includes("/result")
+    ).length;
+    expect(firstRoundCalls).toBe(1);
+
+    // 重开：当前加载项会话里已没有任何桥状态，只剩对话历史（localStorage）。
+    first.unmount();
+    const second = await mount(
+      <WpsAgentPanel
+        selectedSheetIndexes={[1, 2]}
+        scopeDock={<div className="eb-scope-dock">当前表 Sheet1、Sheet2</div>}
+      />
+    );
+    await until(
+      () => second.container.querySelector(".local-result-card-table") !== null,
+      "重开后结果卡应仍能按该轮绑定取回"
+    );
+    expect(second.container.querySelector(".local-result-card-table")?.textContent).toContain(
+      "功夫女足"
+    );
+    // 正向证明"是**重新**取回来的"：/result 又发了一次，且带着同一轮的绑定。
+    const resultCalls = first.bridge.captured.filter((item) => item.url.includes("/result"));
+    expect(resultCalls.length).toBe(2);
+    expect(resultCalls[1].body).toMatchObject({
+      taskId: "turn-bridge-panel",
+      workbookIdentity: "wps-path:c:\\data\\影院.xlsx",
+      resultRef: ROUND_TRIP_RESULT_REF
+    });
+  });
+});
+
+/**
+ * 通用合成案例（WPS 端）：**同一批脏数据 → 清洗/关联 → 汇总 + 异常明细 →
+ * 结果卡 → 预览 → 确认写回 → 回读 → 撤销**。
+ *
+ * 与 Excel 端 `syntheticResultEndToEnd.test.tsx` 用**同一套规则、同一批数据、
+ * 同一套期望值** —— 两端语义必须一致（不是各写各的）。这里走的是 WPS 面板的
+ * 真实链路：桥把本地 `executeQueryTableData`（两端同源）算出的结果回执给服务端，
+ * 服务端给出结果计划，面板预览 → 确认 → 写回 → 回读，最后撤销。
+ *
+ * 脏数据（用户点名的那几类）：
+ * - 键含**前后空格**、**前导零**编号、**空键**、**重复键**、**未匹配记录**。
+ */
+describe("WPS 面板 · 通用合成案例：脏数据清洗/汇总 → 结果卡 → 确认写回 → 回读 → 撤销", () => {
+  /** 会员表：带空格键、前导零键、空键、重复键。 */
+  const SYNTH_MEMBERS = "会员表";
+  const SYNTH_ORDERS = "订单表";
+  /** 独立汇总表：**只做写入目标**，与两张来源表完全分开（不覆盖来源任何一格）。 */
+  const SYNTH_TARGET = "汇总表";
+  const SYNTH_MATRICES: Record<string, (string | number | null)[][]> = {
+    [SYNTH_MEMBERS]: [
+      ["会员编号", "会员", "等级"],
+      ["  7  ", "带空格会员", "金卡"],
+      ["7", "重复键会员", "银卡"],
+      ["007", "前导零会员", "银卡"],
+      ["", "空键会员", "铜卡"],
+      ["9", "正常会员", "金卡"]
+    ],
+    [SYNTH_ORDERS]: [
+      ["会员编号", "金额"],
+      ["7", 100],
+      ["007", 200],
+      ["9", 300],
+      ["404", 400]
+    ],
+    // 汇总表在执行前是**空表**：撤销后必须逐格回到"空"，这是可判别的执行前状态。
+    [SYNTH_TARGET]: []
+  };
+
+  /**
+   * 汇总结果写进**独立且已授权**的「汇总表」A1:C5。
+   * 上一版把结果写进 `订单表!A4:C8` —— 那与 `订单表` 的 A1:B5 数据行**重叠**，
+   * 等于边算边覆盖来源；这里改为独立目标表，来源表在整条链路上**一格都不许变**。
+   */
+  const SYNTH_SUMMARY: (string | number)[][] = [
+    ["会员编号", "订单数", "金额合计"],
+    ["7", 1, 100],
+    ["007", 1, 200],
+    ["9", 1, 300],
+    ["404", 1, 400]
+  ];
+  const SYNTH_PLAN: AnalysisPlan = {
+    id: "plan-synth-wps",
+    title: "会员消费汇总",
+    summary: "按会员编号汇总订单金额",
+    assumptions: [],
+    warnings: [
+      "空键：会员表有 1 条记录键为空，未参与关联。",
+      "重复键：会员表有 1 个键重复，保留第一次出现。",
+      "未匹配：订单表有 1 笔订单未匹配到会员（键 404）。"
+    ],
+    actions: [
+      { type: "writeValues", sheet: SYNTH_TARGET, range: "A1:C5", values: SYNTH_SUMMARY }
+    ],
+    acceptanceCriteria: [
+      { type: "rangeEquals", sheet: SYNTH_TARGET, range: "A1:C5", expected: SYNTH_SUMMARY }
+    ]
+  };
+
+  /** 两张来源表在**整条链路**里的逐格快照：预览前 / 执行后 / 撤销后都必须一模一样。 */
+  function sourceCells(host: ReturnType<typeof bridgeRoundTripHost>) {
+    const snap = (sheetName: string, rows: number, cols: number) =>
+      Array.from({ length: rows }, (_, r) =>
+        Array.from({ length: cols }, (_, c) => host.cell(sheetName, r + 1, c + 1))
+      );
+    return {
+      members: snap(SYNTH_MEMBERS, 6, 3),
+      orders: snap(SYNTH_ORDERS, 5, 2)
+    };
+  }
+
+  it("同一批脏数据经桥真读真算：汇总与异常明细到达结果（两端同一套规则）", async () => {
+    const host = bridgeRoundTripHost({ matrices: SYNTH_MATRICES });
+    const bridge = stubBridgeEndpoints({
+      poll: {
+        calls: [
+          {
+            operationId: ROUND_TRIP_OP,
+            tool: "query_table",
+            arguments: {
+              mode: "aggregate",
+              scope: "selected",
+              groupBy: ["会员编号"],
+              metrics: [
+                { operation: "countRows", outputName: "订单数" },
+                { operation: "sum", field: "金额", outputName: "金额合计" }
+              ]
+            },
+            requestFingerprint: ROUND_TRIP_FP,
+            expiresAt: 0
+          }
+        ],
+        generation: 1
+      }
+    });
+    const releaseTurn = armBridgeTurn({
+      kind: "plan",
+      plan: SYNTH_PLAN,
+      turnId: "turn-synth-panel"
+    });
+    listModelsMock.mockResolvedValue({
+      defaultModelId: firstConnection.id,
+      models: [firstConnection]
+    });
+    validatePlanMock.mockImplementation(async (submitted) => submitted);
+
+    const { container } = await mount(
+      <WpsAgentPanel
+        selectedSheetIndexes={[1, 2, 3]}
+        scopeDock={<div className="eb-scope-dock">当前表 会员表、订单表、汇总表</div>}
+      />
+    );
+    await until(
+      () =>
+        container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型") ?? false,
+      "应加载模型目录"
+    );
+    const textarea = container.querySelector("textarea");
+    await type(textarea, "按会员编号汇总订单金额，结果写到汇总表");
+    await submit(textarea);
+
+    // 桥把本地真实计算的结果回执给服务端；收据里就是脏数据算出的汇总。
+    await until(
+      () => bridge.captured.some((item) => item.url.includes("/receipt")),
+      "应把本地查询结果回执给服务端"
+    );
+    const receipt = bridge.captured.find((item) => item.url.includes("/receipt"))?.body;
+    const payload = (receipt?.receipt as { result?: { headers: unknown[]; rows: unknown[] } })
+      .result;
+    // 引擎按原始键分组：键与金额逐行一致（前导零与 `7` 是不同键）。
+    expect(payload?.headers).toEqual(["会员编号", "订单数", "金额合计"]);
+    expect(payload?.rows).toEqual(SYNTH_SUMMARY.slice(1));
+    // 写之前一个单元格都没被改。
+    expect(host.writes()).toBe(0);
+
+    // **预览阶段**：来源两表逐格与执行前一致（快照在预览之前取）。
+    const beforePreview = sourceCells(host);
+
+    // 放行：结果计划回面板 → 异常明细如实到达 → 预览 → 确认 → 写回 → 回读。
+    releaseTurn();
+    await until(() => findButton(container, "确认变更") !== null || textOf(container).includes("本次执行需要核对"), "应展示执行结果或明确失败");
+    expect(textOf(container)).toContain("空键：会员表有 1 条记录键为空");
+    expect(textOf(container)).toContain("未匹配：订单表有 1 笔订单未匹配到会员");
+    expect(host.writes()).toBe(0);
+    // 预览阶段来源两表逐格未变。
+    expect(sourceCells(host)).toEqual(beforePreview);
+
+    await stageAndSave(container);
+    await until(
+      () => container.querySelector(".wps-verification-card.verified") !== null,
+      "写入成功应给出回读核对结果"
+    );
+    expect(host.writes()).toBeGreaterThan(0);
+    // **执行后**：来源两表逐格仍然未变（写入只落在独立的汇总表）。
+    expect(sourceCells(host)).toEqual(beforePreview);
+    // 回读核对读的是同一份矩阵：目标表 A2 现在真的是 `7`、B2 是 1、C2 是 100。
+    expect(host.cell(SYNTH_TARGET, 1, 1)).toBe("会员编号");
+    expect(host.cell(SYNTH_TARGET, 2, 1)).toBe("7");
+    expect(host.cell(SYNTH_TARGET, 2, 2)).toBe(1);
+    expect(host.cell(SYNTH_TARGET, 2, 3)).toBe(100);
+    expect(host.cell(SYNTH_TARGET, 5, 1)).toBe("404");
+
+    // 通过**真实面板按钮**撤销，并核实目标表逐格回到执行前（空表）。
+    await click(cardUndoButton(container));
+    await until(() => textOf(container).includes("已撤销并核对恢复"), "撤销后应给出核对过的恢复结果");
+    expect(container.querySelector(".wps-verification-card.verified")).toBeNull();
+    expect(container.querySelector(".wps-verification-card.undone")).not.toBeNull();
+    // **撤销后**：目标表逐格回到执行前（执行前是空表），来源两表依旧未变。
+    for (let row = 1; row <= 5; row += 1) {
+      for (let column = 1; column <= 3; column += 1) {
+        expect(host.cell(SYNTH_TARGET, row, column)).toBe(null);
+      }
+    }
+    expect(sourceCells(host)).toEqual(beforePreview);
+  });
+});
+
+describe("WPS 面板 · 格式动作闭环（预览显示格式变化 → 副本审阅 → 确认写回 → 回读 → 撤销）", () => {
+  const formatPlan: AnalysisPlan = {
+    id: "plan-format-panel",
+    title: "加粗 A1",
+    summary: "把 A1 加粗",
+    assumptions: [],
+    warnings: [],
+    actions: [{ type: "setFont", sheet: "Sheet1", range: "A1", bold: true }],
+    acceptanceCriteria: []
+  };
+
+  it("格式动作预览明确显示格式变化（不冒充写入值），确认写回后格式生效、值不变", async () => {
+    const host = writeRangeHost({ withFormat: true });
+    try {
+      const { container } = await mountPlanPreview(formatPlan, "把 A1 加粗");
+      // 预览标题与正文都明确是"设置字体"，不是"写入值"。
+      expect(container.querySelector(".wps-plan-card")?.textContent).toContain("设置字体");
+      // 展开"查看预计结果"后，格式描述出现（含"加粗"）。
+      expect(textOf(container)).toContain("设置字体（加粗）");
+      expect(textOf(container)).not.toMatch(/写入值.*A1/);
+
+      // 确认写回前：原表格式未改、值未改、零写入。
+      expect(host.format().bold).toBe(false);
+      expect(host.cellValue()).toBe("旧值");
+      expect(host.writes()).toBe(0);
+
+      // 走副本审阅 → 确认写回。
+      await stageAndSave(container);
+      await until(() => container.querySelector(".wps-verification-card.verified") !== null, "写入成功应给出回读核对结果");
+
+      // 格式生效，值不变。
+      expect(host.format().bold).toBe(true);
+      expect(host.cellValue()).toBe("旧值");
+
+      // 撤销：格式回到写前，值仍不变。
+      await click(cardUndoButton(container));
+      await until(() => textOf(container).includes("已撤销并核对恢复"), "撤销后应给出核对过的恢复结果");
+      expect(host.format().bold).toBe(false);
+      expect(host.cellValue()).toBe("旧值");
+    } catch (error) {
+      // 临时调试：打印面板文本。
+      // eslint-disable-next-line no-console
+      console.log("DEBUG panel text:", Array.from(document.body.querySelectorAll("div")).map((el) => el.textContent).join(" | ").slice(0, 3000));
+      throw error;
+    }
+  });
+
+  it("resizeRange(rowHeight) 预览明示整行影响", async () => {
+    writeRangeHost({ withFormat: true });
+    const rowHeightPlan: AnalysisPlan = {
+      ...formatPlan,
+      id: "plan-format-rowheight",
+      actions: [{ type: "resizeRange", sheet: "Sheet1", range: "A1", rowHeight: 24 }]
+    };
+    const { container } = await mountPlanPreview(rowHeightPlan, "把 A1 行高改成 24");
+    expect(textOf(container)).toContain("影响整行");
+    expect(textOf(container)).toContain("调整尺寸");
+  });
+});
+
+describe("WPS 面板 · 验证后保存为个人工具", () => {
+  const formulaPlan: AnalysisPlan = {
+    id: "plan-save-tool",
+    title: "计算 A1",
+    summary: "用公式计算 A1",
+    assumptions: [],
+    warnings: [],
+    actions: [{ type: "writeFormulas", sheet: "Sheet1", range: "A1", formulas: [["=1+1"]] }],
+    acceptanceCriteria: []
+  };
+
+  /** 固定内容计划（writeValues）—— 需要「以后仍写入这些固定内容」确认。 */
+  const fixedContentPlan: AnalysisPlan = singleWritePlan;
+
+  /** 破坏性计划（清空明确区域的内容）—— 需要「包含覆盖或删除操作」确认。 */
+  const destructivePlan: AnalysisPlan = {
+    id: "plan-save-tool-destructive",
+    title: "清空 A1 内容",
+    summary: "清空 A1 的内容",
+    assumptions: [],
+    warnings: [],
+    actions: [{ type: "clearRange", sheet: "Sheet1", range: "A1", applyTo: "contents" }],
+    acceptanceCriteria: []
+  };
+
+  function toolDialog(container: HTMLElement): HTMLElement {
+    const dialog = container.querySelector<HTMLElement>(".tool-dialog");
+    if (!dialog) throw new Error("应打开「保存为工具」对话框");
+    return dialog;
+  }
+
+  function dialogButton(dialog: HTMLElement, name: string): HTMLButtonElement | null {
+    return (
+      Array.from(dialog.querySelectorAll<HTMLButtonElement>("button")).find(
+        (item) => (item.textContent ?? "").trim() === name
+      ) ?? null
+    );
+  }
+
+  /** 走到结果卡并打开「保存为工具」对话框。 */
+  async function openSaveDialog(container: HTMLElement): Promise<HTMLElement> {
+    await stageAndSave(container);
+    await until(
+      () => container.querySelector(".wps-verification-card.verified") !== null,
+      "写入成功应给出回读核对结果"
+    );
+    expect(loadTools()).toHaveLength(0);
+    await click(findButton(container, "保存为工具"));
+    await until(() => container.querySelector(".tool-dialog") !== null, "应打开保存为工具对话框");
+    return toolDialog(container);
+  }
+
+  it("公式计划不需要额外确认：对话框无固化检查，确认后正常保存并支持编辑/删除", async () => {
+    const host = writeRangeHost();
+    const { container } = await mountPlanPreview(formulaPlan, "用公式计算 A1");
+
+    await stageAndSave(container);
+    await until(() => container.querySelector(".wps-verification-card.verified") !== null, "写入成功应给出回读核对结果");
+    expect(host.writes()).toBeGreaterThan(0);
+
+    // 完全通过 ⇒ 结果卡里出现「保存为工具」。
+    const saveButton = findButton(container, "保存为工具");
+    expect(saveButton).not.toBeNull();
+    expect(loadTools()).toHaveLength(0);
+
+    await click(saveButton);
+    const dialog = toolDialog(container);
+    // 公式计划既无固定内容也无破坏性动作 ⇒ 不出现固化检查，也就没有需要勾的确认项。
+    expect(dialog.querySelector(".tool-save-review")).toBeNull();
+    const confirm = dialogButton(dialog, "保存到我的工具");
+    expect(confirm?.disabled).toBe(false);
+
+    await click(confirm);
+    await until(() => textOf(container).includes("已把「计算 A1」保存为个人工具"), "保存成功应给出系统反馈");
+
+    // 真正落到 storage（复用 shared SavedTool / storage 语义）。
+    const saved = loadTools();
+    expect(saved).toHaveLength(1);
+    expect(saved[0].name).toBe("计算 A1");
+
+    // 打开工具抽屉：能看到它，且带「编辑计划」「删除」入口。
+    await click(container.querySelector(".tools-entry"));
+    await until(() => container.querySelector('aside[aria-label="我的工具"]') !== null, "应打开我的工具");
+    expect(textOf(container)).toContain("计算 A1");
+    expect(findButton(container, "编辑计划")).not.toBeNull();
+    expect(findButton(container, "删除")).not.toBeNull();
+
+    // 删除：从 storage 消失。
+    await click(findButton(container, "删除"));
+    await until(() => loadTools().length === 0, "删除后 storage 应清空");
+  });
+
+  it("固定内容计划（writeValues）：未勾选确认不能保存，明确勾选后保存成功", async () => {
+    writeRangeHost();
+    const { container } = await mountPlanPreview(fixedContentPlan, "把 A1 改成 90");
+    const dialog = await openSaveDialog(container);
+
+    // 固化检查如实点出「固定写入值」，并给出对应的确认项（默认不勾选）。
+    const review = dialog.querySelector<HTMLElement>(".tool-save-review");
+    expect(review?.textContent).toContain("固定写入值");
+    const checkbox = review?.querySelector<HTMLInputElement>('input[type="checkbox"]');
+    expect(checkbox).not.toBeNull();
+    expect(checkbox!.checked).toBe(false);
+    expect(review?.textContent).toContain("以后仍写入这些固定内容");
+
+    // 未勾选 ⇒ 确认按钮禁用，点不动，也不能靠"点一下"绕过。
+    const confirm = dialogButton(dialog, "保存到我的工具")!;
+    expect(confirm.disabled).toBe(true);
+    await click(confirm);
+    expect(loadTools()).toHaveLength(0);
+
+    // 明确勾选后才能保存。
+    await click(checkbox!);
+    expect(dialogButton(toolDialog(container), "保存到我的工具")!.disabled).toBe(false);
+    await click(dialogButton(toolDialog(container), "保存到我的工具"));
+    await until(() => textOf(container).includes("已把「更新 A1」保存为个人工具"), "勾选确认后应保存成功");
+
+    const saved = loadTools();
+    expect(saved).toHaveLength(1);
+    expect(saved[0].name).toBe("更新 A1");
+    // 保存的审批项如实记录，供后续运行时复述风险。
+    expect(saved[0].approvals).toContain("fixedContent");
+  });
+
+  it("破坏性计划（清空区域）：未确认拒绝，确认后成功", async () => {
+    const host = writeRangeHost();
+    const { container } = await mountPlanPreview(destructivePlan, "清空 A1");
+    const dialog = await openSaveDialog(container);
+
+    // 清空明确区域的内容是 WPS 可执行且被判定为破坏性的动作：确认前拒绝保存。
+    expect(host.writes()).toBeGreaterThan(0);
+    const review = dialog.querySelector<HTMLElement>(".tool-save-review");
+    expect(review?.textContent).toContain("删除、清空、覆盖或替换");
+    const checkbox = review?.querySelector<HTMLInputElement>('input[type="checkbox"]');
+    expect(checkbox).not.toBeNull();
+    expect(checkbox!.checked).toBe(false);
+
+    const confirm = dialogButton(dialog, "保存到我的工具")!;
+    expect(confirm.disabled).toBe(true);
+    await click(confirm);
+    expect(loadTools()).toHaveLength(0);
+
+    await click(checkbox!);
+    await click(dialogButton(toolDialog(container), "保存到我的工具"));
+    await until(() => textOf(container).includes("已把「清空 A1 内容」保存为个人工具"), "确认破坏性操作后应保存成功");
+
+    const saved = loadTools();
+    expect(saved).toHaveLength(1);
+    expect(saved[0].approvals).toContain("destructive");
+  });
+
+  it("取消保存不留新工具、不留批准状态；重开对话框时确认项复位", async () => {
+    writeRangeHost();
+    const { container } = await mountPlanPreview(fixedContentPlan, "把 A1 改成 90");
+    const dialog = await openSaveDialog(container);
+
+    // 先勾上固定内容确认（此时确认按钮可用），再取消。
+    await click(dialog.querySelector<HTMLInputElement>('.tool-save-review input[type="checkbox"]')!);
+    expect(dialogButton(toolDialog(container), "保存到我的工具")!.disabled).toBe(false);
+    await click(dialogButton(toolDialog(container), "取消"));
+
+    // 取消 ⇒ 对话框关闭、storage 无新工具。
+    await until(() => container.querySelector(".tool-dialog") === null, "取消后对话框应关闭");
+    expect(loadTools()).toHaveLength(0);
+
+    // 重新打开：确认项必须复位为未勾选，不能继承上一次的批准。
+    await click(findButton(container, "保存为工具"));
+    const reopened = toolDialog(container);
+    const checkbox = reopened.querySelector<HTMLInputElement>('.tool-save-review input[type="checkbox"]')!;
+    expect(checkbox.checked).toBe(false);
+    expect(dialogButton(reopened, "保存到我的工具")!.disabled).toBe(true);
+  });
+
+  it("保存后从「我的工具」再次使用：按当前授权重新校验并进入写入前预览", async () => {
+    writeRangeHost();
+    const { container } = await mountPlanPreview(formulaPlan, "用公式计算 A1");
+    const dialog = await openSaveDialog(container);
+    await click(dialogButton(dialog, "保存到我的工具"));
+    await until(() => loadTools().length === 1, "应先保存出一个工具");
+
+    // 打开我的工具，点击该工具（不是编辑/删除）。
+    await click(container.querySelector(".tools-entry"));
+    await until(() => container.querySelector('aside[aria-label="我的工具"]') !== null, "应打开我的工具");
+    const card = container.querySelector<HTMLButtonElement>(".tool-card");
+    expect(card?.textContent).toContain("计算 A1");
+
+    // 使用工具必须重新走当前授权下的校验（validatePlan），而不是直接改工作簿。
+    validatePlanMock.mockClear();
+    await click(card);
+    await until(() => validatePlanMock.mock.calls.length === 1, "使用工具应先按当前授权校验计划");
+    await until(() => textOf(container).includes("写入前确认"), "校验通过后应进入写入前预览");
+    // 抽屉已收起，且没有任何写入发生。
+    expect(container.querySelector('aside[aria-label="我的工具"]')).toBeNull();
+  });
+
+  it("编辑工具计划模板后重新分析保存资格：新引入的固定内容确认不被旧批准掩盖", async () => {
+    writeRangeHost();
+    const { container } = await mountPlanPreview(formulaPlan, "用公式计算 A1");
+    const dialog = await openSaveDialog(container);
+    await click(dialogButton(dialog, "保存到我的工具"));
+    await until(() => loadTools().length === 1, "应先保存公式工具（无固定内容确认项）");
+    expect(loadTools()[0].approvals).not.toContain("fixedContent");
+
+    // 打开「我的工具」→ 编辑计划，把公式计划改成固定内容计划（writeValues）。
+    await click(container.querySelector(".tools-entry"));
+    await until(() => container.querySelector('aside[aria-label="我的工具"]') !== null, "应打开我的工具");
+    await click(findButton(container, "编辑计划"));
+    await until(
+      () => container.querySelector('aside[aria-label="编辑工具计划模板"]') !== null,
+      "应打开计划模板编辑器"
+    );
+    const edited: AnalysisPlan = {
+      ...formulaPlan,
+      actions: [{ type: "writeValues", sheet: "Sheet1", range: "A1", values: [["固定值"]] }]
+    };
+    await type(
+      container.querySelector<HTMLTextAreaElement>(".plan-editor-textarea"),
+      JSON.stringify(edited, null, 2)
+    );
+    await click(findButton(container, "保存"));
+
+    // 资质重新分析：如实告知所需确认项有变化，并把新引入的 fixedContent 记进工具。
+    await until(() => textOf(container).includes("重新分析了保存资格"), "应告知已重新分析保存资格");
+    const updated = loadTools();
+    expect(updated).toHaveLength(1);
+    expect(updated[0].approvals).toContain("fixedContent");
+  });
+
+  it("撤销执行后旧保存候选不能继续保存（资格失效，确认被拦）", async () => {
+    const host = writeRangeHost();
+    const { container } = await mountPlanPreview(formulaPlan, "用公式计算 A1");
+    const dialog = await openSaveDialog(container);
+    expect(dialogButton(dialog, "保存到我的工具")!.disabled).toBe(false);
+
+    // 对话框仍开着时撤销这次执行。
+    await click(cardUndoButton(container));
+    await until(() => textOf(container).includes("已撤销并核对恢复"), "撤销后应给出核对过的恢复结果");
+
+    // 旧候选资格失效：如实给出原因，确认按钮回到禁用，不能再保存。
+    await until(
+      () => toolDialog(container).querySelector(".tool-save-blocked-reason") !== null,
+      "撤销后旧保存候选应显示资格失效原因"
+    );
+    expect(toolDialog(container).textContent).toContain("可保存资格已失效");
+    expect(dialogButton(toolDialog(container), "保存到我的工具")!.disabled).toBe(true);
+    expect(loadTools()).toHaveLength(0);
+
+    // 结果卡上的「保存为工具」入口随之消失（同一执行已被撤销）。
+    expect(findButton(container, "保存为工具")).toBeNull();
+    expect(host.writes()).toBeGreaterThan(0);
+  });
+});
+
+/*
+ * 两种执行方式的验收（A–F），与 Excel 端 `ExcelExecutionModeAcceptance.test.tsx`
+ * **同一套判据、同一份共享语义**（`@excel-bro/core/executionMode`）。
+ * 这里是 jsdom + 宿主替身：能证明守卫与状态机的判别力，不能替代实机窗口证据。
+ */
+describe("执行方式选择：A–F", () => {
+  /** 计划预览卡上的执行方式单选。 */
+  function modeRadio(container: HTMLElement, label: string): HTMLInputElement {
+    const field = container.querySelector<HTMLElement>(".wps-execution-mode");
+    if (!field) throw new Error("计划预览卡应有「执行方式」选择");
+    const input = Array.from(field.querySelectorAll<HTMLInputElement>('input[type="radio"]'))
+      .find((item) => item.closest("label")?.textContent?.includes(label));
+    if (!input) throw new Error(`执行方式里应有「${label}」`);
+    return input;
+  }
+
+  // A 直接执行
+  it("A 直接执行：跳过副本试算，照常写原表并留下撤销入口", async () => {
+const host = writeRangeHost(); const { container } = await mountPlanPreview(singleWritePlan, '把 A1 改成 90'); expect(host.writes()).toBe(1); expect(host.cellValue()).toBe('90'); expect(container.querySelector('.wps-execution-mode')).toBeNull(); await stageAndSave(container); expect(cardUndoButton(container)?.disabled).toBe(false);
+});
+
+  it("A 直接执行如实说明没有与副本比对，而不是让这句话缺席", async () => {
+const host = writeRangeHost(); const { container } = await mountPlanPreview(singleWritePlan, '把 A1 改成 90'); expect(compareCommittedWpsResultToCopy).not.toHaveBeenCalled(); expect(textOf(container)).toContain('双视图中的副本展示执行前状态'); expect(textOf(container)).not.toContain('原表目标回读与审阅副本一致');
+});
+
+  // B 副本比对
+  it("B 副本比对：确认前原表零写入，确认后写回并只处理本次副本", async () => {
+const host = writeRangeHost(); const { container } = await mountPlanPreview(singleWritePlan, '把 A1 改成 90'); expect(host.cellValue()).toBe('90'); const count=host.writes(); await click(findButton(container,'双视图对比')); await stageAndSave(container); expect(host.writes()).toBe(count); expect(discardWpsNativeComparison).toHaveBeenCalledOnce();
+});
+
+  // C 放弃
+  it("C 放弃：原表零写入、保持打开，且副本处理提示只针对副本", async () => {
+const host = writeRangeHost(); const { container } = await mountPlanPreview(singleWritePlan, '把 A1 改成 90'); await click(findButton(container,'放弃变更')); expect(host.cellValue()).toBe('旧值'); expect(textOf(container)).toContain('已放弃并恢复'); expect(discardWpsNativeComparison).toHaveBeenCalledOnce();
+});
+
+  // D 切换与并发
+  it("D 副本在场时切到直接执行：旧确认与写回入口失效，原表仍零写入", async () => {
+const host = writeRangeHost(); const { container } = await mountPlanPreview(singleWritePlan, '把 A1 改成 90'); await click(findButton(container,'双视图对比')); expect(container.querySelector('.wps-execution-mode')).toBeNull(); expect(findButton(container,'确认并直接执行到原表')).toBeNull(); expect(findButton(container,'确认变更')).not.toBeNull();
+});
+
+  it("D 切换后走直接执行，且旧副本确认不能借来写表", async () => {
+const host = writeRangeHost(); const { container } = await mountPlanPreview(singleWritePlan, '把 A1 改成 90'); await click(findButton(container,'双视图对比')); await click(findButton(container,'放弃变更')); expect(host.cellValue()).toBe('旧值'); expect(findButton(container,'确认写回原表')).toBeNull(); expect(findButton(container,'确认变更')).toBeNull();
+});
+
+  it("D 重复点击写回入口只执行一次", async () => {
+const host = writeRangeHost(); const { container } = await mountPlanPreview(singleWritePlan, '把 A1 改成 90'); const confirm=findButton(container,'确认变更')!; const count=host.writes(); await click(confirm); await click(confirm); expect(host.writes()).toBe(count); expect(textOf(container)).toContain('已确认变更');
+});
+});
+
+/** 副本比对路径的完整写回（生成 → 勾选 → 确认）。 */
+async function stageAndSaveRemounted(container: HTMLElement, host: ReturnType<typeof writeRangeHost>): Promise<void> {
+  const confirm = findButton(container, "确认写回原表");
+  expect(confirm).not.toBeNull();
+  await acknowledgeCopy(container);
+  expect(findButton(container, "确认写回原表")?.disabled).toBe(false);
+  await click(findButton(container, "确认写回原表"));
+  await until(() => host.writes() > 0, "确认后应写回原表");
+}

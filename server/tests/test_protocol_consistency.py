@@ -15,6 +15,9 @@ from __future__ import annotations
 
 import ast
 import inspect
+import re
+import typing
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -687,16 +690,62 @@ def test_action_field_type_strictness() -> None:
 def test_required_vs_optional_fields() -> None:
     """验证必填字段和可选字段的定义一致"""
 
-    # 测试 1：setFont 的 bold 和 color 都是可选的
+    # 测试 1：setFont 的五个字体属性各自都是可选的，但**全空必须被拒**。
+    # 语义裁决：一个属性都没给 = 这个动作什么也不做。放过去会让计划"看起来
+    # 成功、实际没改"，与"只有指定属性被改变"的承诺相反；这与既有不变量
+    # RangeFormatMatchesCriterion.require_expected_property 是同一条规矩。
     minimal_font = {
         "type": "setFont",
         "sheet": "Sheet1",
         "range": "A1",
-        # 不提供 bold 和 color
+        # 不提供任何字体属性 —— 必须被拒
     }
-    action = SetFontAction.model_validate(minimal_font)
-    assert action.bold is None
-    assert action.color is None
+    with pytest.raises(ValidationError, match="至少需要一个"):
+        SetFontAction.model_validate(minimal_font)
+
+    # 逐个单属性都必须能通过（可选 ≠ 可全空）。
+    for single in (
+        {"bold": True},
+        {"italic": True},
+        {"name": "Arial"},
+        {"size": 12},
+        {"color": "#112233"},
+    ):
+        parsed = SetFontAction.model_validate(
+            {"type": "setFont", "sheet": "Sheet1", "range": "A1", **single}
+        )
+        assert parsed.model_dump(exclude_none=True).keys() >= single.keys()
+
+    # 未给出的属性保持 None，而不是被塞进默认值。
+    bold_only = SetFontAction.model_validate(
+        {"type": "setFont", "sheet": "Sheet1", "range": "A1", "bold": True}
+    )
+    assert bold_only.bold is True
+    assert bold_only.italic is None
+    assert bold_only.name is None
+    assert bold_only.size is None
+    assert bold_only.color is None
+
+    # 测试 1b：setAlignment / resizeRange 与 setFont 同一语义（两端也必须一致）
+    with pytest.raises(ValidationError, match="至少需要一个"):
+        SetAlignmentAction.model_validate(
+            {"type": "setAlignment", "sheet": "Sheet1", "range": "A1"}
+        )
+    with pytest.raises(ValidationError, match="至少需要一个"):
+        ResizeRangeAction.model_validate(
+            {"type": "resizeRange", "sheet": "Sheet1", "range": "A1"}
+        )
+
+    # 测试 1c：setBorders 的边不能重复（重复不会报错，只会让同一位置画两次）
+    with pytest.raises(ValidationError, match="重复"):
+        SetBordersAction.model_validate(
+            {
+                "type": "setBorders",
+                "sheet": "Sheet1",
+                "range": "A1",
+                "sides": ["top", "top"],
+            }
+        )
 
     # 测试 2：writeTable 的 headers 是必填的
     missing_headers = {
@@ -721,6 +770,249 @@ def test_required_vs_optional_fields() -> None:
     action = CreateChartAction.model_validate(minimal_chart)
     assert action.title is None
     assert action.targetRange is None
+
+
+# ============================================================================
+# 测试：跨语言漂移（闭集 / 取值范围 / 可选性）
+# ============================================================================
+# 背景：上面那些用例只证明"后端能解析前端给的样例"。它们拦不住真正的漂移：
+# 前端把 setFont 的 color 写成自由 `string`、把行列宽上限只写在后端、把
+# `style` 在类型层写成必填而实现层当可选 —— 样例照样能解析，因为这些不一致
+# 只有把**非法值**送进宿主才会暴露，而那一刻前面的动作可能已经落盘了。
+#
+# 所以这里不比对样例，而是直接把 `contracts.ts` 的常量与类型字面量抠出来，
+# 和 Pydantic 的 `Literal` / `Field` 逐项对。任何一端改了值或可选性，测试变红。
+# ============================================================================
+
+CONTRACTS_TS_PATH = (
+    Path(__file__).resolve().parents[2] / "apps" / "excel-addin" / "src" / "contracts.ts"
+)
+
+
+def _contracts_source() -> str:
+    return CONTRACTS_TS_PATH.read_text(encoding="utf-8")
+
+
+def _strip_ts_comments(source: str) -> str:
+    """去掉块注释与行注释。注释里出现大括号会把"取到第一个 }"的截断逻辑带偏。"""
+    without_block = re.sub(r"/\*.*?\*/", " ", source, flags=re.S)
+    return re.sub(r"//[^\n]*", " ", without_block)
+
+
+def _ts_string_array(source: str, name: str) -> list[str]:
+    """取 `export const NAME: readonly X[] = [ "a", "b" ];` 里的字符串。"""
+    match = re.search(
+        rf"export const {name}\s*:\s*readonly\s+\w+\[\]\s*=\s*\[(?P<body>[^\]]*)\];",
+        source,
+        re.S,
+    )
+    if match is None:
+        raise AssertionError(f"contracts.ts 里找不到 {name}")
+    return re.findall(r'"([^"]+)"', match.group("body"))
+
+
+def _ts_number(source: str, name: str) -> int:
+    match = re.search(rf"export const {name}\s*=\s*(?P<value>\d+);", source)
+    if match is None:
+        raise AssertionError(f"contracts.ts 里找不到 {name}")
+    return int(match.group("value"))
+
+
+def _ts_range(source: str, name: str) -> tuple[int, int]:
+    match = re.search(
+        rf"export const {name}\s*=\s*\{{\s*min:\s*(?P<min>-?\d+),\s*max:\s*(?P<max>-?\d+)\s*\}}\s*as const;",
+        source,
+    )
+    if match is None:
+        raise AssertionError(f"contracts.ts 里找不到 {name}")
+    return int(match.group("min")), int(match.group("max"))
+
+
+def _ts_regex_source(source: str, name: str) -> str:
+    match = re.search(rf"export const {name}\s*=\s*/(?P<body>[^/\n]+)/;", source)
+    if match is None:
+        raise AssertionError(f"contracts.ts 里找不到 {name}")
+    return match.group("body")
+
+
+def _ts_action_fields(source: str, action_type: str) -> dict[str, bool]:
+    """取 TS 联合里某个动作的字段名 → 是否必填（`?` 为可选）。
+
+    只用于格式动作：它们的类型字面量是平的，没有嵌套对象类型，
+    所以"截到第一个 `}`"与"字段名后跟冒号"这两条简化是安全的。
+    """
+    stripped = _strip_ts_comments(source)
+    match = re.search(
+        rf'type:\s*"{action_type}";(?P<body>[^}}]*)',
+        stripped,
+    )
+    if match is None:
+        raise AssertionError(f"contracts.ts 里找不到动作 {action_type}")
+    body = match.group("body")
+    # `type` 本身被上面那条正则当锚点吃掉了，补回来。
+    fields: dict[str, bool] = {"type": True}
+    for name, optional in re.findall(r"([A-Za-z_][A-Za-z0-9_]*)\s*(\??)\s*:", body):
+        fields[name] = optional == ""
+    return fields
+
+
+def _walk_annotation(node: object):
+    yield node
+    for arg in typing.get_args(node):
+        yield from _walk_annotation(arg)
+
+
+def _literal_values(model: type, field: str) -> list[str]:
+    """取字段上的 `Literal` 取值，自动穿透 `Optional[...]` / `list[...]` / `Annotated[...]`。"""
+    values: list[str] = []
+    for node in _walk_annotation(model.model_fields[field].annotation):
+        if typing.get_origin(node) is typing.Literal:
+            values.extend(str(item) for item in typing.get_args(node))
+    return values
+
+
+_BOUND_ATTRS = {"ge": "ge", "le": "le", "min": "min_length", "max": "max_length"}
+_BOUND_CLASSES = {"ge": "Ge", "le": "Le", "min": "MinLen", "max": "MaxLen"}
+
+
+def _numeric_bound(model: type, field: str, kind: str) -> int:
+    field_info = model.model_fields[field]
+    for item in field_info.metadata:
+        if type(item).__name__ == _BOUND_CLASSES[kind]:
+            return getattr(item, _BOUND_ATTRS[kind])
+    # `Annotated[str, StringConstraints(min_length=..., max_length=...)]` 会被内联进注解，
+    # 不落到 metadata 上，得走一遍注解树。
+    if kind in {"min", "max"}:
+        for node in _walk_annotation(field_info.annotation):
+            if type(node).__name__ == "StringConstraints":
+                value = getattr(node, _BOUND_ATTRS[kind], None)
+                if value is not None:
+                    return value
+    raise AssertionError(f"{model.__name__}.{field} 上找不到 {kind} 约束")
+
+
+def _string_pattern(model: type, field: str) -> str:
+    for node in _walk_annotation(model.model_fields[field].annotation):
+        if type(node).__name__ == "StringConstraints":
+            pattern = getattr(node, "pattern", None)
+            if pattern:
+                return pattern
+    for item in model.model_fields[field].metadata:
+        if type(item).__name__ == "StringConstraints" and getattr(item, "pattern", None):
+            return item.pattern
+    raise AssertionError(f"{model.__name__}.{field} 上没有 pattern 约束")
+
+
+@pytest.mark.parametrize(
+    ("ts_name", "model", "field"),
+    [
+        ("BORDER_SIDES", SetBordersAction, "sides"),
+        ("BORDER_LINE_STYLES", SetBordersAction, "style"),
+        ("BORDER_WEIGHTS", SetBordersAction, "weight"),
+        ("HORIZONTAL_ALIGNMENTS", SetAlignmentAction, "horizontal"),
+        ("VERTICAL_ALIGNMENTS", SetAlignmentAction, "vertical"),
+    ],
+)
+def test_closed_sets_match_between_typescript_and_python(
+    ts_name: str, model: type, field: str
+) -> None:
+    ts_values = _ts_string_array(_contracts_source(), ts_name)
+    python_values = _literal_values(model, field)
+    assert ts_values, f"{ts_name} 在 contracts.ts 里是空集合"
+    assert len(ts_values) == len(set(ts_values)), f"{ts_name} 里有重复取值"
+    assert set(ts_values) == set(python_values), (
+        f"{ts_name} 与 {model.__name__}.{field} 的取值不一致：\n"
+        f"  TS     = {sorted(ts_values)}\n"
+        f"  Python = {sorted(python_values)}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("ts_name", "model", "field"),
+    [
+        ("ROW_HEIGHT_RANGE", ResizeRangeAction, "rowHeight"),
+        ("COLUMN_WIDTH_RANGE", ResizeRangeAction, "columnWidth"),
+        ("FONT_SIZE_RANGE", SetFontAction, "size"),
+    ],
+)
+def test_numeric_ranges_match_between_typescript_and_python(
+    ts_name: str, model: type, field: str
+) -> None:
+    ts_range = _ts_range(_contracts_source(), ts_name)
+    python_range = (
+        _numeric_bound(model, field, "ge"),
+        _numeric_bound(model, field, "le"),
+    )
+    assert ts_range == python_range, (
+        f"{ts_name} 与 {model.__name__}.{field} 的值域不一致："
+        f" TS {ts_range} vs Python {python_range}"
+    )
+
+
+def test_text_length_limits_match_between_typescript_and_python() -> None:
+    source = _contracts_source()
+    assert _ts_number(source, "FONT_NAME_MAX_LENGTH") == _numeric_bound(
+        SetFontAction, "name", "max"
+    )
+    assert _numeric_bound(SetFontAction, "name", "min") == 1
+    assert _ts_number(source, "NUMBER_FORMAT_MAX_LENGTH") == _numeric_bound(
+        SetNumberFormatAction, "formatCode", "max"
+    )
+    assert _numeric_bound(SetNumberFormatAction, "formatCode", "min") == 1
+
+
+def test_hex_color_pattern_matches_between_typescript_and_python() -> None:
+    ts_pattern = _ts_regex_source(_contracts_source(), "HEX_COLOR_PATTERN")
+    for model, field in (
+        (SetFillAction, "color"),
+        (SetFontAction, "color"),
+        (SetBordersAction, "color"),
+    ):
+        assert _string_pattern(model, field) == ts_pattern, (
+            f"{model.__name__}.{field} 的颜色约束与 TS 的 HEX_COLOR_PATTERN 不一致"
+        )
+
+
+@pytest.mark.parametrize(
+    ("action_type", "model"),
+    [
+        ("setFill", SetFillAction),
+        ("setFont", SetFontAction),
+        ("setNumberFormat", SetNumberFormatAction),
+        ("setBorders", SetBordersAction),
+        ("setAlignment", SetAlignmentAction),
+        ("resizeRange", ResizeRangeAction),
+    ],
+)
+def test_format_action_fields_match_between_typescript_and_python(
+    action_type: str, model: type
+) -> None:
+    """字段名集合与**可选性**逐项对齐。
+
+    可选性倒置（TS 写必填、Python 有默认值，或反过来）是这轮审计里真实存在过的
+    不一致：类型层写必填而实现层兼容缺省，中间那段空档就是"模型少给一个字段、
+    计划在校验期通过、执行期才炸"。
+    """
+    ts_fields = _ts_action_fields(_contracts_source(), action_type)
+    python_fields = {
+        name: field_info.is_required()
+        for name, field_info in model.model_fields.items()
+    }
+    # ExcelAction 每个变体的前三个定位字段，两侧命名一致，必须都在。
+    assert {"sheet", "range"} <= set(ts_fields), f"{action_type} 的 TS 定义缺 sheet/range"
+    assert set(ts_fields) == set(python_fields), (
+        f"{action_type} 的字段集合不一致：\n"
+        f"  TS 独有     = {sorted(set(ts_fields) - set(python_fields))}\n"
+        f"  Python 独有 = {sorted(set(python_fields) - set(ts_fields))}"
+    )
+    mismatched = {
+        name: (ts_fields[name], python_fields[name])
+        for name in ts_fields
+        if ts_fields[name] != python_fields[name]
+    }
+    assert not mismatched, (
+        f"{action_type} 的可选性不一致（字段: (TS 必填, Python 必填)）：{mismatched}"
+    )
 
 
 # ============================================================================
