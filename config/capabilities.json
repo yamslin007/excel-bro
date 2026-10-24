@@ -713,6 +713,8 @@
   },
   "taskRecovery": {
     "wpsOwnerLeaseSeconds": 120,
+    "wpsResumeMaxAgeSeconds": 1800,
+    "wpsResumeMaxSourceCells": 250000,
     "maxRegisteredDirectories": 50,
     "operationRetentionDays": 30,
     "maxCheckpointBytes": 67108864,

@@ -604,14 +604,13 @@ describe("natural organic style", () => {
   });
 
   it("keeps the progress-dot contrast above the graphics threshold in every preset", () => {
-    // 「有新进度」浮标 = **跟随主题的品牌浅色渐变圆**，字行走**主题色**：
+    // 「有新进度」浮标 = **透明底 + 主题色字形**（2026-10-24 用户裁决：背景改透明）。
     // 运行中是三颗圆点，跑完是锚图标，两者共用同一个前景令牌。
     //
-    // 这条断言防的是这个组合最容易出的错：浅底 + 浅品牌色在中调色相的预设上会糊。
-    // 实测过 —— 直接拿 `--color-brand-text` 当圆点，warm-orange 只有 2.58、
-    // vivid-green 2.93，都过不了非文本 UI 图形 3:1 的门槛（WCAG 1.4.11）；
-    // 而且 warm-orange 的品牌色压在**纯白**上也才 3.16，所以不是"底太深"能解释的，
-    // 必须把前景色压深。
+    // 这条断言防的是这个组合最容易出的错：字形太浅，浮在消息流上就看不见了。
+    // 实测过 —— 直接拿 `--color-brand-text` 当字形，warm-orange 压在**纯白**上也才
+    // 3.16、vivid-green 只有 2.93，都过不了非文本 UI 图形 3:1 的门槛（WCAG 1.4.11）。
+    // 所以必须把前景色压深。
     //
     // **压深是显式令牌，不是 `color-mix()` 现算**。这是踩过的坑：`background:` 上
     // 写"降级行 + color-mix 行"看似安全，其实**救不了** —— 两条是同一个属性，
@@ -621,38 +620,62 @@ describe("natural organic style", () => {
     // 都拿得到确定值；而且这个值可以被下面这些断言直接算。
     //
     // **读的都是真实数据源**，没有任何期望值写死：
-    //   ① 渐变用了哪些**令牌** —— 从 styles.css 的规则本体里抽 `var(--color-*)`；
-    //   ② 那些令牌在四个预设里各是什么**色值** —— 从 useTheme.ts 的色板里解析；
-    //   ③ 两个字形各自引用的令牌名 —— 从 styles.css 的圆点 / 锚规则里解析；
-    //   ④ 前景色的**色值** —— 从 `:root` 与四个预设的 `progressGlyph` 里解析。
+    //   ① 浮标自己画不画底 —— 从 styles.css 的规则本体里读 `background` / `box-shadow`；
+    //   ② 它压在什么上 —— 从 `.message-stream` 的规则里读底色**令牌名**（底色透明时
+    //      字形背后的真实背景就是消息流本身）；
+    //   ③ 那些令牌在四个预设里各是什么**色值** —— 从 useTheme.ts 的色板里解析；
+    //   ④ 两个字形各自引用的令牌名 —— 从 styles.css 的圆点 / 锚规则里解析；
+    //   ⑤ 前景色的**色值** —— 从 `:root` 与四个预设的 `progressGlyph` 里解析。
     // 所以改预设、换令牌、改色值，都会让这条断言跟着重算；真的过不了就变红。
     const source = css("./styles.css");
     const hook = css("./hooks/useTheme.ts");
     const stripComments = (text: string) => text.replace(/\/\*[\s\S]*?\*\//g, "");
 
-    // ---- ① 外圈：必须是"跟随主题的浅色渐变"，不能再退回写死的深色药丸 ----
+    // ---- ① 底色：**必须是透明**（2026-10-24 用户裁决「背景改为透明的」）----
+    //
+    // 这个控件不该在消息流上盖一块自己的底：42px 的浅色圆会把底下那行字切掉一段。
+    // 三条分开写，是因为它们各自会被不同变异打红（见 scripts/mutate_progress_dot_contrast.mjs）：
+    //   · `background: transparent` —— M3 把品牌渐变写回来时红；
+    //   · 不许出现渐变/图片底 —— 同上（渐变即"又画了一块底"）；
+    //   · `box-shadow: none` —— M8 把 `--shadow-md` 加回来时红（透明底上的投影
+    //     是一团没有主体的灰影）。
+    // 判别点不是"有没有 `background` 这个词"：值必须真的是 `transparent`。
     const buttonRules = [
       ...source.matchAll(/\.new-progress-button(?::[-a-z()]+)?\s*\{([^}]*)\}/gs)
     ].map((match) => stripComments(match[1]));
     expect(buttonRules.length, "找不到 .new-progress-button 规则").toBeGreaterThan(0);
     const buttonRule = buttonRules[0];
 
-    expect(buttonRule, "外圈的渐变不再走品牌令牌了").toContain("var(--color-brand-bg)");
-    // 两个端点都必须是品牌令牌：起点曾经是 `--color-background-subtle`，而它在
-    // default 预设下就是**纯白 `#ffffff`**，42px 的圆上有一半是白的，整个控件
-    // 读成"白圆圈"（用户原话："你这个怎么一个白的了"）。
-    expect(buttonRule, "外圈的渐变不再走品牌令牌了").toContain("var(--color-brand-hover)");
+    expect(
+      buttonRule,
+      "浮标底色必须是 transparent（用户已裁决去掉那层浅色圆底）"
+    ).toMatch(/background:\s*transparent;/);
+    expect(
+      buttonRule,
+      "浮标不该再画渐变/图片底 —— 那就是把用户要去掉的底色又画回来了"
+    ).not.toMatch(/linear-gradient|radial-gradient|url\(/);
+    expect(
+      buttonRule,
+      "透明底上不能留投影：`--shadow-*` 是给\"有底的圆\"算的，底没了只会剩一团灰影"
+    ).toMatch(/box-shadow:\s*none;/);
+    // 悬停/按下同样不许把底画回来（这两条规则里连 `background` 都不该出现）。
+    for (const rule of buttonRules.slice(1)) {
+      expect(
+        rule,
+        `悬停/按下不许重新着色：${rule.trim().split("\n")[0]} 里出现了 background`
+      ).not.toMatch(/background\s*:/);
+    }
 
-    // ---- ①b 外圈**不许画边**（2026-10-12 用户裁决）----
+    // ---- ①b 浮标**不许画边**（2026-10-12 用户裁决）----
     //
     // 两次原话：「去掉这个圆形边缘线条」，随后「去掉边框颜色，改为透明即可」。
-    // 曾经是 `border: 1px solid var(--color-border-strong)`：在浅色渐变外面再套一圈
-    // 灰线，42px 的小圆上那一圈比圆本身还抢眼，读成"一个描了边的灰圈"。圆的轮廓
-    // 现在由渐变本身 + `--shadow-md` 的投影撑（那是"影子"，不是"线"）。
+    // 曾经是 `border: 1px solid var(--color-border-strong)`：在底色外面再套一圈
+    // 灰线，42px 的小圆上那一圈比圆本身还抢眼，读成"一个描了边的灰圈"。
+    // 底色在 2026-10-24 变成透明之后，这条更要守住：透明底上的一圈线就是全部。
     //
     // **判据是"值会不会真的画出一条线"，不是"有没有出现 `border` 这个词"。**
-    // 这个区分是本轮用血换的：作者把边框声明删干净之后，浏览器 UA 样式接手了
-    // `<button>`（Chrome 默认 `2px outset ButtonBorder`），浅绿圆外面冒出一圈**黑环**
+    // 这个区分是踩过的坑：作者把边框声明删干净之后，浏览器 UA 样式接手了
+    // `<button>`（Chrome 默认 `2px outset ButtonBorder`），底色外面冒出一圈**黑环**
     // —— 于是必须显式写一条"关掉边框"的声明把它按回去。那条声明**不画线**，
     // 必须放行；只有真会画出线的（带 `solid`/`dashed`/… 或非零宽度）才拦。
     // 所以按**属性名 + 值**一起判，而不是只看属性名：
@@ -702,14 +725,18 @@ describe("natural organic style", () => {
       }
     }
 
-    // 所有被当作背景端点的令牌里，**最暗的那个**才是圆点对比度的最坏情况
-    // （悬停/按下会把渐变整体压深，所以不能只算常态）。
-    const backgroundTokens = new Set(
-      buttonRules
-        .flatMap((rule) => [...rule.matchAll(/background:\s*([^;]+);/g)].map((m) => m[1]))
-        .flatMap((value) => [...value.matchAll(/var\((--color-[a-z-]+)\)/g)].map((m) => m[1]))
+    // 底色透明之后，"字形压在什么上"不再由浮标自己的规则决定 —— 它压的是
+    // **消息流本身**。所以对比度的背景端点从 `.message-stream` 的规则里读令牌，
+    // 而不是从按钮的渐变里读（那里现在只剩 `transparent`）。
+    const streamRule = stripComments(
+      source.match(/\.message-stream \{([^}]*)\}/s)?.[1] ?? ""
     );
-    expect(backgroundTokens.size, "外圈背景没有引用任何主题令牌").toBeGreaterThan(1);
+    expect(streamRule, "找不到 .message-stream 规则").not.toBe("");
+    const backdropToken = streamRule.match(/background:\s*var\((--color-[a-z-]+)\);/)?.[1];
+    expect(
+      backdropToken,
+      "字形背后的底色应当是一条 var(--color-*) 令牌声明（透明底上就是消息流底色）"
+    ).toBeTruthy();
 
     // ---- ② 圆点：先降级再 color-mix ----
     const dotRule = stripComments(
@@ -834,13 +861,11 @@ describe("natural organic style", () => {
       const fieldOf = (token: string) =>
         token.replace(/^--color-/, "").replace(/-([a-z])/g, (_, c: string) => c.toUpperCase());
 
-      const stops: { token: string; hex: string }[] = [];
-      for (const token of backgroundTokens) {
-        const hex = tokens[fieldOf(token)];
-        expect(hex, `预设 ${preset} 的色板里没有 ${token}（${fieldOf(token)}）`).toBeTruthy();
-        stops.push({ token, hex });
-      }
-      const darkest = stops.reduce((a, b) => (luminance(b.hex) < luminance(a.hex) ? b : a));
+      const backdrop = tokens[fieldOf(backdropToken!)];
+      expect(
+        backdrop,
+        `预设 ${preset} 的色板里没有 ${backdropToken}（${fieldOf(backdropToken!)}）`
+      ).toBeTruthy();
 
       const brandText = tokens.brandText;
       expect(brandText, `预设 ${preset} 的色板里没有 brandText`).toBeTruthy();
@@ -875,11 +900,12 @@ describe("natural organic style", () => {
         ).toBeLessThanOrEqual(0.85);
       });
 
-      // (c) 真正的门槛：压在**最暗**背景端点上的非文本 UI 图形对比度。
-      const ratio = contrast(dot, darkest.hex);
+      // (c) 真正的门槛：非文本 UI 图形压在实际背景上的对比度。
+      //     底色透明之后背景就是消息流底色（`backdropToken`），不再是浮标自己的圆底。
+      const ratio = contrast(dot, backdrop);
       expect(
         ratio,
-        `预设 ${preset}：前景色 ${dot} 压在最暗背景端点 ${darkest.token}=${darkest.hex} 上` +
+        `预设 ${preset}：前景色 ${dot} 压在 ${backdropToken}=${backdrop} 上` +
           `只有 ${ratio.toFixed(2)}:1，低于 3:1`
       ).toBeGreaterThanOrEqual(3);
     }

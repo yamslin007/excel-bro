@@ -137,9 +137,16 @@ if (!dotClass || !anchorClass || !anchorMarkup) {
 /**
  * 下面这些数字**全部从源文件算出来**，不在脚本里重写一遍常量：
  *   - 前景色的色值   ← `:root` 与 useTheme.ts 四个预设里的 `--color-progress-glyph`
- *   - 外圈用到的令牌 ← styles.css 里**按钮自身规则体**（含 `:hover`/`:active`）的 `background`
+ *   - 浮标自己画不画底 ← styles.css 里**按钮自身规则体**（含 `:hover`/`:active`）
+ *   - 字形压在什么上   ← styles.css 的 `.message-stream` 底色**令牌名**
  *   - 令牌的色值     ← useTheme.ts 的四个预设
  * 预览页因此不会和实现各说各话：改了设计，页面上的数字跟着变。
+ *
+ * 底色在 2026-10-24 由用户裁决改为**透明**，所以「压在什么上」不再是浮标自己的
+ * 渐变端点，而是它后面那块消息流底色 —— 和 `styles.test.ts` 的取法完全一致。
+ * 早先这里还会从按钮的 `background` 里抽令牌、取"最暗端点"；底色一透明，那段
+ * 抽取会得到空数组，`reduce` 直接抛错。**别把它写成"空就跳过"**：那等于预览页
+ * 悄悄退化成一张没有对比度结论的图。
  *
  * 前景色**不再**从 `color-mix()` 现算 —— 那是踩过的坑：同一个属性上的 color-mix
  * 一旦算不出值，`background` 会落到 `transparent`、图形整个消失（界面上就是
@@ -153,11 +160,16 @@ if (!rootGlyph) {
 }
 
 /**
- * 收令牌必须**只取按钮自身的规则体**（`.new-progress-button` 与它的 `:hover`/`:active`），
- * 不能扫整个浮标区块：区块里还夹着圆点 / 锚两条字形规则，它们的取色声明里含
- * `var(--color-progress-glyph)` —— 那是**前景图形自己的颜色**，一旦混进来就会被当成
- * "渐变的一个端点"，表格里的"最暗端"会直接变成前景色，算出一个既非外圈、
- * 又毫无意义的对比度。这里和 `styles.test.ts` 的取法保持一致。
+ * 先确认**浮标自己一个底都不画**（那正是 2026-10-24 的裁决），再从消息流读底色令牌。
+ *
+ * 为什么还要单独断言：这段逻辑以前是从按钮规则里抽 `background` 的令牌当"外圈"，
+ * 底改成透明之后那条路会**静默得到空集合**。与其让它退化，不如在"又有人画了底"
+ * 或"定位不到消息流"时当场报错 —— 预览页的数字必须有出处。
+ *
+ * 只取**按钮自身**的规则体（`.new-progress-button` 与它的 `:hover`/`:active`），
+ * 不能扫整个浮标区块：区块里还夹着圆点 / 锚两条字形规则，它们的取色声明是
+ * **前景图形自己的颜色**，混进来就会被当成"背景"，算出一个毫无意义的对比度。
+ * 这里和 `styles.test.ts` 的取法保持一致。
  */
 const buttonRules = [
   ...pillBlock.matchAll(/\.new-progress-button(?::[-a-z()]+)?\s*\{([^}]*)\}/gs)
@@ -167,20 +179,30 @@ if (buttonRules.length < 2) {
     `按钮自身规则块只切到 ${buttonRules.length} 个，浮标区块的结构可能变了（至少要含常态 + :hover）`
   );
 }
-
-const GLYPH_TOKENS = ["--color-progress-glyph", "--color-brand-text"];
-const backgroundTokens = [
-  ...new Set(
-    buttonRules
-      .flatMap((rule) => [...rule.matchAll(/background:\s*([^;]+);/g)].map((m) => m[1]))
-      .flatMap((value) => [...value.matchAll(/var\((--color-[a-z-]+)\)/g)].map((x) => x[1]))
-  )
-];
-const leaked = backgroundTokens.filter((token) => GLYPH_TOKENS.includes(token));
-if (leaked.length > 0) {
+const buttonRuleBodies = buttonRules.map((rule) =>
+  // 注释里会出现 `background` 这类词，先剥掉，免得把说明文字当成声明。
+  rule.replace(/\/\*[\s\S]*?\*\//g, "")
+);
+const paintedBackdrops = buttonRuleBodies
+  .flatMap((rule) => [...rule.matchAll(/background:\s*([^;]+);/g)].map((m) => m[1].trim()))
+  .filter((value) => value !== "transparent");
+if (paintedBackdrops.length > 0) {
   throw new Error(
-    `外圈令牌里混进了 ${leaked.join("、")}（前景图形自己的颜色）—— ` +
-      "说明按钮规则体的切法把字形规则也吃进来了"
+    `浮标不该画底（用户已裁决改为透明），但按钮规则里还有：${paintedBackdrops.join("、")}`
+  );
+}
+const GLYPH_TOKENS = ["--color-progress-glyph", "--color-brand-text"];
+const streamRule = (styles.match(/\.message-stream \{([^}]*)\}/s)?.[1] ?? "").replace(
+  /\/\*[\s\S]*?\*\//g,
+  ""
+);
+const backdropToken = streamRule.match(/background:\s*var\((--color-[a-z-]+)\);/)?.[1];
+if (!backdropToken) {
+  throw new Error("找不到 .message-stream 的底色令牌 —— 字形压在什么上就没有出处了");
+}
+if (GLYPH_TOKENS.includes(backdropToken)) {
+  throw new Error(
+    `${backdropToken} 是前景图形自己的颜色，不能当背景 —— 说明 .message-stream 的取法错了`
   );
 }
 const fieldOf = (token) =>
@@ -201,8 +223,11 @@ const channelsOf = (hex) => [0, 2, 4].map((i) => parseInt(hex.slice(1 + i, 3 + i
 
 const rows = presetNames.map((name) => {
   const palette = presets[name];
-  const stops = backgroundTokens.map((token) => [token, palette[fieldOf(token)]]);
-  const darkest = stops.reduce((a, b) => (luminance(b[1]) < luminance(a[1]) ? b : a));
+  // 底色透明 ⇒ 字形真正压的是消息流底色，每个预设一个值，不再是"渐变里取最暗端点"。
+  const backdrop = palette[fieldOf(backdropToken)];
+  if (!backdrop) {
+    throw new Error(`预设 ${name} 的色板里没有 ${backdropToken}（${fieldOf(backdropToken)}）`);
+  }
   const glyph = palette.progressGlyph;
   // 前景色相对主题色的压深比例（逐通道一致，取平均只为在表格里显示一行字）。
   const deepen =
@@ -210,11 +235,10 @@ const rows = presetNames.map((name) => {
   return {
     name,
     palette,
-    stops,
-    darkest,
+    backdrop,
     glyph,
     deepen,
-    ratio: contrast(glyph, darkest[1])
+    ratio: contrast(glyph, backdrop)
   };
 });
 const worstRow = rows.reduce((a, b) => (b.ratio < a.ratio ? b : a));
@@ -382,20 +406,20 @@ ${anchorButton}
   <div class="note">
     <p><strong>两个字形、一个控件、一种取色。</strong>运行中是三颗点（会动，表达"下面还在长东西"）；跑完换成锚（不动，表达"东西停在那儿、点我下去"）。两者共用前景令牌 <code>--color-progress-glyph</code> —— 同一层浅色底，换个字形不该换种颜色。状态标在按钮的 <code>data-mode="running|idle"</code> 上。</p>
     <p><strong>聚合那一拍为什么读得出来。</strong>半径在 45%–55% 收到 <code>0</code>，三颗点同心重叠 —— 因为同色，最大的 8px 完全盖住 5 / 6px 那两颗，视野里就是<strong>一颗</strong>圆点。这一刻外层自转看不见（绕自身中心转一个点等于没转），所以"合成一颗"不会被旋转打散。</p>
-    <p><strong>外圈是"卡片那种浅绿"，不是某一种绿。</strong>用的是 <code>.activity-card</code> 同族令牌（${backgroundTokens.map((t) => `<code>${t}</code>`).join(" → ")}），四个预设各自给出本主题的浅色调。外圈背景里<strong>一个写死色值都没有</strong> —— 这就是"跟随主题"的含义，也是它以前是固定 <code>#1f1f1f</code> 时最大的问题。</p>
-    <p><strong>前景色为什么是"压深过的主题色"。</strong>直接拿主题色压在这条渐变上，四个预设里有两个过不了非文本 UI 图形 <strong>3:1</strong> 的门槛（WCAG 1.4.11）：warm-orange 只有 2.58、vivid-green 2.93。而且这不是"渐变太深"造成的 —— warm-orange 的品牌色压在<strong>纯白</strong>上也才 3.16，它本身就是中调橙，把底色调得更浅也救不回来。所以做法是同色相<strong>压深</strong>：只降明度、不动色相。锚用同一个令牌，所以下面这四组对比度对它同样成立。</p>
+    <p><strong>浮标<strong>不画底</strong>，字形直接压在消息流上。</strong>2026-10-24 用户裁决：「把这个锚的图标改一下，背景改为透明的」—— 42px 的浅色圆会把底下一行字切掉一段（截图里正好压着"…并移除了审阅标记"）。所以按钮只有 <code>background: transparent</code>、<code>box-shadow: none</code>，命中区域仍是 42px；悬停/按下也不许把底补回来（悬停只换光标，按下缩到 0.94）。下面那张表里的"背景"就是它后面那块消息流的 <code>${backdropToken}</code>。</p>
+    <p><strong>前景色为什么是"压深过的主题色"。</strong>直接拿主题色压在这个底上，四个预设里有两个过不了非文本 UI 图形 <strong>3:1</strong> 的门槛（WCAG 1.4.11）：warm-orange 只有 2.58、vivid-green 2.93。而且这不是"底色太深"造成的 —— warm-orange 的品牌色压在<strong>纯白</strong>上也才 3.16，它本身就是中调橙，把底色调得更浅也救不回来。所以做法是同色相<strong>压深</strong>：只降明度、不动色相。锚用同一个令牌，所以下面这四组对比度对它同样成立。</p>
     <p><strong>压深做成显式令牌，不用 <code>color-mix()</code> 现算。</strong>这不是"怕老引擎"那么简单 —— <code>background:</code> 上写"降级行 + color-mix 行"<strong>救不了</strong>：两条是同一个属性，color-mix 那条赢在层叠、只是<strong>算不出值</strong>，于是 <code>background</code> 落到初始值 <code>transparent</code>，图形<strong>整个消失</strong>，界面上就是"外圈正常、里面空的"。现在读 <code>--color-progress-glyph</code>，任何引擎都拿得到确定值。</p>
     <table>
-      <tr><th>预设</th><th>外圈渐变最暗端</th><th>前景图形</th><th>对比度</th></tr>
+      <tr><th>预设</th><th>字形背后的底色</th><th>前景图形</th><th>对比度</th></tr>
       ${rows
         .map(
           (row) =>
-            `<tr><td>${row.name}</td><td><span class="swatch" style="background:${row.darkest[1]}"></span><code>${row.darkest[1]}</code><br><small>${row.darkest[0]}</small></td><td><span class="swatch" style="background:${row.glyph}"></span><code>${row.glyph}</code><br><small>${row.palette.brandText} × ${(row.deepen * 100).toFixed(0)}%</small></td><td><strong>${row.ratio.toFixed(2)}:1</strong></td></tr>`
+            `<tr><td>${row.name}</td><td><span class="swatch" style="background:${row.backdrop}"></span><code>${row.backdrop}</code><br><small>${backdropToken}</small></td><td><span class="swatch" style="background:${row.glyph}"></span><code>${row.glyph}</code><br><small>${row.palette.brandText} × ${(row.deepen * 100).toFixed(0)}%</small></td><td><strong>${row.ratio.toFixed(2)}:1</strong></td></tr>`
         )
         .join("\n      ")}
     </table>
-    <p>最坏的是 <strong>${worstRow.name}</strong>，${worstRow.ratio.toFixed(2)}:1，仍过门槛。这里取的是渐变里<strong>最暗的那个端点</strong>而不是常态端点：悬停/按下会把渐变整体压深，而三颗点是在半径 13px 上环绕的、会扫到圆边，所以最坏情况不是圆心那一点。</p>
-    <p>这条不变量由 <code>apps/excel-addin/src/styles.test.ts</code> 守卫（改令牌、改色板、改压深比例、把锚换成别的取色都会重算），判别力由 <code>scripts/run_progress_dot_contrast_mutations.mjs</code> 的七个反向变异证明。</p>
+    <p>最坏的是 <strong>${worstRow.name}</strong>，${worstRow.ratio.toFixed(2)}:1，仍过门槛。底色只剩一个令牌、一个值，不再有"渐变最暗端点"这种取法（三颗点扫到圆边那点顾虑也随底色一起消失了）。</p>
+    <p>这条不变量由 <code>apps/excel-addin/src/styles.test.ts</code> 守卫（改令牌、改色板、改压深比例、把锚换成别的取色、把底或投影画回来都会重算），判别力由 <code>scripts/run_progress_dot_contrast_mutations.mjs</code> 的八个反向变异证明。</p>
   </div>
 </div>
 
@@ -417,12 +441,11 @@ function applyPreset(name) {
   root.setProperty("--color-brand-hover", p.brandHover);
   root.setProperty("--color-progress-glyph", p.progressGlyph);
   root.setProperty("--color-border", p.border);
-  /* 浮标外圈不画边（用户裁决）：作者侧那条边框声明已删，并显式写了 border: none
-     把浏览器 UA 给 <button> 的默认边框按回去（不写它浅绿圆外会冒黑环）。外圈的
-     边界靠渐变本身 + --shadow-md —— 所以这条投影必须跟着预设走，否则预览里的
-     浮标会用默认预设的灰影假象。
-     --color-border-strong 本身已不被浮标引用，仍一并设上：它属于主题令牌集，
-     哪天页面又用它，不至于停在默认预设上。 */
+  /* 浮标不画底、不画边、也不投影（2026-10-24 裁决）：作者侧那条边框声明已删，
+     并显式写了 border: none 把浏览器 UA 给 <button> 的默认边框按回去（不写它
+     透明底外会冒黑环）。
+     --shadow-md 与 --color-border-strong 本身已不被浮标引用，仍一并设上：它们
+     属于主题令牌集（同页的卡片还在用），留着免得哪天页面又用到时停在默认预设上。 */
   root.setProperty("--color-border-strong", p.borderStrong);
   root.setProperty("--shadow-md", p.shadowMd);
 }

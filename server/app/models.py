@@ -2799,6 +2799,23 @@ class WpsRecoveryActionDescriptor(BaseModel):
         return value
 
 
+class WpsResumeSource(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    sheetName: str = Field(min_length=1, max_length=31)
+    range: str = Field(max_length=40, pattern=r"^\$?[A-Z]{1,3}\$?[1-9]\d*(?::\$?[A-Z]{1,3}\$?[1-9]\d*)?$")
+    rowCount: int = Field(ge=1, le=1048576)
+    columnCount: int = Field(ge=1, le=16384)
+    previewFingerprint: str = Field(max_length=80, pattern=r"^v2:\d+:[0-9a-f]{8}$")
+    valueFingerprint: str = Field(max_length=80, pattern=r"^v2:\d+:[0-9a-f]{8}$")
+
+
+class WpsResumeContext(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    version: Literal[1] = 1
+    hostVersion: str = Field(min_length=1, max_length=80)
+    sources: list[WpsResumeSource] = Field(min_length=1, max_length=500)
+
+
 class WpsRecoveryDescriptor(BaseModel):
     """WPS 写入的**恢复描述**：服务端账本里关于"要写什么"的全部内容。
 
@@ -2806,13 +2823,14 @@ class WpsRecoveryDescriptor(BaseModel):
     并落进 ``office_executions.plan_json``。这里改成只保存恢复判定必需的元数据：
     动作类型、目标工作表与区域、目标形状、目标指纹，以及动作序列（进度基准）。
 
-    恢复功能**不得**为"能精确续跑"而放宽这条约束 —— 值矩阵只停在本机内存，
-    宁可让续跑能力受限，也不让单元格内容落盘。
+    恢复功能**不得**为"能精确续跑"而放宽这条约束 —— 值矩阵不进入服务端账本。
+    本机既有撤销记录可被受控续跑复用，来源描述仅包含定位、形状与指纹。
     """
 
     model_config = ConfigDict(extra="forbid")
 
     actions: list[WpsRecoveryActionDescriptor] = Field(min_length=1, max_length=500)
+    resumeContext: WpsResumeContext | None = None
 
 
 class WpsExecutionRegisterRequest(BaseModel):

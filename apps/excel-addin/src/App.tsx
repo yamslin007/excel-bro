@@ -1,3 +1,6 @@
+import { RecoveryProbeControl } from "@excel-bro/core/RecoveryProbeControl";
+import { bindRecoveryProbe, interruptRecoveryProbe } from "@excel-bro/core/recoveryProbe";
+import { prepareExcelValueCopies } from './excelValueCopyPlan';
 import { TaskExecutionControls } from "./components/TaskExecutionControls";
 import { acceptsPlanningReplay, planningReceivedSequence, waitForPlanning } from "@excel-bro/core/planningReplay";
 import {
@@ -40,7 +43,7 @@ import {
 } from "react";
 import { ResultReview } from '@excel-bro/core/resultReview';
 import { ResultReviewBar } from './components/ResultReviewBar';
-import { captureExcelBeforeResult, showExcelBeforeResult, closeExcelNativeComparison, type ExcelBeforeResult } from './excelNativeComparison';
+import { excelRecoveryBeforeResult, captureExcelBeforeResult, showExcelBeforeResult, closeExcelNativeComparison, type ExcelBeforeResult } from './excelNativeComparison';
 import { markExcelResult, clearExcelResultMarks, recoverExcelResultMarks, type ExcelResultMarks } from './resultReviewMarkers';
 import type { PlanExecutionResult, ExecutionUndoSnapshot } from './contracts';
 import {
@@ -842,6 +845,7 @@ export default function App() {
   const [activePlanId, setActivePlanId] = useState<string | null>(null);
   const nativeComparison = useExcelNativeComparison();
   type ResultReceipt = { executionId: string; verified: boolean; undoable: boolean; undo: ExecutionUndoSnapshot | null };
+  const [resumedReviewTitle, setResumedReviewTitle] = useState('');
   const [resultReview] = useState(() => new ResultReview<ExcelBeforeResult, ResultReceipt, ExcelResultMarks, ExcelNativeComparison>());
   /*
    * 刷新/重载后认领**上一次**遗留的审阅标记。
@@ -1625,6 +1629,7 @@ export default function App() {
   useEffect(() => {
     if (!resultCandidate || status !== 'idle' || nativeComparison.pending || resultReviewState.pending || resultReviewState.phase === 'reviewing') return;
     const candidate = resultCandidate;
+    setResumedReviewTitle('');
     const planKey = JSON.stringify(candidate.plan), scope = JSON.stringify([...candidate.authorization].sort());
     const isCurrent = () => {
       const now = resultLive.current;
@@ -1632,18 +1637,23 @@ export default function App() {
         now.authorization === scope && now.conversationId === candidate.conversationId &&
         now.messages.some(message => message.id === candidate.id && JSON.stringify(message.plan) === planKey);
     };
+    let executionPlan = candidate.plan;
     void resultReview.start(candidate.id, {
       isCurrent,
       prepare: async () => {
         if (sdkBridge.failure()) throw new Error('本轮本地读取未通过现场核对，请重新读取后生成结果；原表未写入。');
         if (!(await targetGuard.check()) || !isCurrent()) throw new Error('当前计划或授权已变化，未执行。');
         unmarkPlanVerified(candidate.plan.id);
-        return captureExcelBeforeResult(candidate.plan, candidate.authorization);
+        executionPlan = await prepareExcelValueCopies(candidate.plan, candidate.authorization, candidate.identity, isCurrent);
+        const issue = resultReviewPlanIssue(executionPlan, candidate.authorization);
+        if (issue) throw new Error(issue);
+        if (!isCurrent()) throw new Error('当前计划或授权已变化，未执行。');
+        return captureExcelBeforeResult(executionPlan, candidate.authorization);
       },
       execute: async () => {
         let observed: PlanExecutionResult | null = null;
-        const succeeded = await runPlan(candidate.plan, undefined, false, false, undefined,
-          { plan: candidate.plan, authorization: candidate.authorization, workbookIdentity: candidate.identity,
+        const succeeded = await runPlan(executionPlan, undefined, false, false, undefined,
+          { plan: executionPlan, authorization: candidate.authorization, workbookIdentity: candidate.identity,
             requestMessageId: candidate.id },
           result => { observed = result; });
         const result = observed as PlanExecutionResult | null;
@@ -1651,9 +1661,9 @@ export default function App() {
         return { executionId: result.undoSnapshot?.executionId ?? '', verified: result.verification.status === 'verified',
           undoable: result.undoSnapshot?.postStateCoverage === 'complete', undo: result.undoSnapshot ?? null };
       },
-      mark: () => markExcelResult(candidate.plan, candidate.identity),
+      mark: () => markExcelResult(executionPlan, candidate.identity),
       clearMarker: clearExcelResultMarks,
-      showBefore: before => showExcelBeforeResult(before, candidate.identity, candidate.plan, candidate.authorization),
+      showBefore: before => showExcelBeforeResult(before, candidate.identity, executionPlan, candidate.authorization),
       comparisonNotice: copy => copy.comparisonNotice ?? null,
       closeBefore: async copy => {
         const outcome = await closeExcelNativeComparison(copy);
@@ -2590,6 +2600,7 @@ export default function App() {
         throw new Error("服务端没有授予本次 Office 续跑写入权。");
       }
 
+      const resumedFromActionIndex = state.nextActionIndex;
       setActivePlanId(state.plan.id);
       const result = await executePlan(state.plan, {
         authorizedSheetNames: state.authorizedSheetNames,
@@ -2635,13 +2646,42 @@ export default function App() {
       clearPendingOfficeExecution(state.operationId);
       updateFolderResumeMessage(message.id, (current) => ({
         ...current,
-        text: `Office 任务已从第 ${resume.nextActionIndex + 1} 步继续并完成；已提交每一步的写入回执。`,
+        text: `Office 任务已从第 ${resumedFromActionIndex + 1} 步继续并完成；已提交每一步的写入回执。`,
         verification: result.verification,
         executedPlanId: completedPlanId,
         executedExecutionId: result.undoSnapshot?.executionId,
         officeResume: undefined
       }));
       await scan();
+      const completed = state;
+      const undo = result.undoSnapshot ?? null;
+      const facts = {...resultLive.current};
+      setResumedReviewTitle(completed.plan.title);
+      await resultReview.adoptCompleted(`recovered:${completed.operationId}`,
+        undo ? excelRecoveryBeforeResult(completed.plan, undo, completed.authorizedSheetNames) : {comparisonUnavailable:'恢复记录不可用。'},
+        {executionId:completed.operationId,verified:result.verification.status === 'verified',
+          undoable:undo?.postStateCoverage === 'complete',undo}, {
+          isCurrent: () => currentOfficeWorkbookIdentity() === completed.workbookIdentity &&
+            resultLive.current.workbookIdentity === completed.workbookIdentity &&
+            resultLive.current.authorization === facts.authorization &&
+            resultLive.current.conversationId === facts.conversationId,
+          mark: () => markExcelResult(completed.plan, completed.workbookIdentity),
+          clearMarker: clearExcelResultMarks,
+          showBefore: before => showExcelBeforeResult(before, completed.workbookIdentity, completed.plan, completed.authorizedSheetNames),
+          comparisonNotice: copy => copy.comparisonNotice ?? '恢复对比展示原始单元格值及公式文本；不重算公式，不作为原始格式对比。',
+          closeBefore: async copy => {
+            const outcome = await closeExcelNativeComparison(copy);
+            return outcome === 'closed' || outcome === 'already_closed' ? null : '执行前副本仍保留，请手动核对。';
+          },
+          restore: async receipt => {
+            if (!(await resultUndo.current(receipt.executionId))) throw new Error('恢复未成功，当前结果仍保留。');
+          },
+          validateResult: async receipt => {
+            if (!receipt.undo) throw new Error('恢复记录不可用。');
+            await Excel.run(context => assertUndoPostState(context, receipt.undo!));
+          },
+          accepted: () => markPlanVerified(completed.plan.id)
+        });
       finishActivity(
         result.verification.status === "verified" ? "completed" : "warning",
         "Office 断点任务已完成"
@@ -4521,7 +4561,7 @@ export default function App() {
    * - **只读授权工作表**：源表不在本次已勾选范围内就拒绝，不自动扩大授权；
    * - **源值不外发**：读出的值只在本端计算，算好的矩阵不回传服务端；
    * - **不放宽写入闸门**：产出的仍是普通 `AnalysisPlan`，照常进预览卡、
-   *   等用户点"执行到 Excel"才写入，并沿用既有的回读与撤销。
+   *   通过授权与恢复准备后自动写入，再回读审阅；确认不重复执行。
    */
   async function localMappingPlanFromRule(
     response: Extract<AssistantResponse, { kind: "local_plan_rule" }>,
@@ -7515,6 +7555,7 @@ export default function App() {
       } else {
         recoveryLimitation = `${recoverySupport.reason ?? "该计划包含复杂对象操作"}；本次不承诺跨重启自动续跑。`;
       }
+      bindRecoveryProbe((import.meta.env.DEV || import.meta.env.VITE_ENABLE_RECOVERY_PROBE === "true"), currentOfficeWorkbookIdentity(), operationId, plan.actions, Boolean(officeState?.ownerToken));
       const result = await executePlan(plan, {
         /*
        * 直接执行**也**挂 `beforeFirstWrite`：这就是"只跳过副本比对"的落点。
@@ -7553,6 +7594,7 @@ export default function App() {
                   if (!officeState?.ownerToken) {
                     throw new Error("Office 写入权已经失效");
                   }
+                  interruptRecoveryProbe((import.meta.env.DEV || import.meta.env.VITE_ENABLE_RECOVERY_PROBE === "true"), operationId, actionIndex);
                   officeState = await completeOfficeAction(operationId, {
                     expectedRevision: officeState.revision,
                     ownerToken: officeState.ownerToken,
@@ -11304,12 +11346,16 @@ export default function App() {
                           : "验证后保存"}
                       </button>
                     )}
-                    {!message.staleSourceConfirm && !isWorksheetDeletion(message.plan) && nativeComparison.review?.messageId !== message.id && (sourceMode !== "workbook" || !workbook || resultReviewPlanIssue(message.plan, selectedNamesFor(workbook)) !== null) && (
+                    {!message.staleSourceConfirm && !isWorksheetDeletion(message.plan) && nativeComparison.review?.messageId !== message.id && (sourceMode !== "workbook" || !message.plan.actions.some(action => action.type === "copyRange")) && (sourceMode !== "workbook" || !workbook || resultReviewPlanIssue(message.plan, selectedNamesFor(workbook)) !== null) && (
                       <button className="primary-button" disabled={busy} onClick={() => void runPlan(message.plan!)}>
                         {status === "executing" && activePlanId === message.plan.id ? "正在执行..." : "执行到 Excel"}
                       </button>
                     )}
                   </div>
+                  {sourceMode === "workbook" && workbook && !message.staleSourceConfirm && message.plan.actions.some(action => action.type === "copyRange") &&
+                    resultReviewPlanIssue(message.plan, selectedNamesFor(workbook)) !== null && (
+                      <p role="status">{resultReviewPlanIssue(message.plan, selectedNamesFor(workbook))}</p>
+                    )}
                   {!resultMessages.current.has(message.id) && !message.staleSourceConfirm && (nativeComparison.review?.messageId === message.id ||
                     (sourceMode === "workbook" && workbook && !isWorksheetDeletion(message.plan) && resultReviewPlanIssue(message.plan, selectedNamesFor(workbook)) === null)) && (
                     <ExcelNativeReviewActions messageId={message.id} plan={message.plan}
@@ -11514,7 +11560,7 @@ export default function App() {
       )}
 
       <footer className="composer">
-        <ResultReviewBar state={resultReviewState} title={resultCandidate?.plan.title ?? ''}
+        <ResultReviewBar state={resultReviewState} title={resumedReviewTitle || resultCandidate?.plan.title || ''}
           onCompare={() => void resultReview.compare(resultReviewState.key ?? '')}
           onConfirm={() => void resultReview.confirm(resultReviewState.key ?? '')}
           onDiscard={() => void resultReview.discard(resultReviewState.key ?? '')}
@@ -12229,6 +12275,7 @@ export default function App() {
             )}
           </div>
         </div>
+        {(import.meta.env.DEV || import.meta.env.VITE_ENABLE_RECOVERY_PROBE === "true") && <RecoveryProbeControl identity={resultWorkbookIdentity} disabled={busy} />}
       </footer>
       {petVisible && <PetCompanion busy={busy} />}
       <ThemePanel

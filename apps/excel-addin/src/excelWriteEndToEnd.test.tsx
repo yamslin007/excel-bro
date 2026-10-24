@@ -412,6 +412,7 @@ const BRIDGE_FP = "c".repeat(64);
 
 interface PlanTurnOptions {
   pauseBeforePlan?: boolean;
+  probe?: boolean;
   /** 通过真实范围选择弹层建立的授权范围。 */
   authorize?: string[];
   /** 让本轮真的经工具桥读一次宿主，从而产生可信来源记录。 */
@@ -513,6 +514,10 @@ async function sendPlan(
     ).toContain("当前模型")
   );
   if (options.authorize) await setAuthorizedScope(view, options.authorize);
+  if (options.probe) {
+    view.container.querySelector("details.recovery-probe-control")!.setAttribute("open", "");
+    fireEvent.click(await view.findByRole("button", {name:"启用下一次第二步中断"}));
+  }
   fireEvent.change(view.container.querySelector(".composer textarea")!, {
     target: { value: prompt }
   });
@@ -615,6 +620,111 @@ async function clickSave(view: ReturnType<typeof render>) {
 const text = (view: ReturnType<typeof render>) => view.container.textContent ?? "";
 
 describe("主表执行结果审阅（真实 App/执行器，宿主与网络替身）", () => {
+  it.each(["confirm", "discard", "sourceChanged"])("acceptance entry interrupts after second write; remount %s", async outcome => {
+    const sourceChanged = outcome === "sourceChanged";
+    [111,222,333].forEach((v,i)=>host.setCell(SHEET, `B${i+2}`, v));
+    [-101,-202,-303].forEach((v,i)=>host.setCell(TARGET, `B${i+2}`, v));
+    let state: Awaited<ReturnType<typeof getOfficeExecutionStatus>>;
+    vi.mocked(registerOfficeExecution).mockImplementation(async req => {
+      state={...req,status:"running",revision:1,nextActionIndex:0,inFlightActionIndex:null,
+        checkpoint:null,beforeSnapshot:null,canResume:false,requiresReconciliation:false,ownerToken:"owner"} as typeof state;
+      return state;
+    });
+    vi.mocked(startOfficeAction).mockImplementation(async (_id,req)=>{
+      state={...state,revision:state.revision+1,inFlightActionIndex:req.actionIndex,beforeSnapshot:req.beforeSnapshot,requiresReconciliation:true};return state;
+    });
+    vi.mocked(completeOfficeAction).mockImplementation(async(_id,req)=>{
+      state={...state,revision:state.revision+1,inFlightActionIndex:null,nextActionIndex:req.actionIndex+1,checkpoint:req.checkpoint,requiresReconciliation:false};return state;
+    });
+    vi.mocked(suspendOfficeExecution).mockImplementation(async()=>{
+      state={...state,status:"needs_reconciliation",revision:state.revision+1,ownerToken:undefined,canResume:true};return state;
+    });
+    vi.mocked(getOfficeExecutionStatus).mockImplementation(async()=>state);
+    vi.mocked(reconcileOfficeActionReceipt).mockImplementation(async(_id,req)=>{
+      expect(req.actionIndex).toBe(1);expect(req.outcome).toBe("applied");
+      state={...state,status:"running",revision:state.revision+1,ownerToken:"new-owner",nextActionIndex:2,
+        inFlightActionIndex:null,requiresReconciliation:false,checkpoint:req.checkpoint!};return state;
+    });
+    vi.mocked(finishOfficeExecution).mockImplementation(async()=>({...state,status:"completed"}));
+    const plan={id:"probe-three",title:"三次值复制",summary:"复制到目标表",assumptions:[],warnings:[],
+      actions:[2,3,4].map(r=>({type:"copyRange",sheet:TARGET,sourceSheet:SHEET,sourceRange:`B${r}`,
+        targetRange:`B${r}`,copyType:"values",skipBlanks:false,transpose:false}))};
+    const view=await sendPlan(plan,"依次执行三个值复制",{authorize:[SHEET,TARGET],probe:true});
+    await waitFor(()=>expect(suspendOfficeExecution).toHaveBeenCalledTimes(1));
+    expect([2,3,4].map(r=>host.cell(TARGET,`B${r}`))).toEqual([111,222,-303]);
+    expect(vi.mocked(completeOfficeAction).mock.calls.map(c=>c[1].actionIndex)).toEqual([0]);
+    expect(state!.nextActionIndex).toBe(1);expect(state!.inFlightActionIndex).toBe(1);
+    expect(loadPendingOfficeExecution()?.operationId).toBe(state!.operationId);
+    const before=contentWrites(host.originalWrites());expect(before).toHaveLength(2);
+    view.unmount();
+    if (sourceChanged) host.setCell(SHEET,"B3",999);
+    const reopened=render(<App/>);
+    const button=await reopened.findByRole("button",{name:"核对并继续"});
+    await waitFor(()=>expect((button as HTMLButtonElement).disabled).toBe(false));fireEvent.click(button);
+    if (sourceChanged) {
+      await waitFor(()=>expect(text(reopened)).toContain("数据来源在预览后发生了变化"));
+      expect(finishOfficeExecution).not.toHaveBeenCalled();
+      expect(contentWrites(host.originalWrites())).toEqual(before);
+      expect(loadPendingOfficeExecution()).not.toBeNull();return;
+    }
+    await waitFor(()=>expect(finishOfficeExecution, text(reopened)).toHaveBeenCalledTimes(1));
+    expect(contentWrites(host.originalWrites()).slice(before.length).map(w=>w.address)).toEqual(["B4"]);
+    expect([2,3,4].map(r=>host.cell(TARGET,`B${r}`))).toEqual([111,222,333]);
+    expect(vi.mocked(startOfficeAction).mock.calls.map(c=>c[1].actionIndex)).toEqual([0,1,2]);
+    expect(vi.mocked(completeOfficeAction).mock.calls.map(c=>c[1].actionIndex)).toEqual([0,2]);
+    expect(registerOfficeExecution).toHaveBeenCalledTimes(1);expect(loadPendingOfficeExecution()).toBeNull();
+    await stageReview(reopened);
+    expect(reopened.container.querySelector('.result-review-bar')?.textContent).not.toContain('执行未完成');
+    expect(text(reopened)).toContain('从第 3 步继续并完成');
+    const writes=contentWrites(host.originalWrites());
+    fireEvent.click(reopened.getByRole('button',{name:'双视图对比'}));
+    await waitFor(()=>expect(host.createWorkbookCalls()).toHaveLength(1));
+    const seed=host.seedEntries(0)['xl/worksheets/sheet1.xml'];
+    expect(seed).toContain('-101');expect(seed).toContain('-202');expect(seed).toContain('-303');
+    expect(contentWrites(host.originalWrites())).toEqual(writes);
+    if(outcome==='confirm') {
+      const confirm=reopened.getByRole('button',{name:'确认变更'});
+      await waitFor(()=>expect((confirm as HTMLButtonElement).disabled).toBe(false));fireEvent.click(confirm);
+      await waitFor(()=>expect(text(reopened)).toContain('已确认变更'));
+      expect(reopened.queryByRole('button',{name:'确认变更'})).toBeNull();
+      // This SharePoint host cannot close a native local copy; a settled cleanup notice is legitimate.
+      expect(reopened.container.querySelector('.result-review-bar')?.textContent ?? '').not.toContain('执行未完成');
+      expect(contentWrites(host.originalWrites())).toEqual(writes);
+    } else {
+      const discard=reopened.getByRole('button',{name:'放弃变更'});
+      await waitFor(()=>expect((discard as HTMLButtonElement).disabled).toBe(false));fireEvent.click(discard);
+      await waitFor(()=>expect(text(reopened)).toContain('已放弃并恢复'));
+      expect([2,3,4].map(r=>host.cell(TARGET,`B${r}`))).toEqual([-101,-202,-303]);
+    }
+    expect(host.conditionalFormatCount(TARGET)).toBe(0);
+  });
+
+  it.each(['confirm', 'discard'])('value copy automatically executes three actions before %s', async outcome => {
+    [111,222,333].forEach((v,i)=>host.setCell(SHEET, `B${i+2}`, v));
+    [-101,-202,-303].forEach((v,i)=>host.setCell(TARGET, `B${i+2}`, v));
+    const plan = {id:'auto-copy-three',title:'三次值复制',summary:'复制到目标表',assumptions:[],warnings:[],
+      actions:[2,3,4].map(r=>({type:'copyRange',sheet:TARGET,sourceSheet:SHEET,
+        sourceRange:`B${r}`,targetRange:`B${r}`,copyType:'values',skipBlanks:false,transpose:false}))};
+    const view = await sendPlan(plan, '依次复制三格，直接执行后审阅', {authorize:[SHEET,TARGET]});
+    await stageReview(view);
+    expect([2,3,4].map(r=>host.cell(TARGET,`B${r}`))).toEqual([111,222,333]);
+    expect(view.queryByRole('button',{name:'执行到 Excel'})).toBeNull();
+    expect(host.conditionalFormatCount(TARGET)).toBe(3);
+    const writes=contentWrites(host.originalWrites());
+    expect(writes).toHaveLength(3);
+    if(outcome==='confirm') {
+      await clickSave(view);
+      expect(contentWrites(host.originalWrites())).toEqual(writes);
+    } else {
+      fireEvent.click(view.getByRole('button',{name:'放弃变更'}));
+      await waitFor(()=>expect(text(view)).toContain('已放弃并恢复'));
+      expect([2,3,4].map(r=>host.cell(TARGET,`B${r}`))).toEqual([-101,-202,-303]);
+    }
+    expect(host.conditionalFormatCount(TARGET)).toBe(0);
+    expect([2,3,4].map(r=>host.cell(SHEET,`B${r}`))).toEqual([111,222,333]);
+    expect(view.container.querySelector('.scope-trigger')?.textContent).toContain('已固定 2 个工作表');
+  });
+
   it('固定三表授权在执行、确认和重新打开范围选择器后保持不变', async () => {
     const view = await sendPlan(targetPlan, '汇总结果', { authorize: ALL_SHEETS });
     await stageReview(view);
@@ -1183,7 +1293,7 @@ describe("Excel 写侧：中断后先核对再续跑", () => {
       },
       authorizedSheetNames: SCOPE,
       allowedExternalFiles: [],
-      nextActionIndex: 1,
+      nextActionIndex: 0,
       inFlightActionIndex: 0,
       beforeSnapshot: {
         actionIndex: 0,
@@ -1223,6 +1333,44 @@ describe("Excel 写侧：中断后先核对再续跑", () => {
     expect(loadPendingOfficeExecution()).toBeNull();
   });
 
+  it.each(["applied", "not_applied", "unknown"] as const)("A1 三动作中途断开：替身宿主现场核对为 %s 后不重写已完成动作", async (outcome) => {
+    host.setCell(TARGET, "A1", '="影片"', { asFormula: true });
+    host.setCell(TARGET, "B1", "=1200", { asFormula: true });
+    if (outcome === "applied") {
+      host.setCell(TARGET, "A2", '="乙"', { asFormula: true });
+      host.setCell(TARGET, "B2", "=980", { asFormula: true });
+    } else if (outcome === "unknown") {
+      host.setCell(TARGET, "A2", "人工改值");
+    }
+    const beforeWrites = contentWrites(host.originalWrites()).length;
+    const originalFirstRow = host.matrix(TARGET, "A1:B1");
+    const plan = { ...liveTargetPlan, sourceFingerprintSheets: SCOPE, sourceDependencySheets: [SHEET],
+      actions: [...liveTargetPlan.actions, { type: "writeFormulas" as const, sheet: TARGET, range: "A3:B3", formulas: [['="丙"', "=600"]] }] };
+    pendingIndex();
+    vi.mocked(getOfficeExecutionStatus).mockResolvedValue(resumeState({ plan, nextActionIndex: 1, inFlightActionIndex: 1,
+      beforeSnapshot: { ...resumeState().beforeSnapshot, actionIndex: 1, range: "A2:B2", formulas: [["", ""]], fillColor: "" } }) as never);
+    vi.mocked(reconcileOfficeActionReceipt).mockResolvedValue(resumeState({ plan,
+      nextActionIndex: outcome === "applied" ? 2 : 1, inFlightActionIndex: null, requiresReconciliation: false, revision: 3 }) as never);
+    const view = render(<App />);
+    const button = await view.findByRole("button", { name: "核对并继续" });
+    fireEvent.click(button);
+    if (outcome === "unknown") {
+      await waitFor(() => expect(text(view)).toContain("目标范围既不匹配执行前状态"));
+      expect(reconcileOfficeActionReceipt).not.toHaveBeenCalled();
+      expect(startOfficeAction).not.toHaveBeenCalled();
+      expect(contentWrites(host.originalWrites()).length).toBe(beforeWrites);
+      return;
+    }
+    await waitFor(() => expect(finishOfficeExecution).toHaveBeenCalledTimes(1));
+    expect(contentWrites(host.originalWrites()).slice(beforeWrites).map((write) => write.address))
+      .toEqual(outcome === "applied" ? ["A3:B3"] : ["A2:B2", "A3:B3"]);
+    expect(host.matrix(TARGET, "A1:B1")).toEqual(originalFirstRow);
+    expect(host.cell(TARGET, "A3")).toBe('="丙"');
+    expect(vi.mocked(startOfficeAction).mock.calls.map((call) => call[1].actionIndex))
+      .toEqual(outcome === "applied" ? [2] : [1, 2]);
+    expect(reconcileOfficeActionReceipt).toHaveBeenCalledWith(OPERATION_ID, expect.objectContaining({ actionIndex: 1, outcome }));
+  });
+
   it("在途动作先核对为「已写入」：跳过该步，只写剩余步骤，不重复写", async () => {
     // 头一步已经真的写进宿主了（回执丢失），第二部还没写。
     host.setCell(TARGET, "A1", "=\"影片\"", { asFormula: true });
@@ -1232,7 +1380,7 @@ describe("Excel 写侧：中断后先核对再续跑", () => {
     pendingIndex();
     vi.mocked(getOfficeExecutionStatus).mockResolvedValue(resumeState() as never);
     vi.mocked(reconcileOfficeActionReceipt).mockResolvedValue(
-      resumeState({ inFlightActionIndex: null, requiresReconciliation: false, revision: 3 }) as never
+      resumeState({ nextActionIndex: 1, inFlightActionIndex: null, requiresReconciliation: false, revision: 3 }) as never
     );
     vi.mocked(finishOfficeExecution).mockResolvedValue(
       officeLedgerState({ status: "finished", revision: 4 }) as never

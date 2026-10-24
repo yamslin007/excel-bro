@@ -1,3 +1,5 @@
+import {fixture as resumeHost, operationId as resumeOperationId} from "./wpsResume.testHost";
+import {executeWpsPlan} from "./wpsPlanExecutor";
 import { executeWorksheetDeletion, openWorksheetCheckpoint, confirmWorksheetCheckpointBackup, restoreWorksheetCheckpoint } from "../../excel-addin/src/api";
 import { readFileSync } from "node:fs";
 import { act, useEffect, useState, type ReactElement } from "react";
@@ -3858,6 +3860,25 @@ describe("WPS 写入耐久恢复（CAP-03）", () => {
     expect(finishWpsExecutionMock).toHaveBeenCalled();
   });
 
+  it("写入回执中断后不依赖窗格重挂载，立即在最新消息之后显示恢复入口", async () => {
+    const host = writeRangeHost();
+    completeWpsActionMock.mockRejectedValueOnce(new Error("lost action receipt"));
+    const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
+    await stageAndSave(container);
+    await until(() => container.querySelector(".wps-write-recovery") !== null,
+      "保留原页面的 WPS 窗格也必须发现刚中断的任务");
+    const card = container.querySelector(".wps-write-recovery")!;
+    const rows = container.querySelectorAll(".message-row");
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows[rows.length - 1].compareDocumentPosition(card) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(suspendWpsExecutionMock).toHaveBeenCalledTimes(1);
+    expect(completeWpsActionMock).toHaveBeenCalledTimes(1);
+    expect(finishWpsExecutionMock).not.toHaveBeenCalled();
+    expect(claimWpsExecutionResumeMock).not.toHaveBeenCalled();
+    expect(reconcileWpsActionReceiptMock).not.toHaveBeenCalled();
+    expect(host.cellValue()).toBe("90");
+  });
+
   it("本地发现索引只存白名单字段，不含计划、授权或矩阵", async () => {
     const host = writeRangeHost();
     registerWpsExecutionMock.mockResolvedValueOnce({
@@ -4025,6 +4046,85 @@ describe("WPS 写入耐久恢复（CAP-03）", () => {
     );
   }
 
+  it.each(["确认变更", "放弃变更"])("重开后点击真实续跑入口，仅写剩余动作，随后%s不重放计划", async outcome => {
+    const f = resumeHost();
+    await expect(executeWpsPlan(f.application, f.prepared, undefined, undefined, async (phase, c) => {
+      if (phase === "after" && c.actionIndex === 1) throw new Error("lost receipt");
+    }, resumeOperationId, {taskId: "task-1"})).rejects.toThrow("lost receipt");
+    f.writes.length = 0;
+    getWpsApplicationMock.mockReturnValue(f.application);
+    localStorage.setItem(PENDING_KEY, JSON.stringify({schemaVersion:1, operationId:resumeOperationId,
+      conversationId:"conv-1",activityMessageId:"old-message",workbookIdentity:f.state.workbookIdentity,
+      taskId:f.state.taskId,createdAt:new Date().toISOString()}));
+    getWpsExecutionStatusMock.mockResolvedValue(f.state);
+    let owned = {...f.state, ownerToken:"new-owner", ownerActive:true, revision:6};
+    claimWpsExecutionResumeMock.mockImplementation(async () => owned);
+    startWpsActionMock.mockImplementation(async (_id, request) => {
+      owned={...owned,inFlightActionIndex:request.actionIndex,revision:owned.revision+1};return owned;
+    });
+    completeWpsActionMock.mockImplementation(async (_id, request) => {
+      owned={...owned,inFlightActionIndex:null,nextActionIndex:request.actionIndex+1,revision:owned.revision+1};return owned;
+    });
+    finishWpsExecutionMock.mockImplementation(async () => ({...owned,status:"completed" as const}));
+    listModelsMock.mockResolvedValue({defaultModelId:firstConnection.id,models:[firstConnection]});
+    const {container}=await mount(<WpsAgentPanel selectedSheetIndexes={[1,2]} scopeDock={<div>固定两表</div>}/>);
+    await until(()=>findButton(container,"继续剩余动作") !== null,"恢复卡必须接入生产续跑判据");
+    await click(findButton(container,"继续剩余动作"));
+    await until(()=>findButton(container,"确认变更") !== null,"续跑后必须进入审阅");
+    expect(f.writes).toEqual(["Target!A3"]);
+    expect(startWpsActionMock).toHaveBeenCalledWith(resumeOperationId,expect.objectContaining({actionIndex:2}));
+    expect(runTurnMock).not.toHaveBeenCalled();
+    expect(registerWpsExecutionMock).not.toHaveBeenCalled();
+    await click(findButton(container,outcome));
+    await until(()=>container.querySelector(".result-review-bar")===null,"审阅应收尾");
+    if(outcome === "确认变更") {
+      expect(f.writes).toEqual(["Target!A3"]);
+      expect([1,2,3].map(i=>f.cells.get(`Target!A${i}`))).toEqual([10,20,30]);
+    } else {
+      expect([1,2,3].map(i=>f.cells.get(`Target!A${i}`))).toEqual(["old1","old2","old3"]);
+    }
+    expect(localStorage.getItem(PENDING_KEY)).toBeNull();
+  });
+
+  it.each(["确认变更", "放弃变更"])("最终回执丢失后补记并审阅，%s不重写任何动作", async outcome => {
+    const f = resumeHost();
+    await executeWpsPlan(f.application, f.prepared, undefined, undefined, undefined, resumeOperationId, {taskId:"task-1"});
+    f.state.nextActionIndex = 3;
+    f.writes.length = 0;
+    getWpsApplicationMock.mockReturnValue(f.application);
+    localStorage.setItem(PENDING_KEY, JSON.stringify({schemaVersion:1, operationId:resumeOperationId,
+      conversationId:"conv-1",activityMessageId:"old-message",workbookIdentity:f.state.workbookIdentity,
+      taskId:f.state.taskId,createdAt:new Date().toISOString()}));
+    getWpsExecutionStatusMock.mockResolvedValue(f.state);
+    let owned = {...f.state, ownerToken:"new-owner", ownerActive:true, revision:6};
+    claimWpsExecutionResumeMock.mockImplementation(async () => owned);
+    startWpsActionMock.mockImplementation(async (_id, request) => {
+      owned={...owned,inFlightActionIndex:request.actionIndex,revision:owned.revision+1};return owned;
+    });
+    completeWpsActionMock.mockImplementation(async (_id, request) => {
+      owned={...owned,inFlightActionIndex:null,nextActionIndex:request.actionIndex+1,revision:owned.revision+1};return owned;
+    });
+    finishWpsExecutionMock.mockImplementation(async () => ({...owned,status:"completed" as const}));
+    listModelsMock.mockResolvedValue({defaultModelId:firstConnection.id,models:[firstConnection]});
+    const {container}=await mount(<WpsAgentPanel selectedSheetIndexes={[1,2]} scopeDock={<div>固定两表</div>}/>);
+    await until(()=>findButton(container,"补记完成（不重写原表）") !== null,"恢复卡必须接入生产续跑判据");
+    await click(findButton(container,"补记完成（不重写原表）"));
+    await until(()=>findButton(container,"确认变更") !== null,"续跑后必须进入审阅");
+    expect(f.writes).toEqual([]);
+    expect(startWpsActionMock).not.toHaveBeenCalled();
+    expect(runTurnMock).not.toHaveBeenCalled();
+    expect(registerWpsExecutionMock).not.toHaveBeenCalled();
+    await click(findButton(container,outcome));
+    await until(()=>container.querySelector(".result-review-bar")===null,"审阅应收尾");
+    if(outcome === "确认变更") {
+      expect(f.writes).toEqual([]);
+      expect([1,2,3].map(i=>f.cells.get(`Target!A${i}`))).toEqual([10,20,30]);
+    } else {
+      expect([1,2,3].map(i=>f.cells.get(`Target!A${i}`))).toEqual(["old1","old2","old3"]);
+    }
+    expect(localStorage.getItem(PENDING_KEY)).toBeNull();
+  });
+
   it("零写入证据的锚点：纯测试替身计数包含 Value2 和 Formula 两种 setter", () => {
     const host = writeRangeHost();
     // getWpsApplicationMock was explicitly replaced by writeRangeHost; this is
@@ -4067,29 +4167,29 @@ describe("WPS 写入耐久恢复（CAP-03）", () => {
     expect(container.querySelector(".wps-write-recovery")).toBeNull();
   });
 
-  it("还有动作没写：只给「重新读取并生成预览」，不给任何继续/写入按钮", async () => {
+  it("还有动作没写：只给「重新读取并规划」，不给任何继续/写入按钮", async () => {
     const { container } = await mountRecoveryCard({
       state: { nextActionIndex: 1, totalActions: 3 }
     });
 
     const buttons = recoveryButtons(container);
-    expect(buttons).toEqual(["重新读取并生成预览", "清除这条恢复提示"]);
+    expect(buttons).toEqual(["重新读取并规划", "清除这条恢复提示"]);
     // 关键：不许出现"可以继续"这类冒充断点续跑的入口。
     expect(buttons.some((name) => name.includes("继续"))).toBe(false);
-    expect(textOf(container)).toContain("无法精确续跑剩余动作");
+    expect(textOf(container)).toContain("本机材料缺失、过期或不符合精确续跑条件");
   });
 
-  it("点「重新读取并生成预览」→ 用原需求重新发起一轮，不是续跑", async () => {
+  it("点「重新读取并规划」→ 用原需求重新发起一轮，不是续跑", async () => {
     const { container, host } = await mountRecoveryCard({
       state: { nextActionIndex: 1, totalActions: 3 },
       withHistory: true
     });
     runTurnMock.mockResolvedValue({ kind: "plan", plan: singleWritePlan, turnId: "turn-replan" });
-    expect(findButton(container, "重新读取并生成预览")?.disabled).toBe(true);
+    expect(findButton(container, "重新读取并规划")?.disabled).toBe(true);
     await click(container.querySelector('.wps-write-recovery input[type="checkbox"]') as HTMLInputElement);
-    await click(findButton(container, "重新读取并生成预览"));
+    await click(findButton(container, "重新读取并规划"));
     await until(
-      () => textOf(container).includes("重新读取并生成预览 —— 那是新的一轮"),
+      () => textOf(container).includes("不是从上次进度接着写"),
       "应说明这是新的一轮"
     );
 
@@ -4117,6 +4217,8 @@ describe("WPS 写入耐久恢复（CAP-03）", () => {
      */
     const pendingIndex = localStorage.getItem(PENDING_KEY);
     expect(pendingIndex === null || !pendingIndex.includes(oldOperationId)).toBe(true);
+    await until(() => container.querySelector(".wps-write-recovery") === null,
+      "新计划已接管发现索引后，不得刷新并复活旧任务恢复卡");
   });
 
   it.each([

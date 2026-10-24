@@ -836,3 +836,49 @@ def test_sort_recovery_registers_value_evidence_and_rejects_format_evidence():
     payload["operationId"] = "wps-sort-invalid"
     payload["descriptor"]["actions"][0]["previewFingerprint"] = "f1:wrong"
     assert client.post("/api/wps/executions/register", json=payload).status_code == 422
+
+
+def _resume_payload() -> dict:
+    payload = _wps_register_payload("wps-resume-context-1")
+    payload["authorizedSheetNames"].append("Source")
+    payload["descriptor"]["resumeContext"] = {
+        "version": 1, "hostVersion": "12.0", "sources": [{
+            "sheetName": "Source", "range": "A1:A2", "rowCount": 2, "columnCount": 1,
+            "previewFingerprint": "v2:42:12345678", "valueFingerprint": "v2:40:abcdef12",
+        }],
+    }
+    return payload
+
+
+def test_wps_resume_context_roundtrip_is_value_free() -> None:
+    client = TestClient(app)
+    payload = _resume_payload()
+    response = client.post("/api/wps/executions/register", json=payload)
+    assert response.status_code == 200, response.text
+    fetched = client.get("/api/wps/executions/" + payload["operationId"]).json()
+    assert fetched["descriptor"]["resumeContext"] == payload["descriptor"]["resumeContext"]
+    assert fetched["ownerToken"] is None
+    assert "values" not in json.dumps(fetched["descriptor"])
+
+
+@pytest.mark.parametrize("issue", ["raw", "unauthorized", "overlap", "shape", "formula", "fingerprint", "limit"])
+def test_wps_resume_context_rejects_unsafe_metadata(issue: str) -> None:
+    payload = _resume_payload()
+    source = payload["descriptor"]["resumeContext"]["sources"][0]
+    if issue == "raw":
+        source["values"] = [["PRIVATE-NEVER-SEND"]]
+    elif issue == "unauthorized":
+        source["sheetName"] = "Secret"
+    elif issue == "overlap":
+        source["sheetName"] = "Sheet1"
+    elif issue == "shape":
+        source["rowCount"] = 3
+    elif issue == "formula":
+        payload["descriptor"]["actions"][0]["type"] = "writeFormulas"
+    elif issue == "fingerprint":
+        source["valueFingerprint"] = "raw-data"
+    elif issue == "limit":
+        source["range"] = "A1:A1048576"
+        source["rowCount"] = 1048576
+    response = TestClient(app).post("/api/wps/executions/register", json=payload)
+    assert response.status_code == 422, response.text

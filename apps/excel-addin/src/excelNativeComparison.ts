@@ -1,5 +1,6 @@
+import { valueCopyReviewGeometry } from './excelValueCopyPlan';
 import capabilities from "../../../config/capabilities.json";
-import type { AnalysisPlan, CellValue, ExcelAction } from "./contracts";
+import type { AnalysisPlan, CellValue, ExcelAction, ExecutionUndoSnapshot } from "./contracts";
 import { assertRectangularValues, parseExplicitA1Rect, writeMatrixShapeIssue } from "./planCore";
 import { assertSafeFormula } from "./formulaSafety";
 import { applyFormatAction, captureWorkbookSourceFingerprint, captureWorkbookStructure, currentOfficeWorkbookIdentity,
@@ -206,13 +207,16 @@ export function resultReviewPlanIssue(plan: AnalysisPlan, authorization: readonl
     return '计划来源超出本次授权，未执行。';
   }
   // Reuse action/shape limits only; source checks still use the full original plan.
-  return nativeComparisonPlanIssue({ ...plan, sourceFingerprintSheets: [targets[0]] }, targets);
+  try {
+    const geometry = valueCopyReviewGeometry(plan, authorization);
+    return nativeComparisonPlanIssue({ ...geometry, sourceFingerprintSheets: [targets[0]] }, targets);
+  } catch (reason) { return reason instanceof Error ? reason.message : '复制范围无法验证，未执行。'; }
 }
 
 export async function captureExcelBeforeResult(plan: AnalysisPlan, authorization: readonly string[]): Promise<ExcelBeforeResult> {
   const issue = resultReviewPlanIssue(plan, authorization);
   if (issue) throw error(issue);
-  const rects = plan.actions.map(action => parseExplicitA1Rect('range' in action ? action.range : '')!);
+  const rects = valueCopyReviewGeometry(plan, authorization).actions.map(action => parseExplicitA1Rect('range' in action ? action.range : '')!);
   const startRow = Math.min(...rects.map(r => r.startRow)), endRow = Math.max(...rects.map(r => r.endRow));
   const startColumn = Math.min(...rects.map(r => r.startColumn)), endColumn = Math.max(...rects.map(r => r.endColumn));
   const height = endRow - startRow + 1, width = endColumn - startColumn + 1;
@@ -257,6 +261,36 @@ export async function captureExcelBeforeResult(plan: AnalysisPlan, authorization
       startRow, startColumn, values, formulas: values, formulaCells: [], numberFormat, properties, rowHeights, columnWidths
     })) as SheetSnapshot;
   });
+}
+
+/** Rebuild the original before-image from ALL action checkpoints, never from current (partly written) cells.
+ * Recovery records retain formulas, not cached formula results; comparison displays those as literal text.
+ * Only value writes qualify here. Formatting/dimensions are deliberately neutral, not claimed as historic evidence.
+ */
+export function excelRecoveryBeforeResult(plan: AnalysisPlan, undo: ExecutionUndoSnapshot, authorization: readonly string[]): ExcelBeforeResult {
+  const unavailable = {comparisonUnavailable: '恢复记录不足以重建完整执行前对比；请在主表审阅结果。'};
+  if (undo.planId !== plan.id || resultReviewPlanIssue(plan, authorization)) return unavailable;
+  const ranges = plan.actions.map((a,index) => {
+    if (a.type !== 'writeValues') return null;
+    const rect = parseExplicitA1Rect(a.range);
+    const before = undo.ranges.find(b => b.actionIndex === index && b.sheet === a.sheet &&
+      JSON.stringify(parseExplicitA1Rect(b.range)) === JSON.stringify(rect));
+    if (!rect || !before || before.formulas.length !== rect.rows || before.formulas.some(row => row.length !== rect.columns)) return null;
+    return {rect,before};
+  });
+  if (!ranges.length || ranges.some(r => !r)) return unavailable;
+  const valid = ranges.filter((r): r is NonNullable<typeof r> => r !== null);
+  const startRow=Math.min(...valid.map(r=>r.rect.startRow)), endRow=Math.max(...valid.map(r=>r.rect.endRow));
+  const startColumn=Math.min(...valid.map(r=>r.rect.startColumn)), endColumn=Math.max(...valid.map(r=>r.rect.endColumn));
+  const height=endRow-startRow+1, width=endColumn-startColumn+1;
+  if (height*width > LIMITS.maxCells) return unavailable;
+  const values: CellValue[][]=Array.from({length:height},()=>Array(width).fill(''));
+  for (const {rect,before} of valid) for(let i=0;i<rect.rows;i++) for(let j=0;j<rect.columns;j++)
+    values[rect.startRow-startRow+i][rect.startColumn-startColumn+j]=before.formulas[i][j];
+  return {id:'',name:plan.actions[0].sheet,address:`${nativeColumnName(startColumn)}${startRow}:${nativeColumnName(endColumn)}${endRow}`,
+    startRow,startColumn,values,formulas:values,formulaCells:[],
+    numberFormat:values.map(row=>row.map(()=>'General')),properties:values.map(row=>row.map(()=>({}))),
+    rowHeights:Array(height).fill(15),columnWidths:Array(width).fill(8.43)};
 }
 
 /** Open the saved BEFORE image, never re-run the plan to manufacture a comparison. */

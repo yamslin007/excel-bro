@@ -7,6 +7,7 @@ import {
   formatExpectedFingerprint,
   isFormatActionType,
   matrixFingerprintV2,
+  wpsResumeContext,
   type WpsPreparedPlan
 } from "./wpsPlanExecutor";
 import {
@@ -162,6 +163,7 @@ export function clearPendingWpsExecution(
  */
 export function wpsRecoveryDescriptor(prepared: WpsPreparedPlan): WpsRecoveryDescriptor {
   return {
+    ...(wpsResumeContext(prepared) ? {resumeContext: wpsResumeContext(prepared)} : {}),
     actions: prepared.actions.map((action, index) => {
       const source = prepared.plan.actions[action.actionIndex];
       const shared = {

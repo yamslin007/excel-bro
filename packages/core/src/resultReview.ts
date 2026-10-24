@@ -57,7 +57,7 @@ export class ResultReview<Before, Receipt extends ResultReviewReceipt, Marker, C
   private receipt?: Receipt;
   private marker?: Marker;
   private copy?: Copy;
-  private operations?: ResultReviewOperations<Before, Receipt, Marker, Copy>;
+  private operations?: Omit<ResultReviewOperations<Before, Receipt, Marker, Copy>, "prepare" | "execute">;
   getSnapshot = () => this.state;
   subscribe = (listener: () => void) => { this.listeners.add(listener); return () => { this.listeners.delete(listener); }; };
   private update(change: Partial<ResultReviewState>) {
@@ -93,6 +93,26 @@ export class ResultReview<Before, Receipt extends ResultReviewReceipt, Marker, C
       this.update({ phase: 'failed', notice: this.reason(reason) });
       return false;
     } finally { this.update({ pending: false }); }
+  }
+  /** Adopt an already completed, verified execution. No prepare/execute callback exists on this path. */
+  async adoptCompleted(key: string, before: Before, receipt: Receipt,
+    operations: Omit<ResultReviewOperations<Before, Receipt, Marker, Copy>, 'prepare' | 'execute'>): Promise<boolean> {
+    if (!key || this.state.pending || this.state.phase === 'reviewing' || this.attempted.has(key)) return false;
+    this.attempted.add(key);
+    this.operations = operations; this.before = before; this.receipt = receipt;
+    this.marker = undefined; this.copy = undefined;
+    this.update({phase:'executing', key, executionId:receipt.executionId, pending:true,
+      comparing:false, notice:null, marked:false, markerPending:false});
+    try {
+      this.assertCurrent();
+      if (!receipt.executionId || !receipt.verified || !receipt.undoable) throw new Error('恢复结果或恢复点尚未验证，不能进入审阅。');
+      await operations.validateResult?.(receipt);
+      this.assertCurrent();
+      try {this.marker = await operations.mark(receipt);this.update({marked:true});}
+      catch(reason) {this.update({notice:`结果已写入，颜色标记未完整建立：${this.reason(reason)}`});}
+      this.update({phase:'reviewing'}); return true;
+    } catch(reason) {this.update({phase:'failed',notice:this.reason(reason)});return false;}
+    finally {this.update({pending:false});}
   }
   private async clearMarker() {
     if (this.marker !== undefined) {

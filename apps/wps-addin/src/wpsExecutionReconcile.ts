@@ -1,31 +1,14 @@
 import type { WpsExecutionState } from "../../excel-addin/src/contracts";
 
-/**
- * WPS 写入耐久恢复的**重载核对判定**（CAP-03）。
- *
- * 权威现场是服务端账本（`WpsExecutionState`）。面板重载后：读本地发现索引 →
- * 查服务端真实状态 → 身份核对（`wps-path:` 完整字符串一致才继续）→ 依据
- * 服务端状态、剩余动作与本机现场把这次写入归成五类。判定只认正面证据，
- * 拿不到证据就挂起，不猜"写没写"。
- *
- * 纯函数，不碰宿主、不碰网络；渲染与动作由 `WpsAgentPanel.tsx` 负责。
- */
-
-/**
- * 重载后这次写入的核对结论。五态互不冒充。
- *
- * - `completed`：全部动作已在服务端记为完成（缺的只是最终回执）→ **只补记，不重写**。
- * - `reconcile`：有在途动作，且本机现场能给出正面结论 → 可提交核对回执。
- * - `replan`：还有动作没写。确认快照只活在会话内内存，跨关闭拿不回来，
- *   **无法精确续跑剩余动作** → 只能重新读取并生成预览、重新授权确认；
- *   这里绝不能冒充"断点续跑"。
- * - `blocked`：现场与写前/写后都不一致，或状态矛盾 → 人工核对，不给写入按钮。
- * - `insufficient`：查不到状态、身份不可用、本机现场读不到 → 挂起，不给假按钮。
+/** Read-only recovery verdict. Resume requires independently checked local material;
+ * an in-flight action must first be reconciled, never guessed or replayed.
+ * Historical records without compatible source evidence remain replan-only.
  */
 export type WpsReconcileVerdict =
   | { kind: "completed"; recorded?: true }
   | { kind: "reconcile"; actionIndex: number; outcome: "applied" | "not_applied" }
-  | { kind: "replan"; remaining: number }
+  | { kind: "replan"; remaining: number; reason?: string }
+  | { kind: "resume"; remaining: number }
   | { kind: "blocked"; detail: string }
   | { kind: "insufficient"; detail: string };
 
@@ -55,28 +38,13 @@ export function wpsIdentityVerdict(input: {
   return { kind: "match" };
 }
 
-/**
- * 依据服务端状态 + 本机现场 + 身份，判断重载后能安全做什么。
- *
- * 每一档都要**正面证据**，逐条收紧：
- *
- * 1. 服务端没有这次执行 → `insufficient`（查询不创建执行，也不猜）；
- * 2. 身份不match → `insufficient`（同名异路径、未保存一律不放行）；
- * 3. 服务端已 `completed` → `completed`（安全重放，不重写）；
- * 4. 有在途动作：本机现场给出正面结论才 `reconcile`；冲突 → `blocked`；
- *    读不到 → `insufficient`（不许拿"读不到"当成"没写过"）；
- * 5. `canResume === false` → `blocked`（服务端明确说这次不能续）；
- * 6. 剩余动作 = 0 → `completed`（只补记最终回执，不产生任何宿主写入）；
- *    但若本机现场与其矛盾（仍是写前 / 与写后冲突）→ `blocked`；
- * 7. 剩余动作 > 0 → `replan`。**这里不给"继续"**：目标值矩阵与确认快照只活在
- *    会话内内存，重载后拼不回用户当初确认的那份计划，精确续跑未实现。
- *
- * `localInspection` 来自当前授权内登记目标区域的真实只读回读
- * （`inspectWpsRecoveryState`），不依赖 PluginStorage 仍保存完整矩阵。
- * 旧描述没有写后指纹、现场读不到或授权不完整时只能判 unknown。
+/** Server ownership/cursor and current target inspection remain authoritative.
+ * resumeAvailable only adds a suffix-write option after those checks pass.
  */
 export function wpsReconcileVerdict(input: {
   state: WpsExecutionState | null;
+  resumeAvailable?: boolean;
+  resumeUnavailableReason?: string | null;
   identityMatch: boolean;
   localInspection: "completed" | "not_started" | "conflict" | "unknown" | null;
 }): WpsReconcileVerdict {
@@ -142,20 +110,15 @@ export function wpsReconcileVerdict(input: {
     }
     return { kind: "completed" };
   }
-  /*
-   * 还有动作没写。**不给"继续"** —— 精确续跑剩余动作未实现：
-   * 目标值矩阵、来源快照、确认快照与宿主版本都只活在会话内内存，重载后拼不回
-   * 用户当初确认的那份计划。硬要"续跑"只能拿重载后重新读到的现场拼一份新计划，
-   * 那不是续跑，是换个东西写进原表。所以这里如实归成 `replan`。
-   */
-  return { kind: "replan", remaining };
+  return input.resumeAvailable ? {kind: "resume", remaining} : {kind: "replan", remaining, ...(input.resumeUnavailableReason ? {reason: input.resumeUnavailableReason} : {})};
 }
 
 /** 核对结论的用户可见文案（标题级）。 */
 export const WPS_RECONCILE_LABEL: Record<WpsReconcileVerdict["kind"], string> = {
   completed: "已完成，仅缺回执",
   reconcile: "待核对在途动作",
-  replan: "需重新预览",
+  replan: "需重新规划",
+  resume: "可继续剩余动作",
   blocked: "需要人工核对",
   insufficient: "证据不足"
 };
@@ -169,10 +132,13 @@ export function WPS_RECOVERY_DETAIL(verdict: WpsReconcileVerdict): string {
       return verdict.outcome === "applied"
         ? `第 ${verdict.actionIndex + 1} 个动作的现场与写后一致，可补记为已写入，不重复写。`
         : `第 ${verdict.actionIndex + 1} 个动作的现场仍是写前状态，可补记为未写入。`;
+    case "resume":
+      return `原计划与当前授权、来源和目标已核对，可继续剩余 ${verdict.remaining} 个动作；已完成动作不会重写，完成后审阅结果。`;
     case "replan":
       return (
-        `还有 ${verdict.remaining} 个动作没写。目标矩阵与确认快照只存在会话内内存，` +
-        "重开后无法精确续跑剩余动作 —— 只能按原需求重新读取并生成预览，重新授权确认后再写入。"
+        `还有 ${verdict.remaining} 个动作没写。本机材料缺失、过期或不符合精确续跑条件。` +
+        (verdict.reason ? `具体原因：${verdict.reason} ` : "") +
+        "可在当前授权范围内重新读取并规划；通过校验后先执行，再审阅。"
       );
     default:
       return verdict.detail;
@@ -180,12 +146,13 @@ export function WPS_RECOVERY_DETAIL(verdict: WpsReconcileVerdict): string {
 }
 
 /** 各结论允许出现的操作。返回空数组 = 不给任何写入/补记按钮。 */
-export type WpsReconcileAction = "backfill" | "reconcile" | "replan" | "dismiss";
+export type WpsReconcileAction = "backfill" | "reconcile" | "replan" | "resume" | "dismiss";
 
 export const WPS_RECOVERY_ACTION_LABEL: Record<WpsReconcileAction, string> = {
+  resume: "继续剩余动作",
   backfill: "补记完成（不重写原表）",
   reconcile: "核对在途动作",
-  replan: "重新读取并生成预览",
+  replan: "重新读取并规划",
   dismiss: "清除这条恢复提示"
 };
 
@@ -195,6 +162,8 @@ export function wpsReconcileActions(verdict: WpsReconcileVerdict): WpsReconcileA
       return verdict.recorded ? ["dismiss"] : ["backfill", "dismiss"];
     case "reconcile":
       return ["reconcile", "dismiss"];
+    case "resume":
+      return ["resume", "dismiss"];
     case "replan":
       return ["replan", "dismiss"];
     default:

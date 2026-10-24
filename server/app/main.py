@@ -1680,6 +1680,22 @@ def _wps_request_fingerprint(request: WpsExecutionRegisterRequest) -> str:
 
 def _validate_wps_recovery_descriptor(request: WpsExecutionRegisterRequest) -> None:
     authorized = {name.casefold() for name in request.authorizedSheetNames}
+    context = request.descriptor.resumeContext
+    if context is not None:
+        from openpyxl.utils.cell import range_boundaries
+        targets = {a.sheet.casefold() for a in request.descriptor.actions}
+        valid = all(a.type == "writeValues" for a in request.descriptor.actions)
+        cells = 0
+        for source in context.sources:
+            try:
+                c1, r1, c2, r2 = range_boundaries(source.range)
+                valid = valid and r2 - r1 + 1 == source.rowCount and c2 - c1 + 1 == source.columnCount and r2 <= 1048576 and c2 <= 16384
+            except (ValueError, TypeError):
+                valid = False
+            valid = valid and source.sheetName.casefold() in authorized and source.sheetName.casefold() not in targets
+            cells += source.rowCount * source.columnCount
+        if not valid or cells > capability_int("taskRecovery", "wpsResumeMaxSourceCells"):
+            raise service_error(422, "WPS_RESUME_CONTEXT_INVALID", "续跑来源越界、形状不符或不支持该动作组合。", retryable=False)
     if sum(action.cellCount for action in request.descriptor.actions) > capability_int("wpsWrite", "maxCells"):
         raise service_error(422, "WPS_RECOVERY_INVALID", "恢复目标超过 WPS 写入单元格限额。", retryable=False)
     for index, action in enumerate(request.descriptor.actions):

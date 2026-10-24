@@ -1,18 +1,27 @@
-// 反向变异脚本：进度浮标「外圈品牌浅色渐变 + 主题色前景图形（三点 / 锚）」的
-// **对比度与令牌守卫**
+// 反向变异脚本：进度浮标「透明底 + 主题色前景图形（三点 / 锚）」的
+// **对比度、令牌与"不画底"守卫**
 //
-// 用法：node scripts/mutate_progress_dot_contrast.mjs M1|M2|M3|M4|M5|M6|M7|check [restore]
+// 用法：node scripts/mutate_progress_dot_contrast.mjs M1|M2|M3|M4|M5|M6|M7|M8|check [restore]
+//
+// **2026-10-24 重新定点**：用户裁决「把这个锚的图标改一下，背景改为透明的」，
+// 浮标那层品牌浅色渐变被删掉，所以旧 M2（渐变退回深色药丸）与旧 M3（把
+// `brandHover` 改深、验证"最坏端点按所有背景令牌里最暗的算"）**都失去了对应的
+// 被拆对象** —— 渐变没了，就没有"最暗端点"可算。旧 M2 顺延为 M4 家族（边框）
+// 之外的新判别点，旧 M3 直接换成"悬停不许把底补回来"，另新增 M8（投影）。
 //
 //   M1（useTheme.ts）把 vivid-green 的前景色换回**纯品牌色** `#2d9b63`（不压深）。
 //       打「前景色是否真的被压深到能过 3:1」—— 纯色下它是 2.93:1，掉到门槛以下。
 //
-//   M2（styles.css）把外圈的渐变退回**写死的深色药丸** `background: #1f1f1f;`。
-//       打「上色声明里不许出现字面色值」这条负向锚点 —— 它就是当初把前景图形逼成
-//       浅色、与浅色体系割裂的那个写法。
+//   M2（styles.css）把常态底色从 `transparent` 改成**不透明品牌浅色**
+//       `background: var(--color-brand-bg);`。
+//       打的是「值必须**真的是** `transparent`」这条 —— 而不是"有没有 `background`
+//       声明"。刻意用**令牌**、不画渐变：这样"不许出现渐变/图片底"那条**不会**红，
+//       红下来的只能是"底色必须是透明"这一条，判别点是唯一的。
 //
-//   M3（useTheme.ts）把 default 预设的 `brandHover` 改成品牌深绿。
-//       打「最坏端点是不是真的按**所有背景令牌里最暗的那个**算」——
-//       渐变起点是 `brand-bg`、终点是 `brand-hover`，若守卫只看起点，此变异不会红。
+//   M3（styles.css）给 `:hover` **补一层品牌浅色底**（`background: var(--color-brand-bg);`）。
+//       打「悬停/按下不许重新着色」那条循环：旧写法是"渐变整体深一档"，底取消之后
+//       再补底等于把用户刚要去掉的东西从 hover 里放回来。它只落在 `buttonRules[1]`，
+//       常态那三条断言不受影响 —— 判别点唯一。
 //
 //   M4（styles.css）把用户裁决掉的**那圈描边加回来** —— 把"显式关掉边框"那条
 //       声明换成"画一条 1px 实线"。打「外圈不许画边」这条负向断言 —— 就是
@@ -35,8 +44,13 @@
 //       注意它与 M6 的判别点不同：这里**值完全相同**，红的只能是"必须走令牌"；
 //       同值冗余不算空变异 —— 它证明的恰恰是"同值也不行，必须引用令牌"。
 //
-// 七个变异落在**两个文件**上：M2/M4/M5/M6/M7 在 styles.css（全 LF），
-// M1/M3 在 useTheme.ts（全 CRLF）。所以 seed/mutant 的换行归一化与基线 sha256
+//   M8（styles.css）把**投影加回来** `box-shadow: var(--shadow-md);`。
+//       打「透明底上不能留投影」这条 —— `--shadow-*` 是按"有一个圆形底"算的，
+//       底变透明之后它只剩一团没有主体的灰影，读成脏点。刻意用**令牌**，
+//       所以"不许出现字面色值"那条不会红，判别点唯一。
+//
+// 八个变异落在**两个文件**上：M2/M3/M4/M5/M6/M7/M8 在 styles.css（全 LF），
+// M1 在 useTheme.ts（全 CRLF）。所以 seed/mutant 的换行归一化与基线 sha256
 // 都要**分文件**做，不能共用一份。
 import { readFileSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
@@ -59,43 +73,51 @@ const TARGETS = {
   },
   M2: {
     file: STYLES,
-    // 多行 SEED 必须带足上下文。这条渐变的端点现在与 hover 那条**不同**
-    // （hover 两个端点都是 `brand-hover`），但仍要与按钮规则独有的后继声明
-    // （`box-shadow` + `cursor: pointer`）绑定才最稳。
+    // 五条声明绑在一起才唯一：`background: transparent;` 全表 40 次、
+    // `box-shadow: none;` 19 次，各自单独取都会 SKIP。
+    // 这五行是浮标常态规则的**收尾段**（外面那圈 `border: none` 到 `cursor`），
+    // 换掉哪一条都不会与别的规则撞车。
     seed: [
-      "  background: linear-gradient(",
-      "    145deg,",
-      "    var(--color-brand-bg),",
-      "    var(--color-brand-hover)",
-      "  );",
-      "  box-shadow: var(--shadow-md);",
+      "  border: none;",
+      "  border-radius: var(--radius-full);",
+      "  background: transparent;",
+      "  box-shadow: none;",
       "  cursor: pointer;"
     ].join(LF),
-    mutant: ["  background: #1f1f1f;", "  box-shadow: var(--shadow-md);", "  cursor: pointer;"].join(LF)
+    mutant: [
+      "  border: none;",
+      "  border-radius: var(--radius-full);",
+      "  background: var(--color-brand-bg);",
+      "  box-shadow: none;",
+      "  cursor: pointer;"
+    ].join(LF)
   },
   M3: {
-    file: THEME,
-    // `brandHover` 四个预设各一行，`#e3ebe2` 是 default 独有的，所以这一行唯一。
-    seed: '    brandHover: "#e3ebe2",',
-    mutant: '    brandHover: "#2f6b47",'
+    file: STYLES,
+    // `:hover` 规则体里插一条底：只影响 `buttonRules[1]`（悬停/按下那条循环），
+    // 常态的三条断言完全不动。旧 M3（brandHover 改深）随渐变删除而失去对象。
+    seed: ".new-progress-button:hover {",
+    mutant: [".new-progress-button:hover {", "  background: var(--color-brand-bg);"].join(LF)
   },
   M4: {
     file: STYLES,
     // 把用户裁决掉的那圈描边**加回来**（把"关掉边框"的声明换成"画一条实线"，
     // 用令牌，所以"只准走令牌"那条不会红 —— 红的必须是"外圈不许画边"这条负向
     // 断言本身，判别点是唯一的）。
-    // seed 必须带上紧随其后的 `border-radius` 与渐变开头：`border: none;` 单独
-    // 一行在全表出现 5 次、`border-radius: var(--radius-full);` 出现 23 次，
-    // 三行绑一起才唯一。
+    // seed 与 M2/M8 同一段五行（`border: none;` 单独一行在全表出现 5 次）。
     seed: [
       "  border: none;",
       "  border-radius: var(--radius-full);",
-      "  background: linear-gradient("
+      "  background: transparent;",
+      "  box-shadow: none;",
+      "  cursor: pointer;"
     ].join(LF),
     mutant: [
       "  border: 1px solid var(--color-border-strong);",
       "  border-radius: var(--radius-full);",
-      "  background: linear-gradient("
+      "  background: transparent;",
+      "  box-shadow: none;",
+      "  cursor: pointer;"
     ].join(LF)
   },
   M5: {
@@ -120,6 +142,25 @@ const TARGETS = {
     // 不是"颜色必须不同"。
     seed: "  fill: var(--color-progress-glyph);",
     mutant: "  fill: #265639;"
+  },
+  M8: {
+    file: STYLES,
+    // 与 M2 同一段五行，只换 `box-shadow` 那一行：令牌而非字面量，
+    // 所以"不许出现字面色值"不会红，红的只能是"透明底上不能留投影"。
+    seed: [
+      "  border: none;",
+      "  border-radius: var(--radius-full);",
+      "  background: transparent;",
+      "  box-shadow: none;",
+      "  cursor: pointer;"
+    ].join(LF),
+    mutant: [
+      "  border: none;",
+      "  border-radius: var(--radius-full);",
+      "  background: transparent;",
+      "  box-shadow: var(--shadow-md);",
+      "  cursor: pointer;"
+    ].join(LF)
   }
 };
 
@@ -167,7 +208,7 @@ if (!which) {
   process.exit(0);
 }
 if (!TARGETS[which]) {
-  console.error("用法: node scripts/mutate_progress_dot_contrast.mjs M1|M2|M3|M4|M5|M6|M7|check [restore]");
+  console.error("用法: node scripts/mutate_progress_dot_contrast.mjs M1|M2|M3|M4|M5|M6|M7|M8|check [restore]");
   process.exit(2);
 }
 const target = TARGETS[which];

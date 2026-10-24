@@ -1,3 +1,7 @@
+import { RecoveryProbeControl } from "@excel-bro/core/RecoveryProbeControl";
+import { bindRecoveryProbe, interruptRecoveryProbe } from "@excel-bro/core/recoveryProbe";
+import { canResumeWpsExecution, resumeWpsExecution, wpsResumeUnavailableReason } from "./wpsExecutionResume";
+import { prepareWpsResume, prepareWpsCompletedReview } from "./wpsPlanExecutor";
 import { TaskExecutionControls } from "../../excel-addin/src/components/TaskExecutionControls";
 import { acceptsPlanningReplay, planningReceivedSequence, waitForPlanning } from "@excel-bro/core/planningReplay";
 import {
@@ -2371,7 +2375,7 @@ export default function WpsAgentPanel({
       } catch {
         state = null;
       }
-      if (!active) return;
+      if (!active || loadPendingWpsExecution()?.operationId !== pending.operationId) return;
       const currentIdentity = (() => {
         try {
           return wpsWorkbookIdentity(wpsReadWorkbook(getWpsApplication())?.FullName);
@@ -2394,7 +2398,9 @@ export default function WpsAgentPanel({
       const verdict = wpsReconcileVerdict({
         state,
         identityMatch: identity.kind === "match",
-        localInspection
+        localInspection,
+        resumeUnavailableReason: wpsResumeUnavailableReason(getWpsApplication(), state, resolveSelectedSheetIndexes?.() ?? selectedSheetIndexes),
+        resumeAvailable: canResumeWpsExecution(getWpsApplication(), state, resolveSelectedSheetIndexes?.() ?? selectedSheetIndexes)
       });
       setWpsRecovery({
         operationId: pending.operationId,
@@ -2568,7 +2574,9 @@ export default function WpsAgentPanel({
       verdict: wpsReconcileVerdict({
         state,
         identityMatch: identity.kind === "match",
-        localInspection
+        localInspection,
+        resumeUnavailableReason: wpsResumeUnavailableReason(getWpsApplication(), state, resolveSelectedSheetIndexes?.() ?? selectedSheetIndexes),
+        resumeAvailable: canResumeWpsExecution(getWpsApplication(), state, resolveSelectedSheetIndexes?.() ?? selectedSheetIndexes)
       }),
       checking: false,
       acting: false
@@ -2580,7 +2588,7 @@ export default function WpsAgentPanel({
    *
    * 按钮只可能来自 `wpsReconcileActions`（判定给什么才画什么），这里再复核一次
    * 才执行 —— 不画"点了没反应"的按钮，也不拿「重新生成预览」冒充断点续跑：
-   * `replan` 走的是**重新读取 + 重新授权 + 重新确认**的完整一轮，生成的是新预览、
+   * `replan` 走重新读取和规划，使用当前授权，通过校验后执行，再审阅；生成新计划、
    * 新执行身份，与这次未完成的执行不是同一件事。
    */
   const refreshWpsRecovery = async () => {
@@ -2619,7 +2627,8 @@ export default function WpsAgentPanel({
         currentIdentity: wpsWorkbookIdentity(wpsReadWorkbook(getWpsApplication())?.FullName),
         recordedIdentity: fresh.workbookIdentity
       });
-      const verdict = wpsReconcileVerdict({ state: fresh, identityMatch: identity.kind === "match",
+      const verdict = wpsReconcileVerdict({ state: fresh,
+        resumeAvailable: canResumeWpsExecution(getWpsApplication(), fresh, resolveSelectedSheetIndexes?.() ?? selectedSheetIndexes), identityMatch: identity.kind === "match",
         localInspection: inspectWpsRecoveryState(getWpsApplication(), fresh,
           resolveSelectedSheetIndexes?.() ?? selectedSheetIndexes) });
       if (!wpsReconcileActions(verdict).includes(action)) {
@@ -2633,6 +2642,83 @@ export default function WpsAgentPanel({
        * 这里**一次宿主写入都不做** —— 先领取执行权（旧 token 同时作废），
        * 再用新 revision + 新 token 提交完成回执。领取失败就不碰账本。
        */
+      const completedRecord = action === "backfill" ? wpsUndoRecordFor(getWpsApplication(), operationId) : null;
+      if (action === "resume" || (action === "backfill" && completedRecord?.state === "verified" &&
+          completedRecord.actions.every(item => item.type === "writeValues"))) {
+        const application = getWpsApplication();
+        const indexes = () => resolveSelectedSheetIndexes?.() ?? selectedSheetIndexes;
+        const {prepared, record: prior} = action === "resume"
+          ? prepareWpsResume(application, fresh, indexes()) : prepareWpsCompletedReview(application, fresh, indexes());
+        const revisionAtStart = authorizationRevision;
+        const isCurrent = () => resultFacts.current.authorizationRevision === revisionAtStart &&
+          String(wpsReadWorkbook(getWpsApplication())?.FullName ?? "") === prepared.authorization.workbookFullName;
+        let formula: string | null = null;
+        releaseWpsReviewTarget();
+        setResultTitle(prepared.plan.title);
+        await resultReview.start(`resume:${operationId}:${fresh.revision}`, {
+          isCurrent,
+          prepare: async () => ({prepared, workbookFullName: prepared.authorization.workbookFullName!,
+            values: prior.actions.map(a => ({values: a.beforeValues, formulas: a.beforeFormulas, valuesCaptured: true})),
+            formats: prior.actions.map(() => undefined)}),
+          execute: async () => {
+            let record = prior;
+            if (action === "resume") {
+              record = await resumeWpsExecution(application, fresh, indexes, update => setWriteProgress(update.message));
+            } else {
+              const claimed = await claimWpsExecutionResume(operationId, fresh.revision);
+              if (!claimed.ownerToken) throw new Error("没有取得补记执行权。");
+              try {
+                if (!isCurrent() || claimed.operationId !== operationId || claimed.taskId !== fresh.taskId) throw new Error("补记时任务或授权身份已变化。");
+                prepareWpsCompletedReview(application, claimed, indexes());
+                await finishWpsExecution(operationId, {expectedRevision: claimed.revision,
+                  ownerToken: claimed.ownerToken, result: {backfilled: true, actionCount: claimed.totalActions}});
+              } catch (error) {
+                try { await suspendWpsExecution(operationId, {expectedRevision: claimed.revision,
+                  ownerToken: claimed.ownerToken, code: "WPS_BACKFILL_FAILED", message: "补记未完成，请重新核对。"}); } catch { /* retain discovery */ }
+                throw error;
+              }
+            }
+            setWriteProgress(null);
+            setUndoRecord(record);
+            clearPendingWpsExecution(operationId);
+            setWpsRecovery(null);
+            append({role: "system", text: action === "resume" ? "已按原执行身份续跑剩余动作并回读验证，已完成动作未重复写入。请审阅主表结果。" : "已补记完成回执，未重写原表。请审阅主表结果。"});
+            return {record, executionId: record.executionId, verified: true, undoable: true};
+          },
+          mark: async () => { const marks = markWpsResult(application, prepared); formula = marks.formula; return marks; },
+          clearMarker: async marks => { clearWpsResultMarks(application, marks); },
+          showBefore: async before => {
+            const staged = stageWpsBeforeComparison(application, before, formula ?? undefined);
+            bindWpsReviewTarget({original: staged.original,
+              originalIdentity: identityOf(staged.original) ?? {name: staged.plan.authorization.workbookName,
+                fullName: String(staged.plan.authorization.workbookFullName ?? ""), path: staged.plan.authorization.workbookPath ?? null},
+              copyIdentity: {name: staged.copyIdentity.name, fullName: String(staged.copyIdentity.fullName ?? ""), path: staged.copyIdentity.path ?? null},
+              writeSheet: {index: staged.writeSheet.index, name: staged.writeSheet.name}});
+            if (rearrangeWpsComparison(application, staged) !== "arranged") throw new Error("双视图未能排列，请手动查看执行前副本。");
+            return staged;
+          },
+          closeBefore: async copy => {
+            const outcome = discardWpsNativeComparison(copy);
+            if (outcome === "closed" || outcome === "already_closed") { releaseWpsReviewTarget(); return null; }
+            return "执行前副本仍保留，请手动核对。";
+          },
+          restore: async receipt => {
+            if (!await resultUndoRef.current(receipt.executionId, "discard")) throw new Error("恢复未完成，未声明已放弃。");
+          },
+          validateResult: async receipt => {
+            if (inspectWpsUndoRecord(application, receipt.executionId).kind !== "completed") throw new Error("结果已变化，未确认变更。");
+          },
+          accepted: receipt => { verifiedPlanForSaveRef.current = {plan: prepared.plan,
+            sourceSheetNames: prepared.authorization.sheets.map(sheet => sheet.name), executionId: receipt.executionId}; }
+        });
+        setWriteProgress(null);
+        // ResultReview captures errors in its notice; retain recovery discovery and allow a fresh inspection.
+        setWpsRecovery(previous => previous ? {...previous, acting: false} : previous);
+        if (resultReview.getSnapshot().phase !== "reviewing") {
+          refreshWpsRecoveryVerdict(operationId, fresh.taskId, await getWpsExecutionStatus(operationId));
+        }
+        return;
+      }
       if (action === "backfill") {
         const claimed = await claimWpsExecutionResume(operationId, revision);
         if (!claimed.ownerToken) {
@@ -2697,7 +2783,7 @@ export default function WpsAgentPanel({
         }
         if (reconciled.ownerToken) await suspendWpsExecution(operationId, {
           expectedRevision: reconciled.revision, ownerToken: reconciled.ownerToken,
-          code: "WPS_RECOVERY_PREVIEW_REQUIRED", message: "核对完成，剩余动作需重新预览。"
+          code: "WPS_RECOVERY_RECHECK_REQUIRED", message: "核对完成，剩余动作等待来源与本机材料复核。"
         });
         const suspended = await getWpsExecutionStatus(operationId);
         refreshWpsRecoveryVerdict(operationId, current.taskId, suspended);
@@ -2711,9 +2797,8 @@ export default function WpsAgentPanel({
         return;
       }
       /*
-       * 重新预览：这次执行还有动作没写完，但目标矩阵与确认快照只活在会话内内存，
-       * 重载后拼不回用户当初确认的那份计划 —— **精确续跑剩余动作未实现**。
-       * 所以如实走"重新读取并生成预览"，让用户重新授权、重新确认，生成新的执行身份。
+       * 本机材料不满足续跑条件时，重新读取并规划，生成新的执行身份。
+       * 新计划仍先执行后审阅，不能把它称为原动作的精确续跑。
        */
       const taskId = current.taskId;
       const record = messages
@@ -2722,14 +2807,14 @@ export default function WpsAgentPanel({
       append({
         role: "system",
         text:
-          "这次写入还有未完成的动作，而目标矩阵与确认快照只存在会话内，重开后无法精确续跑剩余动作。" +
-          "下面按原需求重新读取并生成预览 —— 那是新的一轮，需要你重新授权并确认后再写入，" +
+          "这次写入还有未完成的动作，本机材料不满足精确续跑条件。" +
+          "下面按原需求重新读取和规划，在当前授权范围内通过校验后执行，再审阅结果；" +
           "不是从上次进度接着写。"
       });
       if (!record) {
         append({
           role: "system",
-          text: "没有找到这次任务的原始需求记录，请重新输入需求，确认预览后再写入。"
+          text: "没有找到这次任务的原始需求记录，请重新输入需求，通过校验后执行，再审阅结果。"
         });
         return;
       }
@@ -2739,7 +2824,7 @@ export default function WpsAgentPanel({
       if (!claimed.ownerToken) throw new Error("未取得旧执行的处置权，不能重新规划。");
       await suspendWpsExecution(operationId, {
         expectedRevision: claimed.revision, ownerToken: claimed.ownerToken,
-        code: "WPS_REPLAN_REQUESTED", message: "用户选择重新读取并生成预览。"
+        code: "WPS_REPLAN_REQUESTED", message: "用户选择重新读取并规划。"
       });
       // 沿用原 taskId 与已确认信息：重新规划仍是同一件事，用户不必重答。
       resumeCarryRef.current = {
@@ -2749,11 +2834,19 @@ export default function WpsAgentPanel({
       await runTurn(resumePrompt(record), { showUser: false });
       // Keep the durable discovery index until a new preview is confirmed or the
       // user explicitly dismisses it; a failed planner must not erase evidence.
-      refreshWpsRecoveryVerdict(operationId, current.taskId, await getWpsExecutionStatus(operationId));
+      // A newly registered execution supersedes discovery of the old attempt.
+      // Do not revive its card after the new plan has already executed/reached review.
+      if (loadPendingWpsExecution()?.operationId === operationId) {
+        const state = await getWpsExecutionStatus(operationId);
+        if (loadPendingWpsExecution()?.operationId === operationId)
+          refreshWpsRecoveryVerdict(operationId, current.taskId, state);
+      } else {
+        setWpsRecovery(previous => previous?.operationId === operationId ? null : previous);
+      }
     } catch (error) {
       append({
         role: "system",
-        text: `恢复动作没有成功，本次未对原表做新的写入。${turnErrorMessage(error)}`
+        text: `恢复动作没有完成；请核对执行记录与原表现场，不会自动重试。${turnErrorMessage(error)}`
       });
       setWpsRecovery((previous) =>
         previous && previous.operationId === operationId
@@ -5417,6 +5510,10 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
         });
         return;
       }
+      // The persisted discovery index now belongs to this replacement execution.
+      setWpsRecovery(previous => previous && previous.operationId !== operationId &&
+        previous.taskId === carried().taskId ? null : previous);
+      bindRecoveryProbe((import.meta.env.DEV || import.meta.env.VITE_ENABLE_RECOVERY_PROBE === "true"), workbookIdentity, operationId, plan.plan.actions, Boolean(wpsLedgerState?.ownerToken && wpsLedgerState.descriptor.resumeContext));
       const registeredOperationId = operationId;
       const record = await executeWpsPlan(getWpsApplication(), plan, (update) => {
         setWriteProgress(update.message);
@@ -5446,6 +5543,7 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
                 }
               });
             } else {
+              interruptRecoveryProbe((import.meta.env.DEV || import.meta.env.VITE_ENABLE_RECOVERY_PROBE === "true"), registeredOperationId, checkpoint.actionIndex);
               wpsLedgerState = await completeWpsAction(registeredOperationId, {
                 expectedRevision: wpsLedgerState.revision,
                 ownerToken: wpsLedgerState.ownerToken,
@@ -5461,7 +5559,7 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
             }
           }
         : undefined,
-        operationId);
+        operationId, {taskId: wpsLedgerState?.taskId});
       let comparison: "matched" | "different" | "unavailable" = "unavailable";
       let comparisonFailed = false;
       if (review) {
@@ -5601,6 +5699,12 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
         } catch {
           // 挂起失败：服务端账本保持 running + 在途动作，重开后核对路径仍能接手。
         }
+      }
+      // WPS reopens an existing pane by setting Visible=true; React need not remount.
+      // Publish the recovery state now, after suspension, using the same read-only
+      // identity/authorization/target verdict as reload. Never automatically reconcile.
+      if (operationId && wpsLedgerState) {
+        refreshWpsRecoveryVerdict(operationId, wpsLedgerState.taskId, wpsLedgerState);
       }
       let latest: WpsUndoRecord | null = null;
       /** 读取宿主存储本身失败 —— 与"读到了但没有记录"是两件事，不能合并。 */
@@ -7930,57 +8034,9 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
                 : modelNotConfigured
                 ? "你好。添加一个模型连接后，即可查询、分析或修改已授权的工作表。"
                 : canWrite
-                  ? "你好。直接告诉我你想查询、分析或修改什么；涉及写入时，我会先展示计划并等你确认。"
+                  ? "你好。直接告诉我你想查询、分析或修改什么；涉及写入时，我会在授权范围内完成校验和执行，再展示结果供你审阅。"
                   : `你好。你可以查询和分析工作表；写入前还需通过当前文件检查：${writeStatusReason}`}
               </p>
-            </div>
-          </article>
-        )}
-
-        {wpsRecovery && (
-          <article className="wps-write-recovery" role="status">
-            <div className="wps-write-recovery-head">
-              <strong>上次写入的恢复核对</strong>
-              <span className={`wps-write-recovery-badge wps-write-recovery-${wpsRecovery.verdict.kind}`}>
-                {wpsRecovery.verdict.kind === "completed" && wpsRecovery.verdict.recorded
-                  ? "已记录完成" : WPS_RECONCILE_LABEL[wpsRecovery.verdict.kind]}
-              </span>
-            </div>
-            {wpsRecovery.identity.kind !== "match" && (
-              <p className="wps-write-recovery-detail">{wpsRecovery.identity.detail}</p>
-            )}
-            <p className="wps-write-recovery-detail">
-              {wpsRecovery.checking
-                ? "正在查询服务端写入现场…"
-                : WPS_RECOVERY_DETAIL(wpsRecovery.verdict)}
-            </p>
-            <p className="wps-write-recovery-detail">
-              恢复仅核对当前已确认范围内的登记区域；重新预览仍须你再次确认写回原表。
-            </p>
-            {/*
-             * 按钮**只**来自判定给的 `wpsReconcileActions`：判定说证据不足/现场冲突
-             * 就一个写入或补记按钮都不画，"继续"只在真的能安全续跑时出现。
-             */}
-            {wpsRecovery.verdict.kind === "replan" && <label>
-              <input type="checkbox" checked={recoveryScopeConfirmed}
-                onChange={(event) => setRecoveryScopeConfirmed(event.target.checked)} />
-              确认使用数据范围中当前已选工作表重新读取；新预览需另行确认写入。
-            </label>}
-            <div className="wps-write-recovery-actions">
-              {wpsReconcileActions(wpsRecovery.verdict).map((action) => (
-                <button
-                  key={action}
-                  className="wps-recovery-action"
-                  type="button"
-                  disabled={busy || wpsRecovery.checking || wpsRecovery.acting || (action === "replan" && !recoveryScopeConfirmed)}
-                  onClick={() => void runWpsRecoveryAction(action)}
-                >
-                  {WPS_RECOVERY_ACTION_LABEL[action]}
-                </button>
-              ))}
-              {(wpsRecovery.verdict.kind === "blocked" || wpsRecovery.verdict.kind === "insufficient") &&
-                <button type="button" disabled={busy || wpsRecovery.checking || wpsRecovery.acting}
-                  onClick={() => void refreshWpsRecovery()}>重新核对（只读）</button>}
             </div>
           </article>
         )}
@@ -8419,6 +8475,54 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
           那里会标明它属于哪一次执行。
         */}
 
+        {wpsRecovery && (
+          <article className="wps-write-recovery" role="status">
+            <div className="wps-write-recovery-head">
+              <strong>上次写入的恢复核对</strong>
+              <span className={`wps-write-recovery-badge wps-write-recovery-${wpsRecovery.verdict.kind}`}>
+                {wpsRecovery.verdict.kind === "completed" && wpsRecovery.verdict.recorded
+                  ? "已记录完成" : WPS_RECONCILE_LABEL[wpsRecovery.verdict.kind]}
+              </span>
+            </div>
+            {wpsRecovery.identity.kind !== "match" && (
+              <p className="wps-write-recovery-detail">{wpsRecovery.identity.detail}</p>
+            )}
+            <p className="wps-write-recovery-detail">
+              {wpsRecovery.checking
+                ? "正在查询服务端写入现场…"
+                : WPS_RECOVERY_DETAIL(wpsRecovery.verdict)}
+            </p>
+            <p className="wps-write-recovery-detail">
+              恢复只使用当前已授权工作表；续跑通过复核后执行剩余动作，再审阅结果。
+            </p>
+            {/*
+             * 按钮**只**来自判定给的 `wpsReconcileActions`：判定说证据不足/现场冲突
+             * 就一个写入或补记按钮都不画，"继续"只在真的能安全续跑时出现。
+             */}
+            {wpsRecovery.verdict.kind === "replan" && <label>
+              <input type="checkbox" checked={recoveryScopeConfirmed}
+                onChange={(event) => setRecoveryScopeConfirmed(event.target.checked)} />
+              使用当前已选工作表重新读取和规划；校验通过后执行，再审阅结果。
+            </label>}
+            <div className="wps-write-recovery-actions">
+              {wpsReconcileActions(wpsRecovery.verdict).map((action) => (
+                <button
+                  key={action}
+                  className="wps-recovery-action"
+                  type="button"
+                  disabled={busy || wpsRecovery.checking || wpsRecovery.acting || (action === "replan" && !recoveryScopeConfirmed)}
+                  onClick={() => void runWpsRecoveryAction(action)}
+                >
+                  {WPS_RECOVERY_ACTION_LABEL[action]}
+                </button>
+              ))}
+              {(wpsRecovery.verdict.kind === "blocked" || wpsRecovery.verdict.kind === "insufficient") &&
+                <button type="button" disabled={busy || wpsRecovery.checking || wpsRecovery.acting}
+                  onClick={() => void refreshWpsRecovery()}>重新核对（只读）</button>}
+            </div>
+          </article>
+        )}
+
         {(progress || writeProgress) && !activeActivityMessageId && progressCard}
       </main>
       {/*
@@ -8568,6 +8672,7 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
               : `当前仍可查询；写入将在满足条件后开放：${writeStatusReason}`}
           </p>
         )}
+        {(import.meta.env.DEV || import.meta.env.VITE_ENABLE_RECOVERY_PROBE === "true") && <RecoveryProbeControl identity={(checkpointWorkbookPath ? wpsWorkbookIdentity(checkpointWorkbookPath) : null)} disabled={busy} />}
       </footer>
 
       {newConversationConfirmOpen && (

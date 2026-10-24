@@ -1,3 +1,4 @@
+import { sameJsonEvidence } from "@excel-bro/core/jsonEvidence";
 import { BORDER_FIELDS, borderField, borderTarget, applyWpsBorders, expandWpsBorders, type BorderAction } from "./wpsBorders";
 import type { CellBorderSide } from "@excel-bro/core/borderEdges";
 import { filteredSourceRows } from "./wpsFilteredPlan";
@@ -14,8 +15,8 @@ import {
   type ChangeSnapshot,
   type RangeChangeReview
 } from "@excel-bro/core/changeReview";
-import type { AnalysisPlan, CellValue, ExcelAction } from "../../excel-addin/src/contracts";
-import { assertFormatActionFields } from "../../excel-addin/src/contracts";
+import type { AnalysisPlan, CellValue, ExcelAction, WpsResumeContext, WpsExecutionState } from "../../excel-addin/src/contracts";
+import { assertFormatActionFields, assertWpsRecoveryDescriptor } from "../../excel-addin/src/contracts";
 import {
   assertRectangularValues,
   blankCellMatrix,
@@ -171,7 +172,7 @@ export type WpsPreparedAction = {
    *
    * 只活在内存里，供确认卡首屏的「修改前」列使用 —— 让用户在写入前看到"到底改了什么"。
    * 出站闸 `wpsRecoveryDescriptor` 是**白名单投影**，不会取这两个字段，所以它
-   * 没有路径进入登记请求或落盘。
+   * 没有路径进入登记请求；执行时会随既有撤销记录保存在宿主 PluginStorage。
    */
   beforeValues: CellValue[][];
   /** false = 宿主这次没交出 `Value2`，确认卡必须标"原值未取得"，不得拿公式顶替。 */
@@ -248,6 +249,7 @@ export type WpsActionAfter = {
 };
 
 export type WpsUndoRecord = {
+  resume?: { taskId: string; context: WpsResumeContext };
   version: 1 | 2;
   executionId: string;
   planId: string;
@@ -882,11 +884,14 @@ export function prepareWpsPlan(
       range: `${columnName(rect.startColumn)}${rect.startRow + row}:${columnName(rect.endColumn)}${rect.startRow + row}` }));
   }) };
   sourceSnapshots = [...sourceSnapshots, ...filteredSources];
+  const independentValueCopies = plan.actions.length > 1 && plan.actions.every(action =>
+    action.type === "copyRange" && action.copyType === "values" && !action.skipBlanks && !action.filters?.length &&
+    !plan.actions.some(target => target.sheet === action.sourceSheet));
   const copySources: WpsSourceSnapshot[] = [];
   if (plan.actions.some(action => action.type === "copyRange")) plan = {...plan, actions:plan.actions.flatMap((action, actionIndex):ExcelAction[] => {
     if(action.type !== "copyRange") return [action];
     if (!(capabilities.wpsWrite.allowedActions as readonly string[]).includes("copyRange")) throw new Error("WPS 当前未开放 copyRange。");
-    if (plan.actions.slice(0, actionIndex).some(previous => !isFormatActionType(previous.type))) {
+    if (!independentValueCopies && plan.actions.slice(0, actionIndex).some(previous => !isFormatActionType(previous.type))) {
       throw new Error("复制来源必须在本计划的数据写入前读取；请先完成前序数据修改，再生成复制计划。");
     }
     const rect=parseExplicitA1Rect(action.sourceRange);
@@ -900,6 +905,8 @@ export function prepareWpsPlan(
     if (!isCompleteSourceMatrix(source.Value2, rect.rows, rect.columns) || !isCompleteSourceMatrix(source.Formula, rect.rows, rect.columns)) throw new Error("复制来源矩阵不完整，未写入。");
     const snapshot=readMatrices(source,rect.rows,rect.columns);
     if(!snapshot.valuesCaptured) throw new Error("复制来源值未完整取得。");
+    if (independentValueCopies && snapshot.formulas.some(row => row.some(value => typeof value === "string" && value.startsWith("="))))
+      throw new Error("多动作值复制的来源含公式依赖，无法保证预读与逐步复制等价；未写入。");
     copySources.push({sheetName:action.sourceSheet,range:action.sourceRange,values:snapshot.values});
     const matched = action.filters?.length ? filteredSourceRows(snapshot.values, action.filters, action.hasHeaders ?? true) : undefined;
     if (matched && !matched.length) throw new Error("没有命中复制条件的行，原表未修改。");
@@ -1010,6 +1017,143 @@ export function prepareWpsPlan(
   };
   prepared.confirmationSnapshot = confirmationSnapshot(prepared);
   return prepared;
+}
+
+/** Only complete, disjoint source evidence qualifies; no cell matrix leaves this host. */
+export function wpsResumeContext(prepared: WpsPreparedPlan): WpsResumeContext | null {
+  const deps = prepared.plan.sourceDependencySheets;
+  if (!deps?.length || !prepared.hostVersion || !prepared.sources.length ||
+      prepared.actions.some(a => a.type !== "writeValues") ||
+      deps.some(name => prepared.actions.some(a => a.sheetName === name) || !prepared.sources.some(s => s.sheetName === name)) ||
+      prepared.sources.some(s => s.presentationFingerprint !== undefined || !deps.includes(s.sheetName)) ||
+      prepared.sources.reduce((n, s) => n + s.rowCount * s.columnCount, 0) > capabilities.taskRecovery.wpsResumeMaxSourceCells) return null;
+  const sources = prepared.sources.map(source => {
+    const snapshot = prepared.sourceSnapshots.find(s => s.sheetName === source.sheetName && s.range === source.range);
+    if (!snapshot) return null;
+    return {sheetName: source.sheetName, range: source.range, rowCount: source.rowCount,
+      columnCount: source.columnCount, previewFingerprint: source.previewFingerprint,
+      valueFingerprint: matrixFingerprintV2(snapshot.values, snapshot.values.map(row => row.map(() => null)))};
+  });
+  if (sources.some(s => !s)) return null;
+  return {version: 1, hostVersion: prepared.hostVersion, sources: sources as WpsResumeContext["sources"]};
+}
+
+/** Check authorization and ALL descriptors before reading any source cells. */
+export function assertWpsResumeSources(application: WpsApplication, state: WpsExecutionState,
+  selectedIndexes: readonly number[]): void {
+  const context = state.descriptor.resumeContext;
+  if (!context) throw new Error("本次执行没有可续跑的来源证据。");
+  assertWpsRecoveryDescriptor(state.descriptor);
+  const authorization = authorizeWpsSheets(application, selectedIndexes);
+  const names = authorization.sheets.map(s => s.name).sort();
+  if (`wps-path:${String(authorization.workbookFullName).trim().toLowerCase()}` !== state.workbookIdentity ||
+      JSON.stringify(names) !== JSON.stringify([...state.authorizedSheetNames].sort()) ||
+      String(application.Version ?? "").trim() !== context.hostVersion)
+    throw new Error("工作簿、宿主版本或授权已变化，不能续跑。");
+  let cells = 0;
+  for (const source of context.sources) {
+    const rect = parseA1Range(source.range);
+    if (!names.includes(source.sheetName) || state.descriptor.actions.some(a => a.sheet === source.sheetName) ||
+        rect.endRow - rect.startRow + 1 !== source.rowCount || rect.endColumn - rect.startColumn + 1 !== source.columnCount)
+      throw new Error("续跑来源越界或尺寸无效。");
+    cells += source.rowCount * source.columnCount;
+  }
+  if (cells > capabilities.taskRecovery.wpsResumeMaxSourceCells) throw new Error("续跑来源超过限额。");
+  for (const source of context.sources) {
+    const selected = authorization.sheets.find(s => s.name === source.sheetName)!;
+    const range = rangeFor(assertWpsAuthorization(application, authorization, selected), source.range);
+    if (range.MergeCells !== false || !isCompleteSourceMatrix(range.Value2, source.rowCount, source.columnCount) ||
+        !isCompleteSourceMatrix(range.Formula, source.rowCount, source.columnCount)) throw new Error("续跑来源无法完整读取。");
+    const current = readMatrices(range, source.rowCount, source.columnCount);
+    if (current.fingerprint !== source.previewFingerprint ||
+        matrixFingerprintV2(current.values, current.values.map(row => row.map(() => null))) !== source.valueFingerprint)
+      throw new Error("来源已变化，不能沿用旧结果续跑。");
+  }
+}
+
+/** Reconstruct ONLY the recorded writeValues, preserving the original undo snapshots. */
+export function prepareWpsResume(application: WpsApplication, state: WpsExecutionState,
+  selectedIndexes: readonly number[], now = Date.now()): {prepared: WpsPreparedPlan; record: WpsUndoRecord} {
+  const record = wpsUndoRecordFor(application, state.operationId);
+  const age = now - Date.parse(record?.createdAt ?? "");
+  if (!record) throw new Error("找不到原执行的本机恢复记录。");
+  if (!record.resume) throw new Error("原执行未保留精确续跑材料；可能已完成或不是支持的可恢复计划。");
+  if (record.resume.taskId !== state.taskId) throw new Error("本机恢复记录与服务端任务身份不一致。");
+  if (!Number.isFinite(age) || age < 0 || age > capabilities.taskRecovery.wpsResumeMaxAgeSeconds * 1000)
+    throw new Error("本机恢复记录已过期或创建时间无效。");
+  if (!sameJsonEvidence(record.resume.context, state.descriptor.resumeContext))
+    throw new Error("本机与服务端的来源证据不一致。");
+  if (!record || record.version !== 2 || !["ready", "applying", "partial_write_recoverable"].includes(record.state) ||
+      !record.resume || record.resume.taskId !== state.taskId || !Number.isFinite(age) || age < 0 ||
+      age > capabilities.taskRecovery.wpsResumeMaxAgeSeconds * 1000 ||
+      !sameJsonEvidence(record.resume.context, state.descriptor.resumeContext) ||
+      state.inFlightActionIndex != null || state.requiresReconciliation ||
+      !Number.isInteger(state.nextActionIndex) || state.nextActionIndex < 0 || state.nextActionIndex >= state.totalActions ||
+      record.actions.length !== state.totalActions || state.descriptor.actions.length !== state.totalActions ||
+      `wps-path:${record.workbookIdentity}` !== state.workbookIdentity ||
+      JSON.stringify([...record.authorizedSheetNames].sort()) !== JSON.stringify([...state.authorizedSheetNames].sort()))
+    throw new Error("本机续跑材料缺失、过期、被替换或仍需核对；未执行。");
+  assertWpsResumeSources(application, state, selectedIndexes);
+  // Validate stored matrices and descriptors, never trust arbitrary PluginStorage action fields.
+  const actions: AnalysisPlan["actions"] = record.actions.map((a, index) => {
+    const d = state.descriptor.actions[index];
+    if (a.type !== "writeValues" || d.type !== "writeValues" || a.actionIndex !== index || d.actionIndex !== index ||
+        a.sheetName !== d.sheet || a.range !== d.range || a.rowCount !== d.rowCount || a.columnCount !== d.columnCount ||
+        a.cellCount !== d.cellCount || a.beforeFingerprint !== d.previewFingerprint ||
+        ![a.values, a.beforeValues, a.beforeFormulas].every(m => Array.isArray(m) && m.length === d.rowCount && m.every(row =>
+          Array.isArray(row) && row.length === d.columnCount && row.every(v => v === null || typeof v === "string" || typeof v === "boolean" || (typeof v === "number" && Number.isFinite(v))))) ||
+        matrixFingerprintV2(a.values, a.values) !== d.expectedFingerprint ||
+        matrixFingerprintV2(a.beforeValues, a.beforeFormulas) !== d.previewFingerprint)
+      throw new Error("本机动作与已登记计划不一致，拒绝续跑。");
+    return {type: "writeValues", sheet: d.sheet, range: d.range, values: a.values.map(row => [...row])};
+  });
+  const prepared = prepareWpsPlan(application, selectedIndexes, {id: record.planId, title: record.planTitle,
+    summary: "继续已登记计划的剩余动作", assumptions: [], warnings: [], acceptanceCriteria: [], actions,
+    sourceDependencySheets: [...new Set(record.resume.context.sources.map(s => s.sheetName))]});
+  for (const [index, action] of prepared.actions.entries()) {
+    const descriptor = state.descriptor.actions[index];
+    if (action.previewFingerprint !== (index < state.nextActionIndex ? descriptor.expectedFingerprint : descriptor.previewFingerprint))
+      throw new Error("已完成或未完成目标已变化，拒绝续跑。");
+  }
+  // Rebuild trusted geometry/index from today's authorization, keep original rollback contents.
+  const restored: WpsUndoRecord = {...record, actions: prepared.actions.map((action, index) => ({...action,
+    beforeValues: record.actions[index].beforeValues.map(row => [...row]),
+    beforeFormulas: record.actions[index].beforeFormulas.map(row => [...row]),
+    beforeFingerprint: state.descriptor.actions[index].previewFingerprint,
+    afterFingerprint: index < state.nextActionIndex ? state.descriptor.actions[index].expectedFingerprint! : null,
+    appliedRows: index < state.nextActionIndex ? action.rowCount : 0}))};
+  return {prepared, record: restored};
+}
+
+/** Completed native writes with a lost final receipt: reconstruct review, never execute. */
+export function prepareWpsCompletedReview(application: WpsApplication, state: WpsExecutionState,
+  indexes: readonly number[]): {prepared: WpsPreparedPlan; record: WpsUndoRecord} {
+  assertWpsRecoveryDescriptor(state.descriptor);
+  const record = wpsUndoRecordFor(application, state.operationId);
+  const authorization = authorizeWpsSheets(application, indexes);
+  if (!record || record.state !== "verified" || state.nextActionIndex !== state.totalActions ||
+      state.inFlightActionIndex != null || state.requiresReconciliation ||
+      `wps-path:${record.workbookIdentity}` !== state.workbookIdentity ||
+      `wps-path:${String(authorization.workbookFullName).trim().toLowerCase()}` !== state.workbookIdentity ||
+      !sameJsonEvidence([...record.authorizedSheetNames].sort(), [...state.authorizedSheetNames].sort()) ||
+      !sameJsonEvidence(authorization.sheets.map(s => s.name).sort(), [...state.authorizedSheetNames].sort()) ||
+      record.actions.length !== state.totalActions || state.descriptor.actions.length !== state.totalActions)
+    throw new Error("完成记录、当前授权或工作簿不匹配，不能接入审阅。");
+  const actions: AnalysisPlan["actions"] = record.actions.map((a, index) => {
+    const d = state.descriptor.actions[index];
+    if (a.type !== "writeValues" || d.type !== "writeValues" || a.actionIndex !== index || d.actionIndex !== index ||
+        a.sheetName !== d.sheet || a.range !== d.range || a.rowCount !== d.rowCount || a.columnCount !== d.columnCount ||
+        ![a.values, a.beforeValues, a.beforeFormulas].every(m => Array.isArray(m) && m.length === d.rowCount &&
+          m.every(row => Array.isArray(row) && row.length === d.columnCount)) ||
+        matrixFingerprintV2(a.values, a.values) !== d.expectedFingerprint ||
+        matrixFingerprintV2(a.beforeValues, a.beforeFormulas) !== d.previewFingerprint)
+      throw new Error("完成记录与原计划不一致，不能接入审阅。");
+    return {type: "writeValues", sheet: d.sheet, range: d.range, values: a.values};
+  });
+  if (inspectWpsUndoRecord(application, state.operationId).kind !== "completed")
+    throw new Error("已完成目标发生变化，不能接入审阅。");
+  return {record, prepared: prepareWpsPlan(application, indexes, {id: record.planId,
+    title: record.planTitle, summary: "补记完成回执后审阅原执行结果", assumptions: [], warnings: [], actions})};
 }
 
 function randomId(): string {
@@ -1558,7 +1702,7 @@ export async function executeWpsPlan(
   onProgress?: (progress: WpsExecutionProgress) => void,
   /**
    * 双栏变更对照只走回调交出去，**不写进 `WpsUndoRecord`** —— record 会落 PluginStorage，
-   * 而前后矩阵按 §7 只许停在会话内内存。
+   * 而 UI 变更对照对象只保留在内存；原始写前快照已由既有撤销记录保存在本机。
    *
    * 一并回传 `executionId`：失败路径同样会回调一次（失败后必须先给对照，再由用户决定
    * 撤销还是重做），那时调用方拿不到 record。
@@ -1574,7 +1718,8 @@ export async function executeWpsPlan(
    * 覆盖默认随机生成的 `executionId`。CAP-03 用它把 PluginStorage 恢复点与服务端
    * 账本的 `operationId` 对齐，使撤销、核对、续跑都指向同一份执行身份。
    */
-  executionIdOverride?: string
+  executionIdOverride?: string,
+  recovery?: {taskId?: string; resume?: {record: WpsUndoRecord; startActionIndex: number; check(): void}}
 ): Promise<WpsUndoRecord> {
   if (!capabilities.wpsWrite.enabled) throw new Error("WPS 写入功能当前已由能力开关关闭。");
   const hostVersion = String(application.Version ?? "").trim();
@@ -1617,7 +1762,8 @@ export async function executeWpsPlan(
     actionCount: prepared.actions.length,
     cellCount: prepared.totalCells
   });
-  const storedActions: StoredAction[] = prepared.actions.map((action) => {
+  recovery?.resume?.check();
+  const storedActions: StoredAction[] = recovery?.resume?.record.actions ?? prepared.actions.map((action) => {
     const authorized = prepared.authorization.sheets.find((sheet) => sheet.index === action.sheetIndex);
     if (!authorized) throw new Error(`工作表「${action.sheetName}」已不在授权范围内。`);
     const sheet = assertWpsAuthorization(application, prepared.authorization, authorized);
@@ -1654,7 +1800,9 @@ export async function executeWpsPlan(
       appliedRows: 0
     };
   });
-  const record: WpsUndoRecord = {
+  const context = wpsResumeContext(prepared);
+  const record: WpsUndoRecord = recovery?.resume?.record ?? {
+    ...(context && recovery?.taskId ? {resume: {taskId: recovery.taskId, context}} : {}),
     version: 2,
     executionId: executionIdOverride ?? randomId(),
     planId: prepared.plan.id,
@@ -1696,6 +1844,7 @@ export async function executeWpsPlan(
   };
   let firstWriteChecked = false;
   const beforeFirstMutation = () => {
+    recovery?.resume?.check();
     if (firstWriteChecked) return;
     assertSourcesCurrent();
     firstWriteChecked = true;
@@ -1720,6 +1869,8 @@ export async function executeWpsPlan(
     record.state = "applying";
     upsertRecord(application, record);
     for (const [position, action] of record.actions.entries()) {
+      if (position < (recovery?.resume?.startActionIndex ?? 0)) continue;
+      recovery?.resume?.check();
       let sheet = getStoredSheet(application, record, action);
 
       // 格式动作：执行前现场采集逐格/逐行格式快照（撤销依据 + 回读基线）。
@@ -1861,6 +2012,7 @@ export async function executeWpsPlan(
           actionCount: record.actions.length,
           cellCount: action.cellCount
         });
+        recovery?.resume?.check();
         const chunk = rangeFor(sheet, rangeAddress(action.rect, offset, rows));
         const chunkValues = action.values.slice(offset, offset + rows);
         attemptedActions.add(action.actionIndex);
@@ -1943,6 +2095,7 @@ export async function executeWpsPlan(
       }
     }
     record.state = "verified";
+    delete record.resume;
     upsertRecord(application, record);
     emitReviews();
     return record;

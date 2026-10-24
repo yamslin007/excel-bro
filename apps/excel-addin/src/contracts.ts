@@ -1972,7 +1972,21 @@ export interface WpsRecoveryActionDescriptor {
  * `AnalysisPlan` 的做法 —— 那个做法会把 `writeValues` 的目标值矩阵带出站并落盘。
  * 恢复功能不得为"能续跑"而放宽这条约束：宁可续跑能力受限，也不让单元格内容出站。
  */
+export interface WpsResumeSource {
+  sheetName: string;
+  range: string;
+  rowCount: number;
+  columnCount: number;
+  previewFingerprint: string;
+  valueFingerprint: string;
+}
+export interface WpsResumeContext {
+  version: 1;
+  hostVersion: string;
+  sources: WpsResumeSource[];
+}
 export interface WpsRecoveryDescriptor {
+  resumeContext?: WpsResumeContext | null;
   actions: WpsRecoveryActionDescriptor[];
 }
 
@@ -2035,9 +2049,26 @@ export function assertWpsExecutionResult(value: unknown): void {
 }
 
 export function assertWpsRecoveryDescriptor(value: unknown): asserts value is WpsRecoveryDescriptor {
-  if (!value || typeof value !== "object" || Object.keys(value).some((key) => key !== "actions") ||
+  if (!value || typeof value !== "object" || Object.keys(value).some((key) => !["actions", "resumeContext"].includes(key)) ||
       !Array.isArray((value as WpsRecoveryDescriptor).actions) || !(value as WpsRecoveryDescriptor).actions.length)
     throw new Error("WPS 恢复描述无效");
+  const context = (value as WpsRecoveryDescriptor).resumeContext;
+  if (context != null) {
+    if (context.version !== 1 || typeof context.hostVersion !== "string" || !context.hostVersion ||
+        context.hostVersion.length > 80 || Object.keys(context).some(key => !["version", "hostVersion", "sources"].includes(key)) ||
+        !Array.isArray(context.sources) || !context.sources.length || context.sources.length > 500)
+      throw new Error("WPS 续跑来源证据无效");
+    for (const source of context.sources) {
+      if (!source || Object.keys(source).some(key => !["sheetName", "range", "rowCount", "columnCount", "previewFingerprint", "valueFingerprint"].includes(key)) ||
+          typeof source.sheetName !== "string" || !source.sheetName || source.sheetName.length > 31 ||
+          typeof source.range !== "string" || !/^\$?[A-Z]{1,3}\$?[1-9]\d*(?::\$?[A-Z]{1,3}\$?[1-9]\d*)?$/.test(source.range) ||
+          !Number.isInteger(source.rowCount) || source.rowCount < 1 || source.rowCount > 1048576 ||
+          !Number.isInteger(source.columnCount) || source.columnCount < 1 || source.columnCount > 16384 ||
+          typeof source.previewFingerprint !== "string" || typeof source.valueFingerprint !== "string" ||
+          !/^v2:\d+:[0-9a-f]{8}$/.test(source.previewFingerprint) || !/^v2:\d+:[0-9a-f]{8}$/.test(source.valueFingerprint))
+        throw new Error("WPS 续跑来源含未知字段或无效指纹");
+    }
+  }
   const keys = ["actionIndex", "type", "sheet", "range", "rowCount", "columnCount", "cellCount",
     "previewFingerprint", "expectedFingerprint", "applyTo", "formulaR1C1", "formatFields"];
   for (const [index, action] of (value as WpsRecoveryDescriptor).actions.entries()) {

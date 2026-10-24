@@ -253,3 +253,24 @@ describe('already executed result review', () => {
     expect(operations.execute).toHaveBeenCalledOnce();
   });
 });
+
+describe('adopt recovered result without execution',()=>{
+  it.each(['confirm','discard'] as const)('adopts a failed review and supports %s without preparing/executing again',async action=>{
+    const {review,operations,receipt}=setup();
+    vi.mocked(operations.execute).mockRejectedValueOnce(new Error('interrupted'));
+    await review.start('old',operations);
+    expect(await review.adoptCompleted('recovered','original-before',receipt,operations)).toBe(true);
+    await review.compare('recovered');
+    expect(operations.showBefore).toHaveBeenCalledWith('original-before',receipt);
+    await review[action]('recovered');
+    expect(operations.prepare).toHaveBeenCalledTimes(1);expect(operations.execute).toHaveBeenCalledTimes(1);
+    expect(review.getSnapshot().phase).toBe(action==='confirm'?'confirmed':'discarded');
+    expect(await review.adoptCompleted('recovered','before',receipt,operations)).toBe(false);
+  });
+  it('unverified result cannot expose review actions',async()=>{
+    const {review,operations,receipt}=setup();
+    expect(await review.adoptCompleted('bad','before',{...receipt,verified:false},operations)).toBe(false);
+    expect(await review.confirm('bad')).toBe(false);expect(operations.mark).not.toHaveBeenCalled();
+    expect(operations.execute).not.toHaveBeenCalled();expect(operations.prepare).not.toHaveBeenCalled();
+  });
+});
