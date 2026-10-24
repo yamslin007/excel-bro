@@ -240,7 +240,15 @@ function makeApplication(initialRow3Value: string) {
   const headerValues = new Set<string>();
   const dataValues = new Set<string>();
   const sourceColumnWholeReads: string[] = [];
+  /*
+   * **真实写入面**：执行器写完之后会逐格回读并与计划比对。替身若只把 setter
+   * 记成"写了一次"而不改值，回读永远等于原值 —— 那会把"执行链路正常"误判成
+   * "回读不符"，测到的是替身缺陷而不是产品行为。所以这里按坐标真正存值。
+   */
+  const written = new Map<string, unknown>();
   const cellAt = (row: number, col: number): string => {
+    const key = `${row},${col}`;
+    if (written.has(key)) return written.get(key) as string;
     if (row === 1) return headerRow[col - 1] ?? "";
     // 第 2 行：已知类别，目标列读取时为空。
     if (row === 2 && col === 1) return KNOWN_CATEGORY;
@@ -257,15 +265,34 @@ function makeApplication(initialRow3Value: string) {
       values.push(line);
     }
     const flat = values.length === 1 && values[0].length === 1 ? values[0][0] : values;
+    /** 把标量或二维矩阵按本区域坐标写进存储（与宿主语义一致：左上角对齐）。 */
+    const store = (value: unknown) => {
+      writes += 1;
+      const matrix = Array.isArray(value) ? value : [[value]];
+      for (let r = 0; r < endRow - startRow + 1; r += 1) {
+        for (let c = 0; c < endCol - startCol + 1; c += 1) {
+          const row = Array.isArray(matrix[r]) ? (matrix[r] as unknown[])[c] : undefined;
+          if (row === undefined && c > 0) continue;
+          written.set(`${startRow + r},${startCol + c}`, row ?? null);
+        }
+      }
+    };
     const range = {
       Rows: { Count: endRow - startRow + 1 },
       Columns: { Count: endCol - startCol + 1 },
       MergeCells: false,
       // `readChunkRange` 读 Value2；`prepareWpsPlan` 复核源值时读 Formula。
-      get Formula() { return flat; },
-      set Formula(_value: unknown) { writes += 1; },
-      get Value2() { return flat; },
-      set Value2(_value: unknown) { writes += 1; }
+      get Formula() { return values.length === 1 && values[0].length === 1 ? cellAt(startRow, startCol) : values.map((row, r) => row.map((_v, c) => cellAt(startRow + r, startCol + c))); },
+      set Formula(value: unknown) { store(value); },
+      get Value2() { return values.length === 1 && values[0].length === 1 ? cellAt(startRow, startCol) : values.map((row, r) => row.map((_v, c) => cellAt(startRow + r, startCol + c))); },
+      set Value2(value: unknown) { store(value); },
+      // `clearRange`（contents）走 ClearContents；与"写入空串"是两回事。
+      ClearContents: () => {
+        writes += 1;
+        for (let r = startRow; r <= endRow; r += 1) {
+          for (let c = startCol; c <= endCol; c += 1) written.delete(`${r},${c}`);
+        }
+      }
     } as Record<string, unknown>;
     return range;
   }
@@ -397,6 +424,7 @@ function localRuleTurnResponse(row3Category: string, includeRow3: boolean) {
 function intentProceedResponse() {
   return {
     kind: "proceed",
+    turnId: "turn-local-outbound",
     summary: "列映射",
     confirmedPrompt: "把类别列翻译成归属",
     provider: "model"
@@ -427,6 +455,12 @@ beforeEach(() => {
   // `POST /api/turn` 被复用两次：先意图、再规划。用计数器区分，避免把
   // 意图请求误判成规划请求。
   let turnCallCount = 0;
+  /*
+   * 账本在**登记**时报出恢复描述，之后每个检查点/完成回执都会带上同一份描述。
+   * 替身要像真实服务端那样把它记住，否则后续动作回执里的空描述会被真实的
+   * `assertWpsRecoveryDescriptor` 拒掉 —— 那是替身不真实，不是产品问题。
+   */
+  let ledgerDescriptor: unknown = null;
   vi.stubGlobal(
     "fetch",
     vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -442,10 +476,49 @@ beforeEach(() => {
       }
       if (url.includes("/api/turn")) {
         turnCallCount += 1;
+        if (url.includes("/stream")) {
+          return new Response(`event: result\ndata: ${JSON.stringify(planResponseFactory())}\n\n`, {
+            headers: { "Content-Type": "text/event-stream" }
+          });
+        }
         // Distinguish by the real request shape, including subsequent clarification turns.
         return jsonResponse(
           JSON.parse(String(init?.body ?? "{}")).scope ? intentProceedResponse() : planResponseFactory()
         );
+      }
+      /*
+       * CAP-03 账本端点：真实实现会在**首写之前**登记、每个动作前后推进检查点。
+       * 这里必须给真实形状的答复，否则登记失败会让写入被安全地中止 ——
+       * 那样测到的是"替身缺端点"，不是产品行为。
+       */
+      if (url.includes("/api/wps/executions")) {
+        const request = init?.body ? JSON.parse(String(init.body)) : {};
+        if (url.includes("/register") && request?.descriptor) ledgerDescriptor = request.descriptor;
+        const revision = Number(request?.expectedRevision ?? 0) + 1;
+        const operationId = decodeURIComponent(url.split("/executions/")[1] ?? "")
+          .split("/")[0] || "wps-execution-test";
+        return jsonResponse({
+          operationId,
+          status: url.endsWith("/complete") ? "completed" : "running",
+          revision,
+          workbookIdentity: "wps-path:c:////data////测试.xlsx",
+          taskId: "task-test",
+          // 回显请求里的描述：真实服务端会校验它（不允许空 actions、不允许矩阵）。
+          descriptor: request?.descriptor ?? ledgerDescriptor ?? { actions: [] },
+          authorizedSheetNames: ["Sheet1"],
+          // 进度必须与描述里的动作数一致（真实服务端就这么校验）。
+          nextActionIndex: url.includes("/actions/complete") ? Math.min(1, (ledgerDescriptor as { actions?: unknown[] })?.actions?.length ?? 1) : 0,
+          totalActions: (ledgerDescriptor as { actions?: unknown[] })?.actions?.length ?? 1,
+          inFlightActionIndex: null,
+          beforeSnapshot: null,
+          checkpoint: null,
+          result: null,
+          error: null,
+          canResume: true,
+          ownerActive: false,
+          requiresReconciliation: false,
+          ownerToken: "owner-token-0123456789abcdef0123456789abcdef"
+        });
       }
       if (url.includes("/api/plans/validate")) {
         // 真走到这里就是违约：本地计划不该来校验。返回原样，让断言能给出
@@ -476,6 +549,22 @@ function panel() {
 /** 从捕获结果里取所有请求体的合并文本，便于做"不含某值"的断言。 */
 function allBodies(): string {
   return captured.map((item) => `${item.url}\n${item.body}`).join("\n");
+}
+
+/**
+ * 只统计**会携带计划语义**的出站：意图、规划、计划校验。
+ *
+ * 为什么不数 `captured.length`：CAP-03 的账本登记（`/api/wps/executions/register`）
+ * 发生在**执行前**，是恢复证据 —— 它只带动作类型/表/区域/计数与两个指纹，
+ * 不含任何单元格内容。新流程"计划就绪即执行"，所以它必然出现在这一轮里；
+ * 把它算进"计划出站"会让"本地计划不出站"这条判据失去判别力（每次都被它顶红）。
+ * 真正的泄漏判据仍然是"目标值/源快照/`values` 不出现在任何请求体里"。
+ */
+function planCalls() {
+  return captured.filter((item) =>
+    item.url.includes("/api/intent") ||
+    item.url.includes("/api/turn") ||
+    item.url.includes("/api/plans/validate"));
 }
 
 describe("图片附件的真实 fetch 链路", () => {
@@ -557,7 +646,8 @@ describe("图片附件的真实 fetch 链路", () => {
     await type(textarea, "按截图生成预览，不执行写入");
     await submit(textarea);
     if (container.querySelector('[role="dialog"]')) await confirmBeforeAnalysis(container);
-    await until(() => captured.filter((r) => r.url.includes("/api/turn")).length === 2 &&
+    // Stream transport failure may use the existing one-shot fallback as well.
+    await until(() => captured.filter((r) => r.url.includes("/api/turn")).length >= 2 &&
       textarea?.value === "按截图生成预览，不执行写入", "失败后应恢复原需求");
     expect(container.querySelector(".composer-attachments img")).not.toBeNull();
     expect(localStorage.getItem("excel-bro.wps.chat.v1")).not.toContain("ZXhwbGljaXQ");
@@ -617,7 +707,7 @@ describe("local_plan_rule 的真实出站请求体", () => {
       expect(textOf(container)).not.toContain(PRIVATE_SENTINEL);
       await confirmBeforeAnalysis(container);
       await until(() => textOf(container).includes(PRIVATE_SENTINEL), "应展示本地未知来源值");
-      const requestCount = captured.length;
+      const requestCount = planCalls().length;
       const target = "用户本地答案-6K9B";
       expect(findButton(container, "按补充映射重新生成预览")!.disabled).toBe(true); // Missing input, not missing authorization.
       expect(container.querySelector('.local-mapping-scope-confirmation')).toBeNull();
@@ -625,11 +715,11 @@ describe("local_plan_rule 的真实出站请求体", () => {
       await typeInput(container.querySelector<HTMLInputElement>('.wps-local-mapping-values input[type="text"]'), target);
       await until(() => !findButton(container, "按补充映射重新生成预览")!.disabled, "填写完整后应可预览");
       await click(findButton(container, "按补充映射重新生成预览"));
-      await until(() => textOf(container).includes("写入前确认"), "确认后必须进入新预览，而不是重问同一道题");
+      await until(() => textOf(container).includes("本次执行计划"), "确认后必须进入新预览，而不是重问同一道题");
       expect(textOf(container)).not.toContain("无法确认当前工作簿和授权工作表");
       expect(textOf(container)).not.toContain("已重新确认当前数据范围");
       expect(findButton(container, "确认此范围并继续")).toBeNull();
-      expect(captured.length).toBe(requestCount);
+      expect(planCalls().length).toBe(requestCount);
       expect(findButton(container, "按补充映射重新生成预览")).toBeNull();
       expect(textOf(container)).toContain(target);
       expect(allBodies()).not.toContain(PRIVATE_SENTINEL);
@@ -637,10 +727,20 @@ describe("local_plan_rule 的真实出站请求体", () => {
       const stored = localStorage.getItem("excel-bro.wps.chat.v1") ?? "";
       expect(stored).not.toContain(PRIVATE_SENTINEL);
       expect(stored).not.toContain(target);
-      expect(stored).toContain('"authorizationRevision":2');
+      /*
+       * 「再确认一次目标」**不是**一次新授权：授权范围一个字没变，
+       * `authorizationRevision` 就不许前进一格 —— 版本号是"已提交范围的身份"，
+       * 不是"用户点过确认"的计数。前进一格会把仍在进行的审阅判成"授权已变化"
+       * （真机症状：确认/放弃反复报"工作簿或授权发生变化"）。
+       */
+      expect(stored).toContain('"authorizationRevision":1');
+      expect(stored).not.toContain('"authorizationRevision":2');
       expect(stored).not.toContain(book.FullName);
       expect(allBodies()).not.toContain(book.FullName);
-      expect(host.writeCount()).toBe(0);
+      // 补全后计划**已经执行**（新流程是"先执行、后审阅"）：这里校验的是
+      // "只写了这一处、且私有值仍不出站/不落盘"，而不是"零写入" ——
+      // 零写入的正确观测点是执行开始之前，由本用例前半段断言。
+      expect(host.writeCount()).toBe(1);
     });
 
     it("分析前授权后换到同名异路径文件：不得把私有补全规则用于另一份文件", async () => {
@@ -661,20 +761,20 @@ describe("local_plan_rule 的真实出站请求体", () => {
       const target = "禁止跨文件挪用-4Q1C";
       await typeInput(container.querySelector<HTMLInputElement>('.wps-local-mapping-values input[type="text"]'), target);
       await until(() => !findButton(container, "按补充映射重新生成预览")!.disabled, "已有前置授权且输入有效");
-      const count = captured.length;
+      const count = planCalls().length;
       fullName = "C:\\Other\\测试.xlsx";
       await click(findButton(container, "按补充映射重新生成预览"));
       await until(() => Boolean(container.querySelector('[role="dialog"]')), "跨文件应先要求选择目标，不能先重规划");
-      expect(captured.length).toBe(count);
+      expect(planCalls().length).toBe(count);
       expect(host.writeCount()).toBe(0);
       expect(container.querySelector<HTMLInputElement>('.wps-local-mapping-values input[type="text"]')!.value).toBe(target);
       const dialog = container.querySelector('[role="dialog"]')!;
       await click(dialog.querySelectorAll('input[type="radio"]')[1]);
       await click(dialog.querySelector('input[type="checkbox"]'));
       await click(findButton(container, "确认目标并继续"));
-      expect(captured.length).toBe(count); // Scope confirmation must not auto-replay old mapping or planning.
+      expect(planCalls().length).toBe(count); // Scope confirmation must not auto-replay old mapping or planning.
       expect(textOf(container)).not.toContain(target);
-      expect(textOf(container)).not.toContain("写入前确认");
+      expect(textOf(container)).not.toContain("本次执行计划");
       expect(allBodies()).not.toContain(target);
     });
 
@@ -692,13 +792,13 @@ describe("local_plan_rule 的真实出站请求体", () => {
       await confirmBeforeAnalysis(container);
       await until(() => textOf(container).includes(PRIVATE_SENTINEL) &&
         Boolean(container.querySelector('.wps-local-mapping-values input[type="text"]')), "前置确认后应展示业务缺口");
-      const count = captured.length;
+      const count = planCalls().length;
       host.setRow3Value("新的私有来源-8F2H");
       await typeInput(container.querySelector<HTMLInputElement>('.wps-local-mapping-values input[type="text"]'), "旧值目标-4J2H");
       await click(findButton(container, "按补充映射重新生成预览"));
       await until(() => textOf(container).includes("新的私有来源-8F2H"), "应读取当前数据并在原卡询问新缺口");
-      expect(findButton(container, "生成右侧副本并排审阅")).toBeNull();
-      expect(captured.length).toBe(count);
+      expect(findButton(container, "确认变更")).toBeNull();
+      expect(planCalls().length).toBe(count);
       expect(host.writeCount()).toBe(0);
       expect(allBodies()).not.toContain("新的私有来源-8F2H");
       expect(localStorage.getItem("excel-bro.wps.chat.v1") ?? "").not.toContain("新的私有来源-8F2H");
@@ -727,7 +827,7 @@ describe("local_plan_rule 的真实出站请求体", () => {
       // 正向锚点 2：**没有任何写入预览**（没有"生成右侧副本并排审阅"按钮，也没有目标区域）。
       // 这正是"拒绝而非兜底"的可观测后果 —— 若生产代码把未命中值兜成 blankLabel，
       // 这里会冒出一个预览，用例立刻变红。
-      expect(findButton(container, "生成右侧副本并排审阅")).toBeNull();
+      expect(findButton(container, "确认变更")).toBeNull();
       expect(textOf(container)).not.toContain(RULE_TARGET_RANGE);
       expect(textOf(container)).not.toContain(TARGET_VALUE);
       expect(textOf(container)).not.toContain("已按映射处理");
@@ -736,15 +836,15 @@ describe("local_plan_rule 的真实出站请求体", () => {
       expect(localStorage.getItem("excel-bro.wps.chat.v1") ?? "").not.toContain(PRIVATE_SENTINEL);
 
       const target = "用户明确目标-8L2P";
-      const fetchesBeforeAnswer = captured.length;
+      const fetchesBeforeAnswer = planCalls().length;
       const sourceReadsBeforeAnswer = host.wholeReads();
       await typeInput(container.querySelector<HTMLInputElement>(`.wps-local-mapping-values input`), target);
       await click(findButton(container, "按补充映射重新生成预览"));
-      await until(() => textOf(container).includes("写入前确认"), "补充后应生成新的写入预览");
+      await until(() => textOf(container).includes("本次执行计划"), "补充后应生成新的写入预览");
       expect(textOf(container)).toContain(target);
-      expect(findButton(container, "生成右侧副本并排审阅")).not.toBeNull();
+      expect(findButton(container, "确认变更")).not.toBeNull();
       expect(host.wholeReads()).toBeGreaterThan(sourceReadsBeforeAnswer);
-      expect(captured.length).toBe(fetchesBeforeAnswer);
+      expect(planCalls().length).toBe(fetchesBeforeAnswer);
       expect(localStorage.getItem("excel-bro.wps.chat.v1") ?? "").not.toContain(PRIVATE_SENTINEL);
       expect(localStorage.getItem("excel-bro.wps.chat.v1") ?? "").not.toContain(target);
 
@@ -778,7 +878,7 @@ describe("local_plan_rule 的真实出站请求体", () => {
       await typeInput(container.querySelector<HTMLInputElement>(".wps-local-mapping-values input"), "原值的目标");
       await click(findButton(container, "按补充映射重新生成预览"));
       await until(() => textOf(container).includes("新出现的本地值-5D8T"), "应询问重新读取后发现的新值");
-      expect(findButton(container, "生成右侧副本并排审阅")).toBeNull();
+      expect(findButton(container, "确认变更")).toBeNull();
       expect(allBodies()).not.toContain("新出现的本地值-5D8T");
       expect(localStorage.getItem("excel-bro.wps.chat.v1") ?? "").not.toContain("新出现的本地值-5D8T");
     });
@@ -795,14 +895,14 @@ describe("local_plan_rule 的真实出站请求体", () => {
       await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "应加载模型");
       await ask(container);
       await until(() => textOf(container).includes(compound), "应展示无法归因的整格值");
-      expect(findButton(container, "生成右侧副本并排审阅")).toBeNull();
-      const fetchesBefore = captured.length;
+      expect(findButton(container, "确认变更")).toBeNull();
+      const fetchesBefore = planCalls().length;
       await click(findButton(container, "改为说明拆分规则"));
       expect(container.querySelector<HTMLInputElement>('input[aria-label="拆分符"]')?.value).toBe("，");
       expect(textOf(container)).toContain("多个类别同时出现时");
       expect(container.querySelector(".clarification-card.pending")).not.toBeNull();
       expect(container.querySelector<HTMLTextAreaElement>(".composer textarea")?.value).toBe("");
-      expect(captured.length).toBe(fetchesBefore);
+      expect(planCalls().length).toBe(fetchesBefore);
       expect(allBodies()).not.toContain(compound);
     });
 
@@ -820,18 +920,18 @@ describe("local_plan_rule 的真实出站请求体", () => {
       await until(() => textOf(container).includes("拆分项未被规则覆盖"), "应主动询问缺失拆分项");
       expect(textOf(container)).toContain(PRIVATE_SENTINEL);
       expect(findButton(container, "按补充映射重新生成预览")?.hasAttribute("disabled")).toBe(true);
-      const fetchesBefore = captured.length;
+      const fetchesBefore = planCalls().length;
       const target = "补充目标-8P2L";
       await typeInput(container.querySelector<HTMLInputElement>(`input[aria-label="拆分项 ${PRIVATE_SENTINEL} 的目标值"]`), target);
       await act(async () => {
         container.querySelector<HTMLInputElement>('.local-mapping-priority input[type="checkbox"]')?.click();
       });
       await click(findButton(container, "按补充映射重新生成预览"));
-      await until(() => textOf(container).includes("写入前确认"), "补全优先级后应生成新预览");
-      expect(captured.length).toBe(fetchesBefore);
+      await until(() => textOf(container).includes("本次执行计划"), "补全优先级后应生成新预览");
+      expect(planCalls().length).toBe(fetchesBefore);
       expect(allBodies()).not.toContain(target);
       expect(localStorage.getItem("excel-bro.wps.chat.v1") ?? "").not.toContain(target);
-      expect(findButton(container, "生成右侧副本并排审阅")).not.toBeNull();
+      expect(findButton(container, "确认变更")).not.toBeNull();
       expect(allBodies()).not.toContain(PRIVATE_SENTINEL);
     });
   });
@@ -851,7 +951,13 @@ describe("local_plan_rule 的真实出站请求体", () => {
       await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "应加载模型");
 
       await ask(container);
-      await until(() => textOf(container).includes("写入前确认"), "应展示写入计划");
+      try {
+        await until(() => textOf(container).includes("本次执行计划"), "应展示写入计划");
+      } catch (error) {
+        console.log("Full text content:", textOf(container));
+        console.log("Pending plan elements:", container.querySelectorAll('.wps-plan-preview, .wps-plan-outcome, [class*="plan"]').length);
+        throw error;
+      }
 
       // 正向锚点 1：确实发生过出站。
       const turnRequests = captured.filter((item) => item.url.includes("/api/turn"));
@@ -882,95 +988,73 @@ describe("local_plan_rule 的真实出站请求体", () => {
       // 真正该钉的是：没有任何请求把**计划本体**送出去（动作数组 / 计划 id /
       // 目标区域成对出现）。用这些计划特有的结构做断言，既避开能力自报，
       // 又比"某个字符串没出现"更贴近"计划没有出站"这件事本身。
-      expect(outbound).not.toContain('"actions"');
-      expect(outbound).not.toContain("wps-map-column-");
-      expect(outbound).not.toContain(`${SOURCE_SHEET}!${RULE_TARGET_RANGE}`);
+      /*
+       * `"actions"` 这个键**会合法地**出现在 CAP-03 的账本登记里：那是恢复描述
+       * （动作类型/表/区域/计数 + 两个指纹），不含任何单元格内容。新流程是
+       * "计划就绪即执行"，所以登记必然发生 —— 拿整串关键字判泄漏会把合法描述
+       * 判成缺陷。真正要钉的是"**没有计划本体**出站"：账本描述里不许出现
+       * 计划 id、目标值矩阵或源快照。
+       */
+      for (const item of captured) {
+        expect(item.body).not.toContain("wps-map-column-");
+        expect(item.body).not.toContain('"values"');
+        expect(item.body).not.toContain("sourceSnapshots");
+      }
 
       // 5) 表头合法出站 —— 证明上面的负向断言不是"整个请求体为空"。
       expect(turnRequests[0].body).toContain("类别");
       expect(KNOWN_CATEGORY).not.toBe(SECOND_CATEGORY);
     });
 
-    it("编辑后重新预览：仍未把源快照或完整 actions[].values 发出去", async () => {
-      const { application } = makeApplication(SECOND_CATEGORY);
-      getWpsApplicationMock.mockReturnValue(application);
+    it("业务补全后重新生成：本地重算不走校验接口，也不把源快照或目标矩阵发出去", async () => {
+      /*
+       * 这条原来走「编辑计划 → 应用修改并重新预览」。新流程取消了编辑入口
+       * （计划一经校验即执行，编辑一个已执行的动作没有意义），但它要钉的性质
+       * 仍然有效且重要：**本地重新生成计划不经过服务端校验，也不上传矩阵**。
+       * 所以改用仍然可达的"业务补全后重新生成"路径，保持同一个判别点。
+       */
+      const host = makeApplication(PRIVATE_SENTINEL);
+      getWpsApplicationMock.mockReturnValue(host.application);
 
       const { container } = await mount(panel());
       await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "应加载模型");
 
       await ask(container);
-      await until(() => textOf(container).includes("写入前确认"), "应展示写入计划");
-
-      // 记账：编辑动作之前的出站量。
-      const beforeEdit = captured.length;
-
-      await click(findButton(container, "编辑计划"));
-      const editBox = container.querySelector<HTMLTextAreaElement>(
-        '[aria-label="编辑写入计划 JSON"]'
-      );
-      const editedPlan = {
-        id: "wps-map-column-edited",
-        title: `按映射表填写 ${SOURCE_SHEET}!${RULE_TARGET_RANGE}`,
-        summary: "按映射规则写入。",
-        assumptions: [],
-        warnings: [],
-        actions: [
-          {
-            type: "writeValues",
-            sheet: SOURCE_SHEET,
-            range: RULE_TARGET_RANGE,
-            values: [[TARGET_VALUE], [SECOND_TARGET_VALUE]]
-          }
-        ]
-      };
-      await type(editBox, JSON.stringify(editedPlan));
-      await click(findButton(container, "应用修改并重新预览"));
+      // 目标确认是否出现取决于本次授权现场：可能先弹确认，也可能已有前置授权直接进入业务缺口。
       await until(
-        () => findButton(container, "生成右侧副本并排审阅") !== null,
-        "编辑后应重新预览"
+        () => Boolean(container.querySelector('[role="dialog"]')) ||
+          textOf(container).includes("本地映射需要你决定"),
+        "应进入目标确认或本地澄清"
       );
+      if (container.querySelector('[role="dialog"]')) await confirmBeforeAnalysis(container);
+      await until(() => textOf(container).includes(PRIVATE_SENTINEL), "应展示本地未知来源值");
 
-      // 编辑后是否还有请求？**本地计算计划这一支是零出站** ——
-      // `applyEditedPlan` 看到 `pendingPlan.sourceSnapshots.length > 0` 就直接
-      // 复用编好的计划，绕开 `validatePlan`（见 WpsAgentPanel 编辑分支）。
-      // 所以这里不能拿"总出站量 > 0"做正向锚点：真正该钉住的是
-      // "编辑后**仍然**没有请求可以把源值带出去"，以及"本地计划确实没走校验"。
-      const editRequests = captured.slice(beforeEdit);
-      const editOutbound = editRequests
-        .map((item) => `${item.url}\n${item.body}`)
-        .join("\n");
+      // 记账：重新生成之前的出站量（只数会携带计划语义的那几类）。
+      const beforeRegenerate = planCalls().length;
+      const capturedBefore = captured.length;
+      const target = "补全后目标-2R8K";
+      await typeInput(container.querySelector<HTMLInputElement>('.wps-local-mapping-values input[type="text"]'), target);
+      await until(() => !findButton(container, "按补充映射重新生成预览")!.disabled, "填写完整后应可生成");
+      await click(findButton(container, "按补充映射重新生成预览"));
+      await until(() => textOf(container).includes("本次执行计划"), "补全后应生成新的写入计划");
 
-      // 锚点 1：本地计算计划在编辑路径上不产生任何服务端校验请求。
+      const regenerateRequests = captured.slice(capturedBefore);
+      // 锚点 1：这次重新生成**没有再打模型/校验接口**（本地规则重算）。
+      expect(planCalls().length).toBe(beforeRegenerate);
       expect(
-        editRequests.filter((item) => item.url.includes("/api/plans/validate")).length
+        regenerateRequests.filter((item) => item.url.includes("/api/plans/validate")).length
       ).toBe(0);
-      // 锚点 2：预览确实被重建了（否则上面一条会因为"什么都没做"而空过）。
-      // 覆盖范围刻意**从规则里取**而不是写死：这样"源范围退回 A2:A2"这类变异
-      // 会在这里一并变红，而不是被一个恰好匹配的硬编码字符串糊过去。
-      expect(findButton(container, "生成右侧副本并排审阅")).not.toBeNull();
-      expect(textOf(container)).toContain(`${SOURCE_SHEET}!${RULE_TARGET_RANGE}`);
-      expect(textOf(container)).toContain(TARGET_VALUE);
-      expect(textOf(container)).toContain(SECOND_TARGET_VALUE);
-      // 锚点 3：编辑路径出站量要么是 0，要么每一笔都不含目标矩阵、源快照或
-      // 完整 actions[].values —— 逐条看，不用"合并文本不含"这种一旦为空
-      // 就恒真的写法。
-      //
-      // 这里同样**不用 `writeValues`** 做判据：它是能力自报清单里的合法字段
-      // （`selfReportedActions`），拿它当泄漏信号会把白名单内容误报成缺陷。
-      for (const item of editRequests) {
-        expect(item.body).not.toContain(TARGET_VALUE);
-        expect(item.body).not.toContain("3B8Z");
-        expect(item.body).not.toContain(SECOND_TARGET_VALUE);
-        expect(item.body).not.toContain("5C1M");
+      // 锚点 2：新计划确实被重建了（否则上面一条会因"什么都没做"而空过）。
+      expect(findButton(container, "确认变更")).not.toBeNull();
+      expect(textOf(container)).toContain(target);
+      // 锚点 3：重新生成期间产生的任何请求都不带源值、源快照或完整矩阵。
+      for (const item of regenerateRequests) {
+        expect(item.body).not.toContain(PRIVATE_SENTINEL);
+        expect(item.body).not.toContain(target);
         expect(item.body).not.toContain("sourceSnapshots");
         expect(item.body).not.toContain('"values"');
-        // 计划本体的结构（动作数组 / 计划 id）不该出现在编辑后的任何请求里。
-        expect(item.body).not.toContain('"actions"');
         expect(item.body).not.toContain("wps-map-column-");
-        expect(item.body).not.toContain(PRIVATE_SENTINEL);
       }
-      expect(editOutbound).not.toContain(TARGET_VALUE);
-      expect(editOutbound).not.toContain(SECOND_TARGET_VALUE);
     });
 
     it("算得档必须真的读映射源列 —— 对照锚点，证明澄清档的零读取是收敛结果", async () => {
@@ -987,7 +1071,7 @@ describe("local_plan_rule 的真实出站请求体", () => {
       await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "应加载模型");
 
       await ask(container);
-      await until(() => textOf(container).includes("写入前确认"), "应展示写入计划");
+      await until(() => textOf(container).includes("本次执行计划"), "应展示写入计划");
 
       expect(headerValueCount()).toBeGreaterThan(0);
       expect(dataValueCount()).toBeGreaterThan(0);
@@ -1078,7 +1162,7 @@ describe("local_plan_rule 的真实出站请求体", () => {
       expect(outbound).not.toContain(RULE_SOURCE_RANGE);
       expect(outbound).not.toContain('"mapping"');
       // 零写入：没有预览、没有确认按钮、也不走校验接口。
-      expect(findButton(container, "生成右侧副本并排审阅")).toBeNull();
+      expect(findButton(container, "确认变更")).toBeNull();
       expect(captured.some((item) => item.url.includes("/api/plans/validate"))).toBe(false);
     });
   });
@@ -1093,13 +1177,17 @@ describe("local_plan_rule 的真实出站请求体", () => {
       };
     });
 
-    /** 打开编辑框读出当前预览计划的真实 JSON —— 断言的是**将要写入的动作**。 */
+    /**
+     * 读出**本次执行计划**的真实 JSON —— 断言的是真正被执行的那些动作。
+     *
+     * 以前借"编辑计划"的文本框，现在执行即落地、不再可编辑；但同一份 JSON
+     * 仍以只读方式挂在执行摘要卡里（`本次执行计划 JSON`），判据不变、入口更稳。
+     */
     async function planUnderPreview(container: HTMLElement) {
-      await click(findButton(container, "编辑计划"));
-      const raw = container.querySelector<HTMLTextAreaElement>(
-        '[aria-label="编辑写入计划 JSON"]'
-      )?.value;
-      if (!raw) throw new Error("没有取到预览计划 JSON");
+      const raw = container.querySelector<HTMLPreElement>(
+        '[aria-label="本次执行计划 JSON"]'
+      )?.textContent;
+      if (!raw) throw new Error("没有取到本次执行计划 JSON");
       return JSON.parse(raw) as {
         actions: { type: string; range: string; applyTo?: string }[];
       };
@@ -1112,7 +1200,7 @@ describe("local_plan_rule 的真实出站请求体", () => {
       // 计数来自真实读取，不是一句"可能有空白"：源列确实被读过。
       expect(host.wholeReads()).toBeGreaterThan(0);
       // 停在澄清卡上：没有预览、没有确认写入的入口。
-      expect(findButton(container, "生成右侧副本并排审阅")).toBeNull();
+      expect(findButton(container, "确认变更")).toBeNull();
     }
 
     it("保留目标原值：那一格不进任何写入动作，且全程零新增出站", async () => {
@@ -1121,9 +1209,9 @@ describe("local_plan_rule 的真实出站请求体", () => {
       const { container } = await mount(panel());
       await reachBlankCard(container, host);
 
-      const fetchesBefore = captured.length;
+      const fetchesBefore = planCalls().length;
       await click(findButton(container, "按选定的空白处理重新生成预览"));
-      await until(() => textOf(container).includes("写入前确认"), "选定后应生成新预览");
+      await until(() => textOf(container).includes("本次执行计划"), "选定后应生成新预览");
 
       const plan = await planUnderPreview(container);
       // B3 一次都不写：公式、值、数字格式、条件格式都不动 —— 它不是"读回原值
@@ -1132,7 +1220,7 @@ describe("local_plan_rule 的真实出站请求体", () => {
       expect(JSON.stringify(plan.actions)).not.toContain("B3");
 
       // 重算在本机完成：没有再打一次模型/服务端。
-      expect(captured.length).toBe(fetchesBefore);
+      expect(planCalls().length).toBe(fetchesBefore);
       // 持久化与出站都不含源值或算好的目标矩阵。
       const stored = localStorage.getItem("excel-bro.wps.chat.v1") ?? "";
       expect(stored).not.toContain(TARGET_VALUE);
@@ -1154,7 +1242,7 @@ describe("local_plan_rule 的真实出站请求体", () => {
         screen$ByLabelText(container, "清空目标内容 —— 清成真空单元格，不是写一个空字符串")
       );
       await click(findButton(container, "按选定的空白处理重新生成预览"));
-      await until(() => textOf(container).includes("写入前确认"), "选定后应生成新预览");
+      await until(() => textOf(container).includes("本次执行计划"), "选定后应生成新预览");
 
       const plan = await planUnderPreview(container);
       const cleared = plan.actions.find((action) => action.type === "clearRange");

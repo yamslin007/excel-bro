@@ -30,10 +30,32 @@ def test_worker_requires_successful_kernel_gate(monkeypatch):
         raise AssertionError("execution reached")
     monkeypatch.setattr(worker, "_run_code", forbidden)
     output = io.StringIO()
+    errors = io.StringIO()
     monkeypatch.setattr(sys, "stdout", output)
+    monkeypatch.setattr(sys, "stderr", errors)
     worker.main()
     assert json.loads(output.getvalue())["reasonCategory"] == "isolation_not_applied"
     assert "PRIVATE_GATE_ERROR" not in output.getvalue()
+    assert worker.EXECUTION_STARTED_MARKER not in errors.getvalue()
+
+
+def test_worker_ack_precedes_exec_but_follows_successful_compilation(monkeypatch):
+    # Compile a synthetic literal only; generated code is never run on the host.
+    from server.app.python_docker_runner import EXECUTION_STARTED_MARKER
+    output = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", output)
+    observed = []
+    def trusted_exec_stub(*args):
+        observed.append(output.getvalue())
+    monkeypatch.setattr(worker, "exec", trusted_exec_stub, raising=False)
+    worker._run_code("result = 1", {})
+    assert observed == [EXECUTION_STARTED_MARKER.decode()]
+    output.seek(0)
+    output.truncate()
+    import pytest
+    with pytest.raises(SyntaxError):
+        worker._run_code("def", {})
+    assert output.getvalue() == ""
 
 
 def test_worker_protocol_with_trusted_stub(monkeypatch):

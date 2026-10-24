@@ -42,33 +42,24 @@ def test_identity_questions_still_use_model_and_both_backends_receive_same_ident
     from server.tests.test_message_understanding import Client, response
     captured = []
     reply = {"kind": "conversation", "message": "我是 Excel Bro，你的 AI 表格助手。"}
-    connection = SimpleNamespace(model="configured-model", adapter=adapter, api_key="PRIVATE_KEY", base_url="PRIVATE_HOST")
-    if adapter == "openai_compatible":
-        client = Client([response(reply)])
-        monkeypatch.setattr(intent, "OpenAICompatibleClient", lambda *_args, **_kwargs: client)
-    else:
-        sdk = SimpleNamespace(ClaudeAgentOptions=lambda **kwargs: SimpleNamespace(**kwargs))
-        monkeypatch.setattr(claude_sdk_agent, "_sdk", lambda: sdk)
-        monkeypatch.setattr(claude_sdk_agent, "_state_dir", lambda: "synthetic-outside-repo")
-
-        async def result(_sdk, prompt, options, _timeout):
-            captured.append((prompt, options))
-            return json.dumps(reply)
-
-        monkeypatch.setattr(claude_sdk_agent, "_result", result)
+    from server.app.llm import ModelConnection
+    connection = ModelConnection(model="configured-model", adapter=adapter,
+        api_key="PRIVATE_KEY", base_url="https://api.deepseek.com/v1", supports_vision=False)
+    fake_sdk = SimpleNamespace(ClaudeAgentOptions=lambda **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(claude_sdk_agent, "_sdk", lambda: fake_sdk)
+    monkeypatch.setattr(claude_sdk_agent, "_state_dir", lambda: "synthetic-outside-repo")
+    async def sdk_result(_sdk, prompt, options, _timeout):
+        captured.append((prompt, options))
+        return json.dumps(reply)
+    monkeypatch.setattr(claude_sdk_agent, "_result", sdk_result)
     result = asyncio.run(intent.check_message_understanding(MessageUnderstandingRequest(prompt=question), config=connection))
     assert result.kind == "conversation"
-    if adapter == "openai_compatible":
-        assert len(client.calls) == 1
-        system = client.calls[0]["messages"][0]["content"]
-        payload = json.loads(client.calls[0]["messages"][1]["content"])
-    else:
-        assert len(captured) == 1
-        payload = json.loads(captured[0][0])
-        options = captured[0][1]
-        system = options.system_prompt
-        assert options.tools == [] and options.allowed_tools == []
-        assert options.max_turns == 1
+    assert len(captured) == 1
+    payload = json.loads(captured[0][0])
+    options = captured[0][1]
+    system = options.system_prompt
+    assert options.tools == [] and options.allowed_tools == []
+    assert options.max_turns == 1
     assert system.startswith(PRODUCT_IDENTITY_PROMPT)
     assert '"configuredModel": "configured-model"' in system
     assert "PRIVATE_KEY" not in system and "PRIVATE_HOST" not in system

@@ -89,12 +89,13 @@ export type WpsSdkBridgeBindingOptions = Omit<SdkBridgeBindingOptions, "hostId">
  * 绑定快照与执行前复核都用这一份 —— 两个读取器分开写，迟早会对不上
  * （一族"收窄测不出来"的缺陷就是这么来的）。
  *
- * 授权读不到就**抛**：调用方（hook 的 begin）会退回空范围，复核一律拒绝。
+ * 授权读不到就**抛**：调用方（hook 的 begin）返回 false，规划请求不会发出。
  * 这是 fail-closed 的方向 —— 绝不拿"读不到"当成"没变化"。
  */
 export function createWpsBridgeLiveContext(
   application: WpsApplication,
-  selectedSheetIndexes: readonly number[]
+  selectedSheetIndexes: readonly number[],
+  includeSourceFingerprint = true
 ): WpsSdkBridgeLiveContext {
   const authorization = authorizeWpsSheets(application, selectedSheetIndexes);
   const metadata = listWpsWorksheets(application);
@@ -103,7 +104,8 @@ export function createWpsBridgeLiveContext(
     workbookIdentity: wpsWorkbookBridgeIdentity(application),
     // 结果与**真实源版本**绑定：指纹取自与读取同一批授权工作表的内容。
     // 绑定与执行前复核各自重读一次，等待期间源变了就会被判成 `source_changed`。
-    sourceFingerprint: wpsAuthorizedSourceFingerprint(application, selectedSheetIndexes),
+    sourceFingerprint: includeSourceFingerprint
+      ? wpsAuthorizedSourceFingerprint(application, selectedSheetIndexes) : null,
     authorizedSheetNames: authorization.sheets.map((sheet) => sheet.name),
     selectedSheetIndexes: authorization.sheets.map((sheet) => sheet.index),
     activeWorksheet: metadata.sheets.find((sheet) => sheet.isActive)?.name ?? ""

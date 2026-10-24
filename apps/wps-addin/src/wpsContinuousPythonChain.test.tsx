@@ -176,6 +176,27 @@ vi.mock("./wpsNativeComparison", () => ({
       }))
     };
   }),
+  // 执行前快照只读原表、不建副本（与真实实现同语义）。
+  /*
+   * 执行前副本：真实实现按**执行前快照**重建（先复制、再把快照写回副本）。
+   * 替身只保证形状与"调用过"，真正的重建逻辑由 `wpsNativeComparison` 单测覆盖。
+   */
+  stageWpsBeforeComparison: vi.fn((_application: unknown, before: unknown) => ({
+    plan: (before as { prepared: unknown }).prepared,
+    original: { Name: "测试.xlsx" },
+    copy: { Name: "Book1" },
+    copyIdentity: { name: "Book1", fullName: null, path: null },
+    originalBefore: [],
+    copyFingerprints: [],
+    copyAfter: [],
+    reviews: [],
+    changedCells: []
+  })),
+  captureWpsBeforeResult: vi.fn((_application: unknown, prepared: unknown) => ({
+    prepared,
+    values: [],
+    workbookFullName: "C:////Data////会员.xlsx"
+  })),
   compareCommittedWpsResultToCopy: vi.fn(() => "matched"),
   verifyWpsNativeComparison: vi.fn(),
   discardWpsNativeComparison: vi.fn(() => "closed")
@@ -598,6 +619,7 @@ function armPrepareTurn(result: WpsTurnResult) {
   let resolveTurn: (() => void) | null = null;
   let released = false;
   runTurnMock.mockImplementation(async (input: WpsReadonlyTurnInput) => {
+    expect(await input.preparePlanningBridge?.("turn-prepare-panel")).toBe(true);
     // 事件形状照抄生产实现：`stage:"answering"` + `turnId` + `bridgeTool`。
     await input.onProgress?.({
       stage: "answering",
@@ -691,18 +713,31 @@ describe("WPS 连续链路：同一次任务从宿主读取到撤销", () => {
 
     // 2) 放行：白名单计划回到面板 → 预览出现；确认前零写入。
     releaseTurn();
-    await until(() => container.textContent?.includes("写入前确认") ?? false, "应展示写入计划预览");
-    expect(host.writes()).toBe(0);
+    await until(() => {
+      const has = container.textContent?.includes("本次执行计划") ?? false;
+      if (!has) console.log("[DEBUG wpsContinuousPythonChain] 未找到写入前确认，当前内容:", container.textContent?.slice(0, 500));
+      return has;
+    }, "应展示写入计划预览");
+    // 等待React完成渲染
+    await settle();
+    await settle();
+    /*
+     * 计划到达即执行（先执行、后审阅）：这里已经不是"零写入"的时刻。
+     * 仍然必须成立的是"**只写目标表**"—— 两张来源表一格都不能动。
+     * 执行前零写入由本用例前段（结果计划尚未返回时）断言。
+     */
+    expect(host.writes()).toBeGreaterThan(0);
     // 两张来源表在预览后仍未改变。
     expect(host.matrix(MEMBERS)).toEqual(MEMBER_ROWS);
     expect(host.matrix(ORDERS)).toEqual(ORDER_ROWS);
 
-    // 3) 真实确认 → 产品执行器写回 → 回读核对。
-    await click(findButton(container, "生成右侧副本并排审阅"));
-    const confirm = findButton(container, "确认写回原表");
-    expect(confirm, "确认写回按钮必须出现").not.toBeNull();
-    await acknowledgeCopy(container);
-    await click(confirm);
+    // 3) 计划就绪即执行（先执行、后审阅）→ 结果回到主表并由固定操作条承接确认。
+    await until(
+      () => findButton(container, "确认变更") !== null || (container.textContent ?? "").includes("本次执行需要核对"),
+      "应自动执行并进入结果审阅：" + (container.textContent ?? "").slice(-160)
+    );
+    // 执行已经发生；这里确认的是"执行结果已就绪"，下面用回读与撤销验证业务结果。
+    expect(findButton(container, "确认变更")).not.toBeNull();
 
     await until(
       () => container.querySelector(".wps-verification-card") !== null,
@@ -715,13 +750,16 @@ describe("WPS 连续链路：同一次任务从宿主读取到撤销", () => {
     expect(host.matrix(MEMBERS)).toEqual(MEMBER_ROWS);
     expect(host.matrix(ORDERS)).toEqual(ORDER_ROWS);
 
-    // 4) 撤销：走真实按钮，验证目标区回到执行前（空表）。
+    // 4) 确认变更 → 撤销：确认只移除审阅标记，不重放计划；
+    //    撤销走真实恢复点，把目标区回到执行前（空表）。
+    await click(findButton(container, "确认变更"));
+    await until(() => (container.textContent ?? "").includes("已确认变更"), "应确认本次结果");
     const undo = cardUndoButton(container);
     expect(undo, "执行结果卡里必须挂可用的撤销按钮").not.toBeNull();
     await click(undo);
     await until(
-      () => container.textContent?.includes("已撤销并核对恢复") ?? false,
-      "撤销后应显示已撤销并核对恢复"
+      () => container.textContent?.includes("已撤销并恢复") ?? false,
+      "撤销后应显示已撤销并恢复"
     );
     expect(host.cell(TARGET, 1, 1)).toBeNull();
     // 撤销也只回滚目标区，来源表始终未变。

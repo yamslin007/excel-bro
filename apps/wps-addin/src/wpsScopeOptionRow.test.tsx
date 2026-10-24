@@ -41,19 +41,31 @@ vi.mock("./wpsWorkbookReader", async (importOriginal) => {
   return { ...actual, listWpsWorksheets: vi.fn() };
 });
 /** 面板本体换替身：只留出范围草稿面板那条槽位，避免把聊天面板一起拉起来。 */
-vi.mock("./WpsAgentPanel", () => ({
-  default: ({
-    scopeDock,
-    onScopeConfirmationReady
-  }: {
-    selectedSheetIndexes?: readonly number[];
-    scopeDock?: ReactNode;
-    onScopeConfirmationReady?: (handler: ((target: AuthorizedTarget) => Promise<boolean>) | null) => void;
-  }) => {
-    useEffect(() => { onScopeConfirmationReady?.(scopeAuthorization); return () => onScopeConfirmationReady?.(null); }, [onScopeConfirmationReady]);
-    return <div>{scopeDock}</div>;
-  }
-}));
+/*
+ * 替身必须是**有名字的大写函数**，不能写成匿名 `default: (...) => ...`：
+ * 里面调了 `useEffect`，匿名箭头挂在 `default` 上时 rules-of-hooks 认不出它是组件，
+ * lint 直接判 error（"called in function 'default'"）。名字只是给 linter 看的，
+ * 行为一个字都没变。
+ */
+function MockWpsAgentPanel({
+  scopeDock,
+  scopeOverlay,
+  onScopeConfirmationReady
+}: {
+  selectedSheetIndexes?: readonly number[];
+  scopeDock?: ReactNode;
+  scopeOverlay?: ReactNode;
+  onScopeConfirmationReady?: (handler: ((target: AuthorizedTarget) => Promise<boolean>) | null) => void;
+}) {
+  useEffect(() => { onScopeConfirmationReady?.(scopeAuthorization); return () => onScopeConfirmationReady?.(null); }, [onScopeConfirmationReady]);
+  return (
+    <div>
+      {scopeDock}
+      {scopeOverlay ? <div className="scope-layer">{scopeOverlay}</div> : null}
+    </div>
+  );
+}
+vi.mock("./WpsAgentPanel", () => ({ default: MockWpsAgentPanel }));
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 if (!Element.prototype.scrollIntoView) {

@@ -62,6 +62,7 @@ export type ExcelNativeComparison = {
   synchronousScrolling?: "enabled" | "different_instance" | "unavailable";
   plan: AnalysisPlan; authorization: readonly string[]; workbookIdentity: string;
   original: SheetSnapshot; originalWindowName: string;
+  comparisonNotice?: string;
   copyWindowName: string; copySheetName: string; copySheetId: string;
   copyEvidence: string; actionEvidence: string; changedCells: number;
   /**
@@ -73,6 +74,10 @@ export type ExcelNativeComparison = {
   copyFormatEvidence?: string;
 };
 const error = (message: string) => new Error(message);
+// Copy fidelity is not write/undo safety. Only this explicit capability failure
+// may degrade optional comparison; authorization and host failures still propagate.
+class ComparisonUnavailableError extends Error {}
+export type ExcelBeforeResult = SheetSnapshot | { comparisonUnavailable: string };
 const LIMITS = capabilities.excelNativeComparison;
 
 export function nativeComparisonPlanIssue(plan: AnalysisPlan, authorization: readonly string[]): string | null {
@@ -125,7 +130,7 @@ function assertLocalFormula(formula: string): void {
   // This initial adapter has no other sheets, workbook names or table names.
   // Reject qualified/structured/indirect references instead of importing unauthorized dependencies.
   const body = formula.replace(/"(?:[^"]|"")*"/g, '""');
-  if (/[!\[\]]/.test(body) || /\b(?:INDIRECT|OFFSET)\s*\(/i.test(body)) throw error("副本公式需要未复制的引用，不能隔离试算。");
+  if (/[!\[\]]/.test(body) || /\b(?:INDIRECT|OFFSET)\s*\(/i.test(body)) throw new ComparisonUnavailableError("副本公式需要未复制的引用，不能隔离试算。");
 }
 export function excelNativeReviewMode(): "native" | "manual" | "unavailable" {
   if (typeof Office === "undefined" || typeof Excel === "undefined" ||
@@ -136,11 +141,17 @@ export function excelNativeReviewMode(): "native" | "manual" | "unavailable" {
 function exactAddress(range: Excel.Range): string {
   return `${nativeColumnName(range.columnIndex + 1)}${range.rowIndex + 1}:${nativeColumnName(range.columnIndex + range.columnCount)}${range.rowIndex + range.rowCount}`;
 }
-async function capture(context: Excel.RequestContext, name: string): Promise<SheetSnapshot> {
+async function capture(context: Excel.RequestContext, name: string, allowEmpty = false): Promise<SheetSnapshot> {
   const sheet = context.workbook.worksheets.getItem(name);
   sheet.load("id,name"); sheet.protection.load("protected");
-  const used = sheet.getUsedRangeOrNullObject(); used.load("isNullObject,rowIndex,columnIndex,rowCount,columnCount");
+  let used = sheet.getUsedRangeOrNullObject(); used.load("isNullObject,rowIndex,columnIndex,rowCount,columnCount");
   await context.sync();
+  if (used.isNullObject && allowEmpty) {
+    // An empty output sheet has a valid blank before-image; still inspect its metadata.
+    used = sheet.getRange("A1");
+    used.load("isNullObject,rowIndex,columnIndex,rowCount,columnCount");
+    await context.sync();
+  }
   if (sheet.protection.protected) throw error("原表已保护，不能确认写回。");
   if (used.isNullObject || used.rowCount * used.columnCount > LIMITS.maxCells) throw error("工作表为空或已用范围超过原生审阅限额。");
   // Read metadata only for this authorized sheet. Complex objects are explicitly unsupported.
@@ -152,7 +163,7 @@ async function capture(context: Excel.RequestContext, name: string): Promise<She
   const formulaAreas = used.getSpecialCellsOrNullObject(Excel.SpecialCellType.formulas); formulaAreas.load("isNullObject");
   await context.sync();
   if (tables.value || charts.value || shapes.value || pivots.value || names.value || bookNames.value || conditions.value || !merges.isNullObject || !validations.isNullObject) {
-    throw error("此表含表格、合并、图表、名称或其他复杂对象，当前不能完整复制；未写入原表。");
+    throw new ComparisonUnavailableError("此表含表格、合并、图表、名称或其他复杂对象，当前不能完整复制；未写入原表。");
   }
   used.load("values,formulas,numberFormat");
   if (!formulaAreas.isNullObject) formulaAreas.areas.load("items/rowIndex,items/columnIndex,items/rowCount,items/columnCount");
@@ -185,30 +196,91 @@ async function capture(context: Excel.RequestContext, name: string): Promise<She
 }
 
 /** A read-only pre-write image for optional comparison after execution. */
-export async function captureExcelBeforeResult(plan: AnalysisPlan, authorization: readonly string[]): Promise<SheetSnapshot> {
-  const issue = nativeComparisonPlanIssue(plan, authorization);
+export function resultReviewPlanIssue(plan: AnalysisPlan, authorization: readonly string[]): string | null {
+  const targets = [...new Set(plan.actions.map(action => action.sheet))];
+  if (targets.length !== 1 || !targets[0] || !authorization.includes(targets[0])) {
+    return '结果审阅需要单张已授权写入目标表。';
+  }
+  if (plan.sourceFingerprintSheets?.some(name => !authorization.includes(name)) ||
+      plan.sourceDependencySheets?.some(name => !authorization.includes(name))) {
+    return '计划来源超出本次授权，未执行。';
+  }
+  // Reuse action/shape limits only; source checks still use the full original plan.
+  return nativeComparisonPlanIssue({ ...plan, sourceFingerprintSheets: [targets[0]] }, targets);
+}
+
+export async function captureExcelBeforeResult(plan: AnalysisPlan, authorization: readonly string[]): Promise<ExcelBeforeResult> {
+  const issue = resultReviewPlanIssue(plan, authorization);
   if (issue) throw error(issue);
-  return Excel.run(context => capture(context, authorization[0]));
+  const rects = plan.actions.map(action => parseExplicitA1Rect('range' in action ? action.range : '')!);
+  const startRow = Math.min(...rects.map(r => r.startRow)), endRow = Math.max(...rects.map(r => r.endRow));
+  const startColumn = Math.min(...rects.map(r => r.startColumn)), endColumn = Math.max(...rects.map(r => r.endColumn));
+  const height = endRow - startRow + 1, width = endColumn - startColumn + 1;
+  if (height * width > LIMITS.maxCells) return { comparisonUnavailable: '本次修改区域跨度超过双视图快照限额；请在主表审阅结果。' };
+  return Excel.run(async context => {
+    const sheet = context.workbook.worksheets.getItem(plan.actions[0].sheet);
+    sheet.load('id,name'); sheet.protection.load('protected');
+    // Read only action rectangles. Gaps in the display canvas remain blank.
+    const reads = rects.map(rect => {
+      const range = sheet.getRange(`${nativeColumnName(rect.startColumn)}${rect.startRow}:${nativeColumnName(rect.endColumn)}${rect.endRow}`);
+      range.load('values,numberFormat');
+      const properties = range.getCellProperties({ format: DIRECT_FORMAT_LOAD_OPTIONS });
+      const rows = Array.from({ length: rect.rows }, (_, i) => range.getRow(i).format);
+      const columns = Array.from({ length: rect.columns }, (_, i) => range.getColumn(i).format);
+      rows.forEach(row => row.load('rowHeight')); columns.forEach(column => column.load('columnWidth'));
+      return { range, properties, rows, columns, rect };
+    });
+    await context.sync();
+    if (sheet.protection.protected) throw error('原表已保护，不能执行。');
+    const values: CellValue[][] = Array.from({ length: height }, () => Array(width).fill(''));
+    const numberFormat: string[][] = Array.from({ length: height }, () => Array(width).fill('General'));
+    const properties: Excel.CellProperties[][] = Array.from({ length: height }, () => Array.from({ length: width }, () => ({})));
+    const rowHeights = Array(height).fill(15), columnWidths = Array(width).fill(8.43);
+    for (const read of reads) {
+      if (read.range.values.length !== read.rect.rows || read.properties.value.length !== read.rect.rows) throw error('执行前快照读取不完整。');
+      for (let r = 0; r < read.rect.rows; r++) {
+        if (read.range.values[r]?.length !== read.rect.columns || read.properties.value[r]?.length !== read.rect.columns) throw error('执行前快照读取不完整。');
+        const row = read.rect.startRow - startRow + r;
+        rowHeights[row] = read.rows[r].rowHeight;
+        for (let c = 0; c < read.rect.columns; c++) {
+          const column = read.rect.startColumn - startColumn + c;
+          values[row][column] = read.range.values[r][c];
+          numberFormat[row][column] = read.range.numberFormat[r][c];
+          properties[row][column] = read.properties.value[r][c];
+          columnWidths[column] = read.columns[c].columnWidth;
+        }
+      }
+    }
+    // No formulas are exported: cached values cannot acquire new dependencies or recalculate.
+    return JSON.parse(JSON.stringify({ id: sheet.id, name: sheet.name,
+      address: `${nativeColumnName(startColumn)}${startRow}:${nativeColumnName(endColumn)}${endRow}`,
+      startRow, startColumn, values, formulas: values, formulaCells: [], numberFormat, properties, rowHeights, columnWidths
+    })) as SheetSnapshot;
+  });
 }
 
 /** Open the saved BEFORE image, never re-run the plan to manufacture a comparison. */
-export async function showExcelBeforeResult(original: SheetSnapshot, identity: string, plan: AnalysisPlan,
+export async function showExcelBeforeResult(original: ExcelBeforeResult, identity: string, plan: AnalysisPlan,
   authorization: readonly string[]): Promise<ExcelNativeComparison> {
   if (currentOfficeWorkbookIdentity() !== identity) throw error('原工作簿已变化，未打开对比副本。');
+  if ('comparisonUnavailable' in original) throw error(original.comparisonUnavailable);
   const copySheetName = `EB_${crypto.randomUUID().replace(/-/g, '').slice(0, 20)}`;
   const artifact = buildManualReviewFile(copySheetName, original, { ...plan, actions: [] }, LIMITS.maxCells, LIMITS.maxBytes);
   let ticket: Awaited<ReturnType<typeof prepareLocalExcelWindows>> | null = null;
-  try { ticket = await prepareLocalExcelWindows(identity, original.name, copySheetName); } catch { /* A comparison remains usable without automatic arrangement. */ }
+  let comparisonNotice: string | undefined;
+  const layoutFailure = (reason: unknown) => `执行前副本已打开，但未能自动并排：${reason instanceof Error ? reason.message : '本机窗口排列不可用'}。可手动排列窗口；确认变更和放弃变更仍可使用。`;
+  try { ticket = await prepareLocalExcelWindows(identity, original.name, copySheetName); }
+  catch (reason) { comparisonNotice = layoutFailure(reason); }
   if (currentOfficeWorkbookIdentity() !== identity) throw error('原工作簿已变化，未打开对比副本。');
   await Excel.createWorkbook(artifact.base64);
   const session: ExcelNativeComparison = { mode: 'manual', plan, authorization: [...authorization], workbookIdentity: identity,
     original, originalWindowName: '', copyWindowName: '', copySheetName, copySheetId: '',
-    copyEvidence: '', actionEvidence: '', changedCells: 0, windowLayout: 'manual' };
+    copyEvidence: '', actionEvidence: '', changedCells: 0, windowLayout: 'manual', comparisonNotice };
   if (ticket) {
     try {
       const layout = await arrangeLocalExcelWindows(ticket);
       session.windowLayout = 'arranged'; session.synchronousScrolling = layout.synchronousScrolling;
-    } catch { /* Do not turn an arrangement failure into another execution. */ }
+    } catch (reason) { session.comparisonNotice = layoutFailure(reason); }
   }
   return session;
 }

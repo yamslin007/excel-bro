@@ -53,6 +53,7 @@ vi.mock("./officeAuthorizedTarget", async (original) => ({
     items: names.map((id) => ({ id, status: "ready", reason: "none" })),
     target: { fileKey: "office:book-1", name: "book.xlsx", sheets: [{ id: "selected", name: "Selected" }, { id: "unselected", name: "Unselected" }], selected: names.map((name) => name.toLowerCase()) }
   })),
+  confirmOfficeAuthorizedScope: vi.fn(async (_names, confirm, expected) => confirm(expected)),
   officeAnalysisTargetEvidence: vi.fn(async () => ({ key: "target-1", conclusive: true }))
 }));
 
@@ -94,8 +95,8 @@ async function pickFolder(view: ReturnType<typeof render>, next: FolderCatalog) 
   await waitFor(() => expect(view.container.querySelector(".folder-sheet-list")).not.toBeNull());
   await waitFor(() => expect((view.getByRole("button", { name: /^Selected/ }) as HTMLButtonElement).disabled).toBe(false));
   fireEvent.click(view.getByRole("button", { name: /^Selected/ }));
-  await waitFor(() => expect((view.getByRole("button", { name: "确认" }) as HTMLButtonElement).disabled).toBe(false));
-  fireEvent.click(view.getByRole("button", { name: "确认" }));
+  await waitFor(() => expect(view.container.querySelector(".scope-close")?.getAttribute("data-scope-pending")).toBe("false"));
+  fireEvent.click(view.container.querySelector(".scope-close")!);
   await waitFor(() => expect(view.container.querySelector(".scope-popover")).toBeNull());
 }
 function send(view: ReturnType<typeof render>, prompt: string) {
@@ -114,19 +115,19 @@ describe("actual Excel folder scope safety", () => {
     await waitFor(() => expect(view.container.querySelector(".folder-sheet-list")).not.toBeNull());
     fireEvent.click(view.getByRole("button", { name: /^Selected/ }));
     await waitFor(() => expect(view.container.textContent).toContain("无法读取文件"));
-    expect((view.getByRole("button", { name: "确认" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(view.container.querySelector(".scope-close")?.getAttribute("data-scope-pending")).toBe("true");
     expect(view.queryByRole("dialog")).toBeNull();
     expect(createFolderSnapshot).not.toHaveBeenCalled();
     expect(captureWorkbook).not.toHaveBeenCalled();
     fireEvent.click(view.container.querySelector(".folder-refresh-button")!);
-    await waitFor(() => expect((view.getByRole("button", { name: "确认" }) as HTMLButtonElement).disabled).toBe(false));
+    await waitFor(() => expect(view.container.querySelector(".scope-close")?.getAttribute("data-scope-pending")).toBe("false"));
   });
   it("opening and closing an unchanged folder picker does not demand authorization again", async () => {
     const view = await boot();
     await pickFolder(view, catalog());
     fireEvent.click(view.container.querySelector(".scope-trigger")!);
     await waitFor(() => expect(refreshFolder).toHaveBeenCalled());
-    await waitFor(() => expect((view.getByRole("button", { name: "确认" }) as HTMLButtonElement).disabled).toBe(false));
+    await waitFor(() => expect(view.container.querySelector(".scope-close")?.getAttribute("data-scope-pending")).toBe("false"));
     fireEvent.click(view.getByRole("button", { name: "关闭数据范围选择" }));
     send(view, "检查已授权表");
     await waitFor(() => expect(checkIntent).toHaveBeenCalledOnce());
@@ -169,12 +170,11 @@ describe("actual Excel folder scope safety", () => {
     expect(checkIntent).toHaveBeenCalledOnce();
   });
 
-  it("session recovery replays committed scope, never newly checked draft sheets", async () => {
+  it("session recovery retains the latest checkbox authorization without a second confirmation", async () => {
     const view = await boot();
     await pickFolder(view, catalog());
     fireEvent.click(view.container.querySelector(".scope-trigger")!);
-    await waitFor(() => expect((view.getByRole("button", { name: "确认" }) as HTMLButtonElement).disabled).toBe(false));
-    fireEvent.click(view.getByRole("button", { name: /^Unselected/ }));
+    await waitFor(() => expect(view.container.querySelector(".scope-close")?.getAttribute("data-scope-pending")).toBe("false"));
     vi.mocked(refreshFolder).mockRejectedValueOnce(new Error("文件夹会话已失效"));
     vi.mocked(scanFolderByPath).mockResolvedValueOnce(catalog("C:/One/Data", "session-rebuilt"));
     fireEvent.click(view.container.querySelector(".folder-refresh-button")!);
@@ -182,11 +182,9 @@ describe("actual Excel folder scope safety", () => {
     expect(vi.mocked(createFolderSnapshot).mock.calls[1]).toEqual([
       "session-rebuilt", [{ fileId: "same-relative-file-id", sheets: ["Selected"] }]
     ]);
-    await waitFor(() => expect((view.getByRole("button", { name: "确认" }) as HTMLButtonElement).disabled).toBe(false));
     fireEvent.click(view.getByRole("button", { name: "关闭数据范围选择" }));
     send(view, "检查已授权表");
-    await waitFor(() => expect(view.container.textContent).toContain("请先在上方「数据范围」中选择文件夹和工作表。"));
-    expect(checkIntent).not.toHaveBeenCalled();
+    await waitFor(() => expect(checkIntent).toHaveBeenCalledOnce());
   });
 
   it("adopting a folder file already open in Excel reads only explicitly selected data", async () => {
@@ -197,6 +195,27 @@ describe("actual Excel folder scope safety", () => {
     expect(captureWorkbookCatalog).toHaveBeenCalledTimes(3);
     expect(vi.mocked(captureWorkbook).mock.calls).toEqual([[['Selected']]]);
     expect(createFolderSnapshot).not.toHaveBeenCalled();
+  });
+
+  /*
+   * ② 从文件入口选中"就是当前打开的这个工作簿"之后，已提交授权必须**当场**就位。
+   *
+   * 采用动作会切回工作簿来源并启用目标守卫；如果已提交范围要等一个被动 effect
+   * 才落地，守卫启用的第一帧读到的是旧/空名单 —— 于是紧接着的一句需求被
+   * "工作表范围发生变化"拦下，用户被要求把刚确认过的范围再确认一次。
+   */
+  it("②从文件入口采用当前工作簿后：下一条需求不再要求确认", async () => {
+    vi.stubGlobal("Office", { context: { document: { url: "file:///C:/One/Data/book.xlsx" } }, onReady: (cb: () => void) => cb() });
+    const view = await boot();
+    await pickFolder(view, catalog());
+    expect(view.container.textContent).toContain("所选文件就是当前工作簿");
+
+    send(view, "检查已授权表");
+    await waitFor(() => expect(checkIntent).toHaveBeenCalledOnce());
+    // 需求真的跑通了（不是被拦下），而且没有出现范围提示。
+    await waitFor(() => expect(view.container.textContent).toContain("字段已核对。"));
+    expect(view.container.querySelector(".target-scope-notice")).toBeNull();
+    expect(view.container.textContent).not.toContain("工作表范围发生变化");
   });
 
   it("从工作目录切回「选择多个」：面板回到真实当前工作簿，不再显示文件夹复合名", async () => {
@@ -242,10 +261,10 @@ describe("actual Excel workbook scope panel layout", () => {
   it("refresh rechecks even unchanged metadata and preserves the manual draft", async () => {
     const view = await boot();
     fireEvent.click(view.container.querySelector(".scope-trigger")!);
-    await waitFor(() => expect((view.getByRole("button", { name: "确认" }) as HTMLButtonElement).disabled).toBe(false));
+    await waitFor(() => expect(view.container.querySelector(".scope-close")?.getAttribute("data-scope-pending")).toBe("false"));
     fireEvent.click(view.getByRole("button", { name: /选择多个.*跨表/ }));
     fireEvent.click(view.getByRole("button", { name: /^Selected/ }));
-    await waitFor(() => expect((view.getByRole("button", { name: "确认" }) as HTMLButtonElement).disabled).toBe(false));
+    await waitFor(() => expect(view.container.querySelector(".scope-close")?.getAttribute("data-scope-pending")).toBe("false"));
     const before = vi.mocked(inspectOfficeScopeAdmission).mock.calls.length;
     fireEvent.click(view.container.querySelector(".scope-refresh")!);
     await waitFor(() => expect(vi.mocked(inspectOfficeScopeAdmission).mock.calls.length).toBeGreaterThan(before));
@@ -253,17 +272,17 @@ describe("actual Excel workbook scope panel layout", () => {
     expect(view.container.querySelector(".scope-admission-summary button")).toBeNull();
     fireEvent.click(view.getByRole("button", { name: "关闭数据范围选择" }));
     send(view, "检查已授权表");
-    await waitFor(() => expect(view.container.textContent).toContain("请先确认当前对话的数据范围"));
+    await waitFor(() => expect(view.container.textContent).toContain("字段已核对。"));
     expect(captureWorkbook).not.toHaveBeenCalled();
-    expect(captureWorkbookStructure).not.toHaveBeenCalled();
-    expect(checkIntent).not.toHaveBeenCalled();
-    expect((view.container.querySelector(".composer textarea") as HTMLTextAreaElement).value).toBe("检查已授权表");
+    expect(captureWorkbookStructure).toHaveBeenCalledOnce();
+    expect(checkIntent).toHaveBeenCalledOnce();
+    expect((view.container.querySelector(".composer textarea") as HTMLTextAreaElement).value).toBe("");
   });
 
   it("automatic refresh updates both labels and checks the new draft without reading fields", async () => {
     const view = await boot();
     fireEvent.click(view.container.querySelector(".scope-trigger")!);
-    await waitFor(() => expect((view.getByRole("button", { name: "确认" }) as HTMLButtonElement).disabled).toBe(false));
+    await waitFor(() => expect(view.container.querySelector(".scope-close")?.getAttribute("data-scope-pending")).toBe("false"));
     fixtures.office.activeWorksheet = "Selected";
     fireEvent.click(view.container.querySelector(".scope-refresh")!);
     await waitFor(() => expect(view.container.querySelector(".workbook-identity em")?.textContent).toContain("当前工作表 Selected"));
@@ -349,7 +368,7 @@ describe("Excel 工作目录：固定页脚的层与格式（对齐 WPS）", () 
     expect(footer.parentElement).toBe(popover);
 
     // 格式对齐 WPS：确认就在这条页脚里，承认汇总紧跟在页脚**下方**。
-    expect(footer.querySelectorAll("button.scope-confirm")).toHaveLength(1);
+    expect(footer.querySelectorAll("button.scope-close")).toHaveLength(1);
     expect(footer.nextElementSibling?.classList.contains("scope-admission-summary")).toBe(true);
     // 工作目录模式**没有**工作簿那条动作条（否则一个面板会出现两条固定页脚）。
     expect(popover.querySelector(".scope-action-buttons")).toBeNull();
@@ -358,44 +377,21 @@ describe("Excel 工作目录：固定页脚的层与格式（对齐 WPS）", () 
     expect(footer.querySelector("button.scope-discard")).toBeNull();
   });
 
-  it("勾选只改草稿：页脚随即出现「取消」，点它把草稿退回已提交的授权并关闭弹层", async () => {
+  it("勾选新增表立即生效，收起与重开保留两张表", async () => {
     const view = await boot();
-    await pickFolder(view, catalog()); // 已提交授权 = book.xlsx 的 Selected
+    await pickFolder(view, catalog());
     fireEvent.click(view.container.querySelector(".scope-trigger")!);
-
-    const footer = await waitFor(() => {
-      const node = view.container.querySelector<HTMLElement>(".folder-selection-footer");
-      if (!node) throw new Error("工作目录页脚没有出现");
-      return node;
-    });
     await waitFor(() => expect(view.container.querySelector(".folder-sheet-list")).not.toBeNull());
-
-    const pressed = (name: RegExp) =>
-      view.getByRole("button", { name }).getAttribute("aria-pressed");
-    expect(pressed(/^Selected/)).toBe("true");
-    expect(pressed(/^Unselected/)).toBe("false");
-    expect(footer.querySelector("button.scope-discard")).toBeNull();
-
-    // 造出草稿差异：多勾一张（已提交仍是 Selected）。
     fireEvent.click(view.getByRole("button", { name: /^Unselected/ }));
-    await waitFor(() => expect(footer.querySelector("button.scope-discard")).not.toBeNull());
-
-    fireEvent.click(footer.querySelector<HTMLButtonElement>("button.scope-discard")!);
-
-    // 判据一：弹层关闭 —— 与 WPS 文件夹页脚的「取消」逐字同形（那边走
-    // `discardScopeEdit`：退回 + 关闭）。坏代码里弹层还开着，这条以超时变红。
-    await waitFor(() => expect(view.container.querySelector(".scope-popover")).toBeNull());
-
-    // 判据二：草稿退回已提交授权 —— 触发器退回"已选 1 张表"（弹层关了，触发器还在）。
-    await waitFor(() =>
-      expect(view.container.querySelector(".scope-trigger")?.textContent).toContain("已选 1 张表")
-    );
-
-    // 判据三：重开面板，勾选状态也要退回去 —— Unselected 不再勾着。
+    await waitFor(() => expect(view.container.querySelector(".scope-close")?.getAttribute("data-scope-pending")).toBe("false"));
+    expect(vi.mocked(createFolderSnapshot).mock.lastCall?.[1]).toEqual([
+      { fileId: "same-relative-file-id", sheets: ["Selected", "Unselected"] }
+    ]);
+    expect(view.container.querySelector(".scope-discard")).toBeNull();
+    fireEvent.click(view.container.querySelector(".scope-close")!);
     fireEvent.click(view.container.querySelector(".scope-trigger")!);
     await waitFor(() => expect(view.container.querySelector(".folder-sheet-list")).not.toBeNull());
-    expect(pressed(/^Unselected/)).toBe("false");
-    expect(pressed(/^Selected/)).toBe("true");
+    expect(view.getByRole("button", { name: /^Unselected/ }).getAttribute("aria-pressed")).toBe("true");
   });
 
   it("「清空」一次清掉整个目录的草稿勾选，按钮在勾选归零后禁用", async () => {

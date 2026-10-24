@@ -3995,7 +3995,7 @@ textarea:focus-visible {
   overflow-wrap: anywhere;
 }
 
-.folder-selection-footer .scope-confirm {
+.folder-selection-footer .scope-close {
   flex: 0 0 auto;
   margin-left: auto;
 }
@@ -4762,8 +4762,19 @@ textarea:focus-visible {
   }
 }
 
+/*
+ * 运行中的「执行过程」卡。
+ *
+ * 宽度必须与收尾后的两张卡（`.activity-log-card` 执行过程、`.local-result-card`
+ * 结果展示）一致：同一个消息流里，同一块区域在「运行中 → 已完成」之间换的是**内容**，
+ * 不是**边界**。这里曾经写死 `width: min(420px, calc(100% - 28px))`，于是运行态比
+ * 结果态窄一大截，卡片长成两条不对齐的竖边。三者的水平内边距本来就都是 12px
+ * （`--spacing-md`），所以铺满即可对齐，不需要额外补偿。
+ */
 .activity-card {
-  width: min(420px, calc(100% - 28px));
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
   border: 1px solid var(--color-border);
   border-radius: var(--radius-md);
   corner-shape: squircle;
@@ -6238,6 +6249,35 @@ textarea:focus-visible {
   padding: 0;
   box-shadow: var(--shadow-md);
 }
+/*
+ * 数据范围面板的**独立呈现层**。
+ *
+ * 之前面板是 `.composer` 的后代：`position:absolute; bottom: calc(100% + 7px)`。
+ * 于是它被输入框那一层牵着走 —— 审阅条一出现、窗口一矮，面板就被挤扁或被外壳
+ * `overflow:hidden` 截掉，还和输入区叠在一起；`.composer` 的 `backdrop-filter`
+ * 还会把它钉在那一层的层叠上下文里。
+ *
+ * 现在它是外壳（`.wps-chat-shell` / 任务窗格根容器）的**直接**子层：
+ * 整格铺开、不进滚动、不进输入框那一层，打开就有完整高度，关闭就彻底不留。
+ */
+.scope-layer {
+  position: absolute;
+  inset: 8px 10px 10px;
+  z-index: 40;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr);
+  background: var(--color-background, #ffffff);
+}
+
+/* 层里的面板不再是"浮在输入框上方的一张卡"，而是这一层的唯一内容：撑满，内部滚。 */
+.scope-layer .scope-popover {
+  position: static;
+  right: auto;
+  bottom: auto;
+  left: auto;
+  max-height: 100%;
+}
+
 
 .work-directory-empty {
   display: grid;
@@ -6767,6 +6807,7 @@ textarea:focus-visible {
 
 .scope-popover-scroll {
   display: grid;
+  align-content: start;
   min-height: 0;
   flex: 1 1 auto;
   gap: var(--scope-popover-block-gap);
@@ -6781,6 +6822,12 @@ textarea:focus-visible {
   gap: 10px;
 }
 
+/* 两端固定标题与列表分层，授权说明在滚动时始终可见。 */
+.scope-popover > .scope-popover-header {
+  flex: 0 0 auto;
+  padding: var(--scope-popover-padding) var(--scope-popover-padding) 0;
+}
+
 .scope-popover-header > div {
   display: grid;
   gap: 2px;
@@ -6793,6 +6840,11 @@ textarea:focus-visible {
 .scope-popover-header span {
   color: var(--color-text-secondary);
   font-size: var(--font-size-caption);
+}
+
+.scope-popover-header .scope-authorization-hint {
+  color: var(--color-brand-text);
+  line-height: 1.5;
 }
 
 .scope-popover-header > button {
@@ -6970,32 +7022,27 @@ textarea:focus-visible {
   cursor: not-allowed;
 }
 
-/*
- * 「放弃修改」——与「刷新」同一层级的**次要按钮**。
- * 它此前完全没有样式规则，浏览器默认 `<button>` 直接露出来（方角 + 原生描边），
- * 和同排的「刷新 / 确认范围」不像一套 UI。这里按 `.scope-refresh` 的口径对齐：
- * 同样的 32px 高度、`--radius-md` 圆角 + squircle、同样的 padding / 字号 / 过渡，
- * 只把描边与文字换成中性色，以区别于品牌绿的「刷新」和实心的「确认范围」。
- */
-.scope-discard {
+/* 「确认」是面板完成按钮；授权仍由勾选立即触发。 */
+.scope-close {
+  min-width: 64px;
   min-height: 32px;
-  border: 1px solid var(--color-border-strong);
+  border: 1px solid var(--color-brand-text);
   border-radius: var(--radius-md);
   corner-shape: squircle;
-  background: var(--color-background);
-  color: var(--color-text-primary);
-  padding: 6px 12px;
+  background: var(--color-brand-text);
+  color: white;
+  padding: 6px 16px;
   font-size: var(--font-size-caption);
-  font-weight: 500;
+  font-weight: 750;
   transition: background 150ms ease, border-color 150ms ease, transform 150ms ease;
 }
 
-.scope-discard:hover:not(:disabled) {
-  background: var(--color-surface-hover);
+.scope-close:hover:not(:disabled) {
+  filter: brightness(0.9);
   transform: translateY(-1px);
 }
 
-.scope-discard:disabled {
+.scope-close:disabled {
   opacity: 0.5;
   cursor: not-allowed;
 }
@@ -7484,6 +7531,25 @@ button.selected > .sheet-checkbox {
   display: flex;
   align-items: center;
   gap: 8px;
+}
+
+/*
+ * 暂停请求的阶段提示（本端已停止接收 / 服务端已接受 / 未确认）。
+ *
+ * 与"处理中…"那类进度不同：它不是运行状态，而是**一次请求的结论**，所以用一行
+ * 小字挂在工具条里，不占进度条的位置，也不会被误读成"还在跑"。
+ */
+.composer-pause-note,
+.agent-progress-note {
+  min-width: 0;
+  color: var(--color-text-tertiary);
+  font-size: var(--font-size-caption);
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.composer-pause-note[data-phase="unconfirmed"] {
+  color: var(--color-warning, #9a6a1f);
 }
 
 .composer-box:focus-within {
@@ -9897,7 +9963,7 @@ button.selected > .sheet-checkbox {
 /* ---------- 右侧 JSON 面板 ---------- */
 .plan-editor-json-panel {
   display: grid;
-  grid-template-rows: minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
   padding: 14px;
   min-width: 0;
   min-height: 0;
@@ -10483,3 +10549,177 @@ button.selected > .sheet-checkbox {
 .result-review-bar p { margin: 0; font-size: 12px; line-height: 1.5; }
 .result-review-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .result-review-actions button { min-width: 0; white-space: normal; }
+.pause-details {
+  color: var(--muted, #6b7b72);
+  font-size: 13px;
+}
+.pause-details > summary {
+  cursor: pointer;
+  padding: 6px 0;
+}
+.pause-details > summary > span {
+  margin-left: 10px;
+  font-size: 12px;
+  opacity: .7;
+}
+.pause-details[open] > summary {
+  margin-bottom: 8px;
+}
+
+.analysis-pause-inline {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  padding: 4px 0;
+  color: var(--text-secondary, #737b76);
+  font-size: 13px;
+}
+.analysis-pause-inline button {
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  padding: 4px 0;
+  color: var(--accent, #2d6a49);
+  font: inherit;
+  cursor: pointer;
+}
+.analysis-pause-inline button:disabled { opacity: .5; cursor: default; }
+.analysis-pause-inline [role="alert"] { flex-basis: 100%; color: #a04b25; }
+
+/* ---------------------------------------------------------------------------
+ * Python 代码内容块（两端共用：WPS 直接加载这份基线样式）
+ *
+ * 只读展示：没有"运行"按钮，也没有任何会绕过校验的入口。
+ * 窄窗格里靠 `max-width: 100%` + 内部横向滚动，不横向撑破消息列。
+ * ------------------------------------------------------------------------- */
+.python-code-block {
+  box-sizing: border-box;
+  min-width: 0;
+  max-width: 100%;
+  margin: 10px 0 0;
+  border: 1px solid var(--color-border, #e3e7e4);
+  border-radius: var(--radius-sm, 10px);
+  corner-shape: squircle;
+  background: var(--color-background-subtle, #f7f9f8);
+  overflow: hidden;
+}
+
+.python-code-header {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 8px;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--color-border, #e3e7e4);
+}
+
+.python-code-lang {
+  padding: 1px 6px;
+  border-radius: var(--radius-xs, 6px);
+  corner-shape: squircle;
+  background: var(--color-brand-bg, #e8f2ec);
+  color: var(--color-brand-text, #2d6a49);
+  font-size: var(--font-size-caption, 12px);
+  font-weight: 600;
+}
+
+.python-code-state {
+  min-width: 0;
+  color: var(--color-text-primary, #1f2a24);
+  font-size: var(--font-size-caption, 12px);
+}
+
+.python-code-state[data-stage="generation_failed"],
+.python-code-state[data-stage="validation_failed"],
+.python-code-state[data-stage="execution_failed"] {
+  color: #a1261b;
+}
+
+.python-code-state[data-stage="paused"] {
+  color: #8a5700;
+}
+
+.python-code-badge {
+  padding: 1px 6px;
+  border-radius: var(--radius-xs, 6px);
+  corner-shape: squircle;
+  background: var(--color-brand-bg, #e8f2ec);
+  color: var(--color-brand-text, #2d6a49);
+  font-size: var(--font-size-caption, 12px);
+}
+
+.python-code-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+
+.python-code-toggle,
+.python-code-copy {
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  padding: 2px 4px;
+  color: var(--color-text-secondary, #5c6b62);
+  font-size: var(--font-size-caption, 12px);
+  font: inherit;
+  font-size: var(--font-size-caption, 12px);
+  cursor: pointer;
+}
+
+.python-code-toggle:hover,
+.python-code-copy:hover {
+  color: var(--color-brand-text, #2d6a49);
+}
+
+.python-code-note {
+  margin: 0;
+  padding: 6px 10px 0;
+  color: var(--color-text-secondary, #5c6b62);
+  font-size: var(--font-size-caption, 12px);
+  line-height: 1.5;
+}
+
+.python-code-block[data-draft="true"] .python-code-body {
+  opacity: .78;
+}
+
+.python-code-body {
+  box-sizing: border-box;
+  max-width: 100%;
+  max-height: 320px;
+  margin: 8px 0 0;
+  padding: 8px 10px 10px;
+  overflow: auto;
+  color: var(--color-text-primary, #1f2a24);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre;
+  tab-size: 4;
+}
+
+.python-code-more {
+  margin: 0;
+  padding: 0 10px 8px;
+  color: var(--color-text-secondary, #5c6b62);
+  font-size: var(--font-size-caption, 12px);
+}
+
+/* 历史段上的"查看后续进展"定位入口：轻量、不抢主按钮位置。 */
+.task-progress-jump {
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  padding: 2px 4px;
+  color: var(--color-brand-text, #2d6a49);
+  font: inherit;
+  font-size: var(--font-size-caption, 12px);
+  cursor: pointer;
+}
+
+.task-progress-jump:hover {
+  text-decoration: underline;
+}

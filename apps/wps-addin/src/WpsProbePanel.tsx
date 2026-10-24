@@ -4,7 +4,6 @@ import { folderRootIdentity } from "@excel-bro/core/scopeFingerprint";
 import {
   addedFolderSheetKeys,
   canPreserveFolderAuthorization,
-  folderScopeDraftDirty,
   folderSelectionsFromKeys,
   folderSheetKey,
   isEBSystemSheet,
@@ -17,7 +16,8 @@ import {
   scanFolderByPath,
   selectFolder
 } from "../../excel-addin/src/api";
-import { inspectWpsScopeAdmission } from "./wpsAuthorizedTarget";
+import { inspectWpsAuthorizedTarget, inspectWpsScopeAdmission } from "./wpsAuthorizedTarget";
+import { useImmediateScopeAuthorization } from "../../excel-addin/src/hooks/useImmediateScopeAuthorization";
 import { useScopeAdmission } from "../../excel-addin/src/hooks/useScopeAdmission";
 import { ScopeAdmissionSummary } from "../../excel-addin/src/components/ScopeAdmissionStatus";
 import { admissionItem } from "@excel-bro/core/scopeAdmission";
@@ -50,16 +50,10 @@ function runProbe(): ProbeState {
 export default function WpsProbePanel() {
   const [probe, setProbe] = useState<ProbeState>({ status: "loading" });
   const [metadata, setMetadata] = useState<WpsWorkbookMetadata | null>(null);
-  /**
-   * **已提交**的授权范围 —— 这次对话真正的数据边界。
-   *
-   * 它只在用户点「确认」时改变。勾选、取消勾选、切换"跟随当前/选择多个"
-   * 都只改下面的草稿：否则用户每取消一次勾选，就会把正在等回答的任务一起打掉，
-   * 而他本来只是想看一眼另一张表。
-   */
+  /** 当前已核实的授权。勾选、取消勾选或切换模式自动核验并提交，期间阻止读写。 */
   const [selectedIndexes, setSelectedIndexes] = useState<number[]>([]);
   const [scopeMode, setScopeMode] = useState<"auto" | "manual">("auto");
-  /** 勾选中的**草稿**。打开面板时从已提交范围复制；取消编辑即丢弃。 */
+  /** 界面选择与核验结果分开，避免异步读数覆盖最新勾选；关闭面板不回退。 */
   const [draftIndexes, setDraftIndexes] = useState<number[]>([]);
   const [draftMode, setDraftMode] = useState<"auto" | "manual">("auto");
   const [scopeOpen, setScopeOpen] = useState(false);
@@ -77,7 +71,7 @@ export default function WpsProbePanel() {
    * 任何"打开磁盘文件"的宿主能力。这也是这张卡能在 WPS 上放开的原因。
    */
   const [scopeSource, setScopeSource] = useState<"workbook" | "folder">("workbook");
-  /** 来源也是草稿：点卡片只改草稿，点「确认」才成为这次的授权来源。 */
+  /** 来源选择同样自动核验，后台目录刷新本身不构成新授权。 */
   const [draftSource, setDraftSource] = useState<"workbook" | "folder">("workbook");
   const [folderCatalog, setFolderCatalog] = useState<FolderCatalog | null>(null);
   /**
@@ -88,7 +82,7 @@ export default function WpsProbePanel() {
    * 而不是跟着新目录继续生效。
    */
   const [folderScope, setFolderScope] = useState<{ root: string; keys: string[] } | null>(null);
-  /** 勾选**草稿**（文件 id + 表名合成的键）。取消即回退到 `folderScope.keys`。 */
+  /** 界面勾选键（文件 id + 表名）。显式勾选会自动核验并提交。 */
   const [draftFolderKeys, setDraftFolderKeys] = useState<string[]>([]);
   const [folderBusy, setFolderBusy] = useState(false);
   const [folderError, setFolderError] = useState("");
@@ -99,9 +93,9 @@ export default function WpsProbePanel() {
   const [recentlyAddedFolderSheetKeys, setRecentlyAddedFolderSheetKeys] = useState<string[]>([]);
   const [folderRefreshNotice, setFolderRefreshNotice] = useState("");
   const folderRequestLock = useRef(false);
-  const scopeConfirmation = useRef<((target: AuthorizedTarget) => Promise<boolean>) | null>(null);
+  const scopeConfirmation = useRef<((target: AuthorizedTarget, options?: { isCurrent?: () => boolean; allowEmpty?: boolean }) => Promise<boolean>) | null>(null);
   const scopeConfirmLock = useRef(false);
-  const registerScopeConfirmation = useCallback((handler: ((target: AuthorizedTarget) => Promise<boolean>) | null) => {
+  const registerScopeConfirmation = useCallback((handler: ((target: AuthorizedTarget, options?: { isCurrent?: () => boolean; allowEmpty?: boolean }) => Promise<boolean>) | null) => {
     scopeConfirmation.current = handler;
   }, []);
   /**
@@ -109,14 +103,14 @@ export default function WpsProbePanel() {
    *  - workbook：`inspectWpsScopeAdmission` 向 WPS 宿主逐表核实；
    *  - folder：`checkFolderAdmission` 由服务端在本地文件系统上逐表核实。
    *
-   * 检查永远**不构成授权** —— 它只回答"现在能不能分析"，提交仍要用户点「确认」。
+   * 检查永远**不构成授权** —— 它只回答"现在能不能分析"，只有用户选择触发自动提交。
    * 两种来源的 id 口径不同（工作表序号 vs 文件夹键），所以按来源分别给。
    */
   const folderAdmissionIds = draftFolderKeys;
   const workbookAdmissionIds = draftIndexes.map(String);
   const admissionIds = draftSource === "folder" ? folderAdmissionIds : workbookAdmissionIds;
   const admission = useScopeAdmission({
-    enabled: scopeOpen && (draftSource === "folder" ? folderCatalog !== null : metadata !== null),
+    enabled: (draftSource === "folder" ? folderCatalog !== null : metadata !== null),
     scopeKey: draftSource === "folder"
       ? JSON.stringify(["folder", folderCatalog?.sessionId, folderCatalog?.folderPath, folderBusy])
       : JSON.stringify([metadata?.fullName, metadata?.name, metadata?.sheets.map((s) => [s.index, s.name]), draftMode, refreshSpin, scopeCatalogAvailable]),
@@ -288,14 +282,16 @@ export default function WpsProbePanel() {
   };
 
   const toggleFolderSheet = (fileId: string, sheetName: string) => {
+    immediateScope.request();
     const key = folderSheetKey(fileId, sheetName);
     setDraftFolderKeys((current) =>
       current.includes(key) ? current.filter((item) => item !== key) : [...current, key]
     );
   };
 
-  /** 全选/清空都只动**本文件**，也只动草稿；已提交授权要等「确认」。 */
+  /** 全选/清空只作用于本文件，并自动更新授权。 */
   const setFolderFileSelection = (fileId: string, selected: boolean) => {
+    immediateScope.request();
     const file = folderCatalog?.files.find((candidate) => candidate.id === fileId);
     if (!file) return;
     const keys = file.worksheets
@@ -306,26 +302,18 @@ export default function WpsProbePanel() {
       : current.filter((key) => !keys.includes(key)));
   };
 
-  /**
-   * 清空**整个工作目录**的草稿勾选（不是"本文件"）。
-   *
-   * 与「选择多个」的「清空」同一件事：只清草稿，已提交的 `folderScope` 一字不动，
-   * 要换成更小的范围仍需按「确认」。
-   */
+  /** 清空整个目录立即撤销所有工作表授权。 */
   const clearFolderSelection = () => {
+    immediateScope.request();
     if (draftFolderKeys.length === 0) return;
     setDraftFolderKeys([]);
     setRecentlyAddedFolderSheetKeys([]);
     if (showSelectedFolderSheets) setShowSelectedFolderSheets(false);
   };
 
-  /**
-   * 打开范围面板：把**已提交**范围复制成草稿。
-   *
-   * 每次打开都从已提交范围起稿 —— 上次看了一半就关掉的草稿不会被当成授权。
-   */
+  /** 打开选择器时展示当前授权；只查看、刷新或关闭不构成新的授权。 */
   const openScope = () => {
-    if (scopeConfirmLock.current) return;
+    if (immediateScope.isPending()) { setScopeOpen(true); return; }
     setScopeError("");
     try {
       const current = listWpsWorksheets(getWpsApplication());
@@ -356,18 +344,11 @@ export default function WpsProbePanel() {
     }
   };
 
-  /** 关闭而不提交：草稿丢弃，已提交授权**一字不改**。 */
-  const discardScopeEdit = () => {
-    if (scopeConfirmLock.current) return;
-    setDraftIndexes(selectedIndexes);
-    setDraftMode(scopeMode);
-    setDraftSource(scopeSource);
-    setDraftFolderKeys(folderScope?.keys ?? []);
-    setFolderError("");
-    setScopeOpen(false);
-  };
+  /** 关闭选择器不撤销勾选，也不打断已经触发的核验。 */
+  const discardScopeEdit = () => { setScopeOpen(false); };
 
   const chooseAutoScope = () => {
+    immediateScope.request();
     setDraftSource("workbook");
     setDraftMode("auto");
     setDraftIndexes(
@@ -376,6 +357,7 @@ export default function WpsProbePanel() {
   };
 
   const chooseManualScope = () => {
+    immediateScope.request();
     setDraftSource("workbook");
     setDraftMode("manual");
     if (draftIndexes.length > 0) return;
@@ -384,91 +366,67 @@ export default function WpsProbePanel() {
     );
   };
 
-  /**
-   * 切到「工作目录」。
-   *
-   * 只是把来源选成 folder 并展开目录选择区 —— **不产生任何授权**：
-   * 候选目录登记完还要逐张勾选，「确认」才提交。已有目录则静默刷新一次。
-   */
+  /** 切换到工作目录，不沿用当前工作簿权限；已有勾选通过核验后自动生效。 */
   const chooseFolderSource = () => {
+    immediateScope.request();
     setDraftSource("folder");
     setFolderPickerView("files");
     setFolderSheetSearch("");
     if (folderCatalog && !folderBusy) void refreshWorkDirectory({ quiet: true });
   };
 
-  const committedFolderKeys = folderScope?.keys ?? [];
-  const scopeDraftDirty = draftSource !== scopeSource ||
-    (draftSource === "folder"
-      ? folderScopeDraftDirty(draftFolderKeys, committedFolderKeys)
-      : draftMode !== scopeMode ||
-        [...draftIndexes].sort((a, b) => a - b).join(",") !==
-          [...selectedIndexes].sort((a, b) => a - b).join(","));
-
   const toggleSheet = (index: number) => {
+    immediateScope.request();
     setDraftIndexes((current) =>
       current.includes(index) ? current.filter((value) => value !== index) : [...current, index]
     );
   };
 
-  /**
-   * 提交草稿为**新一版授权**。
-   *
-   * 两条路都先重核一遍检查结果：**看得见的绿勾不是永久许可**。
-   *  - workbook：点击时重新读取真实宿主元数据再解析范围 —— 不能拿弹层刚打开时的
-   *    那份快照提交。弹层可能开了很久，期间用户可能已经删表、关本子或换了文件。
-   *  - folder：点击时重新用**服务端**按当前勾选算一次候选范围。数据读写都在服务端，
-   *    这里拿到的是"这次授权到底覆盖了哪些表"的回执，不是内存里的旧勾选。
-   */
-  const commitScope = async () => {
-    if (scopeConfirmLock.current || !admission.canCommit) return;
+  /** 显式选择触发自动核验。每次跨 await 检查轮次，旧结果不能提交给新选择。 */
+  const commitScope = async (isCurrent: () => boolean): Promise<boolean> => {
     scopeConfirmLock.current = true;
     setScopeConfirming(true);
     setScopeError("");
     try {
-      const checked = await admission.verify();
-      if (!checked) return;
+      if (draftSource === "folder" && draftFolderKeys.length === 0) {
+        setFolderScope(null);
+        setScopeSource("folder");
+        return true;
+      }
+      const checked = admissionIds.length ? await admission.verify() : null;
+      if (!isCurrent() || (admissionIds.length > 0 && !checked)) return false;
       if (draftSource === "folder") {
         const catalog = folderCatalog;
-        if (!catalog || draftFolderKeys.length === 0) return;
+        if (!catalog) return false;
         const selections = folderSelectionsFromKeys(catalog, draftFolderKeys);
-        if (selections.length === 0) {
-          setScopeError("所选工作表已不存在，请刷新后重新选择；未变更授权。");
-          return;
-        }
         const root = folderRootIdentity(catalog.folderPath);
-        if (!root) {
-          setScopeError("无法核实工作目录身份，请重新选择目录；未变更授权。");
-          return;
-        }
+        if (!root || !selections.length) return false;
         const snapshot = await createFolderSnapshot(catalog.sessionId, selections);
+        if (!isCurrent()) return false;
         if (snapshot.worksheets.length !== draftFolderKeys.length) {
-          // 服务端按这些选择算出来的表数对不上 ⇒ 期间有表被删/改名。不提交半截范围。
-          setScopeError("工作目录内容在确认期间发生变化，请刷新后重新选择；未变更授权。");
-          return;
+          setScopeError("工作目录内容已变化，请刷新后重新选择。");
+          return false;
         }
         setFolderScope({ root, keys: [...draftFolderKeys] });
         setScopeSource("folder");
-        setScopeOpen(false);
-        return;
+        return true;
       }
-      if (!checked.target) return;
+      const target = checked?.target ?? (draftIndexes.length === 0 ? await inspectWpsAuthorizedTarget([]) : null);
+      if (!isCurrent() || !target) return false;
       const nextProbe = runProbe();
-      if (nextProbe.status !== "ready") {
-        setScopeError("暂时无法读取目标身份，请刷新后重试；未变更授权。");
-        return;
-      }
+      if (nextProbe.status !== "ready") return false;
       const nextMetadata = listWpsWorksheets(getWpsApplication());
       const nextIndexes = [...draftIndexes];
       if (nextIndexes.some((index) => !nextMetadata.sheets.some((s) => s.index === index)) ||
-          (draftMode === "auto" && !nextMetadata.sheets.some((s) => s.isActive && nextIndexes.includes(s.index)))) {
-        setScopeError("工作表范围在确认期间发生变化，请刷新后重新选择；未变更授权。");
-        return;
+          (draftMode === "auto" && nextIndexes.length > 0 && !nextMetadata.sheets.some((s) => s.isActive && nextIndexes.includes(s.index)))) {
+        setScopeError("工作表已变化，请刷新后重新选择。");
+        return false;
       }
-      const target = checked.target;
-      if (!scopeConfirmation.current || !(await scopeConfirmation.current(target))) {
-        setScopeError("暂时无法核实文件与工作表，请刷新后重试；未变更授权。");
-        return;
+      const accepted = await scopeConfirmation.current?.(target, { isCurrent, allowEmpty: true });
+      if (!isCurrent()) return false;
+      if (!accepted) {
+        setScopeError("暂时无法核实文件与工作表，请刷新后重试。");
+        return false;
       }
       setProbe(nextProbe);
       setMetadata(nextMetadata);
@@ -476,18 +434,19 @@ export default function WpsProbePanel() {
       setScopeSource("workbook");
       setSelectedIndexes(nextIndexes);
       setDraftIndexes(nextIndexes);
-      setScopeOpen(false);
+      return true;
     } catch (reason) {
-      setScopeError(
-        reason instanceof Error
-          ? reason.message
-          : "暂时无法读取目标身份，请刷新后重试；未变更授权。"
-      );
+      if (isCurrent()) setScopeError(reason instanceof Error ? reason.message : "暂时无法读取目标身份，请刷新后重试。");
+      return false;
     } finally {
       scopeConfirmLock.current = false;
       setScopeConfirming(false);
     }
   };
+  const immediateScope = useImmediateScopeAuthorization({
+    ready: !folderBusy && (admissionIds.length === 0 || admission.canCommit),
+    apply: commitScope
+  });
 
   const resolveSelectedSheetIndexes = useCallback((): readonly number[] => {
     try {
@@ -495,7 +454,6 @@ export default function WpsProbePanel() {
       if (nextProbe.status !== "ready") {
         setProbe(nextProbe);
         setMetadata(null);
-        setSelectedIndexes([]);
         return [];
       }
       const nextMetadata = listWpsWorksheets(getWpsApplication());
@@ -508,7 +466,6 @@ export default function WpsProbePanel() {
       setSelectedIndexes(nextIndexes);
       return nextIndexes;
     } catch {
-      setSelectedIndexes([]);
       return [];
     }
   }, [scopeMode, selectedIndexes]);
@@ -527,7 +484,7 @@ export default function WpsProbePanel() {
       <main className="connection-shell error">
         <img className="probe-logo" src={brandLogoUrl} alt="" />
         <div><strong>尚未连接 WPS 表格</strong><p>{probe.message}</p></div>
-        <button type="button" onClick={refresh}>重新检测</button>
+        <button type="button" onClick={() => { refresh(); if (immediateScope.isPending()) immediateScope.request(); }}>重新检测</button>
       </main>
     );
   }
@@ -555,7 +512,7 @@ export default function WpsProbePanel() {
    */
   const scopeLabel = scopeSource === "folder"
     ? folderCatalog
-      ? `工作目录 ${folderCatalog.folderName} · 已选 ${committedFolderKeys.length} 张表`
+      ? `工作目录 ${folderCatalog.folderName} · 已选 ${folderScope?.keys.length ?? 0} 张表`
       : "设置工作目录"
     : workbookScopeLabel;
 
@@ -582,22 +539,28 @@ export default function WpsProbePanel() {
         : folderCatalog.files)
     : [];
 
-  const scopeDock = (
-    <section className={`wps-scope-dock ${scopeOpen ? "open" : ""}`}>
-      {scopeOpen && (
+  /*
+   * 面板本体走 `scopeOverlay`（外壳的直接子层），触发器那一行走 `scopeDock`
+   * （留在输入框上方）。合在一起时面板会掉进 `.composer` 那一层：被审阅条挤、
+   * 被外壳裁、和输入区叠 —— 真机上看到的就是"面板被挤压/遮挡、层级混乱"。
+   */
+  const scopeOverlay = scopeOpen ? (
         <section className="scope-popover wps-scope-popover" aria-label="选择数据范围">
-          <div className="scope-popover-scroll">
+          {/*
+            标题住在滚动容器**外面**：放进 `.scope-popover-scroll` 它就是"内容的第一行"，
+            内容一滚就跟着滚走，用户滚到一半就不知道自己在选什么、也找不着关闭。
+            与底部动作条同一条道理 —— 一头一尾必须钉住，只有中间列表滚。
+          */}
           <div className="scope-popover-header">
             <div>
               <strong>这次对话使用哪些数据？</strong>
-              <span>
-                {draftSource === "folder"
-                  ? "批量处理本地工作簿；数据由本机服务端读取"
-                  : "默认跟随你当前正在查看的工作表"}
+              <span className="scope-authorization-hint" role="status">
+                勾选即授权{scopeConfirming || admission.checking ? " · 正在核对…" : "，取消勾选即撤销"}
               </span>
             </div>
             <button type="button" aria-label="关闭数据范围" onClick={discardScopeEdit}>×</button>
           </div>
+          <div className="scope-popover-scroll">
           <div className="wps-current-file-card">
             <span aria-hidden="true">XLSX</span>
             <div>
@@ -607,7 +570,7 @@ export default function WpsProbePanel() {
             </div>
           </div>
           <div className="scope-controls">
-            <fieldset className="scope-selection-fields" disabled={scopeConfirming}>
+            <fieldset className="scope-selection-fields">
             <div className="scope-mode-list">
               <button
                 type="button"
@@ -641,10 +604,11 @@ export default function WpsProbePanel() {
                   </div>
                   <div className="sheet-picker-toolbar wps-sheet-picker-toolbar">
                     <button type="button" disabled={filteredSheets.length === 0} onClick={() => {
+                      immediateScope.request();
                       const visible = filteredSheets.map((sheet) => sheet.index);
                       setDraftIndexes((current) => [...new Set([...current, ...visible])]);
                     }}>全选搜索结果</button>
-                    <button type="button" disabled={draftIndexes.length === 0} onClick={() => setDraftIndexes([])}>清空</button>
+                    <button type="button" disabled={draftIndexes.length === 0} onClick={() => { setDraftIndexes([]); immediateScope.request(); }}>清空</button>
                   </div>
                   <div className="sheet-picker-options wps-sheet-picker-options">
                   {filteredSheets.map((sheet) => (
@@ -735,7 +699,7 @@ export default function WpsProbePanel() {
                     type="button"
                     className="folder-refresh-button"
                     disabled={folderBusy}
-                    onClick={() => void refreshWorkDirectory()}
+                    onClick={() => { void refreshWorkDirectory(); if (immediateScope.isPending()) immediateScope.request(); }}
                     title="重新扫描文件和工作表"
                   >
                     ↻ {folderBusy ? "刷新中" : "刷新"}
@@ -915,8 +879,8 @@ export default function WpsProbePanel() {
           {/*
             工作目录侧的固定页脚 —— 结构、类名与内部顺序都与 Excel 的
             `.folder-selection-footer` **逐字对齐**：计数在左，按钮在右
-            （共享样式表里 `.folder-selection-footer .scope-confirm { margin-left: auto }`
-            把确认贴到右边），承认汇总落在页脚**下方**。
+            （共享样式表里 `.folder-selection-footer .scope-close { margin-left: auto }`
+            把确认按钮贴到右边），承认汇总落在页脚**下方**。
 
             页脚的"层"和 Excel 一样：它是 `.scope-popover-scroll` 的**兄弟**，不在滚动容器里。
             放进滚动容器它就只是"内容末尾的一行"，内容一滚就跟着滚走 —— 这条判据在
@@ -933,22 +897,7 @@ export default function WpsProbePanel() {
                   <span role="note">切换文件不会丢失已勾选的工作表</span>
                 </details>
               </div>
-              <button
-                type="button"
-                className="scope-confirm"
-                disabled={scopeConfirming || !admission.canCommit || draftFolderKeys.length === 0}
-                onClick={() => void commitScope()}
-              >
-                {scopeConfirming ? "核对中..." : "确认"}
-              </button>
-              {/* 「取消」只在草稿与已提交授权不一致时出现 —— 两端（Excel / WPS）文件夹页脚
-                  到此**逐字同形**：计数 + ⓘ → 确认 →（可选）取消。出口语义与工作簿动作条那颗
-                  是同一条规则（`discardScopeEdit`）：草稿回到已提交授权，已提交一字不改。 */}
-              {scopeDraftDirty && (
-                <button type="button" className="scope-discard" onClick={discardScopeEdit}>
-                  取消
-                </button>
-              )}
+              <button type="button" className="scope-close" data-scope-pending={immediateScope.pending} onClick={discardScopeEdit}>确认</button>
             </div>
           )}
           {draftSource === "folder" && (
@@ -960,7 +909,7 @@ export default function WpsProbePanel() {
               刷新在目录工具条上。 */}
           {draftSource === "workbook" && (
             <div className="wps-scope-actions">
-              <button type="button" className="scope-refresh" disabled={scopeConfirming} onClick={refresh}>
+              <button type="button" className="scope-refresh" disabled={scopeConfirming} onClick={() => { refresh(); if (immediateScope.isPending()) immediateScope.request(); }}>
                 <i
                   className={`scope-refresh-glyph${refreshSpin ? " spinning" : ""}`}
                   key={refreshSpin}
@@ -968,25 +917,16 @@ export default function WpsProbePanel() {
                 >↻</i>
                 {" "}刷新
               </button>
-              <button
-                type="button"
-                className="scope-confirm"
-                disabled={scopeConfirming || !admission.canCommit}
-                onClick={() => void commitScope()}
-              >
-                {scopeConfirming ? "核对中..." : "确认"}
-              </button>
-              {scopeDraftDirty && (
-                <button type="button" className="scope-discard" onClick={discardScopeEdit}>
-                  取消
-                </button>
-              )}
+              <button type="button" className="scope-close" data-scope-pending={immediateScope.pending} onClick={discardScopeEdit}>确认</button>
             </div>
           )}
           {folderError && <p role="alert" className="authorized-target-error">{folderError}</p>}
           {scopeError && <p role="alert" className="authorized-target-error">{scopeError}</p>}
         </section>
-      )}
+  ) : null;
+
+  const scopeDock = (
+    <section className={`wps-scope-dock ${scopeOpen ? "open" : ""}`}>
       <div className="scope-entry-row">
         <button
           className={`scope-trigger ${scopeOpen ? "open" : ""}`}
@@ -1022,6 +962,7 @@ export default function WpsProbePanel() {
         selectedSheetIndexes={selectedIndexes}
         resolveSelectedSheetIndexes={resolveSelectedSheetIndexes}
         scopeMode={scopeMode}
+        scopeSelectionPending={immediateScope.pending}
         /*
           工作目录模式**不把工作簿范围传下去**：传了等于让下游以为
           "范围就是这些工作表"，那正是"偷用当前工作簿"。下游据此明确拒绝发送。
@@ -1048,6 +989,7 @@ export default function WpsProbePanel() {
           setDraftIndexes(indexes);
         }}
         scopeDock={scopeDock}
+        scopeOverlay={scopeOverlay}
       />
     </main>
   );

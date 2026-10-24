@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import secrets
 import time
 from collections import OrderedDict
@@ -49,6 +50,27 @@ from .models import (
 TERMINAL_CANCEL_ERROR_CODES = frozenset(
     {"cancelled", "timeout", "budget_exhausted", "source_changed", "host_unavailable"}
 )
+
+logger = logging.getLogger(__name__)
+
+
+def bridge_step_id(tool: str, operation_id: str) -> str:
+    """进度事件里"一次工具调用"的步骤身份。
+
+    身份必须包含**这一次调用**，不能只有工具名：同一个工具连续调两次是两个步骤。
+    只用工具名时，第二次调用的 `started` 会覆盖第一次的步骤，界面上"读了两次"
+    看起来只有一次，而且第一次永远不会被标成完成。
+
+    重放同一次调用时 `operation_id` 不变，所以事件仍然落到同一个步骤上（只更新、
+    不新增）；换一次调用 `operation_id` 就是新的，于是独立成步。这正是"重试身份"
+    与"单次调用身份"的分界。
+
+    后缀取 12 位十六进制（48 bit）：足以区分同一任务内的所有调用，
+    又不会把步骤 ID 撑到影响日志可读性。分隔符用 `:`——协议对 `stepId` 的约束是
+    `^[A-Za-z0-9_.:-]+$`（`server/app/models.py`），`#` 会被校验直接拒掉。
+    """
+    suffix = operation_id.removeprefix("op_")[:12] or "unknown"
+    return f"bridge.{tool}:{suffix}"
 
 
 class BridgeError(RuntimeError):
@@ -152,9 +174,16 @@ class ToolBridgeSession:
         binding: BridgeBinding,
         *,
         on_request: Callable[[str, str, dict[str, Any], str], Awaitable[None]] | None,
+        on_complete: (
+            Callable[[str, str, dict[str, Any]], Awaitable[None]] | None
+        ) = None,
     ) -> None:
         self.binding = binding
         self.on_request = on_request
+        # 一次桥调用的**真实结束**（成功 / 固定错误码 / 超时 / 取消）都在这里出口。
+        # 以前没有任何"结束"回调，于是进度事件只有 started、没有 completed，
+        # 前端只能靠"下一步出现了"倒推上一步完成 —— 那是对用户的猜测。
+        self.on_complete = on_complete
         self.generation = 0
         self.cancel_reason: str | None = None
         self.call_count = 0
@@ -198,12 +227,16 @@ class ToolBridgeSession:
 
     async def request(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if self.cancel_reason is not None:
-            return _error_receipt("cancelled")
+            return await self._notify_complete(tool, "op_none", _error_receipt("cancelled"))
         max_calls = capability_int("agentToolBridge", "maxToolCallsPerTask")
         if self.call_count >= max_calls:
-            return _error_receipt("internal", extra_code="budget_exhausted")
+            return await self._notify_complete(
+                tool, "op_none", _error_receipt("internal", extra_code="budget_exhausted")
+            )
         if len(self._pending) >= capability_int("agentToolBridge", "maxPendingPerTask"):
-            return _error_receipt("internal", extra_code="busy")
+            return await self._notify_complete(
+                tool, "op_none", _error_receipt("internal", extra_code="busy")
+            )
 
         fingerprint = arguments_fingerprint(tool, arguments)
         operation_id = f"op_{secrets.token_hex(16)}"
@@ -226,12 +259,28 @@ class ToolBridgeSession:
 
         timeout = float(capability_int("agentToolBridge", "waitTimeoutSeconds"))
         try:
-            return await asyncio.wait_for(future, timeout=timeout)
+            return await self._notify_complete(
+                tool, operation_id, await asyncio.wait_for(future, timeout=timeout)
+            )
         except TimeoutError:
             self._pending.pop(operation_id, None)
-            return _error_receipt("timeout")
+            # 超时也是一个**真实终态**：这一步确实没做成，不能留在"进行中"。
+            return await self._notify_complete(
+                tool, operation_id, _error_receipt("timeout")
+            )
         finally:
             self._pending.pop(operation_id, None)
+
+    async def _notify_complete(
+        self, tool: str, operation_id: str, receipt: dict[str, Any]
+    ) -> dict[str, Any]:
+        if self.on_complete is not None:
+            try:
+                await self.on_complete(operation_id, tool, receipt)
+            except Exception:
+                # 进度事件发不出去只影响展示，绝不能让它把工具回执吞掉。
+                logger.warning("桥调用结束事件发送失败 tool=%s", tool, exc_info=True)
+        return receipt
 
     # -- delivery path -----------------------------------------------------
 
@@ -505,6 +554,9 @@ class TaskToolBridge:
         binding: BridgeBinding,
         *,
         on_request: Callable[[str, str, dict[str, Any], str], Awaitable[None]] | None = None,
+        on_complete: (
+            Callable[[str, str, dict[str, Any]], Awaitable[None]] | None
+        ) = None,
     ) -> ToolBridgeSession:
         self._prune()
         existing = self._sessions.get(binding.task_id)
@@ -529,7 +581,9 @@ class TaskToolBridge:
             authorized_key=binding.authorized_key,
             source_fingerprint=binding.source_fingerprint,
         )
-        session = ToolBridgeSession(binding, on_request=on_request)
+        session = ToolBridgeSession(
+            binding, on_request=on_request, on_complete=on_complete
+        )
         self._sessions[binding.task_id] = session
         self._sessions.move_to_end(binding.task_id)
         return session

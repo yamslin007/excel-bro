@@ -7,3 +7,10 @@ python-dotenv==1.1.1
 uvicorn[standard]==0.35.0
 pytest==8.4.2
 pywin32==312; sys_platform == "win32"
+
+# The Agent uses the SDK for all planning; keep its transitive Starlette pin
+# compatible with FastAPI. The platform wheel includes the native CLI.
+claude-agent-sdk==0.2.159
+mcp==1.23.0
+sse-starlette==2.4.1
+starlette==0.47.3

@@ -4,12 +4,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AuthorizedTarget } from "@excel-bro/core/authorizedTarget";
 import { useAuthorizedTarget } from "./useAuthorizedTarget";
 import { AuthorizedTargetConfirmation } from "../components/AuthorizedTargetConfirmation";
+import { inspectOfficeAuthorizedTarget, officeAnalysisTargetEvidence } from "../officeAuthorizedTarget";
 
 const original: AuthorizedTarget = { fileKey: "PRIVATE_PATH_A", name: "Original.xlsx",
   sheets: [{ id: "1", name: "Sheet1" }, { id: "2", name: "Other" }], selected: ["1"] };
 const other: AuthorizedTarget = { ...original, fileKey: "PRIVATE_PATH_B", name: "Other.xlsx" };
 afterEach(cleanup);
-function mount(options: Partial<Pick<Parameters<typeof useAuthorizedTarget>[0], "reviewActive" | "isReviewCopy" | "analysisEvidence">> = {}) {
+function mount(options: Partial<Pick<Parameters<typeof useAuthorizedTarget>[0], "reviewActive" | "isReviewCopy" | "analysisEvidence" | "selectionPending">> = {}) {
   let current: AuthorizedTarget | null = original;
   const inspect = vi.fn(async () => { if (!current) throw new Error("PRIVATE_FAILURE"); return current; });
   const adopt = vi.fn((target: AuthorizedTarget) => { current = target; });
@@ -36,6 +37,42 @@ function mount(options: Partial<Pick<Parameters<typeof useAuthorizedTarget>[0], 
 }
 async function initialized(h: ReturnType<typeof mount>) { await waitFor(() => expect(h.guard().binding).not.toBeNull()); }
 describe("pre-operation target confirmation shared by both hosts", () => {
+  it("a newer checkbox gesture invalidates verification before any authorization is published", async () => {
+    const h = mount(); await initialized(h);
+    let resolve!: (target: AuthorizedTarget) => void;
+    h.inspect.mockImplementationOnce(() => new Promise((done) => { resolve = done; }));
+    let current = true;
+    let result!: Promise<boolean>;
+    act(() => { result = h.guard().confirmScope({ ...original, selected: ["1", "2"] }, { isCurrent: () => current }); });
+    current = false;
+    await act(async () => { resolve(original); expect(await result).toBe(false); });
+    expect(h.adopt).not.toHaveBeenCalled();
+    expect(h.guard().binding?.selected).toEqual(["1"]);
+  });
+  it("clearing all checkboxes revokes consent without reading data or replaying work", async () => {
+    const evidence = vi.fn(async () => ({ key: "same-scope", conclusive: false }));
+    const h = mount({ analysisEvidence: evidence }); await initialized(h);
+    await act(async () => { await h.guard().confirmScope(original); });
+    expect(h.guard().hasAnalysisConsent("same-scope")).toBe(true);
+    evidence.mockClear();
+    await act(async () => { expect(await h.guard().confirmScope({ ...original, selected: [] }, { allowEmpty: true })).toBe(true); });
+    expect(h.guard().binding?.selected).toEqual([]);
+    expect(h.guard().hasAnalysisConsent("same-scope")).toBe(false);
+    expect(evidence).not.toHaveBeenCalled();
+    expect(h.operation).not.toHaveBeenCalled();
+  });
+  it("an in-flight monitor cannot report an old scope while new checkboxes are being verified", async () => {
+    let pending = false;
+    const h = mount({ selectionPending: () => pending }); await initialized(h);
+    let resolve!: (target: AuthorizedTarget) => void;
+    h.inspect.mockImplementationOnce(() => new Promise((done) => { resolve = done; }));
+    let result!: Promise<boolean>;
+    act(() => { result = h.guard().check(); });
+    pending = true;
+    await act(async () => { resolve({ ...original, selected: ["1", "2"] }); expect(await result).toBe(false); });
+    expect(h.guard().notice).toBeNull();
+    expect(h.adopt).not.toHaveBeenCalled();
+  });
   it("the existing selector can confirm and resume exactly one queued analysis", async () => {
     const h = mount({ analysisEvidence: vi.fn(async () => ({ key: "private-key", conclusive: false })) });
     await initialized(h);
@@ -100,6 +137,38 @@ describe("pre-operation target confirmation shared by both hosts", () => {
     expect(h.ui.queryByRole("dialog")).toBeNull();
     expect(h.adopt).not.toHaveBeenCalled();
   });
+  it.each(["metadata", "analysis-evidence"])("keeps explicit scope consent across an exhausted %s read and rechecks without reauthorization", async (failure) => {
+    const proof = { key: "private-key", conclusive: false };
+    const evidence = vi.fn(async (): Promise<typeof proof | null> => proof);
+    const h = mount({ analysisEvidence: evidence }); await initialized(h);
+    await act(async () => { expect(await h.guard().confirmScope(original)).toBe(true); });
+    if (failure === "metadata") h.current(null);
+    else evidence.mockResolvedValue(null);
+    fireEvent.click(h.ui.getByText("分析需求"));
+    await waitFor(() => expect(h.guard().notice?.reason).toBe("unavailable"));
+    expect(h.guard().hasAnalysisConsent(proof.key)).toBe(true);
+    expect(h.operation).not.toHaveBeenCalled();
+    h.current(original); evidence.mockResolvedValue(proof);
+    fireEvent.click(h.ui.getByText("重新检查"));
+    await waitFor(() => expect(h.operation).toHaveBeenCalledOnce());
+    expect(h.guard().notice).toBeNull();
+    expect(h.adopt).toHaveBeenCalledOnce(); // the original user selection only
+  });
+  it.each(["file", "selection", "conflicting-evidence"])("revokes consent on positive %s change even if the old target returns", async (change) => {
+    const proof = { key: "private-key", conclusive: false };
+    const evidence = vi.fn(async (): Promise<typeof proof | null> => proof);
+    const h = mount({ analysisEvidence: evidence }); await initialized(h);
+    await act(async () => { expect(await h.guard().confirmScope(original)).toBe(true); });
+    if (change === "file") h.current(other);
+    else if (change === "selection") h.current({ ...original, selected: ["1", "2"] });
+    else evidence.mockResolvedValueOnce(proof).mockResolvedValueOnce({ ...proof, key: "conflict" });
+    await act(async () => { expect(await h.guard().checkForAnalysis()).toBe(false); });
+    expect(h.guard().hasAnalysisConsent(proof.key)).toBe(false);
+    h.current(original);
+    await act(async () => { expect(await h.guard().checkForAnalysis()).toBe(false); });
+    expect(h.guard().notice?.reason).toBe("confirmation_required");
+    expect(h.operation).not.toHaveBeenCalled();
+  });
   it("unavailable identity cannot be overridden by calling confirmation directly", async () => {
     const h = mount({ analysisEvidence: vi.fn(async () => null) }); await initialized(h);
     fireEvent.click(h.ui.getByText("分析需求"));
@@ -115,6 +184,17 @@ describe("pre-operation target confirmation shared by both hosts", () => {
     h.current(original);
     fireEvent.click(h.ui.getByText("重新检查"));
     await waitFor(() => expect(h.ui.queryByRole("dialog")).toBeNull());
+    expect(h.operation).not.toHaveBeenCalled();
+    expect(h.adopt).not.toHaveBeenCalled();
+  });
+  it("rechecking an unavailable target cannot promote a queued write callback to an analysis retry", async () => {
+    const h = mount(); await initialized(h); h.current(null);
+    fireEvent.click(h.ui.getByText("操作"));
+    await waitFor(() => expect(h.guard().notice?.reason).toBe("unavailable"));
+    h.current(original);
+    fireEvent.click(h.ui.getByText("重新检查"));
+    await waitFor(() => expect(h.ui.queryByRole("dialog")).toBeNull());
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
     expect(h.operation).not.toHaveBeenCalled();
     expect(h.adopt).not.toHaveBeenCalled();
   });
@@ -481,5 +561,240 @@ describe("pre-operation target confirmation shared by both hosts", () => {
     fireEvent.click(h.ui.getByText("确认目标并继续"));
     await waitFor(() => expect(h.adopt).toHaveBeenCalledOnce());
     expect(h.operation).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * 原地撤销造成的**目录增加**能不能认下来。
+ *
+ * 撤销会把表放回工作簿，目录因此比基线多几张。认下来是为了不误报"目标已变化"，
+ * 但认下来这件事本身要证明：只会认"这次撤销放回的"那几张，授权集合一字不改。
+ * 任何一条被放宽都等于借撤销的名义关掉目标守卫。
+ */
+describe("worksheet restore target rebinding", () => {
+  const sheet = (id: string, name: string) => ({ id, name });
+  const target = (
+    selected: string[],
+    sheets: { id: string; name: string }[],
+    fileKey = "PRIVATE_PATH_A"
+  ): AuthorizedTarget => ({ fileKey, name: "Original.xlsx", sheets, selected });
+
+  it("accepts only the directory growth this restore explains and never widens the authorized set", async () => {
+    const h = mount();
+    await initialized(h);
+    const sheetsAfterDelete = [sheet("1", "Sheet1"), sheet("3", "汇总")];
+    // 删表后的现场：Other 已被删除，授权只剩「Sheet1」。
+    await act(async () => { h.guard().bind(target(["1"], sheetsAfterDelete)); });
+
+    // 回执说放回了 Other，目录里却没有 ⇒ 这份回执不能当证据。
+    expect(h.guard().bindVerifiedRestore(target(["1"], sheetsAfterDelete), ["Other"])).toBe(false);
+    // 目录多了一张谁都没授权的表 ⇒ 不是这次撤销造成的。
+    expect(h.guard().bindVerifiedRestore(
+      target(["1"], [...sheetsAfterDelete, sheet("4", "外部新增")]), ["Other"])).toBe(false);
+    // 回执说放回的表确实在目录里，但同时还多了一张没人认领的表 ⇒ 同样拒绝。
+    // （这一条只被"多出来的表是否来自本次撤销"那条判据挡住，别的判据管不到。）
+    expect(h.guard().bindVerifiedRestore(
+      target(["1"], [...sheetsAfterDelete, sheet("2", "Other"), sheet("4", "外部新增")]), ["Other"])).toBe(false);
+    // 借撤销之名把放回来的表纳入授权 ⇒ 拒绝。
+    expect(h.guard().bindVerifiedRestore(
+      target(["1", "2"], [...sheetsAfterDelete, sheet("2", "Other")]), ["Other"])).toBe(false);
+    // 已授权的表凭空消失 ⇒ 拒绝（撤销只加表）。
+    expect(h.guard().bindVerifiedRestore(target([], [sheet("2", "Other")]), ["Other"])).toBe(false);
+    // 换了工作簿 ⇒ 拒绝。
+    expect(h.guard().bindVerifiedRestore(
+      target(["1"], [...sheetsAfterDelete, sheet("2", "Other")], "PRIVATE_PATH_B"), ["Other"])).toBe(false);
+    // 没有"放回了什么"的回执 ⇒ 拒绝。
+    expect(h.guard().bindVerifiedRestore(
+      target(["1"], [...sheetsAfterDelete, sheet("2", "Other")]), [])).toBe(false);
+
+    // 正面：Other 回到目录里，授权仍是「Sheet1」。
+    expect(h.guard().bindVerifiedRestore(
+      target(["1"], [sheet("1", "Sheet1"), sheet("2", "Other"), sheet("3", "汇总")]), ["Other"])).toBe(true);
+    expect(h.guard().binding?.selected).toEqual(["1"]);
+  });
+});
+
+/*
+ * 基线被推进时，**还在飞**的那一份读数不能拿去和新基线比。
+ *
+ * 现场：`bindVerifiedShrink` / `bindVerifiedRestore`（删表收尾、原地撤销）以及
+ * 从文件入口采用当前工作簿，都是**不经过** `read()` 的直接 bind —— 它们不会等
+ * 监视器那一轮读数回来。于是"读数在旧状态开始、在新基线之后返回"是常态：
+ * 拿旧读数和新基线比，得到的 `scope_changed` 是假的，用户刚确认完就被要求再确认。
+ *
+ * 判据分两半：旧读数作废后必须**重读**（一致则放行）；重读仍是真变化就停下，
+ * 绝不放行旧请求。
+ */
+describe("读数在飞期间基线被推进", () => {
+  it("旧读数不得判成范围变化：作废重读后一致就放行", async () => {
+    const expanded: AuthorizedTarget = { ...original, selected: ["1", "2"] };
+    let current: AuthorizedTarget = original;
+    /** 每一次读都在**发起那一刻**取快照（真实宿主就是这么返回的）。 */
+    const reads: Array<{ snapshot: AuthorizedTarget; release: () => void }> = [];
+    const inspect = vi.fn((() => new Promise<AuthorizedTarget>((resolve) => {
+      const snapshot = current;
+      reads.push({ snapshot, release: () => resolve(snapshot) });
+    })) as never);
+    const adopt = vi.fn();
+    let guard!: ReturnType<typeof useAuthorizedTarget>;
+    function Harness() {
+      guard = useAuthorizedTarget({ enabled: true, inspect, adopt });
+      return <span>{guard.binding ? "bound" : "idle"}</span>;
+    }
+    render(<Harness />);
+    // 首绑：沿用旧的"第一次读成基线"语义。
+    await waitFor(() => expect(reads).toHaveLength(1));
+    await act(async () => { reads.shift()!.release(); await Promise.resolve(); });
+    await waitFor(() => expect(guard.binding?.selected).toEqual(["1"]));
+
+    // 一轮检查开始（读数在旧状态发起，被挂住）。
+    let checked: boolean | null = null;
+    let operation = 0;
+    act(() => { void guard.check().then((ready) => { checked = ready; if (ready) operation += 1; }); });
+    await waitFor(() => expect(reads).toHaveLength(1));
+
+    // 期间基线被推进（= 删表收尾 / 原地撤销那条直接 bind 的路）。
+    current = expanded;
+    act(() => { guard.bind(expanded); });
+    expect(guard.binding?.selected).toEqual(["1", "2"]);
+
+    // 旧读数这时才回来 —— 它描述的是推进**之前**的范围。
+    await act(async () => { reads.shift()!.release(); await Promise.resolve(); });
+    // 实现必须作废它并重读，而不是拿它和新基线比。
+    await waitFor(() => expect(reads.length, "旧读数作废后必须重读一次").toBeGreaterThan(0));
+    await act(async () => { reads.shift()!.release(); await Promise.resolve(); });
+
+    await waitFor(() => expect(checked, `检查没有给出结论（notice=${guard.notice?.reason ?? "none"}）`).toBe(true));
+    expect(guard.notice).toBeNull();
+    expect(operation).toBe(1);
+  });
+
+  it("重读仍与基线不一致：停下并要求确认，旧请求不重放", async () => {
+    const expanded: AuthorizedTarget = { ...original, selected: ["1", "2"] };
+    const mysteriouslyNarrowed: AuthorizedTarget = { ...original, selected: ["1"], sheets: [{ id: "1", name: "Sheet1" }] };
+    let current: AuthorizedTarget = original;
+    const reads: Array<{ snapshot: AuthorizedTarget; release: () => void }> = [];
+    const inspect = vi.fn((() => new Promise<AuthorizedTarget>((resolve) => {
+      const snapshot = current;
+      reads.push({ snapshot, release: () => resolve(snapshot) });
+    })) as never);
+    let guard!: ReturnType<typeof useAuthorizedTarget>;
+    function Harness() {
+      guard = useAuthorizedTarget({ enabled: true, inspect, adopt: vi.fn() });
+      return <span>{guard.binding ? "bound" : "idle"}</span>;
+    }
+    render(<Harness />);
+    await waitFor(() => expect(reads).toHaveLength(1));
+    await act(async () => { reads.shift()!.release(); await Promise.resolve(); });
+    await waitFor(() => expect(guard.binding?.selected).toEqual(["1"]));
+
+    let operation = 0;
+    let checked: boolean | null = null;
+    act(() => { void guard.check(() => { operation += 1; }).then((ready) => { checked = ready; }); });
+    await waitFor(() => expect(reads).toHaveLength(1));
+    current = expanded;
+    act(() => { guard.bind(expanded); });
+    expect(guard.binding?.selected).toEqual(["1", "2"]);
+
+    // 重读开始**之前**目录就已经是一份确实不同的清单：范围真的变了。
+    const stale = reads.shift()!;
+    current = mysteriouslyNarrowed;
+    await act(async () => { stale.release(); await Promise.resolve(); });
+    await waitFor(() => expect(reads.length).toBeGreaterThan(0));
+    await act(async () => { reads.shift()!.release(); await Promise.resolve(); });
+
+    await waitFor(() => expect(checked).toBe(false));
+    expect(guard.notice?.reason).toBe("scope_changed");
+    expect(operation).toBe(0);
+  });
+});
+
+/* ────────────────────────────────────────────────────────────────────────────
+ * 完整调用链：adopt → bind → checkForAnalysis
+ *
+ * 现场：按「Sheet11 → Sheet1 → Sheet10」（不是目录顺序）确认三张表后发送需求，
+ * 被拦在「暂时无法核实当前目标」。链路上的三个事实本来就不该互相打架：
+ *   · 用户**点选**的顺序 → 守卫基线 `bound.selected`；
+ *   · `adopt` 写进已提交的**名字**（`App.tsx` 按工作表目录顺序取出来）；
+ *   · 下一次 `inspect` 按那些名字映射回来的 `selected`（于是变成目录顺序）。
+ * 三者描述的是同一组表，只有顺序不同。判"是不是同一个目标"必须只看集合。
+ *
+ * 这条用例刻意用**真实的** `inspectOfficeAuthorizedTarget` 与
+ * `officeAnalysisTargetEvidence`（只替身宿主对象），否则"证据键"这条判据
+ * 会被测试自己写的那份替身悄悄替掉 —— 那正是仓库里反复踩过的坑。
+ * ──────────────────────────────────────────────────────────────────────────── */
+function stubThreeSheetWorkbook() {
+  const document = { url: "file:///C:/Data/Book.xlsx" };
+  const sheets = [
+    { id: "1", name: "Sheet1", load: vi.fn() },
+    { id: "10", name: "Sheet10", load: vi.fn() },
+    { id: "11", name: "Sheet11", load: vi.fn() }
+  ];
+  const worksheets = { items: sheets, load: vi.fn(), getActiveWorksheet: () => sheets[2] };
+  vi.stubGlobal("Office", { context: { document } });
+  vi.stubGlobal("Excel", { run: async (job: (context: unknown) => unknown) =>
+    job({ workbook: { worksheets }, sync: vi.fn(async () => {}) }) });
+  return { document, sheets };
+}
+describe("已确认范围的证据冲突判据（真实适配器 + 真实守卫）", () => {
+  afterEach(() => { vi.unstubAllGlobals(); });
+  it("已提交名单按目录顺序写回、基线按点选顺序绑定：发送仍不判证据冲突", async () => {
+    stubThreeSheetWorkbook();
+    /** `adopt` 之后写进已提交的名字。初始就是目录顺序（App 第一次读到的样子）。 */
+    let committed: string[] = ["Sheet1", "Sheet10", "Sheet11"];
+    let guard!: ReturnType<typeof useAuthorizedTarget>;
+    function Harness() {
+      guard = useAuthorizedTarget({
+        enabled: true,
+        inspect: () => inspectOfficeAuthorizedTarget(committed),
+        // 与 `App.tsx` 的 adopt 同形：按**工作表目录**顺序取已授权名字。
+        adopt: (target) => {
+          committed = target.sheets
+            .filter((sheet) => target.selected.includes(sheet.id))
+            .map((sheet) => sheet.name);
+        },
+        analysisEvidence: officeAnalysisTargetEvidence
+      });
+      return null;
+    }
+    render(<Harness />);
+    await waitFor(() => expect(guard.binding).not.toBeNull());
+
+    // 用户点选的顺序：Sheet11 → Sheet1 → Sheet10。
+    const clicked: AuthorizedTarget = { ...guard.binding!, selected: ["11", "1", "10"] };
+    await act(async () => { expect(await guard.confirmScope(clicked)).toBe(true); });
+    // adopt 之后已提交名单变成目录顺序 —— 这就是现场那两个顺序的差别来源。
+    expect(committed).toEqual(["Sheet1", "Sheet10", "Sheet11"]);
+    expect(guard.binding?.selected).toEqual(["11", "1", "10"]);
+
+    await act(async () => { expect(await guard.checkForAnalysis()).toBe(true); });
+    expect(guard.notice).toBeNull();
+  });
+  it("成员真的变了仍然拦下：少勾一张不是顺序问题", async () => {
+    stubThreeSheetWorkbook();
+    let committed = ["Sheet1", "Sheet10", "Sheet11"];
+    let guard!: ReturnType<typeof useAuthorizedTarget>;
+    function Harness() {
+      guard = useAuthorizedTarget({
+        enabled: true,
+        inspect: () => inspectOfficeAuthorizedTarget(committed),
+        adopt: (target) => {
+          committed = target.sheets
+            .filter((sheet) => target.selected.includes(sheet.id))
+            .map((sheet) => sheet.name);
+        },
+        analysisEvidence: officeAnalysisTargetEvidence
+      });
+      return null;
+    }
+    render(<Harness />);
+    await waitFor(() => expect(guard.binding).not.toBeNull());
+    const clicked: AuthorizedTarget = { ...guard.binding!, selected: ["11", "1", "10"] };
+    await act(async () => { expect(await guard.confirmScope(clicked)).toBe(true); });
+
+    // 外部少授权一张（同一顺序、同一文件，只有成员不同）：必须判范围变化。
+    committed = ["Sheet1", "Sheet10"];
+    await act(async () => { expect(await guard.checkForAnalysis()).toBe(false); });
+    expect(guard.notice?.reason).toBe("scope_changed");
   });
 });

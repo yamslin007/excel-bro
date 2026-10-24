@@ -1,0 +1,30 @@
+.controlled-script-editor {
+  border: 1px solid var(--color-border, #d9e3dc);
+  border-radius: 12px;
+  padding: 12px;
+  margin-bottom: 12px;
+  min-width: 0;
+  max-height: 55vh;
+  overflow: auto;
+  overflow-wrap: anywhere;
+  background: var(--color-surface, #fff);
+  color: var(--color-text, #26382c);
+}
+.controlled-script-editor summary { cursor: pointer; font-weight: 600; }
+.controlled-script-editor p { font-size: 13px; line-height: 1.5; }
+.controlled-script-editor textarea {
+  box-sizing: border-box;
+  display: block;
+  width: 100%;
+  min-height: 120px;
+  margin: 10px 0;
+  resize: vertical;
+  font: 13px/1.5 Consolas, monospace;
+  color: inherit;
+  background: var(--color-background, #fff);
+  border: 1px solid var(--color-border, #d9e3dc);
+  border-radius: 8px;
+  padding: 10px;
+}
+.controlled-script-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.controlled-script-editor button { max-width: 100%; white-space: normal; }

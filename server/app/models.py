@@ -24,6 +24,12 @@ from .safety import (
 
 CellValue = str | int | float | bool | None
 
+# Stable service-error codes, shared by JSON/SSE and both host clients.
+ModelUsageErrorCode = Literal[
+    "MODEL_QUOTA_EXHAUSTED", "MODEL_CONTEXT_LIMIT", "MODEL_OUTPUT_LIMIT",
+    "MODEL_BUDGET_LIMIT", "MODEL_TURN_LIMIT",
+]
+
 ScopeAdmissionReason = Literal["none", "read_only", "protected", "write_unverified", "host_write_blocked",
     "identity_unverified", "target_changed", "missing", "unreadable", "unsupported", "locked", "directory_not_writable"]
 
@@ -2013,6 +2019,8 @@ class MessageUnderstandingRequest(BaseModel):
     imageCount: int = Field(default=0, ge=0, le=3)
     conversation: list[IntentConversationMessage] = Field(default_factory=list, max_length=6)
     modelId: Annotated[str, StringConstraints(strip_whitespace=True, max_length=200)] | None = None
+    # Opaque planning IDs or preplanning-* local request refs; never authorization.
+    recoveryTasks: list[Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]] = Field(default_factory=list, max_length=6)
 
 
 class MessageConversationResponse(BaseModel):
@@ -2029,8 +2037,16 @@ class MessageContextResponse(BaseModel):
     provider: Literal["model"] = "model"
 
 
+class MessageRecoveryResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["task_recovery"] = "task_recovery"
+    action: Literal["inspect", "continue"] = "inspect"
+    turnId: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
+    provider: Literal["model"] = "model"
+
+
 MessageUnderstandingResponse = Annotated[
-    MessageConversationResponse | MessageContextResponse, Field(discriminator="kind")
+    MessageConversationResponse | MessageContextResponse | MessageRecoveryResponse, Field(discriminator="kind")
 ]
 
 
@@ -2283,9 +2299,31 @@ class BridgeResultResponse(BaseModel):
     scannedRows: int = Field(ge=0)
 
 
+class PythonCodeRequest(BaseModel):
+    """Loopback-only request for the generated code body.
+
+    代码正文**不进事件、不进账本**（会落进 SQLite），只在进程内登记表里短期存在；
+    界面按 ``codeId`` 经本机回环端点取回。``taskId`` 是必需的：只凭 ``codeId``
+    就能取回会让这个端点变成跨任务读取工具。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    taskId: str = Field(min_length=1, max_length=64)
+    codeId: str = Field(pattern=r"^code_py_[0-9a-f]{12}$")
+
+
+class PythonCodeResponse(BaseModel):
+    """取回后的代码正文。``code`` 是**当时那一版**，不是最新一版。"""
+
+    model_config = ConfigDict(extra="forbid")
+    codeId: str = Field(pattern=r"^code_py_[0-9a-f]{12}$")
+    attemptId: str = Field(min_length=1, max_length=64)
+    code: str
+    chars: int = Field(ge=0)
+
+
 class BridgeToolPointer(BaseModel):
     """Opaque pointer persisted with a progress event.
-
     Only the operation id and tool name — never the request arguments, which
     stay in the volatile bridge store and are fetched by the host adapter.
     """
@@ -2295,7 +2333,27 @@ class BridgeToolPointer(BaseModel):
     tool: BridgeToolName
 
 
+class ModelOptionResponse(BaseModel):
+    id: str
+    label: str
+    provider: Literal["model"] = "model"
+    available: bool
+    supportsVision: bool
+    agentAvailable: bool
+    agentUnavailableReason: str | None = None
+    formulaAvailable: bool
+
+
+class ModelCatalogResponse(BaseModel):
+    defaultModelId: str | None = None
+    models: list[ModelOptionResponse]
+
+
 class ManagedModelConnectionResponse(BaseModel):
+    protocol: Literal["openai_compatible", "anthropic"] = "openai_compatible"
+    agentAvailable: bool = False
+    agentUnavailableReason: str | None = None
+    formulaAvailable: bool = True
     id: str
     catalogModelId: str
     label: str
@@ -2327,6 +2385,7 @@ class UpdateModelSettingsRequest(BaseModel):
 
 
 class UpsertModelConnectionRequest(BaseModel):
+    protocol: Literal["openai_compatible", "anthropic"] | None = None
     id: Annotated[
         str,
         StringConstraints(
@@ -2372,7 +2431,13 @@ class SetFormulaModelRequest(BaseModel):
     ] = ""
 
 
+class TestModelConnectionRequest(UpsertModelConnectionRequest):
+    # Older clients test only chat connectivity; new clients choose explicitly.
+    purpose: Literal["agent", "formula"] = "formula"
+
+
 class TestModelConnectionResponse(BaseModel):
+    testedFor: Literal["agent", "formula"] = "formula"
     ok: bool
     message: str
 
@@ -2481,6 +2546,30 @@ class PlanRequest(BaseModel):
     ] = Field(default_factory=list, max_length=200)
 
 
+class PlanningContinuation(BaseModel):
+    """「继续分析」的事实（`/api/turn/{id}/status` 与暂停载荷共用）。
+
+    `available` 只回答"现场是否符合契约且没有已登记的写入"；
+    `canContinue` 是它与预算/状态条件的合成，两者不是同一个判断。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    available: bool
+    code: str | None = None
+    message: str = ""
+    stage: Literal["before_model", "after_tool"] | None = None
+    # 原任务是否依赖来源数据 ⇒ 继续前必须重读并比对来源指纹。
+    # **由服务端从检查点判定**，不由客户端猜：猜"需要"会挡住纯结构任务，
+    # 猜"不需要"会放过改了数据的现场。客户端只按这个布尔决定要不要真读一次。
+    sourceVerificationRequired: bool = False
+
+
+class PlanningPauseAck(BaseModel):
+    turnId: str
+    # Receipt of the stop request, not proof that worker cleanup has finished.
+    pauseRequested: bool
+
+
 class PlanningContinueRequest(BaseModel):
     turnId: TurnId
     expectedRevision: int = Field(ge=1)
@@ -2492,6 +2581,36 @@ class PlanningContinueRequest(BaseModel):
         StringConstraints(strip_whitespace=True, min_length=1, max_length=200),
     ] | None = None
     confirmModelSwitch: bool = False
+    # 继续之前由客户端**重新核实**的现场证据。三项都是**必填**：
+    # 省略、为空、读取失败都拿不到继续权 —— 不允许用"没传就跳过比对"绕过去。
+    # 想继续就必须先读一次当前宿主，并把读到的东西交上来。
+    workbookIdentity: Annotated[
+        str,
+        StringConstraints(strip_whitespace=True, min_length=5, max_length=4000),
+    ]
+    authorizedSheetNames: list[str] = Field(min_length=1, max_length=200)
+    # 来源核实的**三态**，不是一个可省略的布尔：
+    # - `verified`：本轮重读过依赖来源，`sourceFingerprint` 必填并与记录比对；
+    # - `not_collected`：原任务确实没有读过来源（纯结构任务），由服务端判定是否适用；
+    # - `failed`：读了但失败。读取失败与"尚未采集"是两件事，必须分开到达服务端，
+    #   否则"读不到"会被当成"不需要读"而放行。
+    sourceVerification: Literal["verified", "not_collected", "failed"]
+    sourceFingerprint: Annotated[
+        str,
+        StringConstraints(strip_whitespace=True, min_length=1, max_length=400),
+    ] | None = None
+
+    @model_validator(mode="after")
+    def validate_source_evidence(self) -> "PlanningContinueRequest":
+        if self.sourceVerification == "verified" and not (
+            self.sourceFingerprint and self.sourceFingerprint.strip()
+        ):
+            raise ValueError("声明已核实来源时必须提供来源指纹")
+        if self.sourceVerification != "verified" and self.sourceFingerprint is not None:
+            raise ValueError("未声明已核实来源时不应提供来源指纹")
+        if any(not name.strip() for name in self.authorizedSheetNames):
+            raise ValueError("授权成员不能包含空表名")
+        return self
 
     @model_validator(mode="after")
     def validate_model_switch_confirmation(self) -> "PlanningContinueRequest":
@@ -2512,6 +2631,13 @@ class OfficeExecutionRegisterRequest(BaseModel):
     authorizedSheetNames: list[str] = Field(min_length=1, max_length=200)
     allowedExternalFiles: list[str] = Field(default_factory=list, max_length=200)
     workbookIdentity: str = Field(min_length=5, max_length=4000)
+    # 这个执行是由哪个规划任务产生的。与 WPS 的
+    # `WpsExecutionRegisterRequest.taskId` 同一口径：没有它，
+    # `has_execution_for_task` 在 Excel 侧永远为假，「继续分析」就发现不了
+    # "这个任务其实已经写过原表"，等于把重新规划当成旁路。未知来源（例如
+    # `/function` 预览、历史计划重放）允许为空 —— 空只是**不声称**关联，
+    # 不能据此放行任何写入。
+    taskId: str | None = Field(default=None, min_length=1, max_length=100)
     confirmed: Literal[True]
 
     @field_validator("workbookIdentity")
@@ -2590,7 +2716,7 @@ class OfficeExecutionStateResponse(BaseModel):
 # WPS 格式动作**可以声明**的属性名（= 端上 `declaredFormatFields` 的输出集合，也是
 # `apps/wps-addin/src/wpsFormatSnapshot.ts` 的 `ALL_WPS_FORMAT_FIELDS`）。
 #
-# 未通过实机验证的属性（`underline` / `vertical` / `columnWidth`）**不在集合里**：
+# 尚未实现可恢复执行的属性（`underline` / `columnWidth`）**不在集合里**：
 # 端上的投影阶段就产不出来，这里是第二道闸，`main` 里还有按动作类型细分的第三道。
 WPS_FORMAT_FIELD_NAMES = frozenset(
     {
@@ -2599,9 +2725,11 @@ WPS_FORMAT_FIELD_NAMES = frozenset(
         "name",
         "size",
         "color",
-        "horizontalAlignment",
+        "horizontalAlignment", "verticalAlignment",
         "wrapText",
+        "borderTop", "borderBottom", "borderLeft", "borderRight",
         "rowHeight",
+        "fillColor", "fillPattern", "numberFormat",
     }
 )
 
@@ -2610,12 +2738,13 @@ WPS_FORMAT_FIELD_NAMES = frozenset(
 # 与它必须一致，`server/tests/test_wps_execution_api.py` 钉住这条同步。
 WPS_RECOVERY_ACTION_TYPES = frozenset(
     {
-        "writeValues",
+        "writeValues", "sortRange",
         "writeFormulas",
         "clearRange",
         "setFont",
         "setAlignment",
         "resizeRange",
+        "setFill", "setNumberFormat", "setBorders",
     }
 )
 
@@ -2656,11 +2785,11 @@ class WpsRecoveryActionDescriptor(BaseModel):
     @field_validator("formatFields")
     @classmethod
     def validate_format_fields(cls, value: list[str]) -> list[str]:
-        """只校验"名字在已验证集合里且不重复"。
+        """只校验"名字在已实现恢复集合里且不重复"。
 
         "这个动作类型**该**声明哪些属性"（setFont 只有 bold/italic/name/size/color 等）
         是动作类型相关的判据，放在 ``main._validate_wps_recovery_descriptor``；
-        这里只保证**任何**合法记录，读出来后下发给客户端时也不会带出未验证属性名。
+        这里只保证**任何**合法记录，读出来后下发给客户端时也不会带出未实现的恢复属性名。
         """
         if len(set(value)) != len(value):
             raise ValueError("格式属性声明不得重复")
@@ -3054,6 +3183,57 @@ class TaskProgressTrace(BaseModel):
     requiresConfirmation: bool = False
 
 
+class PythonCodeEvent(BaseModel):
+    """模型生成的 Python 代码工件的状态（不是单元格数据）。
+
+    代码走独立字段而不是 ``detail``：``detail`` 是"给人看的一句话"，会被截断、
+    会被拼接，也会在没有代码时照常出现。这里同时带上工件身份
+    （``codeId`` / ``attemptId`` / ``version``），前端才能判定"已运行的就是
+    屏幕上这一版"，而不是靠文案猜。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    codeId: str = Field(min_length=1, max_length=120)
+    attemptId: str = Field(min_length=1, max_length=120)
+    stage: Literal[
+        "generating",
+        "generated",
+        "validating",
+        "running",
+        "analysis_completed",
+        "summarizing",
+        "paused",
+        "not_started",  # 未收到工作程序执行确认，不等同于 Docker CLI 是否启动
+        "generation_failed",
+        "validation_failed",
+        "execution_failed",
+    ]
+    version: int = Field(default=1, ge=1)
+    # 代码正文：上限来自 config/capabilities.json 的 pythonCode.maxCharsPerEvent。
+    code: str | None = Field(default=None, max_length=20000)
+    delta: str | None = Field(default=None, max_length=20000)
+    # 正文字符数：正文不随帧下发时，也要如实告知规模（不是"没有代码"）。
+    chars: int | None = Field(default=None, ge=0)
+    # 这一帧是否携带正文。账本里的历史帧固定为 false —— 代码不进持久化现场。
+    codeRetained: bool | None = None
+    truncated: bool = False
+    complete: bool | None = None
+    executedVersion: int | None = Field(default=None, ge=1)
+    sequence: int | None = Field(default=None, ge=0)
+    # 未开始执行的具体原因（固定文案，不含路径/请求 ID/原始错误）。
+    reason: str | None = Field(default=None, max_length=300)
+
+    @model_validator(mode="after")
+    def validate_code_payload(self) -> "PythonCodeEvent":
+        # 内容阶段必须带正文；后续的"校验/执行/完成"帧只推进状态，不重复搬运代码
+        # （代码已经在同一 stepId 的第一帧里送达，前端按工件身份归并）。
+        if self.stage in ("generating", "generated"):
+            if self.code is None and self.delta is None and not self.chars:
+                raise ValueError("pythonCode 内容阶段必须带 code/delta 或 chars")
+        return self
+
+
 class TaskProgressEvent(BaseModel):
     """由本地代码构造并校验的用户可见任务进度，不承载模型隐藏推理。"""
 
@@ -3098,6 +3278,8 @@ class TaskProgressEvent(BaseModel):
     bridgeTool: BridgeToolPointer | None = None
     # Python 分析结果卡：包含引用与结构，值由前端另行查询。
     pythonResult: LocalResultCard | None = None
+    # Python 代码工件状态（代码正文 + 工件身份 + 阶段），与 pythonResult 分开。
+    pythonCode: PythonCodeEvent | None = None
     timestamp: str = Field(min_length=1, max_length=64)
 
     @model_validator(mode="after")
@@ -3121,3 +3303,87 @@ TurnResponse = Annotated[
     | LocalPlanRuleResponse,
     Field(discriminator="kind"),
 ]
+
+
+class WorksheetDeleteCheckpointRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    operationId: str = Field(pattern=r"^[a-f0-9]{32}$")
+    host: Literal["excel", "wps-et"]
+    workbookPath: str = Field(min_length=1, max_length=2048)
+    hostWindowId: int | None = Field(default=None, gt=0)
+    authorizedSheets: list[str] = Field(min_length=1, max_length=256)
+    plan: AnalysisPlan
+    # Attribution of the originating conversation/request message. Optional so that
+    # records written before this field existed stay readable: missing means
+    # "unknown", never "the current conversation".
+    conversationId: str | None = Field(default=None, min_length=1, max_length=128)
+    requestMessageId: str | None = Field(default=None, min_length=1, max_length=128)
+
+
+class WorksheetCheckpointReference(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    operationId: str = Field(pattern=r"^[a-f0-9]{32}$")
+
+
+class WorksheetCheckpointBackupConsent(WorksheetCheckpointReference):
+    backupSheets: list[str] = Field(min_length=1, max_length=256)
+
+
+class WorksheetRestoreResult(BaseModel):
+    """原地撤销的**实际结果**（不是"打开了某个副本"）。
+
+    只报做过的事：哪些表被放回原工作簿、哪些没放回、修了几处被本次删除打断的
+    跨表公式与工作簿级名称、哪些类型无法核对。`status` 为 `completed` 才代表
+    "名称/顺序/可见性/内容都已核对一致"；`partial` 与 `failed` 都不许显示成已撤销。
+    """
+
+    operationId: str
+    status: Literal["completed", "partial", "failed", "conflict"]
+    restoredSheets: list[str] = Field(default_factory=list)
+    failedSheets: list[str] = Field(default_factory=list)
+    unverifiedSheets: list[str] = Field(default_factory=list)
+    repairedFormulas: int = 0
+    repairedNames: int = 0
+    limitations: list[str] = Field(default_factory=list)
+    message: str
+
+
+class WorksheetDeleteCheckpointResult(BaseModel):
+    operationId: str
+    status: Literal["prepared", "needs_backup_consent", "executing", "completed", "partial_or_unknown", "failed"]
+    backupSheets: list[str] = Field(default_factory=list)
+    deletedSheets: list[str] = Field(default_factory=list)
+    remainingSheets: list[str] = Field(default_factory=list)
+    recoveryAvailable: bool = False
+    message: str
+    # 原地撤销的最近一次结果。旧记录没有这一项 —— 缺失只表示"还没撤销过"，
+    # 不表示"不能撤销"（能不能撤销由 status / recoveryAvailable / 身份核对决定）。
+    restore: WorksheetRestoreResult | None = None
+
+
+class WorksheetCheckpointOpenResult(BaseModel):
+    opened: bool
+    recoveryPath: str
+
+
+class WorksheetCheckpointListRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    workbookPath: str = Field(min_length=1, max_length=2048)
+    host: Literal["excel", "wps-et"]
+
+
+class WorksheetCheckpointSummary(BaseModel):
+    operationId: str
+    status: Literal["prepared", "needs_backup_consent", "executing", "completed", "partial_or_unknown", "failed"]
+    deletedSheets: list[str] = Field(default_factory=list)
+    remainingSheets: list[str] = Field(default_factory=list)
+    recoveryAvailable: bool = False
+    message: str
+    createdAt: str | None = None
+    planTitle: str | None = None
+    # 「备份与恢复」列表要知道这一条是否已经原地撤销过；缺失表示没有撤销记录。
+    restoreStatus: Literal["completed", "partial", "failed", "conflict"] | None = None
+
+
+class WorksheetCheckpointListResult(BaseModel):
+    checkpoints: list[WorksheetCheckpointSummary] = Field(default_factory=list)

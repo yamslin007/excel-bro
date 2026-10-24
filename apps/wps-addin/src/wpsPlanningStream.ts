@@ -1,3 +1,4 @@
+import { waitForPlanning } from "@excel-bro/core/planningReplay";
 /**
  * WPS 端的**流式规划客户端**（CAP-02）。
  *
@@ -39,6 +40,7 @@ import {
   newPlanningCursor,
   planningResumeDecision,
   reconcilePlanningCursor,
+  type PlanningContinuationView,
   type PlanningCursor,
   type PlanningPauseType,
   type PlanningResumeDecision,
@@ -180,8 +182,11 @@ export async function consumeWpsPlanningStream(
     );
   };
 
+  const cancelReader = () => { void reader.cancel().catch(() => undefined); };
+  hooks.signal?.addEventListener("abort", cancelReader, { once: true });
+  try {
   for (;;) {
-    const { done, value } = await reader.read();
+    const { done, value } = await waitForPlanning(reader.read(), hooks.signal);
     if (value) buffer += decoder.decode(value, { stream: true });
     let separator = buffer.indexOf("\n\n");
     while (separator !== -1) {
@@ -193,6 +198,10 @@ export async function consumeWpsPlanningStream(
     if (done) break;
   }
 
+  } finally {
+    hooks.signal?.removeEventListener("abort", cancelReader);
+    if (hooks.signal?.aborted) cancelReader();
+  }
   const tail = buffer.trim();
   if (tail) handleFrame(tail);
   if (!result) {
@@ -219,6 +228,84 @@ export interface WpsPlanningTaskStatus {
   canContinue?: boolean;
   pauseType?: PlanningPauseType | null;
   reason?: string | null;
+  /**
+   * 「继续分析」的权威事实：能不能继续、为什么不能、停在哪个阶段。
+   * 服务端用共享契约 + 执行账本算出，本端不得自行推断。
+   */
+  continuation?: PlanningContinuationView | null;
+  /**
+   * 原任务记录下来的来源指纹与来源表。
+   *
+   * 用于"读到了但不一样"的**本地**判定（服务端还会再判一次）。缺了它，WPS 只能
+   * 等服务端回 409 才知道数据变过，用户在看到结果前多一次无效请求。
+   */
+  sourceFingerprint?: string | null;
+  sourceFingerprintSheets?: string[];
+}
+
+/** `GET /api/turn/{turnId}/events` 的响应视图。 */
+export interface WpsPlanningTaskEvents {
+  turnId: string;
+  status: PlanningTaskStatus;
+  /** 这条任务此刻是否真的还在服务端跑（不是"账本里写着 running"）。 */
+  active: boolean;
+  lastSequence: number;
+  events: TaskProgressEvent[];
+}
+
+/**
+ * 补发**已经落盘**的规划事件（只读，不重新规划）。
+ *
+ * 服务端仍在跑时「继续」会被 409 挡住 —— 再发一次就是重复规划、重复读表。
+ * 想接回**正在运行**的原任务，唯一正当的入口就是读它已保存的事件。
+ */
+export async function getWpsPlanningTaskEvents(
+  turnId: string,
+  afterSequence = 0,
+  signal?: AbortSignal
+): Promise<WpsPlanningTaskEvents> {
+  const query = afterSequence > 0 ? `?afterSequence=${afterSequence}` : "";
+  const response = await fetch(
+    `${API_BASE_URL}/api/turn/${encodeURIComponent(turnId)}/events${query}`,
+    { signal }
+  );
+  if (!response.ok) {
+    throw await wpsPlanningRequestError(response, "读取原任务进度事件失败");
+  }
+  const value: unknown = await response.json();
+  const raw = (value ?? {}) as Record<string, unknown>;
+  if (!Array.isArray(raw.events)) {
+    throw new ApiRequestError(
+      502,
+      "WPS_PLANNING_BAD_EVENT_PAGE",
+      "原任务进度事件格式不正确",
+      false
+    );
+  }
+  const events: TaskProgressEvent[] = [];
+  for (const item of raw.events) {
+    const parsed = parseTaskProgressEvent(item);
+    if (!parsed) {
+      // 与流式通道同一条纪律：不认识的帧不静默吞掉。
+      throw new ApiRequestError(
+        502,
+        "WPS_PLANNING_BAD_EVENT_PAGE",
+        "原任务进度事件格式不正确",
+        false
+      );
+    }
+    events.push(parsed);
+  }
+  const status = String(raw.status ?? "");
+  return {
+    turnId,
+    status: (["running", "waiting_user", "completed", "failed", "cancelled"].includes(status)
+      ? status
+      : "failed") as PlanningTaskStatus,
+    active: raw.active === true,
+    lastSequence: Number(raw.lastSequence ?? 0) || 0,
+    events
+  };
 }
 
 /** 查询规划任务的真实状态。**只查询，不创建任务**。 */
@@ -263,8 +350,37 @@ export function normalizeWpsPlanningStatus(
   const revision = Number.isFinite(raw.revision) ? Math.max(1, Math.floor(Number(raw.revision))) : 1;
   const lastSequence = Number.isFinite(raw.lastSequence) ? Math.max(0, Math.floor(Number(raw.lastSequence))) : 0;
   const pauseType =
-    raw.pauseType === "budget" || raw.pauseType === "model_error" || raw.pauseType === "interrupted"
+    raw.pauseType === "budget" ||
+    raw.pauseType === "budget_exhausted" ||
+    raw.pauseType === "model_error" ||
+    raw.pauseType === "interrupted"
       ? raw.pauseType
+      : null;
+  const rawContinuation = (raw.continuation ?? null) as
+    | Record<string, unknown>
+    | null;
+  const continuation: PlanningContinuationView | null =
+    rawContinuation && typeof rawContinuation.available === "boolean"
+      ? {
+          available: rawContinuation.available,
+          code:
+            typeof rawContinuation.code === "string"
+              ? rawContinuation.code
+              : null,
+          message:
+            typeof rawContinuation.message === "string"
+              ? rawContinuation.message
+              : "",
+          stage:
+            rawContinuation.stage === "before_model" ||
+            rawContinuation.stage === "after_tool"
+              ? rawContinuation.stage
+              : null,
+          // 缺省按"需要核实"处理：没读懂服务端的意图时多读一次数据是安全方向，
+          // 少读一次会让"数据已经变了"的现场直接放行。
+          sourceVerificationRequired:
+            rawContinuation.sourceVerificationRequired === false ? false : true
+        }
       : null;
   return {
     turnId,
@@ -276,7 +392,15 @@ export function normalizeWpsPlanningStatus(
     error: (raw.error ?? null) as WpsPlanningTaskStatus["error"],
     canContinue: typeof raw.canContinue === "boolean" ? raw.canContinue : undefined,
     pauseType,
-    reason: typeof raw.reason === "string" ? raw.reason : null
+    reason: typeof raw.reason === "string" ? raw.reason : null,
+    continuation,
+    sourceFingerprint:
+      typeof raw.sourceFingerprint === "string" ? raw.sourceFingerprint : null,
+    sourceFingerprintSheets: Array.isArray(raw.sourceFingerprintSheets)
+      ? raw.sourceFingerprintSheets.filter(
+          (name): name is string => typeof name === "string" && name.trim() !== ""
+        )
+      : []
   };
 }
 
@@ -298,12 +422,19 @@ export function normalizeWpsPlanningStatus(
  * 点下去只会重复规划的"继续"按钮 —— 而这恰恰是本模块要防的那种假成功。
  *
  * 同理**不拿**"服务端返回了 200"当现场存在的证据。
+ *
+ * 2026-10-19（A0）：服务端现在会给出 `continuation`——它由共享契约与执行账本
+ * 算出，是"这份现场能不能继续"的**唯一权威**。有它就只信它；没有（旧载荷 /
+ * 终态）才退回上面那套现场证据。`pauseType != null` 只是"暂停过"，一份损坏的、
+ * 别的任务的、或已经写过原表的现场同样"暂停过"。
  */
 export function planningStatusView(status: WpsPlanningTaskStatus): PlanningStatusView {
-  const hasCheckpoint =
-    status.pauseType != null ||
-    (status.status === "completed" &&
-      (status.result != null || status.recovery != null));
+  const continuation = status.continuation ?? null;
+  const hasCheckpoint = continuation
+    ? continuation.available
+    : status.pauseType != null ||
+      (status.status === "completed" &&
+        (status.result != null || status.recovery != null));
   return {
     status: status.status,
     canContinue: status.canContinue,
@@ -311,7 +442,8 @@ export function planningStatusView(status: WpsPlanningTaskStatus): PlanningStatu
     reason: status.reason,
     errorCode: status.error?.code ?? null,
     errorMessage: status.error?.message ?? null,
-    hasCheckpoint
+    hasCheckpoint,
+    continuation
   };
 }
 
@@ -322,7 +454,12 @@ export function wpsPlanningResumeDecision(
   return planningResumeDecision(planningStatusView(status));
 }
 
-/** 继续规划的请求体。**不含原需求** —— 那会让服务端重新规划。 */
+/**
+ * 继续规划的请求体。**不含原需求** —— 那会让服务端重新规划。
+ *
+ * 现场证据是**必填**：省略、为空、读取失败都拿不到继续权。服务端不再接受
+ * "没传就跳过比对"的请求，所以这里也不留可选位，缺证据应该在发请求之前停下。
+ */
 export interface WpsPlanningContinueBody {
   turnId: string;
   expectedRevision: number;
@@ -330,6 +467,14 @@ export interface WpsPlanningContinueBody {
   afterSequence: number;
   modelId?: string;
   confirmModelSwitch?: true;
+  /** 本轮重新读到的当前工作簿身份；读不到就不发请求。 */
+  workbookIdentity: string;
+  /** 当前已提交授权的成员，必须与服务端记录完全一致。 */
+  authorizedSheetNames: string[];
+  /** 来源核实的**三态**，不能合并成一个"有没有"。 */
+  sourceVerification: "verified" | "not_collected" | "failed";
+  /** 仅 `sourceVerification === "verified"` 时提供。 */
+  sourceFingerprint?: string;
 }
 
 /**

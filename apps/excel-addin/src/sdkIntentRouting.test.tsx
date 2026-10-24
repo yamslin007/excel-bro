@@ -384,22 +384,37 @@ describe("Excel 面板：桥执行前重读宿主现场（不是启动快照）"
     expect(executeQueryTableTool).not.toHaveBeenCalled();
   });
 
-  it("宿主身份读不到时 fail-closed：不读表，回 unauthorized_scope", async () => {
-    const captured = stubBridgeFetch();
+  it("运行途中宿主身份读不到时 fail-closed：不读表，回 unauthorized_scope", async () => {
+    const captured = stubBridgeFetch({ onPoll: () => {
+      vi.mocked(currentOfficeWorkbookIdentity).mockImplementation(() => {
+        throw new Error("Office 上下文不可用：D:\\敏感\\x.xlsx");
+      });
+    } });
     vi.mocked(executeQueryTableTool).mockResolvedValue(queryToolResult as never);
-    // 身份读取抛错（例如宿主上下文已失效）。绝不允许当成"没变化"放行。
-    vi.mocked(currentOfficeWorkbookIdentity).mockImplementation(() => {
-      throw new Error("Office 上下文不可用：D:\\敏感\\x.xlsx");
-    });
-
     await startBridgeTurn(captured);
     releaseStream();
 
     const receipt = captured.find((c) => c.url.includes("/receipt"))?.body;
-    // 读不到身份 → workbookIdentity 为 null → 与绑定的身份不同 → 拒读。
     expect((receipt?.receipt as Record<string, unknown>)?.errorCode).toBeTruthy();
     expect(executeQueryTableTool).not.toHaveBeenCalled();
     expect(JSON.stringify(receipt)).not.toContain("敏感");
+  });
+
+  it("建立桥时宿主读不到：不发送规划，不等待工具指针", async () => {
+    const captured = stubBridgeFetch();
+    vi.mocked(understandMessage).mockResolvedValue({
+      kind: "needs_workbook_context", summary: "统计记录", provider: "model"
+    });
+    vi.mocked(checkIntent).mockResolvedValue(toolRequestIntent);
+    vi.mocked(currentOfficeWorkbookIdentity).mockImplementation(() => {
+      throw new Error("Office 上下文不可用：D:\\敏感\\x.xlsx");
+    });
+    const view = await send("有多少条记录");
+    await waitFor(() => expect(view.container.textContent).toContain("没有发送规划请求"));
+    expect(streamAssistantResponse).not.toHaveBeenCalled();
+    expect(captured).toHaveLength(0);
+    expect(executeQueryTableTool).not.toHaveBeenCalled();
+    expect(view.container.textContent).not.toContain("敏感");
   });
 });
 

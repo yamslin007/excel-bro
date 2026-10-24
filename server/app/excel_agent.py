@@ -1060,6 +1060,9 @@ def _enforce_action_capabilities(request: PlanRequest, plan: AnalysisPlan) -> No
         action_type = str(getattr(action, "type", ""))
         variant = action.applyTo if action_type == "clearRange" else None
         if is_action_allowed_by_keys(allowed, action_type, variant):
+            if request.hostId == "wps-et" and action_type == "copyRange":
+                if action.copyType not in capabilities().get("wpsWrite", {}).get("copyTypes", []):
+                    raise ValueError("WPS 当前复制仅支持值或链接，可转置和跳过空白；完整格式、相对公式尚未实现。")
             continue
         key = f"{action_type}:{variant}" if variant else action_type
         raise ValueError(
@@ -1644,7 +1647,7 @@ def open_planning_bridge(
     task_id = request.turnId or ""
     if not task_id:
         return None, None
-    from .task_bridge import BridgeBinding, task_tool_bridge
+    from .task_bridge import BridgeBinding, bridge_step_id, task_tool_bridge
 
     async def on_bridge_request(
         operation_id: str, tool: str, arguments: dict[str, Any], fingerprint: str
@@ -1655,16 +1658,40 @@ def open_planning_bridge(
             return
         await on_event({
             "phase": "planning",
-            "stepId": f"bridge.{tool}",
+            # 每次调用一个身份：同工具连续调用是两个独立步骤（见 bridge_step_id）。
+            "stepId": bridge_step_id(tool, operation_id),
             "status": "started",
             "title": "正在本机执行数据查询",
             "toolName": tool,
             "bridgeTool": {"operationId": operation_id, "tool": tool},
         })
 
+    async def on_bridge_complete(
+        operation_id: str, tool: str, receipt: dict[str, Any]
+    ) -> None:
+        """一次桥调用的真实结束：成功 / 固定错误码 / 超时 / 取消。"""
+        if on_event is None:
+            return
+        status = str(receipt.get("status") or "")
+        code = str(receipt.get("errorCode") or "")
+        terminal = (
+            "cancelled" if code == "cancelled"
+            else "warning" if code in {"timeout", "busy", "budget_exhausted", "source_changed"}
+            else "completed" if status == "ok"
+            else "failed"
+        )
+        await on_event({
+            "phase": "planning",
+            "stepId": bridge_step_id(tool, operation_id),
+            "status": terminal,
+            "title": "本机数据查询已完成" if terminal == "completed" else "本机数据查询未完成",
+            "toolName": tool,
+        })
+
     session = task_tool_bridge.open(
         BridgeBinding.from_request(request, task_id=task_id),
         on_request=on_bridge_request,
+        on_complete=on_bridge_complete,
     )
     return task_id, session
 

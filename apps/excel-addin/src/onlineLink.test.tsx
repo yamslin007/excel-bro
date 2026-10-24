@@ -30,11 +30,12 @@
  * 由 `scripts/run_online_link.mjs` 判定"未完成"。
  */
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { transferableAbortController } from "node:util";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import scenario from "../../../config/online_link_scenario.json";
 import App from "./App";
 import { createOfficeTestHost, installOfficeTestHost, type TestOfficeHost } from "./officeTestHost";
-import { invalidateWorkbookStructureCache } from "./excel";
+import { currentOfficeWorkbookIdentity, invalidateWorkbookStructureCache } from "./excel";
 import { resetTrustedSourceReads } from "./planSourceDependency";
 
 const ONLINE = process.env.EB_ONLINE === "1";
@@ -65,12 +66,18 @@ function foldBlank(matrix: ReadonlyArray<ReadonlyArray<unknown>>) {
 /**
  * 授权目标替身：只提供"文件里有哪些表 / 本次选了哪些"，与真实
  * `inspectOfficeAuthorizedTarget` 同语义（不能只返回被选中的表）。
+ *
+ * 身份两维（fileKey / fileRef）取**当前宿主现场**而不是常量：`officeAnalysisTargetEvidence`
+ * 是真实实现，会核对 `target.fileRef === Office.context.document` 且
+ * `identity === target.fileKey`。把证据键换成固定常量会让"同一组表两个键"的
+ * 回归在这条集成链路里永远抓不到。
  */
 function targetFor(names: readonly string[] | null) {
   const sheets = ALL_SHEETS.map((name) => ({ id: SHEET_IDS[name], name }));
   const chosen = names === null ? [...ALL_SHEETS] : [...names];
   return {
-    fileKey: "office:book-online",
+    fileKey: currentOfficeWorkbookIdentity() ?? null,
+    fileRef: Office.context.document,
     name: scenario.workbookName,
     sheets,
     selected: chosen.map((name) => SHEET_IDS[name]).filter(Boolean)
@@ -88,11 +95,7 @@ vi.mock("./officeAuthorizedTarget", async (importOriginal) => ({
   })),
   confirmOfficeAuthorizedScope: vi.fn(async (_names, confirm, expected) =>
     confirm(expected)
-  ),
-  officeAnalysisTargetEvidence: vi.fn(async () => ({
-    key: "online-target-1",
-    conclusive: true
-  }))
+  )
 }));
 
 let host: TestOfficeHost;
@@ -111,6 +114,8 @@ function createHost(memberRows: ReadonlyArray<ReadonlyArray<string | number>>) {
 }
 
 beforeEach(() => {
+  // Real Node fetch must receive Node signals, not jsdom's separate DOM realm.
+  vi.stubGlobal('AbortController', transferableAbortController().constructor);
   localStorage.clear();
   vi.clearAllMocks();
   invalidateWorkbookStructureCache();
@@ -141,12 +146,23 @@ async function setAuthorizedScope(view: ReturnType<typeof render>) {
   await waitFor(() =>
     expect(view.container.querySelector(".workbook-sheet-list")).not.toBeNull()
   );
-  for (const button of [
-    ...view.container.querySelectorAll<HTMLButtonElement>(".workbook-sheet-list button")
-  ]) {
+  // 按**非目录顺序**点选：授权集合的身份是成员的集合，不是点击先后。
+  // 目录顺序（会员表 → 订单表 → 汇总表）恰好等于 adopt 重写后的顺序，
+  // 那样"顺序差异"这条缺陷在这个用例里永远暴露不出来。
+  const buttons = () =>
+    [...view.container.querySelectorAll<HTMLButtonElement>(".workbook-sheet-list button")];
+  for (const name of [ORDERS, TARGET, MEMBERS]) {
+    const button = buttons().find(
+      (candidate) => (candidate.querySelector("strong")?.textContent ?? "") === name
+    );
+    if (!button) throw new Error(`范围列表里没有工作表：${name}`);
+    if (button.getAttribute("aria-pressed") !== "true") fireEvent.click(button);
+  }
+  for (const button of buttons()) {
     const name = button.querySelector("strong")?.textContent ?? "";
-    const selected = button.getAttribute("aria-pressed") === "true";
-    if (selected !== ALL_SHEETS.includes(name)) fireEvent.click(button);
+    if (button.getAttribute("aria-pressed") === "true" && !ALL_SHEETS.includes(name)) {
+      fireEvent.click(button);
+    }
   }
   const commit = view.container.querySelector<HTMLButtonElement>(".scope-confirm");
   if (!commit) throw new Error("范围「确认」按钮尚未出现");
@@ -164,12 +180,14 @@ async function runTurn(count: number) {
     ).toContain("当前模型")
   );
   await setAuthorizedScope(view);
+  if (count === 1) expect(host.originalWrites()).toHaveLength(0);
+  expect(host.matrix(TARGET, scenario.targetRange).flat().every(v => v === "")).toBe(true);
   fireEvent.change(view.container.querySelector(".composer textarea")!, {
     target: { value: scenario.prompt }
   });
   fireEvent.click(view.getByRole("button", { name: /^发送$/ }));
   await waitFor(
-    () => expect(view.container.querySelector(".inline-plan")).not.toBeNull(),
+    () => expect(findButton(view, "确认变更"), view.container.textContent ?? '').toBeDefined(),
     { timeout: 60_000 }
   );
   return view;
@@ -188,19 +206,11 @@ describe.skipIf(!ONLINE)("Excel 在线连续集成", () => {
     // ---------------- 基线：金卡 400 / 银卡 200 / 未匹配 400 ----------------
     const view = await runTurn(1);
 
-    // 预览期：来源与目标一个单元格都没动（副本写入另计）。
-    expect(host.originalWrites()).toHaveLength(0);
+    // Results are already on the original; confirmation must not execute again.
     expect(host.matrix(MEMBERS, scenario.memberRange)).toEqual(scenario.memberRows);
     expect(host.matrix(ORDERS, scenario.orderRange)).toEqual(scenario.orderRows);
-    expect(host.matrix(TARGET, scenario.targetRange).flat().every((v) => v === "")).toBe(
-      true
-    );
     // 计划里的值来自服务端隔离执行（不是测试常量）：预览文案带目标区域。
     expect(view.container.textContent).toContain(scenario.targetSheet);
-
-    const runButton = findButton(view, "执行到 Excel");
-    expect(runButton, "多表授权下应渲染直接执行入口").toBeDefined();
-    fireEvent.click(runButton!);
 
     await waitFor(
       () =>
@@ -217,6 +227,16 @@ describe.skipIf(!ONLINE)("Excel 在线连续集成", () => {
     await waitFor(() => expect(view.container.textContent).toContain("并通过独立验证"), {
       timeout: 30_000
     });
+    const writesBeforeAccept = host.originalWrites().length;
+    const accept = findButton(view, "确认变更")!;
+    await waitFor(() => expect(accept.disabled).toBe(false));
+    fireEvent.click(accept);
+    await waitFor(() => expect(findButton(view, "确认变更")).toBeUndefined());
+    expect(host.originalWrites()).toHaveLength(writesBeforeAccept);
+    // 确认只清标记并开放保存工具，不是第二次执行。
+    expect(
+      view.container.querySelector("button[title='保存为可重复使用的个人工具']")
+    ).not.toBeNull();
 
     const undoButton = findButton(view, "↶ 撤销本次执行");
     expect(undoButton, "执行后状态已完整核对，撤销按钮必须可用").toBeDefined();
@@ -241,9 +261,6 @@ describe.skipIf(!ONLINE)("Excel 在线连续集成", () => {
     resetTrustedSourceReads();
 
     const second = await runTurn(2);
-    const secondRun = findButton(second, "执行到 Excel");
-    expect(secondRun).toBeDefined();
-    fireEvent.click(secondRun!);
 
     await waitFor(
       () =>
@@ -261,5 +278,15 @@ describe.skipIf(!ONLINE)("Excel 在线连续集成", () => {
     await waitFor(() => expect(second.container.textContent).toContain("并通过独立验证"), {
       timeout: 30_000
     });
+    const secondWrites = host.originalWrites().length;
+    const secondAccept = findButton(second, "确认变更")!;
+    await waitFor(() => expect(secondAccept.disabled).toBe(false));
+    fireEvent.click(secondAccept);
+    await waitFor(() => expect(findButton(second, "确认变更")).toBeUndefined());
+    expect(host.originalWrites()).toHaveLength(secondWrites);
+    const secondUndo = findButton(second, "↶ 撤销本次执行")!;
+    await waitFor(() => expect(secondUndo.disabled).toBe(false));
+    fireEvent.click(secondUndo);
+    await waitFor(() => expect(host.matrix(TARGET, scenario.targetRange).flat().every(v => v === "")).toBe(true));
   }, 180_000);
 });

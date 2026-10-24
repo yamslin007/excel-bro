@@ -84,7 +84,9 @@ def _clean(monkeypatch):
 
 def _fake_runner_summing():
     def runner(data_registry, scope_token, scope, origin, receipts, code,
-               cancel_check=None):
+               cancel_check=None, on_runner_start=None):
+        if on_runner_start:
+            on_runner_start()
         # 模拟 run_registered_analysis_internal：解析数据 → 求和 → 返回矩阵结果。
         values = data_registry.resolve(scope_token, scope, origin, receipts)
         total = sum(
@@ -210,7 +212,10 @@ def test_cancelled_run_fails_closed_without_late_result(monkeypatch):
         SimpleNamespace(turnId="task-py"),
         {"code": "result = 1", "datasetHandles": [receipt.datasetHandle]},
     )
-    assert result["status"] == "unavailable"
+    assert result["status"] == "cancelled"
+    assert result["reasonCategory"] == "authorization_changed"
+    assert "resultHandle" not in result
+    assert python_analysis.project_python_analysis_receipt(result)["status"] == "cancelled"
     assert local_results.count_task("task-py") == 0
 
 

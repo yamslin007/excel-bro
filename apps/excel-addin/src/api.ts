@@ -1,4 +1,9 @@
+import { assertWorksheetCheckpointResult, assertWorksheetRestoreResult } from "./contracts";
+import { waitForPlanning } from "@excel-bro/core/planningReplay";
+import type { PlanningPauseAck } from "./contracts";
+import type { ModelCatalog } from "./contracts";
 import capabilities from "../../../config/capabilities.json";
+import { modelUsageNotice } from "@excel-bro/core/modelUsageNotice";
 import {
   assertTestModelConnectionResponse,
   assertIntentCheckResponse,
@@ -51,6 +56,7 @@ import {
   type PlanRequest,
   type PlanValidateRequest,
   type TestModelConnectionResponse,
+  type TestModelConnectionRequest,
   type UpdateModelSettingsRequest,
   type UpsertModelConnectionRequest,
   type SetFormulaModelRequest,
@@ -88,6 +94,11 @@ export interface PlanChatResponse {
  */
 export const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8765";
+
+/** 代码正文取回的结果：要么真的拿到了正文，要么明确说没拿到以及为什么。 */
+export type PythonCodeBodyResult =
+  | { status: "ready"; code: string; chars: number }
+  | { status: "unavailable"; reason: "missing" | "offline" };
 
 export class ExcelReviewLayoutVersionError extends Error {
   constructor() {
@@ -177,18 +188,7 @@ export interface ServiceHealth {
  * `id: "local"` 的“基础模式”占位项，该入口已移除；此处仍保留
  * `"local"` 只用于识别并迁移旧的本地选择记录。
  */
-export interface ModelOption {
-  id: string;
-  label: string;
-  provider: "model";
-  available: boolean;
-  supportsVision: boolean;
-}
-
-export interface ModelCatalog {
-  defaultModelId: string | null;
-  models: ModelOption[];
-}
+export type { ModelOption, ModelCatalog } from "./contracts";
 
 /**
  * 模型目录的加载状态。
@@ -206,7 +206,10 @@ export class ApiRequestError extends Error {
     message: string,
     public readonly retryable: boolean
   ) {
-    super(message);
+    const usageNotice = modelUsageNotice(code);
+    super(usageNotice ?? message);
+    // No automatic retry for a hard limit, even when an older server labels it retryable.
+    if (usageNotice) this.retryable = false;
     this.name = "ApiRequestError";
   }
 }
@@ -246,7 +249,7 @@ export class StreamingToolDeliveryUnavailableError extends Error {
   constructor() {
     super(
       "当前链路无法把模型发起的表格查询请求投递到本机：该后端未提供流式接口，或代理/网关没有透传流式响应。" +
-        "请更新并重启本地 Python 服务、确认代理不缓冲 SSE，或改用非 SDK 模型。"
+        "请更新并重启本地 Python 服务，并确认代理不缓冲 SSE。"
     );
     this.name = "StreamingToolDeliveryUnavailableError";
   }
@@ -402,8 +405,11 @@ async function consumePlanningStream(
     }
   };
 
+  const cancelReader = () => { void reader.cancel().catch(() => undefined); };
+  hooks.signal?.addEventListener("abort", cancelReader, { once: true });
+  try {
   for (;;) {
-    const { done, value } = await reader.read();
+    const { done, value } = await waitForPlanning(reader.read(), hooks.signal);
     if (value) buffer += decoder.decode(value, { stream: true });
     let separator = buffer.indexOf("\n\n");
     while (separator !== -1) {
@@ -415,6 +421,10 @@ async function consumePlanningStream(
     if (done) break;
   }
 
+  } finally {
+    hooks.signal?.removeEventListener("abort", cancelReader);
+    if (hooks.signal?.aborted) cancelReader();
+  }
   const tail = buffer.trim();
   if (tail) handleFrame(tail);
   if (!result) {
@@ -468,6 +478,12 @@ export async function streamAssistantResponse(
   );
 }
 
+export async function pausePlanningTask(turnId: string): Promise<PlanningPauseAck> {
+  const response = await fetch(`${API_BASE_URL}/api/turn/${encodeURIComponent(turnId)}/pause`, { method: "POST" });
+  if (!response.ok) throw await requestError(response, "未能向原任务发送暂停请求");
+  return await response.json() as PlanningPauseAck;
+}
+
 export async function getPlanningTaskStatus(
   turnId: string,
   signal?: AbortSignal
@@ -482,6 +498,90 @@ export async function getPlanningTaskStatus(
   return (await response.json()) as PlanningTaskStatusResult;
 }
 
+/**
+ * 补发**已经落盘**的规划进度事件（只读，不重新规划）。
+ *
+ * 服务端仍在跑时「继续」会被 409 挡住 —— 那是对的，再发一次就是重复规划。
+ * 想接回**正在运行**的原任务，只能读它已保存的事件。
+ */
+export async function getPlanningTaskEvents(
+  turnId: string,
+  afterSequence = 0,
+  signal?: AbortSignal
+): Promise<{
+  turnId: string;
+  status: string;
+  active: boolean;
+  lastSequence: number;
+  events: unknown[];
+}> {
+  const query = afterSequence > 0 ? `?afterSequence=${afterSequence}` : "";
+  const response = await fetch(
+    `${API_BASE_URL}/api/turn/${encodeURIComponent(turnId)}/events${query}`,
+    { signal }
+  );
+  if (!response.ok) {
+    throw await requestError(response, "读取原任务进度事件失败");
+  }
+  const value = (await response.json()) as Record<string, unknown>;
+  if (!Array.isArray(value.events)) {
+    throw new ApiRequestError(502, "PLANNING_BAD_EVENT_PAGE", "原任务进度事件格式不正确", false);
+  }
+  return {
+    turnId,
+    status: typeof value.status === "string" ? value.status : "",
+    active: value.active === true,
+    lastSequence: Number(value.lastSequence ?? 0) || 0,
+    events: value.events
+  };
+}
+
+/**
+ * 按 `codeId` 取回这次任务生成过的 Python 代码正文。
+ *
+ * 代码正文**不进持久账本**（会随 `planning_task_events` 落进 SQLite），只在服务端
+ * 进程内短期登记。因此界面拿到的事件只有"状态 + 规模"，正文要用这个端点按需取回。
+ *
+ * 取不回来（登记表过期 / 被淘汰 / 任务对不上 / 本机服务没开）时**不抛错**：
+ * 对界面来说这三种情况是同一件事——"手上没有这段代码"，必须照实说，
+ * 不能拿状态标签假装代码还在。
+ */
+export async function fetchPythonCodeBody(
+  request: { taskId: string; codeId: string },
+  signal?: AbortSignal
+): Promise<PythonCodeBodyResult> {
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE_URL}/api/sdk/python-code`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(request),
+      signal
+    });
+  } catch {
+    return { status: "unavailable", reason: "offline" };
+  }
+  if (response.status === 404) return { status: "unavailable", reason: "missing" };
+  if (!response.ok) return { status: "unavailable", reason: "offline" };
+  let value: unknown;
+  try {
+    value = await response.json();
+  } catch {
+    return { status: "unavailable", reason: "offline" };
+  }
+  const payload = (value ?? {}) as Record<string, unknown>;
+  // 只认"确实给出了正文"的响应：`code` 缺失时回 `unavailable`，
+  // 绝不用空串顶替（空串会被上层当成"拿到了代码"）。
+  if (typeof payload.code !== "string" || payload.code.length === 0) {
+    return { status: "unavailable", reason: "missing" };
+  }
+  return {
+    status: "ready",
+    code: payload.code,
+    chars: typeof payload.chars === "number" ? payload.chars : payload.code.length
+  };
+}
+
 export async function continuePlanningTask(
   request: {
     turnId: string;
@@ -490,6 +590,16 @@ export async function continuePlanningTask(
     afterSequence: number;
     modelId?: string;
     confirmModelSwitch?: true;
+    /**
+     * 本轮**重新读到的**现场证据。三项必填：服务端不再接受"没传就跳过比对"的
+     * 请求，所以缺证据应该在发请求之前停下，而不是发一个省略字段的请求碰运气。
+     */
+    workbookIdentity: string;
+    authorizedSheetNames: string[];
+    /** 来源核实的**三态**；"读取失败"与"尚未采集"必须分开表达。 */
+    sourceVerification: "verified" | "not_collected" | "failed";
+    /** 仅 `sourceVerification === "verified"` 时提供。 */
+    sourceFingerprint?: string;
   },
   hooks: StreamHooks = {}
 ): Promise<PlanningStreamResult> {
@@ -524,13 +634,19 @@ export async function understandMessage(
       prompt: request.prompt,
       imageCount: request.imageCount ?? 0,
       conversation: request.conversation?.map(({ role, text }) => ({ role, text })) ?? [],
-      modelId: request.modelId ?? null
+      modelId: request.modelId ?? null,
+      ...(request.recoveryTasks?.length ? { recoveryTasks: request.recoveryTasks
+        .filter((id) => typeof id === "string" && id.length > 0 && id.length <= 200).slice(-6) } : {})
     }),
     signal
   });
   if (!response.ok) throw await requestError(response, "消息理解服务请求失败；请确认后端已更新并重启。");
   const value: unknown = await response.json();
   assertMessageUnderstandingResponse(value);
+  if (value.kind === "task_recovery" &&
+      (request.imageCount || !request.recoveryTasks?.includes(value.turnId))) {
+    throw new Error("消息理解返回了未提供的恢复任务；未查询、未继续。");
+  }
   return value;
 }
 
@@ -539,18 +655,18 @@ export async function checkIntent(
   signal?: AbortSignal
 ): Promise<IntentCheckResponse> {
   recordModelCall();
-  const response = await fetch(`${API_BASE_URL}/api/turn`, {
+  const response = await waitForPlanning(fetch(`${API_BASE_URL}/api/turn`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(request),
     signal
-  });
+  }), signal);
 
   if (!response.ok) {
     throw await requestError(response, "需求确认服务请求失败");
   }
 
-  const value: unknown = await response.json();
+  const value: unknown = await waitForPlanning(response.json(), signal);
   assertIntentCheckResponse(value);
   return value;
 }
@@ -627,7 +743,7 @@ export async function saveModelConnection(
 }
 
 export async function testModelConnection(
-  request: UpsertModelConnectionRequest
+  request: TestModelConnectionRequest
 ): Promise<TestModelConnectionResponse> {
   const response = await fetch(
     `${API_BASE_URL}/api/settings/model/connections/test`,
@@ -676,7 +792,8 @@ export async function deleteModelConnection(
 export async function validatePlan(
   plan: AnalysisPlan,
   authorizedSheets: string[],
-  existingSheets: string[] = authorizedSheets
+  existingSheets: string[] = authorizedSheets,
+  signal?: AbortSignal
 ): Promise<AnalysisPlan> {
   const request: PlanValidateRequest = {
     plan,
@@ -686,7 +803,7 @@ export async function validatePlan(
   const response = await fetch(`${API_BASE_URL}/api/plans/validate`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(request)
+    body: JSON.stringify(request), signal
   });
   if (!response.ok) {
     throw await requestError(response, "计划校验失败");
@@ -710,6 +827,12 @@ export async function registerOfficeExecution(input: {
   authorizedSheetNames: string[];
   allowedExternalFiles: string[];
   workbookIdentity: string;
+  /**
+   * 产生这份计划的规划任务。带上它，服务端才能在这个任务"其实已经写过原表"
+   * 时拒绝「继续分析」；不知道来源（历史计划重放、`/function` 预览）时留空，
+   * 空只是不声称关联，不会让写入被放行。
+   */
+  taskId?: string;
 }): Promise<OfficeExecutionState> {
   const response = await fetch(`${API_BASE_URL}/api/office/executions/register`, {
     method: "POST",
@@ -1563,4 +1686,73 @@ export async function fetchSdkBridgeResult(
     signal
   });
   return responseJson<SdkBridgeResultResponse>(response);
+}
+
+
+export async function executeWorksheetDeletion(input: import("./contracts").WorksheetDeleteCheckpointRequest) {
+  const result = await responseJson<unknown>(await fetch(`${API_BASE_URL}/api/worksheet-checkpoints/execute`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input)
+  }));
+  assertWorksheetCheckpointResult(result, input.operationId);
+  return result;
+}
+export async function worksheetCheckpointStatus(operationId: string) {
+  const result = await responseJson<unknown>(await fetch(`${API_BASE_URL}/api/worksheet-checkpoints/status`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ operationId })
+  }));
+  assertWorksheetCheckpointResult(result, operationId);
+  return result;
+}
+export async function openWorksheetCheckpoint(operationId: string) {
+  const result = await responseJson<import("./contracts").WorksheetCheckpointOpenResult>(await fetch(`${API_BASE_URL}/api/worksheet-checkpoints/open`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ operationId })
+  }));
+  if (result.opened !== true || typeof result.recoveryPath !== "string" || !result.recoveryPath) throw new Error("恢复副本打开结果尚未确认；当前原表保留。");
+  return result;
+}
+
+/**
+ * **原地**撤销本次删除（把表放回当前打开的原工作簿）。
+ *
+ * 与 `openWorksheetCheckpoint` 是两条路：这里不打开任何新文件、不改文件身份。
+ * 回执必须自带覆盖关系（见 `assertWorksheetRestoreResult`），否则不当作已完成。
+ */
+export async function restoreWorksheetCheckpoint(operationId: string, deletedSheets: readonly string[]) {
+  const result = await responseJson<unknown>(await fetch(`${API_BASE_URL}/api/worksheet-checkpoints/restore`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ operationId })
+  }));
+  assertWorksheetRestoreResult(result, operationId, deletedSheets);
+  return result;
+}
+
+/**
+ * 按**工作簿身份**列出恢复点（只读）。
+ *
+ * 旧记录只有请求元数据、没有会话归属：这里按服务端保存的工作簿路径把它们找回来，
+ * 但不会替它们编一个会话。列表返回的是摘要，不含单元格内容。
+ */
+export async function listWorksheetCheckpoints(input: import("./contracts").WorksheetCheckpointListRequest) {
+  const result = await responseJson<import("./contracts").WorksheetCheckpointListResult>(
+    await fetch(`${API_BASE_URL}/api/worksheet-checkpoints/list`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input)
+    })
+  );
+  const checkpoints = Array.isArray(result?.checkpoints) ? result.checkpoints : null;
+  if (!checkpoints) throw new Error("恢复点列表不完整，请稍后重试。");
+  return checkpoints.map(item => {
+    if (typeof item.operationId !== "string" || !/^[a-f0-9]{32}$/.test(item.operationId) ||
+        typeof item.message !== "string" || typeof item.recoveryAvailable !== "boolean" ||
+        !Array.isArray(item.deletedSheets) || !Array.isArray(item.remainingSheets)) {
+      throw new Error("恢复点列表不完整，请稍后重试。");
+    }
+    return item;
+  });
+}
+
+export async function confirmWorksheetCheckpointBackup(input: import("./contracts").WorksheetCheckpointBackupConsent) {
+  const result = await responseJson<unknown>(await fetch(`${API_BASE_URL}/api/worksheet-checkpoints/confirm-backup`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(input)
+  }));
+  assertWorksheetCheckpointResult(result, input.operationId);
+  return result;
 }

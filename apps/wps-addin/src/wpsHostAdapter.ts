@@ -70,7 +70,7 @@ export function resolveWpsCapability(
   actionType: string,
   hostVersion: string | null
 ): ActionCapability {
-  const allowed = (capabilities.wpsWrite.allowedActions as readonly string[]).some(
+  const allowed = [...capabilities.wpsWrite.allowedActions, ...capabilities.worksheetCheckpoint.allowedActions].some(
     (entry) => entry === actionType || entry.startsWith(`${actionType}:`)
   );
   if (!capabilities.wpsWrite.enabled) {
@@ -79,7 +79,7 @@ export function resolveWpsCapability(
   if (!allowed) {
     return {
       state: "unverified",
-      reason: `动作「${actionType}」尚未在 WPS 完成实机验收，规划阶段已排除。`
+      reason: `EB 的 WPS 执行器尚未开放「${actionType}」的执行、回读与恢复闭环，规划阶段已排除；不代表 WPS 软件没有此能力。`
     };
   }
   if (wpsWriteVersionStatus(hostVersion) === "blocked") {
@@ -106,7 +106,7 @@ export function resolveWpsCapability(
 export function wpsReportedActionTypes(hostVersion: string | null): string[] {
   if (!capabilities.wpsWrite.enabled) return [];
   if (wpsWriteVersionStatus(hostVersion) === "blocked") return [];
-  return [...(capabilities.wpsWrite.allowedActions as readonly string[])];
+  return [...capabilities.wpsWrite.allowedActions, ...capabilities.worksheetCheckpoint.allowedActions];
 }
 
 export function createWpsHostAdapter(

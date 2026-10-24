@@ -1,11 +1,30 @@
 // CellValue 的权威定义在 packages/core/src/contracts.ts（L0）。
+export interface PlanningPauseAck {
+  turnId: string;
+  /** 接受停止请求；是否已停下仍须查询任务状态。 */
+  pauseRequested: boolean;
+}
 // 本文件内部大量引用该类型，故 import 后再导出，避免两端各持一份定义后语义漂移。
 import type { CellValue } from "@excel-bro/core/contracts";
 // 空白策略的权威定义在 packages/core/src/blankPolicy.ts（L2）。协议层只是转发，
 // 不另起一份 —— 四种意图一旦在两处各写一遍，就会悄悄漂移。
 import type { BlankPolicy } from "@excel-bro/core";
+import type {
+  PythonCodeEvent,
+  PythonCodeLimits,
+  PythonCodeStage
+} from "@excel-bro/core/pythonCodeArtifact";
+// 大小/折叠上限的唯一出处：`config/capabilities.json`（代码只做兜底）。
+import capabilities from "../../../config/capabilities.json";
 
 export type { CellValue, BlankPolicy };
+export type {
+  PythonCodeArtifact,
+  PythonCodeEvent,
+  PythonCodeStage
+} from "@excel-bro/core/pythonCodeArtifact";
+export type { ReplySegment } from "@excel-bro/core/replySegments";
+export type { ModelUsageErrorCode } from "@excel-bro/core/modelUsageNotice";
 export type { PythonResultReceipt, PythonResultReadRequest, PythonMatrixResult } from "@excel-bro/core/contracts";
 export type { PythonDataSource, PythonDataScope, PythonDataScopeRequest,
   PythonDataSnapshotRequest, PythonDataRevokeRequest, PythonDatasetReceipt } from "@excel-bro/core/contracts";
@@ -699,19 +718,23 @@ export interface MessageUnderstandingRequest {
   imageCount?: number;
   conversation?: Array<{ role: "user" | "assistant"; text: string }>;
   modelId?: string | null;
+  /** Opaque task IDs or preplanning-* local request refs; no workbook data or authorization. */
+  recoveryTasks?: string[];
 }
 
 export type MessageUnderstandingResponse =
   | { kind: "conversation"; message: string; provider: "model" }
-  | { kind: "needs_workbook_context"; summary: string; provider: "model" };
+  | { kind: "needs_workbook_context"; summary: string; provider: "model" }
+  | { kind: "task_recovery"; turnId: string; action?: "inspect" | "continue"; provider: "model" };
 
 export function assertMessageUnderstandingResponse(value: unknown): asserts value is MessageUnderstandingResponse {
   if (!value || typeof value !== "object") throw new Error("消息理解响应格式无效");
   const item = value as Record<string, unknown>;
-  const key = item.kind === "conversation" ? "message" : item.kind === "needs_workbook_context" ? "summary" : null;
+  const key = item.kind === "conversation" ? "message" : item.kind === "needs_workbook_context" ? "summary" : item.kind === "task_recovery" ? "turnId" : null;
   if (!key || item.provider !== "model" || typeof item[key] !== "string" || !(item[key] as string).trim()
-      || (item[key] as string).length > (key === "message" ? 1500 : 500)
-      || Object.keys(item).some((field) => !["kind", key, "provider"].includes(field))) {
+      || (item[key] as string).length > (key === "message" ? 1500 : key === "turnId" ? 200 : 500)
+      || (item.kind === "task_recovery" && item.action !== undefined && !["inspect", "continue"].includes(String(item.action)))
+      || Object.keys(item).some((field) => !["kind", key, "provider", ...(item.kind === "task_recovery" ? ["action"] : [])].includes(field))) {
     throw new Error("消息理解响应格式无效；未读取工作表结构");
   }
 }
@@ -824,6 +847,22 @@ export interface IntentMemory {
   toolRequest?: DataToolRequest | null;
 }
 
+export interface ModelOption {
+  agentAvailable?: boolean;
+  agentUnavailableReason?: string | null;
+  formulaAvailable?: boolean;
+  id: string;
+  label: string;
+  provider: "model";
+  available: boolean;
+  supportsVision: boolean;
+}
+
+export interface ModelCatalog {
+  defaultModelId: string | null;
+  models: ModelOption[];
+}
+
 export interface ModelSettings {
   baseUrl: string | null;
   defaultModel: string | null;
@@ -834,7 +873,14 @@ export interface ModelSettings {
   connections: ManagedModelConnection[];
 }
 
+export type ModelConnectionProtocol = "openai_compatible" | "anthropic";
+export type ModelConnectionPurpose = "agent" | "formula";
+
 export interface ManagedModelConnection {
+  protocol?: ModelConnectionProtocol;
+  agentAvailable?: boolean;
+  agentUnavailableReason?: string | null;
+  formulaAvailable?: boolean;
   id: string;
   catalogModelId: string;
   label: string;
@@ -850,6 +896,7 @@ export interface UpdateModelSettingsRequest {
 }
 
 export interface UpsertModelConnectionRequest {
+  protocol?: ModelConnectionProtocol;
   id?: string | null;
   label: string;
   baseUrl: string;
@@ -863,7 +910,12 @@ export interface SetFormulaModelRequest {
   modelId: string;
 }
 
+export interface TestModelConnectionRequest extends UpsertModelConnectionRequest {
+  purpose?: ModelConnectionPurpose;
+}
+
 export interface TestModelConnectionResponse {
+  testedFor?: ModelConnectionPurpose;
   ok: boolean;
   message: string;
 }
@@ -875,7 +927,8 @@ export function assertTestModelConnectionResponse(
     throw new Error("服务返回的连接测试结果不是有效对象");
   }
   const result = value as Partial<TestModelConnectionResponse>;
-  if (result.ok !== true || typeof result.message !== "string") {
+  if (result.ok !== true || typeof result.message !== "string" ||
+      (result.testedFor !== undefined && result.testedFor !== "agent" && result.testedFor !== "formula")) {
     throw new Error("服务返回的连接测试结果缺少必要字段");
   }
 }
@@ -905,6 +958,10 @@ export function assertModelSettings(
         typeof connection.label !== "string" ||
         typeof connection.baseUrl !== "string" ||
         typeof connection.modelId !== "string" ||
+        (connection.protocol !== undefined && connection.protocol !== "openai_compatible" && connection.protocol !== "anthropic") ||
+        (connection.agentAvailable !== undefined && typeof connection.agentAvailable !== "boolean") ||
+        (connection.formulaAvailable !== undefined && typeof connection.formulaAvailable !== "boolean") ||
+        (connection.agentUnavailableReason != null && typeof connection.agentUnavailableReason !== "string") ||
         typeof connection.supportsVision !== "boolean" ||
         typeof connection.apiKeyConfigured !== "boolean" ||
         (connection.apiKeyHint !== null &&
@@ -1928,24 +1985,30 @@ export interface WpsRecoveryDescriptor {
  * 表现成真实 WPS 上"确认写回"时提示「恢复描述的动作定位或形状无效」。
  */
 export const WPS_RECOVERABLE_ACTION_TYPES = [
-  "writeValues",
+  "writeValues", "sortRange",
   "writeFormulas",
   "clearRange",
   "setFont",
   "setAlignment",
-  "resizeRange"
+  "setFill",
+  "setNumberFormat",
+  "resizeRange",
+  "setBorders"
 ] as const;
 
 /**
  * 每个格式动作**可以声明**的属性名（= 执行器 `declaredFormatFields` 的输出集合，
  * 也与 `wpsFormatSnapshot.ALL_WPS_FORMAT_FIELDS` 的字段名同源）。
  *
- * 未通过实机验证的属性（`underline` / `vertical` / `columnWidth`）**不在任何一行里**：
+ * 尚未实现可恢复执行的属性（`underline` / `columnWidth`）**不在任何一行里**：
  * 它们在投影阶段就产不出来，这里是第二道闸 —— 服务端还有第三道。
  */
 export const WPS_FORMAT_ACTION_FIELDS: Record<string, readonly string[]> = {
   setFont: ["bold", "italic", "name", "size", "color"],
-  setAlignment: ["horizontalAlignment", "wrapText"],
+  setAlignment: ["horizontalAlignment", "verticalAlignment", "wrapText"],
+  setFill: ["fillColor", "fillPattern"],
+  setNumberFormat: ["numberFormat"],
+  setBorders: ["borderTop", "borderBottom", "borderLeft", "borderRight"],
   resizeRange: ["rowHeight"]
 };
 
@@ -2292,6 +2355,25 @@ export interface PlanningPauseResult {
   }>;
   sourceFingerprint?: string | null;
   sourceFingerprintSheets?: string[];
+  /**
+   * 「继续分析」的事实：能不能继续、为什么不能、停在哪个阶段。
+   *
+   * 由服务端用共享契约 `planningContext` + 执行账本算出，**客户端不得自行推断**
+   * ——`canContinue` 是它的合成结果，不是它的替代品：预算或状态不允许时
+   * `available` 仍可能是 true。
+   */
+  continuation: {
+    available: boolean;
+    /** 固定拒绝码（`PLANNING_CONTEXT_*`）；available 时为 null。 */
+    code: string | null;
+    message: string;
+    stage: "before_model" | "after_tool" | null;
+    /**
+     * 原任务依赖来源数据 ⇒ 继续前必须重读并比对来源指纹。
+     * 服务端判定，客户端只据此决定要不要真读一次。
+     */
+    sourceVerificationRequired?: boolean;
+  };
 }
 
 export type PlanningStreamResult = AssistantResponse | PlanningPauseResult;
@@ -2422,6 +2504,15 @@ export interface TaskProgressEvent {
   bridgeTool?: SdkBridgeToolPointer | null;
   /** Python 分析结果卡：包含引用与结构，值由前端另行查询。 */
   pythonResult?: LocalResultCard | null;
+  /**
+   * Python 代码工件状态。
+   *
+   * 代码**不塞进** `detail` 之类的进度文案字段：那些字段是给人看的一句话，
+   * 会被截断、会被拼接，也会在没有代码时照常出现。代码走这个专门字段，
+   * 携带工件身份（`codeId` / `attemptId` / `version`）与阶段，前端据此判定
+   * "已运行的就是这一版"，而不是猜。
+   */
+  pythonCode?: PythonCodeEvent | null;
   timestamp: string;
 }
 
@@ -3328,12 +3419,128 @@ function parseProgressTarget(value: unknown): TaskProgressTarget | null {
   return file || sheet || range ? { file, sheet, range } : null;
 }
 
+/**
+ * 单帧代码正文的接收上限。
+ *
+ * 上限本身放在 `config/capabilities.json` 的 `pythonCode.maxCharsPerEvent`（配置
+ * 优先，代码只是兜底）：这是**协议边界**的上限（一帧能带多少），不是界面显示
+ * 上限。超出即截断并置 `truncated`，界面据此不再提供"复制全部"。
+ */
+export const PYTHON_CODE_MAX_CHARS =
+  Number(capabilities.pythonCode?.maxCharsPerEvent) > 0
+    ? Number(capabilities.pythonCode.maxCharsPerEvent)
+    : 20000;
+
+function positiveInt(value: unknown, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
+/** 展示上限同样来自配置：预览几行、超过多少行折叠。 */
+export const PYTHON_CODE_LIMITS: PythonCodeLimits = {
+  maxChars: PYTHON_CODE_MAX_CHARS,
+  previewLines: positiveInt(capabilities.pythonCode?.previewLines, 6),
+  collapseAfterLines: positiveInt(capabilities.pythonCode?.collapseAfterLines, 24)
+};
+
+// not_started 表示未收到工作程序执行确认；不把 Docker CLI 启动当作已执行。
+const PYTHON_CODE_STAGES = new Set([  "generating",
+  "generated",
+  "validating",
+  "running",
+  "analysis_completed",
+  "summarizing",
+  "paused",
+  "not_started",
+  "generation_failed",
+  "validation_failed",
+  "execution_failed"
+]);
+
+/**
+ * 严格解析 Python 代码工件状态。
+ *
+ * 形状不符一律当"没有"：半成品工件会让界面把一段不完整、来源不明的代码
+ * 当成"已生成"，从而出现"看起来能跑"的误导。代码正文按上限截断，并在
+ * `truncated` 上留痕 —— 前端据此关掉"复制全部"。
+ */
+export function parsePythonCodeEvent(value: unknown): PythonCodeEvent | null {
+  if (!value || typeof value !== "object") return null;
+  const candidate = value as Record<string, unknown>;
+  const codeId = typeof candidate.codeId === "string" ? candidate.codeId.trim() : "";
+  const attemptId =
+    typeof candidate.attemptId === "string" ? candidate.attemptId.trim() : "";
+  if (!codeId || codeId.length > 120 || !attemptId || attemptId.length > 120) {
+    return null;
+  }
+  if (
+    typeof candidate.stage !== "string" ||
+    !PYTHON_CODE_STAGES.has(candidate.stage)
+  ) {
+    return null;
+  }
+  const code = typeof candidate.code === "string" ? candidate.code : undefined;
+  const delta = typeof candidate.delta === "string" ? candidate.delta : undefined;
+  // 内容阶段（生成中 / 已生成）必须带正文；验证、执行、完成这些帧只推进状态。
+  if (
+    (candidate.stage === "generating" || candidate.stage === "generated") &&
+    code === undefined &&
+    delta === undefined
+  ) {
+    return null;
+  }
+  const limit = PYTHON_CODE_MAX_CHARS;
+  const bounded = (text: string | undefined) =>
+    text === undefined
+      ? undefined
+      : text.length > limit
+        ? text.slice(0, limit)
+        : text;
+  const clippedCode = bounded(code);
+  const clippedDelta = bounded(delta);
+  const droppedByLimit =
+    (code !== undefined && clippedCode !== code) ||
+    (delta !== undefined && clippedDelta !== delta);
+  return {
+    codeId,
+    attemptId,
+    stage: candidate.stage as PythonCodeStage,
+    ...(typeof candidate.version === "number" && Number.isFinite(candidate.version)
+      ? { version: Math.max(1, Math.floor(candidate.version)) }
+      : {}),
+    ...(clippedCode !== undefined ? { code: clippedCode } : {}),
+    ...(clippedDelta !== undefined ? { delta: clippedDelta } : {}),
+    truncated: Boolean(candidate.truncated) || droppedByLimit,
+    ...(typeof candidate.complete === "boolean" ? { complete: candidate.complete } : {}),
+    // 正文字符数：正文没随事件下发时，界面靠它说清规模（"812 字符"）。
+    ...(typeof candidate.chars === "number" &&
+    Number.isFinite(candidate.chars) &&
+    candidate.chars >= 0
+      ? { chars: Math.floor(candidate.chars) }
+      : {}),
+    // 服务端显式声明的"正文不随事件保留"。缺省不等于 false。
+    ...(typeof candidate.codeRetained === "boolean"
+      ? { codeRetained: candidate.codeRetained }
+      : {}),
+    // 未开始执行的具体原因：只允许一句固定文案（服务端生成，长度受限）。
+    ...(typeof candidate.reason === "string" && candidate.reason.trim()
+      ? { reason: candidate.reason.trim().slice(0, 300) }
+      : {}),
+    ...(typeof candidate.executedVersion === "number" &&
+    Number.isFinite(candidate.executedVersion)
+      ? { executedVersion: Math.max(1, Math.floor(candidate.executedVersion)) }
+      : {}),
+    ...(typeof candidate.sequence === "number" && Number.isFinite(candidate.sequence)
+      ? { sequence: Math.max(0, Math.floor(candidate.sequence)) }
+      : {})
+  };
+}
+
 export function parseTaskProgressEvent(
   value: unknown,
   legacyOperationId = "legacy-turn",
   legacySequence = 0
-): TaskProgressEvent | null {
-  if (!value || typeof value !== "object") return null;
+): TaskProgressEvent | null {  if (!value || typeof value !== "object") return null;
   const candidate = value as Partial<TaskProgressEvent>;
   if (candidate.schemaVersion !== 1) {
     const legacy = parseTurnStepEvent(value);
@@ -3429,6 +3636,9 @@ export function parseTaskProgressEvent(
       (candidate as TaskProgressEvent & { bridgeTool?: unknown }).bridgeTool
     ),
     pythonResult: parseLocalResultCard(candidate.pythonResult),
+    pythonCode: parsePythonCodeEvent(
+      (candidate as TaskProgressEvent & { pythonCode?: unknown }).pythonCode
+    ),
     timestamp: candidate.timestamp
   };
 }
@@ -3465,4 +3675,115 @@ export function parseBridgeToolPointer(value: unknown): SdkBridgeToolPointer | n
     return null;
   }
   return { operationId: pointer.operationId, tool: pointer.tool };
+}
+
+
+export interface WorksheetDeleteCheckpointRequest {
+  operationId: string;
+  host: "excel" | "wps-et";
+  workbookPath: string;
+  hostWindowId?: number | null;
+  authorizedSheets: string[];
+  plan: AnalysisPlan;
+  /**
+   * 发起本次操作的原会话与请求消息。
+   *
+   * 旧记录没有这两个字段：缺失即"归属未知"，服务端不会把它算进当前会话，
+   * 也不会因此拒绝恢复。
+   */
+  conversationId?: string;
+  requestMessageId?: string;
+}
+export interface WorksheetCheckpointReference { operationId: string; }
+export interface WorksheetCheckpointBackupConsent extends WorksheetCheckpointReference { backupSheets: string[]; }
+/**
+ * 原地撤销的实际结果。
+ *
+ * 与 `WorksheetCheckpointOpenResult` 是两件事：那边只是"打开了执行前副本"，
+ * 这边是"把表放回了当前打开的原工作簿"。`status === "completed"` 才代表
+ * 名称、顺序、可见性与内容都核对过；`partial` / `failed` 都不许说成已撤销。
+ */
+export interface WorksheetRestoreResult {
+  operationId: string;
+  status: "completed" | "partial" | "failed" | "conflict";
+  restoredSheets: string[];
+  failedSheets: string[];
+  unverifiedSheets: string[];
+  repairedFormulas: number;
+  repairedNames: number;
+  limitations: string[];
+  message: string;
+}
+export interface WorksheetDeleteCheckpointResult {
+  operationId: string;
+  status: "prepared" | "needs_backup_consent" | "executing" | "completed" | "partial_or_unknown" | "failed";
+  backupSheets?: string[];
+  deletedSheets: string[];
+  remainingSheets: string[];
+  recoveryAvailable: boolean;
+  message: string;
+  /** 最近一次原地撤销结果；缺失只表示"还没撤销过"。 */
+  restore?: WorksheetRestoreResult | null;
+}
+export interface WorksheetCheckpointOpenResult { opened: boolean; recoveryPath: string; }
+export interface WorksheetCheckpointListRequest { workbookPath: string; host: "excel" | "wps-et"; }
+/** 服务端按工作簿身份列出的恢复点摘要；不含单元格内容。 */
+export interface WorksheetCheckpointSummary {
+  operationId: string;
+  status: "prepared" | "needs_backup_consent" | "executing" | "completed" | "partial_or_unknown" | "failed";
+  deletedSheets: string[];
+  remainingSheets: string[];
+  recoveryAvailable: boolean;
+  message: string;
+  createdAt: string | null;
+  planTitle: string | null;
+  restoreStatus?: WorksheetRestoreResult["status"] | null;
+}
+export interface WorksheetCheckpointListResult { checkpoints: WorksheetCheckpointSummary[]; }
+
+
+/** Reject incomplete/stale service receipts; a successful HTTP status is not deletion evidence. */
+export function assertWorksheetCheckpointResult(value: unknown, operationId: string): asserts value is WorksheetDeleteCheckpointResult {
+  const item = value as Partial<WorksheetDeleteCheckpointResult> | null;
+  const names = (list: unknown): list is string[] => Array.isArray(list) && list.every(name => typeof name === "string" && name.length > 0) && new Set(list).size === list.length;
+  if (!item || item.operationId !== operationId ||
+      !["prepared", "needs_backup_consent", "executing", "completed", "partial_or_unknown", "failed"].includes(String(item.status)) ||
+      !names(item.deletedSheets) || !names(item.remainingSheets) || typeof item.recoveryAvailable !== "boolean" || typeof item.message !== "string" ||
+      (item.backupSheets !== undefined && !names(item.backupSheets)) ||
+      (item.status === "needs_backup_consent" && (!names(item.backupSheets) || !item.backupSheets.length || item.recoveryAvailable || item.deletedSheets.length > 0)) ||
+      (item.status === "completed" && (!item.recoveryAvailable || !item.deletedSheets.length || !item.remainingSheets.length || item.deletedSheets.some(name => item.remainingSheets!.includes(name))))) {
+    throw new Error("工作表检查点回执不完整，执行状态尚未确认；请查询状态，不要重复删除。");
+  }
+}
+
+/**
+ * 撤销回执同样要**先自证**，不能拿 HTTP 200 当证据。
+ *
+ * 三条硬约束：
+ * - 归属必须是这一次执行；
+ * - 声称 `completed` 时，已放回的表必须**覆盖**本次删除的全部表，且没有失败/未核对的；
+ * - `partial` 必须真的"只完成了一部分"（有放回的、也有没放回的），否则措辞会骗人。
+ */
+export function assertWorksheetRestoreResult(
+  value: unknown,
+  operationId: string,
+  deletedSheets: readonly string[]
+): asserts value is WorksheetRestoreResult {
+  const item = value as Partial<WorksheetRestoreResult> | null;
+  const names = (list: unknown): list is string[] =>
+    Array.isArray(list) && list.every(name => typeof name === "string" && name.length > 0) && new Set(list).size === list.length;
+  const statuses = ["completed", "partial", "failed", "conflict"];
+  if (!item || item.operationId !== operationId || !statuses.includes(String(item.status)) ||
+      !names(item.restoredSheets) || !names(item.failedSheets) || !names(item.unverifiedSheets) ||
+      !names(item.limitations) || typeof item.message !== "string" ||
+      typeof item.repairedFormulas !== "number" || typeof item.repairedNames !== "number") {
+    throw new Error("撤销回执不完整，工作簿状态尚未确认；请核对工作表列表。");
+  }
+  const covered = deletedSheets.every(name => item.restoredSheets!.includes(name));
+  if (item.status === "completed" && (!covered || item.failedSheets!.length || item.unverifiedSheets!.length)) {
+    throw new Error("撤销回执声称全部完成，但覆盖范围对不上；请核对工作表列表。");
+  }
+  if (item.status === "partial" && (!item.restoredSheets!.length || !item.failedSheets!.length)) {
+    throw new Error("撤销回执声称部分完成，但清单与状态不一致；请核对工作表列表。");
+  }
 }

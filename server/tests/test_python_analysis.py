@@ -1407,7 +1407,7 @@ def test_execution_entry_exception_fails_closed_in_sdk(monkeypatch, tmp_path):
     assert parsed["status"] == "unavailable"
     assert parsed["reasonCategory"] == "execution_error"
     assert parsed["message"] == (
-        "隔离 Python 分析在执行环节发生内部错误；本轮未运行任何代码，请改用只读工具或直接提交计划。"
+        "隔离 Python 分析未能完成，未发布可用结果；是否开始执行以执行确认记录为准。"
     )
 
 

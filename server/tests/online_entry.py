@@ -4,7 +4,7 @@
 
 1. 打开隔离 Python 总开关 —— 走驱动写入的**临时能力表**
    （``EXCEL_BRO_CAPABILITIES_PATH``），不改生产 ``config/capabilities.json``；
-2. 把 ``OpenAICompatibleClient.chat_completions`` 换成本文件里的**固定工具调用
+2. 把 SDK 的 ``query`` 换成本文件里的**固定工具调用
    序列**。模型推理是本轮唯一被允许替代的环节，替身**只产出工具调用**，
    绝不调用任何内部函数去绕过分派、登记、编译或执行；
 3. 用 uvicorn 起**真实** ASGI 应用（真实路由、真实工具处理、真实桥、真实
@@ -33,7 +33,8 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-os.environ.setdefault("AI_BASE_URL", "http://127.0.0.1:1")
+# Explicit test entry: transport is replaced below; no external endpoint is used.
+os.environ["AI_BASE_URL"] = "https://api.deepseek.com/v1"
 os.environ.setdefault("AI_MODEL", "online-test-model")
 
 SCENARIO_PATH = pathlib.Path(
@@ -150,42 +151,64 @@ def _planning_call(messages: list[dict[str, Any]]):
 
 
 def _install_model_double() -> None:
-    from server.app.llm import client as llm_client
+    from types import SimpleNamespace
+    from server.app import claude_sdk_agent
 
-    async def chat_completions(
-        self,
-        *,
-        messages,
-        max_tokens=None,
-        temperature=None,
-        tools=None,
-        tool_choice=None,
-    ):
-        system = _system_prompt(list(messages))
-        if "先理解消息" in system:
-            return _completion(
-                json.dumps(
-                    {
-                        "kind": "needs_workbook_context",
-                        "summary": "按会员等级汇总订单金额",
-                    },
-                    ensure_ascii=False,
-                )
-            )
-        if "判断用户是在普通交谈" in system:
-            return _completion(
-                json.dumps(
-                    {
-                        "kind": "proceed",
-                        "summary": "按会员等级汇总订单金额",
-                        "confirmedPrompt": SCENARIO["prompt"],
-                    },
-                    ensure_ascii=False,
-                )
-            )
-        return _planning_call(list(messages))
+    class Result:
+        is_error = False
+        subtype = "success"
+        api_error_status = None
+        def __init__(self, content=""):
+            self.result = content
 
-    llm_client.OpenAICompatibleClient.chat_completions = chat_completions
+    class FixedSdk:
+        ResultMessage = Result
+        CLINotFoundError = type("CLINotFoundError", (Exception,), {})
+        CLIConnectionError = type("CLIConnectionError", (Exception,), {})
+        ProcessError = type("ProcessError", (Exception,), {})
+        ResultError = type("ResultError", (Exception,), {})
+        CLIJSONDecodeError = type("CLIJSONDecodeError", (Exception,), {})
+
+        def ClaudeAgentOptions(self, **kwargs):
+            return SimpleNamespace(**kwargs)
+
+        def tool(self, name, description, schema):
+            return lambda handler: SimpleNamespace(name=name, handler=handler)
+
+        def create_sdk_mcp_server(self, *, name, version, tools):
+            return {tool.name: tool for tool in tools}
+
+        async def query(self, *, prompt, options):
+            system = options.system_prompt
+            if "先理解消息" in system:
+                yield Result(json.dumps({"kind": "needs_workbook_context", "summary": "按会员等级汇总订单金额"}))
+                return
+            if "判断用户是在普通交谈" in system:
+                yield Result(json.dumps({"kind": "proceed", "summary": "按会员等级汇总订单金额",
+                                         "confirmedPrompt": SCENARIO["prompt"]}))
+                return
+            messages = []
+            # Only model decisions are fixed. Actual registered MCP handlers
+            # perform bridge requests, Docker analysis and plan compilation.
+            for _ in range(4):
+                payload, _usage = _planning_call(messages)
+                calls = payload["choices"][0]["message"].get("tool_calls", [])
+                if not calls:
+                    raise RuntimeError("Online SDK model sequence did not reach a result plan")
+                call = calls[0]["function"]
+                tool = options.mcp_servers["excel_bro"][call["name"]]
+                receipt = await tool.handler(json.loads(call["arguments"]))
+                if receipt.get("is_error"):
+                    raise RuntimeError(f"Online SDK tool failed: {call['name']}")
+                messages.append({"role": "tool", "content": receipt["content"][0]["text"]})
+                if call["name"] == "submit_result_plan":
+                    yield Result()
+                    return
+            raise RuntimeError("Online SDK model sequence exhausted")
+
+    claude_sdk_agent._sdk = lambda: FixedSdk()
+    # The runner supplies a real, test-owned SDK directory outside the repository.
+    # Keep production configuration checks active even with the model transport double.
 
 
 def _watch_correlation(app: Any) -> None:

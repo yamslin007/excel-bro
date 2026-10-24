@@ -1,12 +1,13 @@
+import { ModelConnectionProtocolFields } from "../../excel-addin/src/components/ModelConnectionProtocolFields";
 import type { ModelOption } from "../../excel-addin/src/api";
 import type { useModelManagement } from "../../excel-addin/src/hooks/useModelManagement";
-import { connectionModelSuffix } from "../../excel-addin/src/modelSelection";
+import { agentModelAvailable, agentModelUnavailableReason, formulaModelAvailable, connectionModelSuffix } from "../../excel-addin/src/modelSelection";
 
 type ModelManagement = ReturnType<typeof useModelManagement>;
 
 const SUCCESSFUL_SETTINGS_FEEDBACK = new Set([
   "API Key 已保存并立即生效。",
-  "模型连接已添加，并已切换为当前模型。",
+  "模型连接已添加。用途与可用状态请见连接列表。",
   "模型连接已更新。",
   "模型连接已删除。",
   "/function 公式模型已更新。",
@@ -103,7 +104,7 @@ export default function WpsModelSettingsPanel({
           )}
         </div>
       )}
-      <p>兼容 OpenAI /chat/completions 的服务均可接入。连接测试成功后才能保存。</p>
+      <ModelConnectionProtocolFields draft={connectionDraft} onChange={setConnectionDraft} />
       <label>
         <span>连接名称</span>
         <input
@@ -116,7 +117,7 @@ export default function WpsModelSettingsPanel({
         <span>服务地址</span>
         <input
           value={connectionDraft.baseUrl}
-          placeholder="https://api.example.com/v1"
+          placeholder={connectionDraft.protocol === "anthropic" ? "供应商提供的 Anthropic 兼容地址" : "https://api.example.com/v1"}
           onChange={(event) => setConnectionDraft((draft) => draft ? { ...draft, baseUrl: event.target.value } : draft)}
         />
       </label>
@@ -203,7 +204,7 @@ export default function WpsModelSettingsPanel({
           disabled={settingsSaving || settingsTesting || !connectionVerified}
           title={!connectionVerified ? "请先测试连接并确认成功" : undefined}
           onClick={() => void saveConnection()}
-        >{settingsSaving ? "正在保存…" : connectionDraft.id ? "保存修改" : "添加并使用"}</button>
+        >{settingsSaving ? "正在保存…" : connectionDraft.id ? "保存修改" : "添加连接"}</button>
       </div>
       {connectionTestFeedback && (
         <div className={`model-connection-feedback ${connectionTestFeedback.kind}`} role={connectionTestFeedback.kind === "error" ? "alert" : "status"}>
@@ -302,7 +303,7 @@ export default function WpsModelSettingsPanel({
                 {connectionDraft && !connectionDraft.id && connectionEditor}
                 {(modelSettings?.connections.length ?? 0) === 0 && !connectionDraft && (
                   <div className="model-connection-empty">
-                    还没有模型连接。可添加 DeepSeek、OpenAI 或其他兼容 OpenAI /chat/completions 的服务。
+                    还没有模型连接。请添加兼容 SDK Agent 的连接；OpenAI 兼容连接可单独用于公式。
                   </div>
                 )}
                 {modelSettings?.connections.some((connection) =>
@@ -322,7 +323,7 @@ export default function WpsModelSettingsPanel({
                     {(modelSettings?.connections ?? []).map((connection) => {
                       const isCurrent = currentModelId === connection.catalogModelId;
                       const catalogModel = models.find((model) => model.id === connection.catalogModelId);
-                      const canSelect = Boolean(catalogModel?.available);
+                      const canSelect = agentModelAvailable(catalogModel);
                       return (
                         <article
                           className={`model-connection-card${isCurrent ? " current" : ""}`}
@@ -333,7 +334,7 @@ export default function WpsModelSettingsPanel({
                             type="button"
                             aria-label={`${isCurrent ? "当前使用模型" : "切换为模型"} ${connection.label} · ${connection.modelId}${connectionModelSuffix(modelSettings?.connections ?? [], connection.id)}`}
                             disabled={isCurrent || !canSelect || settingsSaving || settingsTesting || Boolean(connectionDraft)}
-                            title={!canSelect ? "模型暂不可用，请重试读取或编辑连接" : undefined}
+                            title={!canSelect && catalogModel ? agentModelUnavailableReason(catalogModel) : undefined}
                             onClick={() => {
                               selectModel(connection.catalogModelId);
                             }}
@@ -349,7 +350,7 @@ export default function WpsModelSettingsPanel({
                                 Key：{connection.apiKeyConfigured ? `已配置 ${connection.apiKeyHint ?? ""}` : "未配置"}
                                 {connection.supportsVision ? " · 支持图片" : ""}
                               </small>
-                              {!isCurrent && <em>{canSelect ? "点击切换使用" : "暂不可用，请检查连接"}</em>}
+                              {!isCurrent && <em>{canSelect ? "点击切换使用" : catalogModel ? agentModelUnavailableReason(catalogModel) : "暂不可用，请检查连接"}</em>}
                             </span>
                           </button>
                           {pendingDeleteConnectionId === connection.id ? (
@@ -399,7 +400,7 @@ export default function WpsModelSettingsPanel({
                   >
                     <option value="">跟随全局选择（默认）</option>
                     {models.map((model) => (
-                      <option key={model.id} value={model.id} disabled={!model.available}>{model.label}</option>
+                      <option key={model.id} value={model.id} disabled={!formulaModelAvailable(model)}>{model.label}</option>
                     ))}
                   </select>
                 </label>

@@ -1,0 +1,85 @@
+/* 删除结果卡复用共享结果卡样式（ExecutionResultCard），这里只补它自己的排布。 */
+.worksheet-checkpoint-card {
+  margin: 8px 0;
+}
+.worksheet-checkpoint-card p {
+  margin: 6px 0;
+  overflow-wrap: anywhere;
+}
+.worksheet-checkpoint-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.worksheet-checkpoint-actions button {
+  min-height: 34px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  max-width: 100%;
+}
+
+/* 「备份与恢复」里的恢复点区段：与抽屉里其它分区同一套排版。 */
+.worksheet-checkpoint-recovery {
+  border-top: 1px solid var(--color-border);
+  padding-top: 14px;
+  margin-top: 14px;
+}
+.worksheet-checkpoint-recovery > header {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.worksheet-checkpoint-recovery > header span,
+.worksheet-checkpoint-recovery-state {
+  color: var(--color-text-secondary);
+}
+.worksheet-checkpoint-recovery-list {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.worksheet-checkpoint-recovery-list > li {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  overflow-wrap: anywhere;
+}
+.worksheet-checkpoint-recovery-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+.worksheet-checkpoint-recovery-head > strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.worksheet-checkpoint-recovery-head > em {
+  flex: 0 0 auto;
+  font-style: normal;
+  font-size: var(--font-size-caption);
+  color: var(--color-text-secondary);
+}
+.worksheet-checkpoint-recovery-head > em.status-partial_or_unknown,
+.worksheet-checkpoint-recovery-head > em.status-needs_backup_consent {
+  color: var(--color-warning-text, #9a6328);
+}
+.worksheet-checkpoint-recovery-list details > summary {
+  cursor: pointer;
+  color: var(--color-brand-text);
+  font-weight: 600;
+}
+.worksheet-checkpoint-recovery-list button {
+  align-self: flex-start;
+  min-height: 34px;
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}

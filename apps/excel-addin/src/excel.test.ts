@@ -1310,34 +1310,7 @@ describe("executeAction filtered row-scoped actions", () => {
     ]);
   });
 
-  it("copyRange writes header plus matching rows to the target range", async () => {
-    const world = makeMockExcel({ 数据: rows });
-    const action: ExcelAction = {
-      type: "copyRange",
-      sheet: "结果",
-      sourceSheet: "数据",
-      sourceRange: "A1:B5",
-      targetRange: "D1:E3",
-      copyType: "values",
-      skipBlanks: false,
-      transpose: false,
-      hasHeaders: true,
-      filters: [peopleEquals("企鹅")]
-    };
-
-    await executeAction(world.context as any, action, 0, collector as any);
-
-    expect(world.writes).toEqual([
-      {
-        range: "D1:E3",
-        values: [
-          ["人员", "得分"],
-          ["企鹅", -3],
-          ["企鹅", -8]
-        ]
-      }
-    ]);
-  });
+  // Conditional copy now also captures real recovery state; covered in filteredCopyExecution.test.ts.
 
   it("removeDuplicates deletes only duplicate rows within the filtered set", async () => {
     const world = makeMockExcel({ 数据: rows });

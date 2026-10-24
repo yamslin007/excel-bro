@@ -429,17 +429,17 @@ def test_b1_b3_missing_mapping_rule_routes_to_clarification_without_data_rows(
         }
     )
     client = _ClarificationClient()
-    monkeypatch.setattr(
-        intent_module, "OpenAICompatibleClient", lambda *_args, **_kwargs: client
-    )
+    from server.tests.sdk_text_harness import install_text_transport
+    from server.tests.test_claude_sdk_agent import _connection
+    install_text_transport(monkeypatch, client)
 
-    response = asyncio.run(check_intent(request, config=object()))
+    response = asyncio.run(check_intent(request, config=_connection()))
 
     assert response.kind == "clarification"
     assert "映射" in response.clarification.question
     assert len(client.calls) == 1
     outbound = client.calls[0][1]["content"]
-    assert "数据范围结构摘要（不含数据行）" in outbound
+    assert "scope" in json.loads(outbound)
     assert "类别分组" in outbound
     assert secret_row not in outbound
     assert "dataRows" not in outbound

@@ -67,7 +67,7 @@ describe("任务窗格信息层级：Excel 与 WPS 的同状态口径", () => {
     expect(appSource).toContain("执行完成，但验证未通过");
     // WPS 只有"核对过"与"已撤销"两态；写失败时根本不该出现结果卡
     // （这条由 WpsAgentPanel.test.tsx 的渲染断言把关）。
-    expect(wpsSource).toContain("已撤销并核对恢复");
+    expect(wpsSource).toContain("已撤销并恢复");
   });
 
   it("两端都有对应的卡片样式，且窄窗下笔记区块不溢出", () => {

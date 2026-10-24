@@ -1,3 +1,4 @@
+import { BORDER_FIELDS, readWpsBorder, restoreWpsBorder } from "./wpsBorders";
 /**
  * WPS 格式属性的**逐格 / 逐行快照**采集与恢复（Task #53 的宿主适配层）。
  *
@@ -28,27 +29,39 @@ import type { WpsRange } from "./wpsHost";
 
 /** 快照覆盖的全部格式字段名（用于属性级恢复的字段集合）。 */
 export const ALL_WPS_FORMAT_FIELDS = [
+  ...BORDER_FIELDS,
   "bold",
   "italic",
   "name",
   "size",
   "color",
   "horizontalAlignment",
+  "verticalAlignment",
   "wrapText",
-  "rowHeight"
+  "rowHeight",
+  "fillColor", "fillPattern", "fillPatternColor", "numberFormat"
 ] as const;
 
 export type WpsFormatField = (typeof ALL_WPS_FORMAT_FIELDS)[number];
 
 /** 单格的字体/对齐/换行快照。`null` = 未直接设置或未采集，恢复时跳过。 */
 export type WpsCellFormatSnapshot = {
+  borderTop?: string | null;
+  borderBottom?: string | null;
+  borderLeft?: string | null;
+  borderRight?: string | null;
   bold: boolean | null;
   italic: boolean | null;
   name: string | null;
   size: number | null;
   color: number | null;
   horizontalAlignment: number | null;
+  verticalAlignment?: number | null;
   wrapText: boolean | null;
+  fillColor?: number | null;
+  fillPattern?: number | null;
+  fillPatternColor?: number | null;
+  numberFormat?: string | null;
 };
 
 /** 整块区域的格式快照：逐格字体/对齐/换行 + 逐行行高。 */
@@ -73,17 +86,28 @@ function readString(value: unknown): string | null {
   return typeof value === "string" ? value : null;
 }
 
+/** New optional host properties may throw on older wrappers. Missing evidence blocks only actions that require it. */
+function optionalFormat<T>(read: () => unknown, normalize: (value: unknown) => T | null): T | null {
+  try { return normalize(read()); } catch { return null; }
+}
+
 /** 读单格（`range.Item(r+1, c+1)`）的格式快照。**不回退到整块**。 */
 function readCellFormat(cell: WpsRange): WpsCellFormatSnapshot {
   const font = cell.Font;
   return {
+    ...Object.fromEntries(BORDER_FIELDS.map(field=>[field,readWpsBorder(cell,field)])),
     bold: readBoolean(font?.Bold),
     italic: readBoolean(font?.Italic),
     name: readString(font?.Name),
     size: readNumber(font?.Size),
     color: readNumber(font?.Color),
     horizontalAlignment: readNumber(cell.HorizontalAlignment),
-    wrapText: readBoolean(cell.WrapText)
+    verticalAlignment: optionalFormat(() => cell.VerticalAlignment, readNumber),
+    wrapText: readBoolean(cell.WrapText),
+    fillColor: optionalFormat(() => cell.Interior?.Color, readNumber),
+    fillPattern: optionalFormat(() => cell.Interior?.Pattern, readNumber),
+    fillPatternColor: optionalFormat(() => cell.Interior?.PatternColor, readNumber),
+    numberFormat: optionalFormat(() => cell.NumberFormat, readString)
   };
 }
 
@@ -158,6 +182,14 @@ function restoreCellFormat(
   saved: WpsCellFormatSnapshot,
   fields: ReadonlySet<WpsFormatField>
 ): void {
+  for(const field of BORDER_FIELDS) if(fields.has(field) && saved[field]!=null) restoreWpsBorder(cell,field,saved[field]);
+  if (fields.has("numberFormat") && saved.numberFormat != null) cell.NumberFormat = saved.numberFormat;
+  if ((fields.has("fillColor") || fields.has("fillPattern") || fields.has("fillPatternColor")) && cell.Interior) {
+    if (fields.has("fillColor") && saved.fillColor != null) cell.Interior.Color = saved.fillColor;
+    if (fields.has("fillPatternColor") && saved.fillPatternColor != null) cell.Interior.PatternColor = saved.fillPatternColor;
+    // Pattern last: assigning Color can implicitly enable a solid fill.
+    if (fields.has("fillPattern") && saved.fillPattern != null) cell.Interior.Pattern = saved.fillPattern;
+  }
   const font = cell.Font;
   if (font) {
     if (fields.has("bold") && saved.bold !== null) font.Bold = saved.bold;
@@ -169,6 +201,7 @@ function restoreCellFormat(
   if (fields.has("horizontalAlignment") && saved.horizontalAlignment !== null) {
     cell.HorizontalAlignment = saved.horizontalAlignment;
   }
+  if (fields.has("verticalAlignment") && saved.verticalAlignment != null) cell.VerticalAlignment = saved.verticalAlignment;
   if (fields.has("wrapText") && saved.wrapText !== null) {
     cell.WrapText = saved.wrapText;
   }
@@ -211,13 +244,17 @@ export function sameWpsFormatSnapshot(left: WpsFormatSnapshot, right: WpsFormatS
       const a = left.cells[r][c];
       const b = right.cells[r][c];
       if (
+        BORDER_FIELDS.some(field=>a[field]!==b[field]) ||
         a.bold !== b.bold ||
         a.italic !== b.italic ||
         a.name !== b.name ||
         a.size !== b.size ||
         a.color !== b.color ||
         a.horizontalAlignment !== b.horizontalAlignment ||
-        a.wrapText !== b.wrapText
+        a.verticalAlignment !== b.verticalAlignment ||
+        a.wrapText !== b.wrapText ||
+        a.fillColor !== b.fillColor || a.fillPattern !== b.fillPattern ||
+        a.fillPatternColor !== b.fillPatternColor || a.numberFormat !== b.numberFormat
       ) {
         return false;
       }
@@ -228,4 +265,60 @@ export function sameWpsFormatSnapshot(left: WpsFormatSnapshot, right: WpsFormatS
     if (left.rowHeights[r] !== right.rowHeights[r]) return false;
   }
   return true;
+}
+
+/**
+ * 「区域内**数据行**的内容级格式是否一致」探针 —— 排序 / 去重的前置守卫。
+ *
+ * 为什么需要它：排序只重排**值**，单元格格式留在原位。如果同一个区域里有的行
+ * 加粗、有的行是红色、有的行是百分比格式，那么"值排序"之后格式就与数据脱钩了，
+ * 用户看到的是"数据换了位置、格式没跟着走"。这类区域必须先被拒绝，或由宿主原生
+ * 排序把格式一起搬 —— 本项目不冒这个险，直接拒绝并说清原因。
+ *
+ * 判据边界（刻意排除的两类属性）：
+ *  - **边框**：边框是网格属性，相邻单元格共用一条物理边；它本来就不随行移动
+ *    （见 `wpsBorders` 的归属检查），把它算进"格式一致性"会让几乎所有真实表被拒。
+ *  - **行高**：行高属于物理行，不属于数据行，同样不随排序移动。
+ *
+ * 只读，不写任何属性。`fromRow` 用于跳过表头行（表头格式与数据行不同是正常的）。
+ */
+export function wpsUniformCellStyle(
+  range: WpsRange,
+  rows: number,
+  columns: number,
+  fromRow = 0
+): { captured: boolean; uniform: boolean; detail: string } {
+  const singleCell = rows === 1 && columns === 1;
+  if (rows * columns > 1 && typeof range.Item !== "function") {
+    return { captured: false, uniform: false, detail: "宿主的区域对象不支持逐格定位，无法核对格式一致性" };
+  }
+  const signatures = new Set<string>();
+  for (let r = fromRow; r < rows; r += 1) {
+    for (let c = 0; c < columns; c += 1) {
+      const cell = cellAt(range, r, c, singleCell);
+      const snapshot = readCellFormat(cell);
+      // 与 `captureWpsFormatSnapshot` 同一条纪律：读不到就不是"默认值"。
+      if (
+        snapshot.bold === null || snapshot.italic === null || snapshot.name === null ||
+        snapshot.size === null || snapshot.color === null ||
+        snapshot.horizontalAlignment === null || snapshot.wrapText === null
+      ) {
+        return {
+          captured: false,
+          uniform: false,
+          detail: `第 ${r + 1} 行第 ${c + 1} 列的字体/对齐无法完整读取`
+        };
+      }
+      signatures.add(JSON.stringify([
+        snapshot.bold, snapshot.italic, snapshot.name, snapshot.size, snapshot.color,
+        snapshot.horizontalAlignment, snapshot.verticalAlignment, snapshot.wrapText,
+        snapshot.fillColor ?? null, snapshot.fillPattern ?? null,
+        snapshot.fillPatternColor ?? null, snapshot.numberFormat ?? null
+      ]));
+      if (signatures.size > 1) {
+        return { captured: true, uniform: false, detail: "区域内存在两种以上内容级格式" };
+      }
+    }
+  }
+  return { captured: true, uniform: true, detail: "区域内数据行格式一致" };
 }

@@ -3778,6 +3778,25 @@ def _save_workbooks_atomically(
             temporary.unlink(missing_ok=True)
         raise
 
+    # 这一步必须有自己的真实终态：以前只有 started + progress，于是"准备文件"
+    # 永远停在进行中，前端只能靠"后面出现了备份步骤"倒推它做完了 —— 那是对
+    # 用户的猜测。空间确认也通过之后才算真的做完（失败时这一步仍是进行中，
+    # 由调用方的中止处理把它标成失败）。
+    _emit_folder_progress(
+        on_progress,
+        {
+            "executionId": execution_id,
+            "phase": "saving",
+            "stepId": "folder.prepare-files",
+            "status": "completed",
+            "title": "待写入文件已准备",
+            "summary": f"已准备 {len(targets)} / {len(targets)} 个文件。",
+            "current": len(targets),
+            "total": len(targets),
+            "unit": "files",
+        },
+    )
+
     backup_directory = backup_root / "executions" / execution_id
     backups_by_path: dict[Path, Path] = {}
     manifest_files: list[dict[str, object]] = []
@@ -5021,6 +5040,29 @@ def _execute_folder_plan(
                     },
                 )
 
+            # 拆分工作表这一子步骤同样需要真实终态（以前只有 progress）。
+            _emit_folder_progress(
+                on_progress,
+                {
+                    "executionId": execution_id,
+                    "phase": "executing",
+                    "stepId": f"folder.action.{index + 1}.sheets",
+                    "status": "completed",
+                    "title": "拆分工作表已生成",
+                    "summary": f"已处理 {len(splits)} / {len(splits)} 张结果工作表。",
+                    "current": len(splits),
+                    "total": len(splits),
+                    "unit": "sheets",
+                    "actionIndex": index + 1,
+                    "actionCount": len(request.plan.actions),
+                    "actionType": action.type,
+                    "target": {
+                        "file": str(path.relative_to(session.root)),
+                        "sheet": sheet_name,
+                    },
+                },
+            )
+
             if split_changed:
                 modified_paths.add(path)
             action_results.append(
@@ -5839,6 +5881,22 @@ def resume_folder_plan(
                     "target": {"file": str(target.relative_to(session.root))},
                 },
             )
+
+        # 续跑发布同样需要真实终态：以前只有 progress，界面上这一步永远"正在继续"。
+        _emit_folder_progress(
+            on_progress,
+            {
+                "executionId": execution_id,
+                "phase": "saving",
+                "stepId": "folder.resume.publish",
+                "status": "completed",
+                "title": "待发布文件已全部续跑",
+                "summary": f"已继续 {len(pending)} / {len(pending)} 个待发布文件。",
+                "current": len(pending),
+                "total": len(pending),
+                "unit": "files",
+            },
+        )
 
         _set_manifest_status(backup_directory, manifest, "ready", completed=True)
         checkpoint = {

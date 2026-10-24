@@ -264,6 +264,61 @@ def test_folder_plan_writes_output_workbook(tmp_path: Path) -> None:
     assert recovery_point.files[0].recoveryAction == "remove"
 
 
+def test_every_started_folder_step_gets_its_own_terminal_event(
+    tmp_path: Path,
+) -> None:
+    """真实执行一次文件夹写入：每个 started 的步骤都必须有自己的终态。
+
+    以前 ``folder.prepare-files``（以及拆分表的 ``.sheets`` 子步骤）只有
+    started/progress，永远停在进行中 —— 前端只能靠"后面出现了下一步"倒推它做完，
+    那是对用户的猜测。这里直接看真实执行发出的事件序列。
+    """
+    source = tmp_path / "scores.xlsx"
+    _create_source(source)
+    catalog = scan_folder(tmp_path)
+    plan = AnalysisPlan.model_validate(
+        {
+            "id": "folder-step-terminals",
+            "title": "写入得分",
+            "summary": "修改已有文件的单元格",
+            "actions": [
+                {"type": "writeValues", "sheet": "得分", "range": "B2", "values": [[35]]}
+            ],
+        }
+    )
+    events: list[dict] = []
+
+    execute_folder_plan(
+        FolderExecuteRequest(sessionId=catalog.sessionId, plan=plan),
+        on_progress=events.append,
+    )
+
+    terminal = {"completed", "warning", "failed", "cancelled"}
+    started_indexes = {
+        event["stepId"]: index
+        for index, event in enumerate(events)
+        if event.get("status") == "started"
+    }
+    assert started_indexes, "这次执行没有发出任何 started 事件，判据无从成立"
+
+    dangling = []
+    for step_id, start_index in started_indexes.items():
+        closed = any(
+            later.get("stepId") == step_id and later.get("status") in terminal
+            for later in events[start_index + 1 :]
+        )
+        if not closed:
+            dangling.append(step_id)
+    assert dangling == [], f"这些步骤开始了但没有终态：{dangling}"
+
+    # 具体判别点：准备待写入文件这一步有真实的完成事件。
+    assert any(
+        event.get("stepId") == "folder.prepare-files"
+        and event.get("status") == "completed"
+        for event in events
+    )
+
+
 def test_existing_file_is_backed_up_before_write(tmp_path: Path) -> None:
     source = tmp_path / "scores.xlsx"
     _create_source(source)
@@ -3489,8 +3544,13 @@ def test_completed_task_artifact_cleanup_only_removes_exact_operation(
 
 
 def test_folder_bulk_delete_keeps_source_sheet_and_can_be_undone(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch,
 ) -> None:
+    from server.tests.test_claude_sdk_agent import _FakeSdk, _connection, _install_fake
+    import server.app.planner as planner
+    fake = _FakeSdk(invoke=("plan_delete_other_worksheets", {"keepSheets": ["sheet-dc1"]}))
+    _install_fake(monkeypatch, tmp_path, fake)
+    monkeypatch.setattr(planner, "selected_model_config", lambda _: _connection())
     source = tmp_path / "movies.xlsx"
     workbook = Workbook()
     workbook.active.title = "sheet-dc1"

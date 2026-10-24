@@ -1,0 +1,5 @@
+.task-execution-controls { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:8px 12px; margin:6px 0; border:1px solid var(--border-color, #dce5df); border-radius:12px; color:var(--text-secondary, #52675b); font-size:13px; }
+.task-execution-controls > span { min-width:0; overflow-wrap:anywhere; }
+.task-execution-button { flex:0 0 36px; width:36px; height:36px; border:0; border-radius:50%; background:var(--accent-color, #2c6b47); color:white; cursor:pointer; font-size:18px; }
+.task-execution-button:disabled { opacity:.5; cursor:default; }
+.task-execution-button:focus-visible { outline:2px solid #2c6b47; outline-offset:3px; }

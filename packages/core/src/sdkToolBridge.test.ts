@@ -333,6 +333,74 @@ describe("serviceBridgeOnce", () => {
     expect(recorded.executed).toEqual([]);
     expect(result.polled).toBe(false);
   });
+
+  /**
+   * 读表是**异步**的，而 `isStale` 只在 await 之前查过一次 —— 于是"复核通过 →
+   * 开始读表 → 期间这一轮被取消/结束/被新一轮取代 → 读表返回 → 照样发回执"。
+   *
+   * 后果不是多一条网络请求：旧一轮的读表结果会以回执形式进到**新一轮**的桥上，
+   * 服务端拿它当本轮的结果继续往下走。所以回执发出之前必须再核一次轮次。
+   */
+  it("读表返回后才发现本轮已失效：一条回执都不许发，也不许推进已交付记录", async () => {
+    const state = applyBridgePollResponse(createSdkBridgeState(BINDING), {
+      calls: [call()],
+      generation: 1
+    });
+    const recorded: Recorded = { polls: 0, receipts: [], verified: [], executed: [] };
+    let stale = false;
+    const { ports: host } = ports({
+      recorded,
+      // 读表进行中，这一轮被收尾（cancel/end/新 begin 都会让 isStale 变真）。
+      execute: async (_binding, pending) => {
+        recorded.executed.push(pending.operationId);
+        stale = true;
+        return { kind: "result", result: { rows: [["甲", 2]] } };
+      }
+    });
+
+    const result = await serviceBridgeOnce(state, host, { isStale: () => stale });
+
+    // 只读的读表**已经发生**（不能假装没读），但回执一条都不许发。
+    expect(recorded.executed).toEqual([OP]);
+    expect(recorded.receipts).toEqual([]);
+    expect(result.stale).toBe(true);
+    // 失效轮次不得推进 delivered，也不得把这条待执行调用"清掉"当成功。
+    expect(result.state.delivered[OP]).toBeUndefined();
+    expect(result.state.pending.map((item) => item.operationId)).toEqual([OP]);
+  });
+
+  /**
+   * 反面：**回执已经在途**时失效，不能撤也撤不回。
+   *
+   * 本地取消改变不了"服务端可能已经收到"这一事实，所以这里不假装撤回、也不伪造
+   * 结果 —— 只是把这条 outcome 如实记下来，状态整份由调用方丢弃。这条用例钉的是
+   * "别为了解决上面那个竞态，把已经在途的回执也一起吞掉"。
+   */
+  it("回执已在途时才失效：如实记录 outcome，但不假装本地能撤回", async () => {
+    const state = applyBridgePollResponse(createSdkBridgeState(BINDING), {
+      calls: [call()],
+      generation: 1
+    });
+    const recorded: Recorded = { polls: 0, receipts: [], verified: [], executed: [] };
+    let stale = false;
+    const { ports: host } = ports({
+      recorded,
+      receipt: async (_binding, pending, outcome) => {
+        recorded.receipts.push({ operationId: pending.operationId, outcome });
+        // 请求已经发出去了，回来的路上这一轮才失效。
+        stale = true;
+        return { status: "accepted" };
+      }
+    });
+
+    const result = await serviceBridgeOnce(state, host, { isStale: () => stale });
+
+    expect(recorded.receipts).toHaveLength(1);
+    expect(result.outcomes[0]).toMatchObject({ status: "accepted" });
+    // 仍然不允许把"已经失效的轮次"标成已交付 —— 回写由调用方按 stale 整份丢弃。
+    expect(result.stale).toBe(true);
+    expect(result.state.delivered[OP]).toBeUndefined();
+  });
 });
 
 describe("runBridgeUntilIdle", () => {

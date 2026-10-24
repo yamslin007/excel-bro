@@ -1,16 +1,12 @@
 from __future__ import annotations
 
 import json
-import logging
-import os
 import re
 import uuid
 from typing import Any
 
-from pydantic import ValidationError
-
-from .capabilities import capability_int, capability_optional_int, model_timeout_seconds
-from .llm import ModelConnection, ModelNotConfiguredError, OpenAICompatibleClient, LLMResponseError
+from .capabilities import capability_int
+from .llm import ModelConnection, ModelNotConfiguredError
 from .models import (
     IntentCheckRequest,
     IntentCheckResponse,
@@ -22,12 +18,11 @@ from .models import (
     MessageUnderstandingResponse,
     MessageConversationResponse,
     MessageContextResponse,
+    MessageRecoveryResponse,
 )
-from .structural_intent import parse_bulk_worksheet_deletion
-from .assistant_identity import PRODUCT_IDENTITY_PROMPT, with_runtime_model_identity
-from .task_context import TASK_CONTEXT_PROMPT, task_context_payload
+from .agent_runtime import AGENT_DECISION_PROMPT, sdk_agent_connection
+from .assistant_identity import PRODUCT_IDENTITY_PROMPT
 
-logger = logging.getLogger(__name__)
 
 
 MESSAGE_UNDERSTANDING_PROMPT = PRODUCT_IDENTITY_PROMPT + """
@@ -42,19 +37,33 @@ needs_workbook_context。这只表示需要核对授权后读取字段，不是�
 缺少字段信息不是现在追问的理由：先返回 needs_workbook_context，后续读取授权结构再判断。
 附件数量不代表看到了图片；有图片时交给后续视觉阶段，不猜测图片内容。
 不得声称已经读取、计算或写入工作簿，不要生成工具调用、澄清选项或操作计划。
-只返回以下两种 JSON 之一，不使用 Markdown，内容使用简体中文：
+recoveryTasks 是本对话仍待处理的任务引用，可能是服务端规划任务 ID，也可能是
+preplanning- 开头的本机暂停需求引用；后者尚未建立规划检查点，但原需求仍已保留，可以重新分析。
+这些引用不是执行授权。“没有检查点”不代表“没有原需求”，不能据此要求用户重述任务。
+当用户要求继续、恢复或查询此前暂停任务时，应结合对话选择 recoveryTasks 中的原任务，
+返回 task_recovery，而不是另建工作簿任务或声称没有任务。多个候选且无法判断时，用
+conversation 简短询问用户要继续哪一个。感谢、普通追问或明确的新需求不应自动恢复旧任务。
+task_recovery 的 action 必须区分用户意图：要求继续、接着做时为 continue；
+仅询问进度、核对状态时为 inspect。continue 也必须先核对原任务状态、授权与来源，
+不能直接重放已完成操作，不生成计划、不授予写入权限。
+附带图片或修改原任务要求时不要用 task_recovery 忽略新增要求，应先澄清。
+只返回以下三种 JSON 之一，不使用 Markdown，内容使用简体中文：
 {"kind":"conversation","message":"直接回复"}
 {"kind":"needs_workbook_context","summary":"需要结合授权表结构理解的任务"}
+{"kind":"task_recovery","turnId":"recoveryTasks 中的一个 ID","action":"inspect 或 continue"}
 """
 
 
 def message_understanding_payload(request: MessageUnderstandingRequest) -> dict[str, Any]:
     # Deliberately independent of scope, priorIntent and priorResult projections.
-    return {
+    payload = {
         "prompt": request.prompt,
         "imageCount": request.imageCount,
         "conversation": [item.model_dump() for item in request.conversation],
     }
+    if request.recoveryTasks:
+        payload["recoveryTasks"] = request.recoveryTasks
+    return payload
 
 
 def parse_message_understanding(content: str, request: MessageUnderstandingRequest) -> MessageUnderstandingResponse:
@@ -70,6 +79,11 @@ def parse_message_understanding(content: str, request: MessageUnderstandingReque
         return parsed
     if payload.get("kind") == "needs_workbook_context":
         return MessageContextResponse.model_validate({**payload, "provider": "model"})
+    if payload.get("kind") == "task_recovery":
+        parsed = MessageRecoveryResponse.model_validate({**payload, "provider": "model"})
+        if request.imageCount or parsed.turnId not in request.recoveryTasks:
+            raise ValueError("Recovery task was not offered by this conversation")
+        return parsed
     raise ValueError("Invalid message routing kind")
 
 
@@ -78,31 +92,11 @@ async def check_message_understanding(
 ) -> MessageUnderstandingResponse:
     if config is None:
         raise ModelNotConfiguredError("尚未配置模型，无法理解这条消息。请先添加模型。")
-    if getattr(config, "adapter", "openai_compatible") == "claude_agent_sdk":
-        from .claude_sdk_agent import check_sdk_message_understanding
-        return await check_sdk_message_understanding(request, config)
-    user_content = json.dumps(message_understanding_payload(request), ensure_ascii=False)
-    timeout = float(os.getenv("AI_INTENT_TIMEOUT_SECONDS", str(max(10.0, model_timeout_seconds()))))
-    async with OpenAICompatibleClient(config, timeout=timeout) as client:
-        repair_note = ""
-        for _attempt in range(2):
-            payload, _ = await client.chat_completions(
-                messages=[{"role": "system", "content": with_runtime_model_identity(MESSAGE_UNDERSTANDING_PROMPT, config)},
-                          {"role": "user", "content": user_content + repair_note}],
-                max_tokens=capability_optional_int("intentContext", "maxOutputTokens"),
-            )
-            try:
-                choice = payload["choices"][0]
-                if choice.get("finish_reason") == "length":
-                    break
-                return parse_message_understanding(choice["message"].get("content") or "", request)
-            except (KeyError, IndexError, TypeError, ValueError, ValidationError):
-                repair_note = "\n上次输出未通过校验；只返回规定的完整 JSON，不要工具调用或计划。"
-    # Unknown intent must not become an implicit permission to read fields.
-    raise LLMResponseError("未能理解这条消息；尚未读取工作表结构，请重试。")
+    from .claude_sdk_agent import check_sdk_message_understanding
+    return await check_sdk_message_understanding(request, sdk_agent_connection(config))
 
 
-INTENT_SYSTEM_PROMPT = PRODUCT_IDENTITY_PROMPT + """
+INTENT_SYSTEM_PROMPT = PRODUCT_IDENTITY_PROMPT + AGENT_DECISION_PROMPT + """
 
 本轮内部任务：判断用户是在普通交谈，还是提出了工作簿任务；
 不能分析数据、计算结果或生成 Excel 操作计划。
@@ -282,23 +276,6 @@ def _scope_label(request: IntentCheckRequest) -> str:
     return f"已选择 {len(names)} 张工作表：{'、'.join(names[:3])} 等"
 
 
-def local_intent_check(
-    request: IntentCheckRequest,
-) -> IntentCheckResponse | None:
-    if request.imageCount:
-        return None  # A text-only shortcut cannot interpret or discard attached images.
-    bulk_deletion = parse_bulk_worksheet_deletion(request.prompt)
-    if bulk_deletion is not None:
-        keeper_name = bulk_deletion.keeper_name
-        return IntentProceedResponse(
-            provider="local",
-            summary=f"删除除「{keeper_name}」外的所有其他工作表。",
-            confirmedPrompt=f"删除除「{keeper_name}」外的所有其他工作表",
-        )
-    # 其他业务语义交给模型。本地层只处理可确定识别的高风险结构命令。
-    return None
-
-
 def _parse_model_response(
     content: str, request: IntentCheckRequest
 ) -> IntentCheckResponse:
@@ -346,102 +323,10 @@ async def check_intent(
     *,
     config: ModelConnection | None,
 ) -> IntentCheckResponse:
-    deterministic = local_intent_check(request)
-    if deterministic is not None:
-        return deterministic
-    read_only_required = is_explicit_read_only_query(request.prompt)
     if config is None:
-        # 普通 Agent 请求缺少模型时必须明确失败，不能静默把原需求当作
-        # “已确认”放行——那会让用户以为模型已经理解了这个需求。
         raise ModelNotConfiguredError(
             "尚未配置模型，无法理解这条需求。请点击「添加模型」，"
             "填写服务地址、模型 ID 和 API Key 后重试。"
         )
-
-    if getattr(config, "adapter", "openai_compatible") == "claude_agent_sdk":
-        from .claude_sdk_agent import check_sdk_intent
-
-        return await check_sdk_intent(request, config)
-
-    scope_payload: dict[str, Any] = request.scope.model_dump()
-    user_content = (
-        f"用户需求：{request.prompt}\n"
-        f"本件任务已确认信息：{json.dumps(task_context_payload(request), ensure_ascii=False)}\n"
-        f"用户是否回答过澄清问题：{request.intentConfirmed}\n"
-        f"当前澄清轮次：{request.clarificationRound}/{MAX_CLARIFICATION_ROUNDS}\n"
-        f"附件图片数量：{request.imageCount}\n"
-        f"最近对话：{json.dumps([item.model_dump() for item in request.conversation], ensure_ascii=False)}\n"
-        f"上一轮结构化意图：{json.dumps(request.priorIntent.model_dump() if request.priorIntent else None, ensure_ascii=False)}\n"
-        f"上一轮紧凑结果：{json.dumps(request.priorResult.model_dump() if request.priorResult else None, ensure_ascii=False)}\n"
-        f"上次工具失败：{json.dumps(request.toolFailure.model_dump() if request.toolFailure else None, ensure_ascii=False)}\n"
-        f"本地只读安全判定：{'明确只读查询，禁止返回 proceed' if read_only_required else '未锁定为只读'}\n"
-        f"数据范围结构摘要（不含数据行）：{json.dumps(scope_payload, ensure_ascii=False)}"
-    )
-    full_timeout = model_timeout_seconds()
-    timeout = float(
-        os.getenv(
-            "AI_INTENT_TIMEOUT_SECONDS",
-            str(max(10.0, full_timeout)),
-        )
-    )
-    async with OpenAICompatibleClient(config, timeout=timeout) as client:
-        repair_note = ""
-        for _attempt in range(2):
-            payload, _ = await client.chat_completions(
-                messages=[
-                    {"role": "system", "content": with_runtime_model_identity(INTENT_SYSTEM_PROMPT + TASK_CONTEXT_PROMPT, config)},
-                    {
-                        "role": "user",
-                        "content": f"{user_content}{repair_note}",
-                    },
-                ],
-                max_tokens=capability_optional_int("intentContext", "maxOutputTokens"),
-            )
-            content = ""
-            try:
-                choice = payload["choices"][0]
-                if choice.get("finish_reason") == "length":
-                    # Never trust even parseable JSON from an incomplete response.
-                    # A length limit is not fixed by a schema-repair prompt.
-                    logger.warning("Intent response truncated; using safe routing fallback")
-                    break
-                content = (
-                    choice["message"].get("content")
-                    or ""
-                )
-                parsed = _parse_model_response(content, request)
-                if (
-                    parsed.kind == "clarification"
-                    and request.clarificationRound
-                    >= MAX_CLARIFICATION_ROUNDS
-                ):
-                    raise ValueError("已达到澄清轮次上限，不能继续返回 clarification")
-                if read_only_required and parsed.kind == "proceed":
-                    raise ValueError(
-                        "当前需求是明确只读查询，必须返回 tool_request，不能进入 Excel 规划"
-                    )
-                return parsed
-            except (
-                KeyError,
-                IndexError,
-                TypeError,
-                ValueError,
-                ValidationError,
-                json.JSONDecodeError,
-            ) as error:
-                repair_note = (
-                    "\n\n你上一次返回的内容未通过结构化协议校验。"
-                    f"\n校验错误：{error}"
-                    f"\n无效输出：{content[:1200]}"
-                    "\n请只返回一个符合系统规定格式的 JSON 对象，不要解释。"
-                )
-
-    if read_only_required:
-        return _read_only_routing_fallback(request)
-
-    # 写入意图路由失败不应阻断用户。后续计划仍会先展示预览，避免直接写入。
-    return IntentProceedResponse(
-        provider="local",
-        summary="意图路由未能生成有效结构，已按原需求进入安全预览。",
-        confirmedPrompt=request.prompt,
-    )
+    from .claude_sdk_agent import check_sdk_intent
+    return await check_sdk_intent(request, sdk_agent_connection(config))

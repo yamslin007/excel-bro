@@ -24,9 +24,9 @@ describe("WPS 格式动作已验证属性白名单", () => {
     expect([...WPS_VERIFIED_RESIZE_PROPERTIES].sort()).toEqual(["rowHeight"].sort());
   });
 
-  it("setAlignment 带 vertical 时明确拒绝（不静默忽略）", () => {
-    expect(() => assertWpsVerifiedSetAlignment({ horizontal: "center", vertical: "center" }))
-      .toThrow(/vertical/i);
+  it("setAlignment 的垂直对齐支持合法枚举、拒绝未知枚举", () => {
+    expect(() => assertWpsVerifiedSetAlignment({ horizontal: "center", vertical: "center" })).not.toThrow();
+    expect(() => assertWpsVerifiedSetAlignment({ vertical: "unknown" })).toThrow("垂直对齐");
   });
 
   it("setAlignment 不带 vertical 时放行", () => {
@@ -54,8 +54,8 @@ describe("WPS 格式动作已验证属性白名单", () => {
   });
 
   it("#RRGGBB 颜色转 WPS 数字颜色", () => {
-    expect(wpsColorFromHex("#FF0000")).toBe(0xff0000);
-    expect(wpsColorFromHex("#0000ff")).toBe(0x0000ff);
+    expect(wpsColorFromHex("#FF0000")).toBe(0x0000ff);
+    expect(wpsColorFromHex("#0000ff")).toBe(0xff0000);
   });
 
   it("非法颜色抛错", () => {

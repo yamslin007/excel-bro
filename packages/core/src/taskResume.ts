@@ -212,15 +212,20 @@ export function taskResumeDecision(record: TaskResumeRecord): TaskResumeDecision
   if (record.resumability === "checkpoint") {
     return {
       action: "continue_checkpoint",
-      actionLabel: "继续任务",
+      actionLabel: "继续分析",
+      /*
+       * 不许写成"不会重做已完成的步骤"：这只在引用仍然有效时才成立。检查点里
+       * 保存的是**引用与已确认口径**，服务端会按当前授权重新读取、重新计算，
+       * 取不到引用就重读 —— 那正是"不再沿用过期结果"的落点。
+       */
       detail:
-        "从上次保存的进度继续，不会重做已完成的步骤；写入前仍然要经过预览与你的确认。",
+        "按当前授权重新读取并分析；已确认的口径会保留，写入前仍要经过预览与你的确认。",
       canContinue: true
     };
   }
   return {
     action: "regenerate_preview",
-    actionLabel: "继续任务",
+    actionLabel: "重新分析",
     detail:
       "保留原需求与你已确认的信息，重新读取并重新生成预览。这是重新生成，不是从旧步骤精确续跑。",
     canContinue: true

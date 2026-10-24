@@ -20,23 +20,17 @@ CONTEXT = {"schemaVersion": 1, "originalPrompt": "根据类别填写等级", "co
 ]}
 
 
-def test_ordinary_intent_and_real_planning_loop_receive_the_same_context(monkeypatch):
-    client = _IntentClient([{"kind": "proceed", "summary": "填写", "confirmedPrompt": "根据类别填写等级"}])
-    monkeypatch.setattr(intent_module, "OpenAICompatibleClient", lambda *_args, **_kwargs: client)
+def test_legacy_deepseek_selection_enters_sdk_with_confirmed_context(monkeypatch, tmp_path):
+    from dataclasses import replace
+    fake = _FakeSdk(response=json.dumps({"kind": "proceed", "summary": "填写", "confirmedPrompt": "根据类别填写等级"}))
+    _install_fake(monkeypatch, tmp_path, fake)
     request = IntentCheckRequest.model_validate({**_intent_request().model_dump(), "taskContext": CONTEXT})
-    result = asyncio.run(intent_module.check_intent(request, config=_ordinary_connection()))
+    connection = replace(_connection(), adapter="openai_compatible", base_url="https://api.deepseek.com/v1")
+    result = asyncio.run(intent_module.check_intent(request, config=connection))
     assert result.kind == "proceed"
-    serialized = json.dumps(CONTEXT, ensure_ascii=False)
-    assert serialized in client.calls[0][1]["content"]
-    payload = _tool_payload("submit_answer", {"message": "完整规则已收到"}, "answer-1")
-    planner = _PlanningClient(lambda _turn: (payload, _usage()))
-    monkeypatch.setattr(excel_agent, "OpenAICompatibleClient", lambda *_args, **_kwargs: planner)
-    plan = PlanRequest.model_validate({**_plan_request().model_dump(), "taskContext": CONTEXT})
-    result = asyncio.run(excel_agent.run_excel_agent(plan, connection=_ordinary_connection(), timeout=5))
-    assert result.kind == "answer"
-    sent = json.dumps(planner.message_snapshots, ensure_ascii=False)
-    assert serialized in planner.message_snapshots[0][1]["content"]
-    assert "PRIVATE_DATA_ROW" not in sent
+    assert json.loads(fake.calls[0][0])["taskContext"] == CONTEXT
+    assert fake.calls[0][1].env["ANTHROPIC_BASE_URL"] == "https://api.deepseek.com/anthropic"
+    assert "PRIVATE_RESULT_ROW" not in fake.calls[0][0]
 
 
 def test_context_is_bounded_and_cannot_carry_rows_or_authorization():

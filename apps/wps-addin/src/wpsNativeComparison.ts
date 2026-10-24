@@ -1,3 +1,4 @@
+import { isFormatActionType } from "./wpsPlanExecutor";
 import capabilities from "../../../config/capabilities.json";
 import { readWpsRangeValues } from "./wpsRangeValues";
 import { writeWpsMatrix } from "./wpsWriteMatrix";
@@ -16,6 +17,7 @@ import {
   applyFormatAction,
   assertWpsPreparedPlanUnchanged,
   asFormatFields,
+  declaredFormatFields,
   composedFormatSnapshot,
   formatActionApplied,
   formatEvidenceFingerprint,
@@ -27,7 +29,8 @@ import {
   type WpsPreparedAction,
   type WpsPreparedPlan
 } from "./wpsPlanExecutor";
-import { captureWpsFormatSnapshot, sameWpsFormatSnapshot, type WpsFormatSnapshot } from "./wpsFormatSnapshot";
+import { captureWpsFormatSnapshot, restoreWpsFormatSnapshot, sameWpsFormatSnapshot, type WpsFormatSnapshot } from "./wpsFormatSnapshot";
+import { clearReviewMarksFromCopySheet } from "./wpsResultReviewMarkers";
 
 export class WpsFormulaTrialError extends Error {}
 
@@ -116,9 +119,7 @@ function snapshot(range: WpsRange, action: WpsPreparedAction): WpsActionAfter & 
   };
 }
 
-function isFormatActionType(type: string): type is "setFont" | "setAlignment" | "resizeRange" {
-  return type === "setFont" || type === "setAlignment" || type === "resizeRange";
-}
+
 
 /** 格式动作覆盖的全部格地址（格式动作不改值，`changedCells` 需按整块区域标记）。 */
 function rangeCellAddresses(action: WpsPreparedAction): string[] {
@@ -314,6 +315,162 @@ function writeSheetOf(prepared: WpsPreparedPlan): WpsAuthorizedSheet {
  * The native split view is deliberately limited to the single sheet being written. Copying the
  * whole workbook would silently include sheets the user did not authorize. No file is saved here.
  */
+/**
+ * 执行**前**状态的轻量快照：不建副本、不要求宿主具备复制/并排能力。
+ *
+ * 为什么必须先快照而不是先建副本：新流程是"先执行、后审阅、**可选**双视图"。
+ * 在 prepare 阶段就 `Worksheet.Copy()`，等于把"用户可能根本没点的那一步"变成
+ * 执行的**前置条件** —— 宿主没有复制接口时，连写入都会被一起挡掉。用户没要求
+ * 双视图，就不该为它付出任何代价。
+ *
+ * 这里只做两件事：复核原表仍是预览时那一本（`assertOriginalUnchanged` 会重跑
+ * 计划校验与来源快照比对），并把目标区域执行前的值留下。副本在用户**真的**点
+ * 「双视图对比」时才由 `stageWpsNativeComparison(..., true)` 建立。
+ */
+export type WpsBeforeResult = {
+  prepared: WpsPreparedPlan;
+  /** 执行前目标区域的值/公式（与 `plan.actions` 对齐）；格式动作另取格式快照。 */
+  values: WpsActionAfter[];
+  /** 执行前格式快照（仅格式动作有；值动作为 undefined）。 */
+  formats: Array<WpsFormatSnapshot | undefined>;
+  workbookFullName: string;
+};
+
+export function captureWpsBeforeResult(application: WpsApplication, prepared: WpsPreparedPlan): WpsBeforeResult {
+  const original = assertOriginalUnchanged(application, prepared);
+  // Optional comparison currently supports one sheet. Capturing before-state
+  // must not impose that limitation on an authorized multi-sheet execution.
+  const actionRange = (action: WpsPreparedPlan["actions"][number]) => {
+    const authorized = prepared.authorization.sheets.find(sheet => sheet.name === action.sheetName);
+    if (!authorized) throw new Error("执行目标不在本次已授权工作表范围内");
+    const sheet = original.Worksheets.Item(authorized.index);
+    if (sheet.Name !== authorized.name) throw new Error("工作表身份已变化，未采集快照");
+    return target(sheet, action.range);
+  };
+  const values = prepared.actions.map(action => snapshot(actionRange(action), action));
+  if (values.some((item) => !item.valuesCaptured)) {
+    throw new Error("宿主未提供原表目标区域的显示值，无法建立可靠的执行前快照；原表未写入。");
+  }
+  const formats = prepared.actions.map((action, index) =>
+    isFormatActionType(action.type)
+      ? captureWpsFormatSnapshot(actionRange(action), action.rowCount, action.columnCount)
+      : undefined
+  );
+  /*
+   * 格式采集不完整**不阻止执行**：双视图是可选的，为它拒绝写入等于把可选功能
+   * 变成前置条件（正是本次要修的那类缺陷）。这里如实留下"哪些动作的格式没采到"，
+   * 等到用户真的点「双视图对比」时再明确说明"无法完整重建执行前格式"。
+   */
+  return {
+    prepared,
+    values,
+    formats: formats.map((format) => (format && format.captured ? format : undefined)),
+    workbookFullName: String(prepared.authorization.workbookFullName ?? "")
+  };
+}
+
+/**
+ * 建立**执行前**副本（用户点「双视图对比」时才调用）。
+ *
+ * 为什么不能复用 `stageWpsNativeComparison(..., true)`：那个函数是"先复制当前表、
+ * 再按计划试算"，在**执行之后**调用时复制到的是**执行后**状态 —— 用户看到的
+ * "对比"就成了"执行后的表 vs 执行后的表"，什么也没比出来。而且它开头会
+ * `assertOriginalUnchanged`（拿预览快照比对原表），执行后原表必然已变，直接抛错，
+ * 于是双视图根本打不开。
+ *
+ * 所以这里按**执行前快照**重建：先复制当前表拿到一个独立工作簿，再把
+ * `WpsBeforeResult` 里的值/公式与格式写回副本的目标区域。原表一格不动，
+ * 也不靠"临时把原表还原再复制"这种会短暂破坏现场的写法。
+ */
+export function stageWpsBeforeComparison(
+  application: WpsApplication,
+  before: WpsBeforeResult,
+  reviewFormula?: string
+): WpsNativeComparison {
+  const prepared = before.prepared;
+  const writeSheet = writeSheetOf(prepared);
+  const active = application.ActiveWorkbook;
+  if (!active || String(active.FullName ?? "") !== before.workbookFullName) {
+    throw new Error("当前工作簿已不是本次执行的那一本，未打开双视图；执行结果与撤销不受影响。");
+  }
+  const originalSheet = active.Worksheets.Item(writeSheet.index);
+  if (typeof originalSheet.Copy !== "function" || typeof application.Windows?.CompareSideBySideWith !== "function") {
+    throw new Error("当前 WPS 宿主未提供工作表副本或并排比较接口，未打开双视图；执行结果与撤销不受影响。");
+  }
+  originalSheet.Copy();
+  const copy = application.ActiveWorkbook;
+  const copyIdentity = copy ? comparisonWorkbookIdentity(copy) : null;
+  if (!copy || !copyIdentity || !copyIdentity.name || copyIdentity.path ||
+      copyIdentity.fullName === before.workbookFullName ||
+      copy.Worksheets.Count !== 1 || copy.Worksheets.Item(1).Name !== originalSheet.Name) {
+    throw new Error("WPS 未能确认新建了独立的单表副本；执行结果与撤销不受影响。请检查是否留下未保存副本。");
+  }
+  const sheet = copy.Worksheets.Item(1);
+  /*
+   * `Worksheet.Copy()` 复制的是**当前**原表，而原表此刻已经打上了本次审阅标记
+   * （条件格式规则）。不清理，执行前副本也会高亮同样的区域，用户看到两边都黄，
+   * 误以为"执行前也是这个颜色"。这里只清副本里**本次**审阅的规则（按完整随机
+   * 公式 `reviewFormula` 认领），用户自己的条件格式（及其顺序、语义）一个不碰。
+   * 没有本次公式就不清（宁可副本多一圈高亮，也不误删别人的规则）。
+   */
+  if (reviewFormula) {
+    clearReviewMarksFromCopySheet(sheet, prepared.actions.map(action => action.range), reviewFormula);
+  }
+  const copyAfter: WpsActionAfter[] = [];
+  const copyFingerprints: string[] = [];
+  for (const [index, action] of prepared.actions.entries()) {
+    /*
+     * **列宽无法按快照重建**：格式快照只采了逐格属性与行高，列宽是列级属性且
+     * 未进快照。若本次动作改了列宽，副本会沿用"执行后"的宽度 —— 那不是执行前
+     * 状态。对这种动作**明确拒绝本次对比**（不是拒绝执行），而不是让它看起来对。
+     */
+    if (action.type === "resizeRange" && (action as { columnWidth?: number | null }).columnWidth != null) {
+      throw new Error("本次动作调整了列宽，执行前列宽未纳入快照，无法完整重建执行前状态，未打开双视图；执行结果与撤销不受影响。");
+    }
+    const range = target(sheet, action.range);
+    const original = before.values[index];
+    // The compared area is a cached-value snapshot, never live formulas.
+    for (let r = 0; r < action.rowCount; r += 1) {
+      for (let c = 0; c < action.columnCount; c += 1) {
+        const value = original.values?.[r]?.[c] ?? null;
+        const cell = action.rowCount === 1 && action.columnCount === 1
+          ? range : range.Item?.(r + 1, c + 1);
+        if (!cell) throw new Error("副本缺少逐格写入接口，无法重建值快照。");
+        if (typeof value === "string" && /^[=+\-@]/.test(value)) cell.NumberFormat = "@";
+        cell.Value2 = value;
+      }
+    }
+    const format = before.formats[index];
+    if (isFormatActionType(action.type)) {
+      /*
+       * 格式动作必须有执行前格式快照才能重建。拿不到就**明确说不**：
+       * 用执行后的格式冒充"执行前"，会让用户以为格式没变过 —— 那比打不开更糟。
+       * 这条只在用户真的点了双视图时才触发，不影响已完成的执行与撤销。
+       */
+      if (!format) throw new Error(`「${action.sheetName}!${action.range}」的执行前格式未完整采集，无法重建该区域的执行前状态，未打开双视图。`);
+      restoreWpsFormatSnapshot(range, format, declaredFormatFields(asFormatFields(action)));
+    }
+    const observed = snapshot(range, action);
+    if (!observed.valuesCaptured) throw new Error("副本回读失败，无法确认执行前状态。");
+    copyAfter.push(observed);
+    copyFingerprints.push(observed.fingerprint);
+  }
+  return {
+    original: active,
+    copy,
+    copyIdentity,
+    writeSheet,
+    plan: prepared,
+    reviews: [],
+    changedCells: [],
+    originalBefore: before.values,
+    originalFormatBefore: before.formats,
+    copyFormatFinal: before.formats,
+    copyFingerprints,
+    copyAfter
+  };
+}
+
 export function stageWpsNativeComparison(
   application: WpsApplication,
   prepared: WpsPreparedPlan,

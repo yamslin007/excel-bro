@@ -1,3 +1,9 @@
+import { BORDER_FIELDS, borderField, borderTarget, applyWpsBorders, expandWpsBorders, type BorderAction } from "./wpsBorders";
+import type { CellBorderSide } from "@excel-bro/core/borderEdges";
+import { filteredSourceRows } from "./wpsFilteredPlan";
+import { computationPresentation, computedValuesPlan, isCompleteSourceMatrix } from "./wpsComputedPlan";
+import { copyRangePlan } from "@excel-bro/core/copyRangePlan";
+import { writeTableLayout, WRITE_TABLE_HEADER_FILL } from "@excel-bro/core/writeTableLayout";
 import capabilities from "../../../config/capabilities.json";
 import { readWpsRangeValues } from "./wpsRangeValues";
 import { writeWpsMatrix } from "./wpsWriteMatrix";
@@ -9,6 +15,7 @@ import {
   type RangeChangeReview
 } from "@excel-bro/core/changeReview";
 import type { AnalysisPlan, CellValue, ExcelAction } from "../../excel-addin/src/contracts";
+import { assertFormatActionFields } from "../../excel-addin/src/contracts";
 import {
   assertRectangularValues,
   blankCellMatrix,
@@ -17,6 +24,7 @@ import {
 } from "../../excel-addin/src/planCore";
 import { assertSafeFormula } from "../../excel-addin/src/formulaSafety";
 import type { WpsApplication, WpsRange, WpsWorksheet } from "./wpsHost";
+import { wpsReadWorkbook } from "./wpsResultReviewTarget";
 import {
   assertWpsAuthorization,
   authorizeWpsSheets,
@@ -28,15 +36,23 @@ import {
   assertWpsVerifiedSetAlignment,
   assertWpsVerifiedResizeRange,
   wpsColorFromHex,
-  wpsHorizontalAlignment
+  wpsOleColorFromHex,
+  wpsHorizontalAlignment,
+  wpsVerticalAlignment
 } from "./wpsFormatCapability";
 import {
   captureWpsFormatSnapshot,
   restoreWpsFormatSnapshot,
   sameWpsFormatSnapshot,
+  wpsUniformCellStyle,
   type WpsFormatField,
   type WpsFormatSnapshot
 } from "./wpsFormatSnapshot";
+/*
+ * 排序/去重的**顺序语义**来自共享层：两端必须排出同一个结果，
+ * 不能各写一份比较器。范围/格式/公式等宿主相关的守卫留在本文件。
+ */
+import { sortedMatrix } from "@excel-bro/core/tableTransforms";
 
 const STORAGE_KEY = "excel-bro.wps.undo.v1";
 
@@ -55,25 +71,35 @@ type SupportedAction =
   | Extract<ExcelAction, { type: "clearRange" }>
   | Extract<ExcelAction, { type: "setFont" }>
   | Extract<ExcelAction, { type: "setAlignment" }>
-  | Extract<ExcelAction, { type: "resizeRange" }>;
+  | Extract<ExcelAction, { type: "resizeRange" }>
+  | Extract<ExcelAction, { type: "setFill" }>
+  | Extract<ExcelAction, { type: "setNumberFormat" }>
+  | Extract<ExcelAction, { type: "sortRange" }>
+  | BorderAction;
 
 /** 值动作（writeValues / writeFormulas / clearRange）—— 走值矩阵路径。 */
 type ValueAction = Extract<SupportedAction, { type: "writeValues" | "writeFormulas" | "clearRange" }>;
 
 /** 格式动作（setFont / setAlignment / resizeRange）—— 走格式快照路径。 */
-type FormatAction = Extract<SupportedAction, { type: "setFont" | "setAlignment" | "resizeRange" }>;
+type FormatAction = Extract<SupportedAction, { type: "setFont" | "setAlignment" | "resizeRange" | "setFill" | "setNumberFormat" | "setBorders" }>;
 
 /** 格式动作在 StoredAction 里可用的字段形状（不含 sheet/range 定位字段，那些单独传）。 */
 export type FormatActionFields =
   | { type: "setFont"; bold?: boolean | null; italic?: boolean | null; name?: string | null; size?: number | null; color?: string | null }
   | { type: "setAlignment"; horizontal?: string | null; vertical?: string | null; wrapText?: boolean | null }
-  | { type: "resizeRange"; rowHeight?: number | null; columnWidth?: number | null };
+  | { type: "resizeRange"; rowHeight?: number | null; columnWidth?: number | null }
+  | { type: "setFill"; color: string }
+  | { type: "setNumberFormat"; formatCode: string }
+  | BorderAction;
 
 /** 从 ExcelAction 格式动作提取 FormatActionFields（prepareFormatAction 用）。 */
 function asFormatFieldsFromExcelAction(
-  action: Extract<ExcelAction, { type: "setFont" | "setAlignment" | "resizeRange" }>
+  action: Extract<ExcelAction, { type: "setFont" | "setAlignment" | "resizeRange" | "setFill" | "setNumberFormat" | "setBorders" }>
 ): FormatActionFields {
   switch (action.type) {
+    case "setBorders": return action;
+    case "setFill": return { type: "setFill", color: action.color };
+    case "setNumberFormat": return { type: "setNumberFormat", formatCode: action.formatCode };
     case "setFont":
       return { type: "setFont", bold: action.bold, italic: action.italic, name: action.name, size: action.size, color: action.color };
     case "setAlignment":
@@ -88,7 +114,7 @@ function asFormatFieldsFromExcelAction(
  * 优先从 `formatAction` 字段读取（`prepareFormatAction` 已把具体字段存进去）。
  */
 export function asFormatFields(action: { formatAction?: FormatActionFields } | StoredAction): FormatActionFields {
-  return action.formatAction ?? asFormatFieldsFromExcelAction(action as unknown as Extract<ExcelAction, { type: "setFont" | "setAlignment" | "resizeRange" }>);
+  return action.formatAction ?? asFormatFieldsFromExcelAction(action as unknown as Extract<ExcelAction, { type: "setFont" | "setAlignment" | "resizeRange" | "setFill" | "setNumberFormat" | "setBorders" }>);
 }
 
 /**
@@ -101,10 +127,10 @@ export function asFormatFields(action: { formatAction?: FormatActionFields } | S
  *
  * `assertAllowedAction` 与漂移检测测试都认这一份，`clearRange` 按 `applyTo` 细分。
  *
- * 格式动作（setFont/setAlignment/resizeRange）按**已实机验证的属性子集**开放：
+ * 格式动作按已实现且可采集恢复证据的属性子集开放，实机证据另行记录：
  * 动作名进了这份清单只说明"执行器认这个动作类型"，属性级守卫在
  * `assertWpsVerifiedSetFont`/`assertWpsVerifiedSetAlignment`/`assertWpsVerifiedResizeRange`
- * 与 `prepareWpsPlan` 预检里兜住（underline/vertical/columnWidth 等未验证属性明确拒绝）。
+ * 与 `prepareWpsPlan` 预检里兜住（underline/columnWidth 等未实现属性明确拒绝）。
  */
 export const WPS_SUPPORTED_ACTION_KEYS: readonly string[] = [
   "writeValues",
@@ -112,7 +138,14 @@ export const WPS_SUPPORTED_ACTION_KEYS: readonly string[] = [
   "clearRange:contents",
   "setFont",
   "setAlignment",
-  "resizeRange"
+  "resizeRange",
+  "setFill",
+  "setNumberFormat",
+  "writeTable",
+  "copyRange",
+  "computeValues",
+  "setBorders",
+  "sortRange"
 ];
 
 type Rect = {
@@ -124,7 +157,7 @@ type Rect = {
 
 export type WpsPreparedAction = {
   actionIndex: number;
-  type: "writeValues" | "writeFormulas" | "clearRange" | "setFont" | "setAlignment" | "resizeRange";
+  type: "writeValues" | "writeFormulas" | "clearRange" | "setFont" | "setAlignment" | "resizeRange" | "setFill" | "setNumberFormat" | "setBorders" | "sortRange";
   sheetIndex: number;
   sheetName: string;
   range: string;
@@ -163,6 +196,7 @@ export type WpsSourceSnapshot = {
 };
 
 type WpsPreparedSource = {
+  presentationFingerprint?: string;
   sheetIndex: number;
   sheetName: string;
   range: string;
@@ -173,6 +207,8 @@ type WpsPreparedSource = {
 
 export type WpsPreparedPlan = {
   plan: AnalysisPlan;
+  /** Original parameterized operation for saved tools, never a replacement for execution evidence. */
+  originalPlan?: AnalysisPlan;
   /** In-memory only; needed to recheck the original calculation input after a preview edit. */
   sourceSnapshots: WpsSourceSnapshot[];
   authorization: WpsReadAuthorization;
@@ -412,6 +448,7 @@ function hasAmbiguousLogicalCell(values: CellValue[][], formulas: CellValue[][])
 function confirmationSnapshot(prepared: WpsPreparedPlan): string {
   return JSON.stringify({
     plan: prepared.plan,
+    originalPlan: prepared.originalPlan,
     sourceSnapshots: prepared.sourceSnapshots,
     sheets: prepared.authorization.sheets.map(({ index, name }) => ({ index, name })),
     workbookIdentity: prepared.workbookIdentity,
@@ -446,10 +483,9 @@ function overlaps(left: WpsPreparedAction, right: WpsPreparedAction): boolean {
     right.rect.endColumn < left.rect.startColumn
   );
   if (!geometric) return false;
-  // 两个都是格式动作时允许同区域重叠：它们改的是（可能不同的）格式字段，
-  // 属性级恢复（`declaredFormatFields`）各自恢复各自的字段，不会互相覆盖。
-  // 值动作重叠、值动作 × 格式动作重叠仍拒绝（值动作会整块覆盖区域）。
-  if (isFormatActionType(left.type) && isFormatActionType(right.type)) return false;
+  // Values and declared format fields have separate snapshots and restoration.
+  // Only two value writes are ambiguous; value + format is needed by writeTable.
+  if (isFormatActionType(left.type) || isFormatActionType(right.type)) return false;
   return true;
 }
 
@@ -487,6 +523,131 @@ function selectedSheet(
   return {
     index: authorized.index,
     sheet: assertWpsAuthorization(application, authorization, authorized)
+  };
+}
+
+
+/* ------------------------------------------------------------------------- *
+ * 排序（sortRange）：值重排，格式/公式/表格对象三类影响必须先核对
+ * ------------------------------------------------------------------------- */
+
+/**
+ * 排序前的**影响面核对**，任何一条不成立就整份拒绝。
+ *
+ * 为什么不能只把值矩阵重排一遍写回去：排序的真实语义是"数据行带着它自己的
+ * 格式一起换位置"。本实现只重排值，所以必须先证明三件事：
+ *  1. 区域里**没有公式** —— 公式的重排会改变相对引用指向（`=B2*2` 搬到第 5 行
+ *     仍指向 B2 就是错的）。当前不做相对引用重写，因此一律拒绝。
+ *  2. 数据行的**内容级格式一致**（字体/填充/数字格式/对齐/换行）—— 不一致时
+ *     "只换值"会让格式与数据脱钩，用户看到的是错位的结果。
+ *     边框与行高属于网格/物理行属性，本来就不随行移动，不在此列。
+ *  3. 区域不与**表格对象**重叠 —— 在表格内重排值而不移动表格对象，会破坏表头、
+ *     汇总行与结构化引用。宿主没有 `ListObjects` 时报"无法确认"而不是"没有"。
+ *
+ * 这些场景一律**写入前拒绝**，不静默丢内容或格式。
+ */
+function assertSortableRange(
+  sheet: WpsWorksheet,
+  hostRange: WpsRange,
+  rect: Rect,
+  sheetName: string,
+  address: string,
+  rowCount: number,
+  columnCount: number,
+  hasHeaders: boolean,
+  before: { formulas: CellValue[][] }
+): void {
+  const formulaCells = before.formulas
+    .flat()
+    .filter((value) => typeof value === "string" && value.startsWith("="));
+  if (formulaCells.length) {
+    throw new Error(
+      `区域「${sheetName}!${address}」包含 ${formulaCells.length} 个公式：重排会改变相对引用的指向，` +
+      "当前不支持排序含公式的区域。请先转成值，或缩小到不含公式的数据区域。"
+    );
+  }
+  const style = wpsUniformCellStyle(hostRange, rowCount, columnCount, hasHeaders ? 1 : 0);
+  if (!style.captured) {
+    throw new Error(`区域「${sheetName}!${address}」的单元格格式无法完整核对（${style.detail}），排序会让格式与数据脱钩，未写入。`);
+  }
+  if (!style.uniform) {
+    throw new Error(
+      `区域「${sheetName}!${address}」的数据行存在不同格式（${style.detail}）：` +
+      "排序只重排值，格式不会跟着行走，结果会错位。请先统一格式，或缩小到格式一致的区域。"
+    );
+  }
+  const objects = sheet.ListObjects;
+  if (!objects || typeof objects.Item !== "function") {
+    throw new Error(
+      `无法确认「${sheetName}!${address}」是否属于表格对象（宿主未提供 ListObjects）：` +
+      "在表格内重排值会破坏表头与结构化引用，未写入。"
+    );
+  }
+  const count = Number(objects.Count ?? 0);
+  for (let index = 1; index <= count; index += 1) {
+    const object = objects.Item(index);
+    const objectRect = parseExplicitA1Rect(String((object?.Range as { Address?: unknown } | undefined)?.Address ?? ""));
+    if (!objectRect) continue;
+    const geometric = !(
+      rect.endRow < objectRect.startRow || objectRect.endRow < rect.startRow ||
+      rect.endColumn < objectRect.startColumn || objectRect.endColumn < rect.startColumn
+    );
+    if (geometric) {
+      throw new Error(
+        `区域「${sheetName}!${address}」与表格对象「${String(object?.Name ?? index)}」重叠：` +
+        "在表格内排序会破坏表头与结构化引用，未写入。"
+      );
+    }
+  }
+}
+
+/** 排序动作的预检 + 目标矩阵计算（目标矩阵 = 当前值的稳定重排）。 */
+function prepareSortRangeAction(
+  action: Extract<ExcelAction, { type: "sortRange" }>,
+  actionIndex: number,
+  sheetIndex: number,
+  sheet: WpsWorksheet,
+  hostRange: WpsRange,
+  targetRange: string,
+  rect: Rect,
+  rowCount: number,
+  columnCount: number
+): WpsPreparedAction {
+  if (!(capabilities.wpsWrite.allowedActions as readonly string[]).includes("sortRange")) {
+    throw new Error("WPS 当前未开放 sortRange。");
+  }
+  const keys = Array.isArray(action.keys) ? action.keys : [];
+  if (!keys.length) throw new Error("排序至少需要一个键。");
+  if (keys.length > 20) throw new Error("排序键最多 20 个。");
+  for (const key of keys) {
+    if (!Number.isInteger(key.column) || key.column < 0 || key.column >= columnCount) {
+      throw new Error(`排序列索引 ${key.column} 超出「${action.sheet}!${targetRange}」的 ${columnCount} 列范围。`);
+    }
+  }
+  const dataRows = action.hasHeaders ? rowCount - 1 : rowCount;
+  if (dataRows < 1) throw new Error(`区域「${action.sheet}!${targetRange}」没有可排序的数据行（只有表头）。`);
+  if (hostRange.Formula === undefined) throw new Error(`区域「${action.sheet}!${targetRange}」无法保存恢复快照。`);
+  const before = readMatrices(hostRange, rowCount, columnCount);
+  if (!before.valuesCaptured) {
+    throw new Error(`区域「${action.sheet}!${targetRange}」的显示值未完整取得，排序不可核对，未写入。`);
+  }
+  assertSortableRange(sheet, hostRange, rect, action.sheet, targetRange, rowCount, columnCount, action.hasHeaders, before);
+  const values = sortedMatrix(before.values, keys, action.hasHeaders);
+  return {
+    actionIndex,
+    type: "sortRange",
+    sheetIndex,
+    sheetName: action.sheet,
+    range: targetRange,
+    rowCount,
+    columnCount,
+    cellCount: rowCount * columnCount,
+    values,
+    preview: values.slice(0, 5).map((row) => row.slice(0, 5)),
+    beforeValues: before.values,
+    beforeValuesCaptured: before.valuesCaptured,
+    previewFingerprint: before.fingerprint,
+    rect
   };
 }
 
@@ -537,7 +698,8 @@ function supportedAction(action: ExcelAction): action is SupportedAction {
     action.type === "clearRange" ||
     action.type === "setFont" ||
     action.type === "setAlignment" ||
-    action.type === "resizeRange"
+    action.type === "resizeRange" || action.type === "setFill" || action.type === "setNumberFormat" || action.type === "setBorders" ||
+    action.type === "sortRange"
   );
 }
 
@@ -555,8 +717,8 @@ function assertAllowedAction(action: SupportedAction): void {
 }
 
 /** 是否为格式动作（走格式快照路径，而非值矩阵路径）。 */
-export function isFormatActionType(type: string): type is "setFont" | "setAlignment" | "resizeRange" {
-  return type === "setFont" || type === "setAlignment" || type === "resizeRange";
+export function isFormatActionType(type: string): type is "setFont" | "setAlignment" | "resizeRange" | "setFill" | "setNumberFormat" | "setBorders" {
+  return type === "setFont" || type === "setAlignment" || type === "resizeRange" || type === "setFill" || type === "setNumberFormat" || type === "setBorders";
 }
 
 /**
@@ -569,7 +731,7 @@ export function isFormatActionType(type: string): type is "setFont" | "setAlignm
  * `formatSnapshot`（逐格字体/对齐/换行 + 逐行行高）。
  */
 function prepareFormatAction(
-  action: Extract<ExcelAction, { type: "setFont" | "setAlignment" | "resizeRange" }>,
+  action: Extract<ExcelAction, { type: "setFont" | "setAlignment" | "resizeRange" | "setFill" | "setNumberFormat" | "setBorders" }>,
   actionIndex: number,
   sheetIndex: number,
   sheet: WpsWorksheet,
@@ -600,6 +762,8 @@ function prepareFormatAction(
   }
   const beforePreview = readMatrices(hostRange, rowCount, columnCount);
   const formatAction = asFormatFieldsFromExcelAction(action);
+  // Fail before the first write if the new action cannot be restored.
+  formatEvidenceFingerprint(formatAction, formatSnapshot);
   return {
     actionIndex,
     type: action.type,
@@ -620,6 +784,24 @@ function prepareFormatAction(
   };
 }
 
+/** Expand before snapshots, ledger registration and execution so every effect is recoverable. */
+export function expandWpsPlanActions(plan: AnalysisPlan): AnalysisPlan {
+  if (!plan.actions.some(action => action.type === "writeTable")) return plan;
+  const actions = plan.actions.flatMap((action): ExcelAction[] => {
+    if (action.type !== "writeTable") return [action];
+    if (!(capabilities.wpsWrite.allowedActions as readonly string[]).includes("writeTable")) {
+      throw new Error("WPS 当前未开放 writeTable。");
+    }
+    const layout = writeTableLayout(action);
+    return [
+      {type:"writeValues", sheet:action.sheet, range:layout.range, values:layout.values},
+      {type:"setFont", sheet:action.sheet, range:layout.headerRange, bold:true},
+      {type:"setFill", sheet:action.sheet, range:layout.headerRange, color:WRITE_TABLE_HEADER_FILL}
+    ];
+  });
+  return {...plan, actions};
+}
+
 export function prepareWpsPlan(
   application: WpsApplication,
   selectedSheetIndexes: readonly number[],
@@ -631,11 +813,105 @@ export function prepareWpsPlan(
   if (wpsWriteVersionStatus(hostVersion) === "blocked") {
     throw new Error(`当前 WPS JSAPI 版本「${hostVersion || "未知"}」尚未开放写入。`);
   }
-  const workbook = application.ActiveWorkbook;
+  const workbook = wpsReadWorkbook(application);
   if (!workbook || workbook.ReadOnly !== false) throw new Error("当前 WPS 工作簿没有明确处于可编辑状态。");
   if (!plan.actions.length) throw new Error("计划中没有可执行操作。");
+  plan.actions.forEach(assertFormatActionFields);
+  /*
+   * 去重会**物理删除行**并把下方数据上移，属于结构变更：没有经过实机取证的
+   * `EntireRow.Insert` 恢复链路之前，不提供这条入口。这里给出具体原因而不是
+   * 让用户看到泛泛的"未开放" —— 并且**不**用"把值压实后清空尾行"冒充去重。
+   */
+  if (plan.actions.some((action) => action.type === "removeDuplicates")) {
+    throw new Error(
+      "WPS 端暂不支持 removeDuplicates：它需要删除整行并把下方数据上移，" +
+      "恢复必须先经实机验证行插入与整块还原；当前不提供该入口，也不会用清空尾行冒充去重。"
+    );
+  }
+  const originalPlan: AnalysisPlan | undefined = plan.actions.some(action => action.type === "setBorders" || action.type === "writeTable" || action.type === "copyRange" || action.type === "computeValues" || action.type === "sortRange" || action.type === "removeDuplicates" || (action.type === "clearRange" && Boolean(action.filters?.length)))
+    ? JSON.parse(JSON.stringify(plan)) : undefined;
+  if (plan.actions.some(action=>action.type==="setBorders") && !(capabilities.wpsWrite.allowedActions as readonly string[]).includes("setBorders")) throw new Error("WPS 当前未开放 setBorders。");
+  plan = {...plan, actions:expandWpsBorders(plan.actions, capabilities.wpsWrite.maxCells, capabilities.wpsWrite.maxExpandedActions)};
+  plan = expandWpsPlanActions(plan);
   const authorization = authorizeWpsSheets(application, selectedSheetIndexes);
   const identity = workbookIdentity(authorization);
+  // Resolve every named source and target before reading any source values.
+  for (const action of plan.actions) {
+    selectedSheet(application, authorization, action.sheet);
+    if (action.type === "copyRange" || action.type === "computeValues") selectedSheet(application, authorization, action.sourceSheet);
+  }
+  const computedSources: WpsSourceSnapshot[] = [];
+  const computationEvidence = new Map<string, string>();
+  if (plan.actions.some(action => action.type === "computeValues")) plan = { ...plan, actions: plan.actions.flatMap((action, index): ExcelAction[] => {
+    if (action.type !== "computeValues") return [action];
+    if (!(capabilities.wpsWrite.allowedActions as readonly string[]).includes("computeValues")) throw new Error("WPS 当前未开放 computeValues。");
+    if (index > 0) throw new Error("计算动作须在本计划的其他修改前读取来源；请分开执行后重新计算。");
+    const { sheet } = selectedSheet(application, authorization, action.sourceSheet);
+    const used = action.sourceRange ? null : sheet.UsedRange;
+    const address = action.sourceRange ?? (used && Number.isInteger(used.Row) && Number.isInteger(used.Column)
+      && Number.isInteger(used.Rows?.Count) && Number.isInteger(used.Columns?.Count)
+      ? `${columnName(used.Column!)}${used.Row}:${columnName(used.Column! + used.Columns!.Count - 1)}${used.Row! + used.Rows!.Count - 1}` : "");
+    const rect = parseExplicitA1Rect(address);
+    if (!rect || rect.rows * rect.columns > capabilities.wpsWrite.maxCells) throw new Error("计算来源区域无效、未完整取得或超过单次限额。");
+    const source = rangeFor(sheet, address);
+    if (source.MergeCells !== false || source.Formula === undefined || source.Value2 === undefined) throw new Error("计算来源包含合并区域或无法完整读取。");
+    if (!isCompleteSourceMatrix(source.Value2, rect.rows, rect.columns) || !isCompleteSourceMatrix(source.Formula, rect.rows, rect.columns)) throw new Error("计算来源矩阵不完整，未写入。");
+    const before = readMatrices(source, rect.rows, rect.columns);
+    if (!before.valuesCaptured) throw new Error("计算来源值未完整取得。");
+    const presentation = computationPresentation(source, rect.rows, rect.columns);
+    computedSources.push({ sheetName: action.sourceSheet, range: address, values: before.values });
+    computationEvidence.set(JSON.stringify([action.sourceSheet, address]), JSON.stringify(presentation));
+    return computedValuesPlan(action, before.values, presentation, capabilities.wpsWrite.maxCells);
+  }) };
+  sourceSnapshots = [...sourceSnapshots, ...computedSources];
+  const filteredSources: WpsSourceSnapshot[] = [];
+  if (plan.actions.some(action => action.type === "clearRange" && action.filters?.length)) plan = { ...plan, actions: plan.actions.flatMap((action, index): ExcelAction[] => {
+    if (action.type !== "clearRange" || !action.filters?.length) return [action];
+    if (action.applyTo !== "contents") throw new Error("WPS 条件清空当前只支持内容。");
+    if (plan.actions.slice(0, index).some(previous => !isFormatActionType(previous.type))) throw new Error("条件清空需要先读取来源，请拆分前序数据修改后重新生成计划。");
+    const rect = parseExplicitA1Rect(action.range);
+    if (!rect || rect.rows * rect.columns > capabilities.wpsWrite.maxCells) throw new Error("条件清空范围无效或超过限额。");
+    const { sheet } = selectedSheet(application, authorization, action.sheet);
+    const source = rangeFor(sheet, action.range);
+    if (source.MergeCells !== false || !isCompleteSourceMatrix(source.Value2, rect.rows, rect.columns) || !isCompleteSourceMatrix(source.Formula, rect.rows, rect.columns)) throw new Error("条件清空来源无法完整读取，未写入。");
+    const before = readMatrices(source, rect.rows, rect.columns);
+    const rows = filteredSourceRows(before.values, action.filters, action.hasHeaders ?? true);
+    if (!rows.length) throw new Error("没有命中清空条件的行，原表未修改。");
+    filteredSources.push({ sheetName: action.sheet, range: action.range, values: before.values });
+    return rows.map(row => ({ type: "clearRange", sheet: action.sheet, applyTo: "contents",
+      range: `${columnName(rect.startColumn)}${rect.startRow + row}:${columnName(rect.endColumn)}${rect.startRow + row}` }));
+  }) };
+  sourceSnapshots = [...sourceSnapshots, ...filteredSources];
+  const copySources: WpsSourceSnapshot[] = [];
+  if (plan.actions.some(action => action.type === "copyRange")) plan = {...plan, actions:plan.actions.flatMap((action, actionIndex):ExcelAction[] => {
+    if(action.type !== "copyRange") return [action];
+    if (!(capabilities.wpsWrite.allowedActions as readonly string[]).includes("copyRange")) throw new Error("WPS 当前未开放 copyRange。");
+    if (plan.actions.slice(0, actionIndex).some(previous => !isFormatActionType(previous.type))) {
+      throw new Error("复制来源必须在本计划的数据写入前读取；请先完成前序数据修改，再生成复制计划。");
+    }
+    const rect=parseExplicitA1Rect(action.sourceRange);
+    if(!rect || rect.rows*rect.columns>capabilities.wpsWrite.maxCells) throw new Error("复制来源区域无效或超过单次单元格限额。");
+    if (!(capabilities.wpsWrite.copyTypes as readonly string[]).includes(action.copyType)) {
+      throw new Error("WPS 当前复制支持值或链接，可转置和跳过空白；完整格式、相对公式复制尚未实现。");
+    }
+    const {sheet}=selectedSheet(application,authorization,action.sourceSheet);
+    const source=rangeFor(sheet,action.sourceRange);
+    if(source.MergeCells!==false || source.Value2===undefined || source.Formula===undefined) throw new Error("复制来源包含合并单元格或无法完整读取。");
+    if (!isCompleteSourceMatrix(source.Value2, rect.rows, rect.columns) || !isCompleteSourceMatrix(source.Formula, rect.rows, rect.columns)) throw new Error("复制来源矩阵不完整，未写入。");
+    const snapshot=readMatrices(source,rect.rows,rect.columns);
+    if(!snapshot.valuesCaptured) throw new Error("复制来源值未完整取得。");
+    copySources.push({sheetName:action.sourceSheet,range:action.sourceRange,values:snapshot.values});
+    const matched = action.filters?.length ? filteredSourceRows(snapshot.values, action.filters, action.hasHeaders ?? true) : undefined;
+    if (matched && !matched.length) throw new Error("没有命中复制条件的行，原表未修改。");
+    return copyRangePlan(action, snapshot.values, matched ? [0, ...matched] : undefined);
+  })};
+  sourceSnapshots=[...sourceSnapshots,...copySources];
+  if (plan.actions.length > capabilities.wpsWrite.maxExpandedActions) throw new Error("展开后的 WPS 动作超过恢复记录限额，请缩小目标区域。");
+  if (copySources.length || computedSources.length || filteredSources.length) {
+    const sourceDependencySheets = [...new Set([...(plan.sourceDependencySheets ?? []), ...[...copySources, ...computedSources, ...filteredSources].map(source=>source.sheetName)])];
+    plan={...plan,sourceDependencySheets};
+    if(originalPlan) originalPlan.sourceDependencySheets=[...sourceDependencySheets];
+  }
   const actions: WpsPreparedAction[] = plan.actions.map((action, actionIndex) => {
     if (!supportedAction(action)) {
       throw new Error(`WPS 当前不执行「${action.type}」。请使用当前已开放的写入动作。`);
@@ -651,8 +927,13 @@ export function prepareWpsPlan(
     if (hostRange.MergeCells !== false) throw new Error(`区域「${action.sheet}!${targetRange}」包含合并单元格或状态未知。`);
 
     // 格式动作：属性级守卫 + 逐格/逐行格式快照，不采集值矩阵。
-    if (action.type === "setFont" || action.type === "setAlignment" || action.type === "resizeRange") {
+    if (action.type === "setFont" || action.type === "setAlignment" || action.type === "resizeRange" || action.type === "setFill" || action.type === "setNumberFormat" || action.type === "setBorders") {
       return prepareFormatAction(action, actionIndex, index, sheet, hostRange, targetRange, rect, rowCount, columnCount);
+    }
+
+    // 排序：目标矩阵 = 当前值的稳定重排；影响面先核对，不成立就整份拒绝。
+    if (action.type === "sortRange") {
+      return prepareSortRangeAction(action, actionIndex, index, sheet, hostRange, targetRange, rect, rowCount, columnCount);
     }
 
     if (hostRange.Formula === undefined) throw new Error(`区域「${action.sheet}!${targetRange}」无法生成公式快照。`);
@@ -695,7 +976,8 @@ export function prepareWpsPlan(
       range: snapshot.range,
       rowCount,
       columnCount,
-      previewFingerprint: current.fingerprint
+      previewFingerprint: current.fingerprint,
+      presentationFingerprint: computationEvidence.get(JSON.stringify([snapshot.sheetName, snapshot.range]))
     };
   });
   for (let left = 0; left < actions.length; left += 1) {
@@ -711,6 +993,7 @@ export function prepareWpsPlan(
   }
   const prepared: WpsPreparedPlan = {
     plan,
+    ...(originalPlan ? {originalPlan} : {}),
     sourceSnapshots: sourceSnapshots.map((snapshot) => ({
       sheetName: snapshot.sheetName,
       range: snapshot.range,
@@ -758,7 +1041,7 @@ function getStoredSheet(
   record: WpsUndoRecord,
   action: StoredAction
 ): WpsWorksheet {
-  const workbook = application.ActiveWorkbook;
+  const workbook = wpsReadWorkbook(application);
   const fullName = String(workbook?.FullName ?? "").trim().toLowerCase();
   if (!workbook || fullName !== record.workbookIdentity) throw new Error("当前工作簿与恢复点不一致，已停止操作。");
   const sheet = workbook.Worksheets.Item(action.sheetIndex);
@@ -783,6 +1066,21 @@ export function applyFormatAction(
   range: WpsRange,
   action: FormatActionFields
 ): void {
+  if (action.type === "setBorders") { applyWpsBorders(range, action); return; }
+  if (action.type === "setFill" || action.type === "setNumberFormat") {
+    for (let r = 0; r < (range.Rows?.Count ?? 0); r += 1) {
+      for (let c = 0; c < (range.Columns?.Count ?? 0); c += 1) {
+        const cell = range.Item ? range.Item(r + 1, c + 1) : range;
+        if (action.type === "setNumberFormat") cell.NumberFormat = action.formatCode;
+        else {
+          if (!cell.Interior) throw new Error("WPS 未提供可恢复的填充接口。");
+          cell.Interior.Color = wpsOleColorFromHex(action.color);
+          cell.Interior.Pattern = 1;
+        }
+      }
+    }
+    return;
+  }
   if (action.type === "setFont") {
     for (let r = 0; r < (range.Rows?.Count ?? 0); r += 1) {
       for (let c = 0; c < (range.Columns?.Count ?? 0); c += 1) {
@@ -803,6 +1101,7 @@ export function applyFormatAction(
       for (let c = 0; c < (range.Columns?.Count ?? 0); c += 1) {
         const cell = range.Item ? range.Item(r + 1, c + 1) : range;
         if (action.horizontal != null) cell.HorizontalAlignment = wpsHorizontalAlignment(action.horizontal);
+        if (action.vertical != null) cell.VerticalAlignment = wpsVerticalAlignment(action.vertical);
         if (action.wrapText != null) cell.WrapText = action.wrapText;
       }
     }
@@ -826,6 +1125,9 @@ export function applyFormatAction(
  */
 export function declaredFormatFields(action: FormatActionFields): WpsFormatField[] {
   const fields: WpsFormatField[] = [];
+  if (action.type === "setBorders") return action.sides.map(side=>borderField(side as CellBorderSide));
+  if (action.type === "setFill") return ["fillColor", "fillPattern"];
+  if (action.type === "setNumberFormat") return ["numberFormat"];
   if (action.type === "setFont") {
     if (action.bold != null) fields.push("bold");
     if (action.italic != null) fields.push("italic");
@@ -834,6 +1136,7 @@ export function declaredFormatFields(action: FormatActionFields): WpsFormatField
     if (action.color != null) fields.push("color");
   } else if (action.type === "setAlignment") {
     if (action.horizontal != null) fields.push("horizontalAlignment");
+    if (action.vertical != null) fields.push("verticalAlignment");
     if (action.wrapText != null) fields.push("wrapText");
   } else if (action.type === "resizeRange") {
     if (action.rowHeight != null) fields.push("rowHeight");
@@ -876,13 +1179,20 @@ export function wpsFormatEvidenceFingerprint(
   fields: readonly WpsFormatField[],
   snapshot: WpsFormatSnapshot
 ): string {
+  if (type === "setFill" && snapshot.cells.some(row => row.some(cell => cell.fillPatternColor == null))) {
+    throw new Error("WPS 无法完整采集填充图案颜色，未执行不可恢复的操作。");
+  }
   const payload: unknown[] = [type, [...fields]];
   for (const field of fields) {
     if (field === "rowHeight") {
       payload.push(snapshot.rowHeights.map((height) => height));
       continue;
     }
-    payload.push(snapshot.cells.map((row) => row.map((cell) => cell[field])));
+    const matrix = snapshot.cells.map(row => row.map(cell => cell[field]));
+    if (matrix.some(row => row.some(value => value == null))) {
+      throw new Error(`WPS 无法完整采集格式属性「${field}」，未执行不可恢复的操作。`);
+    }
+    payload.push(matrix);
   }
   return formatFingerprintOf(payload);
 }
@@ -897,7 +1207,13 @@ export function formatEvidenceFingerprint(
 
 /** 声明属性在**执行后**的取值。`applyFormatAction` 把声明值写到区域内的每一格/每一行。 */
 function formatTargetValue(action: FormatActionFields, field: WpsFormatField): WpsFormatScalar {
+  if ((BORDER_FIELDS as readonly string[]).includes(field)) return action.type === "setBorders" ? borderTarget(action) : null;
   switch (field) {
+    case "borderTop": case "borderBottom": case "borderLeft": case "borderRight": return null;
+    case "fillColor": return action.type === "setFill" ? wpsOleColorFromHex(action.color) : null;
+    case "fillPattern": return action.type === "setFill" ? 1 : null;
+    case "fillPatternColor": return null;
+    case "numberFormat": return action.type === "setNumberFormat" ? action.formatCode : null;
     case "rowHeight":
       return action.type === "resizeRange" ? action.rowHeight ?? null : null;
     case "bold":
@@ -910,6 +1226,7 @@ function formatTargetValue(action: FormatActionFields, field: WpsFormatField): W
       return action.type === "setFont" ? action.size ?? null : null;
     case "color":
       return action.type === "setFont" && action.color != null ? wpsColorFromHex(action.color) : null;
+    case "verticalAlignment": return action.type === "setAlignment" && action.vertical != null ? wpsVerticalAlignment(action.vertical) : null;
     case "horizontalAlignment":
       return action.type === "setAlignment" && action.horizontal != null
         ? wpsHorizontalAlignment(action.horizontal)
@@ -1022,6 +1339,9 @@ function declaredFieldsMatch(action: FormatActionFields, cells: WpsFormatSnapsho
   for (let r = 0; r < cells.length; r += 1) {
     for (let c = 0; c < cells[r].length; c += 1) {
       const cell = cells[r][c];
+      if (action.type === "setBorders" && action.sides.some(side=>cell[borderField(side as CellBorderSide)] !== borderTarget(action))) return false;
+      if (action.type === "setFill" && (cell.fillColor !== wpsOleColorFromHex(action.color) || cell.fillPattern !== 1)) return false;
+      if (action.type === "setNumberFormat" && cell.numberFormat !== action.formatCode) return false;
       if (action.type === "setFont") {
         if (action.bold != null && cell.bold !== action.bold) return false;
         if (action.italic != null && cell.italic !== action.italic) return false;
@@ -1030,6 +1350,7 @@ function declaredFieldsMatch(action: FormatActionFields, cells: WpsFormatSnapsho
         if (action.color != null && cell.color !== wpsColorFromHex(action.color)) return false;
       } else if (action.type === "setAlignment") {
         if (action.horizontal != null && cell.horizontalAlignment !== wpsHorizontalAlignment(action.horizontal)) return false;
+        if (action.vertical != null && cell.verticalAlignment !== wpsVerticalAlignment(action.vertical)) return false;
         if (action.wrapText != null && cell.wrapText !== action.wrapText) return false;
       }
     }
@@ -1060,6 +1381,9 @@ export function formatActionApplied(
     for (let c = 0; c < after.cells[r].length; c += 1) {
       const beforeCell = before.cells[r][c];
       const afterCell = after.cells[r][c];
+      for (const field of [...BORDER_FIELDS, "fillColor", "fillPattern", "fillPatternColor", "numberFormat", "verticalAlignment"] as const) {
+        if (!declared.has(field) && afterCell[field] !== beforeCell[field]) return false;
+      }
       if (!declared.has("bold") && afterCell.bold !== beforeCell.bold) return false;
       if (!declared.has("italic") && afterCell.italic !== beforeCell.italic) return false;
       if (!declared.has("name") && afterCell.name !== beforeCell.name) return false;
@@ -1124,6 +1448,9 @@ function formatActionUnchangedSinceFinal(
       const finalCell = finalSnapshot.cells[r]?.[c];
       if (!finalCell) return false;
       const currentCell = current.cells[r][c];
+      for (const field of [...BORDER_FIELDS, "fillColor", "fillPattern", "fillPatternColor", "numberFormat", "verticalAlignment"] as const) {
+        if (declared.has(field) && (currentCell[field] == null || currentCell[field] !== finalCell[field])) return false;
+      }
       if (declared.has("bold") && currentCell.bold !== finalCell.bold) return false;
       if (declared.has("italic") && currentCell.italic !== finalCell.italic) return false;
       if (declared.has("name") && currentCell.name !== finalCell.name) return false;
@@ -1171,6 +1498,9 @@ function formatActionRestored(
     for (let c = 0; c < restored.cells[r].length; c += 1) {
       const beforeCell = before.cells[r][c];
       const restoredCell = restored.cells[r][c];
+      for (const field of [...BORDER_FIELDS, "fillColor", "fillPattern", "fillPatternColor", "numberFormat", "verticalAlignment"] as const) {
+        if (declared.has(field) && (restoredCell[field] == null || restoredCell[field] !== beforeCell[field])) return false;
+      }
       if (declared.has("bold") && restoredCell.bold !== beforeCell.bold) return false;
       if (declared.has("italic") && restoredCell.italic !== beforeCell.italic) return false;
       if (declared.has("name") && restoredCell.name !== beforeCell.name) return false;
@@ -1212,7 +1542,7 @@ export type WpsActionCheckpoint = {
   actionIndex: number;
   sheetName: string;
   range: string;
-  type: "writeValues" | "writeFormulas" | "clearRange" | "setFont" | "setAlignment" | "resizeRange";
+  type: "writeValues" | "writeFormulas" | "clearRange" | "setFont" | "setAlignment" | "resizeRange" | "setFill" | "setNumberFormat" | "setBorders" | "sortRange";
   beforeFingerprint: string;
   afterFingerprint: string | null;
 };
@@ -1256,19 +1586,31 @@ export async function executeWpsPlan(
     if (!supportedAction(action)) throw new Error(`WPS 当前不执行「${action.type}」。`);
     assertAllowedAction(action);
   });
-  const workbook = application.ActiveWorkbook;
+  const workbook = wpsReadWorkbook(application);
   if (!workbook || workbook.ReadOnly !== false) throw new Error("当前 WPS 工作簿已不再处于可编辑状态。");
+  const assertSourcesCurrent = () => {
   for (const source of prepared.sources) {
     const authorized = prepared.authorization.sheets.find((sheet) => sheet.index === source.sheetIndex);
     if (!authorized || authorized.name !== source.sheetName) {
       throw new Error(`源工作表「${source.sheetName}」不在预览时的授权范围，请重新预览。`);
     }
     const sheet = assertWpsAuthorization(application, prepared.authorization, authorized);
-    const current = readMatrices(rangeFor(sheet, source.range), source.rowCount, source.columnCount);
+    const sourceRange = rangeFor(sheet, source.range);
+    if (sourceRange.MergeCells !== false || !isCompleteSourceMatrix(sourceRange.Value2, source.rowCount, source.columnCount)
+      || !isCompleteSourceMatrix(sourceRange.Formula, source.rowCount, source.columnCount)) {
+      throw new Error(`源区域「${source.sheetName}!${source.range}」无法完整重读，未执行写入。`);
+    }
+    const current = readMatrices(sourceRange, source.rowCount, source.columnCount);
     if (current.fingerprint !== source.previewFingerprint) {
       throw new Error(`源区域「${source.sheetName}!${source.range}」在预览后发生变化，请重新预览并确认。`);
     }
+    if (source.presentationFingerprint !== undefined && JSON.stringify(computationPresentation(
+      rangeFor(sheet, source.range), source.rowCount, source.columnCount)) !== source.presentationFingerprint) {
+      throw new Error(`计算来源「${source.sheetName}!${source.range}」的数字格式或显示文本已变化，请重新计算。`);
+    }
   }
+  };
+  assertSourcesCurrent();
   onProgress?.({
     stage: "snapshot",
     message: "正在保存执行前恢复点…",
@@ -1326,6 +1668,38 @@ export async function executeWpsPlan(
   };
   upsertRecord(application, record);
 
+  // A durable checkpoint awaits the local server. Recheck sources after that await,
+  // immediately before the first host write; preparation-time evidence alone is stale.
+  const attemptedActions = new Set<number>();
+  let interruptedHostWrite = false;
+  let interruptedValueAction: number | null = null;
+  const assertPriorWritesCurrent = () => {
+    for (const prior of record.actions) {
+      if (prior.appliedRows === 0) continue;
+      const priorSheet = getStoredSheet(application, record, prior);
+      const priorRange = rangeFor(priorSheet, prior.range);
+      const matches = isFormatActionType(prior.type)
+        ? formatActionSafeToUndo(asFormatFields(prior), prior.afterFormatSnapshot, captureWpsFormatSnapshot(priorRange, prior.rowCount, prior.columnCount))
+        : readMatrices(priorRange, prior.rowCount, prior.columnCount).fingerprint === prior.afterFingerprint;
+      if (!matches) throw new Error("等待期间已执行区域发生外部变化，已停止后续动作并保留恢复点。");
+    }
+  };
+  const refreshAppliedFormatEvidence = () => {
+    for (const prior of record.actions) {
+      if (!isFormatActionType(prior.type) || prior.appliedRows === 0) continue;
+      const priorSheet = getStoredSheet(application, record, prior);
+      const snapshot = captureWpsFormatSnapshot(rangeFor(priorSheet, prior.range), prior.rowCount, prior.columnCount);
+      if (!snapshot.captured) throw new Error("已执行格式的回读依据不完整，已停止后续动作。");
+      formatEvidenceFingerprint(asFormatFields(prior), snapshot);
+      prior.afterFormatSnapshot = snapshot;
+    }
+  };
+  let firstWriteChecked = false;
+  const beforeFirstMutation = () => {
+    if (firstWriteChecked) return;
+    assertSourcesCurrent();
+    firstWriteChecked = true;
+  };
   // 回读矩阵按 actionIndex 存，只活在这次调用的闭包里。
   const afterByIndex = new Map<number, WpsActionAfter>();
   const matchByIndex = new Map<number, boolean>();
@@ -1346,14 +1720,14 @@ export async function executeWpsPlan(
     record.state = "applying";
     upsertRecord(application, record);
     for (const [position, action] of record.actions.entries()) {
-      const sheet = getStoredSheet(application, record, action);
+      let sheet = getStoredSheet(application, record, action);
 
       // 格式动作：执行前现场采集逐格/逐行格式快照（撤销依据 + 回读基线）。
       // 同区域多个格式动作按顺序执行，后一个动作的"写前格式"是前一个执行后的状态，
       // 必须在**这里**（本动作执行前）采集，不能在开头统一采集。
       if (isFormatActionType(action.type)) {
         const formatAction = asFormatFields(action);
-        const formatRange = rangeFor(sheet, action.range);
+        let formatRange = rangeFor(sheet, action.range);
         const beforeFormat = captureWpsFormatSnapshot(formatRange, action.rowCount, action.columnCount);
         if (!beforeFormat.captured) {
           throw new Error(`区域「${action.sheetName}!${action.range}」的格式无法完整逐格采集，未执行写入。`);
@@ -1397,8 +1771,22 @@ export async function executeWpsPlan(
           actionCount: record.actions.length,
           cellCount: action.cellCount
         });
-        applyFormatAction(formatRange, formatAction);
+        beforeFirstMutation();
+        sheet = getStoredSheet(application, record, action);
+        formatRange = rangeFor(sheet, action.range);
+        if (wpsReadWorkbook(application)?.ReadOnly !== false || sheet.ProtectContents !== false || formatRange.MergeCells !== false
+          || formatEvidenceFingerprint(formatAction, captureWpsFormatSnapshot(formatRange, action.rowCount, action.columnCount)) !== beforeFingerprint) {
+          throw new Error("检查期间目标状态或格式发生变化，未执行本动作。");
+        }
+        assertPriorWritesCurrent();
+        attemptedActions.add(action.actionIndex);
+        // Persist the before snapshot before entering a setter; it may modify a cell and then throw.
         action.appliedRows = action.rowCount;
+        upsertRecord(application, record);
+        interruptedHostWrite = true;
+        applyFormatAction(formatRange, formatAction);
+        refreshAppliedFormatEvidence();
+        interruptedHostWrite = false;
         // 回读格式快照，比对目标属性是否改到、未声明属性是否保持写前值。
         const afterFormat = captureWpsFormatSnapshot(formatRange, action.rowCount, action.columnCount);
         const afterFingerprint = formatEvidenceFingerprint(formatAction, afterFormat);
@@ -1450,6 +1838,15 @@ export async function executeWpsPlan(
           afterFingerprint: null
         });
       }
+      beforeFirstMutation();
+      sheet = getStoredSheet(application, record, action);
+      const checkedRange = rangeFor(sheet, action.range);
+      if (wpsReadWorkbook(application)?.ReadOnly !== false || sheet.ProtectContents !== false || checkedRange.MergeCells !== false
+        || !isCompleteSourceMatrix(checkedRange.Formula, action.rowCount, action.columnCount)
+        || readMatrices(checkedRange, action.rowCount, action.columnCount).fingerprint !== action.beforeFingerprint) {
+        throw new Error("检查期间目标状态或内容发生变化，未执行本动作。");
+      }
+      assertPriorWritesCurrent();
       for (let offset = 0; offset < action.rowCount; offset += capabilities.wpsWrite.chunkRows) {
         const rows = Math.min(capabilities.wpsWrite.chunkRows, action.rowCount - offset);
         onProgress?.({
@@ -1466,11 +1863,15 @@ export async function executeWpsPlan(
         });
         const chunk = rangeFor(sheet, rangeAddress(action.rect, offset, rows));
         const chunkValues = action.values.slice(offset, offset + rows);
+        attemptedActions.add(action.actionIndex);
+        action.appliedRows = offset + rows;
+        upsertRecord(application, record);
+        interruptedValueAction = action.actionIndex;
         if (action.type === "writeFormulas") setRangeFormulas(chunk, chunkValues);
         else setRangeValues(chunk, chunkValues);
-        action.appliedRows = offset + rows;
         const afterChunk = readMatrices(rangeFor(sheet, action.range), action.rowCount, action.columnCount);
         action.afterFingerprint = afterChunk.fingerprint;
+        interruptedValueAction = null;
         // 这一读本来就有（分块进度 + 指纹），矩阵随即丢弃；这里顺手留一份，
         // 分块中途失败时它就是最后一块真实的现场。不新增任何宿主调用。
         afterByIndex.set(action.actionIndex, {
@@ -1547,9 +1948,23 @@ export async function executeWpsPlan(
     return record;
   } catch (error) {
     for (const action of record.actions) {
+      // A failed pre-write check is not proof that this execution changed the sheet.
+      if (!attemptedActions.has(action.actionIndex)) continue;
       try {
         const sheet = getStoredSheet(application, record, action);
+        if (isFormatActionType(action.type)) {
+          if (!interruptedHostWrite && action.afterFormatSnapshot) continue;
+          const partialFormat = captureWpsFormatSnapshot(rangeFor(sheet, action.range), action.rowCount, action.columnCount);
+          if (partialFormat.captured && action.beforeFormatSnapshot) {
+            const changed = formatEvidenceFingerprint(asFormatFields(action), partialFormat) !== formatEvidenceFingerprint(asFormatFields(action), action.beforeFormatSnapshot);
+            action.appliedRows = changed ? action.rowCount : 0;
+            if (changed) action.afterFormatSnapshot = partialFormat;
+          }
+          continue;
+        }
+        if (action.afterFingerprint && interruptedValueAction !== action.actionIndex) continue;
         const current = readMatrices(rangeFor(sheet, action.range), action.rowCount, action.columnCount);
+        if (current.fingerprint === action.beforeFingerprint) action.appliedRows = 0;
         // 只为"已经写过但没留下回读矩阵"的动作补一份现场（例如第一块写入就抛错）。
         // 没写过的动作不补：它的"修改后"就该是未采集，不能拿"跟修改前一样"糊过去。
         if (action.appliedRows > 0 && !afterByIndex.has(action.actionIndex)) {
@@ -1563,12 +1978,7 @@ export async function executeWpsPlan(
           action.appliedRows = action.rowCount;
           action.afterFingerprint = current.fingerprint;
         }
-        // 格式动作：部分写入时也留一份**当前**格式快照当最终状态，撤销冲突检测才
-        // 按最终状态比（读不到就留空，撤销退回"声明目标值"旧口径）。
-        if (isFormatActionType(action.type) && action.appliedRows > 0) {
-          const partialFormat = captureWpsFormatSnapshot(rangeFor(sheet, action.range), action.rowCount, action.columnCount);
-          if (partialFormat.captured) action.afterFormatSnapshot = partialFormat;
-        }
+
       } catch {
         // Keep the durable before-snapshot even when the host can no longer be inspected.
       }
@@ -1585,7 +1995,7 @@ export async function executeWpsPlan(
 }
 
 export function latestWpsUndo(application: WpsApplication): WpsUndoRecord | null {
-  const workbook = application.ActiveWorkbook;
+  const workbook = wpsReadWorkbook(application);
   const identity = String(workbook?.FullName ?? "").trim().toLowerCase();
   return readRecords(application).find((record) =>
     record.workbookIdentity === identity &&
@@ -1729,7 +2139,7 @@ export async function undoWpsExecution(  application: WpsApplication,
   if (!["verified", "partial_write_recoverable", "undo_conflict"].includes(record.state)) {
     throw new Error("这个恢复点当前不可撤销。");
   }
-  const workbook = application.ActiveWorkbook;
+  const workbook = wpsReadWorkbook(application);
   if (!workbook || workbook.ReadOnly !== false) throw new Error("当前 WPS 工作簿不可编辑，无法撤销。");
   for (const action of record.actions) {
     if (action.appliedRows === 0) continue;

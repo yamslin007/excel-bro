@@ -1,4 +1,7 @@
 import { describe, expect, it } from "vitest";
+import { compileControlledScript } from "@excel-bro/core/controlledScript";
+import { assertEditablePlan } from "../../excel-addin/src/contracts";
+import { captureWpsBeforeResult, stageWpsBeforeComparison } from "./wpsNativeComparison";
 import {
   canClaimWriteSuccess,
   cellDisplayText,
@@ -116,6 +119,32 @@ function hostWithSource() {
 }
 
 describe("WPS guarded plan executor", () => {
+  it("controlled JS executes and restores two selected sheets; optional comparison does not block capture", async () => {
+    const one = host([["before1"]]), two = host([["before2"]]), secret = host([["private"]]);
+    const sheets = [one, two, secret].map((fixture, i) => {
+      const sheet = fixture.application.ActiveWorkbook!.Worksheets.Item(1);
+      sheet.Name = ["One", "Two", "Secret"][i];
+      return sheet;
+    });
+    one.application.ActiveWorkbook!.Worksheets = {Count:3, Item:(index: number) => sheets[index - 1]};
+    const scriptPlan: unknown = plan([]);
+    Object.assign(scriptPlan!, {actions:compileControlledScript('for(const sheet of authorizedSheets) emit({type:"writeValues",sheet,range:"A1",values:[[sheet]]});',["One","Two"])});
+    assertEditablePlan(scriptPlan);
+    const prepared = prepareWpsPlan(one.application, [1,2], scriptPlan);
+    let before!: ReturnType<typeof captureWpsBeforeResult>;
+    expect(() => { before = captureWpsBeforeResult(one.application, prepared); }).not.toThrow();
+    expect(before.values.map(value => value.values)).toEqual([[["before1"]], [["before2"]]]);
+    expect(one.values()).toEqual([["before1"]]);
+    const record = await executeWpsPlan(one.application, prepared);
+    expect(one.values()).toEqual([["One"]]);
+    expect(two.values()).toEqual([["Two"]]);
+    expect(secret.values()).toEqual([["private"]]);
+    expect(() => stageWpsBeforeComparison(one.application, before)).toThrow("单张工作表");
+    await undoWpsExecution(one.application, record.executionId);
+    expect(one.values()).toEqual([["before1"]]);
+    expect(two.values()).toEqual([["before2"]]);
+    expect(() => prepareWpsPlan(one.application, [1], scriptPlan)).toThrow();
+  });
   it("allows the observed 12.0 JSAPI in development but rechecks it before execution", async () => {
     const target = host([["旧值"]]);
     target.application.Version = "12.0";
@@ -333,13 +362,13 @@ describe("WPS guarded plan executor", () => {
    * 常用格式操作在 WPS 端的接通状态（Task #53）：
    * - setFont / setAlignment / resizeRange **已接通**（但只开放已实机验证的属性子集，
    *   未验证属性在预检里明确拒绝，见 `wpsFormatCapability.test.ts`）。
-   * - setFill / setNumberFormat / setBorders / autofit 仍未接通，必须保持 fail-closed：
+   * - setFill / setNumberFormat 缺少快照时拒绝；setBorders 缺少逐边颜色来源快照时拒绝，autofit 仍未接通，必须保持 fail-closed：
    *   在动工作簿**之前**整份计划被拒，且不留下任何恢复点。
    *
    * 这条用例的作用是让"顺手把配置放开了"这件事立刻变红 —— 而不是等到实机上
    * 出现"计划显示成功、表格格式没变"。
    */
-  it("refuses still-unwired 常用格式操作 before touching the workbook (setFill/setNumberFormat/setBorders/autofit)", () => {
+  it("refuses missing format metadata and still-unwired actions before touching the workbook", () => {
     const target = host([["表头", 1200]]);
     const unwiredActions: AnalysisPlan["actions"] = [
       { type: "setFill", sheet: "明细", range: "A1:B1", color: "#DDEEFF" },
@@ -348,7 +377,9 @@ describe("WPS guarded plan executor", () => {
       { type: "autofit", sheet: "明细", range: "A1:B1" }
     ];
     for (const action of unwiredActions) {
-      expect(() => prepareWpsPlan(target.application, [1], plan([action]))).toThrow("当前不执行");
+      expect(() => prepareWpsPlan(target.application, [1], plan([action]))).toThrow(
+        action.type === "setFill" || action.type === "setNumberFormat" || action.type === "setBorders" ? /无法完整逐格采集/ : /当前不执行/
+      );
     }
     expect(target.values()).toEqual([["表头", 1200]]);
     // 没有任何写入 ⇒ 不允许留下恢复点；否则撤销列表里会出现一份"什么也没改"的记录。

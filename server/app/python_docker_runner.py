@@ -529,6 +529,9 @@ def _new_container_name() -> str:
 # ---------------------------------------------------------------------------
 # 有界输出收集器（并发、双通道独立上限、提前终止）
 # ---------------------------------------------------------------------------
+EXECUTION_STARTED_MARKER = b"\x1eEB_PYTHON_EXECUTION_STARTED_V1\x1f\n"
+
+
 class _OutputCollector:
     """并发读取容器 stdout/stderr 的**有界**收集器。
     - 每个通道独立字节上限；一旦触顶立即置 ``over_limit``，不再累积
@@ -570,6 +573,10 @@ class _OutputCollector:
     def stderr_bytes(self) -> bytes:
         with self._lock:
             return bytes(self._stderr)
+    def execution_started(self) -> bool:
+        with self._lock:
+            # 只接受工作程序首帧，不能把 traceback 中的文字当成控制帧。
+            return self._stderr.startswith(EXECUTION_STARTED_MARKER)
     def stdout_size(self) -> int:
         with self._lock:
             return len(self._stdout)
@@ -815,6 +822,7 @@ def run_python_isolated(
     max_result_depth: int = _DEFAULT_MAX_RESULT_DEPTH,
     max_result_elements: int = _DEFAULT_MAX_RESULT_ELEMENTS,
     cancel_check=None,
+    on_runner_start=None,
     endpoint: VerifiedEndpoint | None = None,
 ) -> DockerRunResult:
     """执行一次隔离 Python 分析。失败关闭：任何环节异常都有明确生命周期。
@@ -869,6 +877,16 @@ def run_python_isolated(
     # 用锁定端点执行 docker run
     full_args = ["docker", *endpoint.cli_prefix(), *args[1:]]
     collector = _OutputCollector(stdout_cap=max_output_bytes, stderr_cap=max_stderr_bytes)
+    execution_notified = False
+
+    def notify_execution(*, completed=False):
+        nonlocal execution_notified
+        # 旧不可变镜像没有控制帧，只能在合法成功回包之后确认执行过；不猜运行中。
+        if not execution_notified and (collector.execution_started() or completed):
+            execution_notified = True
+            if on_runner_start is not None:
+                on_runner_start()
+
     proc = None
     terminally_cleaned = False
     import time as _time
@@ -897,6 +915,7 @@ def run_python_isolated(
         # 等待：输入失败 / 输出超限 / 取消 / 超时 / 自然结束
         status_early: str | None = None
         while True:
+            notify_execution()
             # 输入传输失败不得被吞掉后继续发布成功结果（F1）——直接进入失败分支。
             if stdin_state["error"] is not None:
                 status_early = "input_error"
@@ -932,6 +951,7 @@ def run_python_isolated(
         t_out.join(timeout=5)
         t_err.join(timeout=5)
         t_in.join(timeout=5)
+        notify_execution()
         # 取消后迟到结果 → 拒绝（清理核查同样必须被消费，F2）
         if cancel_check is not None and cancel_check():
             state = _cleanup_container(container_name, endpoint=endpoint)
@@ -972,6 +992,7 @@ def run_python_isolated(
         )
         if not ok_payload:
             return DockerRunResult("error", proc.returncode, None, err_reason or "execution_error")
+        notify_execution(completed=True)
         return DockerRunResult(
             "completed", 0,
             {"status": "completed", "result": result_value},

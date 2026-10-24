@@ -13,7 +13,7 @@
  *  3. 已提交的回答跨重载存活：继续时原需求与确认内容一起重新发出。
  *  4. 取消是终态：重开后不会再被摆成"可以继续"。
  *  5. 写入状态未知时**不得**显示"原表未写入"。
- *  6. 没有恢复记录的旧卡片不被冒充成可继续任务。
+ *  6. 没有恢复记录的旧卡片不被冒充成可继续分析。
  */
 import { act, type ReactElement } from "react";
 import { createRoot } from "react-dom/client";
@@ -520,7 +520,7 @@ describe("待答澄清：面板重载后任务仍然可继续", () => {
     );
     expect(container.querySelector(".clarification-recovery")).toBeNull();
     expect(recoveryButtons(container)).toEqual([]);
-    expect(textOf(container)).not.toContain("继续任务");
+    expect(textOf(container)).not.toContain("继续分析");
   });
 
   it("点「核对待续跑状态」不得重新规划：不调用规划、不生成新写入计划", async () => {
@@ -591,7 +591,7 @@ describe("待答澄清：面板重载后任务仍然可继续", () => {
       () => Boolean(container.querySelector(".clarification-recovery")),
       "应渲染中断卡"
     );
-    await click(recoveryButton(container, "继续任务"));
+    await click(recoveryButton(container, "重新分析"));
     await until(() => runTurnMock.mock.calls.length === 1, "继续应发起一轮");
     await until(
       () => storedTaskResumes().some((item) => item.phase === "answer_submitted"),
@@ -609,7 +609,7 @@ describe("待答澄清：面板重载后任务仍然可继续", () => {
     expect(kept.every((item) => (item.confirmations as unknown[]).length === 1)).toBe(true);
   });
 
-  it("没有恢复记录的旧卡片不被冒充成可继续任务", async () => {
+  it("没有恢复记录的旧卡片不被冒充成可继续分析", async () => {
     seedHistory([
       {
         id: "m1",
@@ -671,7 +671,7 @@ describe("已提交答案：断线后不丢答案、不重复询问", () => {
       resultContext: null,
       provider: "model"
     } as never);
-    await click(recoveryButton(reopened, "继续任务"));
+    await click(recoveryButton(reopened, "重新分析"));
     await until(() => runTurnMock.mock.calls.length === 3, "继续应发起新的一轮");
     const prompt = (runTurnMock.mock.calls[2][0] as { prompt: string }).prompt;
     expect(prompt).toContain("帮我处理表格");
@@ -798,7 +798,7 @@ describe("重新授权不是澄清答案", () => {
       () => Boolean(container.querySelector(".clarification-recovery")),
       "应渲染中断卡"
     );
-    await click(recoveryButton(container, "继续任务"));
+    await click(recoveryButton(container, "重新分析"));
     await until(() => runTurnMock.mock.calls.length === 1, "继续应发起一轮");
 
     const cards = storedClarifications();
@@ -822,7 +822,7 @@ describe("重新授权不是澄清答案", () => {
       () => Boolean(container.querySelector(".clarification-recovery")),
       "应渲染中断卡"
     );
-    await click(recoveryButton(container, "继续任务"));
+    await click(recoveryButton(container, "重新分析"));
     await until(() => runTurnMock.mock.calls.length === 1, "继续应发起一轮");
 
     for (const card of storedClarifications()) {
@@ -847,7 +847,7 @@ describe("重新授权不是澄清答案", () => {
       () => Boolean(container.querySelector(".clarification-recovery")),
       "应渲染中断卡"
     );
-    await click(recoveryButton(container, "继续任务"));
+    await click(recoveryButton(container, "重新分析"));
     await until(() => runTurnMock.mock.calls.length === 1, "继续应发起一轮");
 
     const prompt = (runTurnMock.mock.calls[0][0] as { prompt: string }).prompt;
@@ -867,7 +867,7 @@ describe("重新授权不是澄清答案", () => {
       () => Boolean(container.querySelector(".clarification-recovery")),
       "应渲染中断卡"
     );
-    await click(recoveryButton(container, "继续任务"));
+    await click(recoveryButton(container, "重新分析"));
     await until(() => runTurnMock.mock.calls.length === 1, "重授权后应发起新一轮");
     // 不得谎称范围已变 —— 引用换了不等于表换了。
     expect(textOf(container)).not.toContain("数据范围已经变化");

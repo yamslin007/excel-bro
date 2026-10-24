@@ -113,11 +113,16 @@ def test_python_completion_emits_event_with_result_handle():
     assert "resultHandle" in result
     result_handle = result["resultHandle"]
 
-    # 5. 断言：事件已发送
-    assert len(emitted_events) == 1
-    event = emitted_events[0]
+    # 5. 断言：完成事件已发送（代码生命周期事件是另一类，不能顶替它）
+    completion = [item for item in emitted_events if "pythonResult" in item]
+    assert len(completion) == 1, emitted_events
+    event = completion[0]
+    assert len([item for item in emitted_events if item.get("status") == "completed"]) == 1
+    assert event["pythonCode"]["stage"] == "analysis_completed"
     assert event["phase"] == "planning"
-    assert event["stepId"] == "python.completed"
+    # 步骤身份带本次执行的 run_id（`py_<12hex>`）：写死 `python.completed` 时，
+    # 同一任务里跑两次分析会合并成同一个步骤。
+    assert event["stepId"].startswith("python.analysis:py_"), event["stepId"]
     assert event["status"] == "completed"
     assert event["title"] == "隔离 Python 分析完成"
     assert "pythonResult" in event
@@ -127,9 +132,29 @@ def test_python_completion_emits_event_with_result_handle():
     assert event["pythonResult"]["rowCount"] > 0
     assert event["pythonResult"]["columnCount"] > 0
 
+    # 6. 断言：代码块的状态事件**只带身份与规模**，不带正文。
+    # 这是"生成的代码不进入持久化现场"的判据 —— 事件会被写进
+    # planning_task_events（SQLite），正文一进去就落盘。
+    lifecycle = [item for item in emitted_events if "pythonCode" in item]
+    assert [item["pythonCode"]["stage"] for item in lifecycle] == [
+        "generated",
+        "validating",
+        "running",
+        "analysis_completed",
+    ]
+    for item in lifecycle:
+        assert "code" not in item["pythonCode"]
+        assert "delta" not in item["pythonCode"]
+        assert item["stepId"].startswith("python.analysis:py_")
+    # 同一次执行的全部生命周期事件落在**同一个**步骤上（否则代码块会变成好几块）。
+    assert len({item["stepId"] for item in lifecycle}) == 1
+    # 正文整段不出现在任何一条事件里。
+    emitted_text = str(emitted_events)
+    assert "result = {'kind': 'matrix'" not in emitted_text
+
 
 def test_python_failure_does_not_emit_completion_event():
-    """Python 分析失败时，不应发送完成事件。"""
+    """Python 分析失败时，不应发送完成事件，但代码块状态必须如实收尾。"""
     class FakeRequest:
         turnId = "test-turn-456"
 
@@ -152,8 +177,32 @@ def test_python_failure_does_not_emit_completion_event():
     assert result["status"] in ("rejected", "unavailable")
     assert "resultHandle" not in result
 
-    # 断言：没有事件被发送
-    assert len(emitted_events) == 0
+    # 断言：没有完成事件（没有结果卡就没有"分析完成"）
+    assert [item for item in emitted_events if "pythonResult" in item] == []
+
+    # 断言：代码块不能停在"正在运行"——执行没成，状态要落到失败。
+    # 只断言"没有事件"会把一个卡在运行态的界面判成通过。
+    stages = [
+        item["pythonCode"]["stage"]
+        for item in emitted_events
+        if "pythonCode" in item
+    ]
+    # 这里一次**执行器都没启动**（没有可信数据登记 ⇒ prepare 阶段就停下），
+    # 所以既没有 running，也没有 executedVersion —— 旧实现在这条路径上会发出
+    # `validating → running(executedVersion=1) → execution_failed`，等于宣称
+    # 一段从未运行的代码"跑过了"。
+    assert stages == ["generated", "not_started"]
+    assert "running" not in stages
+    assert not any(
+        "executedVersion" in item["pythonCode"]
+        for item in emitted_events
+        if "pythonCode" in item
+    )
+    assert not any(
+        item["status"] == "completed"
+        for item in emitted_events
+        if "pythonCode" in item
+    )
 
 
 def test_python_event_includes_only_result_handle_not_values():
@@ -179,10 +228,14 @@ def test_python_event_includes_only_result_handle_not_values():
     ))
 
     assert result["status"] == "completed"
-    event = emitted_events[0]
+    completion = [item for item in emitted_events if "pythonResult" in item]
+    assert len(completion) == 1, emitted_events
+    event = completion[0]
+    assert len([item for item in emitted_events if item.get("status") == "completed"]) == 1
+    assert event["pythonCode"]["stage"] == "analysis_completed"
 
-    # 断言：事件中没有任何源数据或分析结果的值
-    event_str = str(event)
+    # 断言：**所有**事件里都没有源数据或分析结果的值（不只完成事件）
+    event_str = str(emitted_events)
     assert "SECRET_VALUE" not in event_str
     assert "CONFIDENTIAL" not in event_str
     assert "ANALYZED_123" not in event_str

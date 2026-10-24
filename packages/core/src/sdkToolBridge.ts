@@ -418,6 +418,8 @@ export interface BridgeServiceResult {
   /** 真正执行了本地查询的次数。 */
   executed: number;
   outcomes: BridgeOutcomeEntry[];
+  /** 这一轮跑到一半发现"已收尾/已换轮"，结果**不得**回写。 */
+  stale?: boolean;
 }
 
 /**
@@ -428,8 +430,10 @@ export interface BridgeServiceResult {
  */
 export async function serviceBridgeOnce(
   state: SdkBridgeState,
-  ports: BridgeHostPorts
+  ports: BridgeHostPorts,
+  options: { isStale?: () => boolean } = {}
 ): Promise<BridgeServiceResult> {
+  const isStale = options.isStale ?? (() => false);
   const binding = state.binding;
   if (binding === null || state.cancelled) {
     return { state, polled: false, executed: 0, outcomes: [] };
@@ -439,6 +443,10 @@ export async function serviceBridgeOnce(
   let polled = false;
   if (shouldPollBridge(next)) {
     const response = await ports.poll(binding);
+    if (isStale()) {
+      // 轮询期间这一轮已经被收尾/被新一轮取代：不回写，也不执行读表。
+      return { state, polled: true, executed: 0, outcomes: [], stale: true };
+    }
     next = applyBridgePollResponse(next, response);
     polled = true;
   }
@@ -447,6 +455,9 @@ export async function serviceBridgeOnce(
   let executed = 0;
   for (const call of [...next.pending]) {
     if (next.cancelled) break;
+    if (isStale()) {
+      return { state: next, polled, executed, outcomes, stale: true };
+    }
     const decision = decideBridgeReceipt(next, call.operationId, call.requestFingerprint);
     if (decision !== "accepted") {
       // 已交付 / 会话已取消：本地短路，不重复读宿主。同时把它移出待执行列表，
@@ -464,12 +475,28 @@ export async function serviceBridgeOnce(
       continue;
     }
     const verdict = await ports.verify(binding, call);
+    if (isStale()) {
+      // 复核期间被收尾：**不执行**。读表本身是只读的，但执行完就会去回执，
+      // 那条回执会进到新一轮的桥上 —— 旧一轮的读表结果不该出现在新任务里。
+      return { state: next, polled, executed, outcomes, stale: true };
+    }
     let outcome: BridgeCallOutcome;
     if (verdict.ok) {
       outcome = await ports.execute(binding, call);
       executed += 1;
     } else {
       outcome = { kind: "error", errorCode: verdict.errorCode };
+    }
+    /*
+     * 读表是**异步**的：复核通过之后、结果回来之前，这一轮仍可能被取消、收尾
+     * 或被新一轮取代。回执一旦发出，旧轮次的读表结果就会以"本轮的工具结果"
+     * 身份进入新一轮的桥，服务端拿它继续往下推理 —— 所以发之前必须再核一次。
+     *
+     * 注意这里只拦"还没发出"的回执：**已经发出的**回执撤不回来，不能声称本地
+     * 取消能改变服务端已经收到的事实，那种情况交给归属、幂等与状态核对。
+     */
+    if (isStale()) {
+      return { state: next, polled, executed, outcomes, stale: true };
     }
     const response = await ports.receipt(binding, call, outcome);
     outcomes.push({
@@ -478,6 +505,14 @@ export async function serviceBridgeOnce(
       status: response.status,
       code: response.code ?? null
     });
+    /*
+     * 回执已经在途时才失效：如实记下 outcome（事实就是发生了），但**不提交**本地
+     * 状态 —— 不推进 `delivered`，也不把这条 pending 当成已成功清掉。整份状态由
+     * 调用方按 `stale` 丢弃。
+     */
+    if (isStale()) {
+      return { state: next, polled, executed, outcomes, stale: true };
+    }
     // accepted/duplicate 才认为服务端已收下；rejected 留给下一轮指针重试。
     if (response.status !== "rejected") {
       next = markBridgeDelivered(next, call.operationId, call.requestFingerprint);
@@ -494,27 +529,34 @@ export async function serviceBridgeOnce(
 /**
  * 反复服务直到没有新的指针（服务端一次只发一个指针，正常情况一轮就够）。
  * ``maxRounds`` 是防呆上限，避免服务端异常时客户端空转。
+ *
+ * ``isStale`` 是**生命周期隔离闸**：调用方（`useSdkToolBridge`）在"上一轮已经收尾"
+ * 或"新一轮已经 `begin`"时把它变假，本函数随即停止 —— 既不再轮询、也不再执行。
+ * 没有它的话，旧一轮的 drain 会拿着旧绑定把 8 轮跑完，然后由调用方把结果整个提交
+ * 回去，把新 `begin` 刚建立的绑定覆盖掉；症状是"继续分析之后桥又聋了"。
  */
 export async function runBridgeUntilIdle(
   state: SdkBridgeState,
   ports: BridgeHostPorts,
-  options: { maxRounds?: number } = {}
+  options: { maxRounds?: number; isStale?: () => boolean } = {}
 ): Promise<BridgeServiceResult> {
   const maxRounds = options.maxRounds ?? 8;
+  const isStale = options.isStale ?? (() => false);
   let current = state;
   let polled = false;
   let executed = 0;
   const outcomes: BridgeOutcomeEntry[] = [];
   for (let round = 0; round < maxRounds; round += 1) {
+    if (isStale()) break;
     if (current.cancelled || (current.pending.length === 0 && !shouldPollBridge(current))) {
       break;
     }
-    const result = await serviceBridgeOnce(current, ports);
+    const result = await serviceBridgeOnce(current, ports, { isStale });
     current = result.state;
     polled = polled || result.polled;
     executed += result.executed;
     outcomes.push(...result.outcomes);
     if (!result.polled && result.outcomes.length === 0) break;
   }
-  return { state: current, polled, executed, outcomes };
+  return { state: current, polled, executed, outcomes, stale: isStale() };
 }

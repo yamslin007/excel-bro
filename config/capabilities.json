@@ -1,4 +1,15 @@
 {
+  "worksheetCheckpoint": {
+    "allowedActions": ["deleteWorksheet", "restoreWorksheet"],
+    "maxBytes": 104857600,
+    "maxExpandedBytes": 536870912,
+    "maxZipEntries": 10000,
+    "maxRestoreCells": 200000,
+    "nativeReadAttempts": 3,
+    "nativeReadRetryDelayMs": 150,
+    "stateWriteAttempts": 4,
+    "stateWriteRetryDelayMs": 75
+  },
   "version": 1,
   "taskContext": {
     "maxConfirmations": 8,
@@ -74,8 +85,45 @@
     "maxCells": 1000,
     "chunkRows": 100,
     "verifiedVersionPrefixes": [],
-    "developmentVersionPrefixes": ["12.0"],
-    "allowedActions": ["writeValues", "writeFormulas", "clearRange:contents", "setFont", "setAlignment", "resizeRange"]
+    "developmentVersionPrefixes": [
+      "12.0"
+    ],
+    "allowedActions": [
+      "writeValues",
+      "writeFormulas",
+      "clearRange:contents",
+      "setFont",
+      "setAlignment",
+      "resizeRange",
+      "setFill",
+      "setNumberFormat",
+      "writeTable",
+      "copyRange",
+      "computeValues",
+      "setBorders",
+      "sortRange"
+    ],
+    "copyTypes": [
+      "values",
+      "link"
+    ],
+    "maxExpandedActions": 500,
+    "actionExpansion": {
+      "writeTable": [
+        "writeValues",
+        "setFont",
+        "setFill"
+      ],
+      "copyRange": [
+        "writeValues",
+        "writeFormulas"
+      ],
+      "computeValues": [
+        "writeValues",
+        "setFont",
+        "setFill"
+      ]
+    }
   },
   "columnMappingFormula": {
     "maxCases": 32,
@@ -89,46 +137,126 @@
       "enabled": true,
       "versions": {
         "16.0": {
-          "writeValues": { "state": "supported" },
-          "writeFormulas": { "state": "supported" },
-          "clearRange:contents": { "state": "supported" },
-          "clearRange:all": { "state": "supported" },
-          "clearRange:formats": { "state": "supported" },
-          "clearRange:hyperlinks": { "state": "supported" },
-          "setFill": { "state": "supported" },
-          "setFont": { "state": "supported" },
-          "setNumberFormat": { "state": "supported" },
-          "setBorders": { "state": "supported" },
-          "setAlignment": { "state": "supported" },
-          "autofit": { "state": "supported" },
-          "resizeRange": { "state": "supported" },
-          "setDataValidation": { "state": "supported" },
-          "setConditionalFormat": { "state": "supported" },
-          "freezePanes": { "state": "supported" },
-          "setHyperlink": { "state": "supported" },
-          "createWorksheet": { "state": "supported" },
-          "deleteWorksheet": { "state": "supported" },
-          "insertRange": { "state": "supported" },
-          "deleteRange": { "state": "supported" },
-          "mergeCells": { "state": "supported" },
-          "unmergeCells": { "state": "supported" },
-          "createTable": { "state": "supported" },
-          "addNamedRange": { "state": "supported" },
-          "activateWorksheet": { "state": "supported" },
-          "writeTable": { "state": "supported" },
-          "copyRange": { "state": "supported" },
-          "sortRange": { "state": "supported" },
-          "removeDuplicates": { "state": "supported" },
-          "filterRange": { "state": "supported" },
-          "clearFilter": { "state": "supported" },
-          "computeValues": { "state": "supported" },
-          "splitGroupAggregate": { "state": "supported" },
-          "createChart": { "state": "supported" },
-          "createPivotTable": { "state": "supported" },
-          "addComment": { "state": "supported" },
-          "addNote": { "state": "supported" },
-          "addImage": { "state": "supported" },
-          "addShape": { "state": "supported" }
+          "writeValues": {
+            "state": "supported"
+          },
+          "writeFormulas": {
+            "state": "supported"
+          },
+          "clearRange:contents": {
+            "state": "supported"
+          },
+          "clearRange:all": {
+            "state": "supported"
+          },
+          "clearRange:formats": {
+            "state": "supported"
+          },
+          "clearRange:hyperlinks": {
+            "state": "supported"
+          },
+          "setFill": {
+            "state": "supported"
+          },
+          "setFont": {
+            "state": "supported"
+          },
+          "setNumberFormat": {
+            "state": "supported"
+          },
+          "setBorders": {
+            "state": "supported"
+          },
+          "setAlignment": {
+            "state": "supported"
+          },
+          "autofit": {
+            "state": "supported"
+          },
+          "resizeRange": {
+            "state": "supported"
+          },
+          "setDataValidation": {
+            "state": "supported"
+          },
+          "setConditionalFormat": {
+            "state": "supported"
+          },
+          "freezePanes": {
+            "state": "supported"
+          },
+          "setHyperlink": {
+            "state": "supported"
+          },
+          "createWorksheet": {
+            "state": "supported"
+          },
+          "deleteWorksheet": {
+            "state": "supported"
+          },
+          "insertRange": {
+            "state": "supported"
+          },
+          "deleteRange": {
+            "state": "supported"
+          },
+          "mergeCells": {
+            "state": "supported"
+          },
+          "unmergeCells": {
+            "state": "supported"
+          },
+          "createTable": {
+            "state": "supported"
+          },
+          "addNamedRange": {
+            "state": "supported"
+          },
+          "activateWorksheet": {
+            "state": "supported"
+          },
+          "writeTable": {
+            "state": "supported"
+          },
+          "copyRange": {
+            "state": "supported"
+          },
+          "sortRange": {
+            "state": "supported"
+          },
+          "removeDuplicates": {
+            "state": "supported"
+          },
+          "filterRange": {
+            "state": "supported"
+          },
+          "clearFilter": {
+            "state": "supported"
+          },
+          "computeValues": {
+            "state": "supported"
+          },
+          "splitGroupAggregate": {
+            "state": "supported"
+          },
+          "createChart": {
+            "state": "supported"
+          },
+          "createPivotTable": {
+            "state": "supported"
+          },
+          "addComment": {
+            "state": "supported"
+          },
+          "addNote": {
+            "state": "supported"
+          },
+          "addImage": {
+            "state": "supported"
+          },
+          "addShape": {
+            "state": "supported"
+          }
         }
       }
     },
@@ -136,46 +264,163 @@
       "enabled": true,
       "versions": {
         "12.0": {
-          "writeValues": { "state": "supported" },
-          "writeFormulas": { "state": "supported" },
-          "clearRange:contents": { "state": "supported" },
-          "clearRange:all": { "state": "unverified", "reason": "WPS 上 applyTo=all 会连格式一并清除，尚未实机验收其回读与恢复。" },
-          "clearRange:formats": { "state": "unverified", "reason": "格式清除后的回读与撤销尚未在 WPS 实机验收。" },
-          "clearRange:hyperlinks": { "state": "unverified", "reason": "WPS 上按 applyTo=hyperlinks 清除实际移除的对象与其回读尚未实机验收。" },
-          "writeTable": { "state": "unverified", "reason": "WPS 表格对象 API 的写入与回读尚未验收。" },
-          "copyRange": { "state": "unverified", "reason": "copyType/转置/跳过空白等变体尚未在 WPS 上逐个验收。" },
-          "sortRange": { "state": "unverified", "reason": "WPS 排序后的真实顺序回读尚未验收。" },
-          "removeDuplicates": { "state": "unverified", "reason": "WPS 去重后的行集合回读尚未验收。" },
-          "filterRange": { "state": "unverified", "reason": "WPS 筛选规则回读尚未验收。" },
-          "clearFilter": { "state": "unverified", "reason": "WPS 清除筛选的规则状态回读尚未验收。" },
-          "computeValues": { "state": "unverified", "reason": "执行时求值路径尚未接入 WPS 执行器。" },
-          "splitGroupAggregate": { "state": "unverified", "reason": "WPS 上多表输出与动态验收条件尚未验收。" },
-          "setFill": { "state": "unverified", "reason": "WPS 填充（Interior.Color/Pattern）尚未实机探测（因前置失败被 abort），保持未验证。" },
-          "setFont": { "state": "supported", "reason": "WPS 字体 bold/italic/name/size/color 已实机验证（underline 未验证，由执行器属性级守卫拒绝）。" },
-          "setNumberFormat": { "state": "unverified", "reason": "WPS 数字格式回读尚未验收。" },
-          "setBorders": { "state": "unverified", "reason": "WPS 边框属性回读尚未验收（未实机探测）。" },
-          "setAlignment": { "state": "supported", "reason": "WPS 水平对齐/自动换行已实机验证（垂直对齐未验证，由执行器属性级守卫拒绝）。" },
-          "autofit": { "state": "unverified", "reason": "WPS 自适应列宽的效果无法稳定回读。" },
-          "resizeRange": { "state": "supported", "reason": "WPS 行高已实机验证（列宽有量化漂移未验证，由执行器属性级守卫拒绝）。" },
-          "setDataValidation": { "state": "unverified", "reason": "WPS 数据验证规则回读尚未验收。" },
-          "setConditionalFormat": { "state": "unverified", "reason": "WPS 条件格式规则回读尚未验收。" },
-          "freezePanes": { "state": "unverified", "reason": "WPS 冻结窗格状态回读尚未验收。" },
-          "setHyperlink": { "state": "unverified", "reason": "WPS JSAPI 的超链接写入与回读尚未实机验收；safety.allowHyperlink 只控制 HYPERLINK() 公式函数，与本动作无关。" },
-          "createWorksheet": { "state": "unverified", "reason": "WPS 新建工作表及其恢复尚未验收。" },
-          "deleteWorksheet": { "state": "unverified", "reason": "WPS 整表删除的恢复资料与撤销尚未验收。" },
-          "insertRange": { "state": "unverified", "reason": "WPS 结构插入会引起引用迁移，尚未验收。" },
-          "deleteRange": { "state": "unverified", "reason": "WPS 结构删除会引起引用迁移，尚未验收。" },
-          "mergeCells": { "state": "unverified", "reason": "WPS 合并/取消合并的影响范围与恢复尚未验收。" },
-          "unmergeCells": { "state": "unverified", "reason": "WPS 取消合并的影响范围与恢复尚未验收。" },
-          "createTable": { "state": "unverified", "reason": "WPS 表格对象身份与回读尚未验收。" },
-          "addNamedRange": { "state": "unverified", "reason": "WPS 名称管理 API 尚未探测与验收。" },
-          "activateWorksheet": { "state": "unverified", "reason": "激活工作表不是写入，但仍需确认授权边界与恢复语义。" },
-          "createChart": { "state": "unverified", "reason": "WPS 图表数据源与位置回读尚未验收。" },
-          "createPivotTable": { "state": "unverified", "reason": "WPS 数据透视表数据源与位置回读尚未验收。" },
-          "addComment": { "state": "unverified", "reason": "WPS 批注 API 尚未验收。" },
-          "addNote": { "state": "unverified", "reason": "WPS 备注 API 尚未验收。" },
-          "addImage": { "state": "unverified", "reason": "WPS 图片插入与位置回读尚未验收。" },
-          "addShape": { "state": "unverified", "reason": "WPS 形状插入与位置回读尚未验收。" }
+          "writeValues": {
+            "state": "supported"
+          },
+          "writeFormulas": {
+            "state": "supported"
+          },
+          "clearRange:contents": {
+            "state": "supported"
+          },
+          "clearRange:all": {
+            "state": "unverified",
+            "reason": "EB 的 WPS 执行器尚未实现 clearRange:all 的执行、回读与恢复闭环；不是仅缺实机验收。"
+          },
+          "clearRange:formats": {
+            "state": "unverified",
+            "reason": "EB 的 WPS 执行器尚未实现 clearRange:formats 的执行、回读与恢复闭环；不是仅缺实机验收。"
+          },
+          "clearRange:hyperlinks": {
+            "state": "unverified",
+            "reason": "EB 的 WPS 执行器尚未实现 clearRange:hyperlinks 的执行、回读与恢复闭环；不是仅缺实机验收。"
+          },
+          "writeTable": {
+            "state": "supported",
+            "reason": "写入表头与数据，并设置表头字体和填充；展开为可回读、恢复的范围动作，不创建表格对象。实机待验收。"
+          },
+          "copyRange": {
+            "state": "supported",
+            "reason": "支持值、链接、转置和跳过空白，来源限已授权区域；支持按明确表头字段条件复制；all/formulas/formats 未实现。实机待验收。"
+          },
+          "sortRange": {
+            "state": "supported",
+            "reason": "WPS 端已实现排序：仅支持明确 A1 区域、稳定排序、空白恒排末位；区域含公式、数据行格式不一致、与表格对象重叠或宿主无法核对表格对象时写入前拒绝。实机待验收。"
+          },
+          "removeDuplicates": {
+            "state": "unverified",
+            "reason": "EB 的 WPS 执行器尚未实现 removeDuplicates 的执行、回读与恢复闭环；不是仅缺实机验收。"
+          },
+          "filterRange": {
+            "state": "unverified",
+            "reason": "EB 的 WPS 执行器尚未实现 filterRange 的执行、回读与恢复闭环；不是仅缺实机验收。"
+          },
+          "clearFilter": {
+            "state": "unverified",
+            "reason": "EB 的 WPS 执行器尚未实现 clearFilter 的执行、回读与恢复闭环；不是仅缺实机验收。"
+          },
+          "computeValues": {
+            "state": "supported",
+            "reason": "已授权现有目标表内的本地确定性计算；与 Excel 共用 query_table。执行前复核来源值、公式、数字格式和显示文本；展开为可回读恢复的值写入和表头样式。不新建目标表，实机待验收。"
+          },
+          "splitGroupAggregate": {
+            "state": "unverified",
+            "reason": "EB 的 WPS 执行器尚未实现 splitGroupAggregate 的执行、回读与恢复闭环；不是仅缺实机验收。"
+          },
+          "setFill": {
+            "state": "supported",
+            "reason": "已实现逐格快照、写入、回读及属性级恢复；宿主字段不可读时写前拒绝，实机待验收。"
+          },
+          "setFont": {
+            "state": "supported",
+            "reason": "WPS 字体 bold/italic/name/size/color 已实机验证（underline 未验证，由执行器属性级守卫拒绝）。"
+          },
+          "setNumberFormat": {
+            "state": "supported",
+            "reason": "已实现逐格快照、写入、回读及属性级恢复；宿主字段不可读时写前拒绝，实机待验收。"
+          },
+          "setBorders": {
+            "state": "supported",
+            "reason": "逐格逐边快照、执行、回读与恢复；必须读取颜色来源和色调，缺少属性时写前拒绝；相邻单元格重复设置同一边界的计划暂拒绝。实机待验。"
+          },
+          "setAlignment": {
+            "state": "supported",
+            "reason": "WPS 水平对齐/自动换行已有实机证据；垂直对齐已实现逐格回读和恢复，缺少旧属性时写前拒绝，实机待验。"
+          },
+          "autofit": {
+            "state": "unverified",
+            "reason": "EB 的 WPS 执行器尚未实现 autofit 的执行、回读与恢复闭环；不是仅缺实机验收。"
+          },
+          "resizeRange": {
+            "state": "supported",
+            "reason": "WPS 行高已实机验证（列宽有量化漂移未验证，由执行器属性级守卫拒绝）。"
+          },
+          "setDataValidation": {
+            "state": "unverified",
+            "reason": "EB 的 WPS 执行器尚未实现 setDataValidation 的执行、回读与恢复闭环；不是仅缺实机验收。"
+          },
+          "setConditionalFormat": {
+            "state": "unverified",
+            "reason": "EB 的 WPS 执行器尚未实现 setConditionalFormat 的执行、回读与恢复闭环；不是仅缺实机验收。"
+          },
+          "freezePanes": {
+            "state": "unverified",
+            "reason": "EB 的 WPS 执行器尚未实现 freezePanes 的执行、回读与恢复闭环；不是仅缺实机验收。"
+          },
+          "setHyperlink": {
+            "state": "unverified",
+            "reason": "EB 的 WPS 执行器尚未实现 setHyperlink 的执行、回读与恢复闭环；不是仅缺实机验收。"
+          },
+          "createWorksheet": {
+            "state": "unverified",
+            "reason": "EB 的 WPS 执行器尚未实现 createWorksheet 的执行、回读与恢复闭环；不是仅缺实机验收。"
+          },
+          "deleteWorksheet": {
+            "state": "supported",
+            "reason": "受控本机检查点通道：仅纯删表计划、本机已保存 XLSX、全部表已授权；完整备份后删除并核对剩余表。恢复打开独立副本，不覆盖原表；实机待验。"
+          },
+          "insertRange": {
+            "state": "unverified",
+            "reason": "EB 的 WPS 执行器尚未实现 insertRange 的执行、回读与恢复闭环；不是仅缺实机验收。"
+          },
+          "deleteRange": {
+            "state": "unverified",
+            "reason": "EB 的 WPS 执行器尚未实现 deleteRange 的执行、回读与恢复闭环；不是仅缺实机验收。"
+          },
+          "mergeCells": {
+            "state": "unverified",
+            "reason": "EB 的 WPS 执行器尚未实现 mergeCells 的执行、回读与恢复闭环；不是仅缺实机验收。"
+          },
+          "unmergeCells": {
+            "state": "unverified",
+            "reason": "EB 的 WPS 执行器尚未实现 unmergeCells 的执行、回读与恢复闭环；不是仅缺实机验收。"
+          },
+          "createTable": {
+            "state": "unverified",
+            "reason": "EB 的 WPS 执行器尚未实现 createTable 的执行、回读与恢复闭环；不是仅缺实机验收。"
+          },
+          "addNamedRange": {
+            "state": "unverified",
+            "reason": "EB 的 WPS 执行器尚未实现 addNamedRange 的执行、回读与恢复闭环；不是仅缺实机验收。"
+          },
+          "activateWorksheet": {
+            "state": "unverified",
+            "reason": "EB 的 WPS 执行器尚未实现 activateWorksheet 的执行、回读与恢复闭环；不是仅缺实机验收。"
+          },
+          "createChart": {
+            "state": "unverified",
+            "reason": "EB 的 WPS 执行器尚未实现 createChart 的执行、回读与恢复闭环；不是仅缺实机验收。"
+          },
+          "createPivotTable": {
+            "state": "unverified",
+            "reason": "EB 的 WPS 执行器尚未实现 createPivotTable 的执行、回读与恢复闭环；不是仅缺实机验收。"
+          },
+          "addComment": {
+            "state": "unverified",
+            "reason": "EB 的 WPS 执行器尚未实现 addComment 的执行、回读与恢复闭环；不是仅缺实机验收。"
+          },
+          "addNote": {
+            "state": "unverified",
+            "reason": "EB 的 WPS 执行器尚未实现 addNote 的执行、回读与恢复闭环；不是仅缺实机验收。"
+          },
+          "addImage": {
+            "state": "unverified",
+            "reason": "EB 的 WPS 执行器尚未实现 addImage 的执行、回读与恢复闭环；不是仅缺实机验收。"
+          },
+          "addShape": {
+            "state": "unverified",
+            "reason": "EB 的 WPS 执行器尚未实现 addShape 的执行、回读与恢复闭环；不是仅缺实机验收。"
+          }
         }
       }
     },
@@ -183,43 +428,117 @@
       "enabled": true,
       "versions": {
         "1.0": {
-          "writeValues": { "state": "supported" },
-          "writeFormulas": { "state": "supported" },
-          "clearRange:contents": { "state": "supported" },
-          "setFill": { "state": "supported" },
-          "setFont": { "state": "supported" },
-          "setNumberFormat": { "state": "supported" },
-          "setBorders": { "state": "supported" },
-          "setAlignment": { "state": "supported" },
-          "autofit": { "state": "supported" },
-          "resizeRange": { "state": "supported" },
-          "freezePanes": { "state": "supported" },
-          "createWorksheet": { "state": "supported" },
-          "deleteWorksheet": { "state": "supported" },
-          "insertRange": { "state": "supported" },
-          "deleteRange": { "state": "supported" },
-          "mergeCells": { "state": "supported" },
-          "unmergeCells": { "state": "supported" },
-          "writeTable": { "state": "supported" },
-          "copyRange": { "state": "supported" },
-          "sortRange": { "state": "supported" },
-          "removeDuplicates": { "state": "supported" },
-          "filterRange": { "state": "supported" },
-          "clearFilter": { "state": "supported" },
-          "computeValues": { "state": "supported" },
-          "splitGroupAggregate": { "state": "supported" },
-          "createTable": { "state": "supported" },
-          "addNamedRange": { "state": "supported" },
-          "activateWorksheet": { "state": "supported" },
-          "setDataValidation": { "state": "supported" },
-          "setConditionalFormat": { "state": "supported" },
-          "setHyperlink": { "state": "supported" },
-          "createChart": { "state": "supported" },
-          "createPivotTable": { "state": "supported" },
-          "addComment": { "state": "supported" },
-          "addNote": { "state": "supported" },
-          "addImage": { "state": "supported" },
-          "addShape": { "state": "supported" }
+          "writeValues": {
+            "state": "supported"
+          },
+          "writeFormulas": {
+            "state": "supported"
+          },
+          "clearRange:contents": {
+            "state": "supported"
+          },
+          "setFill": {
+            "state": "supported"
+          },
+          "setFont": {
+            "state": "supported"
+          },
+          "setNumberFormat": {
+            "state": "supported"
+          },
+          "setBorders": {
+            "state": "supported"
+          },
+          "setAlignment": {
+            "state": "supported"
+          },
+          "autofit": {
+            "state": "supported"
+          },
+          "resizeRange": {
+            "state": "supported"
+          },
+          "freezePanes": {
+            "state": "supported"
+          },
+          "createWorksheet": {
+            "state": "supported"
+          },
+          "deleteWorksheet": {
+            "state": "supported"
+          },
+          "insertRange": {
+            "state": "supported"
+          },
+          "deleteRange": {
+            "state": "supported"
+          },
+          "mergeCells": {
+            "state": "supported"
+          },
+          "unmergeCells": {
+            "state": "supported"
+          },
+          "writeTable": {
+            "state": "supported"
+          },
+          "copyRange": {
+            "state": "supported"
+          },
+          "sortRange": {
+            "state": "supported"
+          },
+          "removeDuplicates": {
+            "state": "supported"
+          },
+          "filterRange": {
+            "state": "supported"
+          },
+          "clearFilter": {
+            "state": "supported"
+          },
+          "computeValues": {
+            "state": "supported"
+          },
+          "splitGroupAggregate": {
+            "state": "supported"
+          },
+          "createTable": {
+            "state": "supported"
+          },
+          "addNamedRange": {
+            "state": "supported"
+          },
+          "activateWorksheet": {
+            "state": "supported"
+          },
+          "setDataValidation": {
+            "state": "supported"
+          },
+          "setConditionalFormat": {
+            "state": "supported"
+          },
+          "setHyperlink": {
+            "state": "supported"
+          },
+          "createChart": {
+            "state": "supported"
+          },
+          "createPivotTable": {
+            "state": "supported"
+          },
+          "addComment": {
+            "state": "supported"
+          },
+          "addNote": {
+            "state": "supported"
+          },
+          "addImage": {
+            "state": "supported"
+          },
+          "addShape": {
+            "state": "supported"
+          }
         }
       }
     }
@@ -270,6 +589,10 @@
   },
   "savedTools": {
     "maxItems": 50
+  },
+  "modelConnectionTest": {
+    "timeoutSeconds": 60,
+    "maxTurns": 3
   },
   "agent": {
     "maxTurns": 8,
@@ -369,6 +692,24 @@
     "maxSummaryCharacters": 1000,
     "folderOperationTtlSeconds": 3600,
     "folderMaxPendingOperations": 100
+  },
+  "pythonCode": {
+    "maxCharsPerEvent": 20000,
+    "previewLines": 6,
+    "collapseAfterLines": 24,
+    "maxCopyChars": 20000
+  },
+  "agentPlanTools": {
+    "maxLiteralCells": 1000
+  },
+  "controlledScript": {
+    "maxSourceCharacters": 32768,
+    "maxSteps": 20000,
+    "maxDepth": 40,
+    "maxActions": 100,
+    "maxTargetCells": 1000,
+    "maxStringCharacters": 32767,
+    "maxOutputCharacters": 262144
   },
   "taskRecovery": {
     "wpsOwnerLeaseSeconds": 120,

@@ -1,0 +1,182 @@
+{
+  "workbookName": "会员.xlsx",
+  "workbookIdentity": "url:https://contoso.sharepoint.com/membership.xlsx",
+  "sourceFingerprint": "fp-source-1",
+  "hostId": "excel-office",
+  "memberSheet": "会员表",
+  "orderSheet": "订单表",
+  "targetSheet": "汇总表",
+  "resultRef": "res_19df37aacb6e89c2a7d885c7e047d888",
+  "result": {
+    "resultRef": "res_19df37aacb6e89c2a7d885c7e047d888",
+    "title": "Python 分析结果",
+    "headers": [
+      "列1",
+      "列2",
+      "列3"
+    ],
+    "rows": [
+      [
+        "会员等级",
+        "金额合计",
+        ""
+      ],
+      [
+        "未匹配",
+        400,
+        ""
+      ],
+      [
+        "金卡",
+        400,
+        ""
+      ],
+      [
+        "银卡",
+        200,
+        ""
+      ],
+      [
+        "空键数",
+        1,
+        ""
+      ],
+      [
+        "重复键数",
+        1,
+        ""
+      ],
+      [
+        "未匹配键",
+        1,
+        "404"
+      ]
+    ],
+    "sourceSheets": [
+      "会员表",
+      "订单表"
+    ],
+    "warnings": [],
+    "complete": true,
+    "calculation": "隔离 Python 分析得到的固定值结果",
+    "scannedRows": 7
+  },
+  "plan": {
+    "id": "result-write-84f98ad897",
+    "title": "写入 汇总表!A1:C8",
+    "summary": "把本地结果「Python 分析结果」写入「汇总表」A1:C8（8 行 × 3 列）。",
+    "sourceFingerprint": null,
+    "sourceFingerprintSheets": [],
+    "sourceDependencySheets": [
+      "会员表",
+      "订单表"
+    ],
+    "assumptions": [],
+    "warnings": [
+      "执行后目标区域的现有内容会被覆盖。"
+    ],
+    "actions": [
+      {
+        "type": "writeValues",
+        "sheet": "汇总表",
+        "range": "A1:C8",
+        "values": [
+          [
+            "列1",
+            "列2",
+            "列3"
+          ],
+          [
+            "会员等级",
+            "金额合计",
+            null
+          ],
+          [
+            "未匹配",
+            400,
+            null
+          ],
+          [
+            "金卡",
+            400,
+            null
+          ],
+          [
+            "银卡",
+            200,
+            null
+          ],
+          [
+            "空键数",
+            1,
+            null
+          ],
+          [
+            "重复键数",
+            1,
+            null
+          ],
+          [
+            "未匹配键",
+            1,
+            "404"
+          ]
+        ]
+      }
+    ],
+    "acceptanceCriteria": [
+      {
+        "type": "worksheetExists",
+        "sheet": "汇总表"
+      },
+      {
+        "type": "rangeEquals",
+        "sheet": "汇总表",
+        "range": "A1:C8",
+        "expected": [
+          [
+            "列1",
+            "列2",
+            "列3"
+          ],
+          [
+            "会员等级",
+            "金额合计",
+            null
+          ],
+          [
+            "未匹配",
+            400,
+            null
+          ],
+          [
+            "金卡",
+            400,
+            null
+          ],
+          [
+            "银卡",
+            200,
+            null
+          ],
+          [
+            "空键数",
+            1,
+            null
+          ],
+          [
+            "重复键数",
+            1,
+            null
+          ],
+          [
+            "未匹配键",
+            1,
+            "404"
+          ]
+        ]
+      }
+    ],
+    "localResultRef": "res_19df37aacb6e89c2a7d885c7e047d888"
+  }
+}

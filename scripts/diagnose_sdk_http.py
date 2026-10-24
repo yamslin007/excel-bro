@@ -88,7 +88,11 @@ async def run(args):
                             fixture["orderSheet"]: fixture["orderRows"],
                             fixture["targetSheet"]: [[""]],
                         }
+                        if args.causal_change:
+                            synthetic_host.SHEET_ROWS[fixture["memberSheet"]] = fixture["causalChange"]["memberRows"]
                         request.update(planningGoal="write_preview", prompt=synthetic_host.PROMPT)
+                        if args.prompt_file:
+                            request["prompt"] = Path(args.prompt_file).read_text(encoding="utf-8-sig")
                         request["workbook"] = {
                             "name": "sdk-http-audit.xlsx", "workbookIdentity": "wps-path:c:\\sdk-http-audit.xlsx",
                             "capturedAt": "2026-10-11T00:00:00Z", "activeWorksheet": fixture["memberSheet"],
@@ -138,7 +142,8 @@ async def run(args):
                                             delivered = await client.post("/api/sdk/tool-bridge/receipt", json={**binding,
                                                 "operationId": call["operationId"], "requestFingerprint": call["requestFingerprint"], "receipt": receipt})
                                             delivered.raise_for_status()
-                                            item["bridgeReceipts"].append({"tool": call["tool"], "status": delivered.status_code})
+                                            item["bridgeReceipts"].append({"tool": call["tool"], "status": delivered.status_code,
+                                                "sources": call["arguments"].get("sources", []) if call["tool"] == "prepare_python_data" else []})
                                     if event == "error":
                                         item["errorCode"] = payload.get("code")
                 except Exception as exc:
@@ -154,6 +159,9 @@ async def run(args):
                     item["elapsedSeconds"] = round(time.monotonic()-started, 3)
                     item["passed"] = (item.get("resultKind") == ("plan" if args.python else "answer")
                         and not item.get("errorCode") and (not args.python or item.get("resultHttpStatus") == 200))
+                    item["transportPassed"] = item["passed"]
+                    item["businessAcceptance"] = "not_checked"
+                    item["causalChange"] = bool(args.causal_change)
                     (out / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
                     print(json.dumps(item, ensure_ascii=False), flush=True)
     finally:
@@ -170,6 +178,8 @@ if __name__ == "__main__":
     parser.add_argument("--out", default="outputs/sdk-http-audit-20261011")
     parser.add_argument("--python", action="store_true", help="Real model + real Docker, synthetic host values; no workbook writes")
     parser.add_argument("--base-url", help="Use a running loopback backend and its real ledger; no configuration changes to that backend")
+    parser.add_argument("--prompt-file", help="Acceptance request text; never supply expected result values")
+    parser.add_argument("--causal-change", action="store_true", help="Change only synthetic source data using the acceptance fixture")
     args = parser.parse_args()
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)

@@ -1707,6 +1707,43 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
   z-index: 2;
 }
 
+/*
+ * 失败/冲突的可展开诊断详情。
+ *
+ * 首屏只显示一行"查看错误详情"的摘要（真实状态的结论在上面那条消息里），
+ * 点开才看到执行身份、现场核对与原因。`pre` 保留换行与等宽，便于照抄报错。
+ * 不写死颜色：文字与背景都走主题令牌，两端同一份观感。
+ */
+.message-error-detail {
+  margin-top: 6px;
+  font-size: var(--font-size-caption);
+}
+
+.message-error-detail > summary {
+  cursor: pointer;
+  color: var(--color-brand-text);
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.message-error-detail > pre {
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  max-height: 220px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  color: var(--color-text-primary, currentColor);
+  font-family: var(--font-family-mono, ui-monospace, monospace);
+  font-size: var(--font-size-caption);
+  line-height: 1.5;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
 /* WPS 内嵌网页允许直接选中文字复制。复制入口沿用 Excel 的鼠标悬停／触屏规则。 */
 .wps-chat-shell .message-text,
 .wps-chat-shell .task-progress-content,

@@ -489,6 +489,9 @@ def test_model_catalog_lists_allowlisted_models_without_a_local_placeholder(
                 "provider": "model",
                 "available": True,
                 "supportsVision": False,
+                "agentAvailable": False,
+                "agentUnavailableReason": "此端点未配置 Anthropic 兼容协议，仅可用于独立公式；请按供应商说明配置 SDK 端点。",
+                "formulaAvailable": True,
             },
             {
                 "id": "fast-model",
@@ -496,6 +499,9 @@ def test_model_catalog_lists_allowlisted_models_without_a_local_placeholder(
                 "provider": "model",
                 "available": True,
                 "supportsVision": False,
+                "agentAvailable": False,
+                "agentUnavailableReason": "此端点未配置 Anthropic 兼容协议，仅可用于独立公式；请按供应商说明配置 SDK 端点。",
+                "formulaAvailable": True,
             },
             {
                 "id": "reasoning-model",
@@ -503,6 +509,9 @@ def test_model_catalog_lists_allowlisted_models_without_a_local_placeholder(
                 "provider": "model",
                 "available": True,
                 "supportsVision": False,
+                "agentAvailable": False,
+                "agentUnavailableReason": "此端点未配置 Anthropic 兼容协议，仅可用于独立公式；请按供应商说明配置 SDK 端点。",
+                "formulaAvailable": True,
             },
         ],
     }
@@ -1474,6 +1483,113 @@ def test_folder_execute_stream_reports_unknown_effect_as_needs_reconciliation(
     )
 
 
+def test_turn_events_endpoint_tails_persisted_events_without_replanning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """只读补发：把正在跑/已跑完的任务事件按序号取回，**不重新规划**。
+
+    这是「原任务仍在运行」时接回事件流的唯一入口 —— 继续端点此时会 409，
+    再发一次需求就是重复规划、重复读表、重复花预算。
+    """
+    calls = {"plan": 0}
+
+    async def fake_create_plan(
+        _request: object,
+        *,
+        tool_cache: object = None,
+        on_event=None,
+        **_checkpoint_options: object,
+    ) -> AnswerResponse:
+        calls["plan"] += 1
+        assert on_event is not None
+        await on_event({"phase": "planning", "stepId": "planning.inspect", "title": "正在查看工作簿结构"})
+        await on_event({"phase": "planning", "stepId": "planning.read", "title": "正在读取数据"})
+        return AnswerResponse(message="完成", provider="model")
+
+    monkeypatch.setattr(main_module, "create_plan", fake_create_plan)
+    client = TestClient(app)
+    payload = {**_STREAM_PAYLOAD, "turnId": "turn-events-tail"}
+    client.post("/api/turn/stream", json=payload)
+
+    first = client.get("/api/turn/turn-events-tail/events").json()
+    assert [event["title"] for event in first["events"]] == [
+        "正在查看工作簿结构",
+        "正在读取数据",
+    ]
+    assert first["lastSequence"] == first["events"][-1]["sequence"]
+    # 跑完之后就不再是 active（重开面板时据此决定要不要继续轮询）。
+    assert first["active"] is False
+
+    after = first["events"][0]["sequence"]
+    tail = client.get(
+        "/api/turn/turn-events-tail/events", params={"afterSequence": after}
+    ).json()
+    assert [event["title"] for event in tail["events"]] == ["正在读取数据"]
+
+    # 判别点：只读接口，没有触发第二次规划。
+    assert calls["plan"] == 1
+    # 不存在的任务如实 404，不编一份空事件列表冒充"任务还在"。
+    missing = client.get("/api/turn/no-such-turn/events")
+    assert missing.status_code == 404
+
+
+def test_folder_execute_stream_closes_the_interrupted_step_as_failed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """执行中途失败时，正在那一步必须有终态，不能只发一条新的 ``folder.failed``。
+
+    否则被打断的步骤永远停在"进行中"，界面上只能靠"出现了失败卡"去猜它没做成。
+    """
+
+    def fake_execute(request, on_progress=None):
+        assert on_progress is not None
+        on_progress(
+            {
+                "executionId": "0123456789abcdef0123456789abcdef",
+                "phase": "executing",
+                "stepId": "folder.action.1",
+                "status": "started",
+                "title": "正在执行第 1 / 1 步",
+                "current": 0,
+                "total": 1,
+                "unit": "actions",
+            }
+        )
+        raise RuntimeError("模拟保存窗口中断")
+
+    monkeypatch.setattr(main_module, "execute_folder_plan", fake_execute)
+    monkeypatch.setattr(main_module, "folder_session_root", lambda _session_id: tmp_path)
+    payload = {
+        "sessionId": "session-interrupted-step-test",
+        "operationId": "folder-interrupted-step-operation",
+        "plan": {
+            "id": "folder-plan-interrupted-step",
+            "title": "创建结果表",
+            "summary": "创建一张结果表",
+            "assumptions": [],
+            "warnings": [],
+            "actions": [{"type": "createWorksheet", "sheet": "结果"}],
+        },
+    }
+    client = TestClient(app)
+
+    response = client.post("/api/folders/execute/stream", json=payload)
+
+    assert response.status_code == 200
+    progress = [
+        _payload for name, _payload in _parse_sse(response.text) if name == "progress"
+    ]
+    steps = [event for event in progress if event.get("stepId") == "folder.action.1"]
+    assert [event["status"] for event in steps] == ["started", "failed"]
+    # 顺序：先给被打断的那一步收尾，再报整体失败。
+    by_step = [event.get("stepId") for event in progress]
+    assert by_step.index("folder.action.1") < by_step.index("folder.failed")
+    # 终态事件带的是这一步自己的标题，不是从整体失败卡复制过来的。
+    assert steps[-1]["title"] == "这一步没有完成"
+    assert steps[-1]["summary"] == "模拟保存窗口中断"
+
+
 def test_folder_resume_stream_claims_checkpoint_and_returns_original_result(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1789,8 +1905,9 @@ def test_turn_stream_persists_unexpected_failure_and_returns_safe_error(
     assert record.error == error
 
 
+@pytest.mark.parametrize("stop_via", ["disconnect", "pause_endpoint"])
 def test_closing_planning_stream_stops_worker_before_releasing_active_fence(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, stop_via: str,
 ) -> None:
     worker_cancelled = asyncio.Event()
 
@@ -1802,17 +1919,13 @@ def test_closing_planning_stream_stops_worker_before_releasing_active_fence(
         on_checkpoint=None,
         **_checkpoint_options: object,
     ) -> AnswerResponse:
+        # SDK 适配器真实产出的现场形状：只有阶段与可信进展，没有消息/工具缓存。
         checkpoint = {
-            "schemaVersion": 1,
-            "kind": "planning",
-            "stage": "tool_batch_completed",
-            "messages": [{"role": "user", "content": "继续前的安全现场"}],
-            "toolCache": {},
-            "loopState": {"activeElapsedSeconds": 1},
-            "toolMode": "all",
-            "repairingSubmission": False,
-            "nextTurnIndex": 1,
-            "pendingAssistantMessage": None,
+            "stage": "after_tool",
+            "confirmations": [],
+            "completedTools": ["query_table"],
+            "resultRefs": [],
+            "failedTool": None,
         }
         if on_checkpoint is not None:
             await on_checkpoint(checkpoint)
@@ -1826,7 +1939,15 @@ def test_closing_planning_stream_stops_worker_before_releasing_active_fence(
         return AnswerResponse(kind="answer", message="不会到达", provider="local")
 
     monkeypatch.setattr(main_module, "create_plan", hanging_create_plan)
-    payload = {**_STREAM_PAYLOAD, "turnId": "turn-stream-close-test"}
+    payload = {
+        **_STREAM_PAYLOAD,
+        "turnId": "turn-stream-close-test",
+        # 断点续跑只对"身份可核对"的工作簿开放；未保存工作簿拿不到这种身份。
+        "workbook": {
+            **_STREAM_PAYLOAD["workbook"],
+            "workbookIdentity": "url:https://example.invalid/close-test.xlsx",
+        },
+    }
     request = main_module.PlanRequest.model_validate(payload)
     record, created = main_module._folder_operation_ledger.register_planning_task(
         request.turnId or "",
@@ -1841,7 +1962,29 @@ def test_closing_planning_stream_stops_worker_before_releasing_active_fence(
         first = await anext(stream)
         assert "event: step" in first
         assert request.turnId in main_module._active_planning_tasks
+        if stop_via == "pause_endpoint":
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as api:
+                ack = await api.post(f"/api/turn/{request.turnId}/pause")
+                assert ack.status_code == 200
+                assert ack.json()["pauseRequested"] is True
+                repeated = await api.post(f"/api/turn/{request.turnId}/pause")
+                assert repeated.json()["pauseRequested"] is True
+            assert main_module._planning_task_handles[request.turnId].cancelling() == 1
+            # Receiving a stop request must not release the concurrency fence.
+            assert request.turnId in main_module._active_planning_tasks
         await stream.aclose()
+        assert request.turnId not in main_module._planning_task_handles
+        assert request.turnId not in main_module._planning_stop_requests
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as api:
+            ack = await api.post(f"/api/turn/{request.turnId}/pause")
+            assert ack.status_code == 200
+            assert ack.json()["pauseRequested"] is False
+            status = await api.get(f"/api/turn/{request.turnId}/status")
+            assert status.json()["status"] == "interrupted"
+            events = await api.get(f"/api/turn/{request.turnId}/events")
+            assert events.json()["active"] is False
+            missing = await api.post("/api/turn/no-such-pause-task/pause")
+            assert missing.status_code == 404
 
     asyncio.run(close_after_first_event())
 
@@ -1851,6 +1994,37 @@ def test_closing_planning_stream_stops_worker_before_releasing_active_fence(
     assert persisted is not None
     assert persisted.status == "running"
     assert persisted.checkpoint is not None
+
+
+@pytest.mark.parametrize("endpoint", ["/api/intent/message", "/api/intent", "/api/turn/stream"])
+@pytest.mark.parametrize("kind", ["quota", "output"])
+def test_usage_limits_reach_user_through_json_and_sse(monkeypatch, endpoint, kind):
+    from server.app.llm import LLMHTTPStatusError, LLMUsageLimitError
+
+    async def failing(*args, **kwargs):
+        if kind == "quota":
+            raise LLMHTTPStatusError(429, '{"error":{"code":"insufficient_quota","message":"PRIVATE_KEY"}}')
+        raise LLMUsageLimitError("MODEL_OUTPUT_LIMIT")
+
+    monkeypatch.setattr(main_module, "selected_model_config", lambda *args: None)
+    monkeypatch.setattr(main_module, "check_intent", failing)
+    monkeypatch.setattr(main_module, "check_message_understanding", failing)
+    monkeypatch.setattr(main_module, "create_plan", failing)
+    payload = _STREAM_PAYLOAD if endpoint.endswith("stream") else (
+        _intent_payload("分析当前表") if endpoint == "/api/intent" else {"prompt": "分析当前表"}
+    )
+    response = TestClient(app).post(endpoint, json=payload)
+    if endpoint.endswith("stream"):
+        errors = [data for event, data in _parse_sse(response.text) if event == "error"]
+        assert len(errors) == 1
+        detail = errors[0]
+    else:
+        assert response.status_code == 502, response.text
+        detail = response.json()["detail"]
+    assert detail["code"] == ("MODEL_QUOTA_EXHAUSTED" if kind == "quota" else "MODEL_OUTPUT_LIMIT")
+    assert detail["retryable"] is False
+    assert "PRIVATE_KEY" not in detail["message"]
+    assert ("模型设置" if kind == "quota" else "未获得完整结果") in detail["message"]
 
 
 def test_turn_stream_maps_overloaded_429_to_friendly_message(
@@ -1932,6 +2106,7 @@ def test_turn_stream_pauses_persists_and_continues_from_checkpoint(
         on_event=None,
         on_checkpoint=None,
         resume_checkpoint=None,
+        resume_revision=None,
         approved_wall_time_seconds=None,
         reminder_seconds=None,
     ) -> AnswerResponse:
@@ -1940,16 +2115,11 @@ def test_turn_stream_pauses_persists_and_continues_from_checkpoint(
         resumed_checkpoints.append(resume_checkpoint)
         if resume_checkpoint is None:
             checkpoint = {
-                "schemaVersion": 1,
-                "kind": "planning",
-                "stage": "tool_batch_completed",
-                "messages": [{"role": "user", "content": "查看当前数据"}],
-                "toolCache": {"context": "saved"},
-                "loopState": {"activeElapsedSeconds": 60},
-                "toolMode": "terminal",
-                "repairingSubmission": False,
-                "nextTurnIndex": 1,
-                "pendingAssistantMessage": None,
+                "stage": "after_tool",
+                "confirmations": [{"questionId": "q1", "label": "口径", "answerLabel": "按月"}],
+                "completedTools": ["query_table"],
+                "resultRefs": [],
+                "failedTool": None,
             }
             if on_checkpoint is not None:
                 await on_checkpoint(checkpoint)
@@ -1964,6 +2134,7 @@ def test_turn_stream_pauses_persists_and_continues_from_checkpoint(
         "turnId": "turn-planning-pause-test",
         "workbook": {
             **_STREAM_PAYLOAD["workbook"],
+            "workbookIdentity": "url:https://example.invalid/pause-test.xlsx",
             "sourceFingerprint": "sha256:original-source",
             "sourceFingerprintSheets": ["数据"],
         },
@@ -1990,6 +2161,12 @@ def test_turn_stream_pauses_persists_and_continues_from_checkpoint(
             "requestId": "continue-request-0001",
             "confirmed": True,
             "afterSequence": pause["lastSequence"],
+            # 继续必须带本轮重新核实过的现场：同一份身份、同一批授权成员、
+            # 已重读且未变的来源指纹。
+            "workbookIdentity": "url:https://example.invalid/pause-test.xlsx",
+            "authorizedSheetNames": ["数据"],
+            "sourceVerification": "verified",
+            "sourceFingerprint": "sha256:original-source",
         },
     )
     continued_events = _parse_sse(continued.text)
@@ -1997,8 +2174,15 @@ def test_turn_stream_pauses_persists_and_continues_from_checkpoint(
     assert result["message"] == "续跑完成"
     assert calls == 2
     assert resumed_checkpoints[0] is None
-    assert resumed_checkpoints[1] is not None
-    assert resumed_checkpoints[1]["toolCache"] == {"context": "saved"}
+    resumed_context = resumed_checkpoints[1]
+    assert resumed_context is not None
+    # 续跑交回服务端的**只能**是共享契约的 planning_context，不是旧循环检查点。
+    assert resumed_context["kind"] == "planning_context"
+    assert resumed_context["taskId"] == "turn-planning-pause-test"
+    assert resumed_context["completedTools"] == [{"tool": "query_table", "status": "completed"}]
+    assert resumed_context["confirmations"][0]["answerLabel"] == "按月"
+    assert "toolCache" not in resumed_context
+    assert "messages" not in resumed_context
     record = main_module._folder_operation_ledger.planning_task(
         "turn-planning-pause-test"
     )
@@ -2049,7 +2233,8 @@ def test_model_timeout_pauses_and_user_can_switch_configured_fallback(
             await on_checkpoint(checkpoint)
             raise main_module.LLMTimeoutError("timeout")
         assert model_id == "connection:fallback"
-        assert resume_checkpoint["toolCache"] == {"context": "saved"}
+        assert resume_checkpoint["kind"] == "planning_context"
+        assert resume_checkpoint["stage"] == "before_model"
         return AnswerResponse(kind="answer", message="备用模型接续完成", provider="model")
 
     monkeypatch.setattr(main_module, "create_plan", model_fails_then_resumes)
@@ -2089,6 +2274,10 @@ def test_model_timeout_pauses_and_user_can_switch_configured_fallback(
         **_STREAM_PAYLOAD,
         "turnId": "turn-model-fallback-test",
         "modelId": "connection:primary",
+        "workbook": {
+            **_STREAM_PAYLOAD["workbook"],
+            "workbookIdentity": "url:https://example.invalid/fallback-test.xlsx",
+        },
     }
     client = TestClient(app)
 
@@ -2115,6 +2304,11 @@ def test_model_timeout_pauses_and_user_can_switch_configured_fallback(
             "afterSequence": pause["lastSequence"],
             "modelId": "connection:fallback",
             "confirmModelSwitch": True,
+            # 这个任务没有来源依赖（原检查点里既无来源指纹也无结果引用），
+            # 因此"尚未采集来源"是合法状态，不该被来源闸挡住。
+            "workbookIdentity": "url:https://example.invalid/fallback-test.xlsx",
+            "authorizedSheetNames": ["数据"],
+            "sourceVerification": "not_collected",
         },
     )
     continued_events = _parse_sse(continued.text)
@@ -2194,6 +2388,10 @@ def test_interrupted_planning_task_can_switch_model_and_resume_checkpoint(
         **_STREAM_PAYLOAD,
         "turnId": "turn-interrupted-model-switch-test",
         "modelId": "connection:primary-interrupted",
+        "workbook": {
+            **_STREAM_PAYLOAD["workbook"],
+            "workbookIdentity": "url:https://example.invalid/interrupted-switch.xlsx",
+        },
     }
     request = main_module.PlanRequest.model_validate(payload)
     record, created = main_module._folder_operation_ledger.register_planning_task(
@@ -2203,20 +2401,25 @@ def test_interrupted_planning_task_can_switch_model_and_resume_checkpoint(
         approved_wall_time_seconds=60,
     )
     assert created is True
-    checkpoint = {
-        "schemaVersion": 2,
-        "kind": "planning",
-        "stage": "tool_batch_completed",
-        "messages": [{"role": "user", "content": "保留的任务上下文"}],
-        "toolCache": {"context": "saved-before-disconnect"},
-        "loopState": {"activeElapsedSeconds": 8},
-        "toolMode": "full",
-        "repairingSubmission": False,
-        "nextTurnIndex": 1,
-        "pendingAssistantMessage": None,
-        "nextToolIndex": 0,
-        "toolBatchState": {},
-    }
+    # 必须是**当前契约**的 planning_context：旧循环检查点已经不允许继续
+    # （见 test_legacy_loop_checkpoint_cannot_be_continued）。
+    checkpoint = main_module.planning_context.build_context(
+        turn_id=record.turn_id,
+        executor_id=main_module._folder_operation_ledger.executor_id,
+        task_revision=record.revision,
+        stage="after_tool",
+        prompt="查看当前数据",
+        planning_goal=None,
+        confirmations=[],
+        target_identity="url:https://example.invalid/interrupted-switch.xlsx",
+        authorized_sheet_names=["数据"],
+        source_fingerprint=None,
+        source_fingerprint_sheets=[],
+        result_refs=[],
+        completed_tools=["query_table"],
+        failed_tool=None,
+        saved_at="2026-10-19T22:00:00+08:00",
+    )
     main_module._folder_operation_ledger.save_planning_checkpoint(
         record.turn_id,
         checkpoint,
@@ -2241,6 +2444,10 @@ def test_interrupted_planning_task_can_switch_model_and_resume_checkpoint(
             "afterSequence": 0,
             "modelId": "connection:fallback-interrupted",
             "confirmModelSwitch": True,
+            # 现场没有来源指纹，也没有依赖既有结果 ⇒ 允许"尚未采集来源"。
+            "workbookIdentity": "url:https://example.invalid/interrupted-switch.xlsx",
+            "authorizedSheetNames": ["数据"],
+            "sourceVerification": "not_collected",
         },
     )
     events = _parse_sse(continued.text)
@@ -2310,44 +2517,19 @@ def test_intent_rejection_does_not_special_case_a_single_sheet_workbook() -> Non
 def test_model_intent_retries_invalid_structure_and_keeps_prior_intent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("AI_BASE_URL", "https://api.example.test/v1")
-    monkeypatch.setenv("AI_MODEL", "example-model")
-    calls: list[dict[str, object]] = []
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        calls.append(json.loads(request.content))
+    from server.tests.test_claude_sdk_agent import _connection
+    from server.app import claude_sdk_agent as sdk
+    calls = []
+    monkeypatch.setattr(main_module, "selected_model_config", lambda _: _connection())
+    monkeypatch.setattr(sdk, "_sdk", lambda: object())
+    monkeypatch.setattr(sdk, "_options", lambda *_a, **_k: None)
+    async def result(_sdk, prompt, options, timeout):
+        calls.append(prompt)
         if len(calls) == 1:
-            return httpx.Response(
-                200,
-                json={"choices": [{"message": {"content": "我需要想一下"}}]},
-            )
-        return httpx.Response(
-            200,
-            json={
-                "choices": [
-                    {
-                        "message": {
-                            "content": json.dumps(
-                                {
-                                    "kind": "proceed",
-                                    "summary": "继承上一轮并改为最小值",
-                                    "confirmedPrompt": "在相同范围和口径下找出占比最小的一项",
-                                },
-                                ensure_ascii=False,
-                            )
-                        }
-                    }
-                ]
-            },
-        )
-
-    transport = httpx.MockTransport(handler)
-    original_client = httpx.AsyncClient
-    monkeypatch.setattr(
-        httpx,
-        "AsyncClient",
-        lambda **kwargs: original_client(transport=transport, **kwargs),
-    )
+            return "我需要想一下"
+        return json.dumps({"kind": "proceed", "summary": "继承上一轮并改为最小值",
+                           "confirmedPrompt": "在相同范围和口径下找出占比最小的一项"})
+    monkeypatch.setattr(sdk, "_result", result)
     payload = _intent_payload("那最小的呢")
     payload["modelId"] = "example-model"
     payload["priorIntent"] = {
@@ -2384,9 +2566,10 @@ def test_model_intent_retries_invalid_structure_and_keeps_prior_intent(
     assert response.status_code == 200
     assert response.json()["confirmedPrompt"].endswith("占比最小的一项")
     assert len(calls) == 2
-    second_prompt = calls[1]["messages"][1]["content"]  # type: ignore[index]
-    assert "上一轮结构化意图" in second_prompt
-    assert "上一轮紧凑结果" in second_prompt
+    second_prompt = calls[1]
+    assert "priorIntent" in second_prompt
+    assert "priorResult" in second_prompt
+    assert "0.42" not in second_prompt
     assert "上一轮极值结果" in second_prompt
     assert "不应发送的原始数据" not in second_prompt
-    assert "未通过结构化协议校验" in second_prompt
+    assert "未通过结构校验" in second_prompt

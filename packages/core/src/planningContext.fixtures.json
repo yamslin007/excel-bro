@@ -1,0 +1,356 @@
+{
+  "expect": {
+    "turnId": "turn-a0-fixture",
+    "revision": 7
+  },
+  "base": {
+    "kind": "planning_context",
+    "schemaVersion": 1,
+    "taskId": "turn-a0-fixture",
+    "turnId": "turn-a0-fixture",
+    "executorId": "exec-fixture",
+    "taskRevision": 3,
+    "stage": "after_tool",
+    "resumability": "continue",
+    "savedAt": "2026-10-19T22:00:00+08:00",
+    "prompt": "把会员表和订单表关联后汇总到汇总表",
+    "planningGoal": "write_plan",
+    "confirmations": [
+      {
+        "questionId": "q1",
+        "answerLabel": "按会员编号关联"
+      }
+    ],
+    "target": {
+      "identity": "url:https://example.invalid/book.xlsx",
+      "evidenceKey": "[\"url:https://example.invalid/book.xlsx\",[\"S1\",\"S2\",\"S3\"]]",
+      "sheetNames": [
+        "会员表",
+        "订单表",
+        "汇总表"
+      ]
+    },
+    "authorization": {
+      "sheetNames": [
+        "会员表",
+        "订单表",
+        "汇总表"
+      ]
+    },
+    "sourceFingerprint": "abc123",
+    "sourceFingerprintSheets": [
+      "会员表",
+      "订单表"
+    ],
+    "resultRefs": [
+      {
+        "resultRef": "res_0123456789abcdef0123456789abcdef",
+        "sourceFingerprint": "abc123"
+      }
+    ],
+    "completedTools": [
+      {
+        "tool": "query_table",
+        "status": "completed"
+      }
+    ],
+    "failedTool": null,
+    "unknownTool": null
+  },
+  "cases": [
+    {
+      "name": "valid",
+      "expected": {
+        "ok": true
+      }
+    },
+    {
+      "name": "null-record",
+      "record": null,
+      "expected": {
+        "ok": false,
+        "code": "PLANNING_CONTEXT_MISSING"
+      }
+    },
+    {
+      "name": "blank-string",
+      "record": "   ",
+      "expected": {
+        "ok": false,
+        "code": "PLANNING_CONTEXT_MISSING"
+      }
+    },
+    {
+      "name": "empty-object",
+      "record": {},
+      "expected": {
+        "ok": false,
+        "code": "PLANNING_CONTEXT_KIND_MISMATCH"
+      }
+    },
+    {
+      "name": "legacy-loop-checkpoint",
+      "record": {
+        "stage": "before_model",
+        "loopState": {
+          "activeElapsedSeconds": 12
+        },
+        "pendingAssistantMessage": {
+          "role": "assistant",
+          "content": ""
+        }
+      },
+      "expected": {
+        "ok": false,
+        "code": "PLANNING_CONTEXT_KIND_MISMATCH"
+      }
+    },
+    {
+      "name": "other-kind",
+      "patch": {
+        "kind": "wps_loop_state"
+      },
+      "expected": {
+        "ok": false,
+        "code": "PLANNING_CONTEXT_KIND_MISMATCH"
+      }
+    },
+    {
+      "name": "old-schema",
+      "patch": {
+        "schemaVersion": 0
+      },
+      "expected": {
+        "ok": false,
+        "code": "PLANNING_CONTEXT_UNSUPPORTED_VERSION"
+      }
+    },
+    {
+      "name": "future-schema",
+      "patch": {
+        "schemaVersion": 2
+      },
+      "expected": {
+        "ok": false,
+        "code": "PLANNING_CONTEXT_UNSUPPORTED_VERSION"
+      }
+    },
+    {
+      "name": "forbidden-plan",
+      "patch": {
+        "plan": {
+          "id": "p1"
+        }
+      },
+      "expected": {
+        "ok": false,
+        "code": "PLANNING_CONTEXT_SENSITIVE"
+      }
+    },
+    {
+      "name": "forbidden-values-in-step",
+      "patch": {
+        "completedTools": [
+          {
+            "tool": "writeValues",
+            "status": "completed",
+            "values": [
+              [
+                "张三",
+                100
+              ]
+            ]
+          }
+        ]
+      },
+      "expected": {
+        "ok": false,
+        "code": "PLANNING_CONTEXT_SENSITIVE"
+      }
+    },
+    {
+      "name": "unknown-extra-field",
+      "patch": {
+        "note": "随便加的"
+      },
+      "expected": {
+        "ok": false,
+        "code": "PLANNING_CONTEXT_INVALID"
+      }
+    },
+    {
+      "name": "missing-field",
+      "remove": [
+        "authorization"
+      ],
+      "expected": {
+        "ok": false,
+        "code": "PLANNING_CONTEXT_INVALID"
+      }
+    },
+    {
+      "name": "empty-executor",
+      "patch": {
+        "executorId": ""
+      },
+      "expected": {
+        "ok": false,
+        "code": "PLANNING_CONTEXT_INVALID"
+      }
+    },
+    {
+      "name": "zero-revision",
+      "patch": {
+        "taskRevision": 0
+      },
+      "expected": {
+        "ok": false,
+        "code": "PLANNING_CONTEXT_INVALID"
+      }
+    },
+    {
+      "name": "task-id-mismatch",
+      "patch": {
+        "taskId": "turn-other",
+        "turnId": "turn-other"
+      },
+      "expected": {
+        "ok": false,
+        "code": "PLANNING_CONTEXT_TASK_MISMATCH"
+      }
+    },
+    {
+      "name": "self-inconsistent-identity",
+      "patch": {
+        "taskId": "turn-other"
+      },
+      "expected": {
+        "ok": false,
+        "code": "PLANNING_CONTEXT_TASK_MISMATCH"
+      }
+    },
+    {
+      "name": "revision-ahead-of-ledger",
+      "patch": {
+        "taskRevision": 99
+      },
+      "expected": {
+        "ok": false,
+        "code": "PLANNING_CONTEXT_STALE_REVISION"
+      }
+    },
+    {
+      "name": "stage-not-supported",
+      "patch": {
+        "stage": "executing"
+      },
+      "expected": {
+        "ok": false,
+        "code": "PLANNING_CONTEXT_STAGE_UNSUPPORTED"
+      }
+    },
+    {
+      "name": "replan-only",
+      "patch": {
+        "resumability": "replan"
+      },
+      "expected": {
+        "ok": false,
+        "code": "PLANNING_CONTEXT_NOT_CONTINUABLE"
+      }
+    },
+    {
+      "name": "unknown-tool-present",
+      "patch": {
+        "unknownTool": {
+          "tool": "writeValues"
+        }
+      },
+      "expected": {
+        "ok": false,
+        "code": "PLANNING_CONTEXT_NOT_CONTINUABLE"
+      }
+    },
+    {
+      "name": "empty-authorized-members",
+      "patch": {
+        "target": {
+          "identity": "url:https://example.invalid/book.xlsx",
+          "evidenceKey": "k",
+          "sheetNames": []
+        }
+      },
+      "expected": {
+        "ok": false,
+        "code": "PLANNING_CONTEXT_INVALID"
+      }
+    },
+    {
+      "name": "identity-without-namespace",
+      "patch": {
+        "target": {
+          "identity": "name:会员表.xlsx",
+          "evidenceKey": "k",
+          "sheetNames": [
+            "会员表"
+          ]
+        }
+      },
+      "expected": {
+        "ok": false,
+        "code": "PLANNING_CONTEXT_INVALID"
+      }
+    },
+    {
+      "name": "target-without-evidence-key",
+      "patch": {
+        "target": {
+          "identity": "url:https://example.invalid/book.xlsx",
+          "sheetNames": [
+            "会员表",
+            "订单表",
+            "汇总表"
+          ]
+        }
+      },
+      "expected": {
+        "ok": true
+      }
+    },
+    {
+      "name": "fingerprint-sheets-without-fingerprint",
+      "patch": {
+        "sourceFingerprint": null
+      },
+      "expected": {
+        "ok": false,
+        "code": "PLANNING_CONTEXT_INVALID"
+      }
+    },
+    {
+      "name": "bad-result-ref",
+      "patch": {
+        "resultRefs": [
+          {
+            "resultRef": "res_not-a-ref",
+            "sourceFingerprint": null
+          }
+        ]
+      },
+      "expected": {
+        "ok": false,
+        "code": "PLANNING_CONTEXT_INVALID"
+      }
+    },
+    {
+      "name": "prompt-too-long",
+      "patch": {
+        "prompt": "__LONG_PROMPT__"
+      },
+      "expected": {
+        "ok": false,
+        "code": "PLANNING_CONTEXT_INVALID"
+      }
+    }
+  ]
+}

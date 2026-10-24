@@ -17,6 +17,7 @@ import type { PlanEditorTarget } from "../hooks/usePlanEditor";
 import { applyThemePalette } from "../hooks/useTheme";
 import { loadThemeSettings } from "../utils/imageStorage";
 import { JsonCodeEditor } from "./JsonCodeEditor";
+import { ControlledScriptEditor } from "./ControlledScriptEditor";
 
 // 消息协议
 interface PlanEditorInitMessage {
@@ -622,6 +623,10 @@ export default function PlanEditorDialog() {
 
         {/* 右侧：JSON 编辑器 */}
         <section className="plan-editor-json-panel">
+          <ControlledScriptEditor
+            getAuthorizedSheets={() => payload?.authorizedSheets ?? []}
+            draft={draft} onApply={handleDraftChange} disabled={busy}
+          />
           <JsonCodeEditor
             value={draft}
             onChange={handleDraftChange}

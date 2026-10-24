@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { useFolderBackups, type FolderBackupTarget } from "../hooks/useFolderBackups";
 
 interface FolderBackupManagerProps {
@@ -8,6 +8,13 @@ interface FolderBackupManagerProps {
   onBackupDeleted?: (remainingUndoIds: string[]) => void;
   workbookUndoCount?: number;
   folderUndoCount?: number;
+  /**
+   * 工作表删除恢复点区段。
+   *
+   * 由调用方注入而不是在这里直接取：这一层只负责"备份与恢复"的版式，
+   * 检查点的归属与查询留在检查点自己那一份实现里。
+   */
+  checkpointSection?: ReactNode;
 }
 
 function formatBytes(value: number): string {
@@ -61,7 +68,8 @@ export function FolderBackupManager({
   onUndo,
   onBackupDeleted,
   workbookUndoCount = 0,
-  folderUndoCount = 0
+  folderUndoCount = 0,
+  checkpointSection
 }: FolderBackupManagerProps) {
   const {
     data,
@@ -512,6 +520,7 @@ export function FolderBackupManager({
             )}
           </>
         )}
+        {checkpointSection}
       </div>
     </aside>
   );

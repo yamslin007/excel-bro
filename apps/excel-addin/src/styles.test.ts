@@ -227,7 +227,7 @@ describe("narrow task pane", () => {
     expect(planning).toContain('"正在准备规划请求"');
     expect(planning.indexOf('completeCurrentStep("已准备规划请求"')).toBeGreaterThan(0);
     expect(planning.indexOf('completeCurrentStep("已准备规划请求"')).toBeLessThan(
-      planning.indexOf("await streamAssistantResponse(")
+      planning.indexOf("await waitForPlanning(streamAssistantResponse(")
     );
   });
 });
@@ -514,11 +514,8 @@ describe("natural organic style", () => {
     const source = css("./styles.css");
     const panel = css("../../wps-addin/src/WpsProbePanel.tsx");
 
-    // 面板里同排出现的三个按钮类名都必须有样式规则。
-    // 背景：`.scope-discard`（「取消」）此前**完全没有 CSS**，浏览器默认样式
-    // 直接露出来（方角 + 原生描边），和「刷新 / 确认」不像一套 UI。
-    for (const selector of [".scope-refresh", ".scope-confirm", ".scope-discard"]) {
-      // TSX 里写的是 `className="scope-discard"`（无点），样式表里是 `.scope-discard`。
+    // 刷新与确认沿用同一组尺寸和圆角。
+    for (const selector of [".scope-refresh", ".scope-close"]) {
       expect(panel, `面板没有用到 ${selector}`).toContain(`"${selector.slice(1)}"`);
       // 同一选择器可能有多条规则（布局一条、外观一条），CSS 是叠加的 ——
       // 必须把所有匹配的规则体拼起来看，只取第一条会读到只有 flex 的那条而假红。
@@ -534,12 +531,12 @@ describe("natural organic style", () => {
       expect(rule, selector).toContain("var(--font-size-caption)");
     }
 
-    // 次要按钮的可辨识度：取消**不能**长得像主按钮（实心品牌绿）。
-    const discard = [...source.matchAll(/\.scope-discard\s*\{([^}]*)\}/g)]
+    // 确认仅关闭面板，视觉上作为主要完成动作。
+    const confirm = [...source.matchAll(/\.scope-close\s*\{([^}]*)\}/g)]
       .map((m) => m[1])
       .join("\n");
-    expect(discard).not.toContain("background: var(--color-brand-text)");
-    expect(discard).toContain("var(--color-background)");
+    expect(confirm).toContain("background: var(--color-brand-text)");
+    expect(confirm).toContain("color: white");
   });
 
   it("keeps the image entry icon-only and marks the file chip with a paperclip", () => {
@@ -898,5 +895,54 @@ describe("natural organic style", () => {
     expect(hook).not.toContain("PAPER_GRAIN");
     expect(panel).not.toContain('id: "natural-organic"');
     expect(panel).toContain("默认 Notion");
+  });
+});
+
+/*
+ * 「执行过程」卡与「结果展示」卡必须在同一条竖边里。
+ *
+ * 这两张卡住在同一个 `.message-content` 里，是同一块区域的两种状态：运行中显示执行过程，
+ * 收尾后显示结果。用户看到的是"卡片一会儿窄一会儿宽"，实际读到的信息是"这块区域换了个东西"，
+ * 所以它们的左右外边界必须一致。
+ *
+ * 事故原型：`.activity-card`（运行态）写死了 `width: min(420px, calc(100% - 28px))`，
+ * 而 `.activity-log-card`（已完成）和 `.local-result-card`（结果）都是块级铺满。
+ * 于是运行态比收尾态窄一截，右边空出一条，看上去像两张不对齐的卡。
+ *
+ * 这条断言只钉「有没有宽度上限」这个机制本身，不冒充视觉验收：真实观感仍要在
+ * 真实宿主里看一眼（见 docs 的验收分档）。
+ */
+describe("执行过程卡与结果展示卡同宽", () => {
+  /** 取单条 `选择器 { ... }` 的声明体；用带花括号的选择器原文定位，避免匹配到 `.x p {`。 */
+  function ruleBody(source: string, selector: string): string {
+    const start = source.indexOf(`${selector} {`);
+    expect(start, `找不到规则 ${selector}`).toBeGreaterThanOrEqual(0);
+    const end = source.indexOf("}", start);
+    return source.slice(start, end);
+  }
+
+  it("运行态卡不设宽度上限，与结果卡一样铺满消息内容区", () => {
+    const source = css("./styles.css");
+    const live = ruleBody(source, ".activity-card");
+    const result = ruleBody(source, ".local-result-card");
+
+    // 运行态：显式铺满，并且不得有任何 px 上限或右侧内缩。
+    expect(live).toContain("width: 100%");
+    expect(live).not.toMatch(/width:\s*min\(/);
+    expect(live).not.toMatch(/width:\s*calc\(100%\s*-/);
+
+    // 结果卡：靠块级默认铺满，不声明 width —— 它才是"一样宽"的参照系。
+    expect(result).not.toMatch(/(^|[\s;{])width:/);
+  });
+
+  it("运行态卡与已完成卡的水平内边距一致（文字左边线对得上）", () => {
+    const source = css("./styles.css");
+    const live = ruleBody(source, ".activity-card");
+    const done = ruleBody(source, ".activity-log-card");
+
+    // 两张都是「执行过程」卡，只差运行/已结束；左右内边距必须同值，
+    // 否则同一句话在切换状态时左右跳动。
+    expect(live).toMatch(/padding:\s*[\d.]+px\s+var\(--spacing-md\)|padding:\s*[\d.]+px\s+12px/);
+    expect(done).toMatch(/padding:\s*[\d.]+px\s+12px/);
   });
 });

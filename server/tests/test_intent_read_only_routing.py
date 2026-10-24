@@ -9,6 +9,9 @@ import pytest
 from server.app import intent as intent_module
 from server.app.intent import check_intent, is_explicit_read_only_query
 from server.app.models import IntentCheckRequest
+from server.app.llm import LLMResponseError
+from server.tests.sdk_text_harness import install_text_transport
+from server.tests.test_claude_sdk_agent import _connection
 
 
 def _request(prompt: str) -> IntentCheckRequest:
@@ -60,11 +63,7 @@ class _FakeClient:
 def _install_client(
     monkeypatch: pytest.MonkeyPatch, client: _FakeClient
 ) -> None:
-    monkeypatch.setattr(
-        intent_module,
-        "OpenAICompatibleClient",
-        lambda *_args, **_kwargs: client,
-    )
+    install_text_transport(monkeypatch, client)
 
 
 def test_explicit_count_query_rejects_proceed_and_repairs_to_tool_request(
@@ -109,12 +108,12 @@ def test_explicit_count_query_rejects_proceed_and_repairs_to_tool_request(
     )
     _install_client(monkeypatch, client)
 
-    response = asyncio.run(check_intent(_request(prompt), config=object()))
+    response = asyncio.run(check_intent(_request(prompt), config=_connection()))
 
     assert response.kind == "tool_request"
     assert len(client.calls) == 2
-    assert "明确只读查询，禁止返回 proceed" in client.calls[0][1]["content"]
-    assert "必须返回 tool_request" in client.calls[1][1]["content"]
+    assert json.loads(client.calls[0][1]["content"])["readOnlyRequired"] is True
+    assert "上次输出未通过结构校验" in client.calls[1][1]["content"]
 
 
 def test_repeated_invalid_read_only_routing_fails_closed(
@@ -129,7 +128,7 @@ def test_repeated_invalid_read_only_routing_fails_closed(
     client = _FakeClient([proceed, proceed])
     _install_client(monkeypatch, client)
 
-    response = asyncio.run(check_intent(_request(prompt), config=object()))
+    response = asyncio.run(check_intent(_request(prompt), config=_connection()))
 
     assert response.kind == "clarification"
     assert response.provider == "local"
@@ -145,9 +144,8 @@ def test_intent_rejects_parseable_but_truncated_response_without_format_retry(mo
                 "kind": "conversation", "message": "不得接受截断回复"})}}]}, {}
     client = TruncatedClient([])
     _install_client(monkeypatch, client)
-    response = asyncio.run(check_intent(_request("统计记录数量"), config=object()))
-    assert response.kind == "clarification"
-    assert response.provider == "local"
+    with pytest.raises(LLMResponseError):
+        asyncio.run(check_intent(_request("统计记录数量"), config=_connection()))
     assert len(client.calls) == 1
 
 
@@ -166,7 +164,7 @@ def test_explicit_write_request_can_still_proceed(
     )
     _install_client(monkeypatch, client)
 
-    response = asyncio.run(check_intent(_request(prompt), config=object()))
+    response = asyncio.run(check_intent(_request(prompt), config=_connection()))
 
     assert response.kind == "proceed"
     assert len(client.calls) == 1
@@ -180,13 +178,13 @@ def test_non_task_conversation_is_answered_without_planning(
     client = _FakeClient([{"kind": "conversation", "message": "你好！我可以帮你查询和分析已授权的工作表。"}])
     _install_client(monkeypatch, client)
 
-    response = asyncio.run(check_intent(_request(prompt), config=object()))
+    response = asyncio.run(check_intent(_request(prompt), config=_connection()))
 
     assert response.kind == "conversation"
     assert response.provider == "model"
     assert "你好" in response.message
     assert len(client.calls) == 1
-    assert "数据范围结构摘要（不含数据行）" in client.calls[0][1]["content"]
+    assert "scope" in json.loads(client.calls[0][1]["content"])
     assert "影院名称" in client.calls[0][1]["content"]
     assert "甲" not in client.calls[0][1]["content"]
 

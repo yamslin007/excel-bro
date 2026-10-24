@@ -88,9 +88,12 @@ def test_isolated_execution_runs_off_the_event_loop(monkeypatch):
     observed: dict[str, int] = {}
 
     def fake(*, data_registry, scope_token, scope, origin, receipts, code,
-             cancel_check=None):
+             cancel_check=None, on_runner_start=None):
         observed["thread"] = threading.get_ident()
         started.set()
+        if on_runner_start:
+            # 容器即将启动 —— "正在运行"的唯一证据来源。
+            on_runner_start()
         release.wait(2)  # 卡住真实执行，模拟容器运行
         return {"status": "completed",
                 "result": {"kind": "matrix", "values": [[10]]}}
@@ -135,7 +138,9 @@ def test_cancel_reaches_the_executor_and_waits_for_termination(monkeypatch):
     state = {"observed": False, "terminated": False}
 
     def fake(*, data_registry, scope_token, scope, origin, receipts, code,
-             cancel_check=None):
+             cancel_check=None, on_runner_start=None):
+        if on_runner_start:
+            on_runner_start()
         for _ in range(1000):
             if cancel_check is not None and cancel_check():
                 state["observed"] = True
@@ -170,6 +175,67 @@ def test_cancel_reaches_the_executor_and_waits_for_termination(monkeypatch):
     assert state["terminated"] is True
     # 取消当次不发布任何结果。
     assert local_results.count_task(TASK) == 0
+
+
+def test_each_isolated_run_emits_its_own_completion_step(monkeypatch):
+    """同一任务里跑两次分析 = 两个步骤身份（写死 ``python.completed`` 会合并成一个）。
+
+    身份写死时，第二次分析的完成事件覆盖第一次的步骤，界面上"分析了两轮"
+    看起来只有一轮，而且第一轮永远停在"进行中"。
+    """
+    def fake(*, data_registry, scope_token, scope, origin, receipts, code,
+             cancel_check=None, on_runner_start=None):
+        if on_runner_start:
+            on_runner_start()
+        return {"status": "completed",
+                "result": {"kind": "matrix", "values": [[10]]}}
+
+    monkeypatch.setattr(pa, "run_registered_analysis_internal", fake)
+    receipt = _bind()
+    request = SimpleNamespace(turnId=TASK)
+    arguments = _arguments(receipt.datasetHandle)
+
+    async def scenario():
+        events: list[dict] = []
+
+        async def on_event(payload):
+            events.append(payload)
+
+        first = await execute_python_analysis_async(
+            request, arguments, on_event=on_event
+        )
+        second = await execute_python_analysis_async(
+            request, arguments, on_event=on_event
+        )
+        return first, second, events
+
+    first, second, events = asyncio.run(scenario())
+
+    # 正向锚点：两次都真的跑完了（下面比的不是"两次都没执行"）。
+    assert first["status"] == "completed"
+    assert second["status"] == "completed"
+    # 一次执行只发**一条**完成事件（不是"每次发两条"凑出来的两个身份）。
+    completion = [event for event in events if "pythonResult" in event]
+    assert len(completion) == 2, events
+    step_ids = [event["stepId"] for event in completion]
+    assert len(set(step_ids)) == 2, f"两次分析合并成了同一步骤：{step_ids}"
+    assert all(step.startswith("python.analysis:py_") for step in step_ids)
+    # 两条完成事件各自带自己那次的结果卡（不是第二条覆盖第一条）。
+    assert completion[0]["pythonResult"]["resultRef"] == first["resultHandle"]
+    assert completion[1]["pythonResult"]["resultRef"] == second["resultHandle"]
+
+    # 代码生命周期事件：每次执行各 3 条（开始校验 / 开始运行 / 收尾），
+    # 且**同一次执行只落在一个 stepId 上** —— 一次执行长出两个步骤身份，
+    # 界面上就会把同一段代码画成两块。
+    lifecycle = [event for event in events if "pythonCode" in event]
+    per_attempt: dict[str, set[str]] = {}
+    for event in lifecycle:
+        per_attempt.setdefault(event["pythonCode"]["attemptId"], set()).add(
+            event["stepId"]
+        )
+    assert len(per_attempt) == 2, per_attempt
+    assert all(len(steps) == 1 for steps in per_attempt.values()), per_attempt
+    assert len({next(iter(steps)) for steps in per_attempt.values()}) == 2
 
 
 def test_async_path_stays_fail_closed_without_runner(monkeypatch):

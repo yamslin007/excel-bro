@@ -289,3 +289,22 @@ def _submit_plan_action_items(definitions: list[dict]) -> dict:
                 "properties"
             ]["actions"]["items"]
     raise AssertionError("定义里没有 submit_plan")
+
+
+@pytest.mark.parametrize("copy_type", ["values", "link", "all", "formulas", "formats"])
+def test_wps_copy_variants_are_validated_before_plan_submission(copy_type):
+    request = _request(hostId="wps-et", hostVersion="12.0", selfReportedActions=["copyRange"])
+    plan = _plan([{"type":"copyRange", "sheet":"订单", "sourceSheet":"订单", "sourceRange":"A1:A2", "targetRange":"B1:B2", "copyType":copy_type, "skipBlanks":False,"transpose":False}])
+    if copy_type in {"values", "link"}:
+        _enforce_action_capabilities(request, plan)
+    else:
+        with pytest.raises(ValueError, match="完整格式、相对公式"):
+            _enforce_action_capabilities(request, plan)
+
+
+@pytest.mark.parametrize("copy_type", ["values", "link"])
+def test_wps_filtered_copy_preserves_supported_variants(copy_type):
+    request = _request(hostId="wps-et", hostVersion="12.0", selfReportedActions=["copyRange"])
+    plan = _plan([{"type":"copyRange", "sheet":"订单", "sourceSheet":"订单", "sourceRange":"A1:B4", "targetRange":"D1", "copyType":copy_type, "skipBlanks":True, "transpose":True, "hasHeaders":True,
+                   "filters":[{"field":"类别","operator":"equals","value":"甲"}]}])
+    _enforce_action_capabilities(request, plan)

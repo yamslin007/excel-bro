@@ -14,6 +14,8 @@ import {
   type WpsPlanningTaskStatus
 } from "./wpsPlanningStream";
 import { newPlanningRequestId } from "@excel-bro/core";
+import { waitForPlanning } from "@excel-bro/core/planningReplay";
+import type { PlanningContinuationEvidence } from "@excel-bro/core/planningContinuationEvidence";
 import { assertKnownResultKind } from "./wpsPlanningTypes";
 import capabilities from "../../../config/capabilities.json";
 import {
@@ -38,6 +40,8 @@ import type {
   PlanningPauseResult,
   ResultContext,
   SdkBridgeToolPointer,
+  TaskProgressEvent,
+  TaskProgressStatus,
   WorkbookSnapshot
 } from "../../excel-addin/src/contracts";
 import {
@@ -177,6 +181,24 @@ export type WpsReadonlyTurnProgress = {
   toolName?: string;
   message: string;
   /**
+   * 这一步**真实**的结构化状态。
+   *
+   * 以前这里没有这个字段，于是整条链上"完成"永远表达不出来：转换层只能说
+   * "还在进行"，下游只能靠"下一步出现了"倒推上一步完成 —— 那是对用户撒谎。
+   * 本地阶段（读表结构、算数）由 `runWpsTurn` 在真正做完之后补发 `completed`；
+   * 服务端事件则由 `event.status` 原样带过来。
+   */
+  status?: TaskProgressStatus;
+  /**
+   * 服务端原始事件（只有服务端事件才有）。
+   *
+   * **整条带着，不逐字段 copy。** 曾经为了"只取要用的几个字段"手工挑，
+   * 结果 `bridgeTool` 被漏掉，续跑时模型发的读表请求永远到不了本端、
+   * 服务端一路等到超时（表现是"继续分析卡住"）。字段清单会随协议增长，
+   * 挑字段的写法注定再漏一次；交给下游按 `TaskProgressEvent` 整体消费。
+   */
+  event?: TaskProgressEvent;
+  /**
    * 本轮规划在服务端的**任务身份**（`turnId`）。
    *
    * 意图判断一返回就带上它，且**只上报一次**（`intent` 阶段）。
@@ -198,6 +220,38 @@ export type WpsReadonlyTurnProgress = {
   pythonResult?: LocalResultCard | null;
 };
 
+/**
+ * 把规划流的 `TaskProgressEvent` 折成面板消费的进度对象。
+ *
+ * **唯一实现**，首次规划与"继续分析"共用。续跑路径曾经各自拼了一份"看起来一样"
+ * 的对象，只 copy 了 stage/turnId/sequence/stepId/title/message，**漏掉了
+ * `bridgeTool`** —— 于是续跑时模型发出的读表请求永远到不了本端，服务端一路等到
+ * 超时（表现为"继续分析卡住"，不是报错）。
+ *
+ * 现在改成**整条事件挂上去**（`event`），显示用的几个字段由它派生。这样协议每加
+ * 一个字段，转换层不需要改，也不会再漏。
+ */
+export function wpsProgressFromTaskEvent(
+  turnId: string,
+  event: TaskProgressEvent,
+  fallbackStepId = "planning-stream",
+  fallbackMessage = "正在规划"
+): WpsReadonlyTurnProgress {
+  return {
+    stage: "answering",
+    turnId,
+    sequence: event.sequence,
+    stepId: event.stepId || fallbackStepId,
+    title: event.title,
+    // 状态**照抄事件**，不在这里改写成"进行中"。
+    status: event.status,
+    message: event.summary || event.title || fallbackMessage,
+    bridgeTool: event.bridgeTool ?? null,
+    pythonResult: event.pythonResult ?? null,
+    event
+  };
+}
+
 export type WpsReadonlyTurnInput = {
   application: WpsApplication;
   selectedSheetIndexes: readonly number[];
@@ -213,6 +267,8 @@ export type WpsReadonlyTurnInput = {
   signal?: AbortSignal;
   /** Metadata-only UI guard, repeated before each source read after model awaits. */
   beforeRead?: () => Promise<void>;
+  /** Await the host bridge after intent supplies the task id, before planning starts. */
+  preparePlanningBridge?: (turnId: string) => Promise<boolean>;
   onProgress?: (progress: WpsReadonlyTurnProgress) => void;
 };
 
@@ -501,25 +557,72 @@ export async function runWpsTurn(
 ): Promise<WpsTurnResult> {
   const prompt = input.prompt.trim();
   if (prompt.length < 2) throw new Error("请输入至少两个字符的问题。");
-  input.onProgress?.({ stage: "intent", stepId: "message-intent", title: "理解消息", message: "先理解当前消息，判断是否需要工作簿上下文；尚未读取字段或数据。" });
+  /*
+   * 本地阶段的**真实结束**必须由这里补发。
+   *
+   * 以前本地阶段只发"开始了"，一次都没发过"做完了"，于是下游只能靠
+   * "下一步出现了"倒推上一步完成 —— 那是对用户的猜测：最后一步永远停在半途，
+   * 中途某一步却可能被提前宣布完成。这里把"开始 / 完成 / 失败"配对发出去，
+   * 下游只需要照抄状态，不需要推理。
+   */
+  const startedStages = new Map<string, WpsReadonlyTurnProgress>();
+  const emitLocalStage = (progress: WpsReadonlyTurnProgress) => {
+    if (progress.stepId) startedStages.set(progress.stepId, progress);
+    input.onProgress?.(progress);
+  };
+  const finishLocalStage = (
+    stepId: string,
+    status: TaskProgressStatus = "completed",
+    title?: string
+  ) => {
+    const started = startedStages.get(stepId);
+    // 没开始过就不补：凭空插入一条"已完成"会让时间线多出一步用户没见过的事。
+    if (!started) return;
+    startedStages.delete(stepId);
+    input.onProgress?.({
+      ...started,
+      title: title ?? started.title,
+      status,
+      message: status === "completed"
+        ? `${title ?? started.title ?? stepId}：已完成`
+        : `${title ?? started.title ?? stepId}：未完成`
+    });
+  };
+  /** 失败/中止时把所有开着的本地阶段如实收尾，不留"永远在转"的行。 */
+  const abandonLocalStages = (status: TaskProgressStatus) => {
+    for (const stepId of [...startedStages.keys()]) finishLocalStage(stepId, status);
+  };
+  if (!input.messageUnderstanding) emitLocalStage({ stage: "intent", stepId: "message-intent", title: "理解消息", status: "started", message: "先理解当前消息，判断是否需要工作簿上下文；尚未读取字段或数据。" });
   const messageUnderstanding = input.messageUnderstanding ?? await (dependencies.understandMessage ?? understandMessage)({
     prompt, imageCount: input.images?.length ?? 0,
     conversation: input.conversation ?? [], modelId: input.modelId || null
-  }, input.signal);
+  }, input.signal).catch((error: unknown) => {
+    abandonLocalStages("failed");
+    throw error;
+  });
+  finishLocalStage("message-intent");
   if (input.signal?.aborted) throw new DOMException("Aborted", "AbortError");
   if (messageUnderstanding.kind === "conversation") {
     return { kind: "answer", message: messageUnderstanding.message, provider: messageUnderstanding.provider, resultContext: null };
   }
-  input.onProgress?.({ stage: "reading", stepId: "read-schemas", title: "读取已授权表结构", message: "只读取字段结构，不向意图模型发送原始数据行。" });
+  if (messageUnderstanding.kind === "task_recovery") {
+    throw new Error("恢复请求必须通过原任务卡片核对，不得新建规划或读取工作表。");
+  }
+  emitLocalStage({ stage: "reading", stepId: "read-schemas", title: "读取已授权表结构", status: "started", message: "只读取字段结构，不向意图模型发送原始数据行。" });
   await input.beforeRead?.();
   const authorization = authorizeWpsSheets(input.application, input.selectedSheetIndexes);
   const schemas = await dependencies.readSchemas(input.application, authorization, {
     signal: input.signal
+  }).catch((error: unknown) => {
+    abandonLocalStages("failed");
+    throw error;
   });
+  finishLocalStage("read-schemas");
+  input.signal?.throwIfAborted();
   const { scope, workbook } = buildWpsReadonlyContexts(input.application, schemas);
 
-  input.onProgress?.({ stage: "intent", stepId: "intent", title: "结合字段理解任务", message: "结合已授权字段判断是否需要澄清、查询或写入计划。" });
-  const intent = await dependencies.checkIntent(
+  emitLocalStage({ stage: "intent", stepId: "intent", title: "结合字段理解任务", status: "started", message: "结合已授权字段判断是否需要澄清、查询或写入计划。" });
+  const intent = await waitForPlanning(dependencies.checkIntent(
     {
       prompt,
       scope,
@@ -531,7 +634,12 @@ export async function runWpsTurn(
       modelId: input.modelId || null
     },
     input.signal
-  );
+  ), input.signal).catch((error: unknown) => {
+    abandonLocalStages(input.signal?.aborted ? "cancelled" : "failed");
+    throw error;
+  });
+  input.signal?.throwIfAborted();
+  finishLocalStage("intent");
   if (intent.kind === "conversation") {
     return { kind: "answer", message: intent.message, provider: intent.provider, resultContext: null };
   }
@@ -546,6 +654,9 @@ export async function runWpsTurn(
       stage: "intent",
       stepId: "planning-identity",
       title: "已建立规划任务身份",
+      // 这是一条**事实**，不是一个还在进行的动作：拿到即完成。
+      // 不写 `status` 的话，下游只能把它当成"永远在转"的一步。
+      status: "completed",
       message: "已从服务端取得本次规划的任务身份，断线后可用它查询真实进度。",
       turnId: intent.turnId
     });
@@ -571,27 +682,38 @@ export async function runWpsTurn(
   const sdkPlanning = isSdkPlanningModel(input.modelId);
   if (intent.kind === "tool_request" && !sdkPlanning) {
     await input.beforeRead?.();
-    input.onProgress?.({ stage: "reading", stepId: "read-data", title: "读取授权数据", message: "只为已确定的本地查询读取完整数据。" });
+    emitLocalStage({ stage: "reading", stepId: "read-data", title: "读取授权数据", status: "started", message: "只为已确定的本地查询读取完整数据。" });
+    const readSheetIds = new Set<string>();
     const results = await dependencies.readSheets(input.application, authorization, {
       signal: input.signal,
       onProgress: ({ sheet, rowsRead, totalRows }) => {
-        input.onProgress?.({
+        const stepId = `read-data:${sheet.name}`;
+        readSheetIds.add(stepId);
+        emitLocalStage({
           stage: "reading",
-          stepId: `read-data:${sheet.name}`,
+          stepId,
           title: `读取「${sheet.name}」`,
           sheetName: sheet.name,
           rowsRead,
           totalRows,
+          // 逐表的进度是"进行中"，不是完成；完成由下面的循环补发。
+          status: rowsRead >= totalRows ? "completed" : "progress",
           message: `正在读取「${sheet.name}」：${rowsRead} / ${totalRows} 行`
         });
       }
+    }).catch((error: unknown) => {
+      abandonLocalStages("failed");
+      throw error;
     });
-    input.onProgress?.({ stage: "calculating", stepId: "query", title: "本地确定性计算", toolName: "query_table", message: "在本机计算完整授权数据，不以模型快照代替全表。" });
+    for (const stepId of readSheetIds) finishLocalStage(stepId);
+    finishLocalStage("read-data");
+    emitLocalStage({ stage: "calculating", stepId: "query", title: "本地确定性计算", status: "started", toolName: "query_table", message: "在本机计算完整授权数据，不以模型快照代替全表。" });
     const querySheets = sheetsForRequest(intent.request, results, scope.activeWorksheet);
     dataResults = [dependencies.executeQuery(intent.request, querySheets)];
+    finishLocalStage("query");
   }
 
-  input.onProgress?.({ stage: "answering", stepId: "answer", title: "生成回答或计划", message: "根据意图结果与本地计算摘要组织回答。" });
+  emitLocalStage({ stage: "answering", stepId: "answer", title: "生成回答或计划", status: "started", message: "根据意图结果与本地计算摘要组织回答。" });
   const hostVersion = String(input.application.Version ?? "").trim() || null;
   const planRequest: PlanRequest = {
     turnId: intent.turnId,
@@ -623,6 +745,19 @@ export async function runWpsTurn(
    * "再试一次一次性接口"，那会掩盖真实原因并可能产生第二次模型调用。
    */
   const turnIdForStream = intent.turnId ?? "";
+  if (input.preparePlanningBridge) {
+    let ready = false;
+    if (turnIdForStream && !input.signal?.aborted) {
+      try {
+        ready = await input.preparePlanningBridge(turnIdForStream);
+      } catch {
+        // Do not expose host exception details or fall back to an unbridged request.
+        ready = false;
+      }
+    }
+    if (input.signal?.aborted) throw new DOMException("Aborted", "AbortError");
+    if (!ready) throw new Error("本机读表桥未就绪，未发送规划请求。请重试本次需求。");
+  }
   let response: AssistantResponse | null = null;
   let pause: PlanningPauseResult | null = null;
   if (turnIdForStream) {
@@ -635,18 +770,7 @@ export async function runWpsTurn(
         {
           signal: input.signal,
           onProgress: (event) => {
-            input.onProgress?.({
-              stage: "answering",
-              turnId: turnIdForStream,
-              sequence: event.sequence,
-              stepId: event.stepId || "planning-stream",
-              title: event.title,
-              message: event.summary || event.title || "正在规划",
-              // 桥指针必须原样透传：丢掉它，本端就再也看不到"模型在等本机读表"，
-              // 服务端会一直等到超时（表现为"分析卡住"而不是报错）。
-              bridgeTool: event.bridgeTool ?? null,
-              pythonResult: event.pythonResult ?? null
-            });
+            input.onProgress?.(wpsProgressFromTaskEvent(turnIdForStream, event));
           }
         }
       );
@@ -675,13 +799,22 @@ export async function runWpsTurn(
     response = await dependencies.createAssistantResponse(planRequest, input.signal);
   }
   if (pause) {
-    // 暂停是结构化终态，不是失败：原样交给调用方落"可操作暂停卡"。
-    // 按钮由 `wpsPlanningResumeDecision(pause)` 判定，本函数不替它猜。
+    /*
+     * 暂停是结构化终态，不是失败：原样交给调用方落"可操作暂停卡"。
+     *
+     * 但"生成回答或计划"这一步**没有完成**，不能留一行永远在转：调用方会按
+     * `awaiting_input` 收尾，这里先把本地阶段如实标成"未完成"，让时间线上
+     * 不留悬念。判据只写在事件里，不靠调用方再猜一次。
+     */
+    finishLocalStage("answer", "warning");
     return { kind: "planning_pause", pause };
   }
   if (!response) {
+    abandonLocalStages("failed");
     throw new Error("规划没有返回任何结构化结果。");
   }
+  // 规划这一轮已经拿到结构化结果，"生成回答或计划"到此真正结束。
+  finishLocalStage("answer");
   if (response.kind === "clarification") {
     return {
       kind: "clarification", clarification: { response },
@@ -710,19 +843,21 @@ export async function runWpsTurn(
     }
     // 服务端只给了规则（它手上没有源值）。到这里才读源区域：上面 schema 扫描
     // 只取字段名，不含数据行。读出的值**只在本端用**，算完不回传。
-    input.onProgress?.({ stage: "reading", stepId: "read-mapping-source", title: "读取授权源列", message: "映射源值只留在本机，不上传服务端计划校验。" });
+    input.onProgress?.({ stage: "reading", stepId: "read-mapping-source", title: "读取授权源列", status: "started", message: "映射源值只留在本机，不上传服务端计划校验。" });
     const sourceSheet = await readMappingSource(
       input,
       authorization,
       response.rule.sourceSheet,
       dependencies
     );
-    input.onProgress?.({ stage: "calculating", stepId: "map-column", title: "计算目标列", toolName: "map_column", message: "在本机按映射规则生成目标值。" });
+    input.onProgress?.({ stage: "reading", stepId: "read-mapping-source", title: "读取授权源列", status: "completed", message: "已读取映射源列，值只在本机使用。" });
+    input.onProgress?.({ stage: "calculating", stepId: "map-column", title: "计算目标列", status: "started", toolName: "map_column", message: "在本机按映射规则生成目标值。" });
     const mapped = localMappingResult(response.rule, sourceSheet, {
       summary: response.summary,
       warnings: response.warnings,
       assumptions: response.assumptions
     }, sheetHeaderRows(schemas));
+    input.onProgress?.({ stage: "calculating", stepId: "map-column", title: "计算目标列", status: "completed", toolName: "map_column", message: "已按映射规则算出目标列。" });
     // 带上这次规划的身份：断线后要先拿它查真实状态，而不是重新发一遍需求。
     return { ...mapped, turnId: response.turnId } as WpsTurnResult;
   }
@@ -917,6 +1052,12 @@ export async function resumeWpsPlanning(
      * 否则中途漏收的事件会被永久跳过。
      */
     afterSequence?: number;
+    /**
+     * 本轮**重新核实**过的现场证据。三项必填，与 Excel 端同一份结构与判据
+     * （`buildPlanningContinuationEvidence`）：缺证据就不该走到这里，
+     * 服务端也不再接受"省略即跳过比对"。
+     */
+    evidence: PlanningContinuationEvidence;
   },
   dependencies: WpsReadonlyAgentDependencies = DEFAULT_DEPENDENCIES
 ): Promise<WpsPlanningContinueResult> {
@@ -961,19 +1102,23 @@ export async function resumeWpsPlanning(
       afterSequence: Math.min(Number.isSafeInteger(input.afterSequence) && input.afterSequence! >= 0
         ? input.afterSequence! : 0, status.lastSequence),
       modelId: input.modelId ?? undefined,
-      confirmModelSwitch: input.confirmModelSwitch
+      confirmModelSwitch: input.confirmModelSwitch,
+      // 证据原样上交：这里**不**做"有就传、没有就省略"的条件拼装 ——
+      // 那种写法正是上一版"三项全省略也能继续"的来源。
+      workbookIdentity: input.evidence.workbookIdentity,
+      authorizedSheetNames: [...input.evidence.authorizedSheetNames],
+      sourceVerification: input.evidence.sourceVerification,
+      ...(input.evidence.sourceVerification === "verified" &&
+      input.evidence.sourceFingerprint
+        ? { sourceFingerprint: input.evidence.sourceFingerprint }
+        : {})
     },
     {
       signal: input.signal,
       onProgress: (event) => {
-        input.onProgress?.({
-          stage: "answering",
-          turnId,
-          sequence: event.sequence,
-          stepId: event.stepId || "planning-continue",
-          title: event.title,
-          message: event.summary || event.title || "正在继续规划"
-        });
+        // 与首次规划**同一份**映射：续跑时模型同样会发 `bridgeTool` 指针，
+        // 漏传一次就等于这一轮续跑永远读不到表。
+        input.onProgress?.(wpsProgressFromTaskEvent(turnId, event, "planning-continue", "正在继续规划"));
       }
     }
   );

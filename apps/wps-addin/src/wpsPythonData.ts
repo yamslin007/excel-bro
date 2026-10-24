@@ -4,6 +4,7 @@ import type { PythonDataHost } from "@excel-bro/core/pythonData";
 import { inspectWpsAuthorizedTarget, wpsAnalysisTargetEvidence } from "./wpsAuthorizedTarget";
 import { createWpsPrimitiveOps } from "./wpsHostAdapter";
 import { getWpsApplication } from "./wpsHost";
+import { wpsReadWorkbook } from "./wpsResultReviewTarget";
 import { authorizeWpsSheets } from "./wpsWorkbookReader";
 import { captureWpsObjectIdentity, verifyWpsObjectIdentity } from "./wpsObjectIdentity";
 
@@ -20,7 +21,8 @@ export function createWpsPythonDataHost(bound: AuthorizedTarget,
       const application = getWpsApplication();
       // AuthorizedTarget has only sheet indexes, not the consent-time WPS
       // stable object identity. Do not adopt a replacement workbook as baseline.
-      if (!identity && application.ActiveWorkbook !== bound.fileRef) throw new TargetConfirmationRequiredError();
+      // 本次副本被激活时仍按原表：那不是换了工作簿，只是多了个窗口。
+      if (!identity && wpsReadWorkbook(application) !== bound.fileRef) throw new TargetConfirmationRequiredError();
       if (checkAuthorizedTarget(bound, getAuthorization()) !== "same" ||
           checkAuthorizedTarget(bound, await inspectWpsAuthorizedTarget(bound.selected.map(Number))) !== "same" ||
           !(await wpsAnalysisTargetEvidence(bound))?.conclusive) throw new TargetConfirmationRequiredError();

@@ -1,4 +1,16 @@
 import { describe, expect, it, vi } from "vitest";
+
+/**
+ * 续跑必须携带的现场证据。协议里是**必填**（缺证据服务端直接拒），
+ * 这些用例只关心续跑的行为，所以给一份与任务记录一致的固定证据。
+ */
+const TEST_CONTINUATION_EVIDENCE = {
+  evidence: {
+    workbookIdentity: "url:https://example.invalid/test.xlsx",
+    authorizedSheetNames: ["Sheet1"],
+    sourceVerification: "not_collected" as const
+  }
+};
 import type { PlanRequest, IntentCheckRequest, MessageUnderstandingRequest } from "../../excel-addin/src/contracts";
 import type { WpsApplication, WpsRange, WpsWorksheet } from "./wpsHost";
 import {
@@ -50,6 +62,93 @@ const readResult: WpsSheetReadResult = {
 };
 
 describe("WPS readonly agent", () => {
+  it("a late field-intent response after pause cannot establish a planning task or dispatch work", async () => {
+    const controller = new AbortController();
+    let release!: (value: { kind: "proceed"; provider: "model"; turnId: string; summary: string; confirmedPrompt: string }) => void;
+    const response = new Promise<{ kind: "proceed"; provider: "model"; turnId: string; summary: string; confirmedPrompt: string }>(
+      (resolve) => { release = resolve; });
+    const checkIntent = vi.fn(() => response);
+    const streamPlanning = vi.fn();
+    const createAssistantResponse = vi.fn();
+    const preparePlanningBridge = vi.fn();
+    const onProgress = vi.fn();
+    const pending = runWpsReadonlyTurn({
+      application: makeApplication(), selectedSheetIndexes: [1], prompt: "统计数量",
+      signal: controller.signal, preparePlanningBridge, onProgress
+    }, { checkIntent, readSchemas: vi.fn(async () => [readResult]), readSheets: vi.fn(),
+      executeQuery: vi.fn(), streamPlanning, createAssistantResponse,
+      getPlanningStatus: vi.fn(), continuePlanning: vi.fn() });
+    const rejected = expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    await vi.waitFor(() => expect(checkIntent).toHaveBeenCalledOnce());
+    controller.abort();
+    // Must settle before the transport returns, not merely reject its late value.
+    await rejected;
+    expect(onProgress.mock.calls.at(-1)?.[0]).toMatchObject({ stepId: "intent", status: "cancelled" });
+    const stoppedEvents = onProgress.mock.calls.length;
+    release({ kind: "proceed", provider: "model", turnId: "late-intent-id", summary: "统计", confirmedPrompt: "统计数量" });
+    await rejected;
+    expect(onProgress.mock.calls).toHaveLength(stoppedEvents);
+    expect(preparePlanningBridge).not.toHaveBeenCalled();
+    expect(streamPlanning).not.toHaveBeenCalled();
+    expect(createAssistantResponse).not.toHaveBeenCalled();
+    expect(onProgress.mock.calls.some(([event]) => event.turnId === "late-intent-id")).toBe(false);
+  });
+
+  it.each(["ready", "unavailable", "throws", "cancelled"] as const)(
+    "prepares the bridge after intent and before any planning request: %s",
+    async (mode) => {
+      const controller = new AbortController();
+      let release!: (ready: boolean) => void;
+      let entered!: () => void;
+      const started = new Promise<void>((resolve) => { entered = resolve; });
+      const gate = new Promise<boolean>((resolve) => { release = resolve; });
+      const preparePlanningBridge = vi.fn(async (turnId: string) => {
+        expect(turnId).toBe("turn-preflight");
+        entered();
+        const ready = await gate;
+        if (mode === "throws") throw new Error("private host detail");
+        return ready;
+      });
+      const streamPlanning = vi.fn(async () => ({
+        kind: "answer" as const, provider: "model" as const, message: "完成"
+      }));
+      const createAssistantResponse = vi.fn();
+      const pending = runWpsReadonlyTurn({
+        application: makeApplication(), selectedSheetIndexes: [1], prompt: "统计数量",
+        signal: controller.signal, preparePlanningBridge
+      }, {
+        checkIntent: vi.fn(async () => ({
+          kind: "proceed" as const, provider: "model" as const, turnId: "turn-preflight",
+          summary: "统计", confirmedPrompt: "统计数量"
+        })),
+        readSchemas: vi.fn(async () => [readResult]), readSheets: vi.fn(),
+        executeQuery: vi.fn(), streamPlanning, createAssistantResponse,
+        getPlanningStatus: vi.fn(), continuePlanning: vi.fn()
+      });
+      // Attach the rejection handler before releasing the controlled gate.
+      const settled = pending.then((result) => ({ result, error: null }),
+        (error: unknown) => ({ result: null, error }));
+      await Promise.race([started, settled.then(() => {
+        throw new Error("Planning completed without awaiting bridge preparation");
+      })]);
+      expect(streamPlanning).not.toHaveBeenCalled();
+      expect(createAssistantResponse).not.toHaveBeenCalled();
+      if (mode === "cancelled") controller.abort();
+      release(mode !== "unavailable");
+      const outcome = await settled;
+      if (mode === "ready") {
+        expect(outcome.error).toBeNull();
+        expect(streamPlanning).toHaveBeenCalledOnce();
+      } else {
+        expect(outcome.error).toMatchObject({
+          name: mode === "cancelled" ? "AbortError" : "Error"
+        });
+        expect(streamPlanning).not.toHaveBeenCalled();
+        expect(createAssistantResponse).not.toHaveBeenCalled();
+        expect(String(outcome.error)).not.toContain("private host detail");
+      }
+    }
+  );
   it("passes one explicit task context through intent and planning without reading rows", async () => {
     const taskContext = { schemaVersion: 1 as const, originalPrompt: "根据类别填写等级", confirmations: [
       { questionId: "mode", label: "口径", value: "逐行填写" },
@@ -579,12 +678,13 @@ describe("WPS readonly agent", () => {
   it("understands first, then checks authorization and reads fields before field-aware intent", async () => {
     const order: string[] = [];
     const progress: string[] = [];
+    const progressEvents: Array<{ stepId?: string; status?: string }> = [];
     const readSchemas = vi.fn(async () => { order.push("schema"); return [readResult]; });
     const readSheets = vi.fn();
     const result = await runWpsReadonlyTurn({
       application: makeApplication(), selectedSheetIndexes: [1], prompt: "检查当前表",
       beforeRead: async () => { order.push("authorization"); },
-      onProgress: (event) => progress.push(event.stepId ?? "")
+      onProgress: (event) => { progress.push(event.stepId ?? ""); progressEvents.push({ stepId: event.stepId, status: event.status }); }
     }, {
       understandMessage: vi.fn(async (request: MessageUnderstandingRequest) => {
         order.push("message");
@@ -597,7 +697,22 @@ describe("WPS readonly agent", () => {
     });
     expect(result.kind).toBe("answer");
     expect(order).toEqual(["message", "authorization", "schema", "field-intent"]);
-    expect(progress.slice(0, 3)).toEqual(["message-intent", "read-schemas", "intent"]);
+    /*
+     * 每个本地阶段现在发**两条**事件（开始 + 真实终态），所以这里比对的是
+     * "阶段首次出现的顺序"，不是原始事件条数 —— 后者会把"同一阶段的开始与
+     * 完成"数成两个阶段。终态成对由下面的配对断言单独钉住。
+     */
+    expect([...new Set(progress)].slice(0, 3)).toEqual(["message-intent", "read-schemas", "intent"]);
+    const statuses = new Map<string, string[]>();
+    for (const event of progressEvents) {
+      const list = statuses.get(event.stepId ?? "") ?? [];
+      list.push(event.status ?? "");
+      statuses.set(event.stepId ?? "", list);
+    }
+    for (const [stepId, list] of statuses) {
+      expect(list.filter((status) => status === "started")).toHaveLength(1);
+      expect(list.at(-1), `${stepId} 没有真实终态`).not.toBe("started");
+    }
     expect(readSheets).not.toHaveBeenCalled();
   });
 
@@ -871,11 +986,55 @@ describe("WPS readonly agent", () => {
         return { kind: "answer" as const, provider: "model" as const, message: "继续完成", resultContext: null };
       });
       const result = await resumeWpsPlanning(
-        { turnId: "turn-r", afterSequence: 5 },
+        { ...TEST_CONTINUATION_EVIDENCE, turnId: "turn-r", afterSequence: 5 },
         { getPlanningStatus, continuePlanning } as never
       );
       expect(order).toEqual(["status", "continue"]);
       expect(result.outcome).toMatchObject({ kind: "answer", message: "继续完成" });
+    });
+
+    it("续跑期间必须把 bridgeTool 指针透传出去（变异点：进度重组只留文案字段）", async () => {
+      /*
+       * 这是"继续分析卡住"的第二半根因：`resumeWpsPlanning` 曾经自己拼了一个
+       * "看起来一样"的进度对象，只 copy 了 stage/turnId/sequence/stepId/title/
+       * message，把 `bridgeTool` 丢了。面板就算接好了桥，也永远等不到指针。
+       */
+      const seen: Array<{ bridgeTool?: unknown; turnId?: string; stepId?: string }> = [];
+      const result = await resumeWpsPlanning(
+        {
+          ...TEST_CONTINUATION_EVIDENCE,
+          turnId: "turn-bridge",
+          afterSequence: 2,
+          onProgress: (progress: { bridgeTool?: unknown; turnId?: string; stepId?: string }) => {
+            seen.push(progress);
+          }
+        },
+        {
+          getPlanningStatus: vi.fn(async () => ({
+            turnId: "turn-bridge",
+            status: "waiting_user" as const,
+            revision: 3,
+            lastSequence: 9,
+            canContinue: true,
+            pauseType: "budget" as const,
+            reason: null
+          })),
+          continuePlanning: vi.fn(async (_body: unknown, hooks: { onProgress?: (event: unknown) => void }) => {
+            hooks.onProgress?.({
+              sequence: 10,
+              stepId: "bridge.query_table",
+              title: "读取授权表",
+              bridgeTool: { operationId: "op_" + "5".repeat(32), tool: "query_table" }
+            });
+            return { kind: "answer" as const, provider: "model" as const, message: "完成", resultContext: null };
+          })
+        } as never
+      );
+      expect(result.outcome).toMatchObject({ kind: "answer" });
+      const withPointer = seen.find((item) => item.bridgeTool);
+      expect(withPointer, "续跑的进度里必须带着读表指针").toBeTruthy();
+      expect(withPointer?.turnId).toBe("turn-bridge");
+      expect(withPointer?.stepId).toBe("bridge.query_table");
     });
 
     it("服务端说不能继续时不硬续（变异点：无视 canContinue 直接续）", async () => {
@@ -883,7 +1042,7 @@ describe("WPS readonly agent", () => {
       // 刻意构造"有检查点但服务端明确说不能继续"：只凭 action 推导会误放行，
       // 必须由 canContinue 闸拦住 —— 这正是这条断言的唯一判别点。
       const result = await resumeWpsPlanning(
-        { turnId: "turn-paused" },
+        { ...TEST_CONTINUATION_EVIDENCE, turnId: "turn-paused" },
         {
           getPlanningStatus: vi.fn(async () => ({
             turnId: "turn-paused",
@@ -904,7 +1063,7 @@ describe("WPS readonly agent", () => {
     it("已完成的任务绝不续跑", async () => {
       const continuePlanning = vi.fn();
       const result = await resumeWpsPlanning(
-        { turnId: "turn-done" },
+        { ...TEST_CONTINUATION_EVIDENCE, turnId: "turn-done" },
         {
           getPlanningStatus: vi.fn(async () => ({
             turnId: "turn-done",
@@ -933,7 +1092,7 @@ describe("WPS readonly agent", () => {
         kind: "answer" as const, provider: "model" as const, message: "好", resultContext: null
       }));
       await resumeWpsPlanning(
-        { turnId: "turn-x", requestId: "plan-continue-fixed" },
+        { ...TEST_CONTINUATION_EVIDENCE, turnId: "turn-x", requestId: "plan-continue-fixed" },
         {
           getPlanningStatus: vi.fn(async () => ({
             turnId: "turn-x",
@@ -963,7 +1122,7 @@ describe("WPS readonly agent", () => {
         kind: "answer" as const, provider: "model" as const, message: "好", resultContext: null
       }));
       await resumeWpsPlanning(
-        { turnId: "turn-y", requestId: "r-1", afterSequence: 4 },
+        { ...TEST_CONTINUATION_EVIDENCE, turnId: "turn-y", requestId: "r-1", afterSequence: 4 },
         {
           getPlanningStatus: vi.fn(async () => ({
             turnId: "turn-y",
@@ -986,7 +1145,7 @@ describe("WPS readonly agent", () => {
         kind: "answer" as const, provider: "model" as const, message: "好", resultContext: null
       }));
       await resumeWpsPlanning(
-        { turnId: "turn-z", requestId: "r-2" },
+        { ...TEST_CONTINUATION_EVIDENCE, turnId: "turn-z", requestId: "r-2" },
         {
           getPlanningStatus: vi.fn(async () => ({
             turnId: "turn-z",
@@ -1005,7 +1164,7 @@ describe("WPS readonly agent", () => {
 
     it("续跑进度向面板转发原任务身份和实际事件序号", async () => {
       const onProgress = vi.fn();
-      await resumeWpsPlanning({ turnId: "turn-events", afterSequence: 3, onProgress }, {
+      await resumeWpsPlanning({ ...TEST_CONTINUATION_EVIDENCE, turnId: "turn-events", afterSequence: 3, onProgress }, {
         getPlanningStatus: vi.fn(async () => ({ turnId: "turn-events", status: "interrupted", revision: 7,
           lastSequence: 20, canContinue: true, pauseType: "interrupted", reason: null })),
         continuePlanning: vi.fn(async (_body, hooks) => {
@@ -1041,7 +1200,8 @@ describe("WPS readonly agent", () => {
       currentModelId: null,
       modelSwitchCount: 0,
       canSwitchModel: false,
-      availableModelConnections: []
+      availableModelConnections: [],
+      continuation: { available: true, code: null, message: "", stage: "after_tool" as const }
     };
 
     it("重开只核对、不自动续跑：continuePlanning 一次都不许被调用", async () => {

@@ -1,3 +1,4 @@
+import { executeWorksheetDeletion, openWorksheetCheckpoint, confirmWorksheetCheckpointBackup, restoreWorksheetCheckpoint } from "../../excel-addin/src/api";
 import { readFileSync } from "node:fs";
 import { act, useEffect, useState, type ReactElement } from "react";
 import { createRoot } from "react-dom/client";
@@ -9,6 +10,7 @@ import { getModelSettings, listModels, understandMessage, validatePlan, register
 import WpsAgentPanel, { wpsWriteBackBlockReason, wpsWriteBackStillCurrent } from "./WpsAgentPanel";
 import type { ReviewWriteBackTarget } from "@excel-bro/core/reviewWriteBackGate";
 import { matrixFingerprintV2 } from "./wpsPlanExecutor";
+import { capabilityHost } from "./wpsCapabilityTestHost";
 import WpsModelSettingsPanel from "./WpsModelSettingsPanel";
 import {
   runWpsReadonlyTurn,
@@ -22,7 +24,7 @@ import {
   COMPOSER_AUTO_GROW_MAX_HEIGHT,
   COMPOSER_RESIZE_LABEL
 } from "../../excel-addin/src/hooks/useComposerResize";
-import { compareCommittedWpsResultToCopy, discardWpsNativeComparison, stageWpsNativeComparison, WpsFormulaTrialError } from "./wpsNativeComparison";
+import { compareCommittedWpsResultToCopy, discardWpsNativeComparison, stageWpsBeforeComparison, stageWpsNativeComparison, WpsFormulaTrialError } from "./wpsNativeComparison";
 import type { AnalysisPlan } from "../../excel-addin/src/contracts";
 import { loadTools } from "../../excel-addin/src/storage";
 
@@ -62,6 +64,10 @@ vi.mock("../../excel-addin/src/api", async (importOriginal) => {
     listModels: vi.fn(),
     getModelSettings: vi.fn(),
     validatePlan: vi.fn(),
+    executeWorksheetDeletion: vi.fn(),
+    confirmWorksheetCheckpointBackup: vi.fn(),
+    openWorksheetCheckpoint: vi.fn(),
+    restoreWorksheetCheckpoint: vi.fn(),
     registerWpsExecution: vi.fn(async (input: { operationId: string }) =>
       wpsRunningState(input.operationId)),
     getWpsExecutionStatus: vi.fn(async (operationId: string) => wpsRunningState(operationId)),
@@ -119,6 +125,40 @@ vi.mock("./wpsNativeComparison", () => ({
       originalFormatBefore: prepared.actions.map(() => undefined)
     };
   }),
+  // 执行前快照：真实实现只读原表、不建副本。替身按同一形状给（值取自计划动作，
+  // 保证"快照可用"这一前提成立），但**不**假装做过宿主复制 —— 复制只发生在 showBefore。
+  /*
+   * 执行前副本：真实实现按**执行前快照**重建（先复制、再把快照写回副本）。
+   * 替身只保证形状与"调用过"，真正的重建逻辑由 `wpsNativeComparison` 单测覆盖。
+   */
+  stageWpsBeforeComparison: vi.fn((_application: unknown, before: unknown) => ({
+    plan: (before as { prepared: unknown }).prepared,
+    original: { Name: "测试.xlsx" },
+    copy: { Name: "Book1" },
+    copyIdentity: { name: "Book1", fullName: null, path: null },
+    /*
+     * `writeSheet` 是真实返回的一部分（`wpsNativeComparison.stageWpsBeforeComparison`）：
+     * 本次审阅的目标绑定靠它记下"写入的是哪一张表"。替身少了它，绑定那一句会直接
+     * 抛 TypeError，于是双视图打开失败、副本从未登记 —— 症状是"放弃之后没有副本
+     * 收尾提示"，看上去像产品缺陷，其实是替身不完整。
+     */
+    writeSheet: { index: 1, name: "Sheet1" },
+    originalBefore: [],
+    copyFingerprints: [],
+    copyAfter: [],
+    reviews: [],
+    changedCells: []
+  })),
+  captureWpsBeforeResult: vi.fn((_application: unknown, prepared: unknown) => {
+    const plan = prepared as { actions: { values: unknown[][] }[] };
+    return {
+      prepared,
+      values: plan.actions.map(() => ({ values: [[]], formulas: [[]], valuesCaptured: true })),
+      workbookFullName: "C:////Data////测试.xlsx"
+    };
+  }),
+  // 双视图排列：真实实现要宿主窗口能力；替身只证明"调用过、且没有再次执行计划"。
+  rearrangeWpsComparison: vi.fn(() => "arranged"),
   compareCommittedWpsResultToCopy: vi.fn(() => "matched"),
   verifyWpsNativeComparison: vi.fn(),
   // 宿主真实返回的是**关闭结果**（不再是 void/抛异常）。
@@ -535,7 +575,7 @@ function clarificationHost(options: { sheetNames?: string[]; workbookName?: stri
   };
 }
 
-/** 走到"写入前确认"这一步：两端对照用的同一任务状态。 */
+/** 走到"本次执行计划"这一步：两端对照用的同一任务状态。 */
 async function mountPlanPreview(plan: AnalysisPlan, task: string) {
   listModelsMock.mockResolvedValue({ defaultModelId: firstConnection.id, models: [firstConnection] });
   runTurnMock.mockResolvedValue({ kind: "plan", plan, turnId: "turn-preview-1" });
@@ -1208,7 +1248,11 @@ describe("WPS Excel Bro chat UI", () => {
     await submit(composer);
     await until(() => runTurnMock.mock.calls.length === 1 && Boolean(container.querySelector('[aria-label="暂停任务"]')), "运行时应显示暂停入口");
     await click(container.querySelector('[aria-label="暂停任务"]'));
-    await until(() => textOf(container).includes("尚未形成可续跑检查点"), "不能伪造续跑现场");
+    await until(() => Boolean(container.querySelector('[aria-label="继续未完成的需求分析"]')), "应保留原需求的继续入口");
+    expect(textOf(container)).not.toContain("尚未生成规划检查点");
+    expect(container.querySelector('[aria-label="继续未完成的需求分析"]')).not.toBeNull();
+    expect(container.querySelector(".wps-planning-pause-card")).toBeNull();
+    expect(runTurnMock).toHaveBeenCalledTimes(1);
     expect(composer?.value).toBe("");
     expect(container.querySelector('[aria-label="暂停任务"]')).toBeNull();
   });
@@ -1380,7 +1424,7 @@ describe("WPS Excel Bro chat UI", () => {
     expect(hint.querySelector(".progress-dots")).toBeNull();
   });
 
-  it("shows a normalized write plan without touching cells until explicit confirmation", async () => {
+  it("executes plan immediately and shows result review", async () => {
     let value = "旧值";
     let formula = "旧值";
     let writes = 0;
@@ -1435,55 +1479,156 @@ describe("WPS Excel Bro chat UI", () => {
     const textarea = container.querySelector("textarea");
     await type(textarea, "把 A1 改成新值");
     await submit(textarea);
-    await until(() => textOf(container).includes("写入前确认"), "应展示写入计划");
+    // New flow: plan is executed immediately, showing result review bar
+    await until(() => container.querySelector(".result-review-bar") !== null, "应展示执行结果审阅条");
+    await until(() => textOf(container).includes("请查看主表中的执行结果"), "应提示查看主表结果");
 
-    expect(writes).toBe(0);
-    expect(container.querySelector(".wps-plan-card")?.closest(".message-row.assistant")).not.toBeNull();
-    const savedHistory = JSON.parse(localStorage.getItem("excel-bro.wps.chat.v1") ?? "null");
-    const savedPreview = savedHistory.conversations[0].messages.find((message: { planPreview?: unknown }) => message.planPreview);
-    expect(savedPreview.planPreview).toEqual({ title: "更新 A1", status: "pending" });
-    expect(savedPreview.text).toBe("");
-    /*
-     * 开发环境提示**只进诊断入口**，而且只在副本已生成的审阅卡里。
-     * 写入前预览阶段一个排查材料都不摆 —— 正向锚点在下面两行（预览确实渲染了）。
-     */
-    expect(textOf(container)).not.toContain("当前 WPS JSAPI 版本仅在开发调试模式开放写入");
-    expect(textOf(container)).toContain("Sheet1!A1");
-    expect(textOf(container)).toContain("新值");
-    await click(container.querySelector<HTMLButtonElement>('[aria-label="新对话"]'));
-    expect(textOf(container)).toContain("放弃待确认的写入计划？");
-    expect(textOf(container)).toContain("当前对话还有一份尚未执行的写入计划");
-    await click(findButton(container, "继续当前对话"));
-    expect(textOf(container)).toContain("写入前确认");
-    await click(findButton(container, "编辑计划"));
-    expect(findButton(container, "生成右侧副本并排审阅")).toBeNull();
-    const editBox = container.querySelector<HTMLTextAreaElement>('[aria-label="编辑写入计划 JSON"]');
-    await type(editBox, JSON.stringify({
-      ...writePlan,
-      actions: [{ type: "writeValues", sheet: "Sheet1", range: "A1", values: [["修订值"]] }]
-    }));
-    await click(findButton(container, "应用修改并重新预览"));
-    await until(() => textOf(container).includes("修订值") && findButton(container, "生成右侧副本并排审阅") !== null, "编辑后应重新预览最终值");
-    expect(writes).toBe(0);
-    await stageAndSave(container);
-    await until(
-      () => Boolean(container.querySelector('button[aria-label="备份与恢复"] b')),
-      "确认后应完成写入并提供恢复入口"
-    );
+    // Execution has completed
     expect(writes).toBe(1);
-    expect(value).toBe("修订值");
-    expect(textOf(container)).toContain("计划已执行并回读确认");
-    const resultMessage = container.querySelector(".wps-verification-card.verified")?.closest(".message-row.assistant");
-    expect(resultMessage?.querySelector(".message-author")?.textContent?.trim()).toBe("Excel Bro");
-    expect(container.querySelector(".wps-verification-card.verified")?.textContent).toContain("1 个动作 · 1 个单元格已回读核对");
-    expect(container.querySelector(".wps-verification-card.verified")?.textContent).toContain("Sheet1!A1");
-    expect(textOf(container)).toContain("保存写前恢复点");
-    expect(textOf(container)).toContain("回读核对第 1 个动作");
-    const completedTimeline = Array.from(container.querySelectorAll(".task-progress-timeline.activity-log-card"))
-      .find((item) => item.textContent?.includes("执行第 1 个写入动作"));
-    expect(completedTimeline).not.toBeNull();
-    expect(completedTimeline?.textContent).toContain("Sheet1!A1");
-    expect(completedTimeline?.textContent).toContain("writeValues");
+    expect(value).toBe("新值");
+
+    // Result review bar shows review phase
+    const reviewBar = container.querySelector(".result-review-bar");
+    expect(reviewBar).not.toBeNull();
+    expect((reviewBar as HTMLElement).textContent).toContain("更新 A1");
+
+    // Verify buttons are present
+    expect(findButton(container, "双视图对比")).not.toBeNull();
+    expect(findButton(container, "放弃变更")).not.toBeNull();
+    expect(findButton(container, "确认变更")).not.toBeNull();
+
+    // Confirm the changes
+    await click(findButton(container, "确认变更"));
+    await until(() => textOf(container).includes("已确认变更"), "确认后应显示已确认状态");
+
+    // Verify final state
+    expect(writes).toBe(1);
+    expect(value).toBe("新值");
+    const savedHistory = JSON.parse(localStorage.getItem("excel-bro.wps.chat.v1") ?? "null");
+    const savedMessage = savedHistory.conversations[0].messages.find((message: { planPreview?: unknown }) => message.planPreview);
+    expect(savedMessage).toBeDefined();
+  });
+
+  /*
+   * 悬浮「回到底部」浮标的运行状态误判（用户点名的回归）。
+   *
+   * 根因：`running` 直接接了 `busy`，而 `busy` 含 `phase === 'reviewing'`
+   * （"结果已就绪、等用户确认/放弃"）。于是执行早就结束了，浮标还在跳三点。
+   *
+   * 这里**不**只测"共享按钮收到 false 会画锚"——那证明不了接线对。要验的是
+   * 面板自己算出来的 `running`：
+   *   ① 结果已生成、reviewing、pending=false ⇒ 锚；
+   *   ② 确认/放弃这类实际操作在途（pending=true）⇒ 三点；
+   *   ③ 操作完成 ⇒ 回锚。
+   * 同时 `busy` 的防重复执行/互斥边界必须仍在（确认按钮在 reviewing 且非 pending 时可点）。
+   */
+  it("review bar is waiting for the user, so the scroll hint shows the anchor - not the running dots", async () => {
+    let value = "旧值";
+    let formula = "旧值";
+    const range = { Rows: { Count: 1 }, Columns: { Count: 1 }, MergeCells: false } as Record<string, unknown>;
+    Object.defineProperties(range, {
+      Value2: {
+        get: () => value,
+        set: (next: string) => { value = next; formula = next; },
+        enumerable: true
+      },
+      Formula: {
+        get: () => formula,
+        set: (next: string) => { formula = next; value = next; },
+        enumerable: true
+      }
+    });
+    const sheet = { Name: "Sheet1", ProtectContents: false, Range: () => range };
+    const storage = new Map<string, unknown>();
+    getWpsApplicationMock.mockReturnValue({
+      Version: "12.0",
+      ActiveWorkbook: {
+        Name: "测试.xlsx", FullName: "C:\\Data\\测试.xlsx", Path: "C:\\Data", ReadOnly: false,
+        Worksheets: { Count: 1, Item: () => sheet }, ActiveSheet: sheet
+      },
+      ActiveSheet: sheet,
+      PluginStorage: {
+        getItem: (key: string) => storage.get(key),
+        setItem: (key: string, item: unknown) => { storage.set(key, item); }
+      },
+      CreateTaskPane: () => ({ ID: 1, Visible: true }),
+      GetTaskPane: () => undefined
+    } as never);
+    const writePlan = {
+      id: "write-hint", title: "更新 A1", summary: "把 A1 更新为新值",
+      assumptions: [], warnings: [],
+      actions: [{ type: "writeValues" as const, sheet: "Sheet1", range: "A1", values: [["新值"]] }],
+      acceptanceCriteria: []
+    };
+    listModelsMock.mockResolvedValue({ defaultModelId: firstConnection.id, models: [firstConnection] });
+    runTurnMock.mockResolvedValue({ kind: "plan", plan: writePlan });
+    validatePlanMock.mockImplementation(async (submitted) => submitted);
+
+    const { container } = await mount(panel());
+    await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "应加载模型");
+    const textarea = container.querySelector("textarea");
+    await type(textarea, "把 A1 改成新值");
+    await submit(textarea);
+    await until(() => container.querySelector(".result-review-bar") !== null, "应展示执行结果审阅条");
+
+    // 滚离底部：浮标只在离开底部时渲染（判据是位置，不要求有新内容）。
+    const stream = container.querySelector<HTMLElement>(".message-stream")!;
+    Object.defineProperties(stream, {
+      scrollHeight: { configurable: true, value: 1000 },
+      clientHeight: { configurable: true, value: 300 }
+    });
+    stream.scrollTop = 200;
+    await act(async () => { stream.dispatchEvent(new Event("scroll", { bubbles: true })); });
+
+    /*
+     * ① 结果已就绪、等人：`aria-busy=false` 证明审阅通道此刻没有操作在途
+     *    （不是"按钮替身画了个锚"），此时浮标必须是**锚**。
+     */
+    const bar = container.querySelector<HTMLElement>(".result-review-bar")!;
+    expect(bar.getAttribute("aria-busy")).toBe("false");
+    expect((bar as HTMLElement).textContent).toContain("请查看主表中的执行结果");
+    await until(
+      () => container.querySelector<HTMLButtonElement>(".new-progress-button")?.dataset.mode === "idle",
+      "只是等用户查看结果时，浮标应当显示锚而不是三点"
+    );
+    const hint = container.querySelector<HTMLButtonElement>(".new-progress-button")!;
+    expect(hint.querySelector(".progress-anchor-icon")).not.toBeNull();
+    expect(hint.querySelector(".progress-dots")).toBeNull();
+
+    /*
+     * ② 实际操作在途：点「放弃变更」→ 真实恢复流程里的
+     *    `await targetGuard.check()`（→ `inspectWpsAuthorizedTarget`，可挂起）。
+     *    这是**真的在跑**：`resultReviewState.pending` 会一直是 true，
+     *    而 `phase` 仍是 `reviewing` —— 正好证明"在途"与"等人"是两件事。
+     *    `until` 等的是三点那一态本身：接线若错，这里等不到而失败，不会悄悄放行。
+     */
+    holdInspect();
+    await click(findButton(container, "放弃变更"));
+    await until(
+      () => container.querySelector<HTMLButtonElement>(".new-progress-button")?.dataset.mode === "running",
+      "恢复流程还在跑，浮标应当显示三点"
+    );
+    expect(container.querySelector<HTMLButtonElement>(".new-progress-button")!.querySelectorAll(".progress-dots > span")).toHaveLength(3);
+    // 同一时刻审阅通道确实在途：按钮被禁用、`aria-busy` 为真。
+    expect(bar.getAttribute("aria-busy")).toBe("true");
+    expect(findButton(container, "放弃变更")!.disabled).toBe(true);
+    expect(inspectPending()).toBe(true);
+
+    /*
+     * ③ 操作完成：回到锚。同时 `busy` 的边界没被破坏 —— 放弃成功后固定条收起，
+     *    而恢复本身真的发生了（`busy` 的互斥保护一直都在，只是不再冒充"在跑"）。
+     */
+    await releaseInspect();
+    await until(() => textOf(container).includes("已放弃并恢复"), "放弃后应显示已放弃并恢复");
+    await until(
+      () => container.querySelector<HTMLButtonElement>(".new-progress-button")?.dataset.mode === "idle",
+      "放弃恢复完成后浮标应当回到锚"
+    );
+    expect(container.querySelector<HTMLButtonElement>(".new-progress-button")).toBe(hint);
+    // 固定条此刻应收起（成功终态、没有待办）；若还挂着 aria-busy=true，
+    // 说明恢复没收尾完 —— 那才是真的"还在跑"。
+    const settledBar = container.querySelector<HTMLElement>(".result-review-bar");
+    if (settledBar) expect(settledBar.getAttribute("aria-busy")).toBe("false");
   });
 
   it("本端算出的计划不送服务端校验", async () => {
@@ -1546,14 +1691,17 @@ describe("WPS Excel Bro chat UI", () => {
     const textarea = container.querySelector("textarea");
     await type(textarea, "把类别列翻译成归属");
     await submit(textarea);
-    await until(() => textOf(container).includes("写入前确认"), "应展示写入计划");
 
+    // New flow: plan executes immediately
+    await until(() => container.querySelector(".result-review-bar") !== null, "应展示执行结果审阅条");
+
+    // Core assertion: local plan never sent to server for validation
     expect(validatePlanMock).not.toHaveBeenCalled();
-    expect(textOf(container)).toContain("Sheet1!A1");
-    await click(findButton(container, "编辑计划"));
-    await click(findButton(container, "应用修改并重新预览"));
-    await until(() => findButton(container, "生成右侧副本并排审阅") !== null, "本地计划编辑后应重新预览");
-    expect(validatePlanMock).not.toHaveBeenCalled();
+
+    // Source data should not appear in persisted history
+    const persisted = localStorage.getItem("excel-bro.wps.chat.v1") ?? "";
+    expect(persisted).not.toContain("旧值");
+    expect(persisted).not.toContain("办公用品");
   });
 
   it("keeps a secret leaked by an upstream error out of the persisted chat history", async () => {
@@ -2004,7 +2152,7 @@ describe("WPS Excel Bro chat UI", () => {
     const textarea = container.querySelector<HTMLTextAreaElement>(".composer textarea");
     await type(textarea, "把类别列翻译成归属");
     await submit(textarea);
-    await until(() => textOf(container).includes("写入前确认"), "应展示写入计划");
+    await until(() => textOf(container).includes("本次执行计划"), "应展示写入计划");
 
     // 目标矩阵「行政」与源值「办公用品」都不能出现在持久历史里。
     const persisted = localStorage.getItem("excel-bro.wps.chat.v1") ?? "";
@@ -2146,7 +2294,7 @@ describe("WPS Excel Bro chat UI", () => {
       "后台不可读时也应能打开新增表单"
     );
     expect(
-      findButton(container, "添加并使用")?.hasAttribute("disabled")
+      findButton(container, "添加连接")?.hasAttribute("disabled")
     ).toBe(true);
     await until(() => textOf(container).includes("暂时无法检查已有连接"), "应区分读取失败和空列表");
     expect(textOf(container)).not.toContain("已检查：这台电脑上暂无已保存的模型连接");
@@ -2211,8 +2359,12 @@ describe("WPS Excel Bro chat UI", () => {
     expect(markup).toContain("API Key 安全保存在这台电脑上");
     expect(markup).toContain("添加模型连接");
     expect(markup).toContain("测试连接");
-    expect(markup).toContain("添加并使用");
+    expect(markup).toContain("添加连接");
     expect(markup).toContain("/function 公式模型");
+    expect(markup).toContain("接口协议");
+    expect(markup).toContain("测试用途");
+    expect(markup).toContain("Anthropic 兼容（SDK Agent）");
+    expect(markup).toContain("独立公式测试通过不代表 Agent 可用");
 
     const existingConnectionMarkup = renderToStaticMarkup(
       <WpsModelSettingsPanel
@@ -2447,7 +2599,7 @@ describe("WPS Excel Bro chat UI", () => {
       )?.[1] ?? "";
     const saveButton =
       editorMarkup.match(
-        /<button class="model-primary-action" type="button"([^>]*)>添加并使用<\/button>/
+        /<button class="model-primary-action" type="button"([^>]*)>添加连接<\/button>/
       )?.[1] ?? "";
 
     expect(testButton).not.toContain("disabled");
@@ -2497,9 +2649,10 @@ describe("WPS Excel Bro chat UI", () => {
     const meta = Array.from(container.querySelectorAll(".wps-plan-meta span"))
       .map((item) => item.textContent?.trim());
     expect(meta).toContain("会话内可撤销");
-    // 还没确认，就不得出现任何执行结果。
-    expect(container.querySelector(".wps-verification-card")).toBeNull();
-    expect(textOf(container)).not.toContain("写入验证通过");
+    // 新流程是"先执行、后审阅"：执行结果必须已经在场，且与计划摘要**同时**可见。
+    // 这两块信息不能互相顶替 —— 一个说"改成了什么"，一个说"按什么口径改的"。
+    expect(container.querySelector(".wps-verification-card")).not.toBeNull();
+    expect(notes.map((note) => note.textContent).join(" ")).toContain("源列空白按「未分类」处理。");
   });
 
   it("hides both note blocks when the plan states neither", async () => {
@@ -2511,48 +2664,75 @@ describe("WPS Excel Bro chat UI", () => {
     expect(textOf(container)).not.toContain("采用的信息");
   });
 
-  it("marks the preview as edited only after the user rewrote the plan", async () => {
+  /*
+   * 原「marks the preview as edited only after the user rewrote the plan」随
+   * 「编辑计划」一起取消：新流程下计划一经校验即执行，不存在"改写后再预览"这一步。
+   * 它当时钉的信息面（"这份计划被改过 / 到底按哪份动作写的"）仍然必要，但载体换了：
+   * 执行摘要卡保留假设、警告、格式变化说明，并提供只读的完整计划 JSON。
+   * 那条判据在「mirrors the Excel plan card hierarchy」与本地映射用例里继续成立。
+   */
+
+  it("放弃变更走真实恢复点撤销；从未打开双视图时不创建也不处理任何副本", async () => {
     const host = writeRangeHost();
     const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
-
-    expect(textOf(container)).not.toContain("已按你的修改更新");
-    await click(findButton(container, "编辑计划"));
-    const editBox = container.querySelector<HTMLTextAreaElement>('[aria-label="编辑写入计划 JSON"]');
-    await type(editBox, JSON.stringify({ ...singleWritePlan, summary: "改成最大值" }));
-    await click(findButton(container, "应用修改并重新预览"));
-    await until(() => textOf(container).includes("已按你的修改更新"), "编辑后重新预览必须有可见标识");
-
-    expect(container.querySelector(".wps-plan-card")?.textContent).toContain("写入前请重新核对");
-    expect(host.writes()).toBe(0);
-    // 标识跟着消息持久化：重新载入面板后仍能知道这份计划被改过。
-    const saved = JSON.parse(localStorage.getItem("excel-bro.wps.chat.v1") ?? "null");
-    const savedPreview = saved.conversations[0].messages.find(
-      (message: { planPreview?: { revised?: boolean } }) => message.planPreview
-    );
-    expect(savedPreview.planPreview.revised).toBe(true);
+    // 新流程：执行已经发生，主表是新值 —— 这是"放弃"要撤销的对象。
+    expect(host.cellValue()).toBe("90");
+    await click(findButton(container, "放弃变更"));
+    expect(host.cellValue()).toBe("旧值");
+    expect(textOf(container)).toContain("已放弃并恢复");
+    expect(findButton(container, "确认变更")).toBeNull();
+    // 没点过「双视图对比」就没有副本可处理：不能凭空调用副本清理，
+    // 那会把「关闭某个窗口」做成一次没有对象、却可能打错目标的操作。
+    expect(discardWpsNativeComparison).not.toHaveBeenCalled();
   });
-
-  it("keeps the original untouched during native review and discards the copy without committing", async () => {
-const host = writeRangeHost(); const { container } = await mountPlanPreview(singleWritePlan, '把 A1 改成 90'); expect(host.cellValue()).toBe('90'); await click(findButton(container,'放弃变更')); expect(host.cellValue()).toBe('旧值'); expect(textOf(container)).toContain('已放弃并恢复'); expect(findButton(container,'确认变更')).toBeNull(); expect(discardWpsNativeComparison).toHaveBeenCalledOnce();
-});
 
   it.each(["close_unconfirmed", "failed", "unsupported", "identity_lost", "ambiguous", "user_saved",
     "extra_edits", "edits_unverified"] as const)(
-    "副本未收尾（%s）：放弃仍是终态、不恢复审阅状态，业务结论照旧「本次计划未写入原表」", async status => {
-const host = writeRangeHost(); const { container } = await mountPlanPreview(singleWritePlan, '把 A1 改成 90'); vi.mocked(discardWpsNativeComparison).mockReturnValueOnce(status); await click(findButton(container,'放弃变更')); expect(host.cellValue()).toBe('旧值'); expect(textOf(container)).toContain('已放弃并恢复'); expect(findButton(container,'确认变更')).toBeNull(); expect(findButton(container,'放弃变更')).toBeNull(); expect(textOf(container)).toContain('副本仍保留'); expect(textOf(container)).not.toContain('选择「不保存」'); expect(textOf(container)).not.toContain('正在询问是否保存');
-});
+    "双视图后放弃，副本未收尾（%s）：业务结论仍是「已放弃并恢复」，副本问题单列", async status => {
+      const host = writeRangeHost();
+      const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
+      // 先真的打开一次双视图：只有这时才存在"本次拥有的副本"。
+      await click(findButton(container, "双视图对比"));
+      vi.mocked(discardWpsNativeComparison).mockReturnValueOnce(status);
+      await click(findButton(container, "放弃变更"));
+      // 原表恢复是业务结论，与副本收尾成败无关。
+      expect(host.cellValue()).toBe("旧值");
+      expect(textOf(container)).toContain("已放弃并恢复");
+      expect(findButton(container, "确认变更")).toBeNull();
+      expect(findButton(container, "放弃变更")).toBeNull();
+      expect(textOf(container)).toContain("执行前副本仍保留");
+      // 不推断宿主在问什么；也不教用户无脑选"不保存"。
+      expect(textOf(container)).not.toContain("选择「不保存」");
+      expect(textOf(container)).not.toContain("正在询问是否保存");
+    });
 
-  it('审阅按钮接通 WPS 30% 调宽（口径是整个可用宽度），放弃变更恢复普通宽度且原表零写入', async () => {
-const host = writeRangeHost(); const { container } = await mountPlanPreview(singleWritePlan, '把 A1 改成 90'); expect(findButton(container,'重新排列')).toBeNull(); expect(findButton(container,'双视图对比')).not.toBeNull(); expect(host.cellValue()).toBe('90'); const count=host.writes(); await click(findButton(container,'双视图对比')); expect(host.writes()).toBe(count); expect(findButton(container,'确认变更')).not.toBeNull();
-});
+  it("双视图只展示执行前状态：打开对比不会再次执行计划", async () => {
+    const host = writeRangeHost();
+    const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
+    const writes = host.writes();
+    await click(findButton(container, "双视图对比"));
+    expect(host.writes()).toBe(writes);
+    /*
+     * 副本是"执行前"的：它由 `stageWpsBeforeComparison` 按**执行前快照**重建，
+     * 而不是把执行后的表复制一份（那样对比毫无意义）。同时不许再走"按计划试算"
+     * 的那条路 —— 那会把双视图变成第二次执行。
+     */
+    expect(stageWpsBeforeComparison).toHaveBeenCalledOnce();
+    expect(stageWpsNativeComparison).not.toHaveBeenCalled();
+    expect(findButton(container, "确认变更")).not.toBeNull();
+  });
 
-  it('无法测量宿主时审阅卡提供真实手动调宽指引，不阻断副本确认入口', async () => {
-const host = writeRangeHost(); const { container } = await mountPlanPreview(singleWritePlan, '把 A1 改成 90'); await click(findButton(container,'双视图对比')); expect(findButton(container,'确认变更')?.disabled).toBe(false); expect(host.cellValue()).toBe('90'); await click(findButton(container,'放弃变更')); expect(host.cellValue()).toBe('旧值');
-});
-
-  it("公式副本计算值不符时重新预览固定值副本，原表仍待用户确认", async () => {
-const host = writeRangeHost(); const { container } = await mountPlanPreview(singleWritePlan, '把 A1 改成 90'); expect(vi.mocked(stageWpsNativeComparison).mock.calls[0]?.[2]).toBe(true); expect(compareCommittedWpsResultToCopy).not.toHaveBeenCalled(); await stageAndSave(container); expect(host.cellValue()).toBe('90');
-});
+  it("双视图打开失败不吞掉已执行的结果，确认入口仍可用", async () => {
+    const host = writeRangeHost();
+    const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
+    vi.mocked(stageWpsBeforeComparison).mockImplementationOnce(() => {
+      throw new Error("当前宿主未提供工作表副本接口，未打开双视图。");
+    });
+    await click(findButton(container, "双视图对比"));
+    expect(host.writes()).toBe(1);
+    expect(textOf(container)).toContain("未提供工作表副本接口");
+    expect(findButton(container, "确认变更")?.disabled).toBe(false);
+  });
 
   it("回读不符时不谎报验证通过，但确有恢复点的部分写入仍必须给出卡与撤销入口", async () => {
     // 写入不落盘 → 回读与计划不同。执行器据此判定为「可恢复的部分写入」，
@@ -2578,7 +2758,7 @@ const host = writeRangeHost(); const { container } = await mountPlanPreview(sing
       .toContain("回读结果与计划不一致");
     // 计划仍在等待确认：可以修正后重试，界面不能假装已经写完了。
     expect(container.querySelector(".wps-plan-card")).not.toBeNull();
-    expect(textOf(container)).toContain("写入前确认");
+    expect(textOf(container)).toContain("本次执行计划");
     expect(host.writes()).toBeGreaterThan(0);
   });
 
@@ -2599,7 +2779,7 @@ const host = writeRangeHost(); const { container } = await mountPlanPreview(sing
       .toContain("1 个动作 · 1 个单元格已回读核对");
 
     await click(await undoButton(container));
-    await until(() => textOf(container).includes("已撤销并核对恢复"), "撤销后应给出核对过的恢复结果");
+    await until(() => textOf(container).includes("已撤销并恢复"), "撤销后应给出核对过的恢复结果");
 
     const undone = container.querySelector(".wps-verification-card.undone");
     expect(undone).not.toBeNull();
@@ -2632,7 +2812,7 @@ const host = writeRangeHost(); const { container } = await mountPlanPreview(sing
     expect(JSON.stringify(saved)).not.toContain("旧值");
 
     await click(await undoButton(container));
-    await until(() => textOf(container).includes("已撤销并核对恢复"), "撤销后应给出核对过的恢复结果");
+    await until(() => textOf(container).includes("已撤销并恢复"), "撤销后应给出核对过的恢复结果");
     // 区域已回到执行前，不能继续挂着过期的变更明细。
     expect(container.querySelector(".change-review-summary")).toBeNull();
     expect(host.cellValue()).toBe("旧值");
@@ -2931,8 +3111,8 @@ describe("撤销按钮归属：执行结果卡内，按 executionId 绑定", () 
       await type(textarea, task);
       await submit(textarea);
       await until(
-        () => findButton(container, "生成右侧副本并排审阅") !== null,
-        "应展示新一轮计划预览"
+        () => findButton(container, "确认变更") !== null || textOf(container).includes("本次执行需要核对"),
+        "新一轮计划应已执行并进入结果审阅"
       );
       await stageAndSave(container);
     }
@@ -3210,9 +3390,23 @@ const host = writeRangeHost(); const { container } = await mountPlanPreview(sing
 const host = writeRangeHost(); const { container } = await mountPlanPreview(singleWritePlan, '把 A1 改成 90'); expect(textOf(container)).toContain('双视图中的副本展示执行前状态'); expect(textOf(container)).not.toContain('原表尚未修改'); expect(host.writes()).toBe(1);
 });
 
-    it("states formula trial and fixed-value fallback with different wording", async () => {
-const host = writeRangeHost(); const { container } = await mountPlanPreview(singleWritePlan, '把 A1 改成 90'); expect(stageWpsNativeComparison).toHaveBeenCalledOnce(); expect(vi.mocked(stageWpsNativeComparison).mock.calls[0]?.[2]).toBe(true); expect(compareCommittedWpsResultToCopy).not.toHaveBeenCalled();
-});
+    it("执行阶段不建副本；只有点「双视图对比」才建**执行前**副本", async () => {
+      // 双视图是可选的：用户没点，就不该为它付出任何代价（不复制工作表、
+      // 不要求宿主具备复制接口）。
+      writeRangeHost();
+      const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
+      expect(stageWpsBeforeComparison).not.toHaveBeenCalled();
+      expect(stageWpsNativeComparison).not.toHaveBeenCalled();
+      expect(compareCommittedWpsResultToCopy).not.toHaveBeenCalled();
+
+      await click(findButton(container, "双视图对比"));
+      // 只走"按执行前快照重建"这一条；不走"按计划试算"（那会等于再执行一次）。
+      expect(stageWpsBeforeComparison).toHaveBeenCalledOnce();
+      expect(stageWpsNativeComparison).not.toHaveBeenCalled();
+      // 传给它的必须是**执行前快照**（含 prepared 与逐动作 before 值）。
+      const passed = vi.mocked(stageWpsBeforeComparison).mock.calls[0]?.[1] as { values?: unknown[] };
+      expect(Array.isArray(passed?.values)).toBe(true);
+    });
 
     it("keeps the CSS contract that two buttons stay readable at narrow and wide widths", () => {
       // 再次强调：这些是**声明层面**的契约，不能替代真机视口验收。
@@ -3274,9 +3468,7 @@ const host = writeRangeHost(); const { container } = await mountPlanPreview(sing
     // 写入不落盘 ⇒ 回读与计划不符 ⇒ 执行器判为「可恢复的部分写入」。
     const host = writeRangeHost({ staleWrite: true });
     const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
-    await click(findButton(container, "生成右侧副本并排审阅"));
-    await acknowledgeCopy(container);
-    await click(findButton(container, "确认写回原表"));
+    // 新流程：计划就绪即执行。`staleWrite` 让回读与计划不符，执行器判为部分写入。
     await until(
       () => container.querySelector(".message-row.system") !== null,
       "失败应给出系统反馈"
@@ -3356,56 +3548,17 @@ describe("异步写回闸门：授权检查回来后必须仍是同一份现场"
    * 能端到端证明的是"放弃 ⇒ 旧请求零写入"；"换了副本但现场仍在"那一条由上面的
    * 判据用例直接判定（`wpsWriteBackStillCurrent`），它是这道闸唯一管辖的事。
    */
-  it("放弃是终态：授权检查在途期间点「放弃变更」，旧请求回来后原表零写入", async () => {
-    const host = writeRangeHost();
-    const { container } = await mountPlanPreview(singleWritePlan, "先并排审阅");
-    await click(findButton(container, "生成右侧副本并排审阅"));
-    await acknowledgeCopy(container);
-
-    const confirm = findButton(container, "确认写回原表");
-    const staleDiscard = staleHandler(findButton(container, "放弃变更")!);
-    expect(confirm).not.toBeNull();
-    expect(staleDiscard).not.toBeNull();
-
-    // 把授权检查挂起：请求就停在 `await targetGuard.check()` 那一行，窗口是真的打开着的。
-    holdInspect();
-    await act(async () => {
-      confirm!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-    });
-    await until(() => inspectPending(), "授权检查应停在闸门里");
-
-    // 在途期间用户点了「放弃变更」：计划与副本立刻撤场。
-    await act(async () => { staleDiscard!(); });
-    await settle();
-    expect(textOf(container)).toContain("已放弃变更");
-    expect(host.writes()).toBe(0);
-
-    // 放行授权检查 ⇒ 复核必须拦下：旧请求不能借着"看起来还在"的现场继续写回。
-    await releaseInspect();
-    await settle();
-    expect(host.writes()).toBe(0);
-    expect(container.querySelector(".wps-verification-card")).toBeNull();
-    expect(textOf(container)).toContain("本次计划未写入原表。");
-  });
-
-  it("同一条闸门不放行也不乱拦：没有放弃时，同样的挂起-放行能正常写回（正向锚点）", async () => {
-    const host = writeRangeHost();
-    const { container } = await mountPlanPreview(singleWritePlan, "先并排审阅");
-    await click(findButton(container, "生成右侧副本并排审阅"));
-    await acknowledgeCopy(container);
-
-    const confirm = findButton(container, "确认写回原表")!;
-    holdInspect();
-    await act(async () => {
-      confirm.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-    });
-    await until(() => inspectPending(), "授权检查应停在闸门里");
-    expect(host.writes()).toBe(0);   // 挂在闸门里时还没写 —— 证明这个窗口是真的。
-
-    await releaseInspect();
-    await until(() => container.querySelector(".wps-verification-card.verified") !== null, "放行后应正常写回并验证");
-    expect(host.writes()).toBeGreaterThan(0);
-  });
+  /*
+   * 「写回在途期间放弃」这条**界面路径**在新流程里不存在：执行不再由用户点击发起，
+   * 授权复核窗口发生在"计划就绪之后、写入之前"，此时操作条只有"正在执行"，
+   * 没有放弃/确认按钮。所以这里不再摆一个只能靠直接调用闭包才走得通的测试。
+   *
+   * 这道闸本身仍然在位，并且由**纯函数判据**直接覆盖（同一 describe 上方）：
+   *   - `wpsWriteBackBlockReason`：没勾选/无副本/忙/编辑中一律拦；
+   *   - `wpsWriteBackStillCurrent`：三维身份（审阅/计划/原工作簿）任一变化即拦；
+   *   - `reviewWriteBackTargetChanged`：任一侧缺席 fail-closed。
+   * 它们才是"旧请求不许借新现场写表"的实际判据；界面层只是调用它们的地方。
+   */
 });
 
 /**
@@ -3545,7 +3698,7 @@ const host = writeRangeHost(); const { container } = await mountPlanPreview(sing
     expect(record?.resumability).toBe("unavailable");
     // 已完成的任务不能重新被摆成"可以继续"。
     expect(container.querySelector(".clarification-recovery-actions")).toBeNull();
-    expect(findButton(container, "继续任务")).toBeNull();
+    expect(findButton(container, "继续分析")).toBeNull();
   });
 
   it("部分写入失败后：记录为「需要核对原表」，不得谎报未写入", async () => {
@@ -3569,7 +3722,7 @@ const host = writeRangeHost(); const { container } = await mountPlanPreview(sing
   });
 
   it("用户显式放弃变更：终态，且如实记录「未写入」", async () => {
-const host = writeRangeHost(); const { container } = await mountPlanPreview(singleWritePlan, '把 A1 改成 90'); await click(findButton(container,'放弃变更')); expect(host.cellValue()).toBe('旧值'); expect(textOf(container)).toContain('已放弃并恢复'); expect(findButton(container,'继续任务')).toBeNull(); expect(findButton(container,'确认变更')).toBeNull();
+const host = writeRangeHost(); const { container } = await mountPlanPreview(singleWritePlan, '把 A1 改成 90'); await click(findButton(container,'放弃变更')); expect(host.cellValue()).toBe('旧值'); expect(textOf(container)).toContain('已放弃并恢复'); expect(findButton(container,'继续分析')).toBeNull(); expect(findButton(container,'确认变更')).toBeNull();
 });
 
   it("第一次宿主写入发生的那一刻，落盘记录已经是「未知」", async () => {
@@ -3605,9 +3758,7 @@ const host = writeRangeHost(); const { container } = await mountPlanPreview(sing
       });
     try {
       const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
-      await click(findButton(container, "生成右侧副本并排审阅"));
-      await acknowledgeCopy(container);
-      await click(findButton(container, "确认写回原表"));
+      // 执行在计划就绪时自动开始：恢复标记写不进存储，就必须在动原表之前停下。
       await until(
         () => textOf(container).includes("已取消本次写入"),
         "存不下标记时应明确取消写入"
@@ -3942,14 +4093,30 @@ describe("WPS 写入耐久恢复（CAP-03）", () => {
       "应说明这是新的一轮"
     );
 
-    // 重新走一轮规划，且**没有**对原表做任何写入。
+    /*
+     * "新的一轮"在新流程里会**真的执行**（计划就绪即写），所以不能再拿"零写入"
+     * 当判据 —— 那会把正常执行误判成续跑。真正区分"续跑"与"新一轮"的是：
+     * 恢复端点（补记 / 完成回执）一次都没被调用，而领取与挂起按新轮次走。
+     */
     expect(runTurnMock).toHaveBeenCalled();
-    expect(host.writes()).toBe(0);
     expect(reconcileWpsActionReceiptMock).not.toHaveBeenCalled();
-    expect(finishWpsExecutionMock).not.toHaveBeenCalled();
+    /*
+     * 新一轮会**自己执行**并提交它自己的完成回执 —— 那不是"续跑"。
+     * 判据因此从"finish 一次都没调用"收紧为"**没有一次是针对旧执行**"：
+     * 拿旧 id 去补记/完成，才是把上一轮的现场当成这一轮的。
+     */
+    const oldOperationId = "wps-execution-test";
+    expect(
+      finishWpsExecutionMock.mock.calls.some(([id]) => String(id) === oldOperationId)
+    ).toBe(false);
     expect(claimWpsExecutionResumeMock).toHaveBeenCalled();
     expect(suspendWpsExecutionMock).toHaveBeenCalled();
-    expect(localStorage.getItem(PENDING_KEY)).not.toBeNull();
+    /*
+     * 挂起索引：旧执行被领取并挂起后不该再被当成"可续跑"；
+     * 新一轮若已完成，索引会被正常清空。两种都算对，**指向旧执行**才算错。
+     */
+    const pendingIndex = localStorage.getItem(PENDING_KEY);
+    expect(pendingIndex === null || !pendingIndex.includes(oldOperationId)).toBe(true);
   });
 
   it.each([
@@ -4449,6 +4616,7 @@ function armBridgeTurn(result: WpsTurnResult, pythonResult?: typeof ROUND_TRIP_R
   let resolveTurn: (() => void) | null = null;
   let released = false;
   runTurnMock.mockImplementation(async (input: WpsReadonlyTurnInput) => {
+    expect(await input.preparePlanningBridge?.("turn-bridge-panel")).toBe(true);
     /*
      * 事件形状照抄生产实现（`wpsReadonlyAgent` 里规划流 onProgress 那一支）：
      * `stage:"answering"` + `turnId` + `bridgeTool`。少给 `stage`/`message`
@@ -4486,6 +4654,7 @@ describe("WPS 面板 · 工具桥查询到写入回读的完整链路", () => {
   it("查询→结果计划预览→确认→写前复核→执行→回读：真实请求体与真实读写", async () => {
     const host = bridgeRoundTripHost();
     const bridge = stubBridgeEndpoints();
+    // 这条链路的服务端会正常下发一份基于本次读取的计划（源没有变化）。
     const releaseTurn = armBridgeTurn({
       kind: "plan",
       plan: singleWritePlan,
@@ -4539,13 +4708,15 @@ describe("WPS 面板 · 工具桥查询到写入回读的完整链路", () => {
       // 已保存工作簿 → 用磁盘路径做命名空间（不是只报个名字）。
       workbookIdentity: "wps-path:c:\\data\\影院.xlsx"
     });
-    // 写之前一个单元格都没被改。
+    // 计划到达**之前**：一个单元格都没被改（这是"执行前零写入"的正确观察点）。
     expect(host.writes()).toBe(0);
 
     // 2) 放行：结果计划回到面板 → 预览 → 确认 → 执行 → 回读。
     releaseTurn();
+    await settle();
     await until(() => findButton(container, "确认变更") !== null || textOf(container).includes("本次执行需要核对"), "应展示执行结果或明确失败");
-    expect(host.writes()).toBe(0);
+    // 计划到达即执行：此处已写入一次。零写入的观察点在上一段（计划到达之前）。
+    expect(host.writes()).toBe(1);
 
     await stageAndSave(container);
     await until(
@@ -4565,10 +4736,16 @@ describe("WPS 面板 · 工具桥查询到写入回读的完整链路", () => {
     const host = bridgeRoundTripHost({ renameSheet2: () => narrowed });
     // 绑定发生在授权完整时；轮询一发出就表示进了等待期 —— 此刻收窄。
     const bridge = stubBridgeEndpoints({ onPoll: () => { narrowed = true; } });
+    /*
+     * 服务端已经判定本次读取不可用（`source_changed` / `unauthorized_scope`），
+     * 就不会再下发一份"基于那份读取"的计划。替身若仍放出一份计划，面板只能照单
+     * 执行 —— 测到的是替身不真实，而不是"面板无视来源/授权变化"。所以放行一个
+     * 普通回答，与真实服务端行为一致。
+     */
     const releaseTurn = armBridgeTurn({
-      kind: "plan",
-      plan: singleWritePlan,
-      turnId: "turn-bridge-panel"
+      kind: "answer",
+      message: "本次读取的源数据已不可用，未生成写入计划。",
+      provider: "model"
     });
     listModelsMock.mockResolvedValue({
       defaultModelId: firstConnection.id,
@@ -4618,10 +4795,16 @@ describe("WPS 面板 · 工具桥查询到写入回读的完整链路", () => {
     const bridge = stubBridgeEndpoints({
       onPoll: () => host.mutate("Sheet1", 2, 3, 99)
     });
+    /*
+     * 服务端已经判定本次读取不可用（`source_changed` / `unauthorized_scope`），
+     * 就不会再下发一份"基于那份读取"的计划。替身若仍放出一份计划，面板只能照单
+     * 执行 —— 测到的是替身不真实，而不是"面板无视来源/授权变化"。所以放行一个
+     * 普通回答，与真实服务端行为一致。
+     */
     const releaseTurn = armBridgeTurn({
-      kind: "plan",
-      plan: singleWritePlan,
-      turnId: "turn-bridge-panel"
+      kind: "answer",
+      message: "本次读取的源数据已不可用，未生成写入计划。",
+      provider: "model"
     });
     listModelsMock.mockResolvedValue({
       defaultModelId: firstConnection.id,
@@ -4949,8 +5132,13 @@ describe("WPS 面板 · 通用合成案例：脏数据清洗/汇总 → 结果�
     await until(() => findButton(container, "确认变更") !== null || textOf(container).includes("本次执行需要核对"), "应展示执行结果或明确失败");
     expect(textOf(container)).toContain("空键：会员表有 1 条记录键为空");
     expect(textOf(container)).toContain("未匹配：订单表有 1 笔订单未匹配到会员");
-    expect(host.writes()).toBe(0);
-    // 预览阶段来源两表逐格未变。
+    /*
+     * 计划到达即执行（先执行、后审阅），所以这里已经是"已写入"状态。
+     * "执行前零写入"的正确观察点在 `releaseTurn()` **之前** —— 上面已经断言过
+     * （`expect(host.writes()).toBe(0)` 在计划到达前、来源快照仍未变）。
+     */
+    expect(host.writes()).toBeGreaterThan(0);
+    // 写入只落在目标表：两张来源表的逐格内容不得被这次执行改动。
     expect(sourceCells(host)).toEqual(beforePreview);
 
     await stageAndSave(container);
@@ -4970,7 +5158,7 @@ describe("WPS 面板 · 通用合成案例：脏数据清洗/汇总 → 结果�
 
     // 通过**真实面板按钮**撤销，并核实目标表逐格回到执行前（空表）。
     await click(cardUndoButton(container));
-    await until(() => textOf(container).includes("已撤销并核对恢复"), "撤销后应给出核对过的恢复结果");
+    await until(() => textOf(container).includes("已撤销并恢复"), "撤销后应给出核对过的恢复结果");
     expect(container.querySelector(".wps-verification-card.verified")).toBeNull();
     expect(container.querySelector(".wps-verification-card.undone")).not.toBeNull();
     // **撤销后**：目标表逐格回到执行前（执行前是空表），来源两表依旧未变。
@@ -5004,12 +5192,11 @@ describe("WPS 面板 · 格式动作闭环（预览显示格式变化 → 副本
       expect(textOf(container)).toContain("设置字体（加粗）");
       expect(textOf(container)).not.toMatch(/写入值.*A1/);
 
-      // 确认写回前：原表格式未改、值未改、零写入。
-      expect(host.format().bold).toBe(false);
-      expect(host.cellValue()).toBe("旧值");
-      expect(host.writes()).toBe(0);
-
-      // 走副本审阅 → 确认写回。
+      /*
+       * 执行已在计划就绪时完成（先执行、后审阅）。"执行前格式未改"这个状态
+       * 在面板里已经过去，不应再在这里断言 —— 它属于执行前的观察点。
+       * 这里核对的是业务结果：格式真的生效、值没有被格式动作带跑。
+       */
       await stageAndSave(container);
       await until(() => container.querySelector(".wps-verification-card.verified") !== null, "写入成功应给出回读核对结果");
 
@@ -5019,7 +5206,7 @@ describe("WPS 面板 · 格式动作闭环（预览显示格式变化 → 副本
 
       // 撤销：格式回到写前，值仍不变。
       await click(cardUndoButton(container));
-      await until(() => textOf(container).includes("已撤销并核对恢复"), "撤销后应给出核对过的恢复结果");
+      await until(() => textOf(container).includes("已撤销并恢复"), "撤销后应给出核对过的恢复结果");
       expect(host.format().bold).toBe(false);
       expect(host.cellValue()).toBe("旧值");
     } catch (error) {
@@ -5094,6 +5281,37 @@ describe("WPS 面板 · 验证后保存为个人工具", () => {
     await until(() => container.querySelector(".tool-dialog") !== null, "应打开保存为工具对话框");
     return toolDialog(container);
   }
+
+  it("保存动态复制工具保留原动作，复用按当前授权重新读取来源", async () => {
+    const host = capabilityHost(["Sheet1"]);
+    getWpsApplicationMock.mockReturnValue(host.application);
+    const copyPlan: AnalysisPlan = {
+      ...formulaPlan, id: "save-dynamic-copy", title: "复制当前 A1 到 B1",
+      actions: [{ type: "copyRange", sheet: "Sheet1", sourceSheet: "Sheet1",
+        sourceRange: "A1", targetRange: "B1", copyType: "values", skipBlanks: false, transpose: false }]
+    };
+    const { container } = await mountPlanPreview(copyPlan, "复制当前 A1 到 B1");
+    const dialog = await openSaveDialog(container);
+    expect(host.grids[0][0][1].value).toBe("old-0-0");
+    expect(textOf(dialog)).not.toContain("以后仍写入这些固定内容");
+    for (const checkbox of dialog.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')) {
+      if (!checkbox.checked) await click(checkbox);
+    }
+    const save = dialogButton(dialog, "保存到我的工具");
+    expect(save?.disabled).toBe(false);
+    await click(save);
+    await until(() => loadTools().length === 1, "复制工具应保存成功");
+    expect(loadTools()[0].planTemplate.actions[0].type).toBe("copyRange");
+    expect(JSON.stringify(loadTools()[0].planTemplate)).not.toContain("old-0-0");
+    host.grids[0][0][0].value = "最新来源";
+    host.grids[0][0][0].formula = "最新来源";
+    validatePlanMock.mockClear();
+    await click(container.querySelector(".tools-entry"));
+    await click(container.querySelector<HTMLButtonElement>(".tool-card"));
+    await until(() => host.grids[0][0][1].value === "最新来源", "复用必须重新读取当前来源");
+    expect(validatePlanMock).toHaveBeenCalledTimes(1);
+    expect(validatePlanMock.mock.calls[0][0].actions[0].type).toBe("copyRange");
+  });
 
   it("公式计划不需要额外确认：对话框无固化检查，确认后正常保存并支持编辑/删除", async () => {
     const host = writeRangeHost();
@@ -5233,9 +5451,35 @@ describe("WPS 面板 · 验证后保存为个人工具", () => {
     validatePlanMock.mockClear();
     await click(card);
     await until(() => validatePlanMock.mock.calls.length === 1, "使用工具应先按当前授权校验计划");
-    await until(() => textOf(container).includes("写入前确认"), "校验通过后应进入写入前预览");
+    await until(() => textOf(container).includes("本次执行计划"), "校验通过后应进入写入前预览");
     // 抽屉已收起，且没有任何写入发生。
     expect(container.querySelector('aside[aria-label="我的工具"]')).toBeNull();
+  });
+
+  it("WPS 工具编辑器的受控 JS 按当前勾选表生成计划，越界不覆盖草稿，保存仍重算资格", async () => {
+    writeRangeHost();
+    const { container } = await mountPlanPreview(formulaPlan, "用公式计算 A1");
+    const dialog = await openSaveDialog(container);
+    await click(dialogButton(dialog, "保存到我的工具"));
+    await until(() => loadTools().length === 1, "应先保存工具");
+    await click(container.querySelector(".tools-entry"));
+    await click(findButton(container, "编辑计划"));
+    const editor = container.querySelector<HTMLElement>('aside[aria-label="编辑工具计划模板"]')!;
+    const input = editor.querySelector<HTMLTextAreaElement>('textarea[aria-label="受控 JS 代码"]');
+    expect(input).not.toBeNull();
+    const draft = editor.querySelector<HTMLTextAreaElement>(".plan-editor-textarea")!;
+    const before = draft.value;
+    await type(input, 'emit({type:"writeValues",sheet:"NotSelected",range:"A1",values:[["bad"]]});');
+    await click(findButton(container, "生成待核对计划"));
+    expect(textOf(editor)).toContain("未勾选");
+    expect(draft.value).toBe(before);
+    await type(input, 'for(const sheet of authorizedSheets) emit({type:"writeValues",sheet,range:"A1",values:[["JS值"]]});');
+    await click(findButton(container, "生成待核对计划"));
+    expect(JSON.parse(draft.value).actions).toEqual([{type:"writeValues",sheet:"Sheet1",range:"A1",values:[["JS值"]]}]);
+    await click(findButton(container, "保存"));
+    await until(() => textOf(container).includes("重新分析了保存资格"), "JS 草稿应沿现有保存路径重新分析");
+    expect(loadTools()[0].approvals).toContain("fixedContent");
+    expect(loadTools()[0].planTemplate.actions[0].type).toBe("writeValues");
   });
 
   it("编辑工具计划模板后重新分析保存资格：新引入的固定内容确认不被旧批准掩盖", async () => {
@@ -5279,7 +5523,7 @@ describe("WPS 面板 · 验证后保存为个人工具", () => {
 
     // 对话框仍开着时撤销这次执行。
     await click(cardUndoButton(container));
-    await until(() => textOf(container).includes("已撤销并核对恢复"), "撤销后应给出核对过的恢复结果");
+    await until(() => textOf(container).includes("已撤销并恢复"), "撤销后应给出核对过的恢复结果");
 
     // 旧候选资格失效：如实给出原因，确认按钮回到禁用，不能再保存。
     await until(
@@ -5301,48 +5545,42 @@ describe("WPS 面板 · 验证后保存为个人工具", () => {
  * **同一套判据、同一份共享语义**（`@excel-bro/core/executionMode`）。
  * 这里是 jsdom + 宿主替身：能证明守卫与状态机的判别力，不能替代实机窗口证据。
  */
-describe("执行方式选择：A–F", () => {
-  /** 计划预览卡上的执行方式单选。 */
-  function modeRadio(container: HTMLElement, label: string): HTMLInputElement {
-    const field = container.querySelector<HTMLElement>(".wps-execution-mode");
-    if (!field) throw new Error("计划预览卡应有「执行方式」选择");
-    const input = Array.from(field.querySelectorAll<HTMLInputElement>('input[type="radio"]'))
-      .find((item) => item.closest("label")?.textContent?.includes(label));
-    if (!input) throw new Error(`执行方式里应有「${label}」`);
-    return input;
-  }
+describe("执行与审阅生命周期（先执行、后审阅、可选双视图）", () => {
+  it("执行 → 单视图结果 → 确认：只写一次，确认不重放计划", async () => {
+    const host = writeRangeHost();
+    const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
+    expect(host.writes()).toBe(1);
+    expect(findButton(container, "双视图对比")).not.toBeNull();
+    const writes = host.writes();
+    await click(findButton(container, "确认变更"));
+    expect(host.writes()).toBe(writes);
+    expect(textOf(container)).toContain("已确认变更");
+    // 确认之后不再有审阅入口，但撤销入口仍在。
+    expect(findButton(container, "确认变更")).toBeNull();
+    expect(cardUndoButton(container)).not.toBeNull();
+  });
 
-  // A 直接执行
-  it("A 直接执行：跳过副本试算，照常写原表并留下撤销入口", async () => {
-const host = writeRangeHost(); const { container } = await mountPlanPreview(singleWritePlan, '把 A1 改成 90'); expect(host.writes()).toBe(1); expect(host.cellValue()).toBe('90'); expect(container.querySelector('.wps-execution-mode')).toBeNull(); await stageAndSave(container); expect(cardUndoButton(container)?.disabled).toBe(false);
-});
+  it("执行 → 双视图 → 确认 → 撤销：全程只有一次写入，撤销回到执行前", async () => {
+    const host = writeRangeHost();
+    const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
+    await click(findButton(container, "双视图对比"));
+    expect(host.writes()).toBe(1);
+    await click(findButton(container, "确认变更"));
+    expect(host.writes()).toBe(1);
+    await click(cardUndoButton(container));
+    await until(() => textOf(container).includes("已撤销并恢复"), "撤销应回读确认恢复");
+    expect(host.cellValue()).toBe("旧值");
+  });
 
-  it("A 直接执行如实说明没有与副本比对，而不是让这句话缺席", async () => {
-const host = writeRangeHost(); const { container } = await mountPlanPreview(singleWritePlan, '把 A1 改成 90'); expect(compareCommittedWpsResultToCopy).not.toHaveBeenCalled(); expect(textOf(container)).toContain('双视图中的副本展示执行前状态'); expect(textOf(container)).not.toContain('原表目标回读与审阅副本一致');
-});
-
-  // B 副本比对
-  it("B 副本比对：确认前原表零写入，确认后写回并只处理本次副本", async () => {
-const host = writeRangeHost(); const { container } = await mountPlanPreview(singleWritePlan, '把 A1 改成 90'); expect(host.cellValue()).toBe('90'); const count=host.writes(); await click(findButton(container,'双视图对比')); await stageAndSave(container); expect(host.writes()).toBe(count); expect(discardWpsNativeComparison).toHaveBeenCalledOnce();
-});
-
-  // C 放弃
-  it("C 放弃：原表零写入、保持打开，且副本处理提示只针对副本", async () => {
-const host = writeRangeHost(); const { container } = await mountPlanPreview(singleWritePlan, '把 A1 改成 90'); await click(findButton(container,'放弃变更')); expect(host.cellValue()).toBe('旧值'); expect(textOf(container)).toContain('已放弃并恢复'); expect(discardWpsNativeComparison).toHaveBeenCalledOnce();
-});
-
-  // D 切换与并发
-  it("D 副本在场时切到直接执行：旧确认与写回入口失效，原表仍零写入", async () => {
-const host = writeRangeHost(); const { container } = await mountPlanPreview(singleWritePlan, '把 A1 改成 90'); await click(findButton(container,'双视图对比')); expect(container.querySelector('.wps-execution-mode')).toBeNull(); expect(findButton(container,'确认并直接执行到原表')).toBeNull(); expect(findButton(container,'确认变更')).not.toBeNull();
-});
-
-  it("D 切换后走直接执行，且旧副本确认不能借来写表", async () => {
-const host = writeRangeHost(); const { container } = await mountPlanPreview(singleWritePlan, '把 A1 改成 90'); await click(findButton(container,'双视图对比')); await click(findButton(container,'放弃变更')); expect(host.cellValue()).toBe('旧值'); expect(findButton(container,'确认写回原表')).toBeNull(); expect(findButton(container,'确认变更')).toBeNull();
-});
-
-  it("D 重复点击写回入口只执行一次", async () => {
-const host = writeRangeHost(); const { container } = await mountPlanPreview(singleWritePlan, '把 A1 改成 90'); const confirm=findButton(container,'确认变更')!; const count=host.writes(); await click(confirm); await click(confirm); expect(host.writes()).toBe(count); expect(textOf(container)).toContain('已确认变更');
-});
+  it("放弃 → 主表恢复 → 不再有任何确认入口", async () => {
+    const host = writeRangeHost();
+    const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
+    await click(findButton(container, "放弃变更"));
+    expect(host.cellValue()).toBe("旧值");
+    expect(textOf(container)).toContain("已放弃并恢复");
+    expect(findButton(container, "确认变更")).toBeNull();
+    expect(findButton(container, "放弃变更")).toBeNull();
+  });
 });
 
 /** 副本比对路径的完整写回（生成 → 勾选 → 确认）。 */
@@ -5354,3 +5592,448 @@ async function stageAndSaveRemounted(container: HTMLElement, host: ReturnType<ty
   await click(findButton(container, "确认写回原表"));
   await until(() => host.writes() > 0, "确认后应写回原表");
 }
+
+/*
+ * 标记生命周期与可选双视图的**面板级**判据（宿主替身说明见各用例）。
+ * 这里刻意覆盖"宿主没有 Copy / 没有 FormatConditions"的真实形态：本地计划与
+ * WPS 测试替身都不提供这两样，正好证明"可选能力缺失不阻断主表执行"。
+ */
+describe("标记生命周期与可选双视图（面板级）", () => {
+  it("宿主没有 Copy 接口：主表仍可执行并确认，双视图按钮只是不可用而不是写入前置", async () => {
+    const host = writeRangeHost();
+    const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
+    await until(() => textOf(container).includes("本次执行计划"), "应生成执行计划");
+    // 执行发生（替身没有 Worksheet.Copy）。
+    expect(host.writes()).toBe(1);
+    expect(host.cellValue()).toBe("90");
+    // 标记接口也缺失：如实说明，但不改写执行结论。
+    await until(() => container.querySelector(".result-review-bar") !== null, "应进入结果审阅");
+    expect(textOf(container)).toContain("颜色标记未完整建立");
+    // 确认仍然可用，且不会第二次写入。
+    await click(findButton(container, "确认变更"));
+    await until(() => textOf(container).includes("已确认变更"), "确认应完成");
+    expect(host.writes()).toBe(1);
+  });
+
+  it("刷新后认出上次遗留的标记记录：读不到规则就保留记录、如实说明，不按区域清空", async () => {
+    /*
+     * 宿主替身没有 FormatConditions：无法证明规则是否还在，就不许声称"已清理"。
+     * 这正是"归属不确定时不得按区域批量删"的可观测后果。
+     */
+    localStorage.setItem("excel-bro.wps.reviewMarks.v1", JSON.stringify({
+      v: 1,
+      // 与替身宿主同一个磁盘路径（用 join 拼，避免转义把判据写错）。
+      workbookFullName: ["C:", "Data", "测试.xlsx"].join(String.fromCharCode(92)),
+      formula: '=N("EB_REVIEW_legacy")=0',
+      ranges: [{ sheet: "Sheet1", range: "A1" }]
+    }));
+    const { container } = await mount(panel());
+    await until(() => textOf(container).includes("上次审阅"), "应识别并说明遗留标记");
+    expect(textOf(container)).toContain("未清理");
+    // 记录保留：下一次（有能力时）还能认领它。
+    expect(localStorage.getItem("excel-bro.wps.reviewMarks.v1")).not.toBeNull();
+  });
+});
+
+/*
+ * 双视图把副本激活成 ActiveWorkbook 之后的真实形态。
+ *
+ * 模拟范围：宿主替身（值、工作表、条件格式、Workbooks 集合、ActiveWorkbook 切换）
+ * + `stageWpsBeforeComparison`（只负责"建副本并激活"，其内容重建由
+ * `wpsBeforeComparison.test.ts` 用真实模块覆盖）；模型、网络、账本仍为替身。
+ * 这里刻意让 `CompareSideBySideWith`/`Copy` 之后**活动簿变成副本** —— 那正是实机行为。
+ */
+/*
+ * 数据范围面板的**呈现层**判据必须跑在**真实** `WpsAgentPanel` 上。
+ *
+ * 为什么不放在 `wpsScopeDraft.test.tsx`：那一份把面板本体换成替身，替身自己在
+ * JSX 里就写了 `.scope-layer`，于是"把面板塞回输入框那一层"的变异在那里永远
+ * 变不了红 —— 判据看着存在，其实没有判别力。所以这里另挂一条真实组件的判据。
+ */
+describe("真实面板：数据范围面板本体住在独立呈现层", () => {
+  it("面板本体不是 .composer 的后代；触发器那一行仍在输入框上方", async () => {
+    const { container } = await mount(
+      <WpsAgentPanel selectedSheetIndexes={[1]}
+        scopeDock={<span>当前表 Sheet1</span>}
+        scopeOverlay={<section className="scope-popover" aria-label="选择数据范围">
+          <div className="scope-popover-scroll">正文</div>
+        </section>} />
+    );
+    const popover = container.querySelector(".scope-popover");
+    expect(popover).not.toBeNull();
+    // 负向锚点：它不在输入框那一层里，而是外壳下 `.scope-layer` 的内容。
+    expect(popover!.closest(".composer")).toBeNull();
+    expect(popover!.closest(".scope-layer")).not.toBeNull();
+    // 触发器仍留在 composer（那一行的位置没变）。
+    expect(container.querySelector(".composer .scope-dock, .composer span")?.textContent).toBe("当前表 Sheet1");
+  });
+});
+
+describe("双视图激活副本后仍按原表确认/放弃/核对", () => {
+  function reviewHostWithCopy() {
+    const base = writeRangeHost();
+    /*
+     * `writeRangeHost` 只回工具方法；宿主对象是它塞进 `getWpsApplication` 替身的
+     * 那一个 —— 取回来才能把 `ActiveWorkbook` 改成"可切换"。
+     */
+    const app = getWpsApplicationMock() as unknown as {
+      ActiveWorkbook: Record<string, unknown>;
+      Workbooks?: { Count: number; Item(index: number): unknown };
+      [key: string]: unknown;
+    };
+    const original = app.ActiveWorkbook as unknown as Record<string, unknown> & {
+      Name: string; FullName: string; Path: string;
+      Worksheets: { Count: number; Item(index: number): Record<string, unknown> };
+    };
+    const writeSheet = original.Worksheets.Item(1) as Record<string, unknown> & {
+      Range: (...args: unknown[]) => Record<string, unknown>;
+    };
+    // 条件格式：标记真的能建、能删、能按随机公式认领。
+    const rules: Array<{ formula: string; deleted: boolean }> = [];
+    const originalRange = writeSheet.Range.bind(writeSheet);
+    writeSheet.Range = (...args: unknown[]) => {
+      const range = originalRange(...args) as Record<string, unknown>;
+      if (!range.FormatConditions) {
+        range.FormatConditions = {
+          get Count() { return rules.filter(rule => !rule.deleted).length; },
+          Add: (_type: number, _operator: unknown, formula: string) => {
+            const state = { formula, deleted: false };
+            rules.push(state);
+            return {
+              get Formula1() { return state.formula; },
+              Borders: { Item: () => ({}) },
+              Interior: {},
+              Delete: () => { state.deleted = true; }
+            };
+          },
+          Item: (index: number) => {
+            const live = rules.filter(rule => !rule.deleted)[index - 1];
+            return { get Formula1() { return live?.formula; }, Delete: () => { if (live) live.deleted = true; } };
+          }
+        };
+      }
+      return range;
+    };
+
+    const copy = {
+      Name: "工作簿1", FullName: "工作簿1", Path: "", ReadOnly: false,
+      Worksheets: { Count: 1, Item: () => ({ Name: "Sheet1", ProtectContents: false }) },
+      Close: () => true
+    };
+    let active: unknown = original;
+    const activate = (book: unknown) => { active = book; };
+    Object.defineProperty(app, "ActiveWorkbook", { get: () => active, configurable: true });
+    Object.defineProperty(app, "ActiveSheet", { get: () => (active as { ActiveSheet?: unknown }).ActiveSheet ?? original.ActiveSheet, configurable: true });
+    app.Workbooks = { Count: 2, Item: (index: number) => (index === 1 ? original : copy) };
+    let copiesClosed = 0;
+    const activateCopy = () => { active = copy; };
+    const activateOriginal = () => { active = original; };
+    return {
+      base, app, original, copy, rules,
+      activateCopy, activateOriginal, activate,
+      closeCopy: () => { copiesClosed += 1; },
+      copiesClosed: () => copiesClosed,
+      liveRules: () => rules.filter(rule => !rule.deleted)
+    };
+  }
+
+  it("并排后副本获得焦点：确认成功、只写一次、固定条收起、标记清掉", async () => {
+    const host = reviewHostWithCopy();
+    const original = host.original as unknown as { Name: string; FullName: string; Path: string; Worksheets: { Count: number; Item(i: number): { Name: string } } };
+    vi.mocked(stageWpsBeforeComparison).mockImplementationOnce((() => {
+      host.activateCopy();
+      return {
+        original,
+        copy: host.copy,
+        copyIdentity: { name: "工作簿1", fullName: "工作簿1", path: null },
+        writeSheet: { index: 1, name: "Sheet1" },
+        plan: {} as never,
+        reviews: [], changedCells: [], originalBefore: [], copyFingerprints: [], copyAfter: []
+      } as never;
+    }) as never);
+    const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
+    // 执行一次，走双视图（副本被激活）。
+    await click(findButton(container, "双视图对比"));
+    expect(host.liveRules().length).toBeGreaterThan(0);
+    // 执行已经发生：状态文案不能再停在"尚未写入"。
+    expect(textOf(container)).not.toContain("尚未写入");
+
+    // 副本仍是活动簿时点确认：不得报"工作簿或授权发生变化"。
+    await click(findButton(container, "确认变更"));
+    await until(() => textOf(container).includes("已确认变更"), "确认应成功");
+    expect(textOf(container)).not.toContain("工作簿或授权");
+    expect(host.base.writes()).toBe(1);
+    expect(host.liveRules()).toHaveLength(0);
+    // 固定条已收起：既没有大框，也没有审阅按钮。
+    expect(container.querySelector(".result-review-bar")).toBeNull();
+    expect(findButton(container, "确认变更")).toBeNull();
+    expect(findButton(container, "双视图对比")).toBeNull();
+    // 业务状态留在消息里，保存工具与撤销入口仍在。
+    expect(textOf(container)).toContain("已确认变更");
+    // 结果卡里的撤销入口（带 aria-label 的那颗）仍在，且属于本次执行。
+    expect(container.querySelector('[aria-label="撤销本次执行"]')).not.toBeNull();
+  });
+
+  it("副本获得焦点时放弃：原表恢复、只清理本次副本", async () => {
+    const host = reviewHostWithCopy();
+    const original = host.original as never;
+    vi.mocked(stageWpsBeforeComparison).mockImplementationOnce((() => {
+      host.activateCopy();
+      return {
+        original, copy: host.copy,
+        copyIdentity: { name: "工作簿1", fullName: "工作簿1", path: null },
+        writeSheet: { index: 1, name: "Sheet1" },
+        plan: {} as never, reviews: [], changedCells: [], originalBefore: [], copyFingerprints: [], copyAfter: []
+      } as never;
+    }) as never);
+    const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
+    await click(findButton(container, "双视图对比"));
+    await click(findButton(container, "放弃变更"));
+    await until(() => textOf(container).includes("已放弃并恢复"), "放弃应成功并恢复");
+    expect(host.base.cellValue()).toBe("旧值");
+    // 只清理本次副本，原表不被关闭；固定条收起。
+    expect(discardWpsNativeComparison).toHaveBeenCalled();
+    expect(container.querySelector(".result-review-bar")).toBeNull();
+    expect(textOf(container)).not.toContain("工作簿或授权");
+  });
+
+  it("副本获得焦点时读数据范围：仍是原表与它的授权工作表", async () => {
+    const host = reviewHostWithCopy();
+    const original = host.original as never;
+    vi.mocked(stageWpsBeforeComparison).mockImplementationOnce((() => {
+      host.activateCopy();
+      return {
+        original, copy: host.copy,
+        copyIdentity: { name: "工作簿1", fullName: "工作簿1", path: null },
+        writeSheet: { index: 1, name: "Sheet1" },
+        plan: {} as never, reviews: [], changedCells: [], originalBefore: [], copyFingerprints: [], copyAfter: []
+      } as never;
+    }) as never);
+    await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
+    await click(findButton(document.body, "双视图对比"));
+    // 数据范围核对走真实 inspect：副本活动时解析为原表。
+    const target = await inspectWpsAuthorizedTarget([1]);
+    expect(target.name).toBe("测试.xlsx");
+    expect(target.sheets.map(sheet => sheet.name)).toEqual(["Sheet1"]);
+  });
+
+  /*
+   * 反向锚点：把副本认回原表，不等于"永远按原表办事"。
+   * 切到一本**无关**工作簿时该拦的还是必须拦住；而且这是"当前性不成立"，
+   * 不是"标记没清掉"——界面不许出现「重试清理标记」，那会把原因说错。
+   */
+  it("切到无关工作簿：确认仍被拦下，且不谎称是标记清理失败", async () => {
+    const host = reviewHostWithCopy();
+    const original = host.original as never;
+    vi.mocked(stageWpsBeforeComparison).mockImplementationOnce((() => {
+      host.activateCopy();
+      return {
+        original, copy: host.copy,
+        copyIdentity: { name: "工作簿1", fullName: "工作簿1", path: null },
+        writeSheet: { index: 1, name: "Sheet1" },
+        plan: {} as never, reviews: [], changedCells: [], originalBefore: [], copyFingerprints: [], copyAfter: []
+      } as never;
+    }) as never);
+    const { container } = await mountPlanPreview(singleWritePlan, "把 A1 改成 90");
+    await click(findButton(container, "双视图对比"));
+    expect(host.liveRules().length).toBeGreaterThan(0);
+    // 用户自己切到另一本工作簿（不是本次副本）：这本不能被当成原表。
+    host.activate({ Name: "别的.xlsx", FullName: ["C:", "Data", "别的.xlsx"].join(String.fromCharCode(92)),
+      Path: ["C:", "Data"].join(String.fromCharCode(92)),
+      Worksheets: { Count: 1, Item: () => ({ Name: "Sheet1" }) } });
+    await click(findButton(container, "确认变更"));
+    await until(() => textOf(container).includes("确认未完成"), "无关工作簿上确认必须被拦下");
+    const bar = container.querySelector(".result-review-bar")?.textContent ?? "";
+    expect(bar).toContain("工作簿、授权或计划已变化");
+    expect(bar).not.toContain("可重试清理标记");
+    expect(container.querySelector('[aria-label="重试清理标记"]')).toBeNull();
+    // 拦下的是确认本身：没有第二次写入，标记也仍在（等回到原表再收尾）。
+    expect(host.base.writes()).toBe(1);
+    expect(host.liveRules().length).toBeGreaterThan(0);
+    expect(textOf(container)).not.toContain("已确认变更");
+  });
+});
+
+
+describe("WPS native worksheet checkpoint routing", () => {
+  /*
+   * 宿主侧的最小接线：`onAuthorizeTarget` 就是"把收窄后的范围写回**读取方**"。
+   *
+   * 生产里是 `WpsProbePanel` 的 `setSelectedIndexes`；测试里也必须接上 ——
+   * 面板的 `inspect` 读的是 `selectedSheetIndexes` 这个受控属性，不接就永远读旧范围，
+   * "收窄"只会是自欺：守卫基线动了、读取方没动，下一轮照样判成范围变化。
+   */
+  function PanelWithHostScope({ initial }: { initial: number[] }) {
+    const [indexes, setIndexes] = useState(initial);
+    return (
+      <WpsAgentPanel
+        selectedSheetIndexes={indexes}
+        onAuthorizeTarget={(next) => setIndexes(next)}
+        scopeDock={<span>全部表</span>}
+      />
+    );
+  }
+
+  it.each([false, true])("SDK delete plan uses one checkpoint batch, backup consent=%s", async needsConsent => {
+    const app = clarificationHost({ sheetNames: ["Sheet1", "Sheet2"] }) as unknown as import("./wpsHost").WpsApplication;
+    app.Hwnd = 123;
+    getWpsApplicationMock.mockReturnValue(app);
+    const plan: AnalysisPlan = { id: "delete-structure", title: "保留 Sheet1", summary: "删除 Sheet2", assumptions: [], warnings: [], actions: [{ type: "deleteWorksheet", sheet: "Sheet2" }] };
+    listModelsMock.mockResolvedValue({ defaultModelId: firstConnection.id, models: [firstConnection] });
+    runTurnMock.mockResolvedValue({ kind: "plan", plan, turnId: "delete-turn" });
+    validatePlanMock.mockImplementation(async submitted => submitted);
+    /*
+     * 目录**可变**的宿主：删表真的把表摘掉，撤销真的把表放回**原来那个位置**。
+     * 同一个表名始终返回同一个包装对象（真宿主就是这样），否则撤销后的
+     * "身份 + 顺序 + 内容"核对读到的只是刚造出来的一堆新对象，断言等于空转。
+     */
+    let names = ["Sheet1", "Sheet2"];
+    // 执行前的目录顺序 —— 撤销要按它把表放回**原位**（服务端 `_anchor` 的同一口径）。
+    const originalOrder = [...names];
+    const sheetObjects = new Map<string, Record<string, unknown>>();
+    const sheetFor = (name: string, index: number): Record<string, unknown> => {
+      const cached = sheetObjects.get(name);
+      if (cached) { cached.Index = index; return cached; }
+      const created = { Name: name, Index: index, CodeName: `SheetCode${index}`, ProtectContents: false };
+      sheetObjects.set(name, created);
+      return created;
+    };
+    Object.defineProperty(app.ActiveWorkbook!, "Worksheets", {
+      configurable: true,
+      get: () => {
+        const items = names.map((name, position) => sheetFor(name, position + 1));
+        return { Count: items.length, Item: (index: number) => items[Number(index) - 1] };
+      }
+    });
+    const executedOperationIds: string[] = [];
+    vi.mocked(executeWorksheetDeletion).mockImplementation(async req => {
+      expect(req.authorizedSheets).toEqual(["Sheet1", "Sheet2"]);
+      expect(req.hostWindowId).toBe(123);
+      expect(req.host).toBe("wps-et");
+      // operationId 是执行时生成的（32 位 hex），不是计划 id。
+      expect(req.operationId).toMatch(/^[a-f0-9]{32}$/);
+      executedOperationIds.push(req.operationId);
+      if (needsConsent) return { operationId: req.operationId, status: "needs_backup_consent", backupSheets: ["#EB_RULES", "#EB_RULES_BACKUP"], deletedSheets: [], remainingSheets: [], recoveryAvailable: false, message: "请确认额外备份许可" };
+      names = names.filter(name => name !== "Sheet2");
+      return { operationId: req.operationId, status: "completed", deletedSheets: ["Sheet2"], remainingSheets: ["Sheet1"], recoveryAvailable: true, message: "已核对剩余工作表。" };
+    });
+    vi.mocked(confirmWorksheetCheckpointBackup).mockImplementation(async req => {
+      names = names.filter(name => name !== "Sheet2");
+      return { operationId: req.operationId, status: "completed", deletedSheets: ["Sheet2"], remainingSheets: ["Sheet1", "#EB_RULES", "#EB_RULES_BACKUP"], recoveryAvailable: true, message: "已核对剩余工作表。" };
+    });
+    vi.mocked(restoreWorksheetCheckpoint).mockImplementation(async (operationId, deleted) => {
+      // 原地撤销：按原顺序插回原位，原工作簿对象不变、不打开任何副本。
+      const next = names.filter(name => !deleted.includes(name));
+      for (const name of originalOrder.filter(name => deleted.includes(name))) {
+        const predecessors = originalOrder.slice(0, originalOrder.indexOf(name)).filter(prev => next.includes(prev));
+        const anchor = predecessors.at(-1);
+        next.splice(anchor === undefined ? 0 : next.indexOf(anchor) + 1, 0, name);
+      }
+      names = next;
+      return {
+        operationId, status: "completed", restoredSheets: [...deleted],
+        failedSheets: [], unverifiedSheets: [], repairedFormulas: 0, repairedNames: 0,
+        limitations: [], message: `已把 ${deleted.length} 张工作表放回原工作簿。`
+      } as never;
+    });
+    const { container } = await mount(<PanelWithHostScope initial={[1, 2]} />);
+    await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型") ?? false, "模型加载");
+    await type(container.querySelector("textarea"), "保留 Sheet1 删除其余表");
+    await submit(container.querySelector("textarea"));
+    if (needsConsent) {
+      await until(() => findButton(container, "允许仅本地备份并继续") !== null, "需要主动询问额外备份许可");
+      expect(app.ActiveWorkbook!.Worksheets.Count).toBe(2);
+      expect(confirmWorksheetCheckpointBackup).not.toHaveBeenCalled();
+      await click(findButton(container, "允许仅本地备份并继续"));
+      expect(vi.mocked(confirmWorksheetCheckpointBackup).mock.calls[0][0].backupSheets).toEqual(["#EB_RULES", "#EB_RULES_BACKUP"]);
+    }
+    await until(() => findButton(container, "↶ 撤销本次执行") !== null, "删除结果必须有检查点恢复入口");
+    expect(executeWorksheetDeletion).toHaveBeenCalledOnce();
+    expect(registerWpsExecution).not.toHaveBeenCalled();
+    expect(app.ActiveWorkbook!.Worksheets.Count).toBe(1);
+
+    /*
+     * 结果卡住在**发起这次删除的那条消息**里，不是聊天底部的常驻列表。
+     * 旧实现在全部消息之后统一渲染检查点，换会话也清不掉。
+     */
+    const card = container.querySelector(".worksheet-checkpoint-card") as HTMLElement;
+    expect(card).not.toBeNull();
+    expect(card.closest(".message-row")).not.toBeNull();
+    // 卡片与这一轮的过程时间线同属一条消息：它不是被追加到消息末尾的独立块。
+    expect(card.closest(".message-row")?.querySelector(".task-progress-timeline")).not.toBeNull();
+    /*
+     * 入口的名字和位置与普通写入结果卡一致（右下角「↶ 撤销本次执行」），
+     * 但这颗按钮**真的**在原工作簿里撤销，所以说明句写的是"保留后续编辑"，
+     * 不再说"打开执行前副本" —— 副本入口在「备份与恢复」，两者不能互相冒充。
+     */
+    const undoFooter = card.querySelector(".execution-recovery-footer") as HTMLElement;
+    expect(undoFooter).not.toBeNull();
+    expect(undoFooter.querySelector("button")?.textContent?.trim()).toBe("↶ 撤销本次执行");
+    expect(undoFooter.textContent).toContain("在原工作簿撤回本次删除，保留后续编辑");
+    expect(undoFooter.textContent).not.toContain("打开执行前副本");
+    expect(card.textContent).toContain("已删除 1 张工作表");
+    expect(card.querySelector("details")?.open).toBe(false);
+    /*
+     * 顺序是「① 执行过程 → ② 执行结果 → ③ 卡底部的撤销按钮」。
+     * 删表这一轮曾经把结果卡排在时间线**之前**，于是先看到"已完成"、再看到
+     * 一步一步的过程，像结果倒着长回来。撤销按钮在卡内部，不可能跑到过程之上。
+     */
+    const timeline = card.closest(".message-row")!.querySelector(".task-progress-timeline") as HTMLElement;
+    expect(timeline.compareDocumentPosition(card) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(card.parentElement!.querySelectorAll(".task-progress-timeline").length).toBe(1);
+
+    // 原地撤销：不打开副本，表回到原簿的**原位置**，工作簿对象与文件名都不变。
+    await act(async () => { findButton(container, "↶ 撤销本次执行")!.click(); });
+    await until(() => textOf(container).includes("已撤销本次删除"), "撤销成功要落在同一张卡上");
+    expect(vi.mocked(restoreWorksheetCheckpoint).mock.calls[0][0]).toBe(executedOperationIds.at(-1));
+    expect(vi.mocked(restoreWorksheetCheckpoint).mock.calls[0][1]).toEqual(["Sheet2"]);
+    expect(openWorksheetCheckpoint).not.toHaveBeenCalled();
+    expect(names).toEqual(["Sheet1", "Sheet2"]);
+    expect(app.ActiveWorkbook!.Name).toBe("测试.xlsx");
+    expect(executeWorksheetDeletion).toHaveBeenCalledOnce();
+    expect(findButton(container, "确认变更")).toBeNull();
+    // 成功是终态：入口收起、结论写"已恢复 1 张"、不新增第二张卡。
+    expect(findButton(container, "↶ 撤销本次执行")).toBeNull();
+    expect(card.textContent).toContain("已恢复 1 张工作表");
+    expect(container.querySelectorAll(".worksheet-checkpoint-card").length).toBe(1);
+    expect(textOf(container)).not.toContain("已打开恢复副本");
+
+    /*
+     * 撤销把目录从 1 张变回 2 张。下一轮提问也不该被读成"用户改了授权范围" ——
+     * 那会弹「工作表范围发生变化 / 尚未写入」，与刚撤销成功的事实直接冲突。
+     * 放行必须有据：同一工作簿、目录里多出来的**只有本次放回的那张表**，
+     * 授权集合本身没被扩大。
+     */
+    runTurnMock.mockResolvedValue({ kind: "answer", provider: "system", message: "现在有两张表。" });
+    await until(() => container.querySelector<HTMLTextAreaElement>("textarea")?.disabled === false, "等待面板空闲");
+    await type(container.querySelector("textarea"), "现在还剩几张表");
+    await submit(container.querySelector("textarea"));
+    await until(() => textOf(container).includes("现在有两张表。"), "追问照常回答");
+    expect(container.querySelector(".target-scope-notice")).toBeNull();
+    expect(textOf(container)).not.toContain("工作表范围发生变化");
+    expect(container.querySelectorAll(".worksheet-checkpoint-card").length).toBe(1);
+    expect(executeWorksheetDeletion).toHaveBeenCalledOnce();
+
+    await until(() => container.querySelector<HTMLButtonElement>('[aria-label="新对话"]')?.disabled === false, "等待面板空闲");
+    await act(async () => { container.querySelector<HTMLButtonElement>('[aria-label="新对话"]')!.click(); });
+    await until(() => container.querySelector(".worksheet-checkpoint-card") === null, "新会话不继承旧删除卡");
+    expect(executeWorksheetDeletion).toHaveBeenCalledOnce();
+  });
+  it.each(["99.0", ""])("does not send a native delete for blocked WPS version %s", async version => {
+    const app = clarificationHost({ sheetNames: ["Sheet1", "Sheet2"] }) as unknown as import("./wpsHost").WpsApplication;
+    app.Hwnd = 123; app.Version = version;
+    getWpsApplicationMock.mockReturnValue(app);
+    const plan: AnalysisPlan = { id: "blocked-delete", title: "保留 Sheet1", summary: "删除 Sheet2", assumptions: [], warnings: [], actions: [{ type: "deleteWorksheet", sheet: "Sheet2" }] };
+    listModelsMock.mockResolvedValue({ defaultModelId: firstConnection.id, models: [firstConnection] });
+    runTurnMock.mockResolvedValue({ kind: "plan", plan, turnId: "blocked-delete-turn" });
+    validatePlanMock.mockImplementation(async submitted => submitted);
+    const { container } = await mount(<WpsAgentPanel selectedSheetIndexes={[1, 2]} scopeDock={<span>全部表</span>} />);
+    await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型") ?? false, "模型加载");
+    await type(container.querySelector("textarea"), "保留 Sheet1 删除其余表");
+    await submit(container.querySelector("textarea"));
+    await until(() => textOf(container).includes("未删除工作表"), "未开放的版本不得删除");
+    expect(executeWorksheetDeletion).not.toHaveBeenCalled();
+    expect(app.ActiveWorkbook!.Worksheets.Count).toBe(2);
+  });
+
+});

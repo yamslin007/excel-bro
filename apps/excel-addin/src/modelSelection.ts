@@ -8,6 +8,31 @@
 export interface SelectableModel {
   id: string;
   available: boolean;
+  agentAvailable?: boolean;
+  agentUnavailableReason?: string | null;
+  formulaAvailable?: boolean;
+}
+
+/** Older catalogues lack purpose metadata; the server remains the final guard. */
+export function agentModelAvailable(model: SelectableModel | undefined): boolean {
+  return Boolean(model?.available && model.agentAvailable !== false);
+}
+
+export function formulaModelAvailable(model: SelectableModel): boolean {
+  return model.available && model.formulaAvailable !== false;
+}
+
+export function agentModelUnavailableReason(model: SelectableModel): string {
+  return model.agentUnavailableReason || "此连接暂不可用于 SDK Agent，请检查连接配置。";
+}
+
+export function canonicalModelId(id: string): string {
+  const prefix = "claude-agent-sdk:";
+  return id.startsWith(prefix) ? `connection:${id.slice(prefix.length)}` : id;
+}
+
+export function keepUnavailableSelection(models: SelectableModel[], id: string): boolean {
+  return models.some((model) => model.id === canonicalModelId(id) && model.agentAvailable === false);
 }
 
 /** 同一模型 ID 的多条连接按保存顺序编号；编号只用于展示，选择仍使用唯一连接 ID。 */
@@ -36,7 +61,7 @@ export const LEGACY_LOCAL_MODEL_ID = "local";
 export const NO_MODEL_SELECTED = "";
 
 /**
- * 这条连接是不是 **Claude Agent SDK** 适配器。
+ * 已选连接的 Agent 规划统一使用 Claude Agent SDK。
  *
  * SDK 适配器只拿得到表结构（`planningReadPolicy: "none"`），需要数据时必须由
  * 模型经本机工具桥调 `query_table` 去读真实宿主。因此它的判据是**两件事**的
@@ -47,8 +72,9 @@ export const NO_MODEL_SELECTED = "";
  *   "不上传数据行"守卫拒绝，新工具桥就永远拿不到执行权）。
  */
 export function isSdkPlanningModel(modelId: string | null | undefined): boolean {
-  const value = (modelId ?? "").trim().toLocaleLowerCase();
-  return value === "claude-agent-sdk" || value.startsWith("claude-agent-sdk:");
+  // Model IDs identify credentials, not a second Agent implementation. Endpoint
+  // compatibility is validated by the server; it cannot fall back to old loops.
+  return isRealModelId(modelId);
 }
 
 /** The SDK adapter currently supports header-only planning, including free-text continuation. */
@@ -99,7 +125,9 @@ export function chooseAvailableModel(
   defaultModelId: string | null | undefined,
   preferredModelId?: string
 ): string {
-  const usable = models.filter((model) => model.available && isRealModelId(model.id));
+  const usable = models.filter((model) => agentModelAvailable(model) && isRealModelId(model.id));
+  currentModelId = canonicalModelId(currentModelId);
+  preferredModelId = preferredModelId ? canonicalModelId(preferredModelId) : undefined;
   if (usable.length === 0) return NO_MODEL_SELECTED;
   const has = (candidate: string | null | undefined) =>
     typeof candidate === "string" &&
@@ -107,6 +135,8 @@ export function chooseAvailableModel(
     usable.some((model) => model.id === candidate);
   if (has(preferredModelId)) return preferredModelId as string;
   if (has(currentModelId)) return currentModelId;
+  // An existing incompatible choice requires a user decision, never a new provider.
+  if (keepUnavailableSelection(models, currentModelId)) return NO_MODEL_SELECTED;
   if (has(defaultModelId)) return defaultModelId as string;
   return usable[0].id;
 }

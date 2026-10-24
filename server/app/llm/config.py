@@ -128,7 +128,7 @@ def _managed_sdk_connection(
     selected = next((item for item in managed if item.id == connection_id), None)
     if selected is None or not selected.api_key:
         return None
-    sdk_url = _deepseek_anthropic_url(selected.base_url)
+    sdk_url = selected.base_url if selected.protocol == "anthropic" else _deepseek_anthropic_url(selected.base_url)
     if sdk_url is None:
         return None
     return ModelConnection(
@@ -161,6 +161,11 @@ class ManagedModelConnection:
     model: str
     api_key: str
     supports_vision: bool
+    protocol: str = "openai_compatible"
+
+    @property
+    def adapter(self) -> str:
+        return "claude_agent_sdk" if self.protocol == "anthropic" else "openai_compatible"
 
     @property
     def catalog_id(self) -> str:
@@ -208,6 +213,9 @@ def load_managed_connections() -> tuple[ManagedModelConnection, ...]:
         base_url = str(item.get("baseUrl", "")).strip().rstrip("/")
         model = str(item.get("modelId", "")).strip()
         api_key = str(item.get("apiKey", "")).strip()
+        protocol = item.get("protocol", "openai_compatible")
+        if protocol not in ("openai_compatible", "anthropic"):
+            raise ModelConnectionStoreError(f"模型连接配置文件第 {index + 1} 项协议无效")
         if not connection_id or not label or not base_url or not model:
             raise ModelConnectionStoreError(
                 f"模型连接配置文件第 {index + 1} 项缺少必要字段"
@@ -220,6 +228,7 @@ def load_managed_connections() -> tuple[ManagedModelConnection, ...]:
                 model=model,
                 api_key=api_key,
                 supports_vision=item.get("supportsVision") is True,
+                protocol=protocol,
             )
         )
     return tuple(connections)
@@ -260,6 +269,7 @@ def _write_managed_connections(
                 "modelId": connection.model,
                 "apiKey": connection.api_key,
                 "supportsVision": connection.supports_vision,
+                "protocol": connection.protocol,
             }
             for connection in connections
         ],
@@ -281,6 +291,7 @@ def upsert_managed_connection(
     api_key: str | None,
     clear_api_key: bool,
     supports_vision: bool,
+    protocol: str | None = None,
 ) -> dict[str, object]:
     current = list(load_managed_connections())
     existing = next(
@@ -312,6 +323,7 @@ def upsert_managed_connection(
         model=normalized_model,
         api_key=resolved_api_key,
         supports_vision=supports_vision,
+        protocol=protocol or (existing.protocol if existing else "openai_compatible"),
     )
     next_connections = tuple(
         replacement if connection.id == resolved_id else connection
@@ -331,6 +343,7 @@ def draft_model_connection(
     api_key: str | None,
     clear_api_key: bool,
     supports_vision: bool,
+    protocol: str | None = None,
 ) -> ModelConnection:
     existing = next(
         (
@@ -356,6 +369,7 @@ def draft_model_connection(
         model=model.strip(),
         api_key=resolved_api_key,
         supports_vision=supports_vision,
+        adapter="claude_agent_sdk" if (protocol or (existing.protocol if existing else "openai_compatible")) == "anthropic" else "openai_compatible",
     )
 
 
@@ -389,9 +403,10 @@ def set_formula_model_id(model_id: str) -> dict[str, object]:
         valid_ids = {
             str(option["id"])
             for option in catalog["models"]  # type: ignore[index]
+            if option.get("formulaAvailable", False)
         }
         if normalized not in valid_ids:
-            raise ValueError("所选公式模型不存在或未配置")
+            raise ValueError("所选公式模型不存在、未配置或不支持 OpenAI 兼容公式接口")
     _write_managed_connections(
         load_managed_connections(), formula_model_id=normalized
     )
@@ -455,6 +470,7 @@ def resolve_model_config(
             model=selected.model,
             api_key=selected.api_key,
             supports_vision=selected.supports_vision,
+            adapter=selected.adapter,
         )
     settings = load_model_settings()
     if settings is None:
@@ -467,6 +483,7 @@ def resolve_model_config(
                 model=selected.model,
                 api_key=selected.api_key,
                 supports_vision=selected.supports_vision,
+                adapter=selected.adapter,
             )
         return _claude_sdk_connection()
     selected_model = model_id or settings.default_model
@@ -533,6 +550,7 @@ def selected_model_config(
             model=selected.model,
             api_key=selected.api_key,
             supports_vision=selected.supports_vision,
+            adapter=selected.adapter,
         )
     if settings is None:
         # 只有托管连接可用。空 model_id 时取第一个真实连接，显式指定的
@@ -547,6 +565,7 @@ def selected_model_config(
                 model=selected.model,
                 api_key=selected.api_key,
                 supports_vision=selected.supports_vision,
+                adapter=selected.adapter,
             )
         selected = next(
             (
@@ -563,6 +582,7 @@ def selected_model_config(
             model=selected.model,
             api_key=selected.api_key,
             supports_vision=selected.supports_vision,
+            adapter=selected.adapter,
         )
     selected_model = model_id or settings.default_model
     if selected_model not in settings.models:
@@ -597,6 +617,25 @@ def formula_model_config() -> ModelConnection | None:
         return None
 
 
+def connection_capabilities(connection: ModelConnection) -> dict[str, object]:
+    from ..agent_runtime import sdk_agent_connection
+
+    reason = None
+    try:
+        sdk_agent_connection(connection)
+        if not connection.api_key:
+            reason = "SDK Agent 需要配置 API Key。"
+        elif not _claude_sdk_state_ready():
+            reason = "SDK 运行目录未配置，请用项目启动脚本启动服务。"
+    except ModelNotAvailableError:
+        reason = "此端点未配置 Anthropic 兼容协议，仅可用于独立公式；请按供应商说明配置 SDK 端点。"
+    return {
+        "agentAvailable": reason is None,
+        "agentUnavailableReason": reason,
+        "formulaAvailable": connection.adapter == "openai_compatible",
+    }
+
+
 def model_catalog() -> dict[str, object]:
     """模型目录：只包含真实配置的模型连接。
 
@@ -605,7 +644,7 @@ def model_catalog() -> dict[str, object]:
     """
     settings = load_model_settings()
     managed = load_managed_connections()
-    options: list[dict[str, str | bool]] = []
+    options: list[dict[str, object]] = []
     if settings is not None:
         options.extend(
             {
@@ -614,6 +653,7 @@ def model_catalog() -> dict[str, object]:
                 "provider": "model",
                 "available": True,
                 "supportsVision": settings.supports_vision(model),
+                **connection_capabilities(ModelConnection(settings.base_url, model, settings.api_key, settings.supports_vision(model))),
             }
             for model in settings.models
         )
@@ -637,16 +677,8 @@ def model_catalog() -> dict[str, object]:
             "provider": "model",
             "available": True,
             "supportsVision": connection.supports_vision,
+            **connection_capabilities(ModelConnection(connection.base_url, connection.model, connection.api_key, connection.supports_vision, connection.adapter)),
         })
-        sdk_id = f"{CLAUDE_SDK_MANAGED_PREFIX}{connection.id}"
-        if _managed_sdk_connection(sdk_id, managed) is not None:
-            options.append({
-                "id": sdk_id,
-                "label": f"Agent SDK · {base_label}{suffix}",
-                "provider": "model",
-                "available": True,
-                "supportsVision": connection.supports_vision,
-            })
     sdk_connection = _claude_sdk_connection()
     if sdk_connection is not None:
         options.append({
@@ -655,6 +687,7 @@ def model_catalog() -> dict[str, object]:
             "provider": "model",
             "available": True,
             "supportsVision": sdk_connection.supports_vision,
+            **connection_capabilities(sdk_connection),
         })
     if settings is not None:
         default_model_id: str | None = settings.default_model
@@ -705,6 +738,8 @@ def model_settings_view() -> dict[str, object]:
             {
                 "id": connection.id,
                 "catalogModelId": connection.catalog_id,
+                "protocol": connection.protocol,
+                **connection_capabilities(ModelConnection(connection.base_url, connection.model, connection.api_key, connection.supports_vision, connection.adapter)),
                 "label": connection.label,
                 "baseUrl": connection.base_url,
                 "modelId": connection.model,

@@ -125,16 +125,19 @@ describe("规划继续方案：按钮只由结构化状态推导", () => {
     expect(decision.canContinue).toBe(false);
   });
 
-  it("有检查点的 waiting_user 走精确续跑，文案说'从上次保存的进度继续'", () => {
+  it("有检查点的 waiting_user 走继续分析，文案说'按当前授权重新读取并分析'", () => {
     const decision = planningResumeDecision({
       status: "waiting_user",
       canContinue: true,
       hasCheckpoint: true,
+      continuation: { available: true, code: null, message: "", stage: "after_tool" },
       reason: "本轮处理时间已用完，当前进度已安全保存。"
     });
     expect(decision.action).toBe("continue_checkpoint");
-    expect(decision.actionLabel).toBe("继续任务");
-    expect(decision.detail).toContain("从上次保存的进度继续");
+    expect(decision.actionLabel).toBe("继续分析");
+    expect(decision.detail).toContain("按当前授权重新读取并分析");
+    // 负向：检查点只保存引用与已确认口径，引用可能过期，不能承诺"不重做"。
+    expect(decision.detail).not.toContain("不会重做");
   });
 
   it("没有检查点时只能重新规划，文案说'重新读取并生成预览'而不是'继续'", () => {
@@ -146,7 +149,27 @@ describe("规划继续方案：按钮只由结构化状态推导", () => {
     expect(decision.action).toBe("regenerate");
     expect(decision.actionLabel).toBe("重新读取并生成预览");
     // 关键：不得出现"从上次保存的进度继续"这类精确续跑承诺。
-    expect(decision.actionLabel).not.toBe("继续任务");
+    expect(decision.actionLabel).not.toBe("继续分析");
+    expect(decision.actionLabel).not.toBe("继续分析");
+  });
+
+  it("服务端说不能继续时照抄它的原因，不给按钮、也不退回重新规划", () => {
+    const decision = planningResumeDecision({
+      status: "waiting_user",
+      canContinue: false,
+      hasCheckpoint: true,
+      continuation: {
+        available: false,
+        code: "PLANNING_CONTEXT_HAS_EXECUTION",
+        message: "这个任务已经登记过写入。先核对原表与执行状态，不能用重新分析绕过。",
+        stage: "after_tool"
+      }
+    });
+    expect(decision.action).toBe("none");
+    expect(decision.canContinue).toBe(false);
+    expect(decision.detail).toContain("先核对原表与执行状态");
+    // 负向：不能把"已经写过原表"说成"没有现场、重新生成预览就好"。
+    expect(decision.detail).not.toContain("重新读取并生成预览");
   });
 
   it("过期/不可继续的任务只允许真实降级，不提供假继续按钮", () => {
@@ -201,17 +224,22 @@ describe("规划继续方案：按钮只由结构化状态推导", () => {
   });
 
   it("总时长已用完（budget_exhausted）不提供续跑按钮，也不承诺必然可继续", () => {
-    // 服务端会把这种暂停的 canContinue 置为 false；这里如实核对下游不给按钮。
+    // 服务端会把这种暂停的 canContinue 置为 false；现场可能仍然合法，
+    // 但"按一下就能接着跑"是假承诺 —— 既不给按钮，也不退回"重新生成预览"。
     const decision = planningResumeDecision({
       status: "waiting_user",
       canContinue: false,
       hasCheckpoint: true,
       pauseType: "budget_exhausted",
+      continuation: { available: true, code: null, message: "", stage: "after_tool" },
       reason: "本轮有效运行总时长已用完，不再启动新的模型或工具调用。"
     });
-    expect(decision.action).toBe("regenerate");
-    expect(decision.actionLabel).not.toBe("继续任务");
-    // 原因原样透出，不被"进度已安全保存"之类的兜底文案顶掉。
+    expect(decision.action).toBe("none");
+    expect(decision.canContinue).toBe(false);
+    expect(decision.actionLabel).not.toBe("继续分析");
+    expect(decision.actionLabel).not.toBe("继续分析");
+    // 负向：不能把"总时长用完"讲成"没有现场，重新生成预览"。
+    expect(decision.detail).toContain("总时长已用完");
     expect(decision.detail).not.toContain("从上次保存的进度继续");
   });
 
@@ -313,8 +341,8 @@ describe("面板重开：从历史挑出需要重新核对的暂停", () => {
     reason,
     canContinue: true,
     action: "continue_checkpoint" as const,
-    actionLabel: "继续任务",
-    detail: "从上次保存的进度继续"
+    actionLabel: "继续分析",
+    detail: "按当前授权重新读取并分析"
   });
 
   const payloadOf = (turnId: string) => (turnId ? { turnId } : null);

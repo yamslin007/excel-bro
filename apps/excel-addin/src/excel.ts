@@ -1,3 +1,6 @@
+import { copyRangePlan } from "@excel-bro/core/copyRangePlan";
+import { filteredSourceRows } from "./filteredSourceRows";
+import { writeTableValues, WRITE_TABLE_HEADER_FILL } from "@excel-bro/core/writeTableLayout";
 import type {
   AnalysisPlan,
   ActionExecutionResult,
@@ -1485,7 +1488,11 @@ export function verificationGaps(
             (criterion.type === "rangeEquals" ||
               criterion.type === "formulasEqual") &&
             sameRange(criterion, action.sheet, action.targetRange)
-        );
+        ) || Boolean(action.filters?.length && dynamicCriteria.some(criterion =>
+          (criterion.type === "rangeEquals" || criterion.type === "formulasEqual") &&
+          criterion.sheet.toLocaleLowerCase() === action.sheet.toLocaleLowerCase() &&
+          normalizedRangeAddress(criterion.range).split(":")[0] === normalizedRangeAddress(action.targetRange).split(":")[0]
+        ));
         break;
       case "splitGroupAggregate":
         verified = dynamicCriteria.length > 0;
@@ -2686,6 +2693,10 @@ export function preflightPlanActions(
       });
       return;
     }
+    if (action.type === "copyRange" && action.filters?.length && !["values", "link"].includes(action.copyType)) {
+      issues.push({index, message:"条件复制目前支持值或链接，不能把完整格式或相对公式复制降级成值复制"});
+      return;
+    }
     if (
       action.type === "copyRange" &&
       !hasSheet(action.sourceSheet)
@@ -3162,7 +3173,7 @@ export async function executeAction(
           target.values = matrix;
           const header = target.getRow(0);
           header.format.font.bold = true;
-          header.format.fill.color = "#DFF3E4";
+          header.format.fill.color = WRITE_TABLE_HEADER_FILL;
           for (const columnIndex of output.ratioColumnIndexes) {
             const ratioRange = targetSheet.getRange(
               `${columnName(columnIndex + 1)}2:${columnName(columnIndex + 1)}${
@@ -3332,15 +3343,14 @@ export async function executeAction(
     case "createWorksheet":
       return;
     case "writeTable": {
-      const values = [action.headers, ...action.rows];
-      assertRectangularValues(values);
+      const values = writeTableValues(action);
       const start = sheet.getRange(action.startCell);
       const target = start.getResizedRange(values.length - 1, values[0].length - 1);
       target.values = values;
       if (action.headers.length > 0) {
         const header = start.getResizedRange(0, action.headers.length - 1);
         header.format.font.bold = true;
-        header.format.fill.color = "#DFF3E4";
+        header.format.fill.color = WRITE_TABLE_HEADER_FILL;
       }
       return;
     }
@@ -3454,22 +3464,50 @@ export async function executeAction(
       source.load("values");
       await context.sync();
       const values = source.values as CellValue[][];
-      const headerRowIndex = (action.hasHeaders ?? true) ? 0 : -1;
-      const matchIndices = resolveFilteredRowIndices(
-        values,
-        headerRowIndex,
-        action.filters
-      );
-      const headerRows =
-        headerRowIndex >= 0 ? [values[headerRowIndex]] : [];
-      const keptRows = matchIndices.map((index) => values[index]);
-      const filtered = [...headerRows, ...keptRows];
-      if (filtered.length === 0 || filtered[0].length === 0) return;
-      sheet
-        .getRange(action.targetRange)
-        .getResizedRange(filtered.length - 1, filtered[0].length - 1).values =
-        filtered;
-      return;
+      const selected = filteredSourceRows(values, action.filters, action.hasHeaders ?? true);
+      if (!selected.length) throw new Error("没有命中复制条件的行，原表未修改。");
+      const writes = copyRangePlan(action, values, [0, ...selected]);
+      const targetRect = parseExplicitA1Rect(action.targetRange)!;
+      const outputRows = action.transpose ? values[0].length : selected.length + 1;
+      const outputColumns = action.transpose ? selected.length + 1 : values[0].length;
+      const outputAddress = matrixRange(action.targetRange.split(":")[0], outputRows, outputColumns)!;
+      const outputRange = sheet.getRange(outputAddress);
+      outputRange.load("values,formulas");
+      await context.sync();
+      const expected: CellValue[][] = (action.copyType === "link" ? outputRange.formulas : outputRange.values)
+        .map(row => row.map(normalizeValue));
+      // Save each actual write span: skipped blanks are neither written nor restored.
+      const capturedWrites: Array<{write:typeof writes[number]; snapshot:ExecutionUndoSnapshot["ranges"][number]}> = [];
+      for (const write of writes) {
+        const captured = await captureUndoRange(context, write, actionIndex);
+        if (!captured.snapshot) throw new Error("复制目标无法保存恢复依据，未写入。");
+        capturedWrites.push({write,snapshot:captured.snapshot});
+        const rect = parseExplicitA1Rect(write.range)!;
+        const matrix = write.type === "writeValues" ? write.values : write.formulas;
+        matrix.forEach((row, r) => row.forEach((value, c) => {
+          expected[rect.startRow - targetRect.startRow + r][rect.startColumn - targetRect.startColumn + c] = value;
+        }));
+      }
+      // Capturing spans required async host reads; verify again before queuing any writes.
+      source.load("values");
+      const targets = capturedWrites.map(({write})=>sheet.getRange(write.range));
+      targets.forEach(target=>target.load("formulas"));
+      await context.sync();
+      if (JSON.stringify(source.values) !== JSON.stringify(values)) throw new Error("复制来源在检查期间发生变化，未写入。");
+      for (let index=0;index<targets.length;index++) {
+        if (JSON.stringify(targets[index].formulas.map(row=>row.map(normalizeValue))) !== JSON.stringify(capturedWrites[index].snapshot.formulas)) {
+          throw new Error("复制目标在检查期间发生变化，未写入。");
+        }
+      }
+      for (const [index,{write,snapshot}] of capturedWrites.entries()) {
+        const target = targets[index];
+        collector.overwrittenRanges.push(snapshot);
+        if (write.type === "writeValues") target.values = write.values;
+        else target.formulas = write.formulas;
+      }
+      return action.copyType === "link"
+        ? [{type:"formulasEqual",sheet:action.sheet,range:outputAddress,expected:expected.map(row=>row.map(value=>String(value ?? "")))}]
+        : [{type:"rangeEquals",sheet:action.sheet,range:outputAddress,expected}];
     }
     case "sortRange":
       sheet.getRange(action.range).sort.apply(

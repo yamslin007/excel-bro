@@ -417,6 +417,8 @@ class FolderOperationLedger:
             );
             CREATE INDEX IF NOT EXISTS idx_office_executions_status_updated
                 ON office_executions(status, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_office_executions_task
+                ON office_executions(task_id);
             """
         )
         operation_columns = {
@@ -1681,6 +1683,22 @@ class FolderOperationLedger:
         if task_id is not None and record.task_id != task_id:
             raise RuntimeError("该 operationId 已绑定到另一个任务")
         return record, False
+
+    def has_execution_for_task(self, task_id: str) -> bool:
+        """这个规划任务是否已经登记过写入执行。
+
+        "继续分析"必须先过这一关：只要有执行记录（无论已完成、部分执行还是
+        结果未知），就**不能**用重新规划绕过去 —— 那等于在没有核对原表的情况下
+        再写一遍。调用方据此把用户导向"继续执行 / 核对"或明确说明需要重新发起。
+        """
+        if not task_id:
+            return False
+        with self._connect_readonly() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM office_executions WHERE task_id = ? LIMIT 1",
+                (task_id,),
+            ).fetchone()
+        return row is not None
 
     def office_execution(self, operation_id: str) -> OfficeExecutionRecord | None:
         with self._connect_readonly() as connection:

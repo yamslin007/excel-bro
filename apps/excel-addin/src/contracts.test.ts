@@ -85,6 +85,48 @@ describe("parseTaskProgressEvent", () => {
     ).toBeNull();
   });
 
+  it("parses the python code frame without trusting unknown stages", () => {
+    const base = {
+      schemaVersion: 1,
+      operationId: "turn-code",
+      sequence: 2,
+      phase: "planning",
+      stepId: "python.analysis:py_0123456789ab",
+      status: "progress",
+      title: "正在隔离环境分析",
+      timestamp: "2026-09-02T00:00:00Z"
+    };
+    const parsed = parseTaskProgressEvent({
+      ...base,
+      pythonCode: {
+        codeId: "code_py_0123456789ab",
+        attemptId: "py_0123456789ab",
+        stage: "running",
+        version: 1,
+        chars: 812,
+        executedVersion: 1,
+        sequence: 2
+      }
+    });
+    expect(parsed?.pythonCode).toMatchObject({
+      stage: "running",
+      codeId: "code_py_0123456789ab",
+      chars: 812,
+      executedVersion: 1
+    });
+    // 正文没有随事件到达：这是常态（代码不进账本），不是解析失败。
+    expect(parsed?.pythonCode?.code).toBeUndefined();
+
+    // 不认识的状态整帧丢弃，不猜、不降级成最接近的那个。
+    const unknown = parseTaskProgressEvent({
+      ...base,
+      pythonCode: { codeId: "code_py_0123456789ab", attemptId: "py_0123456789ab", stage: "daydreaming" }
+    });
+    expect(unknown?.pythonCode).toBeNull();
+    // 事件本身仍然可用：坏的是一个可选字段，不是整条进度。
+    expect(unknown?.status).toBe("progress");
+  });
+
   it("keeps safe tool facts and accepts the cancelled terminal status", () => {
     const event = parseTaskProgressEvent({
       schemaVersion: 1,

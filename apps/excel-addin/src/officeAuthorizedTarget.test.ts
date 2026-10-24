@@ -76,4 +76,31 @@ describe("Office target metadata adapter", () => {
     const h = host(); h.sync.mockImplementation(async () => { h.document.url = "file:///C:/Data/Other.xlsx"; });
     await expect(inspectOfficeAuthorizedTarget(null)).rejects.toThrow("检查期间");
   });
+  /*
+   * 证据键 = **文件身份 + 授权集合**。集合的身份不包含"用户先点了哪一张"。
+   *
+   * 现场：按「Sheet11 → Sheet1 → Sheet10」确认了三张表，发送时被判「暂时无法核实
+   * 当前目标」。同一组表只因点选顺序不同就产出两个键，`checkForAnalysis` 把
+   * 两个键读成"证据冲突"。键必须与点选顺序无关，但**必须**与成员变化有关。
+   */
+  it("evidence keys do not depend on the order the sheets were picked, only on the set", async () => {
+    host();
+    const picked = await officeAnalysisTargetEvidence(await inspectOfficeAuthorizedTarget(["Other", "Sheet1"]));
+    const readBack = await officeAnalysisTargetEvidence(await inspectOfficeAuthorizedTarget(["Sheet1", "Other"]));
+    expect(picked).toMatchObject({ conclusive: true });
+    expect(readBack).toMatchObject({ conclusive: true });
+    expect(picked?.key).toBe(readBack?.key);
+    // 少授权一张就是另一个目标，不能被"排序无关"吞掉。
+    const narrowed = await officeAnalysisTargetEvidence(await inspectOfficeAuthorizedTarget(["Sheet1"]));
+    expect(narrowed?.key).not.toBe(picked?.key);
+  });
+  it("a changed file or a replaced document reference still yields no evidence at all", async () => {
+    const h = host();
+    const target = await inspectOfficeAuthorizedTarget(["Sheet1", "Other"]);
+    h.document.url = "file:///D:/Elsewhere/Original.xlsx";
+    expect(await officeAnalysisTargetEvidence(target)).toBeNull();
+    // 同 URL 的新 document 对象也不是原来那次授权。
+    host();
+    expect(await officeAnalysisTargetEvidence(target)).toBeNull();
+  });
 });

@@ -92,7 +92,7 @@ describe("Office range selection and follow-up authorization", () => {
   });
   it("keeps the real App range-confirmation entry wired to the verified adapter", () => {
     const source = readFileSync(resolve(process.cwd(), "src/App.tsx"), "utf8");
-    const picker = source.slice(source.indexOf("async function confirmSheetSelection()"), source.indexOf("function buildIntentScope("));
+    const picker = source.slice(source.indexOf("async function confirmSheetSelection("), source.indexOf("function buildIntentScope("));
     expect(picker).toContain("await confirmOfficeAuthorizedScope(");
     expect(picker).toContain("targetGuard.confirmScope");
     expect(picker).toContain("setWorkbookScopeMode(workbookScopeMode)");

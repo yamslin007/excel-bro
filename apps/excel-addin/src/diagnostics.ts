@@ -1,4 +1,5 @@
 export type DiagnosticPhase =
+  | "scope_selection"
   | "scan"
   | "intent_model"
   | "planning_model"
@@ -16,6 +17,7 @@ export interface DiagnosticEvent {
   modelCalls: number;
   status: "succeeded" | "failed" | "cancelled";
   errorCategory?: string;
+  scopeSelection?: { mode: string; selectedCount: number; committedMode: string; committedCount: number };
 }
 
 export type ProgressDiagnosticDisposition =
@@ -23,6 +25,13 @@ export type ProgressDiagnosticDisposition =
   | "updated"
   | "ignored-stale"
   | "ignored-operation"
+  /**
+   * 目标步骤已经是终态，而这条事件想把它拉回进行中（重放 / 迟到 / 补发）。
+   *
+   * 单独一类而不是并进 `ignored-stale`：两者的原因不同 —— 序号更新但语义更旧，
+   * 说明**生产方**又发了一遍旧状态，排查时要看的不是游标而是生产侧。
+   */
+  | "ignored-terminal-replay"
   | "rejected-invalid";
 
 export interface ProgressDiagnosticEvent {

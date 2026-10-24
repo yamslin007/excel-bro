@@ -18,6 +18,7 @@ import ctypes
 import platform
 
 MAX_INPUT_BYTES = 2 * 1024 * 1024  # 2MB 上限
+EXECUTION_STARTED_MARKER = "\x1eEB_PYTHON_EXECUTION_STARTED_V1\x1f\n"
 
 
 def _lock_down() -> None:
@@ -87,7 +88,12 @@ def _run_code(code: str, input_payload):
     }
     # 使用 exec 执行模型代码，结果通过约定变量返回：
     # 代码应给 `result` 赋值；若未赋值，则尝试捕获最后一个表达式值。
-    exec(compile(code, "<isolated-python>", "exec"), namespace, namespace)
+    compiled = compile(code, "<isolated-python>", "exec")
+    # 固定控制帧：只在隔离闸已通过且代码编译成功后发出，不携带代码或数据。
+    # 宿主不能把 docker CLI 启动、容器创建或输入写入成功当作这条确认。
+    sys.stderr.write(EXECUTION_STARTED_MARKER)
+    sys.stderr.flush()
+    exec(compiled, namespace, namespace)
     if "result" in namespace:
         return namespace["result"]
     return None

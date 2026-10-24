@@ -1,4 +1,266 @@
+## 2026-10-24：用户 Excel 实机验收反馈
+
+用户在 Python验收-Excel.xlsx 实机确认：双视图对比、放弃变更并恢复、确认变更、确认后撤销均正常。提供的四张截图均显示“已固定 3 个工作表”，本轮未再出现范围丢失。这是用户实机反馈，限定于本次 Excel 场景；不扩展为 WPS 或所有异常交错均已验收，也不据此宣称此前模式切回 auto 的根因已完整复现。
+
+## 2026-10-24：后台扫描不得改写固定工作表选择
+
+Excel 执行/撤销收尾会调用 scan。范围 Hook 的扫描回调改为读取当前模式，避免被旧任务保留的 auto 闭包把后来固定的多表草稿覆盖成活动表。固定选择在目录刷新中原样保留；缺失表仍由准入/目标守卫拒绝，不自动收窄、不自动扩大。WPS 同簿固定模式本就保留选择，本轮不改宿主适配。
+
+新增回归先证明旧扫描回调会收窄勾选，再验证修复；真实 App 覆盖固定三表执行和确认后仍为三表。用户截图中“模式本身变成 auto”的完整实机交错尚未复现，不能把这一处已证明的勾选覆盖缺陷当成全部现场根因。未执行真实窗格验收。
+
+## 2026-10-24：恢复 Excel 执行后双视图窗口排列
+
+执行前值快照副本必须保留窗口桥约定的 EB_ 加 20 位十六进制身份；中文前缀会被 prepare/close 协议拒绝，导致只打开副本而无法并排或自动关闭。现恢复该身份格式，不放宽服务端识别与关闭边界。排列失败通过审阅状态展示具体原因，保留副本清理句柄以及确认/放弃入口，不重放主表写入。WPS 仍使用既有原生 CompareSideBySideWith 路径。
+
+回归覆盖真实 Excel 面板生成种子、桥协议名称、调用排列以及 prepare/arrange 失败提示；双端构建与回归另行记录于 outputs/dual-layout-*。真实 Excel/WPS 窗口排列仍需实机验证，生成文件不能替代并排成功证据。
+
+## 2026-10-24：双视图使用本次修改区域的执行前值快照
+
+Excel 不再为执行后双视图调用整表 capture。执行前仅按计划的动作矩形读取 values、numberFormat、直接格式与行列尺寸；对比画布中动作间的空隙留白，不读取或导出空隙、其他区域或依赖表。副本只写固定值，不导出公式，不复制图表、名称、合并及条件格式效果。画布仍受既有限额约束；无法读取可靠快照仍明确失败。主表执行、回读、确认和恢复链不变。
+
+WPS 保留宿主原生单表副本适配，但本次修改区域按执行前固定值重建，不重新写回公式；clearRange 的执行前对比同样恢复旧值，不再次清空。副本其他区域仅是宿主背景，不作为执行前证据。列宽和无法采集格式等既有宿主限制仍明确提示；不宣称复制整簿或全部复杂对象。两端共享审阅条说明对比范围、公式不重算及对象限制。
+
+Excel 审阅期间的输入框提示改为“等待审阅结果”，其他不可暂停的处理中状态不再误称暂停失效。双端自动化覆盖值快照、公式不重算、原表不重复写入与恢复；Excel 检查区域外数据不进入副本，WPS 检查清空前值。真实双端窗格仍待验。
+
+## 2026-10-24：可选双视图复制限制不再阻止主表执行
+
+Excel captureExcelBeforeResult 曾复用完整副本的 capture 检查；工作簿名称、复杂对象和已有跨表公式导致可选素材采集失败，阻断自动执行。现用显式 ComparisonUnavailableError 区分复制能力限制；仅这类限制保存为不可用结果，写入仍经过既有执行器的授权、来源、恢复快照和回读检查。未知宿主错误、保护、授权与计划错误继续抛出，不作宽泛忽略。点击双视图时明确说明不可用，不伪造不完整副本、不重放执行；确认与放弃仍由已验证回执与恢复点处理。
+
+WPS captureWpsBeforeResult 已将可选对比限制与动作恢复分离，本轮未改其行为。新增 Excel 真实 App/执行器加替身宿主用例覆盖名称、跨表公式、确认不重放、对比失败后撤销、未知读取错误及格式恢复快照失败零写入。替身 getSpecialCellsOrNullObject(Formulas) 现在从真实单元格公式状态返回区域，不再恒为空。
+
+真实 Excel/WPS 窗格仍待验证。本次不认定截图中具体是哪一种复杂对象，也不修改用户工作簿。
+
+## 2026-10-23：续跑计划接入执行后审阅
+
+用户确认当前交互为计划就绪后执行并展示结果，再选择确认变更、放弃变更或双视图；不新增“确认执行 / 取消计划”门槛。本节覆盖此前本轮误提的执行前确认方案。确认变更只清除审阅标记，不重放写入；放弃变更使用既有恢复点。
+
+Excel 首次 appendMessage 会登记自动执行候选，续跑 applyPlanningContinuationResult 只更新消息，导致计划落到旧副本入口。两条路径现共用 enqueueProducedPlan，普通计划与本地规则计划都登记到当前回复段的执行后审阅链；按消息身份去重，加载历史不触发。保留工作簿身份、授权、来源复核、白名单执行、回读和恢复边界。WPS 保持原有自动执行路径，本次误加的批准状态已撤回。
+
+新增 excelWriteEndToEnd 回归：暂停后继续交付计划，无需再次点击执行即可写入并回读，默认不建副本，结果有放弃与双视图入口，确认变更不重复写入。真实 Office.js/WPS 窗格仍待验，自动化仅为真实组件/执行器加替身宿主。
+
+## 2026-10-23：Excel 续跑结果落在当前回复段
+
+真实服务只读记录 turn-4152c91387e24ef19fcbaef4cd7cf1ce 显示 submit_result_plan 已成功，恢复描述为汇总表 A1:G9 的白名单 writeValues 计划；用户反馈最新 Python 结果卡后没有预览入口。Excel applyPlanningContinuationResult 仍把计划写入旧暂停消息，和新回复段的进度分离。现捕获同 turnId 活动段的 persistenceKey，计划/回答落到该段；同任务旧暂停入口退役，历史进度不改写。无匹配活动段才使用原消息。WPS 既有路径在末尾 append 计划预览，本次不改执行器。
+
+测试 messageFirstRouting.test.tsx 新增继续后预览与最新过程卡同属一条消息、仅一个计划的断言。临时退回旧目标消息时用例失败，还原后通过。只读服务事实不等于已验收真实窗格新版本；重新加载后的 Office.js 实机仍待验。没有绕过预览确认，没有改用户工作表。
+
+## 2026-10-23：进度展示语义修订
+
+两端共用 TaskProgressTimeline：有后续段的历史卡标明“本段已结束 · 已接续”；接续段保持接续标题，不再因 awaiting_input 改名为需求分析。普通 awaiting_input 只表示等待下一步操作；已收到 preflight-plan 完成证据时才提示预览已生成、待确认写入。closedByFinish 中的步骤以中断符号展示，真实 warning 保持警告；不修改历史事件或终态。planning.model 明确标作包含工具调用的整体阶段，耗时不可与工具耗时相加，原始事件顺序保持。
+
+Python 同次分析的 analysis_completed 与 pythonResult 在同一个 python.analysis:<run_id> 完成事件内投递；无代码工件的兼容分支仍发送独立结果事件。结果引用、代码正文不进账本的边界不变。旧的持久化重复事件不按标题合并，避免误合并真实的多次分析。暂停详情的 resolved 表示本段已接续，不宣称整个任务或写入已完成。
+
+双端自动化与服务端回归日志：outputs/progress-presentation-*.log。真实 Excel/WPS 窗格尚待验收；仅调整展示和事件身份，不改变写入授权或自动执行策略。
+
+## 2026-10-23：发送与任务控制分离
+
+发送按钮固定为 ↑，空输入/空表单提交不恢复任务。Excel/WPS 共用 TaskExecutionControls，放在输入框上方、表单之外；■ 暂停，暂停请求处理中显示禁用的 …，暂停后 ▶ 由用户另一次点击才恢复。按钮始终 type=button，暂停/继续使用不同 React key，不复用为提交按钮；忽略双击的第二次点击。输入文字的发送与既有语义续跑仍走原意图路径。
+
+本次覆盖旧约定“空输入点发送即可继续”。暂停后的自动核对仍只查询状态；这次调整不新增写入能力、不改变授权和预览确认边界。组件原生 click 用例验证同步渲染时不会连带 form submit 或 resume；双端面板验证空提交无动作、明确 ▶ 才恢复。真实宿主验收尚未执行。
+
+## 2026-10-23：暂停回执归属与历史段计时修订
+
+两端暂停请求增加独立的回执代数：新一轮运行或新一次暂停会使旧回执失效，迟到成功、失败、超时不能覆盖当前输入框提示。Excel 续跑的活动收尾也检查原 controller 的归属；这是防守性保护，不宣称已复现实机交错。
+
+共享 TaskProgressTimeline 的非活动段固定显示结束时的完整计时快照，不再每秒重绘。这修订此前“暂停后历史卡的等待进度应继续增长”的展示约定；底层等待区间仍保留供恢复时累计。冻结显示不代表后台已停止，服务端结论仍由暂停回执和状态查询决定，pauseRequested 只表示请求被接受。
+
+双端回归覆盖输入框/卡片两入口各三轮暂停继续、迟到回执不污染下一轮、8 秒超时及超时后的迟到成功。Excel 新段位置额外比较对应的最新用户消息。服务端经 ASGI HTTP 路由检查重复暂停、清理后 interrupted、active=false 和未知任务 404。
+
+证据：outputs/pause-followup-*.log。真实 Excel/WPS 窗格尚未验收；不把组件替身测试记为实机通过。未扩展写入/回读中途暂停。
+
+## 2026-10-23：继续复用已完成分析，暂停到原任务
+
+同日晚些：暂停/继续的**收尾按归属**再收一处。`resumePlanningTaskFromMessage` 的 `finally` 里，
+`turnAbortRef` 与 `sdkBridge.end()` 原本就按 `ownsTurn` 判，但 `setStatus("idle")` 与续跑并发闸
+是无条件写的 —— 一次被取代的执行只要晚于新一轮收尾，就会把新一轮的运行态按回 idle
+（暂停按钮消失、可中止对象还在）并放掉闸。现统一为：controller / 运行态 / 并发闸 / 桥
+各自只收"自己那一代"；并发闸从布尔改成记持有者（`AbortController | null`）。WPS 侧同口径
+（`settleExecution` 读 `planExecutionTeardown`）。按钮形态由共享判据 `pauseButtonState` /
+`executionPauseState` 决定：**没有可中止对象就不许画 ■**，`…` 表示不可暂停并给原因，▶ 表示
+"已暂停且输入为空"。暂停请求的三种回执分开表达（本端已停止 / 服务端请求已接受 / 未确认），
+`pauseRequested:true` 不等于"已停下"。注意两种既有口径不要当缺陷改：收尾后的"等待进度"
+继续走属于"后台可能仍在执行"的分桶（`finishTimelineAt`），`is-live` 归零也不等于
+`finishActivity` 已生效。真实 Excel / WPS 窗格仍未验收。
+
+同日补修（字段理解阶段）：`/api/turn` 的意图分支、`/api/intent/message` 与兼容 `/api/intent` 在尚未产生规划身份时，将只读模型调用绑定到 HTTP 请求生命周期。`until_disconnected` 在 FastAPI 消费请求体后监听断连，取消并等待调用清理；迟到成功结果不登记决定、不发布。此机制不用于写入或持久规划。共享 `checkIntent` 对响应头及正文等待均响应取消；Excel 字段意图和异步结构读取、WPS 字段意图执行层也显式中断等待，WPS 不把中断步骤补成 completed。卡片与输入框暂停共用原处理入口。
+
+SDK 的 Python 完成回执使用 resultHandle，现与查询回执的 resultRef 一样记录到 after_tool 检查点；恢复初始化继承已完成工具与结果引用，before_model 不再覆盖为空。模型仍是新的调用，接续提示明确优先复用有效引用、只处理剩余目标；引用过期/归属或来源核对不通过仍拒绝复用，不恢复原模型会话，也不绕过预览确认。
+
+两端的恢复游标由 planningReplay.ts 综合同一任务的本地日志/暂停记录/在途游标，不能用服务端最新序号冒充已消费位置。轮询按身份和序号去重；接回进度的本地步骤收到响应即 completed。WPS 在 completed 页不提前以 awaiting_input 收尾；计划校验有独立完成回执。成功取回结果后退役该任务所有旧暂停入口。
+
+POST /api/turn/{turnId}/pause 返回 PlanningPauseAck（turnId、pauseRequested）。它请求取消原规划子任务，保持活跃互斥闸直到清理结束；重复请求不再次取消清理。是否已停下、能否继续仍查询 status。两端输入框暂停均调用此接口，并中断流/轮询/结果校验等待；迟到回包不再提交界面。暂停后的自动状态核对只报告事实，不自动取回或处理完成结果。写入与回读中途暂停仍未开放，本接口不作用于已确认的写入动作。
+
 # Excel Bro 架构文档
+
+## 2026-10-22：执行确认与跨任务回复段修正
+
+本节修订此前“容器即将启动即视为 running”的口径。`docker_worker.py` 仅在隔离闸通过、代码编译成功后，于执行入口向 stderr 发出固定 V1 控制帧；不含正文、数据、路径或密钥。Docker 适配器通过有界收集器识别完整首帧，并只触发一次 `on_runner_start`。创建 CLI 进程、写入 stdin 或容器启动尝试均不代表代码已执行。控制帧不进入模型、账本或工作簿。旧不可变镜像无首帧时，只能在合法成功回包后确认执行；失败/取消且无确认时不附加 executedVersion，双端显示“未确认执行”。使用实时确认需要重建隔离镜像并按既有验证流程更新不可变摘要，不能改用可变 tag 或绕过隔离检查。
+
+内部 Python 工具回执新增封闭组合 cancelled/cancelled、cancelled/authorization_changed，沿既有投影白名单产生固定文案，不发布取消后的结果。取消与执行失败分开；没有确认的失败落 not_started，HTTP/SSE 字段未增加，两端与 models.py 的语义注释同步。
+
+回复段接链与活动身份切换分别处理：继续已 superseded/closed 的父段也补 nextSegmentId，保留父段状态、日志与耗时；其它任务不接入这条链。Excel/WPS 仍共用 openReplySegment。WPS 的 updateActivity/endActivity 通过 updateWpsActivityMessage 统一写回，冻结段在归并/收尾前被拒绝，活动段还校验传入任务身份。
+
+## 2026-10-21：暂停 / 继续的步骤身份、终态与只读补发（Excel 与 WPS 同口径）
+
+**问题不是文案，是四层各写一套。** 事件状态在 `wpsProgressFromTaskEvent` 里被丢掉、
+活动日志靠"下一步出现"猜上一步完成、桥/隔离分析/文件夹执行三条生产入口只发
+`started + progress` 从不发终态、恢复时只修最后一行的计时 —— 合起来就是"过程卡
+永远停在进行中"、"继续之后编号重来"、"已完成步骤又被拉回运行态"。
+
+### 一、事件与步骤身份
+
+- **完整保留结构化状态**：`wpsProgressFromTaskEvent` / Excel 的 `applyProgressEvent`
+  一律把事件自己的 `status` 交给共享层，不再由本地按"有没有下一步"推断。
+- **三层身份**：`operationId`（任务 / 桥调用）、`stepId`（步骤）、`requestId`（继续
+  动作幂等键）。桥的步骤 id 是 `bridge.{tool}:{operationId 前 12 位}`
+  （`agent_tool_bridge.py` 的 `bridge_step_id`），隔离分析的终局步骤是
+  `python.completed:{py_xxxx}` —— **同工具连续两次调用是两个步骤，同一次调用的重放
+  仍是同一个步骤**（序号只前进）。分隔符只能用 `:`：`models.py` 的
+  `^[A-Za-z0-9_.:-]+$` 会拒 `#`。
+- **终态必须真发**：桥（`completed` / `failed` / `cancelled` / 超时）、隔离分析
+  （每次执行一条自己的终局）、文件夹执行（`folder.prepare-files`、各拆分表的
+  `.sheets`、`folder.resume.publish`）全部补齐"这一步结束了"。执行异常时先把
+  **被打断的那一步**关成 `failed`（标题"这一步没有完成"），再报整体
+  `folder.failed` —— 顺序反过来，前端就只能靠猜。
+- **父子阶段**：模型规划里覆盖多个子工具的阶段由阶段自己的事件宣告完成，不靠
+  "出现下一步"假装完成。
+
+### 二、暂停与继续
+
+- **三条入口、两个落点**：点按钮 / 空输入点发送 → 直接进暂停卡；输入框里打
+  「继续」「接着做」→ **仍先走意图理解**（`understandMessage` → `kind:
+  task_recovery`），再落到同一条 `resumePlanningFromPause`。本地不写关键词分类：
+  那是语义判断，归模型。
+- **继续 = 新开一个回复段，不是改旧卡**：同一任务仍然只有一个有效执行实例
+  （`operationId` / `stepId` / `eventSequence` / 结果引用 / 写入回执全部不变），
+  但展示上**允许多个历史回复段**。继续后必须在这条用户消息之后**立刻**出现新的
+  助手回复段（`openReplySegment` 把旧段降为 `superseded` 并接 `nextSegmentId`），
+  旧段保留它停止时的状态，并提供「查看后续进展」的轻量定位入口。
+  **旧约定「永远接回原来那张过程卡」已作废**：它把「恢复正确」寄托在"界面上只有
+  一张卡"上，于是同一任务的历史被反复改写，用户也分不清哪条反馈是最新的。
+- 段身份是一条独立的展示身份（`ReplySegment`：`id` / `taskId` / `status` /
+  `previousSegmentId` / `nextSegmentId` / `continuesTask`），判据只有一份：
+  `packages/core/src/replySegments.ts`。四条不许破的约束：
+  1. **多段但只有一个活动段**（`segmentAcceptsProgress` 只认活动段，任务相同的
+     旧段也不接受进度）；
+  2. **先更新共享任务状态，再投影到段**（段切换不改步骤身份、事件游标、结果引用、
+     写入回执）；
+  3. **旧订阅抢不回活动段**（继续时把旧段冻结，迟到事件只进权威记录）；
+  4. **历史段保留当时状态**，迟到结果在最新段里说明，不回头改写旧段。
+- **段身份 = 承载它的消息 id**：`previousSegmentId` / `nextSegmentId` 与消息 id
+  同一个键，否则「查看后续进展」要在两套身份之间翻译。
+- 继续时**不继承上一段时间线**（`previousLog: null`）：带过来就等于把两段合成一段，
+  新段会从第 1 步重复展示旧步骤。上一段完成了几步只用于一句文案，不复用时间线。
+- **三条路径**：
+  1. 原任务 `running` → **只读补发**（见下）接回事件流，不重发需求；
+  2. `completed` → 取回 `result` 走同一条 `applyTurnResult` / 首条结果处理链；
+  3. 有检查点 → 带 `expectedRevision` / `requestId` / `afterSequence` 继续。
+- **重复点击合并**：`resumingPauseRef`（WPS）/ `planningResumeInFlightRef`（Excel）
+  是**同步**闸，同一帧内两次点击只产生一次恢复；超时重试沿用同一个 `requestId`。
+- **没有检查点的阶段**如实说不能继续，不假装重试成功。
+
+### 三、只读补发端点
+
+`GET /api/turn/{turn_id}/events?afterSequence=N` → `{turnId, status, active,
+lastSequence, events}`。**不调模型、不写账本、不创建任务**。未知任务 404
+`PLANNING_TASK_NOT_FOUND`，负数 422。这条通道存在的唯一理由：原任务在跑时
+「继续」会被 409 挡住（再发一次就是重复规划、重复读表），但用户按下继续之后
+什么都不发生同样是错的。两端轮询口径一致：`1200ms` 间隔、`90s` 上限，超限
+如实说"仍在运行"，**不重发需求**。
+
+### 四、计时与状态口径
+
+- 步骤自己的终态 ≠ 活动级 `outcome`：`finishTimeline` 的第 7 参
+  `currentStatus` 由调用方给 —— "带着待确认结果收尾"的活动里，这一步可能真做完了。
+- `closedByFinish`：只记**被结束活动关掉、且没有结论**（`warning`）的步骤。恢复时
+  只重开它们；`completed` / `failed` / `cancelled` 一律原样保留（"已结束的步骤不得
+  被迟到的进行中事件重新激活"）。`closedByFinish` **缺省**（老日志）时才退回按
+  `warning` 猜 —— 写成 `?? []` 会让"新日志明确为空"和"老日志没这字段"混成一件事。
+- 恢复时**每一行**按自己已累计的耗时重新定点（`startedAt = now - 已累计`），不是只修
+  最后一行。暂停时间 / 断线等待时间与真正执行时间分桶记（`timelineDurations`），
+  后台仍在执行的那段不许算成暂停。
+- 判据只有一份：`packages/core/src/activityTimeline.ts`。两端只按引用转发，
+  变异证据见 `scripts/run_activity_resume_mutations.mjs`（T1–T6）。
+
+## 2026-10-18：WPS 边框闭环
+
+`setBorders` 在准备阶段按明确 A1 区域展开为单格外沿，内部线条归上/左单元格；物理边界键发现跨动作相邻侧归属冲突时整体拒绝。白名单、操作数/单元格限额及授权继续生效，保存工具保留原始计划而非展开后的内部动作。
+
+边框本地快照含 LineStyle / Weight / Color / 颜色来源模式 / ThemeColor / TintAndShade；四个属性为 borderTop / borderBottom / borderLeft / borderRight。执行前必需字段读不到即拒绝；写后逐边回读；撤销仅恢复声明的边界并复核，主题色/自动色按模式恢复。协议同步 contracts.ts、models.py 与服务端校验，只传属性名与指纹，不传边框快照或单元格值。部分写入失败仍保留恢复记录。
+
+审阅标记由共享 `reviewMarkStyleForPlan` 按区域重叠决定：边框动作使用底色，填充动作使用边框，同时修改二者则不覆盖实际格式。Excel/WPS 共用判据。原有用户条件格式不会因本轮被删除；显示优先级仍须真实宿主核对。
+
+这是开发实现和自动化证据，不代表 WPS 任意版本均支持所有边框成员。缺少颜色来源或属性回读的版本写前拒绝；真实宿主验收见 DEVELOPMENT.md。
+
+
+## 2026-10-18：WPS 范围能力扩展（仍未全量补齐）
+
+WPS 新增填充、数字格式、垂直对齐、写表、复制子集与 computeValues。共用 writeTableValues/表头配色保持 Excel 既有命名区域起点能力；WPS 使用显式 A1 布局。复制纯函数 copyRangePlan 仅生成白名单动作，来源从当前授权的本机范围读取，不调用模型。WPS 的执行计划在准备期展开，恢复账本登记每个真实效果，confirm 不重复执行。
+
+originalPlan 仅保存复合操作语义供工具复用，与展开后的执行计划同时纳入不可变校验；保存动态复制时不固化当次值。copyTypes 与 actionExpansion 进入能力配置，恢复协议仍只接受实际原语；客户端新增 fillColor/fillPattern/numberFormat 格式字段，server/models 与 main 白名单同步。填充和字体使用 WPS OLE RGB（红色位于低字节）；修正原字体转换红蓝颠倒。
+
+新增格式字段逐格采集；含未知目标字段写前拒绝。撤销只恢复声明字段，执行前副本也只恢复本次改动字段，避免无关 NumberFormat 被重写。copyRange 当前限 values/link，可条件选行、转置、跳过空白；不支持任意前序数据写入后依赖变化的同计划复制，也不伪装支持相对公式或完整格式复制。
+
+computeValues 在 WPS 准备期通过既有本地 query_table 求值，展开 writeValues + 可选表头 setFont/setFill。必须是计划首个动作，来源和既有目标均在本次授权范围；值、公式及归一依赖的数字格式/显示文本都保留本机证据并在首次写入前重新核对。条件复制/清空同样保留源区域证据，缺少唯一表头字段不当成零命中。原始计算计划保留供工具复用，不能固定旧结果。
+
+WPS 检查点异步返回后再次检查目标内容/格式及可编辑状态；新增恢复字段 verticalAlignment 同步客户端协议、server/models 与 main 属性闸。Excel 条件复制共用 copyRangePlan，逐实际写入片段采集恢复点、生成动态回读判据；跳过空白格不写不恢复。无条件复制仍沿既有宿主原语，本轮不宣称补齐它的所有恢复限制。
+
+格式与值的恢复记录在首个宿主写操作前建立；中途异常只归属实际尝试过的动作。重叠格式动作在自身同步写入后刷新前序动作的最终快照，保留部分成功的恢复证据；异步等待期间出现人工改动时不把它吸收进本次写后快照，后续动作和撤销均拒绝覆盖。目标格式回读缺失不能当作有效写后证据。
+
+deleteWorksheet、排序/筛选/去重、结构与对象操作仍未实现，详见 [能力差距表](HOST_ACTION_CAPABILITY_GAP_2026-10-14.md)。本批新增能力的真实宿主验收未执行。受控 JS 与文件夹执行保持既有边界。
+
+
+## 2026-10-18：SDK 连接配置收口（第二批）
+
+Excel/WPS 使用同一连接管理 Hook 与协议控件。托管连接新增 `protocol`（`openai_compatible` / `anthropic`），旧文件缺字段按 OpenAI 兼容处理；编辑请求省略字段时保留旧协议、空密钥保留原密钥。显式 Anthropic 地址按供应商配置原样使用，不猜测自定义网关地址。DeepSeek 官方 OpenAI 地址仍沿已有受控映射，模型与密钥不变。
+
+模型目录和设置返回 `agentAvailable`、`agentUnavailableReason`、`formulaAvailable`。`available` 仍表示连接已配置，不等于 SDK 协议可用，更不等于实测连通。Agent 可用性核对协议、密钥、仓库外运行目录；目录不会联网探测。双端菜单、共享选择器和恢复候选排除明确不可用的 Agent 连接。已有不兼容选择保留在本地，但显示为需要选择兼容连接，不静默切换供应商。原 `claude-agent-sdk:<连接ID>` 仍可解析，前端迁移到同一 `connection:<连接ID>`，目录不重复展示。
+
+连接测试新增明确用途：`POST /api/settings/model/connections/test` 接收 `purpose`，返回 `testedFor`。SDK Agent 测试通过真实 SDK 注册唯一 `connection_probe` MCP 工具，必须收到正确随机令牌的回执；只有文本 OK 不算通过。没有表格、文件、网络或命令工具，不发送工作簿数据；仍禁用 SDK 会话持久化。独立公式测试仅走 OpenAI 接口，不能用于验证 SDK；旧客户端省略 purpose 时保留公式测试语义，新客户端拒绝用途不匹配或缺少 testedFor 的成功回执。修改协议/用途/内容后，旧测试立即失效。限额在 `modelConnectionTest`（60 秒 / 3 轮）；密钥缺失在启动 SDK 前拒绝，不借用缓存登录。
+
+独立公式只能选择 OpenAI 兼容连接；它与表格 Agent 的 SDK 编排分开。两端均已接线，工作簿/文件夹共用同一服务配置，不新增宿主操作能力。协议同步 `contracts.ts` 与 `models.py`。SDK 持久会话、原生检查点恢复、旧循环模块物理拆分尚未实施，不能把本轮连接收口当成这些能力已完成。
+
+
+## 2026-10-18：Agent 唯一入口与结构化本地工具
+
+当前生产入口为：消息 → SDK 理解/澄清 → SDK 工具规划 → 授权本地工具/隔离 Python → 受控结果与 AnalysisPlan → 双端既有执行、回读、结果审阅、恢复。所有自然语言需求进入 SDK，确定性工具不在模型前截断需求。三个阶段目前仍是独立 SDK 调用，共用结构化任务上下文；不等于已实现持久 SDK 会话。
+
+`agent_runtime.sdk_agent_connection` 是连接适配的唯一判据。显式 SDK 连接直接使用；既有 DeepSeek 官方 OpenAI 端点按已验证映射转换，模型、凭据和视觉标志不变。未知网关明确返回 `MODEL_NOT_AVAILABLE`，不拼接猜测 `/anthropic` 地址、不回退普通模型、不换供应商。普通传输仍用于独立公式与连接测试，不再是表格 Agent 路线。
+
+`planner.create_plan` 不再调用 `run_excel_agent`，`intent.check_intent` 不再提前解析自然语言删表。旧 `excel_agent.py` 暂留共享工具实现、提示与历史循环测试，生产规划入口没有调用旧循环；模块尚未完成物理拆分。旧检查点不能当作 SDK 会话继续，明确拒绝而不重新执行。
+
+新增 `plan_tools.py`：
+
+- `plan_delete_other_worksheets(keepSheets[])`：只对当前授权的单个文件生成删表计划；多个保留表为数组，名称在授权元数据内唯一解析；不同文件同名表、未授权名称、无变化均返回明确错误。
+- `plan_range_edit(sheet, range, operation, value)`：按结构化参数生成写值、公式、清空内容计划；保留字面常量类型，拒绝公式冒充常量、无效区域与超限矩阵。字面写入限额来自 `agentPlanTools.maxLiteralCells`。
+
+这些工具不读值、不写工作簿，只输出白名单计划；按真实宿主能力目录裁剪工具及操作参数，提交再次校验。WPS 未支持的删表没有被放开。批量文件、复杂数据加工继续使用既有工具，不能靠本工具猜测跨文件目标。
+
+澄清是 Agent 通用决策能力：需要关联键、重复项处理、覆盖目标等决定时使用已有澄清协议；保留原需求和用户回答。答案不扩大授权，范围变化仍走数据范围入口。SDK 意图上下文新增上一轮结构化意图、结果标题/表头/来源、工具失败的允许字段，不发送结果行、原始行或宿主错误全文。
+
+两端共用 `modelSelection.ts`：所有有效 Agent 连接走结构-only 规划与 SSE 工具投递，不再根据 ID 前缀选择本地预计算。服务端把旧调用的读策略收窄为 `none`，仅投影元数据；任意 `dataResults` 仍拒绝，计算值须经受控工具桥及有归属结果引用。SSE 缺失时明确失败，不回退到无法投递工具的请求。
+
+SDK 已列入基础依赖，`npm run dev:server` 统一启动 Windows 单进程、无热重载服务，使用仓库外 SDK 目录。未新增 HTTP DTO；`contracts.ts` 与 `models.py` 沿用已有协议。本轮不改结果审阅与宿主恢复算法。历史段落中的“两后端”以本节为当前状态。
+
+## 2026-10-18：限定工作表范围的受控 JS
+
+用户明确授权脚本操作本次勾选的多张工作表；未授权宿主文件、网络、进程或其他工作簿访问。当前实现为 `packages/core/src/controlledScript.ts` 的 **JS 子集解释器 → 白名单 AnalysisPlan**，不是原生 VBA / 宏 / 任意 JS 运行器。Acorn 仅解析语法树；解释器没有 `eval`、动态函数、宿主对象或全局对象，也没有任意方法调用。脚本不读取单元格或调用模型，唯一输出接口为 `emit(action)`。
+
+支持 `const`、有限数组的 `for…of`、`if`、数组/对象、基本运算和自身属性读取；`authorizedSheets` 为当前勾选的表名列表。当前动作集是写常量、清空内容、字体、对齐、行高。公式、跨表读取、列宽与结构动作尚未开放给脚本；写值拒绝公式前缀，不能通过公式访问未勾选表。源码、步数、嵌套、动作数、目标格数和输出大小受 `config/capabilities.json.controlledScript` 限制。
+
+共享 `ControlledScriptEditor` 接在 Excel 计划编辑器、WPS 工具模板/计划编辑器。生成只替换 JSON 草稿，丢弃旧结果引用和验收结论；不写入工作簿、不创建恢复点。保存沿原校验路径，执行前仍由各端执行器复核当前工作簿与授权。原生宏无法提供“只能访问勾选工作表”的权限隔离，本轮不调用 `Application.Run`、不修改宏安全设置、不注入 VBProject；这些能力为**未实现**，不能写成已开放。
+
+WPS 的执行前快照现在按每个动作的授权表采集，允许多张勾选表执行与撤销；可选双视图仍只支持单张写入表，多表点击对比时明确拒绝，不影响已执行结果与撤销。Excel 文件夹执行沿既有白名单计划路径，未新增文件夹脚本运行器；WPS 工作目录脚本入口未开放。当前证据是解释器、UI 接线与有状态宿主替身执行/撤销测试；真实 Excel/WPS 的脚本操作仍待验收。SDK 尚未新增自主编写/运行脚本工具，不把手动编辑入口当成 SDK 脚本闭环。
+
+## 2026-10-17：隔离分析完整性与结果尺寸回执
+
+当前审阅顺序以用户最新授权为准：主表执行一次并回读、标记结果，可选双视图展示执行前状态，确认只清标记、放弃真实恢复。下文早期“先复制再写回”为历史方案。
+
+普通后端与 SDK 共用 `python_analysis_tool_definition`，要求分析代码在过滤/去重/关联前保留用户要求的异常及来源行位置，输出汇总、总计和明细；这属于模型行为指导，不是确定性业务完整性证明。
+
+`project_python_analysis_receipt` 现在从可信协调器的 `resultCard` 提取 `resultShape: {rowCount, columnCount}` 给模型。仅成功状态、结果引用匹配且尺寸为正整数时投影，禁止布尔值或字符串尺寸；不透传卡片、表头、值、来源名或任意自由文本。旧回执无卡片时不猜尺寸。模型据此计算目标区域；业务列名已经位于矩阵首行时使用 `includeHeader=false`，不为猜测范围补空行。
+
+这是后端模型工具回执的内部结构，不新增前后端 HTTP/SSE 字段，`contracts.ts` / `models.py` 无协议改动。隐私测试在 `test_python_result_shape.py`，普通后端与 SDK 仍走相同投影入口。通道成功与业务事实验收分开记录，见 [主线状态](SDK_CAPABILITY_ASSESSMENT_2026-10-09.md)。
 
 ## 2026-10-10：双端在线连续集成 + 两后端终局结果工具共用（最新）
 
@@ -476,8 +738,12 @@ SDK 没有工作簿句柄，也不能直接执行写入。原有文件夹模式�
 
 > **口径**：表格里写的是"**当前接入**未实现检查点恢复"，说的是**这次接入方式**
 > （CLI 子进程托管对话状态、服务端读不到现场）这一事实，**不是**对 Claude Agent SDK
-> 本身能力的推断。SDK 是否提供别的会话/恢复机制属于**未核实**，文档不得写成
-> "SDK 永远不支持检查点"；将来换接入方式或补做现场托管时，改这张表而不是改历史结论。
+> 本身能力的推断。2026-10-19 已核实当前安装的 `claude-agent-sdk 0.2.159` **确实提供**
+> `resume` / `session_id` / `fork_session` / `resume_session_at` / `resume_drops_turn`
+> 与 `get_session_messages`，也支持 `session_store` 镜像；当前适配器仍显式使用
+> `--no-session-persistence`（`server/app/claude_sdk_agent.py`），因此**产品侧仍未接入**
+> 会话恢复。是否启用取决于转录中会落入哪些内容的隐私评审，不能把"SDK 有接口"当成
+> "现在可以打开"。将来换接入方式时改这张表，而不是改历史结论。
 
 `planner.py` 在分发到 SDK **之前**检查 `resume_checkpoint`：
 
@@ -1195,11 +1461,15 @@ manifest revision、生命周期、路径边界和写前/写后文件指纹。
   确认内容一起重新发出，**不让用户重复回答同一个问题**。「取消任务」是终态
   （`resumability: unavailable`），无论怎样重开都不会再被自动恢复。
 - **Excel**：`useScopeSelection` 把**草稿**与**已提交授权**分开，新增
-  `committedSheetNames` / `scopeDraftDirty` / `confirmScopeSelection()` /
-  `cancelScopeEdit()`。勾选、取消勾选、全选/清空只改草稿；「确认范围」才提交，
+  `committedSheetNames` / `committedScopeMode` / `scopeDraftDirty` /
+  `confirmScopeSelection()` / `commitAuthorizedScope()` / `cancelScopeEdit()`。
+  勾选、取消勾选、全选/清空只改草稿；「确认范围」才提交，
   且**提交时按当前真实工作簿清单复核**草稿（弹层开了很久时，已经删掉的表不会被
   提交成授权）。「取消范围编辑」把草稿放回已提交授权，一字不改 —— 用户点开只是
   想看一眼别的表时，不该把正在等待回答的任务打掉。
+  「范围」包含**口径**（跟随当前 / 固定多表）：`committedScopeMode` 与
+  `committedSheetNames` 同批写、同批退，守卫只读已提交口径；口径差异也算草稿差异
+  （见文末 2026-10-19（五续））。
 - **WPS 范围面板**（`WpsProbePanel.tsx`）同样改成草稿/已提交两态：勾选只改草稿，
   底部动作是「确认范围」与「放弃修改」（面板重开时草稿回到已提交范围）。
   授权版本只在**已提交范围**真正变化时递增。
@@ -1519,3 +1789,644 @@ Claude 初版新增 `pythonResult` 回调，但 HTTP 事件组装、双端共用
 
 最短实机核对：在专用测试工作簿生成副本，分别点“放弃变更”和确认写回；确认只关闭副本、原表保持打开且无原表保存提示，写回后仍可撤销。兼容副本中另改一格后放弃，打开卡片列出的恢复文件核对该修改仍在。另存副本后再放弃应保留已另存的工作簿。归档目录不可写时应保留副本并报告未关闭。
 
+
+## 2026-10-18：WPS 排序（sortRange）的语义与守卫
+
+**分层**：顺序语义放共享层 `packages/core/src/tableTransforms.ts`（纯函数，无宿主依赖）；
+宿主读写与影响面核对放 WPS 适配层 `apps/wps-addin/src/wpsPlanExecutor.ts`
+（`prepareSortRangeAction` / `assertSortableRange`）。两端读同一份 `sortedMatrix`，
+避免"同一份计划在 Excel 与 WPS 排出不同顺序"。
+
+**执行模型**：排序**不是**新增一条宿主调用，而是把它折算成"目标矩阵 = 当前值的稳定重排"，
+复用既有的值写入、回读、恢复点与撤销链路：
+
+1. `prepare`：读该区域的值/公式 → 跑守卫 → 用 `sortedMatrix` 算出目标矩阵 → 记入
+   `WpsPreparedAction.values`，恢复基线仍来自同一次读取的 `beforeValues`/`beforeFingerprint`。
+2. `execute`：沿用值动作的写前复核（区域指纹必须仍等于预览时）、分块写入、逐块回读，
+   最终整块回读必须与目标矩阵**逐格相等**才算通过。
+3. 恢复点：`beforeValues`/`beforeFormulas` 是整块写前现场；撤销按属性/整块写回，
+   冲突判定用 `afterFingerprint`。执行后用户又改过区域 ⇒ 撤销直接报冲突，不覆盖。
+
+**为什么必须守卫**（写入前拒绝，不静默丢内容/格式）：
+
+| 场景 | 后果 | 处理 |
+|---|---|---|
+| 区域含公式 | 重排会改变相对引用的指向（`=B2*2` 搬到第 5 行仍指 B2） | 拒绝，并说明"请先转成值或缩小区域" |
+| 数据行内容级格式不一致（字体/填充/数字格式/对齐/换行） | 只重排值会让格式与数据脱钩 | 拒绝；边框与行高属于网格/物理行属性，本就不随行移动，不计入 |
+| 与表格对象（ListObject）重叠 | 破坏表头、汇总行与结构化引用 | 拒绝 |
+| 宿主没有 `ListObjects` | 无法证明"不在表格里" | **按"无法确认"拒绝**，不当作"没有表格对象" |
+| 区域只有表头 | 没有可排序的数据行 | 拒绝 |
+
+**空白语义**：空白（`null` / `undefined` / 空串）在排序中**永远排最后**，与升/降序无关；
+这一条在比较器里先于方向翻转处理，否则降序会把空行顶到第一屏。
+
+**审阅与标记**：排序走值动作路径，双栏对照与临时标记读的是真实的写前/写后矩阵，
+不伪造逐格差异；范围与变更摘要由既有 `wpsActionChangeReview` 给出。
+
+**去重（removeDuplicates）为什么不在这批**：它是**删除整行并把下方数据上移**的结构变更，
+恢复必须先经实机验证 `EntireRow.Insert` 与整块还原。共享层的判据
+（`duplicateRowPartition` / `deduplicatedMatrix`）已实现并有测试，但执行入口**不开放**，
+`prepareWpsPlan` 明确拒绝并说明原因；不用"压实值后清空尾行"冒充去重。
+
+
+## 2026-10-19：纯删表计划与完整本地检查点
+
+用户选择的恢复语义为：**打开执行前恢复副本，保留当前原表及后来编辑**。因此这条路径不使用旧的单元格快照重建被删除工作表，也不执行原地整簿覆盖。
+
+- SDK 通过现有 `plan_delete_other_worksheets` 做语义规划；共享 `worksheetDeletion.ts` 只识别已生成的纯 `deleteWorksheet` 白名单计划，不按用户文本另建快捷分支。名称不明确仍走现有澄清。
+- Excel `runPlan` 与 WPS `executeStructuralDeletion` 在执行前重新核对身份、勾选范围及异步检查前后的一致性。新生成的纯删表计划按已授权的直接执行流程进入固定本地适配器；混合删表计划不落入旧范围恢复路径。文件夹模式仍用原来的文件夹执行/备份链路。
+- `POST /api/worksheet-checkpoints/{execute,confirm-backup,status,open}` 只接受回环调用、明确允许的加载项 Origin、JSON 和严格模型。`execute` 在无需补充备份许可时执行删除；`confirm-backup` 仅续行已绑定计划；`status` 不写宿主；`open` 只打开新的恢复副本。生成计划不等于运行任意代码。
+- 固定原生适配器 `worksheet_checkpoint.py` 附着已经打开的工作簿，保留同一 Workbook/Worksheet 对象核对并调用。Excel 用已验证窗口取得对象；WPS 需 `ket.Application` COM 和前端提供的 Hwnd 一致。没有 `Application.Run`、宏、生成脚本或宿主 Python 回退。
+- 完整归档会包含所有工作表。若存在未勾选/隐藏表，先返回 `needs_backup_consent` 和确切表名，不备份、不删除；用户可授予仅本地备份许可，不改变分析/删除授权范围。当前仅支持本机已保存、可写、未保护结构的 `.xlsx`，至少保留一个可见工作表。云 URL、未保存簿、XLS/XLSM、图表表及混合修改计划均拒绝。
+- `SaveCopyAs` 将含当前未保存编辑的工作簿保存到应用数据目录 `worksheet-checkpoints/<operationId>/before.xlsx`，不保存原文件。校验 ZIP、大小/条目限制、完整表名顺序、SHA256 并持久登记后才能首删。容量限制来自 `worksheetCheckpoint` 配置。
+- 删除期间暂时关闭宿主事件及提示，并在 finally 恢复；按保留的 Worksheet 对象删除，逐项核对剩余表名。未完成/回执不明为 `partial_or_unknown`，不自动续删。相同 operationId 只查已有结果；本机线程锁和 OS 文件锁防止多个服务进程并行执行/误认在途状态。
+- 恢复先复核原始归档哈希，再复制出新的 `recovered-<随机值>.xlsx` 并打开，关闭链接更新和宏/事件，随后恢复应用设置。不调用原表的 Save、Close、Quit，不覆盖当前原表，不把恢复文件当临时文件自动删除。当前需原表仍打开以定位同一宿主实例。
+- 前端刷新只按**本机保存的归属**查询状态（见下文「检查点的归属」）；不会重放删除。成功回执必须含合法结果及可用恢复副本才能显示完成。恢复不是原地撤销；删除可能影响剩余表中的跨表公式，不能声称剩余表计算结果不变。
+
+配置分工：WPS `wpsWrite.allowedActions` 仍是范围执行器白名单；`worksheetCheckpoint.allowedActions` 仅 `deleteWorksheet`，属于固定原生适配器。规划能力取二者并集，不能把删表塞进范围执行器。另补齐已有 `sortRange` 的服务端/TS 恢复登记类型，仍按值指纹校验、不接收格式证据或原始矩阵。
+
+证据层级：新增自动化覆盖真实面板路由、完整归档及部分失败状态模拟；实际 Excel/WPS 的 COM 接口可用性和恢复打开效果尚待实机验收，不能以 `supported` 或构建成功替代实机证据。
+
+
+### 2026-10-19：隐藏表导致“已全选却无法删表”的修复
+
+实机只读元数据证据：`评分表.xlsx` 有 8 张可见表，以及非常隐藏的 `#EB_RULES` / `#EB_RULES_BACKUP`；范围面板过滤后只列出 8 张。两次失败检查点的 authorizedSheets 均为 Sheet1–Sheet8，deletedSheets 为空、recoveryAvailable=false。服务端却要求全簿 10 张表授权，造成无法从面板满足的条件；没有据此判定 WPS Delete 接口不可用。
+
+- 不按保留名称豁免权限，不把隐藏表自动加入模型/删除范围。服务端只读表名等元数据，说明缺少的备份许可。用户点击“允许仅本地备份并继续”后才 SaveCopyAs；“暂不删除”不续行。
+- `confirm-backup` 只收 operationId 与确切 backupSheets，复用持久化的原计划/原授权/原文件；不接受客户端替换动作或授权。额外许可在本地检查点记录中留证，备份内容不上传模型。
+- 等待期间整个工作表名顺序必须不变，备份许可必须与当时缺少的名称完全一致；原来选中的删除目标仍只能来自 authorizedSheets。异步许可前两端重新校验当前宿主、授权与会话。查询或重新加载不恢复写权限，也不自动续删。
+- 共享卡片将等待许可显示为决策状态；没有恢复文件的旧失败记录折叠展示。清理 UI 不删除恢复记录。新的确认接口沿用回环/Origin/严格 JSON 模型限制与线程、进程双锁。
+- 本轮未在业务工作簿执行备份或删除；自动化不能替代真实宿主删除验收。
+
+
+## 2026-10-19：检查点的归属、消息内结果卡与恢复入口
+
+**问题**：检查点按宿主级 `operationId` 列表加载，没有会话、工作簿与原请求的绑定；两端又在**全部聊天消息之后**统一渲染这份列表。于是删除完成卡、失败记录与暂缓请求长期贴在聊天底部，换会话/换工作簿/刷新都清不掉。
+
+**归属（唯一来源：`packages/core/src/worksheetCheckpoint.ts`）**
+
+- 每条操作在**发起那一刻**绑定 `{ operationId, conversationId, workbookIdentity, requestMessageId }`，先落盘再派发。落盘顺序是"响应丢失也不重复删除"与"刷新后回挂原消息"的共同前提。
+- 结果卡按 `requestMessageId + conversationId` 渲染在**对应请求消息**内；不再有会话末尾的统一列表。切换会话不会把回执写到新会话，刷新也不会让旧记录重新冒泡。
+- 水合只查询**当前会话 + 当前工作簿**的绑定，且同一 `operationId` 每次挂载最多查一次；`execute` 在同一次挂载内按 `conversationId:planId` 去重。两者合起来保证"刷新只查状态、不重放删除、不重复出卡"。
+- 旧版只存 `operationId` 的记录解析为**归属未知**：不归属当前会话、不被当前工作簿认领；恢复能力保留在「备份与恢复」里，按服务端保存的请求元数据（工作簿路径 + host）列出。
+
+**展示**
+
+- 复用 `ExecutionResultCard` 与 `.execution-recovery-footer` 按钮样式：完成只报「已删除 N 张工作表」，删除清单/剩余表/诊断默认折叠（`ExecutionResultDetails`）。
+- 恢复入口的按钮文案与普通结果卡逐字一致（「↶ 撤销本次执行」），旁边说明「打开执行前副本，当前原表保留」。打开后只追加一句「已打开恢复副本。」，不写"已撤销/已还原"，不调用单元格撤销算法，不新增执行过程卡。
+  > 2026-10-19（三续）起口径变更：这颗按钮改成**在原工作簿原地撤销**，说明句换成「在原工作簿撤回本次删除，保留后续编辑」；"打开执行前副本"只留在「备份与恢复」。见下文「删表撤销改为原地撤销」。
+- 备份授权仍在原请求处展示；`confirm-backup` 只接受当时的确切表名，且重授权不改变分析/删除范围，也不恢复已结束的授权现场。
+- 「备份与恢复」抽屉新增「工作表删除恢复点」区段（Excel `FolderBackupManager` 注入、WPS 备份抽屉直接渲染），只读列表 + 打开副本。
+
+**协议**
+
+- `WorksheetDeleteCheckpointRequest` 新增可选 `conversationId` / `requestMessageId`（缺失即"归属未知"，旧记录仍可读）。
+- 新增 `POST /api/worksheet-checkpoints/list`：`{ workbookPath, host }` → `{ checkpoints: WorksheetCheckpointSummary[] }`。服务端按 `canonical_path` 归一后匹配**同一工作簿**、同一 `host`、同一 `Origin`，记录 `createdAt` 与计划标题；损坏记录跳过而不影响其余记录。列表只读，写入锁被占用时退化为不落盘的读取。
+
+
+## 2026-10-19（续）：删表撤销入口与"旧计划退役不得吃掉回执"
+
+**现象**：Excel 删除成功后撤销入口消失，聊天里只剩「原目标计划：…（目标已重新授权，需重新生成预览）」；WPS 删除成功显示的是「打开执行前恢复副本」，与普通写入结果卡的「↶ 撤销本次执行」不是同一个名字。
+
+**Excel 的真实根因**（不是样式，也不是归属丢失）：删表让已授权工作表变少 ⇒ 下一轮目标守卫判 `scope_changed` ⇒ 用户按提示在弹层重新确认范围 ⇒ `adopt()` 对**所有**会话消息执行 `retireTargetMessage`（`plan: undefined`）。而结果卡的渲染当时挂在 `message.plan && isWorksheetDeletion(message.plan)` 上，于是"计划预览退役"连带把已完成执行回执藏掉了。检查点绑定、`operationId`、`recoveryAvailable` 与应用层授权过滤都没有参与这个消失过程；`requestMessageId` 也一直有效。
+
+**判据**：`requestMessageId` 是回执的唯一归属。结果卡的渲染**只读** `entryForMessage(message.id, conversationId)`，不再以 `message.plan` 为前提。这样：
+
+- 退役带走的是"还能再执行的预览"，回执与恢复入口留在原请求位置；
+- 未执行的删除请求没有回执（没有 entry），退役后就是干干净净的一条历史，不会伪造结果卡；
+- 水合（刷新）也走同一条判据，不重复出卡、不重放删除。
+
+**交互统一**：两端结果卡右下角都用 `WORKSHEET_CHECKPOINT_UNDO_LABEL`（「↶ 撤销本次执行」），与普通写入结果卡同名同位置（`.execution-recovery-footer`），旁边固定一句 `WORKSHEET_CHECKPOINT_RECOVERY_HINT`（「打开执行前副本，当前原表保留」）。点击只调检查点 `open`：不调 `execute`、不覆盖原表、不新增执行过程卡；在途禁用、失败保留重试。「备份与恢复」列表仍用 `WORKSHEET_CHECKPOINT_RECOVERY_LABEL`（一行一条记录，"本次"在那里没有唯一所指）。
+
+> 2026-10-19（三续）起：按钮文案不变，动作改为原地撤销（`restore`），说明句改为 `WORKSHEET_CHECKPOINT_UNDO_HINT`。见下文「删表撤销改为在原地恢复」。
+
+**边界不变**：`recoveryAvailable` 仍是显示撤销入口的唯一许可 —— 未执行、失败且没有恢复档案时没有按钮；`partial_or_unknown` 且确有档案时保留入口，同时保留"未全部完成"的原话。
+## 2026-10-19（再续）：删表后的卡片顺序、状态收尾与"预期收窄"
+
+**现象三件**：① WPS 先显示删除结果与撤销按钮，后显示执行过程；② Excel 删表完成后同一次计划仍挂着「准备就绪」「验证后保存」，看着像还没执行；③ 两端删表成功后都会弹「工作表范围发生变化 / 尚未写入」，与刚完成的结果直接冲突。
+
+**统一顺序**（两端同构，同一批组件）：`TaskProgressTimeline`（完成后默认折叠）→ `ExecutionResultCard` / `WorksheetCheckpointCard`（"工作表删除已完成 · 已删除 N 张工作表"，明细折叠）→ 卡内 `.execution-recovery-footer`（左侧 `WORKSHEET_CHECKPOINT_RECOVERY_HINT`，右侧 `WORKSHEET_CHECKPOINT_UNDO_LABEL`）。撤销按钮属于结果卡，因此必然在过程之后；卡下面不再重复画一遍过程，聊天底部也不再有常驻检查点列表。WPS 侧把结果卡的渲染位置从 `message.verification` 之后、时间线**之前**，移到时间线**之后** —— 只统一按钮文字而不统一排列，等于没统一。
+
+**旧状态收尾（Excel 特有）**：计划卡的「准备就绪」「验证后保存」原来只判 `message.plan` 存在。删表成功后计划仍在（按要求保留在折叠明细里），于是界面像"还在等执行"。改为按**检查点是否已有回执**收尾：`entryForMessage(...)?.result` 存在即视为本次已结束，不再显示待执行文案与重复执行入口；计划、执行记录、恢复点一个都不删。WPS 侧本来就用 `executedPlanCard` 承担"执行后仍可复核"，无需改。
+
+**范围收缩为什么会被误判**：删表本来就会让表集合变小。若删完什么都不做，下一轮目标守卫读到的表比基线少，判 `scope_changed` → 弹「尚未写入」→ 用户重新确认 → `adopt()` 对全部消息 `retireTargetMessage`，结果卡随之消失（上一轮已修，但提示本身仍是错的）。
+
+**"预期"必须被证明**，判据落在共享层 `packages/core/src/worksheetDeletion.ts` 的 `reconcileWorksheetDeletionScope`。放过的条件是**同时**成立：
+
+1. 前后工作簿身份存在且相同（`identity_missing` / `workbook_changed` 一律拒绝）；
+2. 本次执行确有回执（`receipt === null` 拒绝 —— 没有证据就不是预期）；
+3. 回执的删除清单与剩余表清单各自唯一（含系统表时两侧同口径过滤）；
+4. 回执的剩余表与真实目录**逐名相同**（少一张、多一张都算 `receipt_mismatch`）；
+5. 删除清单全部在授权内、且确实已不在目录里；
+6. 幸存数 = 授权数 − 删除数，且幸存不为空（`nothing_authorized_left`）。
+
+通过后返回的 `scope` 保持**原授权顺序、只减不增**。端点侧只做两件事：用真实目录再读一次目标，交给 `useAuthorizedTarget.bindVerifiedShrink` 再卡一遍"同簿 + 只减不增 + 不引入未知表"，通过才推进基线；随后把已提交范围对齐到同一份集合（Excel `setSelectedSheetNames`、WPS `onAuthorizeTarget`）。任一步不成立就原样返回，守卫照常按范围变化拦截 —— **没有全局关守卫，也没有无条件清警告**。
+
+**一个真实的坑（同步记账 vs 渲染期状态）**：`confirmBackup` 的顺序是「`patchEntry` 写回执 → 立刻 `await onCompleted()`」。`patchEntry` 里 `receipts` 是 ref，同步落账；`entries` 是 state，要等下一轮渲染。收尾那一步若从 `entriesRef` 取回执，拿到的必然是 `null` —— 于是"有证据的收窄"被误判成"没证据"，下一轮照样弹提示。`receiptForMessage` 因此先查 `bindings` + `receipts`（同步记账），再回落 `entriesRef`。这条行为由反向变异钉住：去掉同步分支，正向用例立刻变红并复现「工作表范围发生变化」。
+
+**测试替身只保留一份目录事实**：替身宿主的 `Worksheet.delete()` 是空实现（真实删除走 COM），所以"删完之后少一张表"必须显式表达。新增 `TestOfficeHost.sheetNames()` / `removeSheet(name)`，删表用例调 `host.removeSheet(TARGET)`；`targetFor` 替身读同一份目录。这样产品 `scan()` 与授权读数永远看到同一份事实，测试里不再另抄一份"少了哪几张表"的声明。
+
+**验收分档**：自动化侧已闭环（core 632 / Excel 1353 / WPS 965 全绿，两端 `tsc --noEmit` 与 build 通过，关键断言均有反向变异证据）。真实 Excel / WPS 宿主的顺序与提示仍需在有专用工作簿的机器上实机确认 —— 自动化证据不等于实机证据。
+
+
+## 2026-10-19（三续）：删表撤销改为「在原工作簿原地撤销」
+
+**需求变更**：用户改变了此前"撤销时打开恢复副本"的交互选择 —— 点「↶ 撤销本次执行」后要在**当前原工作簿**撤回本次删除，继续留在原文件里工作，不跳到 `recovered-xxx.xlsx`。完整检查点继续保留，「打开执行前副本」降级为「备份与恢复」里的备用入口。**这是恢复能力改造，不是改按钮文案，也不是"打开副本后再切回原窗口"。**
+
+**为什么两端能共用一条实现**：删表本来就走服务端**固定 COM 适配器**（`host="excel"` 定位 `EXCEL7` 文档窗口的保留对象；`host="wps-et"` 取 `ket.Application` 并用 `Hwnd` 校验），两端拿到的是同一个已打开工作簿对象的引用。因此原地撤销既不需要宿主原生 Undo 栈，也**不假定**它能撤销程序删表：只要在同一个对象上调用对象模型。UI 侧只提供 `operationId` 与授权现场，不开放脚本、宏或系统命令。
+
+**恢复算法**（`server/app/worksheet_restore.py`；入参是纯宿主对象，可被替身驱动）
+
+1. `restore_session` 先挂到原簿，关 `EnableEvents` / `DisplayAlerts`、`AutomationSecurity = 3`（禁宏），再用 `Workbooks.Open(archive, 0, True)` **只读**打开归档，`finally` 里 `Close(SaveChanges=False)` 并逐层还原设置。原簿全程不关闭、不保存、不替换 —— 后续编辑因此得以保留。
+2. 逐表 `Worksheet.Copy(Before, After)` 整表复制（保留表格对象/图表/批注/合并/条件格式/数据验证/行高列宽），**不是**搬 `Value`。位置由 `_anchor` 决定：贴"归档顺序里前方最近的存活表"之后，没有就贴 `before`，再没有就追加到末尾。
+3. **位置与名字是硬判据**：复制完立刻比对 `sheet_names(book)` 与预期列表，不等就抛错 —— 宁可判失败，也不谎报成功。
+4. 可见性按归档写回（`Visible` 不会随 `Copy` 过来），不符即抛错。
+5. 副本指纹：`UsedRange.Formula` 归一化矩阵 + `sha256` 与归档逐表比对；超 `worksheetCheckpoint.maxRestoreCells` 直接判失败（不静默跳过核对）。
+6. `#REF!` 修复：只对"归档公式引用了本次被删表"**且**"现场公式仍含 `#REF!`"的格子写回归档原文；工作簿级 `Names.Item(name).RefersTo` 同样按归档写回。删除后变成 `#REF!` 的公式**不保证**仅靠恢复同名表就自动修好，所以必须有执行前/执行后证据 —— 修复条数写进回执（`repairedFormulas` / `repairedNames`）。
+7. 每放回一张就落一次账（`_record_restore_progress`）。部分成功时能如实说出"已恢复哪些 / 未恢复哪些"，重试跳过 `already_restored`，**不重复造表**。同名表已存在 ⇒ `RestoreConflict`，一张都不动。
+
+**冲突与撤销顺序**：`_newer_undeleted` 查同一 `origin` + 同一 `host` + 同一工作簿里**更晚**且仍未撤销的删除记录 ⇒ 拒绝，不拿旧检查点覆盖后续操作。已 `completed` 的记录再次请求直接返回（幂等，不碰宿主）。
+
+**协议**：新增 `POST /api/worksheet-checkpoints/restore` → `WorksheetRestoreResult`（`status` ∈ `completed` / `partial` / `failed` / `conflict`，附 `restoredSheets` / `failedSheets` / `unverifiedSheets` / `repairedFormulas` / `repairedNames` / `limitations`）。`WorksheetDeleteCheckpointResult.restore` 与 `WorksheetCheckpointSummary.restoreStatus` 让结果卡与「备份与恢复」都能区分"已撤销删除"。能力开关 `worksheetCheckpoint.allowedActions` 增加 `restoreWorksheet`，限额新增 `maxRestoreCells`。客户端 `assertWorksheetRestoreResult` 自证覆盖关系：`completed` 必须覆盖全部删除表且无失败/未核对，`partial` 必须同时给出已恢复与失败清单。
+
+**界面**（两端同构，同一批组件）：`.execution-recovery-footer` 按钮仍是 `WORKSHEET_CHECKPOINT_UNDO_LABEL`，说明句换成 `WORKSHEET_CHECKPOINT_UNDO_HINT`（「在原工作簿撤回本次删除，保留后续编辑」）。成功后**只更新同一张卡**：「已撤销本次删除」+「已恢复 N 张工作表」+ 折叠明细里的「已放回：…」，按钮收起（终态），不新增执行过程卡、不新增消息行。冲突/部分/失败：给原文、保留重试入口（`conflict` 不给重试）、**不写"已撤销"**；`recoveryAvailable` 为真时补一句指路「备份与恢复」的副本。删除未完整完成或没有归档时不给入口，只给 `undoReason`。
+
+**授权侧**：共享判据 `packages/core/src/worksheetRestore.ts` 的 `reconcileWorksheetRestoreScope`，与删表时的 `reconcileWorksheetDeletionScope` 对称。撤销把目录变多，不处理就会让下一轮守卫误报"目标已变化"。放过的条件是**同时**成立：前后身份存在且相同；已提交授权里的表都还在目录里；回执说放回的表真在目录里；目录里多出来的**只能是这次放回的**（其他新增 ⇒ `unexpected_sheets`）。通过后 `authorized` **原样返回** —— 撤销不把表加进授权。端点随后用真实目录再核一遍（`useAuthorizedTarget.bindVerifiedRestore`：同 `fileKey`、授权名单前后完全相同、新目录名只能是"原来就有"或"本次 restored"、restored 必须真在目录里），通过才推进基线并对齐已提交范围（Excel `setSelectedSheetNames`、WPS `onAuthorizeTarget`）；任一步不成立就原样返回，守卫照常拦截 —— 不全局关守卫。
+
+**仍然不支持 / 待验**
+
+- 真实 Excel / WPS **没有实机证据**。自动化用替身宿主 + 真实 openpyxl 读写归档，证明的是算法与协议，不是 COM 行为。
+- "撤销后保留当前工作表、选区和滚动位置"未做任何保证：实现不主动切换活动表，但也未核对。
+- 撤销只修**仍为 `#REF!`** 的格子，不覆盖"删除后用户又改过的关联公式"；这类情况以"修复条数 + 指纹比对"如实反映，不做猜测式覆盖。
+- 整簿覆盖、关闭重开、替换磁盘文件三条路径都没有实现，也不允许作为"撤销"出现。
+
+
+### 2026-10-19：Excel 原生定位与范围重复确认修复
+
+Excel 检查点不再先 `describe()` 再第二次取得工作簿：一次 NativeOM 读取同时取得路径身份与 Workbook 对象，验证唯一窗口、进程身份、路径后保留同一对象，供删除/原地恢复使用。Windows `AccessibleObjectFromWindow` 可暂时返回 E_FAIL；只重试只读发现过程，`worksheetCheckpoint.nativeReadAttempts=3`、`nativeReadRetryDelayMs=150` 控制上限和间隔。持续不可读取、明确身份变化、重复候选分别拒绝；不通过 ActiveWorkbook 猜目标，不重试已经开始的写入。WPS 定位分支未变。
+
+Excel 从文件选择转为当前工作簿模式时，`adoptCurrentWorkbookScope` 在同一次状态更新提交 `committedSheetNames`。此前依赖后续 effect 提交授权，守卫启用后的首次检查会读到旧/空名单，导致已选范围又报 scope_changed。草稿勾选仍不改变授权。新增真实 useScopeSelection + useAuthorizedTarget 组合测试在旧代码上复现该提示，修复后通过。
+
+证据边界：真实 Excel 仅做身份元数据只读检查，旧路径复现 E_FAIL，最终路径连续三次定位成功；未在业务工作簿执行删除、恢复、保存。用户反馈 WPS 已正常，Excel 完整删除→撤销仍待更新服务和加载项后的实机验收。
+
+### 2026-10-19（五续）：数据范围「授权同步」——草稿口径不是授权口径
+
+现象：勾选并「确认」了工作表，之后仍反复弹「工作表范围发生变化」。本轮定位到三条彼此独立的成因，
+各自留下判别点（变异 A1–A6；`scripts/mutate_scope_authorization.mjs` +
+`scripts/run_scope_authorization_mutations.mjs`，六个 SEED 全部 RED(OK) 且还原后逐字节一致）。
+
+1. **守卫按草稿口径读"当前范围"**。`inspect` 原来读 `workbookScopeMode` —— 那是弹层里的**草稿**
+   口径（点一下「跟随当前」就变）。于是"点开看看"之后，后台检查改用活动表去比已提交的多表范围，
+   弹「工作表范围发生变化」。现在 `useScopeSelection` 分出 `committedScopeMode`（已提交口径），
+   守卫只读它；与 WPS 的 `scopeMode`（已提交）/ `draftMode`（草稿）对齐，两端同源。
+2. **「取消」只回退名字、不回退口径**。草稿口径留在原地，触发器与守卫都改按另一套口径说话。
+   `cancelScopeEdit` 现在把 `workbookScopeMode` 也退回 `committedScopeMode`。
+3. **"已提交"曾被被动 effect 抄写**。旧实现是
+   `useEffect(() => { if (selectionConfirmed) setCommittedSheetNames(selectedSheetNames) })`，
+   于是**任何**把 `selectionConfirmed` 置真的路径（重读宿主、发送前那一句）都会悄悄改写授权；
+   而守卫基线由另一条路推进，中间那一帧就是"新范围 + 旧基线"，也就是假的范围变化。
+   现在只有 `commitAuthorizedScope(范围, 口径)` 能写已提交；重读宿主只刷新草稿（首读播种一次）。
+   删表收窄（`bindVerifiedShrink`）、原地撤销（`bindVerifiedRestore`）、范围确认三处都在**同一次**
+   状态更新里提交，不留中间态。
+4. **读数与判断之间的代数隔离**。`useAuthorizedTarget.check()` 在 `await` 之后才读 `bound.current`；
+   而删表收尾 / 原地撤销 / 从文件入口采用当前工作簿都**不经过** `read()` 直接 bind，
+   于是"拿旧读数比新基线"是常态。现在每次读数记下 `bindGeneration`，回来时代数变了就作废重读
+   （最多作废 2 次，之后按"读不出来"处理）—— 既不用旧读数制造假变化，也不放行旧请求。
+5. **口径差异算草稿差异**。`scopeDraftDirty` 现在同时比名字与口径（WPS 侧一直是这条判据）；
+   发送闸从"仅手动模式"放宽到"草稿 ≠ 已提交"，因为**读取**是按草稿口径走的：
+   切到「跟随当前」不确认就发送，会把当时的活动表当授权表读出去。
+
+回归（真实 App / 真实守卫 / 真实范围 Hook，只替身网络与目标读数）：①多表确认后后台检查与下一条
+需求都不再要求确认；②从文件入口采用当前工作簿后不重复确认；③固定多表授权后切换活动表不误报；
+④草稿改口径后「取消」不改授权；⑤删表收窄与原地撤销后不误报（既有用例）；⑥确认期间在飞的旧读数
+不污染新基线；⑦真正换簿 / 外部删表 / 回执与目录不一致仍被拦下；⑧「跟随当前」口径下切表仍要先确认；
+⑨只是看了看另一套口径：后台不误报、发送也不静默改读。
+
+证据边界：本轮结论全部是**替身宿主 + 真实 React 链路**的自动化证据。真实 Excel / WPS 下
+2s 轮询与真实目标读数延迟的组合、"切表即提示"是否仍显得频繁，**未做实机验收**
+（步骤见 `docs/DEVELOPMENT.md`「数据范围授权同步实机验收（未执行）」）。
+
+### 2026-10-19（六续）：「暂时无法核实当前目标」——授权集合的身份不含点选顺序
+
+现象：已确认多表范围，发送任务仍被拦在「暂时无法核实当前目标」（`TargetScopeNotice` 对
+`reason === "unavailable"` 的文案），且重新确认后依旧复现。
+
+根因（**一个主题、两处顺序敏感**）：同一组已授权工作表**只因顺序不同**被当成两个目标。
+
+1. 链路上的三个事实本来就不同序：用户点选顺序（Sheet11 → Sheet1 → Sheet10）成为守卫基线
+   `bound.selected`；`App.tsx` 的 `adopt` 按**工作表目录**顺序取出名字写进已提交；
+   下一次 `inspect` 按那些名字映射回来，于是变成目录顺序（['1','10','11']）。
+2. `checkAuthorizedTarget` 比较 `selected` 时**先排序** ⇒ 判 `same`，所以范围提示不弹 ——
+   现场看到的不是"范围变化"，而是下面这条。
+3. `officeAnalysisTargetEvidence` 的键是 `JSON.stringify([identity, target.selected])`，
+   **没有**统一顺序 ⇒ 上面两份范围产出**两个不同的键**。`checkForAnalysis` 对
+   `boundEvidence / evidence / repeated` 三个键做冲突判断（`new Set(keys).size > 1` ⇒
+   `pause(..., "unavailable")`），于是完全相同的授权被判成"证据冲突"。
+   每次重新确认都会重演，所以表现为"反复"。
+
+修复（**判据沉到共享层，两端共用同一份**）：
+
+- `packages/core/src/authorizedTarget.ts` 新增三个共享出口：
+  `canonicalTargetSelection()`（授权集合的规范形）、`authorizedTargetEvidenceKey()`（身份 +
+  规范形）、`selectedTargetSheetNames()`（已授权名字按 `selected` 顺序）。
+  `checkAuthorizedTarget` 也改用它，不再自己抄一份 `[...x].sort()`。
+- 规范形**只消除顺序**：返回新数组（绝不原地 `sort` 调用方的数组）、**不去重**、不合并成员。
+  重复 ID、缺失表、增删成员照旧是 `scope_changed`。
+- Excel `officeAnalysisTargetEvidence` 与 WPS `wpsConfirmationTargetKey` 都改走
+  `authorizedTargetEvidenceKey`，两端口径一致；WPS 的工作表身份（索引 / 名称 / 稳定 ID）
+  仍逐个参与，一张变了就换键。
+- **没有**删除证据冲突判断，**没有**对 `unavailable` 直接放行，也没有改删除/原地恢复算法。
+
+为什么 `App.tsx` 的 `adopt` 没有再顺手改成"保留点选顺序"：`adopt` 写出来的名字顺序在
+规范形之后已不参与任何身份判断，再改一处顺序只会留下第二套"看起来一样"的顺序规则。
+需要它保持点选顺序的调用点（如执行前复核 `App.tsx` 里对 `authorization` 的逐字比对）
+维持现状，本轮未触碰。
+
+回归（真实 App / 真实守卫 / 真实适配器，只替身宿主对象与网络）：
+A. 活动表是最后一张，按非目录顺序确认三张表后**首条**需求不再要求确认目标；
+B. 相同 ID 集合不同顺序 ⇒ 证据键一致（Excel 与 WPS 各一条）；
+C. 增删成员、换文件、替换文档引用仍被拦截（键不同 / 证据为 `null`）；
+D. 真实适配器的 `adopt → bind → checkForAnalysis` 完整链（`useAuthorizedTarget.test.tsx`，
+   真实 `inspectOfficeAuthorizedTarget` + 真实 `officeAnalysisTargetEvidence`）——
+   替身若自己给一个固定证据键，这条判据就会被替身抹掉，所以这里刻意不替换。
+反向变异：`node scripts/mutate_scope_identity.mjs I1..I4` + 驱动
+`node scripts/run_scope_identity_mutations.mjs`（四判据 + 还原 sha256 一致，
+四个 SEED 全部 `RED(OK)`，日志落 `.tmp-mutations/summary-scope-identity.json`）。
+
+证据边界：以上全部是**替身宿主 + 真实 React/守卫/适配器链路**的自动化证据。真实 Excel /
+WPS 下端到端是否仍有此提示**未做实机验收**（步骤见 `docs/DEVELOPMENT.md`「已确认多表范围
+实机验收（未执行）」）。
+
+### 2026-10-19（七续）：第一批 SDK 业务闭环的实测结果与证据边界
+
+本批不改写上面第六轮的身份判据；它只做两件事：**核对**身份阻断已在生产代码与真实 App
+链路中收口，以及把第一批合成案例跑到可复核的程度。
+
+**身份链路的补充证据（不是重复修复）**：`onlineLink.test.tsx` 原先给
+`officeAnalysisTargetEvidence` 注入固定键 `online-target-1`。那会让"同一组表两个键"
+的缺陷在在线集成里永远抓不到，也违反"替身不许给固定证据键"。现在该方法走真实实现
+（`fileKey`/`fileRef` 取宿主现场），范围选择按**非目录顺序**（订单表 → 汇总表 → 会员表）
+点击。
+
+**但这条在线链路不是顺序判据的独立证据**：实测应用 I1（证据键退回直接
+`JSON.stringify(selected)`）后，在线用例**仍然通过**。原因是 `inspectOfficeAuthorizedTarget`
+替身在确认后拿到的名字已经是同一顺序，链路里不会出现"基线按点选顺序、已提交按目录顺序"
+的两份数据。顺序判据仍由真实 App 用例 A（真实 `adopt → bind → checkForAnalysis`）与
+`I1–I4` 变异证明；在线改造的价值是去掉固定键、强制真实 `fileKey`/`fileRef` 核对，并把
+"确认后开放保存工具"纳入断言。不要用这条在线用例冒充顺序缺陷的回归证据。
+
+**真实模型 / SDK / Docker 合成案例**（`scripts/diagnose_sdk_http.py --python`）：
+
+| 运行 | 结果 | 证据 |
+| --- | --- | --- |
+| 基线（首次，任务描述对"空编号"范围有歧义） | 汇总与重复/未匹配正确；**会员表空编号明细缺失**（写成"共 0 条"） | `outputs/sdk-batch1-real-baseline/` |
+| 基线（收窄歧义后重跑） | 金卡 400 / 银卡 200 / 未匹配 400 / 总计 1000；会员表第 5 行空编号、第 3 行重复键 7、订单表第 5 行 404 均可定位 | `outputs/sdk-batch1-real-baseline3/` |
+| 因果变化（仅改会员表 C2 金卡→银卡） | 金卡 300 / 银卡 300 / 未匹配 400 / 总计 1000；三类异常定位不变 | `outputs/sdk-batch1-real-causal/` |
+
+事后业务核对是独立脚本 `scripts/check_sdk_batch1_result.py`，只读工件、不参与产品运行；
+它必须能在首次失败工件上报错（只报"缺少会员表空编号明细"），在修复后的工件上通过。
+运行环境噪声：SDK 子进程退出时被本机安全策略拦下 `reg.exe`，不影响已落盘的
+`report.json` / `synthetic-result.json`；另有一次 `MODEL_CONNECTION_ERROR` 是传输波动，
+失败工件保留在 `outputs/sdk-batch1-real-baseline2/`。
+
+**替身宿主集成**：`npm run test:online` 两端各 1 passed（真实服务端、真实 Docker、真实
+面板与桥；固定模型工具序列 + 有状态宿主替身），并新增"确认后保存工具入口存在"的断言。
+`npm run test:cross-process` 生产侧 4 passed、消费侧 2 passed，消费用例改为当前
+"计划到达即执行一次 → 确认只清标记 → 撤销"契约，不再等待已取消的「执行到 Excel」入口。
+
+**未完成**：真实 Excel / WPS 实机仍未执行；因此"真实模型自主规划 + 真实宿主写回/撤销"
+这条完整证据链仍缺最后一环，不能用替身证据代替。
+
+### 2026-10-19（八续）：已安装 SDK 的会话接口核实（仅设计，不启用）
+
+`claude-agent-sdk 0.2.159` 的 `ClaudeAgentOptions` 提供 `resume`、`session_id`、
+`fork_session`、`resume_session_at`、`resume_drops_turn`，包内另有
+`get_session_messages` 与 `session_store`。这与"当前接入未实现恢复"并不矛盾：当前
+适配器显式添加 `--no-session-persistence`，服务端也拿不到 CLI 的对话现场。
+
+恢复能力的四项语义必须分开设计，不能互相冒充：
+
+1. **查询已有任务状态**：只读，回答"做到哪一步"，不推进任何写入；
+2. **恢复 SDK 规划会话**：重新建立上下文，但必须先复核任务、工作簿、授权、计划版本与来源；
+3. **继续未完成执行**：只对"写前登记过、现场可核对"的剩余动作生效，已完成步骤防重放；
+4. **撤销已完成执行**：走既有原地恢复/检查点通道，不是"再跑一次"。
+
+隐私前置条件未满足前不打开持久化：转录里不得出现原始数据行、携带数据的代码、密钥或
+工具原始输出。若安全恢复必须依赖尚未取得的持久化授权，只提交可审阅设计，由用户决定。
+
+**补充事实（2026-10-19 晚，只读 `--help` 实测）**：捆绑 CLI `2.1.281` 对
+`--no-session-persistence` 的说明原文是 `sessions will not be saved to disk and cannot be
+resumed (only works with --print)` —— 该开关与 `resume` 互斥。因此"打开会话恢复"不是
+删掉一个 extra_arg，而是先定转录落盘范围、清理与保留期。
+
+同时核实到一件更紧的事：**SDK 规划任务今天根本没有"继续"能力**。
+`server/app/planner.py:41` 收了 `on_checkpoint` 却不传给 `run_sdk_plan`，
+账本 `checkpoint_json` 恒空 ⇒ `_planning_pause_payload` 的 `canContinue` 恒假
+（`server/app/main.py:1787`）⇒ 出错即 `finish_planning_task(status="failed")`
+（`:2005`）。客户端 `App.tsx:2810-3075` 那套续跑 UI 对 SDK 任务走不到。
+
+完整设计（状态转换表、九种故障场景、最小持久记录与隐私边界、改动清单、验收矩阵）见
+`docs/SDK_RECOVERY_DESIGN_2026-10-19.md`；本文件不再重复表述，避免两份描述漂移。
+
+## 2026-10-20：规划前桥准备与检查点持久化失败
+
+WPS 首次规划在意图返回 taskId 后调用并等待 `preparePlanningBridge`，成功后才发送规划请求。
+准备阶段仅读取身份与授权元数据。首次 `bridgeTool` 到达时同步固定来源指纹，
+校验本轮身份/授权后才允许轮询，不重建桥或清空 delivered；失败则停止并提示。
+进度回调只服务已经准备好的本轮桥，不再在事件里异步初始化。
+两端共享的 `useSdkToolBridge.begin` 在读取授权失败、空授权或初始化失效时返回 false；
+新初始化期间不把旧绑定视为活桥。已完成结果的绑定仍保留供按引用读取。
+
+检查点状态文件的原子替换遇到 `PermissionError` 时，只重试替换本身，不重放删除或 Copy。
+限额位于 `worksheetCheckpoint.stateWriteAttempts`（默认 4）及 `stateWriteRetryDelayMs`
+（默认 75 ms）。耗尽后停止并返回固定提示，保留最后成功提交的状态和已有归档。
+每张恢复表在 Copy 前提交内部字段 `restorePendingSheet`，核对后提交进度并清除此字段。
+若复制后回执未能持久化，状态查询/列表将其投影为 `restore.unverifiedSheets`。
+重试先核对原工作簿身份与目录：待核对表已存在则停止，不按同名猜测归属；确认不存在后，
+先提交该观察再允许补恢复。不会自动覆盖用户后来创建的同名表。
+
+以上为实现及故障注入边界，未替代真实 SDK、Excel、WPS 的 A1 验收。
+
+## 2026-10-20：暂停任务的自然语言核对与原任务归属
+
+消息理解协议增加可选 `recoveryTasks`（当前会话至多六个未结束规划任务 ID）及
+`task_recovery { turnId, provider }` 响应。模型结合原有对话理解恢复意图；本地不按
+“继续”等关键词重建需求。服务端解析、客户端 API 与面板均拒绝未提供过的任务 ID；
+带新图片的消息不能借恢复分支忽略图片。无候选时不新增请求字段，不增加原始行数据传输。
+
+Excel 将恢复意图接回原消息的状态核对入口。WPS 在开始新需求前保留原任务的内存归属
+（会话、原提示、授权索引、目标对象、任务 ID、游标与续跑请求身份），普通聊天不清除
+暂停上下文，新任务不移除旧卡的核对入口。该上下文不新增持久化；重开窗格只能先查询
+服务端，不能用当前工作簿冒充旧任务目标。服务端确认有可续检查点后才显示继续按钮，
+点击时仍走现场身份、授权、来源证据及执行账本校验。
+
+自然语言恢复先查询，不自动 POST 继续请求，也不新建规划。WPS 查询得到已完成的纯删表
+计划时，不进入会立即写入的结构删除通道；显示已生成方案、未执行，后续删除仍需重新
+进入授权与执行检查。其他结果沿用既有结果接回流程。运行中状态更新原卡，不追加互相
+矛盾的“请重新发送 / 不要重复发送”提示。
+
+自动化覆盖模型协议、真实 HTTP 请求投影、双端面板恢复路由、旧卡保留、非法任务 ID、
+重开 WPS 窗格与只查不删边界；真实 SDK + Excel/WPS 在途中断续跑仍待实机验收。
+
+### 2026-10-20 补充：规划任务建立之前的暂停
+
+上节只覆盖已经拿到规划身份的暂停，没有覆盖消息理解、字段读取、字段意图判断阶段。
+这些阶段没有检查点，旧代码只追加系统提示，因此模型拿不到恢复候选，“继续”仍会
+成为新的空需求。不能用“没有检查点”代替对原需求的保留。
+
+双端共用 `usePrePlanningPause` 与 `PrePlanningPauseCard`：只在本窗格内存保留原提示、
+附件、会话、原授权快照和口径，并关联原暂停消息。模型只收到 `preplanning-*` 引用；
+引用不传给服务端状态/继续接口。选择该引用或点击“继续分析”时，先核对原工作簿、
+已授权集合及口径，再从原需求重新分析，明确不声称从检查点续跑。现场变化、不可读、
+核对期间切换会话或新请求抢占都不放行。引用在发起前同步消费，避免双击重复发起。
+候选按消息顺序排列；新请求不追加重复的原需求气泡，原暂停行更新为已接回。
+
+消息/字段模型返回后再次检查取消状态；Excel 字段读取后的取消也保留原需求。
+已经提交规划的任务仍走原任务核对链，不能回落到本机重分析。共享内存不新增磁盘转录，
+重开窗格不承诺恢复这类尚无服务端身份的早期请求。当前早期恢复实现限于两端当前
+工作簿模式；文件夹模式没有同等可验证宿主快照，不自动重放，原需求仍留在对话。
+
+两端均已实现并有面板用例；真实宿主早期暂停仍待复测。独立真实 SDK 合成文本验证：
+前文含“没有检查点”，输入“继续”后返回对应本机引用，未读取工作簿。该证据只证明
+语义路由，不代替真实宿主全链路。
+
+### 2026-10-20 补充：早期恢复请求的同步交接
+
+用户实机显示“已接回原需求”后只结束两次消息理解。原因是 `restart` 同步消费内存
+引用后立即调用旧渲染闭包，双端候选列表仍从渲染期 `entries` 读取，再次把已消费的
+引用提供给模型。模型再次选择该引用时，恢复方法找不到原条目，直接返回。
+原测试根据提示词是否为“继续”固定第二次模型响应，未覆盖这个交错。
+
+共享 Hook 新增 `pendingEntries()`，调度读取实时、未被领取的候选；渲染仍使用
+`entries`。明确选定原需求后的 `restartingAnalysis` 不提供任何恢复候选，避免重分析
+再次跳转到已消费任务或其他暂停任务。双端对早期恢复同样校验 ID 确实已提供。
+工作簿与授权复核、字段重读及后续模型判断保持原流程，不新增语义关键词判断。
+
+双端面板用例覆盖输入“继续”与按钮入口；模型替身只要收到恢复候选就再次选择，
+要求最终确实进入原需求分析。真实 SDK 两次合成请求分别返回 `task_recovery` 和
+`needs_workbook_context`；此项没有读写宿主，不能作为 Excel/WPS 实机完成证据。
+
+### 2026-10-21：暂停交互收敛到输入框
+
+双端普通暂停默认只显示一行状态，原核对、模型切换和诊断卡放入 `PauseDetails`
+展开项。已确定不能继续的状态展开说明，授权变化仍由范围守卫提示。
+输入为空且没有附件时，右下角按钮可继续当前会话最近一条未结束的暂停任务；
+输入了内容仍走模型语义判断，新消息不会被本地关键词规则改成续跑。没有暂停任务
+时空发送仍禁用，写入/回读阶段的中断限制保持不变。
+
+消息理解协议 `task_recovery` 新增 `action: inspect | continue`，旧响应省略时只查询。
+明确继续会先查状态，确认可续后在同一次用户操作内完成原有证据核验和续跑；后台
+自动检查与仅询问进度仍只读，不因检查点可用而自动继续。运行中的原任务不新建、
+不重放；完成、失败、未知状态沿原分支处理。早期本机暂停没有规划身份，明确继续
+仍复核原授权后重新分析原需求；仅查看状态不启动重分析。
+
+WPS 查询路径返回本次核实的继续上下文供显式操作使用，不从尚未重绘的 state
+读取；随后沿既有继续入口再次读取服务端状态、授权与来源证据。空发送按钮只表达
+继续意愿，不扩大工作簿授权、不绕过执行账本。协议更新需要后端和双端同时加载。
+
+### 2026-10-21：续跑接回原步骤时间线
+
+WPS 首次进度将 task/turn ID 与 sequence 绑定到原 activityLog；检查点继续在请求前
+重新激活原卡，流事件按 stepId 更新原行，新 stepId 才追加。重复序号及异任务事件
+不合并。结果取回也复用该任务的过程卡；再次暂停保持相同关联。旧历史缺少绑定时，
+仅在该暂停消息之前、同一用户轮次内查找过程卡，不能借用另一任务的步骤。
+
+Excel 与 WPS 复用 resumeActivityLog，保留完成行、累计耗时与原编号，恢复末行计时
+时排除暂停间隔；不再为每次继续插入一个带 requestId 的编号步骤。语义判断选中
+原任务后移除本次“理解消息”的临时过程卡。文本继续仍由模型判断，不限制为固定
+词语；仅查询状态不继续。早期无检查点的重新分析仍按真实重读过程展示，不伪装成
+SDK 断点执行。授权、来源复核与宿主写入路径未改。
+
+> **2026-10-22 修订**：本节「接回原卡」的展示约定已被下文的**多回复段**取代。
+> 保留的只有身份与时序那部分（task/turn ID、sequence、stepId 归并）：任务身份不变，
+> 但展示上继续一定会**新开一段**，旧段冻结为历史。
+
+### 2026-10-22：同一任务、多个回复段（过程卡不再唯一）
+
+**作废的旧约定**：一任务绑定一张可变过程卡、继续后更新上方旧消息、"界面上只有一张
+卡"被当成恢复正确的判据。它带来三个真实问题：继续后最新消息下面没有反馈、过程卡
+被反复改写导致对话割裂、以及一张卡越滚越长。
+
+**新约定**（判据 `packages/core/src/replySegments.ts` + 两端 `resumeSegmentRef`）：
+
+| 维度 | 旧 | 新 |
+| --- | --- | --- |
+| 任务身份 | 一个 | **一个**（`operationId`/`stepId`/序号/结果引用/写入回执不变） |
+| 回复段 | 一个 | **多个**（旧段 `superseded`、新段 `live`，`nextSegmentId` 成链） |
+| 继续后进度落点 | 旧卡 | **用户消息之后的新回复段** |
+| 旧卡 | 继续被改写 | **冻结当时状态** + 「查看后续进展」定位入口 |
+| 步骤编号 | 接着旧卡数 | 新段**不重排**编号，只说明"继续（此前 N 步已完成）" |
+
+四条不变量：①多段但只有一个活动段；②先更新共享任务状态再投影到段；③旧订阅抢不回
+活动段（段切换不改步骤身份/事件游标/结果引用/回执）；④历史段保留当时状态、迟到
+结果进权威记录并在最新段说明。
+
+**测试口径也跟着改**：原来断言"只有一张过程卡"的用例改成行为判据（段数 +1、旧段
+逐步文本逐字不变、活动段数 ≤ 1、新段位置在最新用户消息之后），**没有删除也没有
+放宽断言**。
+
+### 2026-10-22：Python 代码内容块（11 态 + 正文不进账本）
+
+代码块的状态必须**有真实事件依据**（`packages/core/src/pythonCodeArtifact.ts`，
+11 态：正在生成/已生成/正在校验/正在隔离运行/分析完成/正在整理结果/已暂停/**未开始
+执行**/生成失败/校验未通过/执行失败）。当前 SDK 通道一次送达整段代码，因此第一条状态是
+**"代码已生成"+"正在校验"，不说"正在逐字生成"**；`summarizing` 只有在上游真的
+进入整理阶段时才允许出现，界面不得自行演绎。
+
+> **这 11 态里有 3 态目前没有生产发出点**（`generating` / `summarizing` /
+> `generation_failed` 只存在于 `server/app/models.py` 的枚举里），能由生产链路真正产生的是
+> 8 态（`generated` / `validating` / `running` / `analysis_completed` / `paused` /
+> `not_started` / `validation_failed` / `execution_failed`）。**定义了状态 ≠ 生产能产生
+> 并验证它**；不要因为枚举齐全就宣称这 3 态已验证，也不要为了让状态表好看去造发出点。
+
+> **2026-10-22 二次修订（缺陷修复）**：`not_started` 是这一批新增的第 11 态。
+> 旧实现把"功能关闭 / 运行器不可用 / 没有可信绑定 / 授权拒绝 / 启动前取消"都走成
+> `validating → running(executedVersion=1) → execution_failed`，而执行器**一次都没被
+> 调用**（复现证据：`outputs/acceptance-2026-10-22/independent-review/python-status.json`，
+> `runner_calls: 0`）。这不只是文案错：它宣称一段从未运行的代码"跑过一版"，还把用户
+> 引向"重试执行失败"。现在的次序是：
+>
+> | 场景 | 事件序列 | 带 `executedVersion` |
+> | --- | --- | --- |
+> | 正常执行 | `generated → validating → running → analysis_completed` | 只有后两态带 |
+> | 功能关闭 / 运行器缺失 / 无绑定 / 授权拒绝 | `generated → not_started` | 不 |
+> | 入参非法（如未知字段） | `generated → validation_failed` | 不 |
+> | 启动前取消 | `generated → validating → not_started`（说明"取消发生在启动之前"） | 不 |
+> | 运行中取消 | `generated → validating → running → paused` | 是（它真跑过） |
+> | 启动后异常 | `generated → validating → running → execution_failed` | 是 |
+>
+> **`running` 只有一个证据源**：`on_runner_start` —— 由
+> `run_isolated_analysis_internal` 在配置/端点/镜像全部通过、**即将调用
+> `run_python_isolated`** 时同步回调。执行前的确定性检查拆在
+> `prepare_python_execution`（不碰执行器）里，真正起容器的是
+> `run_prepared_execution`。取消与异常路径都必须留终态，不许停在 running。
+
+**增量判重按事件身份，不按文本**（`applyPythonCodeEvent`）：判据是
+`sequence`（迟到/重放整帧丢弃）→ `attemptId`（重新生成 = 重建工件）→ `version`
+（内容版本）。**不同事件的相同片段必须原样保留**：`f(g(1` + `)` + `)` 拼出来是
+`f(g(1))`，旧实现按 `code.endsWith(delta)` 去重会丢掉第二个右括号，把用户看到的代码
+改坏（复现证据：`outputs/acceptance-2026-10-22/independent-review/code-delta.json`）。
+缺片（版本跳过）记 `gap`：`complete` 压成 `false`、"复制全部"关闭，补齐（收到中间片或
+收到完整快照）后自动恢复 —— **不许丢片后仍宣告完整**。完整快照整体替换正文。
+> 验证层级：当前生产供应商**只返回完整代码**，增量路径的证据来自单元/业务用例（含
+> 连续括号、连续换行、重复缩进、相同内容不同身份、同事件重放、乱序、缺片、快照覆盖、
+> 旧尝试迟到），**没有**做过真实供应商流式验收。
+
+**正文不进持久账本**（既有硬边界：`test_python_analysis.py` 断言 SQLite 行内不得出现
+代码 sentinel）。因此事件只带 `codeId` / `attemptId` / 阶段 / 版本 / 字符数，正文登记
+在进程内 `server/app/python_code_artifacts.py`（24 条上限、30 分钟 TTL），由界面按
+`codeId` + **任务身份**经回环端点 `POST /api/sdk/python-code` 取回。取不回来（过期/
+淘汰/任务对不上/服务未连通）一律 404 且不区分原因，界面直说"正文没有保留"。
+
+**只读**：代码块没有任何执行入口（本仓库只有"生成白名单计划 → 预览 → 确认 → 执行"
+一条写入路径）。"已运行"只在 `executedVersion === version` 时出现；未完成草稿不提供
+复制全文；代码一律作为文本节点渲染。
+
+### 2026-10-21：早期分析也接回原过程卡
+
+步骤编号没有第 7 步特例。早期暂停引用现在保存原 activity ID 与已完成的消息理解结果；
+恢复时沿用该卡，未完成的消息理解可以重试，已经完成的消息理解不再重新调用。
+工作簿结构仍重新核验，未完成的字段分析重新调用模型；这是阶段接续，不是模型调用内部续算。
+稳定的本机阶段 ID 避免核验过程重新追加已完成行，后续新阶段继续追加。
+暂停操作放在原时间线标题栏，移除早期暂停的灰色说明卡；没有历史时间线时保留简洁入口。
+
+> **2026-10-22 修订（缺陷修复）**：本条原文「恢复时沿用该卡」**已作废**。早期分析
+> （理解消息 / 读表结构 / 字段意图）的继续现在也**新开一个回复段**
+> （`resumeEarlyAnalysisActivity` → `openReplySegmentMessage`），旧卡保留暂停那一刻的
+> 内容与耗时并给出「查看后续进展」。
+> 任务侧行为不变：未完成的消息理解可以重试、**已完成的不再重新调用**、工作簿结构按现场
+> 重新核验、未完成的字段分析重新调用模型。
+> 这一段**没有**服务端任务身份（尚未形成规划检查点），因此段上**不写** `taskId`：不伪造
+> 后端任务、也不宣称 SDK 内部断点续算，归属如实写成"本机按原需求重跑"。
+> 三条入口（输入"继续"、空输入点发送、点卡片上的继续）都经 `restartEarlyAnalysis` 落到
+> 同一条路径，行为一致。
+
+当前实现边界：分析阶段可接收暂停，但取消接收不保证服务端计算已停止；已有任务仍先查询状态。
+写入与回读期间目前禁用中断，尚未实现“当前动作完成并核对后暂停后续动作”。因此不能宣称
+所有执行阶段均可暂停。原生 SDK 会话续算、跨窗格恢复早期引用也不在本次交付内。
+
+### 2026-10-21：WPS 继续分析复用已确认授权
+
+WPS 的 checkOriginalPlanningTarget 原先将对象身份 unknown 与 different 合并拦截，
+一律声称范围已变化；原分析入口已接受的显式范围确认没有被续跑分支消费。宿主为
+同一工作簿/工作表返回新 JS 包装对象时，可因此误拦继续分析。
+
+继续检查点允许在 unknown 时复用已有分析确认：原任务证据键、当前证据键与已确认键
+必须一致，且再次通过共享 checkForAnalysis；证据包括完整路径、表索引、表名及可用
+稳定 ID。无确认、读不到或键变化仍拒绝。different 仍拒绝；unknown 保留原任务并
+如实要求核实，不再声称范围已变化。此规则仅用于分析续跑；取回已完成结果仍保持
+原有严格身份检查，来源指纹、服务端续跑证据、写入校验均未放宽。Excel 没有这条
+WPS 原生对象引用附加闸门，沿用共享授权守卫并做回归。
+
+### 2026-10-21：读取失败不撤销已确认的工作表授权
+
+共享 useAuthorizedTarget 原先在 pause 的所有分支清空 analysisConsent，导致持续
+读取失败耗尽重试后，同一范围恢复可读仍需重复确认。现在 unavailable 默认保留
+原确认键；放行仍需重新读取完整一致证据并匹配原键，核实前停止分析。明确的文件/
+范围变化、显式重新确认要求、以及多次读取之间的证据冲突仍清空确认键。冲突不能
+因界面也使用 unavailable 文案而被当成暂时读取失败。
+
+双端范围提示增加“重新检查”，未知状态不要求重新选择同一范围。recheck 只恢复
+事先登记为分析的回调，不能把 check() 留下的写入回调重新分类成分析后自动执行。
+勾选选择器现有草稿/确认交互未改变；本次解决已确认范围在宿主读取失败后重复失效。
+
+
+### 2026-10-21：勾选即授权（覆盖此前草稿/确认交互）
+
+用户明确要求 Excel / WPS 同步取消额外范围确认。现在每次勾选、取消勾选、全选、清空和模式选择
+都由共享 useImmediateScopeAuthorization 调度自动核验。目录刷新与仅打开选择器不请求新授权；
+收起保留选择。界面选择与已核验授权仍分开存储，仅作为异步核验期间的状态，不再要求用户提交草稿。
+
+每次显式选择递增代数；旧核验跨 await 后必须通过 isCurrent 才能 adopt/bind。选择期间阻止读写和
+后台范围提示，串行收尾接续最后一次选择；失败保留勾选并停止读写，刷新可重试，不自动重放旧请求。
+共享守卫允许显式空范围撤销授权并清除分析确认；固定模式的空选择不回退到活动表。临时宿主读取失败
+沿用前节的已确认键保留规则，真正的文件/表身份变化仍拦截。原有执行、来源指纹、回读及撤销校验保留。
+
+Excel 与 WPS 工作目录两级勾选同样自动核验/提交。Excel 目录会话重建只复用本窗格已核实的同根同表
+授权，不能再次拿旧 sessionId 撤销新会话授权；重建失败、根变化或表缺失均停止。WPS 工作目录服务端
+查询/执行能力没有在本次扩展。两端是否完整实机通过仍须单独验收，自动化不能代替宿主证据。
+
+界面补充：两端授权说明统一移到滚动容器外的固定标题下；底部完成按钮显示“确认”，仅关闭选择面板，
+不触发授权提交或任务执行。目录模式保留底部已选计数，核验状态随顶部说明展示；列表按内容高度排列。
+
+### 2026-10-22：运行中任务恢复读表回执与时间线收尾
+
+Excel 与 WPS 的 running 恢复分支现在同时接回事件时间线和本机工具桥。接回前重新核验
+原文件、已选工作表与来源指纹；状态查询跨 await 后必须再次检查宿主，不能只用查询前证据。
+桥使用原 turnId，逐次执行仍读取当前授权。接回先查询服务端待处理调用，补偿暂停前已接收到
+指针、但回执未完成的情况；只消费权威 pending 调用，不根据历史事件自行重放工具。
+补发事件同时交给进度、结果引用和读表桥，工具回执沿已有幂等路径提交。状态补发 GET 本身
+仍只读；本机工具执行不拥有写表权限。暂停后的自动核对不接回工具或轮询进度。
+
+WPS 点击继续时若任务已完成，转入既有结果取回链；不重新规划。规划完成的结果只进入
+正常结果/预览流程，删除计划继续保留专门的写入闸门。继续中的暂停详情显示“正在继续”，
+同步 ref 防止重复恢复；在核对状态期间再次暂停也走中断处理，不显示为网络失败。
+
+共享时间线对终态补发冻结步骤耗时，终态修正可以更新结论，但不能把步骤重新激活或重新计时。
+WPS 本机消息理解完成即关闭对应步骤，早期用户暂停保持可恢复状态。任务仍在进行时，最后
+一步完成不会让整张卡提前显示已完成。原卡/编号保留，未完成行继续接收事件。
+
+前台计时保存统一起点和 pause/waiting 区间；本机分析停止计为暂停，已知服务端任务的断开
+计为等待进度，因为后台可能仍在运行。两端共用组件展示前台耗时、暂停和等待时间，不把
+它们当作服务端 CPU 时间。终态步骤及已经结束的卡冻结计时。
+
+本节只补齐分析恢复与展示，不实现写入/回读中途暂停、SDK 会话持久化或跨窗格早期恢复。
+双端实现与组件回归已完成；真实 Excel/WPS 原生窗格验收仍待执行。
+
+
+### 2026-10-22：模型额度与长度限制提示
+
+模型失败的 JSON / SSE 服务错误增加稳定 code：MODEL_QUOTA_EXHAUSTED、MODEL_CONTEXT_LIMIT、
+MODEL_OUTPUT_LIMIT、MODEL_BUDGET_LIMIT、MODEL_TURN_LIMIT；错误信封结构不变，两端契约与
+server/app/models.py 同步。HTTP 402 或供应商错误元数据明确说明余额/额度耗尽时才归类为
+额度不足；普通 429 继续表示临时限流，不推断账户余额。硬限制 retryable=false，不自动重试。
+
+SDK 适配器保留最后一次 AssistantMessage 的错误类型，以及失败 ResultMessage / ResultError
+中的状态、错误码、预算/轮数终止原因和输出截断标记。正常回答不作为错误分类依据，供应商
+原始错误内容只用于识别，不进入上述限制提示。SDK 规划步骤在模型错误时发送 failed 终态。
+意图与连接测试入口同样保留额度错误码；不会用泛化的连接失败掩盖额度不足。
+
+Excel 与 WPS 共用 ApiRequestError 和 packages/core/src/modelUsageNotice.ts，将已知 code
+转换为中文原因与操作建议，并保留请求以便处理额度后重试。提醒说明模型调用受限；不能据此
+宣称工作表未写入、写入失败或已经撤销。写入与回读结论由本地执行记录及结果卡提供。本轮不
+新增余额查询接口、不猜测剩余 token、不自动切模型，不改变预览、写入确认及原有恢复边界。

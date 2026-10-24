@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useState, type SetStateAction } from "react";
+import { recordDiagnosticEvent } from "../diagnostics";
+import { useCallback, useEffect, useRef, useState, type SetStateAction } from "react";
 import type {
   FolderCatalog,
   FolderSelection,
@@ -39,19 +40,19 @@ const FOLDER_SHEET_KEYS_KEY = "excelBro.folderSheetKeys";
 export function useScopeSelection() {
   const [toolName, setToolName] = useState("");
   const [toolDescription, setToolDescription] = useState("");
-  /**
-   * 当前草稿里的工作表选择。勾选、取消勾选、全选/清空都只改它 ——
-   * 这些动作**不构成授权**，所以它们不该顺手作废一件正在等待回答的任务。
-   */
+  /** 界面勾选。选择事件由 App 自动核实并提交；后台刷新仅更新目录，不构成授权。 */
   const [selectedSheetNames, setDraftSheetNames] = useState<string[]>([]);
-  /**
-   * **已提交**的数据授权。只有点「确认范围」或明确选用某个范围时才变。
-   *
-   * 它与草稿刻意分开：用户为了看一眼别的表而勾上又取消，不该被当成
-   * "他改了授权"。真正的授权变更必须有一个人明确的确认动作。
-   */
+  /** 已核实的授权。与界面选择分开，防止异步读取期间沿用被取消的勾选。 */
   const [committedSheetNames, setCommittedSheetNames] = useState<string[]>([]);
+  /** 已核实的范围模式，与授权表名同批提交。自动与固定模式不能混用。 */
+  const [committedScopeMode, setCommittedScopeMode] =
+    useState<WorkbookScopeMode>("auto");
   const [selectionConfirmed, setSelectionConfirmed] = useState(false);
+  /** 首读只播种一次；此后"已提交"只能由显式选择的核验结果写。 */
+  const committedSeededRef = useRef(false);
+  /** 现读已提交名单（供"要不要播种"这类"当下事实"判断用，不吃闭包旧值）。 */
+  const committedNamesRef = useRef(committedSheetNames);
+  committedNamesRef.current = committedSheetNames;
   // Exposed selection setters edit a draft, never silently advance authorization.
   const setSelectedSheetNames = useCallback((update: SetStateAction<string[]>) => {
     setDraftSheetNames(update);
@@ -60,6 +61,16 @@ export function useScopeSelection() {
   const [sourceMode, setSourceMode] = useState<SourceMode>("workbook");
   const [workbookScopeMode, setWorkbookScopeMode] =
     useState<WorkbookScopeMode>("auto");
+  // Local diagnostics contain counts/modes only, never workbook names or rows.
+  useEffect(() => {
+    recordDiagnosticEvent({ timestamp: new Date().toISOString(), phase: 'scope_selection',
+      durationMs: 0, modelCalls: 0, status: 'succeeded',
+      scopeSelection: { mode: workbookScopeMode, selectedCount: selectedSheetNames.length,
+        committedMode: committedScopeMode, committedCount: committedSheetNames.length } });
+  }, [workbookScopeMode, selectedSheetNames, committedScopeMode, committedSheetNames]);
+  // Async task cleanup may retain an older scan callback. Read the current mode.
+  const liveScope = useRef({ sourceMode, workbookScopeMode });
+  liveScope.current = { sourceMode, workbookScopeMode };
   const [folderCatalog, setFolderCatalog] = useState<FolderCatalog | null>(() => {
     try {
       const stored = localStorage.getItem(FOLDER_CATALOG_KEY);
@@ -103,21 +114,47 @@ export function useScopeSelection() {
     }
   }, [folderSheetKeys]);
 
-  const applyWorkbookSnapshotSelection = useCallback(
-    (snapshot: WorkbookSnapshot) => {
-      setSelectedSheetNames((current) => {
-        if (sourceMode === "workbook" && workbookScopeMode === "auto") {
-          return [snapshot.activeWorksheet];
-        }
-        const available = new Set(
-          snapshot.worksheets.map((sheet) => sheet.name)
-        );
-        const preserved = current.filter((name) => available.has(name));
-        return preserved.length > 0 ? preserved : [snapshot.activeWorksheet];
-      });
+  /**
+   * 提交一次数据授权：**范围与口径同批写进"已提交"**。
+   *
+   * 这是唯一一条写 `committedSheetNames` / `committedScopeMode` 的路（首读播种除外）。
+   * 守卫（`App` 的 `inspect`）读的就是这两个值：它们必须与守卫基线在**同一次**
+   * 交互里一起推进。分成两步写——先 bind 基线、再等一个 effect 把草稿抄成已提交——
+   * 中间那一帧读到的是"新基线 + 旧范围"，于是用户刚确认完就被判成范围变化。
+   */
+  const commitAuthorizedScope = useCallback(
+    (sheetNames: string[], mode?: WorkbookScopeMode) => {
+      setCommittedSheetNames([...sheetNames]);
+      if (mode) setCommittedScopeMode(mode);
       setSelectionConfirmed(true);
     },
-    [sourceMode, workbookScopeMode]
+    []
+  );
+
+  /**
+   * 重读宿主后刷新草稿。
+   *
+   * **重读不是授权动作**：它只改草稿。唯一的例外是**第一次**读到工作簿
+   * （此前没有任何已提交范围）—— 那时把默认范围记为已提交，否则"打开面板直接
+   * 提问"会被"请先确认数据范围"拦在门口。之后无论是刷新、结构变化还是目录
+   * 刷新，已提交范围都只能由 `commitAuthorizedScope` 改 —— 后台读一次就把
+   * 用户的授权换掉，正是"刚确认完又要求确认"的来源。
+   */
+  const applyWorkbookSnapshotSelection = useCallback(
+    (snapshot: WorkbookSnapshot) => {
+      const fallback = [snapshot.activeWorksheet];
+      const mode = liveScope.current;
+      if (mode.sourceMode !== 'workbook') return;
+      // A catalog refresh is not a selection gesture. Preserve manual choices,
+      // including missing sheets; admission/target guards explain missing targets.
+      if (mode.workbookScopeMode === 'auto') setSelectedSheetNames(fallback);
+      if (!committedSeededRef.current && committedNamesRef.current.length === 0) {
+        committedSeededRef.current = true;
+        setCommittedSheetNames(fallback);
+        setCommittedScopeMode(mode.workbookScopeMode);
+      }
+    },
+    []
   );
 
   /**
@@ -137,43 +174,40 @@ export function useScopeSelection() {
           return [];
         }
       }
-      setCommittedSheetNames(next);
-      setSelectionConfirmed(next.length > 0);
+      if (!next.length) {
+        setSelectionConfirmed(false);
+        return next;
+      }
+      commitAuthorizedScope(next, workbookScopeMode);
       return next;
     },
-    [selectedSheetNames]
+    [selectedSheetNames, workbookScopeMode, commitAuthorizedScope]
   );
 
   /**
-   * 放弃本次范围编辑：草稿回到已提交授权，**已提交授权一字不改**。
+   * 放弃本次范围编辑：草稿回到已提交授权（**包括口径**），已提交授权一字不改。
    *
-   * 这是"我点开只是想看看"的出口 —— 它不该把任何正在等待回答的任务打掉。
+   * 这是"我点开只是想看看"的出口 —— 它不该把任何正在等待回答的任务打掉，
+   * 也不该把"跟随当前 / 选择多个"的口径留在草稿里：口径是授权的一部分，
+   * 留在草稿里会让守卫拿另一套口径去比已提交的范围。
    */
   const cancelScopeEdit = useCallback(() => {
     setSelectedSheetNames(committedSheetNames);
+    setWorkbookScopeMode(committedScopeMode);
     setSelectionConfirmed(committedSheetNames.length > 0);
-  }, [committedSheetNames]);
+  }, [committedSheetNames, committedScopeMode]);
 
   /**
-   * 草稿与已提交授权是否已经不一致。
+   * 草稿与已提交授权是否已经不一致 —— **口径也算**。
    *
-   * 界面据此提示"还有未确认的范围修改"，而不是让用户以为改了就已经生效。
+   * 只比表名是不够的：把"固定多表"改成"跟随当前"（或反过来）同样是换了范围，
+   * 只是换法不一样。口径留在草稿里最危险的一处是**读取**：发送时按草稿口径
+   * 决定读活动表还是读已提交名单，若那时已被放行，就会读一张并没有被授权过的
+   * 活动表。WPS 侧早就是这条判据（`draftMode !== scopeMode`），两端同源。
    */
-  const scopeDraftDirty = folderScopeDraftDirty(
-    selectedSheetNames,
-    committedSheetNames
-  );
-
-  /**
-   * 凡是把范围标成"已确认"的路径，都同步把当前选择记成**已提交授权**。
-   *
-   * 这样既有行为（选自动范围 / 采用当前工作簿 / 选文件夹）都自动获得
-   * "已提交"的语义，不必逐个回调去改；而只改草稿的路径（toggleSheet 等）
-   * 会把 `selectionConfirmed` 置回 false，因此不会走到这里。
-   */
-  useEffect(() => {
-    if (selectionConfirmed) setCommittedSheetNames(selectedSheetNames);
-  }, [selectionConfirmed, selectedSheetNames]);
+  const scopeDraftDirty =
+    folderScopeDraftDirty(selectedSheetNames, committedSheetNames) ||
+    (sourceMode === "workbook" && workbookScopeMode !== committedScopeMode);
 
   const toggleSheet = useCallback((sheetName: string) => {
     setSelectedSheetNames((current) =>
@@ -261,13 +295,23 @@ export function useScopeSelection() {
   );
 
   const adoptCurrentWorkbookScope = useCallback(
-    (_snapshot: WorkbookSnapshot, sheetNames: string[]) => {
+    (
+      _snapshot: WorkbookSnapshot,
+      sheetNames: string[],
+      /**
+       * 这次采用用的是什么口径。默认「固定多表」（旧行为），但"跟随当前"的确认
+       * 也必须把 `auto` 写进已提交 —— 否则守卫会按 `manual` 去读已提交的名字，
+       * 而用户确认的是"跟随活动表"。
+       */
+      mode: WorkbookScopeMode = "manual"
+    ) => {
       setSourceMode("workbook");
-      setWorkbookScopeMode("manual");
+      setWorkbookScopeMode(mode);
       setSelectedSheetNames(sheetNames);
-      setSelectionConfirmed(true);
+      // 草稿与已提交**同批**落地：守卫在这一帧之后立刻就会读到它们。
+      commitAuthorizedScope(sheetNames, mode);
     },
-    []
+    [commitAuthorizedScope]
   );
 
   const chooseFolderScope = useCallback(() => {
@@ -291,7 +335,7 @@ export function useScopeSelection() {
       const selected = selectedSheetNames.filter((name) =>
         available.has(name)
       );
-      return selected.length > 0 ? selected : [snapshot.activeWorksheet];
+      return selected;
     },
     [sourceMode, workbookScopeMode, selectedSheetNames]
   );
@@ -331,9 +375,13 @@ export function useScopeSelection() {
 
     // 已提交授权与显式确认
     committedSheetNames,
+    /** 已提交的**口径**：守卫按它决定"当前范围"读活动表还是读已提交名单。 */
+    committedScopeMode,
     scopeDraftDirty,
     confirmScopeSelection,
     cancelScopeEdit,
+    /** 唯一一条写"已提交授权（范围 + 口径）"的路。 */
+    commitAuthorizedScope,
 
     // 操作
     applyWorkbookSnapshotSelection,

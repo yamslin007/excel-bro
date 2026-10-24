@@ -1,3 +1,5 @@
+import { useEffect } from "react";
+import { useAuthorizedTarget } from "./useAuthorizedTarget";
 // @vitest-environment jsdom
 import { beforeEach, describe, it, expect } from "vitest";
 import { renderHook, act } from "@testing-library/react";
@@ -160,13 +162,52 @@ describe("useScopeSelection", () => {
     expect(result.current.toolDescription).toBe("Description");
   });
 
+  it('任务保留的旧扫描回调不能将后续固定多表选择缩成活动表', () => {
+    const { result } = renderHook(() => useScopeSelection());
+    const oldScan = result.current.applyWorkbookSnapshotSelection;
+    act(() => result.current.applyWorkbookSnapshotSelection(workbook));
+    act(() => result.current.adoptCurrentWorkbookScope(workbook, ['Sheet1', 'Sheet2'], 'manual'));
+    act(() => oldScan({ ...workbook, activeWorksheet: 'Sheet2' }));
+    expect(result.current.workbookScopeMode).toBe('manual');
+    expect(result.current.selectedSheetNames).toEqual(['Sheet1', 'Sheet2']);
+    expect(result.current.committedSheetNames).toEqual(['Sheet1', 'Sheet2']);
+    expect(result.current.scopeDraftDirty).toBe(false);
+  });
+
   it("should apply workbook snapshot selection in auto mode", () => {
     const { result } = renderHook(() => useScopeSelection());
 
     act(() => result.current.applyWorkbookSnapshotSelection(workbook));
 
     expect(result.current.selectedSheetNames).toEqual(["Sheet1"]);
-    expect(result.current.selectionConfirmed).toBe(true);
+    // 首读只**播种**一次默认范围（否则"打开面板直接提问"会被要求先确认），
+    // 但它不是授权动作：`selectionConfirmed` 不再由重读置真。
+    expect(result.current.committedSheetNames).toEqual(["Sheet1"]);
+    expect(result.current.committedScopeMode).toBe("auto");
+    expect(result.current.selectionConfirmed).toBe(false);
+  });
+
+  it("重读宿主只刷新草稿：已提交的范围与口径一字不改", () => {
+    const { result } = renderHook(() => useScopeSelection());
+    const narrowed: WorkbookSnapshot = {
+      ...workbook,
+      worksheets: workbook.worksheets.filter((sheet) => sheet.name === "Sheet1")
+    };
+
+    act(() => result.current.chooseManualScope(workbook));
+    act(() => result.current.setSelectedSheetNames(["Sheet1", "Sheet2"]));
+    act(() => result.current.commitAuthorizedScope(["Sheet1", "Sheet2"], "manual"));
+    expect(result.current.scopeDraftDirty).toBe(false);
+
+    // 宿主重读：目录里少了一张（外部删表 / 换了一份快照）。
+    act(() => result.current.applyWorkbookSnapshotSelection(narrowed));
+
+    // 已提交授权不动 —— 后台读一次就换掉授权，正是"刚确认完又要求确认"的来源。
+    expect(result.current.committedSheetNames).toEqual(["Sheet1", "Sheet2"]);
+    expect(result.current.committedScopeMode).toBe("manual");
+    // 固定选择也不收窄：缺失目标交给准入/身份守卫提示，不擅自代选。
+    expect(result.current.selectedSheetNames).toEqual(["Sheet1", "Sheet2"]);
+    expect(result.current.scopeDraftDirty).toBe(false);
   });
 
   it("should toggle workbook sheets and unconfirm selection", () => {
@@ -428,4 +469,47 @@ describe("useScopeSelection：草稿与已提交授权分开", () => {
     expect(result.current.committedSheetNames).toEqual(["Sheet1", "Sheet2"]);
     expect(result.current.scopeDraftDirty).toBe(false);
   });
+});
+
+// Guard consumers run effects on the FIRST committed render, before a later
+// passive effect can copy draft selection into the committed selection.
+it("adopts an explicitly confirmed workbook scope atomically for guard consumers", () => {
+  const observed: string[][] = [];
+  const { result } = renderHook(() => {
+    const scope = useScopeSelection();
+    useEffect(() => {
+      if (scope.sourceMode === "workbook" && scope.selectionConfirmed) {
+        observed.push([...scope.committedSheetNames]);
+      }
+    }, [scope.sourceMode, scope.selectionConfirmed, scope.committedSheetNames]);
+    return scope;
+  });
+  act(() => result.current.chooseFolderScope());
+  act(() => result.current.adoptCurrentWorkbookScope(workbook, ["Sheet1", "Sheet2"]));
+  expect(observed).toEqual([["Sheet1", "Sheet2"]]);
+  act(() => result.current.toggleSheet("Sheet2"));
+  expect(result.current.committedSheetNames).toEqual(["Sheet1", "Sheet2"]);
+});
+
+it("selecting the already open file does not re-prompt with scope_changed", async () => {
+  const target = { fileKey: "same-workbook", name: "example.xlsx",
+    sheets: [{ id: "1", name: "Sheet1" }, { id: "2", name: "Sheet2" }], selected: ["1", "2"] };
+  const { result } = renderHook(() => {
+    const scope = useScopeSelection();
+    const guard = useAuthorizedTarget({
+      enabled: scope.sourceMode === "workbook" && scope.selectionConfirmed,
+      inspect: async () => ({ ...target, selected: scope.committedSheetNames.map(name =>
+        target.sheets.find(sheet => sheet.name === name)!.id) }),
+      adopt: () => undefined
+    });
+    return { scope, guard };
+  });
+  act(() => result.current.scope.chooseFolderScope());
+  await act(async () => {
+    result.current.guard.bind(target);
+    result.current.scope.adoptCurrentWorkbookScope(workbook, ["Sheet1", "Sheet2"]);
+  });
+  expect(result.current.guard.notice).toBeNull();
+  await act(async () => { expect(await result.current.guard.check()).toBe(true); });
+  expect(result.current.guard.notice).toBeNull();
 });

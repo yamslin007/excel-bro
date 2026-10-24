@@ -68,6 +68,8 @@ export interface TestHostOptions {
    * 生产代码必须在写入前明确拒绝 —— 这里给测试一个构造该情形的注入点。
    */
   conditionalFormatCount?: number;
+  /** Workbook names can prevent full-copy comparison without blocking range writes. */
+  workbookNameCount?: number;
   /** 模拟"目标区域含合并单元格"：`range.getMergedAreasOrNullObject()` 返回非空对象。 */
   mergedAreas?: boolean;
   /**
@@ -184,6 +186,8 @@ type SheetModel = {
    * （真实 Excel 亦然），所以它只该被显式删除操作改动。
    */
   conditionalFormatCount?: number;
+  /** Workbook names can prevent full-copy comparison without blocking range writes. */
+  workbookNameCount?: number;
   /**
    * 附着数据验证的单元格键集合（工作表级状态）。`range.dataValidation.type` 根据
    * 区域内是否有任一格含验证，返回 `"List"`（示例类型）或 `"None"` —— 与真实宿主
@@ -247,6 +251,15 @@ export interface TestOfficeHost {
   ): void;
   /** 换掉文件身份（新的 document 对象，`url` 不同）。 */
   setDocumentUrl(url: string): void;
+  /**
+   * 切换原表的**活动工作表**（用户点了另一张表的标签）。
+   *
+   * 与 `getActiveWorksheet` 读的是同一份事实：只看活动窗口的 `activeSheetId`，
+   * 不自己另记一份"活动表"。
+   */
+  activateSheet(name: string): void;
+  /** 当前活动工作表名（`getActiveWorksheet` 的同一份事实）。 */
+  activeSheetName(): string;
   /** 已打开的窗口名（第一张是原表窗口）。 */
   windowNames(): string[];
   /** 已创建的副本 store 标识（按打开顺序），可与 `cell`/`matrix` 的 store 参数配合。 */
@@ -328,6 +341,29 @@ export interface TestOfficeHost {
     }>,
     store?: TestHostStore
   ): void;
+  /**
+   * 原表当前的表名（按位置顺序）。
+   *
+   * 与 `cell` / `matrix` 同一份账：产品每次 `scan()` 都从 `workbook.worksheets.items`
+   * 读目录，所以这里返回什么，产品下一轮就读到什么。
+   */
+  sheetNames(): string[];
+  /**
+   * 真的从原表目录里移除一张表 —— 模拟"原生删表已经发生"。
+   *
+   * 存在的理由：`Worksheet.delete()` 在替身里是空实现（真实删除走 COM，不经
+   * Office.js），于是"删完之后宿主少一张表"这件事没法靠调用它来表达。有了这个
+   * 入口，测试里的目录变化与产品侧读数就是同一份事实，不用在别处再抄一遍
+   * "少了哪几张表"的声明 —— 抄一份就多一处可能与宿主不一致的假事实。
+   */
+  removeSheet(name: string): void;
+  /**
+   * 往原表目录**末尾**加一张空表 —— 模拟"原地撤销把表放回来了"。
+   *
+   * 与 `removeSheet` 成对：撤销用例先在删除时移走、再在撤销时放回，
+   * 于是"目录里到底有哪些表"始终只有一份事实。
+   */
+  addSheet(name: string): void;
 }
 
 const COLUMN_LIMIT = 16_384;
@@ -1262,7 +1298,17 @@ export function createOfficeTestHost(options: TestHostOptions): TestOfficeHost {
       }),
       getMergedAreasOrNullObject: () =>
         options.mergedAreas ? { isNullObject: false, load: () => undefined } : nullObject(),
-      getSpecialCellsOrNullObject: () => nullObject(),
+      getSpecialCellsOrNullObject: (kind: string) => {
+        if (kind !== "Formulas") return nullObject();
+        const items: Array<{ rowIndex: number; columnIndex: number; rowCount: number; columnCount: number }> = [];
+        for (let row = rect.r0; row <= rect.r1; row++) for (let column = rect.c0; column <= rect.c1; column++) {
+          if (sheet.cells.get(cellKey(row, column))?.formula) {
+            items.push({ rowIndex: row, columnIndex: column, rowCount: 1, columnCount: 1 });
+          }
+        }
+        return { isNullObject: items.length === 0, load: () => undefined,
+          areas: { load: () => undefined, items } };
+      },
       getUsedRangeOrNullObject: () => {
         const used = usedBounds(sheet);
         return used ? wrapRange(book, store, sheet, used) : nullObject();
@@ -1274,12 +1320,16 @@ export function createOfficeTestHost(options: TestHostOptions): TestOfficeHost {
           get items() { return rules.filter(rule => rule.address === bareAddress(rect.r0, rect.c0, rect.r1, rect.c1)); },
           add: (type: string) => {
             const borders = new Map<string, Record<string, unknown>>();
+            const fill: { color?: string } = {};
             const rule = { id: crypto.randomUUID(), address: bareAddress(rect.r0, rect.c0, rect.r1, rect.c1), type,
               custom: { rule: { formula: '' }, load: () => undefined,
-                format: { borders: { getItem: (edge: string) => {
-                  if (!borders.has(edge)) borders.set(edge, {});
-                  return borders.get(edge)!;
-                } } } }, load: () => undefined,
+                format: {
+                  borders: { getItem: (edge: string) => {
+                    if (!borders.has(edge)) borders.set(edge, {});
+                    return borders.get(edge)!;
+                  } },
+                  fill
+                } }, load: () => undefined,
               delete: () => { const index = rules.indexOf(rule); if (index >= 0) rules.splice(index, 1); }
             };
             rules.push(rule); return rule;
@@ -1711,7 +1761,7 @@ export function createOfficeTestHost(options: TestHostOptions): TestOfficeHost {
         names: {
           load: () => undefined,
           items: [] as unknown[],
-          getCount: () => ({ load: () => undefined, value: 0 }),
+          getCount: () => ({ load: () => undefined, value: options.workbookNameCount ?? 0 }),
           add: () => undefined
         },
         pivotTables: { load: () => undefined, items: [] as unknown[] },
@@ -1940,6 +1990,16 @@ export function createOfficeTestHost(options: TestHostOptions): TestOfficeHost {
     setDocumentUrl: (url: string) => {
       documentRef = { url, mode: "ReadWrite" };
     },
+    activateSheet: (sheetName) => {
+      const sheet = originalBook.sheets.find((item) => item.name === sheetName);
+      if (!sheet) throw new Error(`宿主替身：工作表「${sheetName}」不存在`);
+      windows[0].activeSheetId = sheet.id;
+      activeWindowName = windows[0].name;
+    },
+    activeSheetName: () => {
+      const window = windows[0];
+      return window.book.sheets.find((sheet) => sheet.id === window.activeSheetId)?.name ?? "";
+    },
     windowNames: () => windows.map((window) => window.name),
     copyStores: () =>
       windows
@@ -2033,6 +2093,19 @@ export function createOfficeTestHost(options: TestHostOptions): TestOfficeHost {
     setRowHeight: (sheetName, rowIndex, value, store = "original") => {
       const sheet = storeOf(sheetName, store);
       sheet.rowHeights.set(rowIndex, value);
+    },
+    sheetNames: () =>
+      originalBook.sheets
+        .slice()
+        .sort((left, right) => left.position - right.position)
+        .map((sheet) => sheet.name),
+    removeSheet: (sheetName) => {
+      const index = originalBook.sheets.findIndex((sheet) => sheet.name === sheetName);
+      if (index >= 0) originalBook.sheets.splice(index, 1);
+    },
+    addSheet: (sheetName) => {
+      const position = originalBook.sheets.reduce((max, sheet) => Math.max(max, sheet.position), -1) + 1;
+      originalBook.sheets.push(makeSheet(sheetName, position));
     },
     setColumnWidth: (sheetName, columnIndex, value, store = "original") => {
       const sheet = storeOf(sheetName, store);

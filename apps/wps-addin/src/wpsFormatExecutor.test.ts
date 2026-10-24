@@ -158,7 +158,7 @@ describe("WPS 格式动作闭环（预览→执行→回读→撤销）", () => 
     const record = await executeWpsPlan(target.application, prepared);
     expect(target.cell(0, 0).name).toBe("黑体");
     expect(target.cell(0, 0).size).toBe(14);
-    expect(target.cell(0, 0).color).toBe(0xff0000);
+    expect(target.cell(0, 0).color).toBe(0x0000ff);
     expect(target.cell(1, 0).name).toBe("黑体");
     await undoWpsExecution(target.application, record.executionId);
     expect(target.cell(0, 0).name).toBe("宋体");
@@ -213,11 +213,11 @@ describe("WPS 格式动作闭环（预览→执行→回读→撤销）", () => 
     expect(target.cell(0, 0).bold).toBe(false);
   });
 
-  it("setAlignment 带 vertical 明确拒绝（未验证属性不静默忽略）", () => {
+  it("setAlignment 垂直属性读取不到时零写入拒绝", () => {
     const target = formatHost(1, 1);
     expect(() => prepareWpsPlan(target.application, [1], plan([
       { type: "setAlignment", sheet: "明细", range: "A1", horizontal: "center", vertical: "center" }
-    ]))).toThrow(/vertical/i);
+    ]))) .toThrow(/verticalAlignment/);
     // 拒绝后不动工作簿。
     expect(target.cell(0, 0).horizontalAlignment).toBe(1);
   });
@@ -230,14 +230,14 @@ describe("WPS 格式动作闭环（预览→执行→回读→撤销）", () => 
     expect(target.cell(0, 0).rowHeight).toBe(13.5);
   });
 
-  it("setFill/setBorders/autofit 仍拒绝（未接通）", () => {
+  it("缺少填充或边框快照时拒绝；未实现的自适应仍拒绝", () => {
     const target = formatHost(1, 1);
     expect(() => prepareWpsPlan(target.application, [1], plan([
       { type: "setFill", sheet: "明细", range: "A1", color: "#DDEEFF" }
-    ]))).toThrow("当前不执行");
+    ]))).toThrow("无法完整采集");
     expect(() => prepareWpsPlan(target.application, [1], plan([
       { type: "setBorders", sheet: "明细", range: "A1", sides: ["top"] }
-    ]))).toThrow("当前不执行");
+    ]))).toThrow("borderTop");
     expect(() => prepareWpsPlan(target.application, [1], plan([
       { type: "autofit", sheet: "明细", range: "A1" }
     ]))).toThrow("当前不执行");

@@ -1,7 +1,10 @@
 import type { AuthorizedTarget } from "@excel-bro/core/authorizedTarget";
 import { currentOfficeWorkbookIdentity, isEBSystemSheet } from "./excel";
 import { workbookNameFromDocumentUrl } from "./workbookIdentity";
-import { checkAuthorizedTarget } from "@excel-bro/core/authorizedTarget";
+import {
+  authorizedTargetEvidenceKey,
+  checkAuthorizedTarget
+} from "@excel-bro/core/authorizedTarget";
 import { admissionItem, type ScopeAdmissionReport, type ScopeAdmissionReason } from "@excel-bro/core/scopeAdmission";
 
 /** Document-scoped Office metadata only; no cells, used ranges or arbitrary other files. */
@@ -30,7 +33,8 @@ export async function inspectOfficeAuthorizedTarget(selected: readonly string[] 
 export async function officeAnalysisTargetEvidence(target: AuthorizedTarget) {
   const identity = currentOfficeWorkbookIdentity() ?? null;
   if (!target.fileRef || target.fileRef !== Office.context.document || identity !== target.fileKey) return null;
-  return { key: JSON.stringify([identity ?? "document-reference", target.selected]), conclusive: true };
+  // 键必须只由"哪个文件 + 授权了哪些表"决定 —— 用户点选的先后顺序不是身份。
+  return { key: authorizedTargetEvidenceKey(identity ?? "document-reference", target.selected), conclusive: true };
 }
 
 /** The range picker's explicit confirmation shares the same live authorization guard.

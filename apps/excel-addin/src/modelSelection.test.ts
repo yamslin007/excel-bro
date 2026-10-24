@@ -16,27 +16,27 @@ describe("planningReadPolicyForModel", () => {
     expect(planningReadPolicyForModel("claude-agent-sdk", "ifNeeded")).toBe("none");
     expect(planningReadPolicyForModel("claude-agent-sdk:connection-id", "ifNeeded")).toBe("none");
   });
-  it("does not change the original backend's requested policy", () => {
-    expect(planningReadPolicyForModel("connection:id", "ifNeeded")).toBe("ifNeeded");
+  it("uses SDK policy for existing connection IDs too", () => {
+    expect(planningReadPolicyForModel("connection:id", "ifNeeded")).toBe("none");
     expect(planningReadPolicyForModel("connection:id", "none")).toBe("none");
     expect(planningReadPolicyForModel(null, "ifNeeded")).toBe("ifNeeded");
   });
 });
 
 describe("requiresStreamingToolDelivery", () => {
-  it("只有 SDK 适配器需要（取数唯一通道是流式投递的工具请求）", () => {
+  it("SDK 连接需要流式工具投递", () => {
     expect(requiresStreamingToolDelivery("claude-agent-sdk")).toBe(true);
     expect(requiresStreamingToolDelivery("claude-agent-sdk:connection-0001")).toBe(true);
     expect(requiresStreamingToolDelivery("  Claude-Agent-SDK  ")).toBe(true);
   });
 
-  it("普通模型/未选择不需要（仍旧可以退回非流式端点）", () => {
-    expect(requiresStreamingToolDelivery("connection:regular")).toBe(false);
-    expect(requiresStreamingToolDelivery("deepseek-chat")).toBe(false);
+  it("所有有效连接都需要 SDK 流式投递；空选择仍交给模型选择校验", () => {
+    expect(requiresStreamingToolDelivery("connection:regular")).toBe(true);
+    expect(requiresStreamingToolDelivery("deepseek-chat")).toBe(true);
     expect(requiresStreamingToolDelivery(null)).toBe(false);
     expect(requiresStreamingToolDelivery("")).toBe(false);
-    // 前缀相像但不是 SDK 适配器：不许误伤。
-    expect(requiresStreamingToolDelivery("claude-agent-sdkx")).toBe(false);
+    // 目录 ID 不能用来选择另一套 Agent；有效性由模型目录检查。
+    expect(requiresStreamingToolDelivery("claude-agent-sdkx")).toBe(true);
   });
 });
 
@@ -174,5 +174,23 @@ describe("resolveDisplayedModelId", () => {
     expect(
       resolveDisplayedModelId([{ id: "local", available: true }], "local", "local")
     ).toBe("");
+  });
+});
+
+
+describe("SDK purpose-aware selection", () => {
+  const catalogue = [
+    { id: "connection:old", available: true, agentAvailable: false, formulaAvailable: true },
+    { id: "connection:sdk", available: true, agentAvailable: true, formulaAvailable: false }
+  ];
+  it("does not silently replace an existing formula-only choice with another provider", () => {
+    expect(chooseAvailableModel(catalogue, "connection:old", "connection:sdk")).toBe("");
+  });
+  it("allows an explicit compatible selection and excludes formula-only defaults", () => {
+    expect(chooseAvailableModel(catalogue, "connection:old", null, "connection:sdk")).toBe("connection:sdk");
+    expect(chooseAvailableModel(catalogue, "", "connection:old")).toBe("connection:sdk");
+  });
+  it("migrates the old SDK alias to the exact same connection", () => {
+    expect(chooseAvailableModel(catalogue, "claude-agent-sdk:sdk", null)).toBe("connection:sdk");
   });
 });

@@ -20,6 +20,16 @@
  * 出站 body** 里没有它 —— 顺序反过来就是自欺（body 里本来就没有，断言恒真）。
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
+
+/**
+ * 继续请求的现场证据。协议里是**必填**：省略就不再等于"跳过比对"，而是 422。
+ * 这些用例只关心续跑通道本身，所以用一份固定的、与任务记录一致的证据。
+ */
+const TEST_CONTINUATION_EVIDENCE = {
+  workbookIdentity: "url:https://example.invalid/test.xlsx",
+  authorizedSheetNames: ["Sheet1"],
+  sourceVerification: "not_collected" as const
+};
 import {
   consumeWpsPlanningStream,
   continueWpsPlanning,
@@ -223,7 +233,7 @@ describe("CAP-02 状态查询与按钮推导", () => {
     expect(normalized.status).toBe("failed");
   });
 
-  it("无检查点时给「重新读取并生成预览」，不给「继续任务」（变异点：乐观放行）", () => {
+  it("无检查点时给「重新读取并生成预览」，不给「继续分析」（变异点：乐观放行）", () => {
     const decision = planningResumeDecision({
       status: "waiting_user",
       canContinue: true,
@@ -235,7 +245,7 @@ describe("CAP-02 状态查询与按钮推导", () => {
     expect(decision.actionLabel).not.toContain("继续");
   });
 
-  it("有检查点且服务端允许 → 才给「继续任务」", () => {
+  it("有检查点且服务端允许 → 才给「继续分析」", () => {
     const decision = planningResumeDecision({
       status: "waiting_user",
       canContinue: true,
@@ -270,7 +280,7 @@ describe("CAP-02 状态查询与按钮推导", () => {
     // 服务端只回了"我有一个 waiting_user 任务"，**没有** canContinue、
     // 没有 pauseType、没有 result —— 这就是"问到了状态，但现场不完整"。
     // 唯一正确的动作是重新读取并生成预览；若 hasCheckpoint 被写成恒真，
-    // 这里会放行出一个"继续任务"按钮，用户点下去只会重复规划。
+    // 这里会放行出一个"继续分析"按钮，用户点下去只会重复规划。
     const status = normalizeWpsPlanningStatus("turn-1", {
       status: "waiting_user",
       revision: 2,
@@ -355,6 +365,7 @@ describe("CAP-02 查询与继续走真实 HTTP", () => {
       return sseResponse(frame("result", { kind: "answer", provider: "model", message: "完成", resultContext: null }));
     }));
     const outcome = await continueWpsPlanning({
+      ...TEST_CONTINUATION_EVIDENCE,
       turnId: "turn-1",
       expectedRevision: 4,
       requestId: "plan-continue-abc",
@@ -391,7 +402,8 @@ describe("CAP-02 查询与继续走真实 HTTP", () => {
       JSON.stringify({ detail: { code: "PLANNING_REVISION_CONFLICT", message: "版本已变化", retryable: false } }),
       { status: 409 }
     )));
-    await expect(continueWpsPlanning({ turnId: "t", expectedRevision: 1, requestId: "r", afterSequence: 0 }))
+    await expect(continueWpsPlanning({ ...TEST_CONTINUATION_EVIDENCE,
+      turnId: "t", expectedRevision: 1, requestId: "r", afterSequence: 0 }))
       .rejects.toMatchObject({ code: "PLANNING_REVISION_CONFLICT", status: 409 });
   });
 });
@@ -413,6 +425,7 @@ describe("CAP-02 SDK 适配器：无流式工具投递能力时明确拒绝", ()
     await expect(streamWpsPlanning({ modelId: "claude-agent-sdk" }, "turn-error"))
       .rejects.toMatchObject({ status, code: "TASK_STATE_CORRUPT", message: "任务数据库损坏" });
     await expect(continueWpsPlanning({ turnId: "turn-error", expectedRevision: 1,
+      ...TEST_CONTINUATION_EVIDENCE,
       requestId: "continue-error", afterSequence: 0, modelId: "claude-agent-sdk" }))
       .rejects.toMatchObject({ status, code: "TASK_STATE_CORRUPT" });
     expect(fetchMock).toHaveBeenCalledTimes(2);
@@ -443,6 +456,7 @@ describe("CAP-02 SDK 适配器：无流式工具投递能力时明确拒绝", ()
 
     await expect(
       continueWpsPlanning({
+        ...TEST_CONTINUATION_EVIDENCE,
         turnId: "turn-sdk",
         expectedRevision: 2,
         requestId: "r-1",
@@ -452,7 +466,7 @@ describe("CAP-02 SDK 适配器：无流式工具投递能力时明确拒绝", ()
     ).rejects.toMatchObject({ code: "streaming_tool_delivery_unavailable" });
   });
 
-  it("普通模型在同样的 404 下不被这个闸拦住（仍旧报结构化请求错误）", async () => {
+  it("旧连接 ID 同样走 SDK：404 时明确拒绝无工具投递的链路", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response(
       JSON.stringify({ detail: { code: "PLANNING_UNKNOWN", message: "旧后端", retryable: false } }),
       { status: 404 }
@@ -463,7 +477,7 @@ describe("CAP-02 SDK 适配器：无流式工具投递能力时明确拒绝", ()
         { turnId: "turn-1", prompt: "统计", workbook: {}, dataResults: [], modelId: "connection:regular" },
         "turn-1"
       )
-    ).rejects.toMatchObject({ code: "PLANNING_UNKNOWN", status: 404 });
+    ).rejects.toMatchObject({ code: "streaming_tool_delivery_unavailable" });
   });
 });
 
@@ -577,6 +591,7 @@ describe("CAP-02 隐私：源值只留本端", () => {
       return sseResponse(frame("paused", pauseResult));
     }));
     const outcome = await continueWpsPlanning({
+      ...TEST_CONTINUATION_EVIDENCE,
       turnId: sentinel,
       expectedRevision: 1,
       requestId: "r",
@@ -586,4 +601,15 @@ describe("CAP-02 隐私：源值只留本端", () => {
     expect(bodies[0]).not.toContain("prompt");
     expect(isPlanningPause(outcome)).toBe(true);
   });
+});
+
+
+it("cancels a stalled reader when the host fetch does not propagate abort", async () => {
+  const cancelled = vi.fn();
+  const response = new Response(new ReadableStream({ cancel: cancelled }));
+  const controller = new AbortController();
+  const work = consumeWpsPlanningStream(response, "turn-stalled", { signal: controller.signal });
+  controller.abort();
+  await expect(work).rejects.toMatchObject({ name: "AbortError" });
+  expect(cancelled).toHaveBeenCalledOnce();
 });

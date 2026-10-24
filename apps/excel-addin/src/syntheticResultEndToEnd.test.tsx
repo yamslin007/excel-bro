@@ -768,9 +768,9 @@ async function setAuthorizedScope(
     const selected = button.getAttribute("aria-pressed") === "true";
     if (selected !== names.includes(name)) fireEvent.click(button);
   }
-  const commit = view.container.querySelector<HTMLButtonElement>(".scope-confirm");
+  const commit = view.container.querySelector<HTMLButtonElement>(".scope-close");
   if (!commit) throw new Error("范围「确认」按钮尚未出现");
-  await waitFor(() => expect(commit.disabled).toBe(false));
+  await waitFor(() => expect(view.container.querySelector(".scope-close")?.getAttribute("data-scope-pending")).toBe("false"));
   fireEvent.click(commit);
   await waitFor(() => expect(view.container.querySelector(".scope-popover")).toBeNull());
 }
@@ -780,12 +780,16 @@ const text = (view: ReturnType<typeof render>) => view.container.textContent ?? 
 async function clickRunOnExcel(view: ReturnType<typeof render>) {
   const button = await waitFor(() => {
     const found = [...view.container.querySelectorAll("button")].find(
-      (candidate) => candidate.textContent === "执行到 Excel"
+      (candidate) => candidate.textContent === "确认变更"
     ) as HTMLButtonElement | undefined;
-    if (!found) throw new Error("「执行到 Excel」按钮尚未出现");
+    if (!found) throw new Error("结果审阅的确认按钮尚未出现");
     return found;
   });
+  await waitFor(() => expect(button.disabled).toBe(false));
+  const writes = host.originalWrites().length;
   fireEvent.click(button);
+  await waitFor(() => expect(view.queryByRole('button', { name: '确认变更' })).toBeNull());
+  expect(host.originalWrites()).toHaveLength(writes);
   return button;
 }
 
@@ -800,22 +804,13 @@ describe("通用合成案例 · 第 2 段：结果计划 → 确认写回 → �
       ["", "", ""]
     ]);
 
+    const before = host.originalWrites().length;
     const view = await sendSyntheticPlan(syntheticResultPlan());
 
     // 异常明细随计划抵达界面（不静默丢弃）。
     for (const warning of EXPECTED_DETAIL_WARNINGS) {
       expect(text(view)).toContain(warning);
     }
-    // 写前：一个单元格都没动。
-    const before = host.originalWrites().length;
-    expect(host.matrix(TARGET, "A1:C5", "original")).toEqual([
-      ["", "", ""],
-      ["", "", ""],
-      ["", "", ""],
-      ["", "", ""],
-      ["", "", ""]
-    ]);
-
     await clickRunOnExcel(view);
 
     // 只写目标表：两张来源表一个单元格都没动。

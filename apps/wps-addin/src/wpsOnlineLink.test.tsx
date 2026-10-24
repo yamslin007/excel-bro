@@ -12,9 +12,10 @@
  *   → 读**有状态宿主替身** → 真实 `/receipt` 回执 → 服务端登记数据集
  *   → `run_python_analysis` → **真实验证过的 Docker 隔离执行器**算出结果
  *   → 登记结果引用 → 真实 `submit_result_plan` 编译白名单计划
- *   → 规划流把计划交回面板 → 面板预览（确认前零写入）
- *   → 用户点「生成右侧副本并排审阅」→「确认写回原表」→ 产品执行器写回
- *   → 产品回读核对 → 用户点「↶ 撤销本次执行」→ 目标区域逐格还原。
+ *   → 规划流把计划交回面板 → 面板在**既有授权内执行到主表**（先执行、后审阅）
+ *   → 固定操作条给出「双视图对比 / 放弃变更 / 确认变更」→ 用户点「确认变更」
+ *   （只接受结果、撤下本次标记，不再写一遍）→ 产品回读核对
+ *   → 用户点「↶ 撤销本次执行」→ 目标区域逐格还原。
  *
  * 允许的替身（仅此两类）：
  *
@@ -41,6 +42,7 @@
 import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { transferableAbortController } from "node:util";
 
 import scenario from "../../../config/online_link_scenario.json";
 import WpsAgentPanel from "./WpsAgentPanel";
@@ -405,16 +407,17 @@ function cardUndoButton(container: HTMLElement): HTMLButtonElement | null {
 }
 
 /**
- * 审阅卡里的「我已核对副本」确认项。
+ * 新流程里的「确认变更」：它**只接受当前结果并撤下本次审阅标记**，不再写一遍。
  *
- * 写回入口在勾选前是**禁用**的（确认框是真闸）：不勾就点，写入会被拦下、
- * 原表一格不写 —— 所以走完写回链路前必须先勾这里。
+ * 旧的「生成右侧副本并排审阅 → 勾选我已核对副本 → 确认写回原表」三步已经不存在：
+ * 计划就绪即在既有授权内执行到主表，随后由固定操作条承担「双视图 / 放弃 / 确认」。
+ * 所以在线链路里"写入发生"的观测点从"点确认写回"前移到"审阅条出现"。
  */
-async function acknowledgeCopy(container: HTMLElement): Promise<void> {
-  const review = container.querySelector<HTMLElement>(".wps-native-review-status");
-  const checkbox = review?.querySelector<HTMLInputElement>('input[type="checkbox"]') ?? null;
-  if (!checkbox) throw new Error("审阅卡里应有「我已核对副本」确认项");
-  if (!checkbox.checked) await click(checkbox);
+async function confirmReview(container: HTMLElement): Promise<void> {
+  const confirm = findButton(container, "确认变更");
+  if (!confirm) throw new Error("固定操作条里应有「确认变更」：" + snapshotText(container));
+  await click(confirm);
+  await settle();
 }
 
 async function type(element: HTMLTextAreaElement | null, value: string): Promise<void> {
@@ -440,6 +443,8 @@ function snapshotText(container: HTMLElement): string {
 }
 
 beforeEach(() => {
+  // Keep real HTTP cancellation compatible with Node fetch in the jsdom test realm.
+  vi.stubGlobal('AbortController', transferableAbortController().constructor);
   localStorage.clear();
   vi.clearAllMocks();
   currentHost = createWpsHostDouble(
@@ -454,6 +459,7 @@ afterEach(() => {
   mounted = [];
   document.body.innerHTML = "";
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 describe.skipIf(!ONLINE)("WPS 在线连续集成", () => {
@@ -473,33 +479,23 @@ describe.skipIf(!ONLINE)("WPS 在线连续集成", () => {
 
     // 预览期：来源与目标一个单元格都没动（审阅副本上的试写另计）。
     await until(
-      () => findButton(container, "生成右侧副本并排审阅") !== null,
-      () => "应出现写入计划预览（生成右侧副本并排审阅）：" + snapshotText(container)
+      () => findButton(container, "确认变更") !== null,
+      () => "应在既有授权内执行到主表并给出审阅入口：" + snapshotText(container)
     );
-    expect(currentHost.writes()).toBe(0);
+    /*
+     * 新流程里"写入"发生在**审阅之前**（用户已明确授权"先执行、后审阅"），
+     * 所以"预览期零写入"这句老断言不再成立 —— 它描述的是已被移除的旧流程。
+     * 换成同一件事在新流程下的观测点：只写目标区，来源表一格未动，且不建副本。
+     */
     expect(currentHost.copiedSheets()).toHaveLength(0);
     expect(currentHost.matrix(MEMBERS)).toEqual(scenario.memberRows);
     expect(currentHost.matrix(ORDERS)).toEqual(scenario.orderRows);
-    expect(currentHost.matrix(TARGET).flat().every((value) => value === null || value === "")).toBe(true);
-    // 计划里的值来自服务端隔离执行（不是测试常量）：预览文案带目标表名。
+    expect(currentHost.writes()).toBeGreaterThan(0);
+    // 计划里的值来自服务端隔离执行（不是测试常量）：执行文案带目标表名。
     expect(container.textContent).toContain(TARGET);
 
-    // 副本只承载**写入目标**那一张表，绝不复制整本工作簿。
-    await click(findButton(container, "生成右侧副本并排审阅"));
-    await until(
-      () => findButton(container, "确认写回原表") !== null,
-      () => "审阅副本应生成并给出确认写回入口：" + snapshotText(container)
-    );
-    expect(currentHost.copiedSheets()).toEqual([TARGET]);
-    expect(currentHost.writes()).toBe(0);
-    expect(currentHost.copyWrites()).toBeGreaterThan(0);
-    // 两张来源表在预览后仍未改变。
-    expect(currentHost.matrix(MEMBERS)).toEqual(scenario.memberRows);
-    expect(currentHost.matrix(ORDERS)).toEqual(scenario.orderRows);
-
-    // 真实确认 → 产品执行器写回 → 回读核对。
-    await acknowledgeCopy(container);
-    await click(findButton(container, "确认写回原表"));
+    // 确认只接受结果、不再写一遍：目标区仍是执行后的那一版。
+    await confirmReview(container);
     await until(
       () => container.querySelector(".wps-verification-card") !== null,
       () => "写入后应出现执行结果卡：" + snapshotText(container)
@@ -521,7 +517,7 @@ describe.skipIf(!ONLINE)("WPS 在线连续集成", () => {
     expect(undo, "执行结果卡里必须挂可用的撤销按钮").not.toBeNull();
     await click(undo);
     await until(
-      () => container.textContent?.includes("已撤销并核对恢复") ?? false,
+      () => container.textContent?.includes("已撤销并恢复") ?? false,
       () => "撤销后应显示已撤销并核对恢复：" + snapshotText(container)
     );
     expect(currentHost.matrix(TARGET).flat().every((value) => value === null || value === "")).toBe(true);
@@ -549,16 +545,10 @@ describe.skipIf(!ONLINE)("WPS 在线连续集成", () => {
     await type(second.querySelector("textarea"), scenario.prompt);
     await submit(second.querySelector("textarea"));
     await until(
-      () => findButton(second, "生成右侧副本并排审阅") !== null,
-      () => "（第二轮）应出现写入计划预览：" + snapshotText(second)
+      () => findButton(second, "确认变更") !== null,
+      () => "（第二轮）应执行到主表并给出审阅入口：" + snapshotText(second)
     );
-    await click(findButton(second, "生成右侧副本并排审阅"));
-    await until(
-      () => findButton(second, "确认写回原表") !== null,
-      () => "（第二轮）审阅副本应生成：" + snapshotText(second)
-    );
-    await acknowledgeCopy(second);
-    await click(findButton(second, "确认写回原表"));
+    await confirmReview(second);
 
     await until(
       () => second.querySelector(".wps-verification-card") !== null,

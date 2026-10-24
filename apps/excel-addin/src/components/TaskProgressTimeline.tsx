@@ -1,4 +1,9 @@
-import { useId, useLayoutEffect, useRef, useState } from "react";
+import { timelineDurations, isTerminalStatus } from "@excel-bro/core/activityTimeline";
+import { latestPythonCode } from "@excel-bro/core/pythonCodeArtifact";
+import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
+import { PrePlanningPauseCard } from "./PrePlanningPauseCard";
+import PythonCodeBlock from "./PythonCodeBlock";
+import { PYTHON_CODE_LIMITS } from "../contracts";
 import type {
   TaskProgressPhase,
   TaskProgressStatus,
@@ -10,10 +15,31 @@ import type {
   ActivityStep
 } from "../hooks/useActivityProgress";
 
+/**
+ * 这一段回复在对话里的位置信息。
+ *
+ * 它**只是展示**：续跑段不重排编号，历史段提供"查看后续进展"的定位入口。
+ * 任务身份、步骤身份、事件序号与写入回执都不经过这里。
+ */
+export interface ActivitySegmentView {
+  /** 这一段是接着原任务继续的（不显示"步骤 1"这种重排编号）。 */
+  continuesTask?: boolean;
+  /** 这一段已被后续回复接续：给出轻量定位入口。 */
+  onShowLater?: () => void;
+  /** 定位入口的文案，例如「查看后续进展」。 */
+  laterLabel?: string;
+  /** 这一段是当前活动的展示位置。 */
+  live?: boolean;
+}
+
 interface TaskProgressTimelineProps {
   log: ActivityLog;
   live?: boolean;
   onStop?: () => void;
+  onContinue?: () => void;
+  continueBusy?: boolean;
+  continuationError?: string;
+  segment?: ActivitySegmentView;
 }
 
 const LONG_CONTENT_HEIGHT = 480;
@@ -40,7 +66,7 @@ const STATUS_LABELS: Record<TaskProgressStatus, string> = {
 
 const OUTCOME_LABELS: Record<ActivityOutcome, string> = {
   completed: "已完成",
-  awaiting_input: "等待确认",
+  awaiting_input: "等待下一步操作",
   warning: "需要注意",
   failed: "执行失败",
   cancelled: "已取消",
@@ -101,8 +127,22 @@ function hasStepExplanation(step: ActivityStep): boolean {
 export function TaskProgressTimeline({
   log,
   live = false,
-  onStop
+  onStop,
+  onContinue,
+  continueBusy = false,
+  continuationError,
+  segment
 }: TaskProgressTimelineProps) {
+  const [clock, setClock] = useState(Date.now);
+  useEffect(() => {
+    if (!live) return;
+    setClock(Date.now());
+    const timer = window.setInterval(() => setClock(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [live]);
+  const origin = log.timelineStartedAt ?? clock - log.totalMs;
+  const durations = timelineDurations(log, origin,
+    log.timelineStartedAt !== undefined && live ? clock : origin + log.totalMs);
   const collapseCompletedChat = !live && log.outcome === "completed" && log.defaultCollapsed === true;
   const [expanded, setExpanded] = useState(!collapseCompletedChat);
   // WPS reuses the live card; fold only on this completed-chat transition.
@@ -123,13 +163,25 @@ export function TaskProgressTimeline({
   );
   const lastStep = log.steps.length > 0 ? log.steps[log.steps.length - 1] : undefined;
   const overallStatus: ActivityOutcome | TaskProgressStatus =
-    log.outcome ?? (lastStep ? stepStatus(lastStep) : "progress");
+    log.outcome ?? (live ? "progress" : lastStep ? stepStatus(lastStep) : "progress");
   const overallLabel =
-    log.outcome != null
+    !live && segment?.onShowLater ? "本段已结束 · 已接续" :
+    !live && log.outcome === "awaiting_input" && log.steps.some(step =>
+      step.id === "preflight-plan" && step.status === "completed") ? "预览已生成 · 待确认写入" :
+    continueBusy && onContinue ? "正在继续" : onContinue ? "已暂停" : log.outcome != null
       ? OUTCOME_LABELS[log.outcome]
       : STATUS_LABELS[overallStatus as TaskProgressStatus];
   const processLabel =
-    log.outcome === "awaiting_input" ? "需求分析过程" : "执行过程";
+    segment?.continuesTask ? "接续过程" : log.outcome === "awaiting_input"
+      ? "需求分析过程"
+      : segment?.continuesTask ? "接续过程" : "执行过程";
+  /**
+   * 这一段展示的 Python 代码工件。
+   *
+   * 从步骤里取（最后一条带工件的步骤胜出），不是从文案里猜：代码块要回答的是
+   * "这次真的跑了哪段代码"，只能来自事件携带的工件身份与版本。
+   */
+  const pythonCode = latestPythonCode(log.steps);
 
   useLayoutEffect(() => {
     if (!expanded) {
@@ -180,14 +232,29 @@ export function TaskProgressTimeline({
               <i />
             </span>
           )}
-          <strong>
-            {processLabel} · {log.steps.length} 步 · {formatElapsed(log.totalMs)}
+          <strong title="本段实际用时；阶段与工具可能重叠，步骤耗时不能相加。">
+            {processLabel} · {log.steps.length} 步 · {formatElapsed(durations.activeMs)}
           </strong>
+          {(durations.pausedMs > 0 || durations.waitingMs > 0) && (
+            <small className="task-progress-duration-breakdown" title="本段停止时的计时快照；等待进度仅表示未接收进度的时间，不证明后台正在运行或已暂停。">
+              暂停 {formatElapsed(durations.pausedMs)} · 等待进度 {formatElapsed(durations.waitingMs)}
+            </small>
+          )}
           <span className="task-progress-overall">
             {overallLabel}
           </span>
         </div>
         <div className="task-progress-actions">
+          {segment?.onShowLater && (
+            <button
+              type="button"
+              className="task-progress-jump"
+              onClick={segment.onShowLater}
+            >
+              {segment.laterLabel ?? "查看后续进展"} →
+            </button>
+          )}
+          {onContinue && <PrePlanningPauseCard busy={continueBusy} error={continuationError} onContinue={onContinue} />}
           {onStop && (
             <button
               type="button"
@@ -226,30 +293,36 @@ export function TaskProgressTimeline({
           <ol className="activity-steps">
             {log.steps.map((step, index) => {
               const status = stepStatus(step);
+              const segmentStopped = status === "warning" && !!step.id &&
+                log.closedByFinish?.includes(step.id) === true;
               const target = formatTarget(step.target);
               const fallback = hasStepExplanation(step)
                 ? null
-                : STATUS_LABELS[status];
+                : segmentStopped ? "本段已停止接收进度，完成情况以后续进展为准。" : STATUS_LABELS[status];
               return (
                 <li
                   key={step.id ?? step.label + "-" + index}
-                  data-status={status}
+                  data-status={segmentStopped ? "interrupted" : status}
                 >
                   <span
                     className="activity-step-check"
-                    data-status={status}
-                    aria-label={STATUS_LABELS[status]}
+                    data-status={segmentStopped ? "interrupted" : status}
+                    aria-label={segmentStopped ? "本段已中断" : STATUS_LABELS[status]}
                   >
-                    {STATUS_ICONS[status]}
+                    {segmentStopped ? "Ⅱ" : STATUS_ICONS[status]}
                   </span>
                   <div className="activity-step-body">
                     <div className="activity-step-title-row">
-                      <span className="activity-step-index">{index + 1}</span>
+                      {!segment?.continuesTask && (
+                        <span className="activity-step-index">{index + 1}</span>
+                      )}
                       <strong className="activity-step-label">
                         {step.label}
+                        {step.id === "planning.model" && "（整体阶段，包含工具调用）"}
                       </strong>
                       <span className="activity-step-time">
-                        {formatElapsed(step.elapsedMs)}
+                        {formatElapsed(live && !log.excludedKind && !isTerminalStatus(step.status) && step.startedAt !== undefined
+                          ? Math.max(0, clock - step.startedAt) : step.elapsedMs)}
                       </span>
                     </div>
                     <div className="activity-step-badges">
@@ -340,6 +413,13 @@ export function TaskProgressTimeline({
               );
             })}
           </ol>
+          {pythonCode && (
+            <PythonCodeBlock
+              artifact={pythonCode}
+              taskId={log.operationId ?? null}
+              limits={PYTHON_CODE_LIMITS}
+            />
+          )}
           {unmatchedTraces.length > 0 && (
             <div className="activity-traces persisted">
               <strong>判断依据与纠偏记录</strong>

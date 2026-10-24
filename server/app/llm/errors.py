@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import json
+
+from ..models import ModelUsageErrorCode
+
 
 class LLMError(RuntimeError):
     """Base exception for failures raised by an LLM adapter."""
@@ -21,6 +25,58 @@ class LLMResponseError(LLMError):
     pass
 
 
+MODEL_USAGE_MESSAGES: dict[ModelUsageErrorCode, str] = {
+    "MODEL_QUOTA_EXHAUSTED": "模型 API 余额不足或调用额度已用尽。请在模型服务商处检查余额、调用额度或套餐，恢复后重试，或在模型设置中切换可用连接。",
+    "MODEL_CONTEXT_LIMIT": "本次请求超过模型的上下文长度上限。请缩短对话或拆分任务后重试。",
+    "MODEL_OUTPUT_LIMIT": "本次模型输出达到长度上限，未获得完整结果。请拆分任务或调整模型输出上限后重试。",
+    "MODEL_BUDGET_LIMIT": "本次任务达到配置的模型费用上限。请检查任务预算设置，或拆分任务后重试。",
+    "MODEL_TURN_LIMIT": "本次任务达到模型调用轮数上限。请拆分任务后重试。",
+}
+
+
+class LLMUsageLimitError(LLMResponseError):
+    """An actionable limit; repeating the same request cannot resolve it."""
+
+    def __init__(self, code: ModelUsageErrorCode) -> None:
+        self.code = code
+        super().__init__(MODEL_USAGE_MESSAGES[code])
+
+
+def model_usage_error_code(body: str) -> ModelUsageErrorCode | None:
+    """Classify only provider failure metadata, never successful model output.
+
+    Inspect known error fields rather than echoed prompts/request data. Raw
+    payloads are used only for classification and never in the usage notice.
+    """
+    bounded = body[:16384]
+    try:
+        payload = json.loads(bounded)
+    except (ValueError, TypeError):
+        payload = None
+    if isinstance(payload, dict):
+        error = payload.get("error", payload)
+        if isinstance(error, dict):
+            bounded = " ".join(str(error.get(key, "")) for key in ("code", "type", "message"))
+        elif isinstance(error, str):
+            bounded = error
+        else:
+            bounded = ""
+    text = bounded.lower()
+    if any(marker in text for marker in (
+        "insufficient_quota", "insufficient_balance", "insufficient balance",
+        "billing_error", "insufficient credits",
+        "billing_hard_limit_reached", "credit balance is too low",
+        "exceeded your current quota", "余额不足", "额度已用尽", "额度不足",
+    )):
+        return "MODEL_QUOTA_EXHAUSTED"
+    if any(marker in text for marker in (
+        "context_length_exceeded", "maximum context length", "prompt is too long",
+        "上下文长度超限",
+    )):
+        return "MODEL_CONTEXT_LIMIT"
+    return None
+
+
 _STATUS_HINTS: dict[int, str] = {
     401: "模型服务拒绝了 API Key（未授权），请检查密钥是否正确或已过期。",
     402: "模型服务商余额不足，请充值或在设置里切换到其他模型连接。",
@@ -33,16 +89,16 @@ class LLMHTTPStatusError(LLMError):
     def __init__(self, status_code: int, body: str) -> None:
         self.status_code = status_code
         self.body = body.strip()[:300]
+        self.usage_code: ModelUsageErrorCode | None = (
+            "MODEL_QUOTA_EXHAUSTED" if status_code == 402 else
+            model_usage_error_code(body) if status_code in {400, 403, 429} else None
+        )
         self.retry_after: float | None = None
         super().__init__(self._compose_message())
 
     def _compose_message(self) -> str:
-        """可行动的状态码给中文提示，其余透传原始 body 便于排查。
-
-        402 之类的错误上游只回一句英文 JSON（如 Insufficient Balance），直接透给
-        用户看不出该干什么。提示放在前面，原始 body 附在括号里不丢排查信息。
-        """
-        hint = _STATUS_HINTS.get(self.status_code)
+        """Known limits get safe actionable text, with no provider body attached."""
+        hint = MODEL_USAGE_MESSAGES[self.usage_code] if self.usage_code else _STATUS_HINTS.get(self.status_code)
         if hint:
             return f"{hint}（模型服务返回 HTTP {self.status_code}）"
         return (
@@ -52,4 +108,4 @@ class LLMHTTPStatusError(LLMError):
 
     @property
     def retryable(self) -> bool:
-        return self.status_code == 429 or self.status_code >= 500
+        return self.usage_code is None and (self.status_code == 429 or self.status_code >= 500)

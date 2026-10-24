@@ -20,7 +20,7 @@
     "test:wps": "npm run test --workspace excel-bro-wps",
     "publish:wps": "npm run publish --workspace excel-bro-wps",
     "test:core": "npm run test --workspace @excel-bro/core",
-    "dev:server": "python -m uvicorn server.app.main:app --host 127.0.0.1 --port 8765 --reload",
+    "dev:server": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start_claude_sdk_server.ps1",
     "test:server": "python -m pytest server/tests --basetemp=.tmp-pytest",
     "test:cross-process": "node scripts/run_cross_process_chain.mjs",
     "test:online": "node scripts/run_online_link.mjs",

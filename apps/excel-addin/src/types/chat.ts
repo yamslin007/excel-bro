@@ -10,6 +10,7 @@ import type {
 } from "../contracts";
 import type { CrossTableMatchProposal } from "../crossTableFormula";
 import type { ActivityLog } from "../hooks/useActivityProgress";
+import type { ReplySegment } from "@excel-bro/core/replySegments";
 import type { SourceMode } from "./workbook";
 
 export type Status = "idle" | "scanning" | "planning" | "tooling" | "executing";
@@ -76,6 +77,14 @@ export interface ChatMessage {
   verification?: VerificationReport;
   clarification?: MessageClarification;
   activityLog?: ActivityLog;
+  /**
+   * 这条助手回复属于哪一段展示（与执行身份分开）。
+   *
+   * 一个任务可以有多段回复（暂停 → 继续 → 再暂停 → 再继续），同一时刻只有一段
+   * 是 `live`。段身份**不**替代 `operationId` / `requestId`：步骤身份、事件序号、
+   * 结果引用与写入回执仍然只认执行身份。
+   */
+  replySegment?: ReplySegment;
   /** 批量工作表操作超出授权范围时，用结构化引导指向输入框上方的范围入口。 */
   scopeSelectionGuidance?: {
     keeperName: string;

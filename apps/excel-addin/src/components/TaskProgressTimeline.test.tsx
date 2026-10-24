@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ActivityLog } from "../hooks/useActivityProgress";
 import { TaskProgressTimeline } from "./TaskProgressTimeline";
@@ -35,6 +35,46 @@ function sampleLog(): ActivityLog {
 }
 
 describe("TaskProgressTimeline", () => {
+  it("freezes the entire stopped segment even while backend status is unknown", () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(2000);
+      const { container } = render(<TaskProgressTimeline log={{ ...sampleLog(),
+        timelineStartedAt: 1000, totalMs: 1000, excludedKind: "waiting",
+        excludedSince: 2000, outcome: "awaiting_input" }} />);
+      const before = container.textContent;
+      act(() => vi.advanceTimersByTime(10000));
+      expect(container.textContent).toBe(before);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("keeps a live task running after its latest step has completed", () => {
+    const { container } = render(<TaskProgressTimeline log={sampleLog()} live />);
+    expect(container.querySelector(".task-progress-timeline")?.getAttribute("data-status")).toBe("progress");
+    expect(container.querySelector(".task-progress-overall")?.textContent).toBe("进行中");
+    expect(container.querySelector(".activity-steps > li")?.getAttribute("data-status")).toBe("completed");
+  });
+
+  it("shows pause and progress-wait time separately from foreground time", () => {
+    render(<TaskProgressTimeline log={{ ...sampleLog(), totalMs: 10000, pausedMs: 2000,
+      waitingMs: 3000, outcome: "completed" }} />);
+    expect(screen.getByText("执行过程 · 1 步 · 5.0s")).toBeTruthy();
+    expect(screen.getByText("暂停 2.0s · 等待进度 3.0s")).toBeTruthy();
+  });
+
+  it("keeps early continuation compact inside the original timeline", () => {
+    const resume = vi.fn();
+    const { container } = render(<TaskProgressTimeline log={sampleLog()} onContinue={resume} />);
+    expect(screen.getByText("已暂停")).toBeTruthy();
+    const button = screen.getByRole("button", { name: "继续分析" });
+    expect(button.closest(".task-progress-actions")).not.toBeNull();
+    expect(container.querySelector(".folder-resume-card, .pause-details")).toBeNull();
+    expect(screen.queryByText(/尚未生成规划检查点/)).toBeNull();
+    fireEvent.click(button);
+    expect(resume).toHaveBeenCalledOnce();
+  });
+
   it("labels the non-submitting interruption action as pause", () => {
     const pause = vi.fn();
     render(<TaskProgressTimeline log={sampleLog()} live onStop={pause} />);
@@ -119,7 +159,7 @@ describe("TaskProgressTimeline", () => {
     render(<TaskProgressTimeline log={log} />);
 
     expect(screen.getByText(/需求分析过程 · 1 步/)).toBeTruthy();
-    expect(screen.getByText("等待确认")).toBeTruthy();
+    expect(screen.getByText("等待下一步操作")).toBeTruthy();
     expect(screen.queryByText("已完成")).toBeNull();
   });
 
@@ -160,4 +200,37 @@ describe("TaskProgressTimeline", () => {
       }
     }
   });
+});
+
+
+it("distinguishes superseded segments and interrupted steps from real warnings", () => {
+  const log: ActivityLog = { totalMs: 90, outcome: "awaiting_input", closedByFinish: ["interrupted"], steps: [
+    { id: "interrupted", label: "规划阶段", status: "warning", elapsedMs: 90 },
+    { id: "real-warning", label: "数据异常", status: "warning", elapsedMs: 10 }
+  ] };
+  render(<TaskProgressTimeline log={log} segment={{ continuesTask: true, onShowLater: () => {} }} />);
+  expect(screen.getByText("本段已结束 · 已接续")).toBeTruthy();
+  expect(screen.queryByText("等待下一步操作")).toBeNull();
+  expect(screen.getByLabelText("本段已中断").textContent).toBe("Ⅱ");
+  expect(screen.getByLabelText("需要注意").textContent).toBe("!");
+  expect(screen.getByText(/接续过程 · 2 步/)).toBeTruthy();
+});
+
+it("identifies the model stage without reordering its completed tool calls", () => {
+  const log: ActivityLog = { totalMs: 1000, steps: [
+    { id: "planning.model", label: "正在生成操作方案", status: "progress", elapsedMs: 1000 },
+    { id: "tool-1", label: "查询完成", status: "completed", elapsedMs: 30 }
+  ] };
+  const view = render(<TaskProgressTimeline log={log} live />);
+  expect(screen.getByText("正在生成操作方案（整体阶段，包含工具调用）")).toBeTruthy();
+  expect([...view.container.querySelectorAll(".activity-step-label")].map(el => el.textContent)).toEqual([
+    "正在生成操作方案（整体阶段，包含工具调用）", "查询完成"
+  ]);
+});
+
+it("only describes a write preview with completed preflight evidence", () => {
+  render(<TaskProgressTimeline log={{ totalMs: 10, outcome: "awaiting_input", steps: [
+    { id: "preflight-plan", label: "计划校验", elapsedMs: 10, status: "completed" }
+  ] }} />);
+  expect(screen.getByText("预览已生成 · 待确认写入")).toBeTruthy();
 });

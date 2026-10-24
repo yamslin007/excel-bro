@@ -362,6 +362,8 @@ function installFormatHost() {
   ]);
   let active: WpsWorkbook;
   let copyClosed = false;
+  /** 副本是否真的被创建过 —— 用来区分"没建"与"建了没关"。 */
+  let copyCreated = false;
 
   const sheetCache = new Map<string, WpsWorksheet>();
   function buildSheet(name: string, sheetState: CellState[][]): WpsWorksheet {
@@ -393,6 +395,7 @@ function installFormatHost() {
     Activate: () => { active = original; }
   };
   (originalSheet as unknown as { Copy: () => void }).Copy = () => {
+    copyCreated = true;
     const copyState = state.map((row) => row.map((item) => ({ ...item })));
     const copySheet = buildSheet("数据", copyState);
     const copy: WpsWorkbook = {
@@ -439,7 +442,8 @@ function installFormatHost() {
   getWpsApplicationMock.mockImplementation(() => application as never);
   return {
     cell: (row: number, column: number) => state[row - 1][column - 1],
-    copyClosed: () => copyClosed
+    copyClosed: () => copyClosed,
+    copyCreated: () => copyCreated
   };
 }
 
@@ -526,7 +530,7 @@ describe("WPS 面板 · 格式动作点击链路（真实面板 + 真实审阅/�
     expect(resultCard?.textContent).not.toContain("写入值 ·");
     expect(resultCard?.querySelector("details")?.open).toBe(false);
     await click(undo);
-    await until(() => textOf(container).includes("已撤销并核对恢复"), "撤销后应给出核对过的恢复结果");
+    await until(() => textOf(container).includes("已撤销并恢复"), "撤销后应给出核对过的恢复结果");
     expect(host.cell(2, 1).bold).toBe(false);
     expect(host.cell(2, 1).value).toBe("甲");
   });
@@ -553,7 +557,7 @@ describe("WPS 面板 · 格式动作点击链路（真实面板 + 真实审阅/�
     expect(host.cell(2, 1).horizontalAlignment).toBe(-4108);
 
     await click(cardUndoButton(container));
-    await until(() => textOf(container).includes("已撤销并核对恢复"), "撤销后应给出核对过的恢复结果");
+    await until(() => textOf(container).includes("已撤销并恢复"), "撤销后应给出核对过的恢复结果");
     expect(host.cell(2, 1).bold).toBe(false);
     expect(host.cell(2, 1).horizontalAlignment).toBe(1);
   });
@@ -564,11 +568,15 @@ describe("WPS 面板 · 格式动作点击链路（真实面板 + 真实审阅/�
     expect(findButton(container, "重新排列")).toBeNull();
     expect(host.cell(2, 1).bold).toBe(true);
     await click(findButton(container, "双视图对比"));
+    // 双视图是执行前状态的副本：真的建了出来（不是拿执行后的原表顶替）。
+    expect(host.copyCreated()).toBe(true);
+    // 确认入口始终在固定操作条上，不随对话滚走。
     expect(findButton(container, "确认变更")).not.toBeNull();
     await click(findButton(container, "确认变更"));
     await until(() => textOf(container).includes("已确认变更"), "应确认结果");
     expect(host.cell(2, 1).bold).toBe(true);
     expect(host.cell(2, 1).value).toBe("甲");
+    // 只关本次副本。
     expect(host.copyClosed()).toBe(true);
   });
 });

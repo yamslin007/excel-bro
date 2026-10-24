@@ -1,5 +1,6 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
 import { isWpsReviewCopyTarget, wpsAnalysisTargetEvidence } from "./wpsAuthorizedTarget";
+import { bindWpsReviewTarget, releaseWpsReviewTarget, wpsReadWorkbook } from "./wpsResultReviewTarget";
 import { getWpsApplication } from "./wpsHost";
 import type { WpsNativeComparison } from "./wpsNativeComparison";
 import type { AuthorizedTarget } from "@excel-bro/core/authorizedTarget";
@@ -36,17 +37,55 @@ describe("analysis evidence without source cells", () => {
     expect(h.values).not.toHaveBeenCalled();
   });
 });
-describe("owned review copy metadata role, not a new original", () => {
-  const target: AuthorizedTarget = { fileKey: null, name: "Book1", sheets: [], selected: [],
-    fileRef: { Name: "Book1", FullName: "Book1", Path: "" } };
-  const review = { copy: target.fileRef, copyIdentity: { name: "Book1", fullName: "Book1", path: null } } as WpsNativeComparison;
-  it("recognizes the unsaved owned copy when FullName is a name, not a disk identity", () => {
-    expect(isWpsReviewCopyTarget(target, review)).toBe(true);
-    expect(isWpsReviewCopyTarget({ ...target, fileRef: { ...target.fileRef } }, review)).toBe(true);
+describe("owned review copy is not a new original", () => {
+  /*
+   * 绑定的是**本次创建时**记下的身份；判据不用名字前缀/活动窗口/相似度。
+   * 副本被 WPS 激活时读取仍按原表，无关工作簿仍然是无关工作簿。
+   */
+  const sheet = (name: string) => ({ Name: name, Index: 1, CodeName: `id-${name}`, Range: () => ({}),
+    UsedRange: { Row: 1, Column: 1, Rows: { Count: 0 }, Columns: { Count: 0 }, Value2: [] } });
+  const book = (name: string, fullName: string, path: string) => ({
+    Name: name, FullName: fullName, Path: path,
+    Worksheets: { Count: 1, Item: () => sheet("Sheet1") }
   });
-  it("does not exempt unrelated files or an absent review", () => {
-    expect(isWpsReviewCopyTarget({ ...target, name: "Other" }, review)).toBe(false);
-    expect(isWpsReviewCopyTarget({ ...target, fileRef: { Name: "Book1", FullName: "E:\\Other\\Book1.xlsx", Path: "E:\\Other" } }, review)).toBe(false);
-    expect(isWpsReviewCopyTarget(target, null)).toBe(false);
+  const original = book("ss.xlsx", "E:////Work////ss.xlsx", "E:////Work");
+  const copy = book("工作簿1", "工作簿1", "");
+  const unrelated = book("other.xlsx", "E:////Work////other.xlsx", "E:////Work");
+
+  function bind(active: unknown, books: unknown[] = [original, copy]) {
+    bindWpsReviewTarget({
+      original: original as never,
+      originalIdentity: { name: "ss.xlsx", fullName: "E:////Work////ss.xlsx", path: "E:////Work" },
+      copyIdentity: { name: "工作簿1", fullName: "工作簿1", path: null },
+      writeSheet: { index: 1, name: "Sheet1" }
+    });
+    vi.mocked(getWpsApplication).mockReturnValue({
+      get ActiveWorkbook() { return active; },
+      Workbooks: { Count: books.length, Item: (index: number) => books[index - 1] }
+    } as never);
+  }
+
+  afterEach(() => releaseWpsReviewTarget());
+
+  it("副本获得焦点时按原表读取（不是新目标）", () => {
+    bind(copy);
+    expect(isWpsReviewCopyTarget({ fileKey: null, name: "工作簿1", sheets: [], selected: [], fileRef: copy as never })).toBe(true);
+    expect(wpsReadWorkbook(getWpsApplication())).toBe(original);
+  });
+
+  it("无关工作簿不被当成副本；原表关闭后不再解析（守卫会拦）", () => {
+    bind(unrelated);
+    expect(wpsReadWorkbook(getWpsApplication())).toBe(unrelated);
+    expect(isWpsReviewCopyTarget({ fileKey: null, name: "other.xlsx", sheets: [], selected: [], fileRef: unrelated as never })).toBe(false);
+
+    // 只剩副本（原表被关）⇒ 证不出"原表仍在"，不解析，交给守卫拦截。
+    bind(copy, [copy]);
+    expect(wpsReadWorkbook(getWpsApplication())).toBe(copy);
+  });
+
+  it("副本被另存成磁盘文件后不再是本次副本", () => {
+    const saved = book("工作簿1", "E:////Work////工作簿1.xlsx", "E:////Work");
+    bind(saved);
+    expect(wpsReadWorkbook(getWpsApplication())).toBe(saved);
   });
 });

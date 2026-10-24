@@ -82,14 +82,26 @@ def test_matrix_has_no_unknown_action() -> None:
 
 
 def test_wps_bound_does_not_exceed_the_write_allowlist() -> None:
-    """WPS 上界与 `wpsWrite.allowedActions` 必须同一口径。
+    """WPS 上界必须等于范围执行器与固定原生检查点执行器的并集。
 
     两处都是"WPS 上允许写什么"的真值来源，一旦不一致，
     规划前交集与执行预检就会各说各话：用户在预览里看到能执行，
     点确认却被执行器拒绝（或更糟，反过来）。
     """
     config = json.loads(CAPABILITIES.read_text(encoding="utf-8"))
-    allowlist = set(config["wpsWrite"]["allowedActions"])
+    range_actions = set(config["wpsWrite"]["allowedActions"])
+    checkpoint_actions = set(config["worksheetCheckpoint"]["allowedActions"])
+    # 检查点白名单里同时有两类东西：计划动作（`deleteWorksheet`）与事后操作
+    # （`restoreWorksheet`，原地撤销本次删除）。后者不会出现在任何计划里，
+    # 因此不参与"宿主能力矩阵的动作上界"这条比对。
+    assert checkpoint_actions == {"deleteWorksheet", "restoreWorksheet"}
+    assert "restoreWorksheet" not in range_actions
+    assert "restoreWorksheet" not in set(_declared_action_types()), (
+        "原地撤销是执行后的恢复操作，不是计划动作；把它塞进 ExcelAction "
+        "会让模型有机会在计划里提议一次撤销。"
+    )
+    assert not range_actions & checkpoint_actions
+    allowlist = range_actions | (checkpoint_actions & set(_declared_action_types()))
     bound = {
         key
         for key, capability in config["hostCapabilities"]["wps-et"]["versions"]["12.0"].items()

@@ -31,6 +31,16 @@ export {
   suggestWriteTarget
 } from "./range";
 export { normalizeField, detectHeaderIndex, detectSheetFields } from "./tableSchema";
+// 表格区域变换（排序 / 去重）的确定性判据：两端读同一份，避免顺序语义漂移。
+export type { SortKeySpec } from "./tableTransforms";
+export {
+  compareSortValues,
+  sortRowOrder,
+  reorderRows,
+  sortedMatrix,
+  duplicateRowPartition,
+  deduplicatedMatrix
+} from "./tableTransforms";
 // 写进任何用户可见 / 可持久化文本之前，先过一遍凭据脱敏。
 export {
   REDACTED_PLACEHOLDER,
@@ -99,6 +109,16 @@ export {
   formatPlanPropertyGroups,
   formatPlanPreview
 } from "./formatActions";
+
+// 审阅标记的呈现方式判据（浅黄底色 vs 只边框），两端标记实现读同一份。
+export type { ReviewMarkStyle } from "./reviewMarkStyle";
+export {
+  actionTouchesFill,
+  planTouchesFill,
+  reviewMarkStyleForAction,
+  REVIEW_MARK_COLORS,
+  REVIEW_MARK_LEGEND
+} from "./reviewMarkStyle";
 
 // L2 semantics：身份折叠是唯一允许拼接/解析 `url:` 前缀的地方。
 export {
@@ -293,6 +313,7 @@ export type {
   PlanningEventApplication,
   PlanningResumeDecision,
   PlanningStatusView,
+  PlanningContinuationView,
   PlanningStepLifecycle,
   PlanningPausedEntry
 } from "./planningStream";
@@ -310,6 +331,18 @@ export {
   closeDanglingSteps,
   planningPausedEntriesFromHistory
 } from "./planningStream";
+
+export type {
+  PlanningContinuationEvidence,
+  PlanningEvidenceFailure,
+  PlanningEvidenceInput,
+  PlanningEvidenceResult,
+  PlanningSourceVerification
+} from "./planningContinuationEvidence";
+export {
+  buildPlanningContinuationEvidence,
+  PLANNING_EVIDENCE_FAILURE_MESSAGES
+} from "./planningContinuationEvidence";
 
 export type {
   SourceDependencyOrigin,

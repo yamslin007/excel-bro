@@ -1,3 +1,4 @@
+import type { ExcelAction } from "../../excel-addin/src/contracts";
 /**
  * WPS 格式动作的**已验证属性白名单**（Task #53）。
  *
@@ -10,8 +11,7 @@
  *   `setFont` 只要带 `underline` 语义就必须拒绝。
  * - 不因 `RowHeight` 通过就开放 `ColumnWidth` —— `ColumnWidth` 有量化漂移，`resizeRange`
  *   只要带 `columnWidth` 就必须拒绝。
- * - 不因 `HorizontalAlignment` 通过就开放 `VerticalAlignment` —— 垂直对齐哨兵与原值同值，
- *   未验证，`setAlignment.vertical` 必须拒绝。
+ * - 垂直对齐现已实现逐格快照、回读与恢复，但尚无实机通过证据；不加入 VERIFIED 集合。
  *
  * 白名单外的属性**明确拒绝**（抛错），不静默忽略：静默忽略会让计划"看起来成功、
  * 实际没改"，与"只有指定属性被改变"的承诺相反。
@@ -55,18 +55,14 @@ export function assertWpsVerifiedSetFont(action: {
 
 /**
  * setAlignment 的垂直对齐尚未验证（哨兵与原值同为 -4108，写不出区别）。
- * 模型若带了 `vertical`，必须明确拒绝。
+ * 当前实现支持合法枚举，并由执行器对每格进行写前完整采集、回读和恢复。历史探测证据仍为未验证。
  */
 export function assertWpsVerifiedSetAlignment(action: {
   horizontal?: string | null;
   vertical?: string | null;
   wrapText?: boolean | null;
 }): void {
-  if (action.vertical != null) {
-    throw new Error(
-      "WPS 的垂直对齐（VerticalAlignment）尚未实机验证（哨兵与原值同值），当前拒绝 setAlignment.vertical。"
-    );
-  }
+  if (action.vertical != null) wpsVerticalAlignment(action.vertical);
 }
 
 /**
@@ -88,7 +84,7 @@ export function assertWpsVerifiedResizeRange(action: {
  * WPS 适配层的枚举 / 颜色映射（协议字符串 ↔ WPS 数字枚举）
  * ------------------------------------------------------------------------- */
 
-import { XL_H_ALIGN } from "./wpsFormatProbe";
+import { XL_H_ALIGN, XL_V_ALIGN } from "./wpsFormatProbe";
 
 /** 协议水平对齐字符串 → WPS `HorizontalAlignment` 数字枚举。 */
 const HORIZONTAL_TO_WPS: Record<string, number> = {
@@ -111,18 +107,29 @@ export function wpsHorizontalAlignment(value: string): number {
   return mapped;
 }
 
-/** 把协议 `#RRGGBB` 颜色转为 WPS `Font.Color`/`Interior.Color` 的数字（0xRRGGBB）。 */
+/** Implementation support is separate from historical real-host probe evidence. */
+export const WPS_IMPLEMENTED_ALIGNMENT_PROPERTIES = ["horizontal", "vertical", "wrapText"] as const;
+export function wpsVerticalAlignment(value: string): number {
+  if (!Object.hasOwn(XL_V_ALIGN, value)) throw new Error(`WPS 不认识的垂直对齐「${value}」。`);
+  return XL_V_ALIGN[value as keyof typeof XL_V_ALIGN];
+}
+
+/** WPS Font/Interior.Color use an OLE RGB integer: red is the low byte. */
 export function wpsColorFromHex(hex: string): number {
   const match = /^#([0-9a-fA-F]{6})$/.exec(hex);
   if (!match) throw new Error(`WPS 不认识的颜色「${hex}」，应为 #RRGGBB。`);
-  return Number.parseInt(match[1], 16);
+  const rgb = Number.parseInt(match[1], 16);
+  return ((rgb & 0xff) << 16) | (rgb & 0xff00) | ((rgb >>> 16) & 0xff);
 }
 
 /** 格式动作字段（与 `wpsPlanExecutor.FormatActionFields` 同形，供预览描述使用）。 */
 type WpsFormatActionLike =
   | { type: "setFont"; bold?: boolean | null; italic?: boolean | null; name?: string | null; size?: number | null; color?: string | null }
   | { type: "setAlignment"; horizontal?: string | null; vertical?: string | null; wrapText?: boolean | null }
-  | { type: "resizeRange"; rowHeight?: number | null; columnWidth?: number | null };
+  | { type: "resizeRange"; rowHeight?: number | null; columnWidth?: number | null }
+  | { type: "setFill"; color: string }
+  | { type: "setNumberFormat"; formatCode: string }
+  | Extract<ExcelAction,{type:"setBorders"}>;
 
 const HORIZONTAL_LABELS: Record<string, string> = {
   general: "常规",
@@ -142,6 +149,9 @@ const HORIZONTAL_LABELS: Record<string, string> = {
  * 当成"写入值"糊弄过去。`resizeRange.rowHeight` 会改变**整行**，必须明示。
  */
 export function describeWpsFormatAction(action: WpsFormatActionLike): string {
+  if (action.type === "setBorders") return `设置边框（${action.sides.map(side=>({top:"上",bottom:"下",left:"左",right:"右",insideHorizontal:"内部横线",insideVertical:"内部竖线"}[side])).join("、")}）`;
+  if (action.type === "setFill") return `填充颜色改为 ${action.color}`;
+  if (action.type === "setNumberFormat") return `数字格式改为「${action.formatCode}」`;
   if (action.type === "setFont") {
     const parts: string[] = [];
     if (action.bold != null) parts.push(action.bold ? "加粗" : "取消加粗");
@@ -154,6 +164,7 @@ export function describeWpsFormatAction(action: WpsFormatActionLike): string {
   if (action.type === "setAlignment") {
     const parts: string[] = [];
     if (action.horizontal != null) parts.push(`水平对齐改为「${HORIZONTAL_LABELS[action.horizontal] ?? action.horizontal}」`);
+    if (action.vertical != null) parts.push(`垂直对齐改为「${({top:"顶端",center:"居中",bottom:"底端",justify:"两端对齐",distributed:"分散对齐"} as Record<string,string>)[action.vertical] ?? action.vertical}」`);
     if (action.wrapText != null) parts.push(action.wrapText ? "开启自动换行" : "关闭自动换行");
     return parts.length ? `设置对齐（${parts.join("、")}）` : "设置对齐";
   }
@@ -162,4 +173,9 @@ export function describeWpsFormatAction(action: WpsFormatActionLike): string {
   if (action.rowHeight != null) parts.push(`行高改为 ${action.rowHeight}（影响整行）`);
   if (action.columnWidth != null) parts.push(`列宽改为 ${action.columnWidth}（影响整列）`);
   return parts.length ? `调整尺寸（${parts.join("、")}）` : "调整尺寸";
+}
+
+/** WPS ET Interior uses an OLE RGB integer (red in the low byte). */
+export function wpsOleColorFromHex(hex: string): number {
+  return wpsColorFromHex(hex);
 }

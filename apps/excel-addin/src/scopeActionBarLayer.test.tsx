@@ -64,10 +64,10 @@ vi.mock("./excel", async (importOriginal) => ({
 }));
 vi.mock("./officeAuthorizedTarget", async (importOriginal) => ({
   ...await importOriginal<typeof import("./officeAuthorizedTarget")>(),
-  inspectOfficeAuthorizedTarget: vi.fn(async () => fixtures.target),
+  inspectOfficeAuthorizedTarget: vi.fn(async (names: readonly string[] | null) => ({ ...fixtures.target, selected: names === null ? ["unselected"] : names.map((name) => name.toLowerCase()) })),
   inspectOfficeScopeAdmission: vi.fn(async (names: readonly string[]) => ({
     items: names.map((id) => ({ id, status: "ready", reason: "none" })),
-    target: fixtures.target
+    target: { ...fixtures.target, selected: names.map((name) => name.toLowerCase()) }
   })),
   confirmOfficeAuthorizedScope: vi.fn(async (_names, confirm, expected) => confirm(expected)),
   officeAnalysisTargetEvidence: vi.fn(async () => ({ key: "target-1", conclusive: true }))
@@ -76,7 +76,7 @@ vi.mock("./officeAuthorizedTarget", async (importOriginal) => ({
 beforeEach(() => {
   localStorage.clear();
   vi.clearAllMocks();
-  vi.mocked(inspectOfficeAuthorizedTarget).mockResolvedValue(fixtures.target);
+  vi.mocked(inspectOfficeAuthorizedTarget).mockImplementation(async (names) => ({ ...fixtures.target, selected: names === null ? ["unselected"] : names.map((name) => name.toLowerCase()) }));
   vi.mocked(officeAnalysisTargetEvidence).mockResolvedValue({ key: "target-1", conclusive: true });
   vi.mocked(understandMessage).mockResolvedValue({ kind: "conversation", message: "已收到。", provider: "model" });
   vi.mocked(checkIntent).mockResolvedValue({ kind: "conversation", message: "已收到。", provider: "model" });
@@ -172,57 +172,30 @@ describe("数据范围动作条的层：Excel 必须与 WPS 同层", () => {
     expect(shared).toMatch(/^\.scope-action-buttons,$/m);
   });
 
-  it("按钮集合对齐 WPS：刷新 / 确认；草稿与已提交授权不一致时才出现取消", async () => {
+  it("授权说明在固定标题，动作条只有刷新与确认，勾选仍立即生效", async () => {
     const view = await boot();
     const popover = openPicker(view);
-
-    // 初始草稿 == 已提交授权 ⇒ 只有刷新 / 确认。
     expect(labelsIn(barOf(popover))).toEqual(["↻ 刷新", "确认"]);
-    // 负向：旧文案「完成」不许复活在动作条里（它与「确认」是同一个动作，
-    // 两端叫法必须一致，否则用户看到的是两个不同层次的东西）。
-    expect(labelsIn(barOf(popover))).not.toContain("完成");
-    expect(view.container.textContent).not.toContain("确认范围");
-    expect(view.container.textContent).not.toContain("放弃修改");
-
-    // 造出草稿差异：手动模式下多勾一张表。
     fireEvent.click(view.getByRole("button", { name: /选择多个/ }));
-    await waitFor(() => expect(view.container.querySelector(".workbook-sheet-list")).not.toBeNull());
     fireEvent.click(sheetRow(view.container, "Selected"));
-    await waitFor(() => expect(labelsIn(barOf(popover))).toContain("取消"));
-    expect(labelsIn(barOf(popover))).toEqual(["↻ 刷新", "确认", "取消"]);
+    await waitFor(() => expect(view.container.querySelector(".scope-close")?.getAttribute("data-scope-pending")).toBe("false"));
+    expect(labelsIn(barOf(popover))).toEqual(["↻ 刷新", "确认"]);
+    expect(popover.querySelector(":scope > .scope-popover-header .scope-authorization-hint")?.textContent).toContain("勾选即授权");
+    expect(barOf(popover).textContent).not.toContain("勾选即授权");
+    expect(view.container.querySelector(".scope-confirm")).toBeNull();
   });
 
-  it("取消把草稿退回已提交授权并关闭弹层：已提交的范围一字不改", async () => {
+  it("确认关闭面板并保留勾选和固定模式，重开不撤销授权", async () => {
     const view = await boot();
-    const popover = openPicker(view);
+    openPicker(view);
     fireEvent.click(view.getByRole("button", { name: /选择多个/ }));
-    await waitFor(() => expect(view.container.querySelector(".workbook-sheet-list")).not.toBeNull());
-
-    // 已提交授权仍是"当前表 Unselected"（跟随当前表建立的）。
-    const committedLabel = view.container.querySelector(".scope-trigger")?.textContent ?? "";
-    expect(committedLabel).toContain("已固定 1 个工作表");
-    expect(sheetRow(view.container, "Unselected").getAttribute("aria-pressed")).toBe("true");
-
     fireEvent.click(sheetRow(view.container, "Selected"));
-    expect(sheetRow(view.container, "Selected").getAttribute("aria-pressed")).toBe("true");
+    await waitFor(() => expect(view.container.querySelector(".scope-close")?.getAttribute("data-scope-pending")).toBe("false"));
+    fireEvent.click(view.container.querySelector(".scope-close")!);
+    expect(view.container.querySelector(".scope-popover")).toBeNull();
     expect(view.container.querySelector(".scope-trigger")?.textContent).toContain("已固定 2 个工作表");
-
-    const discard = barOf(popover).querySelector<HTMLButtonElement>(".scope-discard");
-    expect(discard).not.toBeNull();
-    fireEvent.click(discard!);
-
-    // 判据一：弹层关闭 —— 与 WPS 的 `discardScopeEdit` 同一条出口语义（用户裁决
-    // 2026-10-16：取消即离开，不是"我点开只是想看看"）。坏代码里弹层还开着，
-    // 这条 waitFor 以超时变红。
-    await waitFor(() => expect(view.container.querySelector(".scope-popover")).toBeNull());
-
-    // 判据二：草稿退回已提交授权 —— 弹层关了，触发器（一直挂着）退回"已固定 1 个"。
-    expect(view.container.querySelector(".scope-trigger")?.textContent).toContain("已固定 1 个工作表");
-
-    // 判据三：重开面板，勾选状态也要退回去 —— 不只按钮消失，Selected 不再勾着。
-    fireEvent.click(view.container.querySelector(".scope-trigger")!);
-    await waitFor(() => expect(view.container.querySelector(".workbook-sheet-list")).not.toBeNull());
-    expect(sheetRow(view.container, "Selected").getAttribute("aria-pressed")).toBe("false");
+    openPicker(view);
+    expect(sheetRow(view.container, "Selected").getAttribute("aria-pressed")).toBe("true");
     expect(sheetRow(view.container, "Unselected").getAttribute("aria-pressed")).toBe("true");
   });
 
@@ -233,13 +206,7 @@ describe("数据范围动作条的层：Excel 必须与 WPS 同层", () => {
     await waitFor(() => expect(view.container.querySelector(".workbook-sheet-list")).not.toBeNull());
     fireEvent.click(sheetRow(view.container, "Selected"));
 
-    // 带着未确认的范围修改发送 ⇒ 停在原地给出错误条（不读字段、不弹第二个对话框）。
-    // 注意顺序：产品是先理解消息、再在"要不要读字段"这道闸前面停下，
-    // 所以这里必须让理解结果落在"需要工作簿上下文"上，才真的走到那道闸。
-    vi.mocked(understandMessage).mockResolvedValue({ kind: "needs_workbook_context", summary: "看看这列", provider: "model" });
-    fireEvent.change(view.container.querySelector(".composer textarea")!, { target: { value: "看看这列" } });
-    fireEvent.click(view.getByRole("button", { name: /^发送$/ }));
-
+    vi.mocked(officeAnalysisTargetEvidence).mockResolvedValue(null);
     const error = await waitFor(() => {
       const node = view.container.querySelector<HTMLElement>(".authorized-target-error");
       if (!node) throw new Error("错误条尚未出现");

@@ -120,8 +120,10 @@ def test_local_api_both_hosts_roundtrip(monkeypatch, host_id, origin):
 
 def test_late_result_discarded_when_scope_revoked(monkeypatch):
     registry, target, token, receipt = prepared()
-    def fake_runner(code, values, *, cancel_check):
+    def fake_runner(code, values, *, cancel_check, on_runner_start=None):
         assert values["datasets"][0]["values"][0][1] == "PRIVATE_DATA"
+        if on_runner_start:
+            on_runner_start()
         registry.revoke(token, target, ORIGIN)
         assert cancel_check()
         return {"status": "completed", "result": "PRIVATE_LATE_RESULT"}

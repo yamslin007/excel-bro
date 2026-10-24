@@ -126,6 +126,68 @@ def _install_fake(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fake: _FakeSd
     monkeypatch.setattr(claude_sdk_agent, "_state_dir", lambda: tmp_path)
 
 
+@pytest.mark.parametrize("mode,expected", [
+    ("billing", "MODEL_QUOTA_EXHAUSTED"),
+    ("billing_process_error", "MODEL_QUOTA_EXHAUSTED"),
+    ("billing_no_result", "MODEL_QUOTA_EXHAUSTED"),
+    ("result_error", "MODEL_QUOTA_EXHAUSTED"),
+    ("context", "MODEL_CONTEXT_LIMIT"),
+    ("output", "MODEL_OUTPUT_LIMIT"),
+    ("budget", "MODEL_BUDGET_LIMIT"),
+    ("turns", "MODEL_TURN_LIMIT"),
+])
+def test_sdk_preserves_actionable_limit_without_raw_text(mode, expected):
+    from server.app.llm.errors import LLMUsageLimitError
+
+    class LimitSdk(_FakeSdk):
+        AssistantMessage = type("AssistantMessage", (), {})
+
+        async def query(self, **kwargs):
+            final = _FakeResult("PRIVATE_DATA_ROW sk-secret")
+            final.is_error = True
+            if mode.startswith("billing"):
+                message = self.AssistantMessage()
+                message.error = "billing_error"
+                yield message
+                if mode == "billing_process_error":
+                    raise self.ProcessError("PRIVATE_DATA_ROW sk-secret")
+                if mode == "billing_no_result":
+                    return
+            elif mode == "result_error":
+                error = self.ResultError("PRIVATE_DATA_ROW")
+                error.api_error_status = 429
+                error.errors = ['{"error":{"code":"insufficient_quota","message":"sk-secret"}}']
+                raise error
+            elif mode == "context":
+                final.errors = ['{"error":{"code":"context_length_exceeded"}}']
+            elif mode == "output":
+                final.stop_reason = "max_tokens"
+            elif mode == "budget":
+                final.subtype = "error_max_budget_usd"
+            else:
+                final.subtype = "error_max_turns"
+            yield final
+
+    with pytest.raises(LLMUsageLimitError) as captured:
+        asyncio.run(claude_sdk_agent._result(LimitSdk(), "prompt", None, 2))
+    assert captured.value.code == expected
+    assert "PRIVATE" not in str(captured.value) and "sk-secret" not in str(captured.value)
+
+
+def test_sdk_success_after_rate_limit_does_not_inherit_old_error():
+    class RecoveredSdk(_FakeSdk):
+        AssistantMessage = type("AssistantMessage", (), {})
+
+        async def query(self, **kwargs):
+            for error in ["rate_limit", None]:
+                message = self.AssistantMessage()
+                message.error = error
+                yield message
+            yield _FakeResult("余额不足是用户询问的内容，并非本次错误")
+
+    assert asyncio.run(claude_sdk_agent._result(RecoveredSdk(), "prompt", None, 2)).startswith("余额不足")
+
+
 def test_sdk_catalog_is_explicit_and_preserves_openai_default(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
@@ -245,7 +307,7 @@ def test_derived_sdk_connection_inherits_explicit_vision_capability(monkeypatch,
     monkeypatch.setattr(llm_config, "_claude_sdk_state_ready", lambda: True)
     selected = SimpleNamespace(
         id="vision-id", api_key="private-key", base_url="https://api.deepseek.com",
-        model="configured-model", supports_vision=vision,
+        model="configured-model", supports_vision=vision, protocol="openai_compatible",
     )
     connection = llm_config._managed_sdk_connection("claude-agent-sdk:vision-id", (selected,))
     assert connection is not None
@@ -372,9 +434,31 @@ def test_sdk_rejects_data_bearing_plan_without_fallback(
     fake = _FakeSdk()
     _install_fake(monkeypatch, tmp_path, fake)
     monkeypatch.setattr("server.app.planner.selected_model_config", lambda _id: _connection())
+    from server.app.models import DataToolResult
+    request = _plan_request(policy="ifNeeded")
+    request.dataResults = [DataToolResult(
+        requestId="unowned-result", title="局部结果", headers=["值"],
+        rows=[["PRIVATE_RESULT_ROW"]], sourceSheets=["Sheet1"],
+        scannedRows=1, complete=True, calculation="本地读取",
+    )]
     with pytest.raises(ModelNotAvailableError, match="仅支持不上传数据行"):
-        asyncio.run(create_plan(_plan_request(policy="ifNeeded")))
+        asyncio.run(create_plan(request))
     assert fake.calls == []
+
+
+def test_planner_narrows_legacy_read_policy_without_uploading_snapshot_rows(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    fake = _FakeSdk(response='{"kind":"answer","message":"已收到"}')
+    _install_fake(monkeypatch, tmp_path, fake)
+    monkeypatch.setattr("server.app.planner.selected_model_config", lambda _id: _connection())
+    request = _plan_request(policy="ifNeeded")
+    assert asyncio.run(create_plan(request)).kind == "answer"
+    payload = json.loads(fake.calls[0][0])
+    assert payload["planningReadPolicy"] == "none"
+    assert "PRIVATE_DATA_ROW" not in fake.calls[0][0]
+    assert "PRIVATE_FULL_PATH" not in fake.calls[0][0]
+    assert request.planningReadPolicy == "ifNeeded"
 
 
 def test_sdk_connection_cannot_be_used_as_openai_compatible() -> None:
@@ -405,8 +489,13 @@ def test_sdk_refuses_another_backends_checkpoint_instead_of_replanning(
         "loopState": {},
         "toolCache": {},
     }
-    with pytest.raises(ModelNotAvailableError, match="不能恢复另一规划后端的检查点"):
+    with pytest.raises(
+        ModelNotAvailableError,
+        match="PLANNING_CONTEXT_KIND_MISMATCH",
+    ) as caught:
         asyncio.run(create_plan(_plan_request(), resume_checkpoint=checkpoint))
+    # 拒绝要说得清为什么、并且指向"重新发起"，不能只说"不能继续"。
+    assert "重新发起需求" in str(caught.value)
     # 关键：拒绝发生在**启动 CLI 之前** —— 一次模型调用都不许发出去。
     assert fake.calls == []
 
@@ -435,7 +524,9 @@ def test_sdk_reuses_saved_deepseek_connection_without_reentering_key(
     catalog = model_catalog()
     assert catalog["defaultModelId"] == original_id
     assert original_id in {item["id"] for item in catalog["models"]}
-    assert derived_id in {item["id"] for item in catalog["models"]}
+    assert derived_id not in {item["id"] for item in catalog["models"]}
+    assert len(catalog["models"]) == 1
+    assert catalog["models"][0]["agentAvailable"] is True
     assert "private-deepseek-key" not in json.dumps(catalog)
 
     selected = selected_model_config(derived_id)
@@ -565,3 +656,219 @@ def test_sdk_process_failure_does_not_expose_stderr_or_claim_network_error(error
     assert "Agent SDK" in str(caught.value)
     assert "private-key-and-prompt-stderr" not in str(caught.value)
     assert "AI_BASE_URL" not in str(caught.value)
+
+
+# ---------------------------------------------------------------------------
+# A0：受控规划现场（before_model / after_tool）
+# ---------------------------------------------------------------------------
+#
+# 这三个用例钉的是**适配器自己**的行为，不是契约纯函数：
+#   - 现场到底有没有被交出去（删掉透传 ⇒ 计数为 0 ⇒ 红）；
+#   - 交出去的东西里有没有值矩阵/路径（把 `_note_step` 的收窄去掉 ⇒ 红）；
+#   - 落盘失败会不会把本轮规划弄崩（去掉 try/except ⇒ 红）。
+# 服务端盖章与拒绝码由 `test_planning_continuation.py` 经真实接口覆盖。
+
+
+class _RecordingBridge:
+    """只替换**宿主传输**：回执是给定的，被测的记账逻辑仍走生产代码。"""
+
+    def __init__(self, receipts: list[dict]) -> None:
+        self.receipts = list(receipts)
+        self.requests: list[tuple[str, dict]] = []
+
+    async def request(self, tool: str, arguments: dict) -> dict:
+        self.requests.append((tool, dict(arguments)))
+        return dict(self.receipts.pop(0))
+
+
+def _plan_with_confirmations() -> PlanRequest:
+    payload = _plan_request().model_dump(mode="json")
+    payload["taskContext"] = {
+        "schemaVersion": 1,
+        "originalPrompt": "请按类别填写等级",
+        "confirmations": [
+            {"questionId": "period", "label": "统计口径", "value": "按月"},
+        ],
+    }
+    return PlanRequest.model_validate(payload)
+
+
+def _plan_submission() -> dict:
+    return {
+        "id": "a0-plan", "title": "填写等级", "summary": "在 B2 写入等级",
+        "actions": [{
+            "type": "writeValues", "sheet": "Sheet1", "range": "B2", "values": [["甲"]],
+        }],
+    }
+
+
+def test_sdk_reports_before_model_checkpoint_with_only_whitelisted_facts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    fake = _FakeSdk(invoke=("submit_plan", {"plan": _plan_submission()}))
+    _install_fake(monkeypatch, tmp_path, fake)
+    monkeypatch.setattr("server.app.planner.selected_model_config", lambda _id: _connection())
+    seen: list[dict] = []
+
+    async def on_checkpoint(payload: dict) -> None:
+        seen.append(payload)
+
+    request = _plan_with_confirmations()
+    asyncio.run(create_plan(request, on_checkpoint=on_checkpoint))
+
+    # 模型还没开跑就先落一次：中断在"已接住任务、尚无进展"时也能如实说。
+    assert [item["stage"] for item in seen] == ["before_model"]
+    payload = seen[0]
+    # 白名单之外一个键都不许有：这个载荷会被服务端盖章后落盘。
+    assert set(payload) == {
+        "stage", "confirmations", "completedTools", "resultRefs", "failedTool",
+    }
+    assert payload["completedTools"] == []
+    assert payload["resultRefs"] == []
+    assert payload["failedTool"] is None
+    # 已确认口径要带上（否则续跑会重复追问用户）。
+    assert payload["confirmations"] == [
+        {"questionId": "period", "label": "统计口径", "answerLabel": "按月"}
+    ]
+    # 负向：任何值、路径、整份计划都不许出现在现场里。
+    serialized = json.dumps(payload, ensure_ascii=False)
+    assert "PRIVATE_DATA_ROW" not in serialized
+    assert "PRIVATE_FULL_PATH" not in serialized
+    assert "values" not in serialized
+
+
+def test_sdk_reports_after_tool_checkpoint_with_owned_result_ref(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    fake = _FakeSdk(invoke=("query_table", {"mode": "rows"}))
+    _install_fake(monkeypatch, tmp_path, fake)
+    result_ref = "res_" + "a" * 32
+    bridge = _RecordingBridge([{"status": "ok", "resultRef": result_ref, "rowCount": 2}])
+    # 只换**传输**：把宿主回执换成给定值；被测的记账与回调仍是生产代码。
+    monkeypatch.setattr(
+        "server.app.task_bridge.task_tool_bridge.open",
+        lambda *_args, **_kwargs: bridge,
+    )
+    seen: list[dict] = []
+
+    async def on_checkpoint(payload: dict) -> None:
+        seen.append(payload)
+
+    # 这一轮模型没有提交终局结果 ⇒ 会以"未提交有效结果"结束，但工具回执与
+    # 现场必须在**失败之前**就已经交出来。
+    with pytest.raises(claude_sdk_agent.LLMResponseError):
+        asyncio.run(
+            claude_sdk_agent.run_sdk_plan(
+                _plan_request(), _connection(), on_checkpoint=on_checkpoint
+            )
+        )
+
+    assert [item["stage"] for item in seen] == ["before_model", "after_tool"]
+    after = seen[-1]
+    assert after["completedTools"] == ["query_table"]
+    # 只认形如 res_<32hex> 的**有归属**引用；回执里的其他字段一个都不留。
+    assert after["resultRefs"] == [{"resultRef": result_ref, "sourceFingerprint": None}]
+    assert after["failedTool"] is None
+    # 桥收到的参数是白名单里的查询参数，不是被改写过的载荷。
+    assert bridge.requests and bridge.requests[0][0] == "query_table"
+
+
+def test_sdk_checkpoint_failure_does_not_break_the_turn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """落盘失败只降低"能不能继续"，不能让本轮规划失败。"""
+    fake = _FakeSdk(invoke=("submit_plan", {"plan": _plan_submission()}))
+    _install_fake(monkeypatch, tmp_path, fake)
+    monkeypatch.setattr("server.app.planner.selected_model_config", lambda _id: _connection())
+    calls: list[dict] = []
+
+    async def broken_on_checkpoint(payload: dict) -> None:
+        calls.append(payload)
+        raise OSError("磁盘已满")
+
+    result = asyncio.run(create_plan(_plan_with_confirmations(), on_checkpoint=broken_on_checkpoint))
+    # 结果照常产出。
+    assert result.kind == "plan"
+    # 而且它**试过**一次：不能因为没落盘就悄悄跳过回调（那样"可继续"会凭空消失）。
+    assert [item["stage"] for item in calls] == ["before_model"]
+
+
+def test_resume_projection_carries_only_whitelisted_strings() -> None:
+    """续跑提示的投影：已确认口径 + 有归属引用，其他一律丢弃。"""
+    good_ref = "res_" + "b" * 32
+    projection = claude_sdk_agent._resume_projection({
+        "kind": "planning_context",
+        "prompt": "请按类别填写等级",
+        "target": {"identity": "url:https://example.invalid/x.xlsx", "sheetNames": ["Sheet1"]},
+        "confirmations": [
+            {"questionId": "period", "label": "统计口径", "answerLabel": "按月"},
+            {"questionId": "", "label": "无身份", "answerLabel": "丢掉"},
+        ],
+        "resultRefs": [
+            {"resultRef": good_ref},
+            {"resultRef": "res_not-a-real-ref"},
+            {"resultRef": "values:[['甲', 10]]"},
+        ],
+        "completedTools": ["query_table"],
+        "failedTool": None,
+    })
+    assert projection is not None
+    assert set(projection) == {
+        "mode", "note", "confirmedDecisions", "previousResultRefs", "completedTools",
+    }
+    assert projection["mode"] == "continue_remaining"
+    # 说明必须点明这是**重新分析**，不是恢复上一次的模型会话。
+    assert "不是恢复上一次的模型会话" in projection["note"]
+    assert projection["confirmedDecisions"] == [
+        {"questionId": "period", "label": "统计口径", "answerLabel": "按月"}
+    ]
+    assert projection["previousResultRefs"] == [good_ref]
+    assert projection["completedTools"] == ["query_table"]
+    serialized = json.dumps(projection, ensure_ascii=False)
+    assert "请按类别填写等级" not in serialized
+    assert "example.invalid" not in serialized
+    assert "Sheet1" not in serialized
+
+
+def test_resume_projection_is_absent_without_facts() -> None:
+    """没有可用事实就不带 resumeContext：宁可让模型重新问，也不给空壳。"""
+    assert claude_sdk_agent._resume_projection(None) is None
+    assert claude_sdk_agent._resume_projection({}) is None
+    assert claude_sdk_agent._resume_projection({
+        "confirmations": [], "resultRefs": [], "completedTools": [],
+    }) is None
+
+
+@pytest.mark.parametrize("status", ["completed", "cancelled", "unavailable"])
+def test_python_completion_checkpoint_survives_another_model_round(monkeypatch, tmp_path, status):
+    fake = _FakeSdk(invoke=("run_python_analysis", {"code": "trusted test double"}))
+    _install_fake(monkeypatch, tmp_path, fake)
+    monkeypatch.setattr("server.app.python_analysis.python_execution_enabled", lambda: True)
+    ref = "res_" + "c" * 32
+    old_ref = "res_" + "b" * 32
+
+    async def analysis(*args, **kwargs):
+        return {"status": status, "resultHandle": ref, "message": "PRIVATE_RESULT_ROW"}
+
+    monkeypatch.setattr("server.app.python_coordinator.execute_python_analysis_async", analysis)
+    seen = []
+    async def checkpoint(value):
+        seen.append(value)
+
+    with pytest.raises(claude_sdk_agent.LLMResponseError):
+        asyncio.run(claude_sdk_agent.run_sdk_plan(_plan_request(), _connection(),
+            on_checkpoint=checkpoint, resume_context={
+                "completedTools": ["query_table"], "resultRefs": [{"resultRef": old_ref}]
+            }))
+    assert seen[0]["completedTools"] == ["query_table"]
+    assert seen[0]["resultRefs"] == [{"resultRef": old_ref, "sourceFingerprint": None}]
+    if status == "completed":
+        assert seen[-1]["stage"] == "after_tool"
+        assert seen[-1]["completedTools"] == ["query_table", "run_python_analysis"]
+        assert [item["resultRef"] for item in seen[-1]["resultRefs"]] == [old_ref, ref]
+    else:
+        assert len(seen) == 1
+    assert "PRIVATE_RESULT_ROW" not in json.dumps(seen)
+    prompt = json.loads(fake.calls[0][0])
+    assert prompt["resumeContext"]["mode"] == "continue_remaining"
+    assert prompt["resumeContext"]["previousResultRefs"] == [old_ref]

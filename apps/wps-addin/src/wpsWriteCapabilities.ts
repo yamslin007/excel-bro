@@ -1,6 +1,7 @@
 import capabilities from "../../../config/capabilities.json";
 import type { WpsApplication, WpsWorkbook, WpsWorksheet } from "./wpsHost";
 import { wpsWriteVersionStatus, type WpsWriteVersionStatus } from "./wpsWriteVersionGate";
+import { wpsReadWorkbook } from "./wpsResultReviewTarget";
 
 export type WpsWriteCapabilityCheck = {
   id: string;
@@ -49,7 +50,8 @@ export function probeWpsWriteCapabilities(
   application: WpsApplication,
   selectedSheetIndexes: readonly number[]
 ): WpsWriteCapabilityProbe {
-  const workbook = application.ActiveWorkbook;
+  // 写入能力体检的是"要写的那本"：双视图激活副本时仍是原表，不该去体检副本。
+  const workbook = wpsReadWorkbook(application);
   const selected = workbook ? selectedSheets(workbook, selectedSheetIndexes) : null;
   const checks: WpsWriteCapabilityCheck[] = [];
   const add = (id: string, label: string, passed: boolean, detail: string) => {

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import pytest
 
-from server.app.intent import local_intent_check
+from server.app.intent import check_intent
+import asyncio
+from server.tests.test_claude_sdk_agent import _FakeSdk, _install_fake, _connection
 from server.app.models import IntentCheckRequest
 from server.app.structural_intent import parse_bulk_worksheet_deletion
 
@@ -37,7 +39,7 @@ def test_parser_does_not_turn_other_requests_into_sheet_deletion(prompt: str) ->
     assert parse_bulk_worksheet_deletion(prompt) is None
 
 
-def test_explicit_bulk_delete_overrides_prior_split_intent_locally() -> None:
+def test_bulk_delete_is_resolved_by_sdk_not_old_prior_intent(monkeypatch, tmp_path) -> None:
     request = IntentCheckRequest.model_validate(
         {
             "prompt": "清除sheet-dc1外的所有子表",
@@ -67,9 +69,10 @@ def test_explicit_bulk_delete_overrides_prior_split_intent_locally() -> None:
         }
     )
 
-    response = local_intent_check(request)
-
-    assert response is not None
+    fake = _FakeSdk(response='{"kind":"proceed","summary":"删除其他授权表","confirmedPrompt":"只保留 sheet-dc1"}')
+    _install_fake(monkeypatch, tmp_path, fake)
+    response = asyncio.run(check_intent(request, config=_connection()))
     assert response.kind == "proceed"
-    assert response.provider == "local"
-    assert response.confirmedPrompt == "删除除「sheet-dc1」外的所有其他工作表"
+    assert response.provider == "model"
+    assert response.confirmedPrompt == "只保留 sheet-dc1"
+    assert request.prompt in fake.calls[0][0]

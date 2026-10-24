@@ -461,6 +461,8 @@ describe.skipIf(!CROSS_PROCESS)("跨前后端连续链路：消费服务端真�
     expect(host.matrix(MEMBERS, "A1:C6")).toEqual(MEMBER_ROWS);
     expect(host.matrix(ORDERS, "A1:B5")).toEqual(ORDER_ROWS);
 
+    // 计划还没到，原表写入次数必须是 0；自动执行发生在计划到达之后。
+    const beforeWrites = host.originalWrites().length;
     gate.release?.();
     await waitFor(() => expect(planReleased).toBe(true));
     await waitFor(() => expect(view.container.querySelector(".inline-plan")).not.toBeNull());
@@ -480,17 +482,17 @@ describe.skipIf(!CROSS_PROCESS)("跨前后端连续链路：消费服务端真�
     // 空白只有一种，即空单元格。这里断言的是**工件里真实编译出来的**值。
     expect(planActionForDetail.values).toContainEqual(["空键数", 1, null]);
     expect(planActionForDetail.values).toContainEqual(["重复键数", 1, null]);
-    const beforeWrites = host.originalWrites().length;
 
-    // 真实点击「执行到 Excel」：产品执行器写回 + 回读核对。
-    const runButton = await waitFor(() => {
+    // 当前审阅契约：计划到达后由产品**自动执行一次**，不再有「执行到 Excel」
+    // 手动入口，也不以双视图作为执行前置。这里等的是执行完成后的「确认变更」。
+    const confirm = await waitFor(() => {
       const found = [...view.container.querySelectorAll("button")].find(
-        (c) => c.textContent === "执行到 Excel"
+        (c) => c.textContent === "确认变更"
       ) as HTMLButtonElement | undefined;
-      if (!found) throw new Error("「执行到 Excel」按钮尚未出现");
+      if (!found) throw new Error("计划到达后没有进入待确认状态");
       return found;
-    });
-    fireEvent.click(runButton);
+    }, { timeout: 15_000 });
+    expect(host.originalWrites().length).toBeGreaterThan(beforeWrites);
 
     // 断言到**具体单元格**：值与坐标都来自工件里的服务端计划。
     //
@@ -511,6 +513,18 @@ describe.skipIf(!CROSS_PROCESS)("跨前后端连续链路：消费服务端真�
     expect(host.originalWrites().length).toBeGreaterThan(beforeWrites);
 
     await waitFor(() => expect(view.container.textContent).toContain("并通过独立验证"));
+
+    // 确认只清标记、不第二次写入，并开放保存工具。
+    const writesAfterExecution = host.originalWrites().length;
+    fireEvent.click(confirm);
+    await waitFor(() => expect(
+      [...view.container.querySelectorAll("button")].some((c) => c.textContent === "确认变更")
+    ).toBe(false));
+    expect(host.originalWrites()).toHaveLength(writesAfterExecution);
+    expect(
+      view.container.querySelector("button[title='保存为可重复使用的个人工具']"),
+      "确认后应开放保存工具"
+    ).not.toBeNull();
 
     // 撤销：走真实按钮，验证目标区逐格回到执行前（空表）。
     const undoButton = [...view.container.querySelectorAll("button")].find(

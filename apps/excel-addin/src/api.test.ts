@@ -1,4 +1,14 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+
+/**
+ * 继续请求的现场证据。协议里是**必填**：省略不再是"跳过比对"，而是 422。
+ * 这些用例只验证续跑通道的行为，用一份固定证据即可。
+ */
+const TEST_CONTINUATION_EVIDENCE = {
+  workbookIdentity: "url:https://example.invalid/test.xlsx",
+  authorizedSheetNames: ["Sheet1"],
+  sourceVerification: "not_collected" as const
+};
 import {
   ApiRequestError,
   apiErrorCategory,
@@ -46,6 +56,27 @@ import type {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+});
+
+describe("field intent cancellation", () => {
+  it.each(["headers", "body"])("stops waiting for stalled %s before the transport responds", async (phase) => {
+    const controller = new AbortController();
+    let release!: (value: unknown) => void;
+    let entered = false;
+    const stalled = new Promise((resolve) => { release = resolve; });
+    vi.stubGlobal("fetch", vi.fn(() => phase === "headers" ? stalled : Promise.resolve({
+      ok: true, json: () => { entered = true; return stalled; }
+    })));
+    const pending = checkIntent({ prompt: "检查字段", scope: {
+      workbookName: "测试.xlsx", sourceMode: "workbook", selectionMode: "auto", activeWorksheet: "Sheet1",
+      totalWorksheetCount: 1, worksheetNames: ["Sheet1"], sheets: []
+    } }, controller.signal);
+    if (phase === "body") await vi.waitFor(() => expect(entered).toBe(true));
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+    release(phase === "headers" ? new Response('{}') : { kind: "conversation", provider: "model", message: "late" });
+    await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+  });
 });
 
 const streamPlanRequest: PlanRequest = {
@@ -909,6 +940,7 @@ describe("streaming assistant response", () => {
 
     const status = await getPlanningTaskStatus("turn-stream-test");
     const response = await continuePlanningTask({
+      ...TEST_CONTINUATION_EVIDENCE,
       turnId: "turn-stream-test",
       expectedRevision: status.revision,
       requestId: "continue-request-0001",
@@ -936,6 +968,7 @@ describe("streaming assistant response", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     await continuePlanningTask({
+      ...TEST_CONTINUATION_EVIDENCE,
       turnId: "turn-fallback-test",
       expectedRevision: 9,
       requestId: "fallback-request-0001",
@@ -1064,6 +1097,7 @@ describe("streaming assistant response", () => {
     await expect(streamAssistantResponse({ ...streamPlanRequest, modelId: "claude-agent-sdk" }))
       .rejects.toMatchObject({ status, code: "TASK_STATE_CORRUPT" });
     await expect(continuePlanningTask({ turnId: "turn-error", expectedRevision: 1,
+      ...TEST_CONTINUATION_EVIDENCE,
       requestId: "continue-error", afterSequence: 0, modelId: "claude-agent-sdk" }))
       .rejects.toMatchObject({ status, code: "TASK_STATE_CORRUPT" });
     expect(fetchMock).toHaveBeenCalledTimes(2);
@@ -1076,6 +1110,7 @@ describe("streaming assistant response", () => {
     );
 
     const rejection = continuePlanningTask({
+      ...TEST_CONTINUATION_EVIDENCE,
       turnId: "turn-sdk-continue",
       expectedRevision: 2,
       requestId: "continue-sdk-0001",
@@ -1089,7 +1124,7 @@ describe("streaming assistant response", () => {
     });
   });
 
-  it("普通模型在同样的 404 下仍旧回退（拒绝只针对需要工具投递的请求）", async () => {
+  it("旧连接 ID 同样走 SDK：404 时不回退到无工具投递的接口", async () => {
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(new Response("Not Found", { status: 404 }))
@@ -1106,14 +1141,11 @@ describe("streaming assistant response", () => {
       );
     vi.stubGlobal("fetch", fetchMock);
 
-    const response = await streamAssistantResponse({
+    await expect(streamAssistantResponse({
       ...streamPlanRequest,
       modelId: "connection:regular"
-    });
-
-    expect(response).toMatchObject({ kind: "answer", message: "普通模型回退结果" });
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(String(fetchMock.mock.calls[1]?.[0])).toContain("/api/turn");
+    })).rejects.toBeInstanceOf(StreamingToolDeliveryUnavailableError);
+    expect(fetchMock).toHaveBeenCalledOnce();
   });
 
   it("连接失败时 SDK 适配器不退回非流式（服务端连请求都还没收到）", async () => {

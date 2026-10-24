@@ -13,6 +13,9 @@
     "build": "tsc --noEmit",
     "test": "vitest run"
   },
+  "dependencies": {
+    "acorn": "^8.17.0"
+  },
   "peerDependencies": {
     "react": "^19.1.1",
     "react-dom": "^19.1.1"

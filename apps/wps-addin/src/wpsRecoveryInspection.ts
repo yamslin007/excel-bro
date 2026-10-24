@@ -2,6 +2,7 @@ import capabilities from "../../../config/capabilities.json";
 import type { WpsExecutionState } from "../../excel-addin/src/contracts";
 import { parseExplicitA1Rect } from "../../excel-addin/src/planCore";
 import type { WpsApplication } from "./wpsHost";
+import { wpsReadWorkbook } from "./wpsResultReviewTarget";
 import {
   isFormatActionType,
   matrixFingerprintV2,
@@ -46,7 +47,8 @@ export function inspectWpsRecoveryState(application: WpsApplication, state: WpsE
     if (cells > capabilities.wpsWrite.maxCells) return "unknown";
     let inFlight: "completed" | "not_started" | null = null;
     for (const action of state.descriptor.actions) {
-      const sheet = application.ActiveWorkbook!.Worksheets.Item(allowed.get(action.sheet)!);
+      // 恢复核对的是**原表**：副本激活时读活动簿会拿到执行前的副本数据，结论必错。
+      const sheet = wpsReadWorkbook(application)!.Worksheets.Item(allowed.get(action.sheet)!);
       const range = sheet.Range?.(action.range);
       if (!range) return "unknown";
       // 宿主交出的区域形状必须与登记一致；不一致就不能拿它去算指纹。

@@ -9,6 +9,7 @@ export function useAuthorizedTarget(options: {
   /** A known review copy must not be adopted as an original by this guard. */
   reviewActive?: boolean;
   monitorPaused?: boolean;
+  selectionPending?: () => boolean;
   isReviewCopy?: (target: AuthorizedTarget) => boolean;
   /** Host evidence for analysis/read authorization only, never permission to write.
    * Keys are private memory bindings. Consistent weak evidence requires consent;
@@ -23,6 +24,16 @@ export function useAuthorizedTarget(options: {
   const flight = useRef<Promise<AuthorizedTarget | null> | null>(null);
   const mounted = useRef(true);
   const checksInFlight = useRef(0);
+  /**
+   * 基线代数：每推进一次基线 +1。
+   *
+   * 读数与"用这份读数做判断"之间隔着一个 `await`，中间完全可能有人推进基线
+   * （删表收尾的 `bindVerifiedShrink`、原地撤销的 `bindVerifiedRestore`、
+   * 从文件入口采用当前工作簿的 `bind` —— 它们都**不经过** `read()`）。
+   * 拿旧读数去比新基线，得到的 `scope_changed` 是假的：用户刚确认完就被要求
+   * 再确认一次。所以每次读数都记下发起时的代数，回来时代数变了就作废重读。
+   */
+  const bindGeneration = useRef(0);
   const confirmLock = useRef(false);
   const analysisConsent = useRef<string | null>(null);
   const [binding, setBinding] = useState<AuthorizedTarget | null>(null);
@@ -55,12 +66,17 @@ export function useAuthorizedTarget(options: {
   const bind = (target: AuthorizedTarget) => {
     if (!bound.current || checkAuthorizedTarget(bound.current, target) !== "same") analysisConsent.current = null;
     bound.current = target;
+    bindGeneration.current += 1;
     setBinding(target);
     setNotice(null);
     setError("");
   };
-  const pause = (current: AuthorizedTarget | null, reason: TargetNoticeReason, onRetry?: () => void) => {
-    analysisConsent.current = null;
+  const pause = (current: AuthorizedTarget | null, reason: TargetNoticeReason, onRetry?: () => void,
+    revokeConsent = reason !== "unavailable") => {
+    // Readability is not authorization. Keep explicit consent while evidence is
+    // unavailable; use it only after fresh reads prove the original key again.
+    // Positive changes and conflicting proofs still revoke it immediately.
+    if (revokeConsent) analysisConsent.current = null;
     if (onRetry) retry.current = onRetry;
     const missing: AuthorizedTarget = { fileKey: null, name: "目标身份暂不可读取", sheets: [], selected: [] };
     const shown = noticeRef.current;
@@ -73,22 +89,40 @@ export function useAuthorizedTarget(options: {
     return false;
   };
   const check = async (onRetry?: () => void, requireConfirmation = false): Promise<boolean> => {
+    if (live.current.selectionPending?.()) return false;
     if (!live.current.enabled) return true;
     checksInFlight.current += 1;
     setChecking(true);
+    let lastCurrent: AuthorizedTarget | null = null;
     try {
-      const current = await readWithRetry();
-      if (!mounted.current) return false;
-      if (!bound.current && current) bind(current);
-      if (!bound.current) {
-        return pause(current, "unavailable", onRetry);
+      /*
+       * 读数期间基线可能被推进（见 `bindGeneration`）。这种情况作废这一次读数、
+       * 重读一次；**不**拿旧读数去比新基线（那是假的范围变化），也**不**直接
+       * 放行（那会把新基线当成旧读数的结论）。
+       *
+       * 上限 = 正常重试次数 + 2 次"作废"，保证一条"读到稳定读数就算"的路，
+       * 同时不会因为持续推进基线而转圈：都在作废就按"读不出来"处理，交给用户确认。
+       */
+      const maxReads = capabilities.authorizedTarget.verificationAttempts + 2;
+      for (let attempt = 0; attempt < maxReads; attempt++) {
+        const generation = bindGeneration.current;
+        const current = await readWithRetry();
+        if (!mounted.current || live.current.selectionPending?.()) return false;
+        lastCurrent = current;
+        if (bindGeneration.current !== generation) continue;
+        if (!bound.current && current) bind(current);
+        if (!bound.current) {
+          return pause(current, "unavailable", onRetry);
+        }
+        // Only a positively identified owned copy is exempt, never an arbitrary active file.
+        if (current && !onRetry && !requireConfirmation && live.current.isReviewCopy?.(current)) return true;
+        const detected = checkAuthorizedTarget(bound.current, current);
+        const reason = requireConfirmation && detected === "same" ? "confirmation_required" : detected;
+        if (reason === "same") return true;
+        return pause(current, reason, onRetry);
       }
-      // Only a positively identified owned copy is exempt, never an arbitrary active file.
-      if (current && !onRetry && !requireConfirmation && live.current.isReviewCopy?.(current)) return true;
-      const detected = checkAuthorizedTarget(bound.current, current);
-      const reason = requireConfirmation && detected === "same" ? "confirmation_required" : detected;
-      if (reason === "same") return true;
-      return pause(current, reason, onRetry);
+      if (!mounted.current) return false;
+      return pause(lastCurrent, "unavailable", onRetry);
     } finally {
       checksInFlight.current -= 1;
       if (mounted.current && checksInFlight.current === 0) setChecking(false);
@@ -104,8 +138,10 @@ export function useAuthorizedTarget(options: {
       let lastCurrent: AuthorizedTarget | null = null;
       for (let attempt = 0; attempt < capabilities.authorizedTarget.verificationAttempts; attempt++) {
         try {
+          const generation = bindGeneration.current;
           const current = await read();
-          if (!mounted.current) return false;
+          if (!mounted.current || live.current.selectionPending?.()) return false;
+          if (generation !== bindGeneration.current) continue;
           lastCurrent = current;
           if (!bound.current) return pause(current, "unavailable", onRetry);
           const detected = checkAuthorizedTarget(bound.current, current);
@@ -113,19 +149,22 @@ export function useAuthorizedTarget(options: {
           if (detected !== "same") continue;
           const boundEvidence = await live.current.analysisEvidence(bound.current);
           const evidence = current && await live.current.analysisEvidence(current);
-          if (!mounted.current) return false;
+          if (!mounted.current || live.current.selectionPending?.()) return false;
+          if (generation !== bindGeneration.current) continue;
           // Inspect again after asynchronous evidence. Positive changes are never retried away.
           const after = await read();
-          if (!mounted.current) return false;
+          if (!mounted.current || live.current.selectionPending?.()) return false;
+          if (generation !== bindGeneration.current) continue;
           lastCurrent = after;
           const afterCheck = checkAuthorizedTarget(bound.current, after);
           if (afterCheck === "file_changed" || afterCheck === "scope_changed") return pause(after, afterCheck, onRetry);
           if (!current || afterCheck !== "same" || checkAuthorizedTarget(current, after) !== "same") continue;
           const repeated = after && await live.current.analysisEvidence(after);
-          if (!mounted.current) return false;
+          if (!mounted.current || live.current.selectionPending?.()) return false;
+          if (generation !== bindGeneration.current) continue;
           // A missing third proof must not erase a conflict already established by two.
           const keys = [boundEvidence?.key, evidence?.key, repeated?.key].filter((key) => key !== undefined);
-          if (new Set(keys).size > 1) return pause(after, "unavailable", onRetry);
+          if (new Set(keys).size > 1) return pause(after, "unavailable", onRetry, true);
           if (!boundEvidence || !evidence || !repeated) continue;
           if ((evidence.conclusive && repeated.conclusive) || analysisConsent.current === evidence.key) return true;
           // Consistent weak evidence permits explicit fresh-read consent, not automatic access.
@@ -143,7 +182,9 @@ export function useAuthorizedTarget(options: {
   };
   /** Explicit scope selection is the authorization action, not another analysis request.
    * Re-read metadata/evidence before binding; never replay a blocked request or write. */
-  const confirmScope = async (expected: AuthorizedTarget, options: { continuePendingAnalysis?: boolean } = {}): Promise<boolean> => {
+  const confirmScope = async (expected: AuthorizedTarget, options: {
+    continuePendingAnalysis?: boolean; isCurrent?: () => boolean; allowEmpty?: boolean;
+  } = {}): Promise<boolean> => {
     if (!live.current.enabled || confirmLock.current) return false;
     confirmLock.current = true;
     setConfirming(true);
@@ -155,22 +196,22 @@ export function useAuthorizedTarget(options: {
       }
       if (flight.current) await flight.current;
       const fresh = await read();
-      if (!mounted.current) return false;
+      if (!mounted.current || options.isCurrent?.() === false) return false;
       const actual = fresh && { ...fresh, selected: [...expected.selected] };
-      if (!actual || !expected.selected.length || new Set(expected.selected).size !== expected.selected.length ||
+      if (!actual || (!expected.selected.length && !options.allowEmpty) || new Set(expected.selected).size !== expected.selected.length ||
           checkAuthorizedTarget(expected, actual) !== "same") {
         setError("文件或工作表在确认期间发生变化，请重新检查；未变更授权。");
         return false;
       }
       let key: string | null = null;
-      if (live.current.analysisEvidence) {
+      if (expected.selected.length && live.current.analysisEvidence) {
         // Compare the clicked snapshot as well as the fresh one: the same URL alone
         // must not authorize a replacement Office document.
         const before = await live.current.analysisEvidence(expected);
         const evidence = await live.current.analysisEvidence(actual);
         const after = await read();
         const repeated = after && await live.current.analysisEvidence({ ...after, selected: actual.selected });
-        if (!mounted.current) return false;
+        if (!mounted.current || options.isCurrent?.() === false) return false;
         if (!before || !evidence || !repeated || before.key !== evidence.key || evidence.key !== repeated.key ||
             !after || checkAuthorizedTarget(actual, { ...after, selected: actual.selected }) !== "same") {
           setError("暂时无法核实目标身份，请重新检查；未变更授权。");
@@ -178,7 +219,7 @@ export function useAuthorizedTarget(options: {
         }
         key = evidence.key;
       }
-      if (!mounted.current || !live.current.enabled) return false;
+      if (!mounted.current || !live.current.enabled || options.isCurrent?.() === false) return false;
       if (live.current.reviewActive) {
         setError("请先保存或放弃当前审阅副本，再切换任务授权。");
         return false;
@@ -276,9 +317,11 @@ export function useAuthorizedTarget(options: {
     setConfirming(true);
     setError("");
     try {
-      if (!(await checkForAnalysis(retry.current)) || !mounted.current) return;
+      // Classify before checkForAnalysis registers retries. A write callback from
+      // check() must never become an analysis callback merely by rechecking.
+      const pending = retry.current && analysisRetries.current.has(retry.current) ? retry.current : undefined;
+      if (!(await checkForAnalysis(pending)) || !mounted.current) return;
       setNotice(null);
-      const pending = retry.current;
       retry.current = undefined;
       // Only a queued fresh analysis request can resume. Old writes are never queued here.
       if (pending) setTimeout(() => { if (mounted.current) pending(); }, 0);
@@ -287,12 +330,70 @@ export function useAuthorizedTarget(options: {
       if (mounted.current) setConfirming(false);
     }
   };
-  const checkRef = useRef(check);
-  checkRef.current = check;
-  useEffect(() => {
+  /**
+   * 只接受**同一次删表造成的收窄**，用它替掉一次会弹"范围发生变化"的确认。
+   *
+   * 调用方必须先按执行回执核对过（共享层 `reconcileWorksheetDeletionScope`）；
+   * 这里再独立卡一遍"只减不增"，因为这是唯一一条不走 `confirmScope` 就推进
+   * 基线的路：
+   * - 文件身份必须相同（换簿一律拒绝）；
+   * - 收窄后的选中表名必须是原选中表名的**真子集**（不能新增、不能换名）；
+   * - 目标里的表不能出现原来没有的名字（外部新增工作表一律拒绝）。
+   * 任一条不成立就返回 false，基线不动，原有的范围提示照常出现。
+   */
+  const bindVerifiedShrink = (target: AuthorizedTarget): boolean => {
+    const current = bound.current;
+    if (!mounted.current || !current) return false;
+    if (!current.fileKey || current.fileKey !== target.fileKey) return false;
+    const names = (item: AuthorizedTarget) =>
+      item.sheets.filter((sheet) => item.selected.includes(sheet.id)).map((sheet) => sheet.name);
+    const before = names(current);
+    const after = names(target);
+    if (!after.length || after.length >= before.length) return false;
+    const allowed = new Set(before);
+    if (after.some((name) => !allowed.has(name))) return false;
+    const known = new Set(current.sheets.map((sheet) => sheet.name));
+    if (target.sheets.some((sheet) => !known.has(sheet.name))) return false;
+    bind(target);
+    return true;
+  };
+  /**
+   * 只接受**同一次原地撤销**造成的目录增加。
+   *
+   * 撤销会把表放回工作簿，于是目录比基线多了几张。若不认下来，下一轮守卫会把它
+   * 读成"范围变了"，弹一句"尚未写入"——与刚撤销成功的事实冲突。
+   *
+   * 放过的条件同样要证明（调用方已用共享层 `reconcileWorksheetRestoreScope` 核对过）：
+   * - 文件身份必须相同；
+   * - 授权集合**一字不差**（撤销不扩大授权，恢复出来的表也不会自动被授权）；
+   * - 目录里新增的名字只能来自这次撤销，且回执里的表必须真的出现。
+   */
+  const bindVerifiedRestore = (target: AuthorizedTarget, restoredSheets: readonly string[]): boolean => {
+    const current = bound.current;
+    if (!mounted.current || !current || !restoredSheets.length) return false;
+    if (!current.fileKey || current.fileKey !== target.fileKey) return false;
+    const names = (item: AuthorizedTarget) =>
+      item.selected
+        .map((id) => item.sheets.find((sheet) => sheet.id === id)?.name)
+        .filter((name): name is string => Boolean(name));
+    const before = names(current);
+    const after = names(target);
+    if (!before.length || before.length !== after.length) return false;
+    const beforeSet = new Set(before);
+    const afterSet = new Set(after);
+    if (before.some((name) => !afterSet.has(name)) || after.some((name) => !beforeSet.has(name))) return false;
+    const restored = new Set(restoredSheets);
+    const knownBefore = new Set(current.sheets.map((sheet) => sheet.name));
+    const knownAfter = new Set(target.sheets.map((sheet) => sheet.name));
+    if (target.sheets.some((sheet) => !knownBefore.has(sheet.name) && !restored.has(sheet.name))) return false;
+    if (restoredSheets.some((name) => !knownAfter.has(name))) return false;
+    bind(target);
+    return true;
+  };
+  const checkRef = useRef(check);  checkRef.current = check;  useEffect(() => {
     mounted.current = true;
     const inspect = () => {
-      if (live.current.enabled && !live.current.reviewActive && !live.current.monitorPaused &&
+      if (live.current.enabled && !live.current.reviewActive && !live.current.monitorPaused && !live.current.selectionPending?.() &&
           !noticeRef.current && document.visibilityState !== "hidden" &&
           !confirmLock.current && !flight.current) void checkRef.current();
     };
@@ -317,5 +418,9 @@ export function useAuthorizedTarget(options: {
     requestConfirmation: (onRetry?: () => void) => check(onRetry, true),
     cancel: () => { retry.current = undefined; setNotice(null); setError(""); },
     /** Only explicit scope confirmation may advance this baseline. */
-    bind };
+    bind,
+    /** 同一次删表的预期收窄；调用方必须先用回执核对过。 */
+    bindVerifiedShrink,
+    /** 同一次原地撤销造成的目录增加；授权集合不变。 */
+    bindVerifiedRestore };
 }

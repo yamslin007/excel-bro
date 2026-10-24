@@ -155,4 +155,50 @@ describe("activityMessages", () => {
       activityLog: log
     });
   });
+
+  /*
+   * 段身份守卫（缺陷 1 的结构性兜底）：历史段已经冻结在它自己的那一刻，
+   * 迟到的进度不许把它重新激活；活动段照常接收。
+   */
+  function segment(id: string, status: "live" | "superseded" | "closed", taskId?: string) {
+    return { id, status, continuesTask: Boolean(taskId),
+      ...(taskId ? { taskId } : {}) } as NonNullable<ChatMessage["replySegment"]>;
+  }
+
+  it("refuses to write progress into a frozen segment", () => {
+    const frozen = { ...log, operationId: "turn-a", sequence: 9 };
+    const frozenLog: ActivityLog = { ...frozen, connectionMessage: "暂停那一刻" };
+    const messages = [
+      message("activity", "assistant", { activityLog: frozenLog,
+        replySegment: segment("activity", "superseded", "turn-a") })
+    ];
+
+    const result = persistActivityMessage(messages,
+      { ...frozen, connectionMessage: "迟到的执行进度" },
+      "activity", message("fallback", "assistant"));
+
+    expect(result).toBe(messages);
+    expect(result[0].activityLog).toBe(frozenLog);
+    expect(result[0].activityLog?.connectionMessage).toBe("暂停那一刻");
+  });
+
+  it("still writes progress into the live segment", () => {
+    const result = persistActivityMessage(
+      [message("activity", "assistant", { replySegment: segment("activity", "live", "turn-a") })],
+      { ...log, operationId: "turn-a", sequence: 9, connectionMessage: "正在执行" },
+      "activity",
+      message("fallback", "assistant")
+    );
+
+    expect(result[0].activityLog?.connectionMessage).toBe("正在执行");
+    expect(result[0].activityPending).toBe(false);
+  });
+
+  it("keeps accepting progress for messages that never had a segment", () => {
+    const result = persistActivityMessage([message("activity", "assistant")],
+      { ...log, operationId: "turn-a", sequence: 9, connectionMessage: "老消息照旧" },
+      "activity", message("fallback", "assistant"));
+
+    expect(result[0].activityLog?.connectionMessage).toBe("老消息照旧");
+  });
 });

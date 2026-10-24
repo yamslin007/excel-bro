@@ -22,6 +22,7 @@
  */
 import type { WpsApplication, WpsWorkbook, WpsWorksheet } from "./wpsHost";
 import { isWpsSystemSheet, workbookFullName } from "./wpsWorkbookReader";
+import { wpsReadWorkbook } from "./wpsResultReviewTarget";
 
 /**
  * 一个已授权工作表的对象身份。
@@ -128,7 +129,8 @@ export function captureWpsObjectIdentity(
   application: WpsApplication,
   selectedSheetIndexes: readonly number[]
 ): WpsObjectIdentity {
-  const workbook = application.ActiveWorkbook;
+  // 本次副本不是新目标：身份按原表取，避免"副本一获得焦点就被判成换了文件"。
+  const workbook = wpsReadWorkbook(application);
   if (!workbook) {
     throw new Error("WPS 表格中当前没有打开的工作簿。");
   }

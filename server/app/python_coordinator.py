@@ -33,11 +33,13 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
 from .capabilities import capability_int
 from .local_results import local_results
+from .python_code_artifacts import python_code_artifacts
 from .models import (
     DataToolResult,
     PythonDataScope,
@@ -51,6 +53,7 @@ from .python_analysis import (
     RECEIPT_STATUS_COMPLETED,
     _rejected_receipt,
     _unavailable_receipt,
+    validate_python_arguments,
 )
 from .python_datasets import DatasetRejected, registry
 
@@ -208,21 +211,39 @@ def _matrix_result_to_data_tool_result(
     )
 
 
-def execute_python_analysis(request: Any, arguments: dict[str, Any],
-                            *, cancel_check=None) -> dict[str, Any]:
-    """``run_python_analysis`` 工具入口的可信正向实现（失败关闭）。
+@dataclass(frozen=True)
+class PreparedPythonExecution:
+    """一次**已通过全部前置闸门、可以真的起执行器**的分析。
 
-    与 :mod:`python_analysis.execute_python_analysis` 的区别：本函数在开关与
-    运行器都就绪时**真的执行**（解析已登记数据 → 隔离执行 → 结果登记为本地
-    结果），而不是返回 ``product_not_ready``。仍复用 :mod:`python_analysis`
-    的入参校验、固定文案与投影；本函数只负责"接上真实执行"这一段。
+    `prepare` 与 `run` 拆开是为了"正在运行"这句话有证据可依：只有拿到这个对象
+    才允许宣告 running，而 running 的发出点又下沉到执行器真正启动的那一刻
+    （`python_analysis.run_isolated_analysis_internal` 的 `on_runner_start`）。
+    """
 
-    返回有类型回执（供 ``project_python_analysis_receipt`` 投影）：
-    - 成功：``{status: "completed", resultHandle, message}``
-    - 失败：``{status: unavailable|rejected, reasonCategory, message}``
+    task_id: str
+    code: str
+    handles: list[str]
+    receipts: list[PythonDatasetReceipt]
+    binding: PythonTaskBinding
+
+
+# 未开始执行时的两种**不同**结论：入参不合法是"校验没过"，
+# 其余（功能关闭、运行器缺失、没有可信绑定、授权拒绝）是"根本没开始跑"。
+STAGE_VALIDATION_FAILED = "validation_failed"
+STAGE_NOT_STARTED = "not_started"
+
+
+def prepare_python_execution(
+    request: Any, arguments: dict[str, Any]
+) -> tuple[PreparedPythonExecution | None, dict[str, Any], str | None]:
+    """执行前的全部确定性检查。返回 ``(prepared, receipt, stage)``。
+
+    ``prepared`` 为 ``None`` 时 ``receipt`` 是"为什么没开始"的固定回执，
+    ``stage`` 说明该用哪个展示状态（校验未通过 / 未开始执行）；
+    **此时执行器一次都没被调用过**，调用方不得发出 running / executedVersion。
     """
     if not _pa.python_execution_enabled():
-        return _unavailable_receipt(REASON_DISABLED)
+        return None, _unavailable_receipt(REASON_DISABLED), STAGE_NOT_STARTED
     code = arguments.get("code") if isinstance(arguments, dict) else None
     from .python_analysis import (
         PYTHON_CODE_WITHHELD_MARKER,
@@ -230,41 +251,60 @@ def execute_python_analysis(request: Any, arguments: dict[str, Any],
         _validate_arguments,
     )
     if code == PYTHON_CODE_WITHHELD_MARKER:
-        return _unavailable_receipt(REASON_CODE_NOT_PRESERVED)
+        return None, _unavailable_receipt(REASON_CODE_NOT_PRESERVED), STAGE_NOT_STARTED
     if not _validate_arguments(arguments):
-        return _rejected_receipt()
+        return None, _rejected_receipt(), STAGE_VALIDATION_FAILED
     if _pa._runner_status() is None:
-        return _unavailable_receipt(REASON_RUNNER_MISSING)
+        return None, _unavailable_receipt(REASON_RUNNER_MISSING), STAGE_NOT_STARTED
 
     # 任务绑定：必须存在（数据登记已通过工具桥完成），否则句柄无法验证。
     task_id = getattr(request, "turnId", None) if request is not None else None
     if not isinstance(task_id, str) or not task_id:
-        return _rejected_receipt()
+        return None, _rejected_receipt(), STAGE_NOT_STARTED
     binding = coordinator.lookup(task_id)
     if binding is None:
-        # 没有可信数据登记 → 模型自报句柄无法验证，失败关闭。
-        return _rejected_receipt()
+        # 没有可信数据登记 → 模型自报句柄无法验证，失败关闭（没开始执行）。
+        return None, _rejected_receipt(), STAGE_NOT_STARTED
 
     handles = arguments.get("datasetHandles") or []
     receipts: list[PythonDatasetReceipt] = []
     for handle in handles:
         receipt = binding.find_receipt(handle)
         if receipt is None:
-            # 句柄不在可信登记里：不信任模型自报的句柄，失败关闭。
-            return _rejected_receipt()
+            # 句柄不在可信登记里：不信任模型自报的句柄，失败关闭（没开始执行）。
+            return None, _rejected_receipt(), STAGE_NOT_STARTED
         receipts.append(receipt)
 
     if not receipts:
-        return _rejected_receipt()
+        return None, _rejected_receipt(), STAGE_NOT_STARTED
 
+    return PreparedPythonExecution(
+        task_id=task_id,
+        code=code,
+        handles=list(handles),
+        receipts=receipts,
+        binding=binding,
+    ), {}, None
+
+
+def run_prepared_execution(
+    prepared: PreparedPythonExecution,
+    *, cancel_check=None, on_runner_start=None,
+) -> dict[str, Any]:
+    """真的起隔离执行器，并把结果登记为本地结果。
+
+    ``on_runner_start`` 由执行器收到工作程序执行确认后回调，不以创建进程代替。
+    """
+    binding = prepared.binding
     result = _pa.run_registered_analysis_internal(
         data_registry=registry,
         scope_token=binding.scope_token,
         scope=binding.scope,
         origin=binding.origin,
-        receipts=receipts,
-        code=code,
+        receipts=prepared.receipts,
+        code=prepared.code,
         cancel_check=cancel_check,
+        on_runner_start=on_runner_start,
     )
 
     status = result.get("status")
@@ -274,8 +314,9 @@ def execute_python_analysis(request: Any, arguments: dict[str, Any],
             # 入参/授权变化/结果非法：统一 rejected，不泄露原因细节。
             return _rejected_receipt()
         if status == "cancelled":
-            # 取消/授权变化竞态：明确不可用，不发布迟到结果。
-            return _unavailable_receipt(REASON_EXECUTION_ERROR)
+            reason = "authorization_changed" if reason == "authorization_changed" else "cancelled"
+            return {"status": "cancelled", "reasonCategory": reason,
+                    "message": _pa._fixed_receipt_message("cancelled", reason)}
         # unavailable / error：映射 runner 固定失败类别到统一公开文案。
         return _unavailable_receipt(_normalize_reason(reason))
 
@@ -283,7 +324,7 @@ def execute_python_analysis(request: Any, arguments: dict[str, Any],
     # **实际**来源依赖：只算模型真正交进来并被解析的那一批句柄对应的表，
     # 不是「本次登记的全部来源」。登记了两张表、只用了其中一张，结果就只依赖
     # 那一张 —— 写成全体是虚报来源。
-    source_sheets = binding.sheets_of(handles)
+    source_sheets = binding.sheets_of(prepared.handles)
     if source_sheets is None:
         # 查不到句柄对应哪张来源 → 无法确认来源依赖，失败关闭，不猜。
         return _unavailable_receipt(REASON_EXECUTION_ERROR)
@@ -294,7 +335,7 @@ def execute_python_analysis(request: Any, arguments: dict[str, Any],
 
     try:
         registered = local_results.register(
-            task_id, data_result, binding.source_fingerprint
+            binding.task_id, data_result, binding.source_fingerprint
         )
     except ValueError:
         return _unavailable_receipt(REASON_EXECUTION_ERROR)
@@ -322,6 +363,21 @@ def execute_python_analysis(request: Any, arguments: dict[str, Any],
     }
 
 
+def execute_python_analysis(request: Any, arguments: dict[str, Any],
+                            *, cancel_check=None, on_runner_start=None) -> dict[str, Any]:
+    """``run_python_analysis`` 工具入口的可信正向实现（失败关闭）。
+
+    = :func:`prepare_python_execution` + :func:`run_prepared_execution`。
+    拆开之后，"没开始执行"与"执行了但失败"是两件可以分开说的事。
+    """
+    prepared, receipt, _stage = prepare_python_execution(request, arguments)
+    if prepared is None:
+        return receipt
+    return run_prepared_execution(
+        prepared, cancel_check=cancel_check, on_runner_start=on_runner_start
+    )
+
+
 async def execute_python_analysis_async(
     request: Any, arguments: dict[str, Any], *, cancel_check=None, on_event=None
 ) -> dict[str, Any]:
@@ -339,24 +395,191 @@ async def execute_python_analysis_async(
     一个脱离监管的容器。
     """
     cancelled = threading.Event()
+    # 这一次隔离执行的**调用身份**：同一次分析重放仍是这一步，再跑一次是新的。
+    # 原来写死 `python.completed`，一个任务里跑两次分析会合并成一个步骤 ——
+    # 第二次的完成事件覆盖第一次，界面上看起来只分析了一次。
+    run_id = f"py_{uuid.uuid4().hex[:12]}"
+    # 代码工件的身份与执行身份**分开**：`run_id` 是这次调用的身份，
+    # `code_id` 是这段代码的身份。它们同源但语义不同 —— 界面据此判定
+    # "已运行的就是屏幕上这一版"，而不是靠文案。
+    code_id = f"code_{run_id}"
+    # 这段代码的生命周期只占**一个** stepId：同一 stepId 的事件在原地更新，
+    # 于是代码块不会因为"校验了""跑了"而变成三块。
+    step_id = f"python.analysis:{run_id}"
+    code_text = arguments.get("code") if isinstance(arguments, dict) else None
+    # 取回正文时必须同时对上任务身份（见 python_code_artifacts 的说明）。
+    code_task_id = getattr(request, "turnId", None) if request is not None else None
+    if not isinstance(code_task_id, str):
+        code_task_id = ""
 
+    async def emit(event: dict[str, Any]) -> None:
+        if on_event is not None:
+            await on_event(event)
+
+    def code_stage(
+        stage: str, *, version: int, **extra: Any
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "codeId": code_id,
+            "attemptId": run_id,
+            "stage": stage,
+            "version": version,
+            "complete": True,
+        }
+        payload.update(extra)
+        return payload
     def guard() -> bool:
         return cancelled.is_set() or bool(cancel_check and cancel_check())
 
+    show_code = bool(
+        on_event is not None and isinstance(code_text, str) and code_text.strip()
+    )
+
+    if show_code:
+        # 代码在这里是**完整**的（SDK 的 tool use 一次送达整段代码）。因此第一条
+        # 状态是"代码已生成"，绝不说"正在生成" —— 那会把"已经到齐"演成"逐字在写"。
+        #
+        # **正文不进事件**：事件会被写进 planning_task_events（SQLite），而仓库
+        # 的硬边界是"生成的代码不进入持久化现场"。正文登记在进程内登记表里，
+        # 事件只带工件身份与规模，前端按 `codeId` 经本机回环端点取回。
+        python_code_artifacts.register(
+            task_id=code_task_id,
+            code_id=code_id,
+            attempt_id=run_id,
+            code=code_text,
+        )
+        await emit({
+            "phase": "planning",
+            "stepId": step_id,
+            "status": "started",
+            "title": "代码已生成",
+            "summary": "代码已完整到达，接下来做本地校验",
+            "pythonCode": code_stage("generated", version=1, chars=len(code_text)),
+        })
+
+    # ---- 执行前的全部确定性检查 -------------------------------------------
+    # 这一步**不碰执行器**。它返回的结论决定后面到底有没有"正在运行"这回事：
+    # 功能关闭 / 运行器缺失 / 没有可信绑定 / 入参非法，都在这里停下。
+    prepared, refusal, refusal_stage = prepare_python_execution(request, arguments)
+    if prepared is None:
+        if show_code:
+            # 没能开始执行：如实说"未开始执行"（或"校验未通过"），并且**不带**
+            # executedVersion —— 否则界面会显示"已运行"，而实际容器一次都没起。
+            reason_text = str(refusal.get("message") or "")
+            await emit({
+                "phase": "planning",
+                "stepId": step_id,
+                "status": "failed",
+                "title": "代码没有开始执行"
+                if refusal_stage == STAGE_NOT_STARTED
+                else "代码校验未通过",
+                "summary": reason_text
+                or "这段代码没有进入隔离执行，表格没有被改动",
+                "pythonCode": code_stage(
+                    refusal_stage or STAGE_NOT_STARTED,
+                    version=1,
+                    chars=len(code_text or ""),
+                    **({"reason": reason_text} if reason_text else {}),
+                ),
+            })
+        return refusal
+
+    if show_code:
+        await emit({
+            "phase": "planning",
+            "stepId": step_id,
+            "status": "progress",
+            "title": "正在校验 Python 代码",
+            "summary": "代码已生成，正在做本地校验",
+            "pythonCode": code_stage("validating", version=1, chars=len(code_text or "")),
+        })
+
     loop = asyncio.get_running_loop()
+    # running 的证据只可能来自执行器自己：`on_runner_start` 在收到执行确认时由
+    # 工作线程同步回调，这里把它转成一个事件并**登记下来**（先于终态等待），
+    # 保证"正在运行"一定出现在终态之前，而不是靠调度顺序碰运气。
+    started = {"yes": False}
+    pending_emits: list[Any] = []
+
+    async def emit_running() -> None:
+        if not show_code:
+            return
+        await emit({
+            "phase": "planning",
+            "stepId": step_id,
+            "status": "progress",
+            "title": "正在隔离环境分析",
+            "summary": "执行器已启动，正在隔离容器里运行",
+            # 执行器确实启动了，才允许说"版本 1 正在运行"。
+            "pythonCode": code_stage("running", version=1, executedVersion=1),
+        })
+
+    def on_runner_start() -> None:
+        started["yes"] = True
+        try:
+            pending_emits.append(asyncio.run_coroutine_threadsafe(emit_running(), loop))
+        except RuntimeError:
+            # 事件循环已经关了（服务正在收尾）：不改事实，只是发不出进度。
+            pass
+
+    async def flush_start_events() -> None:
+        for pending in pending_emits:
+            try:
+                await asyncio.wrap_future(pending)
+            except Exception:
+                pass
+        pending_emits.clear()
+
     future = loop.run_in_executor(
         None,
-        lambda: execute_python_analysis(request, arguments, cancel_check=guard),
+        lambda: run_prepared_execution(
+            prepared, cancel_check=guard, on_runner_start=on_runner_start
+        ),
     )
     try:
         result = await asyncio.shield(future)
+        await flush_start_events()
+        status = result.get("status")
+        if show_code:
+            executed = {"executedVersion": 1} if started["yes"] else {}
+            if status == RECEIPT_STATUS_COMPLETED:
+                await emit({
+                    "phase": "planning",
+                    "stepId": step_id,
+                    "status": "completed",
+                    "title": "隔离 Python 分析完成",
+                    "summary": "结果已登记为本地结果",
+                    "pythonCode": code_stage("analysis_completed", version=1, **executed),
+                    **({"pythonResult": result["resultCard"]} if result.get("resultCard") else {}),
+                })
+            elif status == "cancelled":
+                await emit({
+                    "phase": "planning",
+                    "stepId": step_id,
+                    "status": "cancelled",
+                    "title": "隔离 Python 分析已暂停" if started["yes"] else "代码执行已取消",
+                    "summary": "这次执行被中止，结果没有发布",
+                    "pythonCode": code_stage("paused" if started["yes"] else STAGE_NOT_STARTED,
+                                             version=1, reason=result.get("message"), **executed),
+                })
+            else:
+                # 检查通过后仍可能在启动时失败。没收到执行确认时不能声称跑过代码。
+                await emit({
+                    "phase": "planning",
+                    "stepId": step_id,
+                    "status": "failed",
+                    "title": "隔离 Python 分析未完成",
+                    "summary": "这次执行没有产出结果，表格没有被改动",
+                    "pythonCode": code_stage("execution_failed" if started["yes"] else STAGE_NOT_STARTED,
+                                             version=1, reason=result.get("message"), **executed),
+                })
         # 如果执行成功且有 resultHandle，发送一个进度事件通知前端。
-        if on_event and result.get("status") == RECEIPT_STATUS_COMPLETED:
+        if on_event and not show_code and status == RECEIPT_STATUS_COMPLETED:
             result_card = result.get("resultCard")
             if result_card:
                 await on_event({
                     "phase": "planning",
-                    "stepId": "python.completed",
+                    "stepId": f"python.completed:{run_id}",
                     "status": "completed",
                     "title": "隔离 Python 分析完成",
                     "summary": "结果已登记为本地结果",
@@ -373,6 +596,45 @@ async def execute_python_analysis_async(
                 if future.done():
                     break
                 await asyncio.sleep(0)
+            except Exception:
+                # 取消后的执行器异常也必须收尾；不能跳过下面的取消终态。
+                break
+        await flush_start_events()
+        if show_code:
+            # 取消也可能发生在"执行器还没启动"的时候：那就说"未开始执行"，
+            # 不能说"已暂停"（暂停意味着它跑过一段）。
+            stage = "paused" if started["yes"] else STAGE_NOT_STARTED
+            await emit({
+                "phase": "planning",
+                "stepId": step_id,
+                "status": "cancelled",
+                "title": "隔离 Python 分析已暂停" if started["yes"] else "代码执行已取消",
+                "summary": "这次执行被中止，结果没有发布"
+                if started["yes"]
+                else "执行已取消，未收到代码开始执行的确认",
+                "pythonCode": code_stage(
+                    stage,
+                    version=1,
+                    **({"executedVersion": 1} if started["yes"] else {}),
+                ),
+            })
+        raise
+    except Exception:
+        # 执行器抛异常也必须有终态：否则代码块永远停在"正在运行"。
+        await flush_start_events()
+        if show_code:
+            await emit({
+                "phase": "planning",
+                "stepId": step_id,
+                "status": "failed",
+                "title": "隔离 Python 分析未完成",
+                "summary": "这次执行没有产出结果，表格没有被改动",
+                "pythonCode": code_stage(
+                    "execution_failed" if started["yes"] else STAGE_NOT_STARTED,
+                    version=1,
+                    **({"executedVersion": 1} if started["yes"] else {}),
+                ),
+            })
         raise
 
 

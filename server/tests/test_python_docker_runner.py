@@ -365,3 +365,15 @@ def test_product_entry_still_disabled_by_default():
     )
     assert receipt["status"] == "unavailable"
     assert receipt["reasonCategory"] == "disabled"
+
+
+def test_execution_ack_requires_complete_first_frame():
+    collector = runner._OutputCollector(4096, 4096)
+    marker = runner.EXECUTION_STARTED_MARKER
+    collector.feed_stderr(marker[:9])
+    assert not collector.execution_started()
+    collector.feed_stderr(marker[9:])
+    assert collector.execution_started()
+    other = runner._OutputCollector(4096, 4096)
+    other.feed_stderr(b"error message: " + marker)
+    assert not other.execution_started()

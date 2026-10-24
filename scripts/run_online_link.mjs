@@ -27,7 +27,7 @@
  */
 import { spawn, spawnSync } from "node:child_process";
 import { createServer } from "node:net";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -99,9 +99,10 @@ if (!dockerAvailable()) {
 // ---------------------------------------------------------------------------
 // 2) 临时能力与配置（只影响本次进程）
 // ---------------------------------------------------------------------------
-const runDir = resolve(repoRoot, "outputs", "online-link");
-if (existsSync(runDir)) rmSync(runDir, { recursive: true, force: true });
-mkdirSync(runDir, { recursive: true });
+// Preserve prior evidence and avoid deleting a directory still held by Windows.
+mkdirSync(resolve(repoRoot, "outputs"), { recursive: true });
+const runDir = mkdtempSync(resolve(repoRoot, "outputs", "online-link-"));
+console.log(`[online] 本次证据目录：${runDir}`);
 
 const capabilitiesPath = resolve(runDir, "capabilities.json");
 const capabilities = JSON.parse(
@@ -115,6 +116,7 @@ writeFileSync(capabilitiesPath, JSON.stringify(capabilities, null, 2), "utf8");
 const configDir = resolve(runDir, "config");
 mkdirSync(configDir, { recursive: true });
 
+const sdkStateDir = mkdtempSync(resolve(tmpdir(), "excel-bro-online-sdk-"));
 const logPath = resolve(runDir, "server.log");
 if (existsSync(logPath)) rmSync(logPath);
 
@@ -131,7 +133,7 @@ const server = spawn(
   {
     cwd: repoRoot,
     stdio: "inherit",
-    shell: isWin,
+    shell: false,
     env: {
       ...process.env,
       EB_ONLINE_PORT: String(port),
@@ -140,18 +142,36 @@ const server = spawn(
       EXCEL_BRO_CAPABILITIES_PATH: capabilitiesPath,
       EXCEL_BRO_CONFIG_DIR: configDir,
       AI_BASE_URL: "http://127.0.0.1:1",
-      AI_MODEL: "online-test-model"
+      AI_MODEL: "online-test-model",
+      AI_API_KEY: "online-test-key",
+      ANTHROPIC_API_KEY: "",
+      CLAUDE_AGENT_SDK_MODEL: "",
+      CLAUDE_AGENT_SDK_STATE_DIR: sdkStateDir
     }
   }
 );
 
 const bye = (code) => {
-  if (!server.killed) {
+  if (!server.killed && server.exitCode === null) {
     try {
-      server.kill();
+      if (isWin && server.pid) {
+        // The venv launcher can own another Python process. Stop only the tree
+        // rooted at this run's child, never all Python/Excel processes.
+        const stopped = spawnSync('taskkill', ['/PID', String(server.pid), '/T', '/F'],
+          { shell: false, windowsHide: true, stdio: 'ignore' });
+        if (stopped.status !== 0) {
+          console.error('[online] 本次测试服务端清理未确认。');
+          code = code || 2;
+        }
+      } else {
+        server.kill();
+      }
     } catch {
       // 进程已退出。
     }
+  }
+  if (dirname(resolve(sdkStateDir)) === resolve(tmpdir())) {
+    rmSync(sdkStateDir, { recursive: true, force: true });
   }
   process.exit(code);
 };

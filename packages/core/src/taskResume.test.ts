@@ -189,7 +189,7 @@ describe("sanitizeTaskResumeRecord 只认显式白名单", () => {
 });
 
 describe("taskResumeDecision 只让有检查点的那条说「继续」", () => {
-  it("有安全检查点：说从上次保存的进度继续", () => {
+  it("有安全检查点：说按当前授权重新读取并分析", () => {
     const decision = taskResumeDecision(
       baseRecord({
         phase: "planning",
@@ -199,8 +199,12 @@ describe("taskResumeDecision 只让有检查点的那条说「继续」", () => 
     );
     expect(decision.action).toBe("continue_checkpoint");
     expect(decision.canContinue).toBe(true);
-    // 正向锚点：只有这条文案允许出现"上次保存的进度"
-    expect(decision.detail).toContain("上次保存的进度");
+    expect(decision.actionLabel).toBe("继续分析");
+    // 正向锚点：只有这条文案允许出现"按当前授权重新读取并分析"
+    expect(decision.detail).toContain("按当前授权重新读取并分析");
+    // 负向：不得承诺"不重做已完成步骤"—— 引用可能已过期，取不到就要重读。
+    expect(decision.detail).not.toContain("不会重做");
+    expect(decision.detail).not.toContain("原样续跑");
   });
 
   it("无检查点：只能重新生成预览，且不得冒充精确续跑", () => {
@@ -216,7 +220,8 @@ describe("taskResumeDecision 只让有检查点的那条说「继续」", () => 
     expect(decision.detail).toContain("重新生成预览");
     // 负向：不得出现只有真检查点才能说的话
     expect(decision.detail).not.toContain("上次保存的进度");
-    expect(decision.actionLabel).toBe("继续任务");
+    expect(decision.detail).not.toContain("按当前授权重新读取并分析");
+    expect(decision.actionLabel).toBe("重新分析");
   });
 
   it("等待回答 + 需要重新授权：走 reauthorize，不是「已失效」", () => {

@@ -729,7 +729,7 @@ def test_wps_format_descriptor_refuses_snapshot_smuggling(field: str) -> None:
 
 
 @pytest.mark.parametrize("action_type", ["setFill", "setNumberFormat", "setBorders", "autofit"])
-def test_wps_unopened_format_actions_are_still_refused(action_type: str) -> None:
+def test_wps_formats_refuse_invalid_field_claims(action_type: str) -> None:
     """端上没接通的动作（fail-closed 拒绝）连登记都不该放行。
 
     它们曾经被错误地列在服务端白名单里 —— "能登记"读起来像"能执行"。
@@ -784,7 +784,11 @@ def test_wps_action_whitelist_matches_capabilities() -> None:
     from_capabilities = {
         name.split(":", 1)[0] for name in capabilities["wpsWrite"]["allowedActions"]
     }
-    assert from_capabilities == set(WPS_RECOVERY_ACTION_TYPES)
+    expansions = capabilities["wpsWrite"].get("actionExpansion", {})
+    assert set(expansions) <= from_capabilities
+    for primitives in expansions.values():
+        assert set(primitives) <= set(WPS_RECOVERY_ACTION_TYPES)
+    assert from_capabilities - set(expansions) == set(WPS_RECOVERY_ACTION_TYPES)
     assert set(main_module._WPS_RECOVERABLE_ACTION_TYPES) == set(WPS_RECOVERY_ACTION_TYPES)
     assert set(_ts_recoverable_action_types()) == set(WPS_RECOVERY_ACTION_TYPES)
 
@@ -797,8 +801,38 @@ def test_wps_action_whitelist_matches_capabilities() -> None:
         ), f"{action_type} 的属性白名单两端不一致"
         assert set(names) <= WPS_FORMAT_FIELD_NAMES, f"{action_type} 声明了未验证的属性"
 
-    # 未通过实机验证的属性一个都不许在名单里（它们就是曾经被错误放行的那三个）。
+    # 未实现的属性及旧的非规范字段名不能登记；verticalAlignment 已有实现，实机证据另列。
     assert not (WPS_FORMAT_FIELD_NAMES & {"underline", "vertical", "columnWidth"})
     assert not (set(ts_fields["setFont"]) & {"underline"})
     assert not (set(ts_fields["setAlignment"]) & {"vertical"})
     assert not (set(ts_fields["resizeRange"]) & {"columnWidth"})
+
+
+@pytest.mark.parametrize(("action_type", "fields"), [
+    ("setFill", ["fillColor", "fillPattern"]),
+    ("setNumberFormat", ["numberFormat"]),
+    ("setBorders", ["borderTop", "borderBottom", "borderLeft", "borderRight"]),
+    ("setAlignment", ["verticalAlignment"]),
+])
+def test_wps_added_formats_register_without_snapshots(action_type, fields):
+    client = TestClient(app)
+    payload = _wps_format_register_payload("wps-added-formats")
+    action = payload["descriptor"]["actions"][0]
+    action.update(type=action_type, formatFields=fields)
+    response = client.post("/api/wps/executions/register", json=payload)
+    assert response.status_code == 200, response.text
+    assert response.json()["descriptor"]["actions"][0]["formatFields"] == fields
+    assert "cells" not in response.json()["descriptor"]["actions"][0]
+    assert "values" not in response.json()["descriptor"]["actions"][0]
+
+
+def test_sort_recovery_registers_value_evidence_and_rejects_format_evidence():
+    client = TestClient(app)
+    payload = _wps_register_payload("wps-sort-checkpoint")
+    payload["descriptor"]["actions"][0]["type"] = "sortRange"
+    response = client.post("/api/wps/executions/register", json=payload)
+    assert response.status_code == 200, response.text
+    assert response.json()["descriptor"]["actions"][0]["type"] == "sortRange"
+    payload["operationId"] = "wps-sort-invalid"
+    payload["descriptor"]["actions"][0]["previewFingerprint"] = "f1:wrong"
+    assert client.post("/api/wps/executions/register", json=payload).status_code == 422

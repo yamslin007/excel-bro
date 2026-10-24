@@ -40,7 +40,7 @@ PYTHON_ANALYSIS_CODE_NOT_PRESERVED_MESSAGE = (
 # 执行入口异常（参数解析/校验/协调器/分发/投影/序列化任一环节抛错）时的
 # 统一安全文案：不携带 str(error)、traceback 或任何原始内容。
 PYTHON_ANALYSIS_EXECUTION_ERROR_MESSAGE = (
-    "隔离 Python 分析在执行环节发生内部错误；本轮未运行任何代码，请改用只读工具或直接提交计划。"
+    "隔离 Python 分析未能完成，未发布可用结果；是否开始执行以执行确认记录为准。"
 )
 # 正向成功：结果已登记为本地结果，模型可引用 resultHandle 走结果卡/结果计划。
 PYTHON_ANALYSIS_COMPLETED_MESSAGE = (
@@ -56,10 +56,12 @@ RECEIPT_STATUS_REJECTED = "rejected"
 # 正向执行成功：结果已登记为本地结果（含 resultHandle）。只有可信协调器
 # （python_coordinator）能产生该状态；入参校验/投影仍失败关闭。
 RECEIPT_STATUS_COMPLETED = "completed"
+RECEIPT_STATUS_CANCELLED = "cancelled"
 RECEIPT_STATUSES = (
     RECEIPT_STATUS_UNAVAILABLE,
     RECEIPT_STATUS_REJECTED,
     RECEIPT_STATUS_COMPLETED,
+    RECEIPT_STATUS_CANCELLED,
 )
 
 REASON_DISABLED = "disabled"
@@ -88,6 +90,8 @@ _ALLOWED_RECEIPT_COMBINATIONS: dict[tuple[str, str], str] = {
     (RECEIPT_STATUS_REJECTED, REASON_INVALID_REQUEST): PYTHON_ANALYSIS_REJECTED_MESSAGE,
     # 正向成功：completed 状态无 reasonCategory，message 由可信协调器固定生成。
     (RECEIPT_STATUS_COMPLETED, REASON_NONE): PYTHON_ANALYSIS_COMPLETED_MESSAGE,
+    (RECEIPT_STATUS_CANCELLED, "cancelled"): "隔离 Python 分析已取消，未发布结果。",
+    (RECEIPT_STATUS_CANCELLED, "authorization_changed"): "数据授权已变化，隔离 Python 分析已停止，未发布结果。",
 }
 
 # 安全历史投影占位：代码字面量在消息历史/检查点中的唯一合法形态。
@@ -190,7 +194,7 @@ def _runner_status() -> str | None:
 def run_isolated_analysis_internal(
     code: str,
     input_payload: dict[str, Any],
-    *, cancel_check=None,
+    *, cancel_check=None, on_runner_start=None,
 ) -> dict[str, Any]:
     """内部执行入口：真实调用 Docker 隔离运行时（仅供测试程序使用）。
 
@@ -243,6 +247,7 @@ def run_isolated_analysis_internal(
             code=code,
             input_payload=input_payload,
             cancel_check=cancel_check,
+            on_runner_start=on_runner_start,
             cpu_quota=1.0,  # CPU 速率上限；累计 CPU 时间另由 max_cpu_seconds 表达
             cpu_seconds=limits["maxCpuTimeSeconds"],
             memory_mb=limits["maxMemoryMb"],
@@ -268,7 +273,7 @@ def run_isolated_analysis_internal(
 
 
 def run_registered_analysis_internal(*, data_registry, scope_token, scope, origin,
-                                     receipts, code, cancel_check=None):
+                                     receipts, code, cancel_check=None, on_runner_start=None):
     """Synthetic/integration entry only; no HTTP/model product execution route.
 
     Resolves server-issued handles, passes values only to the locked container,
@@ -286,9 +291,12 @@ def run_registered_analysis_internal(*, data_registry, scope_token, scope, origi
     def cancelled():
         return bool(cancel_check and cancel_check()) or not data_registry.valid(scope_token, scope, origin, receipts)
 
-    result = run_isolated_analysis_internal(code, values, cancel_check=cancelled)
+    result = run_isolated_analysis_internal(
+        code, values, cancel_check=cancelled, on_runner_start=on_runner_start)
     # Even a runner success cannot publish a stale/late result.
-    if cancelled():
+    if cancel_check and cancel_check():
+        return {"status": "cancelled", "reasonCategory": "cancelled"}
+    if not data_registry.valid(scope_token, scope, origin, receipts):
         return {"status": "cancelled", "reasonCategory": "authorization_changed"}
     return result
 
@@ -321,6 +329,36 @@ def run_registered_result_internal(*, data_registry, scope_token, scope, origin,
     return {"status": "completed", "receipt": receipt.model_dump()}
 
 
+def validate_python_arguments(arguments: dict[str, Any]) -> str | None:
+    """对外的入参校验：返回 ``None`` 表示通过，否则返回固定原因码。
+
+    与 :func:`_validate_arguments` 是同一条判据（它调的就是这个包装），差别只在于
+    这里给出**可展示的阶段结论**，供进度事件宣告"这一版代码没通过校验"。
+    原因码是固定枚举，不含代码字面量、路径或异常原文。
+    """
+    if not isinstance(arguments, dict):
+        return "invalid_arguments"
+    if set(arguments.keys()) - set(_ARGUMENT_KEYS):
+        return "invalid_arguments"
+    limits = python_execution_limits()
+    code = arguments.get("code")
+    if not isinstance(code, str) or not code.strip():
+        return "invalid_arguments"
+    if len(code) > limits["maxCodeChars"]:
+        return "code_too_long"
+    handles = arguments.get("datasetHandles", [])
+    if not isinstance(handles, list):
+        return "invalid_arguments"
+    if len(handles) > limits["maxDatasetHandles"]:
+        return "too_many_handles"
+    for item in handles:
+        if not isinstance(item, str) or not item.strip():
+            return "invalid_arguments"
+        if len(item) > limits["maxDatasetHandleChars"]:
+            return "invalid_arguments"
+    return None
+
+
 def _validate_arguments(arguments: dict[str, Any]) -> bool:
     """可信侧严格入参校验（不依赖模型遵守 schema 或框架兜底）。返回 False 表示非法。
 
@@ -333,27 +371,7 @@ def _validate_arguments(arguments: dict[str, Any]) -> bool:
     形状合法不等于授权合法：datasetHandle 的登记核对尚未实现，不能把
     字符串校验冒充授权检查；无执行器时这里之后的路径仍然绝不运行代码。
     """
-    if not isinstance(arguments, dict):
-        return False
-    if set(arguments.keys()) - set(_ARGUMENT_KEYS):
-        return False
-    limits = python_execution_limits()
-    code = arguments.get("code")
-    if not isinstance(code, str) or not code.strip():
-        return False
-    if len(code) > limits["maxCodeChars"]:
-        return False
-    handles = arguments.get("datasetHandles", [])
-    if not isinstance(handles, list):
-        return False
-    if len(handles) > limits["maxDatasetHandles"]:
-        return False
-    for item in handles:
-        if not isinstance(item, str) or not item.strip():
-            return False
-        if len(item) > limits["maxDatasetHandleChars"]:
-            return False
-    return True
+    return validate_python_arguments(arguments) is None
 
 
 def execute_python_analysis(request: Any, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -452,6 +470,16 @@ def project_python_analysis_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
     }
     if status == RECEIPT_STATUS_COMPLETED:
         projected["resultHandle"] = result_handle
+        card = receipt.get("resultCard")
+        if card is not None:
+            if not isinstance(card, dict) or card.get("resultRef") != result_handle:
+                raise ValueError("结果结构与登记引用不一致")
+            shape = {name: card.get(name) for name in ("rowCount", "columnCount")}
+            if any(type(value) is not int or value < 1 for value in shape.values()):
+                raise ValueError("结果结构尺寸无效")
+            # Only dimensions leave the trusted coordinator. Never pass through
+            # card text, headers, values, source names or arbitrary fields.
+            projected["resultShape"] = shape
     return projected
 
 
@@ -538,6 +566,17 @@ def python_analysis_tool_definition() -> dict[str, Any]:
                 "且每一行长度相同、至少一行一列。"
                 "\n4. 把要展示的列名作为 values 的第一行；汇总、总计、明细都应作为普通"
                 "行写进同一个矩阵（结果会以固定值矩阵的形式进入结果卡与写入计划）。"
+                "\n5. 按用户要求逐项覆盖输出：需要异常明细时，应在过滤、去重或关联之前"
+                "从各来源分别保留异常及原始行位置；不能只检查关联后留下的行。"
+                "空值要同时处理 None、空字符串、纯空格以及分析库的缺失值，不要先"
+                "转成字符串而把缺失值当正常键。用户要求的汇总、总计和每类明细都须"
+                "进入结果矩阵；某类没有记录时明确写零条，不用省略来表示零。"
+                "\n6. completed 只证明隔离代码运行及结果登记成功，不证明业务要求完整。"
+                "提交结果前检查分析代码是否覆盖用户全部要求；回执不含数值，不能声称"
+                "已看过结果值。需要修正时仍通过本工具重新计算，不猜造结果。"
+                "成功回执中的 resultShape 给出实际矩阵 rowCount/columnCount，"
+                "用于计算写入区域；不要为猜测的目标区域补空行。矩阵第一行已含业务"
+                "列名时，submit_result_plan 使用 includeHeader=false，避免另加通用列名。"
             ),
             "parameters": {
                 "type": "object",

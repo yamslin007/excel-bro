@@ -76,6 +76,8 @@ export function emptyModelConnectionDraft(): ModelConnectionDraft {
     modelId: "",
     apiKey: "",
     clearApiKey: false,
+    protocol: "openai_compatible",
+    purpose: "agent",
     supportsVision: false
   };
 }

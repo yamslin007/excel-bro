@@ -13,16 +13,21 @@ import {
 } from "../api";
 import type {
   ModelSettings,
-  UpsertModelConnectionRequest
+  UpsertModelConnectionRequest,
+  ModelConnectionProtocol,
+  ModelConnectionPurpose
 } from "../contracts";
 import { emptyModelConnectionDraft } from "../utils";
 import { MODEL_STORAGE_KEY } from "../conversation";
 import {
   chooseAvailableModel,
-  shouldPersistSelection
+  shouldPersistSelection,
+  keepUnavailableSelection
 } from "../modelSelection";
 
 export interface ModelConnectionDraft {
+  protocol?: ModelConnectionProtocol;
+  purpose?: ModelConnectionPurpose;
   id: string | null;
   label: string;
   baseUrl: string;
@@ -219,6 +224,7 @@ export function useModelManagement(options: UseModelManagementOptions) {
         catalog.defaultModelId,
         preferredModelId
       );
+      if (!next && keepUnavailableSelection(catalog.modelOptions, current)) return current;
       if (shouldPersistSelection(current, next)) {
         localStorage.setItem(MODEL_STORAGE_KEY, next);
       }
@@ -268,6 +274,8 @@ export function useModelManagement(options: UseModelManagementOptions) {
       modelId: connection.modelId,
       apiKey: "",
       clearApiKey: false,
+      protocol: connection.protocol ?? "openai_compatible",
+      purpose: connection.agentAvailable === false ? "formula" : "agent",
       supportsVision: connection.supportsVision
     });
     setSettingsFeedback("");
@@ -291,6 +299,7 @@ export function useModelManagement(options: UseModelManagementOptions) {
       modelId,
       apiKey: connectionDraft.apiKey.trim() || null,
       clearApiKey: connectionDraft.clearApiKey,
+      protocol: connectionDraft.protocol ?? "openai_compatible",
       supportsVision: connectionDraft.supportsVision
     };
   }, [connectionDraft]);
@@ -313,13 +322,15 @@ export function useModelManagement(options: UseModelManagementOptions) {
     setSettingsFeedback("");
     setConnectionTestFeedback(null);
     try {
-      const result = await testModelConnection(request);
+      const purpose = connectionDraft?.purpose ?? "agent";
+      const result = await testModelConnection({ ...request, purpose });
       if (connectionDraftVersionRef.current !== draftVersion) return;
+      const verified = result.ok && result.testedFor === purpose;
       setConnectionTestFeedback({
-        kind: result.ok ? "success" : "error",
-        message: result.ok ? "连接成功，当前模型可用。" : result.message
+        kind: verified ? "success" : "error",
+        message: verified ? result.message : "服务未验证所选用途，请更新后台后重新测试连接。"
       });
-      if (result.ok) {
+      if (verified) {
         verifiedDraftVersionRef.current = draftVersion;
         // 连接测试成功后同步刷新目录状态。否则 WPS 首次预检失败留下的
         // 红色“后台不可用”提示会与成功结果同时存在。
@@ -340,7 +351,7 @@ export function useModelManagement(options: UseModelManagementOptions) {
     } finally {
       setSettingsTesting(false);
     }
-  }, [connectionRequest, refreshServiceHealth]);
+  }, [connectionRequest, connectionDraft?.purpose, refreshServiceHealth]);
 
   /**
    * 保存连接
@@ -373,13 +384,13 @@ export function useModelManagement(options: UseModelManagementOptions) {
         : null;
       await refreshModelsAfterSettings(
         saved,
-        createdConnection?.catalogModelId
+        (connectionDraft.purpose ?? "agent") === "agent" ? createdConnection?.catalogModelId : undefined
       );
       setShowApiKey(false);
       setConnectionDraft(null);
       setSettingsFeedback(
         wasCreating
-          ? "模型连接已添加，并已切换为当前模型。"
+          ? "模型连接已添加。用途与可用状态请见连接列表。"
           : "模型连接已更新。"
       );
     } catch (reason) {
@@ -452,6 +463,7 @@ export function useModelManagement(options: UseModelManagementOptions) {
           current,
           catalog.defaultModelId
         );
+        if (!next && keepUnavailableSelection(catalog.modelOptions, current)) return current;
         if (shouldPersistSelection(current, next)) {
           try {
             localStorage.setItem(MODEL_STORAGE_KEY, next);

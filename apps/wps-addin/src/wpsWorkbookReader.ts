@@ -1,6 +1,7 @@
 import capabilities from "../../../config/capabilities.json";
 import { bridgeWorkbookIdentity } from "@excel-bro/core/sdkToolBridge";
 import type { WpsApplication, WpsRange, WpsWorkbook, WpsWorksheet } from "./wpsHost";
+import { wpsReadWorkbook } from "./wpsResultReviewTarget";
 
 export type WpsCellValue = string | number | boolean | null;
 
@@ -159,7 +160,12 @@ export function normalizeWpsStringMatrix(
 }
 
 export function listWpsWorksheets(application: WpsApplication): WpsWorkbookMetadata {
-  const workbook = application.ActiveWorkbook;
+  /*
+   * 当前活动簿若是**本次审阅的副本**，读取按原表进行：副本不是新目标，
+   * 范围面板也不该改读副本。判据只认本次创建时登记的身份（见
+   * `wpsResultReviewTarget`），无关工作簿不受影响。
+   */
+  const workbook = wpsReadWorkbook(application);
   if (!workbook) throw new WpsAuthorizationError("WPS 表格中当前没有打开的工作簿。");
 
   const activeSheet = application.ActiveSheet ?? workbook.ActiveSheet;
@@ -291,7 +297,11 @@ export function authorizeWpsSheets(
   application: WpsApplication,
   selectedSheetIndexes: readonly number[]
 ): WpsReadAuthorization {
-  const workbook = application.ActiveWorkbook;
+  /*
+   * 授权的目标必须是**本次执行的原表**。双视图会把副本激活成活动簿，若这里读活动簿，
+   * 用户只是点开对比，授权就被换成了副本里的那张表（真机症状：范围面板开始读副本）。
+   */
+  const workbook = wpsReadWorkbook(application);
   if (!workbook) throw new WpsAuthorizationError("WPS 表格中当前没有打开的工作簿。");
   const uniqueIndexes = [...new Set(selectedSheetIndexes.map(Number))];
   if (uniqueIndexes.length === 0) {
@@ -324,7 +334,8 @@ export function assertWpsAuthorization(
   authorization: WpsReadAuthorization,
   authorizedSheet: WpsAuthorizedSheet
 ): WpsWorksheet {
-  const workbook = application.ActiveWorkbook;
+  // 与 `authorizeWpsSheets` 同一口径：读原表，不读被激活的本次副本。
+  const workbook = wpsReadWorkbook(application);
   if (!workbook) {
     throw new WpsAuthorizationError("读取期间活动工作簿发生变化，已停止读取；请重新选择数据范围。");
   }

@@ -26,6 +26,7 @@ from .errors import (
     LLMResponseError,
     LLMTimeoutError,
     LLMTransportError,
+    LLMUsageLimitError,
 )
 
 __all__ = [
@@ -34,6 +35,7 @@ __all__ = [
     "LLMResponseError",
     "LLMTimeoutError",
     "LLMTransportError",
+    "LLMUsageLimitError",
     "delete_managed_connection",
     "draft_model_connection",
     "DuplicateModelConnectionError",

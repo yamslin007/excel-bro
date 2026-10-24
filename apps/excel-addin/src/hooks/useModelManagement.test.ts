@@ -117,7 +117,8 @@ describe("useModelManagement", () => {
     deleteModelConnectionMock.mockResolvedValue(modelSettings);
     testModelConnectionMock.mockResolvedValue({
       ok: true,
-      message: "连接成功"
+      testedFor: "agent",
+      message: "SDK 工具测试通过"
     });
     setFormulaModelMock.mockResolvedValue(modelSettings);
     emptyModelConnectionDraftMock.mockReturnValue(emptyDraft);
@@ -335,7 +336,7 @@ describe("useModelManagement", () => {
     expect(result.current.settingsFeedback).toBe("");
     expect(result.current.connectionTestFeedback).toEqual({
       kind: "success",
-      message: "连接成功，当前模型可用。"
+      message: "SDK 工具测试通过"
     });
     expect(refreshServiceHealth).toHaveBeenCalledTimes(1);
   });
@@ -559,4 +560,39 @@ describe("useModelManagement", () => {
     expect(result.current.selectedModelId).toBe("");
     expect(localStorage.getItem(MODEL_STORAGE_KEY)).toBe("");
   });
+  it("does not accept an old or formula-only success as an SDK Agent test", async () => {
+    const { result } = renderModelManagement();
+    act(() => result.current.setConnectionDraft({ ...emptyDraft, label: "SDK", baseUrl: "https://gateway.invalid", modelId: "m", purpose: "agent" }));
+    testModelConnectionMock.mockResolvedValueOnce({ ok: true, testedFor: "formula", message: "chat succeeded" });
+    await act(async () => { await result.current.verifyConnection(); });
+    expect(testModelConnectionMock).toHaveBeenCalledWith(expect.objectContaining({ purpose: "agent" }));
+    expect(result.current.connectionVerified).toBe(false);
+    expect(result.current.connectionTestFeedback?.kind).toBe("error");
+    await act(async () => { await result.current.saveConnection(); });
+    expect(saveModelConnectionMock).not.toHaveBeenCalled();
+  });
+
+  it("invalidates verification when protocol or purpose changes", async () => {
+    const { result } = renderModelManagement();
+    act(() => result.current.setConnectionDraft({ ...emptyDraft, label: "SDK", baseUrl: "https://gateway.invalid", modelId: "m", protocol: "anthropic", purpose: "agent" }));
+    await act(async () => { await result.current.verifyConnection(); });
+    expect(result.current.connectionVerified).toBe(true);
+    act(() => result.current.setConnectionDraft((draft) => draft && { ...draft, protocol: "openai_compatible", purpose: "formula" }));
+    expect(result.current.connectionVerified).toBe(false);
+    await act(async () => { await result.current.saveConnection(); });
+    expect(saveModelConnectionMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps an unavailable saved connection without silently switching providers", () => {
+    localStorage.setItem(MODEL_STORAGE_KEY, "connection:old");
+    chooseAvailableModelMock.mockReturnValue("");
+    const { result } = renderModelManagement();
+    act(() => result.current.migrateModelSelection({ modelOptions: [{
+      id: "connection:old", label: "old", provider: "model", available: true,
+      supportsVision: false, agentAvailable: false
+    }], defaultModelId: "connection:other" }));
+    expect(result.current.selectedModelId).toBe("connection:old");
+    expect(localStorage.getItem(MODEL_STORAGE_KEY)).toBe("connection:old");
+  });
+
 });

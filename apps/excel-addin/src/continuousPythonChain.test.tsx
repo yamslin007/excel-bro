@@ -344,9 +344,9 @@ async function setAuthorizedScope(
     const selected = button.getAttribute("aria-pressed") === "true";
     if (selected !== names.includes(name)) fireEvent.click(button);
   }
-  const commit = view.container.querySelector<HTMLButtonElement>(".scope-confirm");
+  const commit = view.container.querySelector<HTMLButtonElement>(".scope-close");
   if (!commit) throw new Error("范围「确认」按钮尚未出现");
-  await waitFor(() => expect(commit.disabled).toBe(false));
+  await waitFor(() => expect(view.container.querySelector(".scope-close")?.getAttribute("data-scope-pending")).toBe("false"));
   fireEvent.click(commit);
   await waitFor(() => expect(view.container.querySelector(".scope-popover")).toBeNull());
 }
@@ -437,6 +437,8 @@ describe("Excel 连续链路：同一次任务从宿主读取到撤销", () => {
     expect(host.matrix(MEMBERS, "A1:C6")).toEqual(MEMBER_ROWS);
     expect(host.matrix(ORDERS, "A1:B5")).toEqual(ORDER_ROWS);
 
+    const beforeWrites = host.originalWrites().length;
+    expect(host.matrix(TARGET, 'A1:B4').flat().every(value => value === '')).toBe(true);
     gate.release?.();
     // 放行只是解开 mock 的等待：真正的"计划回到面板"以下面的预览断言为准，
     // 不用一个同步标志去替它作证（那样断言的是测试自己的时序，不是产品行为）。
@@ -445,17 +447,20 @@ describe("Excel 连续链路：同一次任务从宿主读取到撤销", () => {
     await waitFor(() => expect(view.container.querySelector(".inline-plan")).not.toBeNull());
     // 异常明细随计划如实到达（不预制异常说明 —— 它在计划 warnings 里）。
     expect(view.container.textContent).toContain("未匹配");
-    const beforeWrites = host.originalWrites().length;
 
     // 真实点击「执行到 Excel」：产品执行器写回 + 回读核对。
     const runButton = await waitFor(() => {
       const found = [...view.container.querySelectorAll("button")].find(
-        (c) => c.textContent === "执行到 Excel"
+        (c) => c.textContent === "确认变更"
       ) as HTMLButtonElement | undefined;
-      if (!found) throw new Error("「执行到 Excel」按钮尚未出现");
+      if (!found) throw new Error("结果审阅确认按钮尚未出现");
       return found;
     });
+    await waitFor(() => expect(runButton.disabled).toBe(false));
+    const writesBeforeAccept = host.originalWrites().length;
     fireEvent.click(runButton);
+    await waitFor(() => expect(view.queryByRole('button', { name: '确认变更' })).toBeNull());
+    expect(host.originalWrites()).toHaveLength(writesBeforeAccept);
 
     await waitFor(() => expect(host.cell(TARGET, "A1")).toBe("会员等级"), {
       timeout: 4000

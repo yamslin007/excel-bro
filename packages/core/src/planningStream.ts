@@ -192,6 +192,22 @@ export interface PlanningResumeDecision {
   reason: string;
 }
 
+/** 服务端给出的「继续资格」事实（`planning_context` 契约 + 执行账本算出）。 */
+export interface PlanningContinuationView {
+  available: boolean;
+  /** 固定拒绝码；`available` 时为 null。服务端闸门码不属于检查点契约，按字符串处理。 */
+  code: string | null;
+  message: string;
+  stage: "before_model" | "after_tool" | null;
+  /**
+   * 原任务是否依赖来源数据 ⇒ 继续前必须重读并比对来源指纹。
+   *
+   * 由服务端从检查点判定，客户端**不自己猜**：猜"需要"会把纯结构任务挡在门外，
+   * 猜"不需要"会放过数据已经变过的现场。缺省按"需要"处理（fail-closed）。
+   */
+  sourceVerificationRequired?: boolean;
+}
+
 /** 服务端状态的保守视图：只读结构化字段，不读助手文本。 */
 export interface PlanningStatusView {
   status: PlanningTaskStatus;
@@ -201,6 +217,13 @@ export interface PlanningStatusView {
   errorCode?: string | null;
   errorMessage?: string | null;
   hasCheckpoint?: boolean;
+  /**
+   * 能不能继续的**权威事实**。
+   *
+   * `hasCheckpoint` 只是"暂停过"的同义词（旧实现直接拿 `pauseType != null` 当它），
+   * 不能单独决定按钮 —— 一份损坏的、别的任务的、或已经写过原表的现场同样"有暂停"。
+   */
+  continuation?: PlanningContinuationView | null;
 }
 
 /**
@@ -232,9 +255,9 @@ export function planningResumeDecision(
       modelFailure && view.canContinue === true && view.hasCheckpoint === true;
     return {
       action: recoverable ? "continue_checkpoint" : "none",
-      actionLabel: recoverable ? "继续任务" : "",
+      actionLabel: recoverable ? "继续分析" : "",
       detail: recoverable
-        ? "从上次保存的进度继续，不会重做已完成的步骤；写入前仍要经过预览与你的确认。"
+        ? "将按当前授权重新读取并分析；已确认的口径会保留，写入前仍需预览与你的确认。"
         : "该任务已经停止，没有可精确续跑的现场。请重新发送需求。",
       canContinue: recoverable,
       reason:
@@ -251,6 +274,40 @@ export function planningResumeDecision(
     };
   }
   // waiting_user / interrupted
+  /*
+   * 总预算用完是**另一种事实**：现场本身可能是好的，但不该再承诺"按一下就能
+   * 接着跑"。此时服务端把 `canContinue` 置假而 `continuation.available` 仍为真，
+   * 若按"没有现场"处理会被读成"重新生成预览"，等于绕开总时限。
+   */
+  if (view.pauseType === "budget_exhausted") {
+    return {
+      action: "none",
+      actionLabel: "",
+      detail:
+        "本轮有效运行总时长已用完，不再启动新的模型或工具调用。已完成的步骤与现场已保存，请重新发起任务。",
+      canContinue: false,
+      reason: view.reason ?? "本轮有效运行总时长已用完。"
+    };
+  }
+  /*
+   * 服务端明确说不能继续时，**原因照抄**，不自己拼一句"没有可验证的现场"。
+   * 它可能知道本端看不到的事实（例如这个任务其实已经登记过写入），
+   * 换成通用措辞会把用户导向"重发一遍"，而不是去核对原表。
+   */
+  const blocked =
+    view.continuation && view.continuation.available === false
+      ? view.continuation
+      : null;
+  if (blocked) {
+    const message = blocked.message.trim() || "该任务当前不能继续分析。";
+    return {
+      action: "none",
+      actionLabel: "",
+      detail: message,
+      canContinue: false,
+      reason: message
+    };
+  }
   if (view.canContinue !== true || view.hasCheckpoint !== true) {
     return {
       action: "regenerate",
@@ -263,9 +320,12 @@ export function planningResumeDecision(
   }
   return {
     action: "continue_checkpoint",
-    actionLabel: "继续任务",
-    detail:
-      "从上次保存的进度继续，不会重做已完成的步骤；写入前仍然要经过预览与你的确认。",
+    actionLabel: "继续分析",
+    /*
+     * 不许写"不会重做已完成的步骤"：检查点保存的是引用与已确认口径，服务端会按
+     * 当前授权重新读取、重新计算，引用失效就重读 —— 这正是"不沿用过期结果"。
+     */
+    detail: "将按当前授权重新读取并分析；已确认的口径会保留，写入前仍需预览与你的确认。",
     canContinue: true,
     reason: view.reason ?? "本轮处理暂停，当前进度已安全保存。"
   };

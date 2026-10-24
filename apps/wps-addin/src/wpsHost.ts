@@ -36,6 +36,8 @@ export type WpsRange = {
       Weight?: unknown;
       Color?: unknown;
       ColorIndex?: unknown;
+      ThemeColor?: unknown;
+      TintAndShade?: unknown;
     };
   };
   /** 水平对齐。官方文档：xlCenter/xlLeft/xlRight/xlJustify/xlDistributed。 */
@@ -84,6 +86,17 @@ export type WpsWorksheet = {
    * 矩形坐标与 `Value2` 访问面自行记账（`wpsWorkbookReader.test.ts`）。
    */
   Range?(cell1: WpsRange | string, cell2?: WpsRange | string): WpsRange;
+  /**
+   * 表格对象集合（ListObject）。排序/去重前必须核对"目标区域是否落在表格对象里"：
+   * 在表格内重排值而不移动表格对象，会把表头/汇总行/结构化引用弄坏。
+   *
+   * 标可选：未在目标 WPS 版本上实机取证。**读不到就拒绝**该区域（见执行器），
+   * 不得因为"没有这个接口"就当成"区域里没有表格对象"。
+   */
+  ListObjects?: {
+    Count: number;
+    Item(index: number): { Name?: unknown; Range?: WpsRange };
+  };
   /** 无参数复制到新的未保存工作簿；原生并排审阅仅在实机确认支持时使用。 */
   Copy?(): void;
 };

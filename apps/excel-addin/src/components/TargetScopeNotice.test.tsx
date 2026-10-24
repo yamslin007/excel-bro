@@ -7,6 +7,16 @@ import type { AuthorizedTarget, TargetNoticeReason } from "@excel-bro/core/autho
 afterEach(cleanup);
 const target: AuthorizedTarget = { name: "同名.xlsx", fileKey: "PRIVATE_PATH", sheets: [{ id: "1", name: "Sheet1" }], selected: ["1"] };
 describe("one scope selector, no second file-choice dialog", () => {
+  it("rechecks unavailable evidence without asking the user to select the same sheets again", () => {
+    const recheck = vi.fn(); const open = vi.fn();
+    const ui = render(<TargetScopeNotice notice={{ bound: target, current: null, reason: "unavailable", round: 1 }}
+      error="" busy={false} onOpenScope={open} onRecheck={recheck} />);
+    expect(ui.container.textContent).toContain("已保留勾选范围");
+    expect(ui.container.textContent).not.toContain("检查并确认");
+    fireEvent.click(ui.getByRole("button", { name: "重新检查" }));
+    expect(recheck).toHaveBeenCalledOnce();
+    expect(open).not.toHaveBeenCalled();
+  });
   it("opens the existing selector instead of offering duplicate same-name choices", () => {
     const open = vi.fn();
     const ui = render(<TargetScopeNotice notice={{ bound: target, current: target, reason: "scope_changed", round: 1 }}

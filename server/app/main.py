@@ -24,6 +24,7 @@ from pydantic import BaseModel
 from .capabilities import capabilities, capability_float, capability_int
 from .capabilities import model_timeout_seconds
 from .intent import check_intent, check_message_understanding
+from .request_cancellation import until_disconnected
 from .folder_workbooks import (
     FolderCatalog,
     FolderExecuteRequest,
@@ -87,6 +88,7 @@ from .models import (
     ManagedFolderRecoveryDirectoriesResponse,
     ManagedFolderRecoveryDirectory,
     ModelSettingsResponse,
+    ModelCatalogResponse,
     OfficeActionCompleteRequest,
     OfficeActionReconcileRequest,
     OfficeActionStartRequest,
@@ -106,9 +108,12 @@ from .models import (
     WpsRecoveryActionDescriptor,
     WpsRecoveryDescriptor,
     PlanRequest,
+    PlanningContinuation,
     PlanningContinueRequest,
+    PlanningPauseAck,
     PlanValidateRequest,
     TestModelConnectionResponse,
+    TestModelConnectionRequest,
     SetFormulaModelRequest,
     TaskProgressEvent,
     TurnRequest,
@@ -126,6 +131,7 @@ from .llm import (
     LLMResponseError,
     LLMTimeoutError,
     LLMTransportError,
+    LLMUsageLimitError,
     model_catalog,
     model_settings_view,
     model_status,
@@ -170,9 +176,13 @@ from .models import (
     BridgeRegisterResponse,
     BridgeResultRequest,
     BridgeResultResponse,
+    PythonCodeRequest,
+    PythonCodeResponse,
 )
 from .task_bridge import BridgeError, register_bridge_result, task_tool_bridge
 from .local_results import local_results
+from .python_code_artifacts import python_code_artifacts
+from . import planning_context
 from .ledger_privacy import ledger_recovery_descriptor
 
 load_dotenv("server/.env")
@@ -227,6 +237,10 @@ app.add_middleware(
 # local service and are never included in the model/history/checkpoint DTOs.
 from .python_data_api import create_python_data_router
 app.include_router(create_python_data_router(ALLOWED_ORIGINS))
+
+from .worksheet_checkpoint_api import create_worksheet_checkpoint_router
+app.include_router(create_worksheet_checkpoint_router(ALLOWED_ORIGINS))
+
 
 
 def _review_layout_origin(request: Request) -> str:
@@ -452,6 +466,41 @@ async def sdk_tool_bridge_result(payload: BridgeResultRequest, request: Request)
     return response
 
 
+@app.post("/api/sdk/python-code", response_model=PythonCodeResponse)
+async def sdk_python_code(payload: PythonCodeRequest, request: Request):
+    """按 ``codeId`` 取回本次任务生成过的 Python 代码正文。
+
+    为什么单独一个端点：代码正文进事件就会随 ``planning_task_events`` 落进
+    SQLite，而仓库的硬边界是"生成的代码不进入持久化现场"。因此事件只带
+    ``codeId`` / 阶段 / 版本 / 字符数，正文留在进程内登记表里，由界面在使用时
+    按需取回。这也是"重连后能如实显示正文未保留"的依据——取不回就照实说。
+
+    取回失败一律 404 且不区分原因：登记表过期、被容量淘汰、任务对不上都在
+    这里塌成"没有这段代码"，避免端点被当成跨任务探测工具。
+    """
+    _bridge_local_guard(request)
+    item = python_code_artifacts.get(payload.codeId, task_id=payload.taskId)
+    if item is None:
+        raise HTTPException(
+            404,
+            detail={
+                "code": "PYTHON_CODE_UNAVAILABLE",
+                "message": "这段代码没有被保留，请以当前回复中的进度为准。",
+                "retryable": False,
+            },
+        )
+    response = JSONResponse(
+        content=PythonCodeResponse(
+            codeId=item.code_id,
+            attemptId=item.attempt_id,
+            code=item.code,
+            chars=len(item.code),
+        ).model_dump(mode="json")
+    )
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 @app.middleware("http")
 async def guard_state_changing_origins(request: Request, call_next):
     """拦截跨站静默调用。
@@ -569,6 +618,12 @@ def _map_turn_error(error: Exception) -> tuple[int, str, str, bool]:
     JSON 端点 raise service_error 用它，流式端点把它序列化成流内 error 事件，
     确保两条路径的错误语义完全一致。返回 None 表示不是可识别的轮次错误。
     """
+    from .llm.errors import MODEL_USAGE_MESSAGES
+
+    if isinstance(error, LLMUsageLimitError):
+        return (502, error.code, str(error), False)
+    if isinstance(error, LLMHTTPStatusError) and error.usage_code:
+        return (502, error.usage_code, MODEL_USAGE_MESSAGES[error.usage_code], False)
     if isinstance(error, LLMTimeoutError):
         return (504, "MODEL_TIMEOUT", "模型响应超时，可以重试当前对话轮次。", True)
     if isinstance(error, LLMConnectError):
@@ -581,12 +636,12 @@ def _map_turn_error(error: Exception) -> tuple[int, str, str, bool]:
     if isinstance(error, LLMHTTPStatusError):
         status = error.status_code
         if status == 429:
-            # 过载/限流是暂时的。后端已自动退避重试若干次仍未成功，这里给用户
-            # 可理解的中文提示，不透传上游英文原始 body（如 engine_overloaded_error）。
+            # Quota failures were classified above. Do not claim a retry count:
+            # the compatible client and SDK have different retry policies.
             return (
                 503,
                 "MODEL_OVERLOADED",
-                "模型服务当前繁忙（过载或限流），已自动重试多次仍未成功，请稍候再重试。",
+                "模型服务当前繁忙或触发临时限流，请稍候再重试。",
                 True,
             )
         if status >= 500:
@@ -627,7 +682,7 @@ async def health() -> dict[str, str | bool | None]:
         ) from error
 
 
-@app.get("/api/models")
+@app.get("/api/models", response_model=ModelCatalogResponse)
 async def models() -> dict[str, object]:
     try:
         return model_catalog()
@@ -687,6 +742,7 @@ async def save_model_connection(
             api_key=request.apiKey,
             clear_api_key=request.clearApiKey,
             supports_vision=request.supportsVision,
+            protocol=request.protocol,
         )
         return ModelSettingsResponse.model_validate(result)
     except ModelConnectionNotFoundError as error:
@@ -758,7 +814,7 @@ async def save_formula_model(
     response_model=TestModelConnectionResponse,
 )
 async def check_model_connection(
-    request: UpsertModelConnectionRequest,
+    request: TestModelConnectionRequest,
 ) -> TestModelConnectionResponse:
     try:
         connection = draft_model_connection(
@@ -768,12 +824,20 @@ async def check_model_connection(
             api_key=request.apiKey,
             clear_api_key=request.clearApiKey,
             supports_vision=request.supportsVision,
+            protocol=request.protocol,
         )
-        await test_model_connection(connection)
-        return TestModelConnectionResponse(
-            ok=True,
-            message="连接成功，服务地址、模型 ID 和 API Key 可用。",
-        )
+        if request.purpose == "agent":
+            from .claude_sdk_agent import check_sdk_connection
+            await check_sdk_connection(connection)
+            message = "SDK Agent 连接测试通过：模型与受控工具已完成往返。"
+        else:
+            if connection.adapter != "openai_compatible":
+                raise ModelNotAvailableError("独立公式需要 OpenAI 兼容接口；此连接配置为 Anthropic 协议。")
+            await test_model_connection(connection)
+            message = "独立公式接口连接测试通过；本次未验证 SDK Agent。"
+        return TestModelConnectionResponse(ok=True, message=message, testedFor=request.purpose)
+    except ModelNotAvailableError as error:
+        raise service_error(400, "MODEL_CONNECTION_INCOMPATIBLE", str(error), retryable=False) from error
     except ModelConnectionNotFoundError as error:
         raise service_error(
             404,
@@ -803,6 +867,9 @@ async def check_model_connection(
             retryable=True,
         ) from error
     except LLMHTTPStatusError as error:
+        if error.usage_code:
+            status, code, message, retryable = _map_turn_error(error)
+            raise service_error(status, code, message, retryable=retryable) from error
         message = (
             "模型服务拒绝了测试请求，请检查 API Key、模型 ID 和服务地址。"
         )
@@ -813,6 +880,9 @@ async def check_model_connection(
             retryable=error.retryable,
         ) from error
     except (LLMResponseError, LLMTransportError) as error:
+        if isinstance(error, LLMUsageLimitError):
+            status, code, message, retryable = _map_turn_error(error)
+            raise service_error(status, code, message, retryable=retryable) from error
         raise service_error(
             502,
             "MODEL_CONNECTION_TEST_FAILED",
@@ -863,15 +933,15 @@ async def get_capabilities() -> dict[str, object]:
 
 
 @app.post("/api/turn", response_model=TurnResponse)
-async def turn(request: TurnRequest) -> TurnResponse:
+async def turn(request: TurnRequest, http_request: Request = None) -> TurnResponse:
     turn_id = request.turnId or f"turn-{uuid.uuid4().hex}"
     try:
         if isinstance(request, IntentCheckRequest):
             turn_registry.ensure_decision_allowed(turn_id)
-            response = await check_intent(
+            response = await until_disconnected(check_intent(
                 request,
                 config=resolve_model_config(request.modelId),
-            )
+            ), http_request)
             turn_registry.record_decision(turn_id, response)
         else:
             state = turn_registry.touch(turn_id)
@@ -903,6 +973,27 @@ async def turn(request: TurnRequest) -> TurnResponse:
 
 def _sse_frame(event: str, data: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+def _withhold_python_code(event: dict[str, Any]) -> dict[str, Any]:
+    """把代码正文从**要落盘的那份**事件里摘掉，只留工件身份与状态。
+
+    代码不进持久化现场是仓库既有边界（模型生成的代码只在任务内存短期存在）。
+    但"代码块要显示真实状态"同样是真的需求 —— 两者不冲突：内存里的这一帧带着
+    正文发给正在连接的客户端，账本里那一份只留 `codeId/attemptId/stage/version/
+    chars`。重连/恢复轮次拿到的是"状态在、正文没了"，界面前端据 `codeRetained`
+    如实说明，而不是凭标题假装代码还在。
+    """
+    code = event.get("pythonCode")
+    if not isinstance(code, dict):
+        return event
+    stripped = {
+        key: value
+        for key, value in code.items()
+        if key not in ("code", "delta")
+    }
+    stripped["codeRetained"] = False
+    return {**event, "pythonCode": stripped}
 
 
 def _log_task_progress(event: TaskProgressEvent) -> None:
@@ -937,6 +1028,8 @@ _folder_operations: dict[str, _FolderOperationState] = {}
 _folder_operations_lock = asyncio.Lock()
 _folder_operation_ledger = FolderOperationLedger()
 _active_planning_tasks: set[str] = set()
+_planning_task_handles: dict[str, asyncio.Task[AssistantResponse]] = {}
+_planning_stop_requests: set[str] = set()
 _active_planning_tasks_lock = asyncio.Lock()
 
 
@@ -1087,7 +1180,7 @@ async def _record_folder_progress(
     _folder_operation_ledger.append_event(
         operation_id,
         next_sequence,
-        validated,
+        _withhold_python_code(validated),
         execution_id=execution_id if isinstance(execution_id, str) else None,
     )
     async with state.condition:
@@ -1103,7 +1196,23 @@ async def _run_folder_operation(
 ) -> None:
     loop = asyncio.get_running_loop()
 
+    # 当前正在进行的那个步骤。异常中止时必须给它一个真实终态：以前只发一条
+    # 新的 ``folder.failed``，被打断的步骤（``folder.action.2`` 之类）永远停在
+    # "进行中"，界面上只能靠"出现了失败卡"去猜它没做成。
+    # 有终态的事件会把它清空 —— 步骤之间出错时不能把**已完成**的步骤改判成失败。
+    in_flight: dict[str, object] = {"stepId": None, "title": ""}
+    terminal_statuses = {"completed", "warning", "failed", "cancelled"}
+
     def on_progress(event: dict[str, object]) -> None:
+        step_id = event.get("stepId")
+        if isinstance(step_id, str) and step_id:
+            if event.get("status") in terminal_statuses:
+                if in_flight.get("stepId") == step_id:
+                    in_flight["stepId"] = None
+                    in_flight["title"] = ""
+            else:
+                in_flight["stepId"] = step_id
+                in_flight["title"] = str(event.get("title") or "")
         future = asyncio.run_coroutine_threadsafe(
             _record_folder_progress(operation_id, state, event), loop
         )
@@ -1138,6 +1247,26 @@ async def _run_folder_operation(
             if expected_error
             else "文件夹执行发生未预期错误，请查看诊断日志。"
         )
+        # 先给被打断的那一步收尾，再报整体失败：顺序反了会让人以为"整体失败了
+        # 但每一步都还在跑"。
+        try:
+            interrupted = in_flight.get("stepId")
+            if isinstance(interrupted, str) and interrupted:
+                await _record_folder_progress(
+                    operation_id,
+                    state,
+                    {
+                        "phase": "executing",
+                        "stepId": interrupted,
+                        "status": "failed",
+                        "title": "这一步没有完成",
+                        "summary": public_message[:1000],
+                    },
+                )
+        except Exception:
+            logger.exception(
+                "文件夹执行失败后无法保存中断步骤 operation_id=%s", operation_id
+            )
         try:
             await _record_folder_progress(
                 operation_id,
@@ -1263,7 +1392,20 @@ async def _run_folder_resume(
 ) -> None:
     loop = asyncio.get_running_loop()
 
+    # 同 ``_run_folder_operation``：断点续跑被打断时，正在进行的步骤也要有终态。
+    in_flight: dict[str, object] = {"stepId": None, "title": ""}
+    terminal_statuses = {"completed", "warning", "failed", "cancelled"}
+
     def on_progress(event: dict[str, object]) -> None:
+        step_id = event.get("stepId")
+        if isinstance(step_id, str) and step_id:
+            if event.get("status") in terminal_statuses:
+                if in_flight.get("stepId") == step_id:
+                    in_flight["stepId"] = None
+                    in_flight["title"] = ""
+            else:
+                in_flight["stepId"] = step_id
+                in_flight["title"] = str(event.get("title") or "")
         future = asyncio.run_coroutine_threadsafe(
             _record_folder_progress(operation_id, state, event), loop
         )
@@ -1302,6 +1444,24 @@ async def _run_folder_resume(
         if not expected_error:
             logger.exception("断点续跑出现未预期异常 operation_id=%s", operation_id)
         message = str(error) if expected_error else "断点续跑发生未预期错误，请查看诊断日志。"
+        try:
+            interrupted = in_flight.get("stepId")
+            if isinstance(interrupted, str) and interrupted:
+                await _record_folder_progress(
+                    operation_id,
+                    state,
+                    {
+                        "phase": "saving",
+                        "stepId": interrupted,
+                        "status": "failed",
+                        "title": "这一步没有完成",
+                        "summary": message[:1000],
+                    },
+                )
+        except Exception:
+            logger.exception(
+                "断点续跑失败后无法保存中断步骤 operation_id=%s", operation_id
+            )
         try:
             await _record_folder_progress(
                 operation_id,
@@ -1399,24 +1559,28 @@ _OFFICE_RECOVERABLE_ACTION_TYPES = {
 # setBorders / autofit 也列在这里）会让"能登记"读起来像"能执行"。漂移由
 # `server/tests/test_wps_execution_api.py::test_wps_action_whitelist_matches_capabilities` 钉住。
 _WPS_RECOVERABLE_ACTION_TYPES = {
-    "writeValues",
+    "writeValues", "sortRange",
     "writeFormulas",
     "clearRange",
     "setFont",
     "setAlignment",
     "resizeRange",
+    "setFill", "setNumberFormat", "setBorders",
 }
 
 # 每个格式动作**可以声明**的属性名。
 #
-# 与 `apps/wps-addin/src/wpsFormatCapability.ts` 的已验证属性白名单同口径：
-# `underline`（哨兵误用布尔）/ `vertical`（哨兵与原值同值）/ `columnWidth`（量化漂移）
-# 都未通过实机验证，因此**不在**这里 —— 模型若带了它们，执行器在预览阶段就拒绝整份
+# 与 `apps/wps-addin/src/wpsFormatCapability.ts` 的已实现恢复属性白名单同口径：
+# `underline`（哨兵误用布尔）/ `columnWidth`（量化漂移）
+# 尚未实现可恢复执行，因此**不在**这里 —— 模型若带了它们，执行器在预览阶段就拒绝整份
 # 计划；这份表是服务端一侧的第二道闸，防止有人绕过端上投影直接登记。
 _WPS_FORMAT_ACTION_PROPERTIES: dict[str, frozenset[str]] = {
     "setFont": frozenset({"bold", "italic", "name", "size", "color"}),
-    "setAlignment": frozenset({"horizontalAlignment", "wrapText"}),
+    "setAlignment": frozenset({"horizontalAlignment", "verticalAlignment", "wrapText"}),
     "resizeRange": frozenset({"rowHeight"}),
+    "setFill": frozenset({"fillColor", "fillPattern"}),
+    "setNumberFormat": frozenset({"numberFormat"}),
+    "setBorders": frozenset({"borderTop", "borderBottom", "borderLeft", "borderRight"}),
 }
 
 
@@ -1569,7 +1733,7 @@ def _validate_wps_format_evidence(
     在这里把它钉住，而不是只信任端上的投影。
 
     `formatFields` 同时被逐名字核对：`setFont` 不得声明 `rowHeight`，任何动作都不得
-    声明未通过实机验证的 `underline` / `vertical` / `columnWidth`（它们不在
+    声明尚未实现可恢复执行的 `underline` / `columnWidth`（它们不在
     `_WPS_FORMAT_ACTION_PROPERTIES` 里，这里因此直接拒绝，而不是"忽略后照常登记"）。
     """
     declared = list(action.formatFields)
@@ -1717,6 +1881,172 @@ def _planning_pause_reason(
     return "本轮处理已暂停，当前进度已保存。"
 
 
+def _stamp_planning_context(
+    turn_id: str,
+    request: PlanRequest,
+    record: PlanningTaskRecord,
+    payload: dict[str, Any],
+) -> dict[str, Any] | None:
+    """把 SDK 侧交来的进展投影盖章成受控记录。
+
+    SDK 只知道"跑到哪个阶段、哪些工具成功了、拿到哪些结果引用"；
+    任务身份、会话归属、版本、工作簿身份、授权成员、来源指纹**只能由这里给**。
+    任何一项拿不到（例如未保存工作簿没有 `url:`/`wps-path:` 身份）就返回 `None`
+    —— 宁可不提供"继续"，也不给一个核不实的现场。
+    """
+    workbook = request.workbook
+    identity = workbook.workbookIdentity
+    if not isinstance(identity, str) or not identity.strip():
+        return None
+    sheet_names = [sheet.name for sheet in workbook.worksheets]
+    if not sheet_names:
+        return None
+    context = planning_context.build_context(
+        turn_id=turn_id,
+        executor_id=_folder_operation_ledger.executor_id,
+        task_revision=record.revision,
+        stage=str(payload.get("stage") or "before_model"),
+        prompt=request.prompt,
+        planning_goal=request.planningGoal,
+        confirmations=list(payload.get("confirmations") or []),
+        target_identity=identity.strip(),
+        authorized_sheet_names=sheet_names,
+        source_fingerprint=workbook.sourceFingerprint,
+        source_fingerprint_sheets=list(workbook.sourceFingerprintSheets or []),
+        result_refs=list(payload.get("resultRefs") or []),
+        completed_tools=[
+            str(item.get("tool") if isinstance(item, dict) else item)
+            for item in (payload.get("completedTools") or [])
+        ],
+        failed_tool=payload.get("failedTool"),
+        saved_at=datetime.now().astimezone().isoformat(),
+    )
+    verdict = planning_context.validate(
+        context, turn_id=turn_id, revision=record.revision
+    )
+    return verdict.record if verdict.ok else None
+
+
+def _planning_continuation(record: PlanningTaskRecord) -> dict[str, Any]:
+    """「继续分析」的唯一判据入口。
+
+    三条必须同时成立：检查点符合共享契约、这个任务没有登记过任何写入执行、
+    任务本身仍处于可继续的状态（由调用方再乘上预算与状态条件）。
+
+    返回值里的 `record` 是通过契约校验的现场本体（供继续前重新核实使用），
+    不进入任何载荷 —— 它含已确认口径文本，客户端只需要 `available/code/message/stage`。
+    """
+    if record.checkpoint is None:
+        return {
+            "available": False,
+            "code": planning_context.CODE_MISSING,
+            "message": planning_context.MESSAGES[planning_context.CODE_MISSING],
+            "stage": None,
+            "record": None,
+            "sourceVerificationRequired": False,
+        }
+    verdict = planning_context.validate(
+        record.checkpoint, turn_id=record.turn_id, revision=record.revision
+    )
+    if not verdict.ok or verdict.record is None:
+        code = verdict.code or planning_context.CODE_INVALID
+        return {
+            "available": False,
+            "code": code,
+            "message": planning_context.MESSAGES.get(code, verdict.message()),
+            "stage": None,
+            "record": None,
+            "sourceVerificationRequired": False,
+        }
+    if _folder_operation_ledger.has_execution_for_task(record.turn_id):
+        # 已有写入（无论完成、部分还是未知）：不许用"重新分析"绕过执行核对。
+        return {
+            "available": False,
+            "code": planning_context.CODE_HAS_EXECUTION,
+            "message": planning_context.MESSAGES[planning_context.CODE_HAS_EXECUTION],
+            "stage": verdict.record["stage"],
+            "record": verdict.record,
+            "sourceVerificationRequired": planning_context.source_verification_required(
+                verdict.record
+            ),
+        }
+    return {
+        "available": True,
+        "code": None,
+        "message": "",
+        "stage": verdict.record["stage"],
+        "record": verdict.record,
+        "sourceVerificationRequired": planning_context.source_verification_required(
+            verdict.record
+        ),
+    }
+
+
+def _reverify_continuation_target(
+    request: PlanningContinueRequest, context: dict[str, Any] | None
+) -> str | None:
+    """继续之前，用客户端**本轮重新核实**的证据核对检查点。
+
+    **fail-closed**：缺证据不放行。以前的写法只在字段非 None 时比对，三项全省略
+    就返回 None —— 那等于"不核实也能继续"，把整道闸变成装饰。现在证据字段是
+    协议必填（见 `PlanningContinueRequest`），这里再对内容做判定：
+
+    - 工作簿身份必须与原任务的**同一份**，否则 `TARGET_CHANGED`；
+    - 授权成员必须与记录**完全相同**（收窄与扩大都不行），否则 `SCOPE_CHANGED`；
+    - 来源核实是三态：`failed` ⇒ `EVIDENCE_UNREADABLE`；`not_collected` 只在原任务
+      确实没读过来源时成立，否则 `SOURCE_UNVERIFIED`；`verified` 必须与记录指纹一致，
+      不一致 ⇒ `SOURCE_CHANGED`。
+
+    任何一项不过就拒绝，**不在这里"顺手"改成新范围**（那等于替用户扩大了授权）。
+    """
+    if not isinstance(context, dict):
+        return planning_context.CODE_INVALID
+    target = context.get("target") if isinstance(context.get("target"), dict) else {}
+    authorization = (
+        context.get("authorization")
+        if isinstance(context.get("authorization"), dict)
+        else {}
+    )
+
+    current_identity = (request.workbookIdentity or "").strip()
+    recorded_identity = str(target.get("identity") or "").strip()
+    if not current_identity:
+        return planning_context.CODE_EVIDENCE_MISSING
+    if current_identity != recorded_identity:
+        return planning_context.CODE_TARGET_CHANGED
+
+    current_sheets = {name.strip() for name in request.authorizedSheetNames if name.strip()}
+    recorded_sheets = {
+        str(name).strip()
+        for name in (authorization.get("sheetNames") or [])
+        if str(name).strip()
+    }
+    if not current_sheets:
+        return planning_context.CODE_EVIDENCE_MISSING
+    if not recorded_sheets:
+        # 记录里没有授权成员：无法判断"范围是否变过"，不能当成一致。
+        return planning_context.CODE_SCOPE_CHANGED
+    if current_sheets != recorded_sheets:
+        return planning_context.CODE_SCOPE_CHANGED
+
+    if request.sourceVerification == "failed":
+        return planning_context.CODE_EVIDENCE_UNREADABLE
+    if request.sourceVerification == "not_collected":
+        # "尚未采集"只有在原任务本身也没有来源依赖时才合法；否则就是漏了核实。
+        if planning_context.source_verification_required(context):
+            return planning_context.CODE_SOURCE_UNVERIFIED
+        return None
+    # verified：有记录指纹就必须一致；记录本身没有指纹时无可比对，只要求确实读过。
+    recorded_fingerprint = context.get("sourceFingerprint")
+    if isinstance(recorded_fingerprint, str) and recorded_fingerprint.strip():
+        submitted = (request.sourceFingerprint or "").strip()
+        if not submitted:
+            return planning_context.CODE_EVIDENCE_MISSING
+        if submitted != recorded_fingerprint.strip():
+            return planning_context.CODE_SOURCE_CHANGED
+    return None
+
+
 def _planning_pause_payload(
     record: PlanningTaskRecord,
     *,
@@ -1755,6 +2085,7 @@ def _planning_pause_payload(
         if isinstance(connection, dict)
         and str(connection.get("catalogModelId", ""))
         and str(connection.get("catalogModelId", "")) != record.current_model_id
+        and connection.get("agentAvailable") is not False
         and (not requires_vision or connection.get("supportsVision") is True)
     ]
     # 可继续 = 有可续跑的检查点现场 + 未达累计活跃执行总时限。
@@ -1764,8 +2095,9 @@ def _planning_pause_payload(
     # 60 秒一点点加满。旧条件（``approved < hard``）会让所有暂停任务的继续按钮
     # 永远消失 —— 那正是要修的毛病。扩展次数上限只在真正需要追加预算时才有意义，
     # 这里不再拿它当"能不能继续"的判据。
+    continuation = _planning_continuation(record)
     can_continue = (
-        record.checkpoint is not None
+        continuation["available"]
         and within_hard_limit
         and not budget_exhausted
         and record.status in {"running", "waiting_user"}
@@ -1811,6 +2143,15 @@ def _planning_pause_payload(
         "availableModelConnections": available_connections,
         "sourceFingerprint": workbook_snapshot.get("sourceFingerprint"),
         "sourceFingerprintSheets": workbook_snapshot.get("sourceFingerprintSheets", []),
+        # 「继续分析」的事实来源：是否可继续、为什么不能、停在哪个阶段。
+        # 这三项由共享契约 + 执行账本算出，客户端不得自行推断。
+        "continuation": PlanningContinuation(
+            available=continuation["available"],
+            code=continuation["code"],
+            message=continuation["message"],
+            stage=continuation["stage"],
+            sourceVerificationRequired=continuation["sourceVerificationRequired"],
+        ).model_dump(mode="json"),
     }
 
 
@@ -1874,13 +2215,16 @@ async def _planning_task_stream(
                     "trace": event.get("trace"),
                     "bridgeTool": event.get("bridgeTool"),
                     "pythonResult": event.get("pythonResult"),
+                    "pythonCode": event.get("pythonCode"),
                     "timestamp": datetime.now().astimezone().isoformat(),
                 }
                 validated = TaskProgressEvent.model_validate(payload)
                 _log_task_progress(validated)
                 serialized = validated.model_dump(mode="json")
                 current_record = _folder_operation_ledger.append_planning_event(
-                    turn_id, event_sequence, serialized
+                    turn_id,
+                    event_sequence,
+                    _withhold_python_code(serialized),
                 )
                 await queue.put(serialized)
 
@@ -1892,9 +2236,22 @@ async def _planning_task_stream(
                     if isinstance(loop_state, dict)
                     else current_record.active_elapsed_seconds
                 )
+                stamped = _stamp_planning_context(
+                    turn_id, request, current_record, checkpoint
+                )
+                if stamped is None:
+                    # 现场核不实（未保存工作簿 / 身份不是命名空间 / 投影校验失败）：
+                    # 绝不写一份"看起来能继续"的检查点。旧检查点保持原样，
+                    # 状态端点会如实说"没有可继续的现场"。
+                    logger.info(
+                        "规划现场未写入（核不实） turn_id=%s stage=%s",
+                        turn_id,
+                        checkpoint.get("stage"),
+                    )
+                    return
                 current_record = _folder_operation_ledger.save_planning_checkpoint(
                     turn_id,
-                    checkpoint,
+                    stamped,
                     active_elapsed_seconds=elapsed,
                 )
 
@@ -1905,12 +2262,16 @@ async def _planning_task_stream(
                     on_event=on_event,
                     on_checkpoint=on_checkpoint,
                     resume_checkpoint=current_record.checkpoint,
+                    resume_revision=current_record.revision,
                     approved_wall_time_seconds=current_record.approved_wall_time_seconds,
                     reminder_seconds=capability_float(
                         "taskRecovery", "planningReminderSeconds"
                     ),
                 )
             )
+            _planning_task_handles[turn_id] = task
+            if turn_id in _planning_stop_requests:
+                task.cancel()
             while True:
                 drain = asyncio.ensure_future(queue.get())
                 done, _pending = await asyncio.wait(
@@ -1932,9 +2293,28 @@ async def _planning_task_stream(
                     if isinstance(loop_state, dict)
                     else current_record.active_elapsed_seconds
                 )
+                # 暂停**不得**用原始循环检查点覆盖已经保存的受控现场：那份原始
+                # 结构可能是旧格式或含消息缓存，覆盖后就等于拿它冒充"可继续"。
+                paused_checkpoint = (
+                    _stamp_planning_context(turn_id, request, current_record, pause.checkpoint)
+                    or current_record.checkpoint
+                )
+                if paused_checkpoint is None:
+                    # 没有任何可核对现场：如实收尾为失败，不给一个永远点不通的"继续"。
+                    failure = {
+                        "status": 409,
+                        "code": planning_context.CODE_MISSING,
+                        "message": "本轮已停止，但没有可核对的规划现场，请重新发起需求。",
+                        "retryable": False,
+                    }
+                    current_record = _folder_operation_ledger.finish_planning_task(
+                        turn_id, status="failed", error=failure
+                    )
+                    yield _sse_frame("error", failure)
+                    return
                 current_record = _folder_operation_ledger.pause_planning_task(
                     turn_id,
-                    pause.checkpoint,
+                    paused_checkpoint,
                     active_elapsed_seconds=elapsed,
                     reason="本轮处理时间已用完，当前进度已安全保存。",
                 )
@@ -2029,7 +2409,8 @@ async def _planning_task_stream(
             # until that child task has actually stopped; otherwise a reconnect can
             # resume the same checkpoint concurrently with the orphaned request.
             if task is not None and not task.done():
-                task.cancel()
+                if not task.cancelling():
+                    task.cancel()
                 try:
                     await task
                 except asyncio.CancelledError:
@@ -2040,6 +2421,8 @@ async def _planning_task_stream(
                     )
             async with _active_planning_tasks_lock:
                 _active_planning_tasks.discard(turn_id)
+                _planning_task_handles.pop(turn_id, None)
+                _planning_stop_requests.discard(turn_id)
 
 
 @app.post("/api/turn/stream")
@@ -2167,6 +2550,70 @@ async def planning_task_status(turn_id: str) -> dict[str, Any]:
     }
 
 
+@app.post("/api/turn/{turn_id}/pause", response_model=PlanningPauseAck)
+async def pause_planning_task(turn_id: str) -> PlanningPauseAck:
+    """Stop the original planner even when the client is only tailing its events.
+
+    The active fence stays until cleanup finishes. Checkpoint availability is
+    still decided by the status endpoint, never by this acknowledgement.
+    """
+    if _folder_operation_ledger.planning_task(turn_id) is None:
+        raise service_error(404, "PLANNING_TASK_NOT_FOUND", "没有找到原任务。", retryable=False)
+    async with _active_planning_tasks_lock:
+        requested = turn_id in _active_planning_tasks
+        if requested:
+            first_request = turn_id not in _planning_stop_requests
+            _planning_stop_requests.add(turn_id)
+            task = _planning_task_handles.get(turn_id)
+            if first_request and task is not None and not task.done():
+                task.cancel()
+    return PlanningPauseAck(turnId=turn_id, pauseRequested=requested)
+
+
+@app.get("/api/turn/{turn_id}/events")
+async def planning_task_events(turn_id: str, afterSequence: int = 0) -> dict[str, Any]:
+    """只读：补发这条规划任务**已经落盘**的进度事件，不重新规划。
+
+    为什么需要它：「继续」在服务端仍在跑时会被 409（`PLANNING_TASK_STILL_RUNNING`）
+    挡住 —— 那是对的（再发一次就是重复规划）。但客户端断线、或用户按过"暂停接收
+    进度"之后，要把**正在跑**的那条任务接回来，唯一正当的入口就是读它已经保存的
+    事件。这里因此只做查询：
+
+      - 不调用模型、不重发需求、不创建任务、不写账本；
+      - `afterSequence` 之后的**紧凑**事件列表（客户端按 `sequence` 自己去重）；
+      - `active` 表示这条任务此刻是否真的还在本进程里跑。
+
+    身份、授权、写回确认一条都不在这里放宽：它读的是既有账本内容，和状态端点是
+    同一个权限面。
+    """
+    if afterSequence < 0:
+        raise service_error(
+            422, "PLANNING_SEQUENCE_INVALID", "afterSequence 不能为负数。", retryable=False
+        )
+    try:
+        record = _folder_operation_ledger.planning_task(turn_id)
+        persisted = _folder_operation_ledger.planning_events(turn_id)
+    except Exception as error:
+        raise _task_state_error(error) from error
+    if record is None:
+        raise service_error(
+            404, "PLANNING_TASK_NOT_FOUND", "未找到该规划任务。", retryable=False
+        )
+    async with _active_planning_tasks_lock:
+        active = turn_id in _active_planning_tasks
+    return {
+        "turnId": turn_id,
+        "status": record.status,
+        "active": active,
+        "lastSequence": record.last_sequence,
+        "events": [
+            event
+            for event in persisted
+            if int(event.get("sequence", 0) or 0) > afterSequence
+        ],
+    }
+
+
 @app.post("/api/turn/continue/stream")
 async def planning_task_continue_stream(
     request: PlanningContinueRequest,
@@ -2183,11 +2630,32 @@ async def planning_task_continue_stream(
         existing = _folder_operation_ledger.planning_task(request.turnId)
     except Exception as error:
         raise _task_state_error(error) from error
-    if existing is None or existing.checkpoint is None:
+    if existing is None:
+        raise service_error(
+            404,
+            "PLANNING_TASK_NOT_FOUND",
+            "未找到该规划任务。",
+            retryable=False,
+        )
+    # 「继续分析」的唯一闸门：共享契约 + 执行账本。**不看 checkpoint 非空**，
+    # 因为"有检查点"完全可能是一份损坏的、别的任务的或已写入过的旧现场。
+    continuation = _planning_continuation(existing)
+    if not continuation["available"]:
         raise service_error(
             409,
-            "PLANNING_CHECKPOINT_NOT_AVAILABLE",
-            "该任务没有可验证的完整规划现场，不能继续。",
+            continuation["code"] or planning_context.CODE_MISSING,
+            continuation["message"],
+            retryable=False,
+        )
+    # 能继续 ≠ 现在可以继续：先核对客户端重新核实过的现场是否仍是同一份。
+    changed = _reverify_continuation_target(request, continuation["record"])
+    if changed is not None:
+        raise service_error(
+            409,
+            changed,
+            planning_context.MESSAGES.get(
+                changed, "当前现场与原任务不一致，不能继续。"
+            ),
             retryable=False,
         )
     extension_seconds = (
@@ -2365,6 +2833,7 @@ async def register_office_execution(
                 "allowedExternalFiles": request.allowedExternalFiles,
             },
             workbook_identity=request.workbookIdentity,
+            task_id=request.taskId,
         )
     except Exception as error:
         raise _office_conflict(error) from error
@@ -3628,9 +4097,10 @@ async def plan_chat_modify(request: PlanChatRequest) -> PlanChatResponse:
     response_model=MessageUnderstandingResponse,
     response_model_exclude_none=True,
 )
-async def understand_message(request: MessageUnderstandingRequest) -> MessageUnderstandingResponse:
+async def understand_message(request: MessageUnderstandingRequest, http_request: Request = None) -> MessageUnderstandingResponse:
     try:
-        return await check_message_understanding(request, config=selected_model_config(request.modelId))
+        return await until_disconnected(check_message_understanding(
+            request, config=selected_model_config(request.modelId)), http_request)
     except (ModelNotConfiguredError, ModelNotAvailableError, LLMTimeoutError, LLMConnectError,
             LLMHTTPStatusError, LLMTransportError, LLMResponseError) as error:
         status, code, message, retryable = _map_turn_error(error)
@@ -3642,12 +4112,12 @@ async def understand_message(request: MessageUnderstandingRequest) -> MessageUnd
     response_model=IntentCheckResponse,
     response_model_exclude_none=True,
 )
-async def intent(request: IntentCheckRequest) -> IntentCheckResponse:
+async def intent(request: IntentCheckRequest, http_request: Request = None) -> IntentCheckResponse:
     try:
-        return await check_intent(
+        return await until_disconnected(check_intent(
             request,
             config=selected_model_config(request.modelId),
-        )
+        ), http_request)
     except (ModelNotConfiguredError, ModelNotAvailableError) as error:
         # 与 /api/turn、/api/turn/stream 走同一套映射：
         # 「没有可用模型」必须是可识别的稳定错误码，而不是泛化的 INVALID_REQUEST。
@@ -3671,6 +4141,9 @@ async def intent(request: IntentCheckRequest) -> IntentCheckResponse:
             detail="无法连接模型服务，请检查网络和 AI_BASE_URL。",
         ) from error
     except LLMHTTPStatusError as error:
+        if error.usage_code:
+            status, code, message, retryable = _map_turn_error(error)
+            raise service_error(status, code, message, retryable=retryable) from error
         status = error.status_code
         if status == 429:
             raise HTTPException(
@@ -3687,6 +4160,9 @@ async def intent(request: IntentCheckRequest) -> IntentCheckResponse:
             ) from error
         raise HTTPException(status_code=502, detail=str(error)) from error
     except (LLMTransportError, LLMResponseError) as error:
+        if isinstance(error, LLMUsageLimitError):
+            status, code, message, retryable = _map_turn_error(error)
+            raise service_error(status, code, message, retryable=retryable) from error
         raise HTTPException(
             status_code=502,
             detail=f"模型意图识别连接失败：{error}",

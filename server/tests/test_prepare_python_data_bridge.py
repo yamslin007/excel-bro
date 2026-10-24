@@ -157,7 +157,9 @@ def test_prepare_python_data_handle_consumed_by_run_python_analysis(monkeypatch)
     handle = receipt["datasetHandles"][0]
 
     def fake_runner(data_registry, scope_token, scope, origin, receipts, code,
-                    cancel_check=None):
+                    cancel_check=None, on_runner_start=None):
+        if on_runner_start:
+            on_runner_start()
         values = data_registry.resolve(scope_token, scope, origin, receipts)
         total = sum(cell for d in values["datasets"] for row in d["values"] for cell in row)
         return {"status": "completed", "result": {"kind": "matrix", "values": [[total]]}}

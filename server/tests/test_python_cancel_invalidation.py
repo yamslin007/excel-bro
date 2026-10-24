@@ -193,7 +193,12 @@ def test_cancel_during_execution_publishes_nothing(monkeypatch):
     session = bridge.open(_binding())
     handle = _register_dataset(session)
 
-    def isolated_that_finishes_after_cancel(code, values, cancel_check=None):
+    def isolated_that_finishes_after_cancel(
+        code, values, cancel_check=None, on_runner_start=None
+    ):
+        # 容器真的启动过：这条用例要证的是"跑完也不许登记"，不是"没开始"。
+        if on_runner_start:
+            on_runner_start()
         # 模拟"容器还在跑，用户取消了"：取消发生在结果返回之前。
         drop_python_state(TASK)
         return {"status": "completed", "result": {"kind": "matrix", "values": [[999]]}}

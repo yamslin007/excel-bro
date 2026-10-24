@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -33,6 +34,7 @@ from server.app.task_bridge import (
     BridgeError,
     TaskToolBridge,
     arguments_fingerprint,
+    bridge_step_id,
 )
 
 SENTINEL = "SENTINEL_SECRET_9F3A"
@@ -320,6 +322,194 @@ def test_bridge_supersedes_on_reauthorization():
 
 
 # ---------------------------------------------------------------------------
+# C2. 桥调用的结束事件与调用身份
+#
+# 以前桥只有 ``on_request``（"开始了"），没有任何"结束了"：进度事件里这一步
+# 永远停在进行中，前端只能靠"下一步出现了"倒推上一步完成 —— 那是对用户的猜测，
+# 而且模型多调一次工具就会把上一步误判成完成。这里钉两件事：
+#   * 每次调用的每个真实终态（成功 / 固定错误码 / 超时 / 取消）都发一条结束事件；
+#   * 步骤身份包含**这一次调用**，同一工具连调两次是两个步骤，同次重放同一身份。
+# ---------------------------------------------------------------------------
+
+STEP_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]+$")
+
+
+def test_bridge_step_id_separates_invocations_of_the_same_tool():
+    first = bridge_step_id("query_table", "op_" + "a" * 32)
+    second = bridge_step_id("query_table", "op_" + "b" * 32)
+
+    # 判别点：同一个工具、两次调用 → 两个步骤身份。
+    assert first != second
+    # 同一次调用（重放）→ 同一身份，事件只更新不新增。
+    assert bridge_step_id("query_table", "op_" + "a" * 32) == first
+    # 同一次调用、不同工具 → 不同身份（工具名也在身份里）。
+    assert bridge_step_id("describe_tables", "op_" + "a" * 32) != first
+    # 协议约束：models.py 的 stepId 只允许 ^[A-Za-z0-9_.:-]+$（1–100 字）。
+    for step_id in (first, second):
+        assert STEP_ID_PATTERN.match(step_id), step_id
+        assert 1 <= len(step_id) <= 100
+        assert "#" not in step_id
+
+
+def test_bridge_reports_a_completion_for_a_successful_call():
+    bridge = TaskToolBridge()
+    events: list[tuple[str, str, dict]] = []
+
+    async def on_complete(operation_id, tool, receipt):
+        events.append((operation_id, tool, receipt))
+
+    session = bridge.open(_binding(), on_complete=on_complete)
+    seen: dict = {}
+
+    async def scenario():
+        task = asyncio.create_task(session.request("query_table", {"mode": "rows"}))
+        for _ in range(200):
+            if session.pending_calls:
+                break
+            await asyncio.sleep(0)
+        call = session.pending_calls[0]
+        seen["operationId"] = call["operationId"]
+        session.deliver(
+            operation_id=call["operationId"],
+            request_fingerprint=call["requestFingerprint"],
+            host_id="excel-office", workbook_name="测试.xlsx",
+            source_fingerprint="fp-source-1", result=_result(), error_code=None,
+        )
+        return await task
+
+    receipt = asyncio.run(scenario())
+
+    # 正向锚点：这次调用真的成功了。
+    assert receipt["status"] == "ok"
+    # 判别点：结束事件恰好一条，且带的是**这一次调用**的身份。
+    assert len(events) == 1
+    operation_id, tool, ended = events[0]
+    assert operation_id == seen["operationId"]
+    assert tool == "query_table"
+    assert ended["status"] == "ok"
+    assert bridge_step_id(tool, operation_id).endswith(
+        operation_id.removeprefix("op_")[:12]
+    )
+
+
+def test_bridge_emits_one_completion_per_call_and_distinct_steps():
+    """同一工具连续调两次：两条结束事件、两个步骤身份（不合并成一步）。"""
+    bridge = TaskToolBridge()
+    events: list[tuple[str, str, dict]] = []
+
+    async def on_complete(operation_id, tool, receipt):
+        events.append((operation_id, tool, receipt))
+
+    session = bridge.open(_binding(), on_complete=on_complete)
+
+    async def one_call(mode: str):
+        task = asyncio.create_task(session.request("query_table", {"mode": mode}))
+        for _ in range(200):
+            if session.pending_calls:
+                break
+            await asyncio.sleep(0)
+        call = session.pending_calls[0]
+        session.deliver(
+            operation_id=call["operationId"],
+            request_fingerprint=call["requestFingerprint"],
+            host_id="excel-office", workbook_name="测试.xlsx",
+            source_fingerprint="fp-source-1", result=_result(), error_code=None,
+        )
+        return await task
+
+    async def scenario():
+        first = await one_call("rows")
+        second = await one_call("aggregate")
+        return first, second
+
+    first, second = asyncio.run(scenario())
+
+    assert first["status"] == "ok" and second["status"] == "ok"
+    assert len(events) == 2
+    step_ids = {
+        bridge_step_id(tool, operation_id) for operation_id, tool, _ in events
+    }
+    assert len(step_ids) == 2, f"两次调用合并成了同一步骤：{step_ids}"
+
+
+def test_bridge_reports_timeout_as_a_real_terminal(monkeypatch):
+    """超时也是一个真实终态：必须发结束事件，不能把这一步永远留在进行中。"""
+    from server.app import capabilities as caps
+
+    real = caps.capability_int
+
+    def fake_capability_int(section: str, key: str) -> int:
+        if (section, key) == ("agentToolBridge", "waitTimeoutSeconds"):
+            return 0  # 立刻超时
+        return real(section, key)
+
+    monkeypatch.setattr("server.app.task_bridge.capability_int", fake_capability_int)
+
+    bridge = TaskToolBridge()
+    events: list[tuple[str, str, dict]] = []
+
+    async def on_complete(operation_id, tool, receipt):
+        events.append((operation_id, tool, receipt))
+
+    session = bridge.open(_binding(), on_complete=on_complete)
+    receipt = asyncio.run(session.request("query_table", {"mode": "rows"}))
+
+    assert receipt == {"status": "error", "errorCode": "timeout"}
+    assert len(events) == 1
+    operation_id, tool, ended = events[0]
+    assert tool == "query_table"
+    # 超时用的是**这次调用**的 operationId（不是占位 op_none）。
+    assert operation_id.startswith("op_")
+    assert ended["errorCode"] == "timeout"
+
+
+def test_bridge_reports_cancel_as_a_real_terminal():
+    bridge = TaskToolBridge()
+    events: list[tuple[str, str, dict]] = []
+
+    async def on_complete(operation_id, tool, receipt):
+        events.append((operation_id, tool, receipt))
+
+    session = bridge.open(_binding(), on_complete=on_complete)
+    session.cancel("user_cancelled")
+
+    receipt = asyncio.run(session.request("query_table", {"mode": "rows"}))
+
+    assert receipt == {"status": "error", "errorCode": "cancelled"}
+    assert len(events) == 1
+    assert events[0][2]["errorCode"] == "cancelled"
+
+
+def test_bridge_completion_failure_never_swallows_the_receipt():
+    """进度事件发不出去只影响展示，不能让工具回执消失。"""
+    bridge = TaskToolBridge()
+
+    async def on_complete(operation_id, tool, receipt):
+        raise RuntimeError("进度通道坏了")
+
+    session = bridge.open(_binding(), on_complete=on_complete)
+
+    async def scenario():
+        task = asyncio.create_task(session.request("query_table", {"mode": "rows"}))
+        for _ in range(200):
+            if session.pending_calls:
+                break
+            await asyncio.sleep(0)
+        call = session.pending_calls[0]
+        session.deliver(
+            operation_id=call["operationId"],
+            request_fingerprint=call["requestFingerprint"],
+            host_id="excel-office", workbook_name="测试.xlsx",
+            source_fingerprint="fp-source-1", result=_result(), error_code=None,
+        )
+        return await task
+
+    receipt = asyncio.run(scenario())
+    assert receipt["status"] == "ok"
+    assert receipt["resultRef"].startswith("res_")
+
+
+# ---------------------------------------------------------------------------
 # C. registry ownership
 # ---------------------------------------------------------------------------
 
@@ -573,7 +763,8 @@ def _install(monkeypatch, tmp_path, fake):
 
 @pytest.mark.parametrize("host_id", ["excel-office", "wps-et"])
 @pytest.mark.parametrize("mode", ["join", "deduplicate"])
-def test_sdk_unsupported_combine_reports_capability_without_host_read(monkeypatch, tmp_path, host_id, mode):
+@pytest.mark.parametrize("termination", ["turns", "quota"])
+def test_sdk_unsupported_combine_reports_capability_without_host_read(monkeypatch, tmp_path, host_id, mode, termination):
     class UnsupportedSdk(_BridgeFakeSdk):
         async def query(self, *, prompt, options):
             tool = options.mcp_servers["excel_bro"]["query_table"]
@@ -584,7 +775,10 @@ def test_sdk_unsupported_combine_reports_capability_without_host_read(monkeypatc
             assert json.loads(outcome["content"][0]["text"])["errorCode"] == "invalid_arguments"
             final = _FakeResult()
             final.is_error = True
-            final.subtype = "error_max_turns"
+            final.subtype = "error_max_turns" if termination == "turns" else "success"
+            if termination == "quota":
+                final.api_error_status = 429
+                final.errors = ['{"error":{"code":"insufficient_quota"}}']
             yield final
 
     fake = UnsupportedSdk([], task_id="turn-bridge-0001", delivered_result=_result())
@@ -593,7 +787,8 @@ def test_sdk_unsupported_combine_reports_capability_without_host_read(monkeypatc
         pytest.fail("不支持的查询不得投递给宿主")
     from server.app.task_bridge import ToolBridgeSession
     monkeypatch.setattr(ToolBridgeSession, "request", no_read)
-    with pytest.raises(Exception, match="当前工作簿查询暂不支持关联或去重"):
+    message = "当前工作簿查询暂不支持关联或去重" if termination == "turns" else "模型 API 余额不足"
+    with pytest.raises(Exception, match=message):
         asyncio.run(claude_sdk_agent.run_sdk_plan(_plan_request(hostId=host_id), _connection()))
 
 

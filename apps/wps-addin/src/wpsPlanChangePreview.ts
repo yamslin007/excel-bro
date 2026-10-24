@@ -1,3 +1,4 @@
+import { isFormatActionType } from "./wpsPlanExecutor";
 import { columnLetterFromIndex } from "@excel-bro/core/range";
 import { parseExplicitA1Rect } from "../../excel-addin/src/planCore";
 import type { CellValue } from "../../excel-addin/src/contracts";
@@ -65,16 +66,14 @@ export function planPreviewCellText(value: CellValue): string {
   return String(value);
 }
 
-/** 是否为格式动作（走格式快照路径，预览显示格式描述而非"写入值"）。 */
-function isFormatActionType(type: string): type is "setFont" | "setAlignment" | "resizeRange" {
-  return type === "setFont" || type === "setAlignment" || type === "resizeRange";
-}
-
 /** 动作类型 → 用户能读的说法。与计划卡其它地方共用同一套词汇。 */
 export function planActionLabel(type: string): string {
   if (type === "clearRange") return "清空内容";
   if (type === "writeFormulas") return "写入公式";
   if (type === "setFont") return "设置字体";
+  if (type === "setFill") return "设置填充";
+  if (type === "setNumberFormat") return "设置数字格式";
+  if (type === "setBorders") return "设置边框";
   if (type === "setAlignment") return "设置对齐";
   if (type === "resizeRange") return "调整尺寸";
   if (type === "writeValues") return "写入值";
