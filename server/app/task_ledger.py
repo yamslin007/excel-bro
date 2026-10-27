@@ -16,7 +16,7 @@ from .capabilities import capability_int
 
 _READONLY_RETRY_ATTEMPTS = 6
 # 当前 schema 版本（与 _initialize_schema 里的 PRAGMA user_version 一致）。
-_SCHEMA_VERSION = 8
+_SCHEMA_VERSION = 9
 # SQLite 只读相关错误码（用于按**准确类别**判定重试，而非匹配错误字符串）。
 # 见 https://www.sqlite.org/rescode.html ：SQLITE_READONLY(8) 及其扩展码。
 _SQLITE_READONLY_CODES = {8, 8 | (1 << 8), 8 | (2 << 8), 8 | (3 << 8)}
@@ -419,6 +419,17 @@ class FolderOperationLedger:
                 ON office_executions(status, updated_at);
             CREATE INDEX IF NOT EXISTS idx_office_executions_task
                 ON office_executions(task_id);
+            -- 「实际写入了几次」的审计：只存**计数与状态**，不存单元格值、公式正文
+            -- 或工具参数。追加式（同一次动作可以先后记两条：写成功一条、补记一条），
+            -- 汇总时按 `(operation_id, action_index)` 取最后一条。
+            CREATE TABLE IF NOT EXISTS office_host_writes (
+                operation_id TEXT NOT NULL,
+                action_index INTEGER NOT NULL CHECK (action_index >= 0),
+                payload_json TEXT NOT NULL,
+                recorded_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_office_host_writes_operation
+                ON office_host_writes(operation_id, action_index, recorded_at);
             """
         )
         operation_columns = {
@@ -1707,6 +1718,73 @@ class FolderOperationLedger:
                 (operation_id,),
             ).fetchone()
         return self._office_record(row) if row is not None else None
+
+    def append_office_host_writes(
+        self, operation_id: str, entries: list[dict[str, Any]]
+    ) -> None:
+        """追加一次宿主写调用审计（**只追加**，不改执行状态、不推进 revision）。
+
+        为什么不是"更新一行"：这份审计是观测，不是恢复点。把它写成 upsert 会让
+        晚到的补记覆盖先到的现场；写成"必须成功"又会给关键写入路径加一个失败点
+        —— 调用方（端上）本来就是 best-effort，失败只该少一条证据，不该影响写入。
+        """
+        if not entries:
+            return
+        now = time.time()
+        rows = [
+            (
+                operation_id,
+                int(entry.get("actionIndex") or 0),
+                json.dumps(entry, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                now,
+            )
+            for entry in entries
+        ]
+        with self._connect() as connection:
+            connection.executemany(
+                """
+                INSERT INTO office_host_writes (
+                    operation_id, action_index, payload_json, recorded_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                rows,
+            )
+            connection.commit()
+
+    def office_host_writes(self, operation_id: str) -> list[dict[str, Any]]:
+        """按动作序号取**每个动作最后一条**审计（同动作多条时以最后一条为准）。"""
+        with self._connect_readonly() as connection:
+            rows = connection.execute(
+                """
+                SELECT action_index, payload_json FROM office_host_writes
+                WHERE operation_id = ?
+                ORDER BY recorded_at ASC, rowid ASC
+                """,
+                (operation_id,),
+            ).fetchall()
+        latest: dict[int, dict[str, Any]] = {}
+        for row in rows:
+            try:
+                payload = json.loads(str(row["payload_json"]))
+            except (TypeError, ValueError):
+                continue
+            if isinstance(payload, dict):
+                latest[int(row["action_index"])] = payload
+        return [latest[key] for key in sorted(latest)]
+
+    def office_host_writes_last_recorded_at(self, operation_id: str) -> float | None:
+        """最近一次收到上报的时刻；一条都没有时返回 ``None``。
+
+        **不要**把它当成 0 或"现在"：`None` 就是"还没收到"，这正是"未采集"与
+        "明确零"的分界依据之一。
+        """
+        with self._connect_readonly() as connection:
+            row = connection.execute(
+                "SELECT MAX(recorded_at) FROM office_host_writes WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+        value = row[0] if row is not None else None
+        return float(value) if value is not None else None
 
     def begin_office_action(
         self,

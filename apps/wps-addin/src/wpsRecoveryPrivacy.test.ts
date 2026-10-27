@@ -74,6 +74,8 @@ function preparedWithSentinel(): WpsPreparedPlan {
     ],
     sources: [],
     totalCells: 4,
+    // 这份计划写的是固定值、且没有本机来源复核 ⇒ 本来就需要来源锚点。
+    sourceAnchorRequired: true,
     previewRevision: "rev-1",
     confirmationSnapshot: "snap-1"
   };

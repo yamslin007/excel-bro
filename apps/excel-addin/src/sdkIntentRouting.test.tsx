@@ -10,11 +10,12 @@
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
-import { checkIntent, understandMessage, streamAssistantResponse } from "./api";
+import { ApiRequestError, checkIntent, understandMessage, streamAssistantResponse } from "./api";
 import {
   captureWorkbookCatalog,
   captureWorkbookSourceFingerprint,
   captureSelectionContext,
+  currentOfficeBridgeWorkbookIdentity,
   currentOfficeWorkbookIdentity
 } from "./excel";
 import { inspectOfficeAuthorizedTarget } from "./officeAuthorizedTarget";
@@ -94,7 +95,13 @@ vi.mock("./excel", async (importOriginal) => ({
   watchWorkbookStructureChanges: vi.fn(async () => () => {}),
   currentOfficeWorkbookIdentity: vi.fn(
     () => "url:https://contoso.sharepoint.com/book.xlsx"
-  )
+  ),
+  /*
+   * 桥/规划读的是 `currentOfficeBridgeWorkbookIdentity`（已保存 = url:，未保存 = 会话内
+   * 对象身份）。用例里不需要造会话身份，**委托**给上面那个 mock：这样"换簿""读不到"
+   * 这两类注入对它同样生效，判据仍然是面板真的重读了一次。
+   */
+  currentOfficeBridgeWorkbookIdentity: vi.fn()
 }));
 
 vi.mock("./officeAuthorizedTarget", async (importOriginal) => ({
@@ -120,6 +127,10 @@ beforeEach(() => {
   vi.mocked(inspectOfficeAuthorizedTarget).mockResolvedValue(fixtures.target);
   vi.mocked(currentOfficeWorkbookIdentity).mockReturnValue(
     "url:https://contoso.sharepoint.com/book.xlsx"
+  );
+  // 桥身份委托给同一个 mock：换簿/读不到两类注入对它同样生效。
+  vi.mocked(currentOfficeBridgeWorkbookIdentity).mockImplementation(() =>
+    currentOfficeWorkbookIdentity()
   );
   vi.mocked(captureSelectionContext).mockResolvedValue({
     activeWorksheet: "Sheet1",
@@ -506,6 +517,25 @@ describe("Excel 面板：完成后按引用取回结果 / 结果不可用", () =
     ).toContain("保留期");
   });
 
+  it("结果先可读后过期404：连续重开不复用缓存或自动重算", async () => {
+    const options={resultStatus:200};
+    const captured=stubBridgeFetch(options);
+    const first=await finishTurnWithLocalResult(captured);
+    await waitFor(()=>expect(first.container.querySelector(".local-result-card-table")).not.toBeNull());
+    const calls=vi.mocked(streamAssistantResponse).mock.calls.length;
+    first.unmount(); options.resultStatus=404;
+    for(let index=0;index<2;index++) {
+      const reopened=render(<App/>);
+      await waitFor(()=>expect(reopened.container.querySelector(".local-result-card-unavailable")).not.toBeNull());
+      expect(reopened.container.querySelector(".local-result-card-table")).toBeNull();
+      expect(reopened.container.textContent).toContain("请重新发起查询");
+      expect(vi.mocked(streamAssistantResponse)).toHaveBeenCalledTimes(calls);
+      reopened.unmount();
+    }
+    expect(captured.filter(c=>c.url.includes("/result"))).toHaveLength(3);
+    expect(captured.some(c=>c.url.includes("/executions"))).toBe(false);
+  });
+
   it("面板重开（新的加载项会话）：结果卡靠**该轮**绑定按引用再取回，不依赖活跃会话", async () => {
     const captured = stubBridgeFetch();
     const first = await finishTurnWithLocalResult(captured);
@@ -533,5 +563,66 @@ describe("Excel 面板：完成后按引用取回结果 / 结果不可用", () =
       workbookIdentity: "url:https://contoso.sharepoint.com/book.xlsx",
       resultRef: RESULT_REF
     });
+  });
+});
+
+/*
+ * A1-E3：**来源在规划期间变化**是本次任务的终态，不是一次普通失败。
+ *
+ * 服务端就此结束本轮（409 / SOURCE_CHANGED / 不可重试），面板必须：
+ *   ① 把"来源已变化、任务已停止、请按最新数据重新发起"如实说出来；
+ *   ② 不把它演成"已完成"，也不演成"用户暂停"（暂停会带一个继续入口 ——
+ *      而这条任务已经没有可继续的现场了）；
+ *   ③ 一个单元格都不写；
+ *   ④ 用户明确重新发起后，新一轮仍能正常走（不是把面板卡死）。
+ */
+describe("Excel 面板：来源变化后的停止（A1-E3）", () => {
+  const STOP_MESSAGE =
+    "来源已变化，当前任务已停止：没有继续读取来源、没有继续计算，也没有写入。请按最新数据重新发起需求。";
+
+  it("显示停止原因、不产生继续入口、不写入；重新发起仍可正常完成", async () => {
+    vi.mocked(understandMessage).mockResolvedValue({
+      kind: "needs_workbook_context",
+      summary: "统计记录",
+      provider: "model"
+    });
+    vi.mocked(checkIntent).mockResolvedValue(toolRequestIntent);
+    vi.mocked(streamAssistantResponse).mockRejectedValueOnce(
+      new ApiRequestError(409, "SOURCE_CHANGED", STOP_MESSAGE, false)
+    );
+
+    const view = await send("有多少条记录");
+
+    await waitFor(() =>
+      expect(view.container.textContent).toContain("来源已变化")
+    );
+    // ① 原文照转（服务端是唯一一份文案，前端不另写一句）。
+    expect(view.container.textContent).toContain(STOP_MESSAGE);
+    // ② 不是"已完成"，也不是"暂停"：活动卡以失败收尾，且没有继续入口。
+    expect(
+      view.container.querySelector(".task-progress-timeline")?.getAttribute("data-status")
+    ).toBe("failed");
+    expect(view.queryByRole("button", { name: /继续/ })).toBeNull();
+    // ③ 没有计划就没有写入路径：连预览卡都不该出现。
+    expect(view.container.querySelector(".inline-plan")).toBeNull();
+    expect(view.container.querySelector(".local-result-card-table")).toBeNull();
+    // 桥已经停：本轮不再发起任何一次宿主读表。
+    expect(vi.mocked(executeQueryTableTool)).not.toHaveBeenCalled();
+
+    // ④ 用户明确重新发起：新一轮按当前数据重新规划，正常完成。
+    vi.mocked(streamAssistantResponse).mockResolvedValueOnce({
+      kind: "answer",
+      provider: "model",
+      message: "已按最新数据重新计算",
+      turnId: "turn-restarted"
+    } as never);
+    fireEvent.change(view.container.querySelector(".composer textarea")!, {
+      target: { value: "按最新数据重新统计一次" }
+    });
+    fireEvent.click(view.getByRole("button", { name: /^发送$/ }));
+    await waitFor(() =>
+      expect(view.container.textContent).toContain("已按最新数据重新计算")
+    );
+    expect(vi.mocked(streamAssistantResponse)).toHaveBeenCalledTimes(2);
   });
 });

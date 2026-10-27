@@ -24,11 +24,12 @@ export function capabilityHost(names = ["明细"], rows = 8, columns = 8) {
       return Object.assign(bind({NumberFormat:"numberFormat", HorizontalAlignment:"horizontalAlignment",VerticalAlignment:"verticalAlignment",WrapText:"wrapText",RowHeight:"rowHeight"}), {
         Font:bind({Bold:"bold",Italic:"italic",Name:"name",Size:"size",Color:"color"}),
         Interior:bind({Color:"fillColor",Pattern:"fillPattern",PatternColor:"fillPatternColor"}),
-        Rows:{Count:1},Columns:{Count:1}
+        Row:r+1,Column:c+1,Rows:{Count:1},Columns:{Count:1}
       }) as WpsRange;
     };
-    const Range = (address:string): WpsRange => {
-      const rect = parseExplicitA1Rect(address);
+    const Range = (address:string | WpsRange, end?: WpsRange): WpsRange => {
+      const a1 = (cell: WpsRange) => `${String.fromCharCode(64 + Number(cell.Column))}${cell.Row}`;
+      const rect = parseExplicitA1Rect(typeof address === "string" ? address : `${a1(address)}:${a1(end ?? address)}`);
       if (!rect || rect.endRow > rows || rect.endColumn > columns) throw new Error(`Invalid test range: ${address}`);
       const r0=rect.startRow-1,c0=rect.startColumn-1;
       const read=(key:"value"|"formula")=>Array.from({length:rect.rows},(_,r)=>Array.from({length:rect.columns},(_,c)=>grid[r0+r][c0+c][key]));
@@ -49,7 +50,7 @@ export function capabilityHost(names = ["明细"], rows = 8, columns = 8) {
       });
       return result;
     };
-    return {Name,Index:index+1,ProtectContents:false,Range};
+    return {Name,Index:index+1,ProtectContents:false,Range, get UsedRange() { return Range(`A1:${String.fromCharCode(64 + columns)}${rows}`); }};
   });
   const storage=new Map<string,unknown>();
   const book={Name:"test.xlsx",FullName:"C:\\Data\\test.xlsx",Path:"C:\\Data",ReadOnly:false,

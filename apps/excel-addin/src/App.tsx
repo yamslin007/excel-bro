@@ -1,4 +1,7 @@
+import { stampLiteralPlanOrigin } from "@excel-bro/core/literalPlanOrigin";
 import { RecoveryProbeControl } from "@excel-bro/core/RecoveryProbeControl";
+import { ResultRefFaultControl } from "@excel-bro/core/ResultRefFaultControl";
+import { resultRefFaultTarget, resultRefFaultVisible } from "@excel-bro/core/resultRefFault";
 import { bindRecoveryProbe, interruptRecoveryProbe } from "@excel-bro/core/recoveryProbe";
 import { prepareExcelValueCopies } from './excelValueCopyPlan';
 import { TaskExecutionControls } from "./components/TaskExecutionControls";
@@ -46,6 +49,7 @@ import { ResultReviewBar } from './components/ResultReviewBar';
 import { excelRecoveryBeforeResult, captureExcelBeforeResult, showExcelBeforeResult, closeExcelNativeComparison, type ExcelBeforeResult } from './excelNativeComparison';
 import { markExcelResult, clearExcelResultMarks, recoverExcelResultMarks, type ExcelResultMarks } from './resultReviewMarkers';
 import type { PlanExecutionResult, ExecutionUndoSnapshot } from './contracts';
+import type { HostWriteAudit } from '@excel-bro/core/hostWriteAudit';
 import {
   checkIntent,
   understandMessage,
@@ -66,12 +70,16 @@ import {
   isLocalServiceConnectionError,
   reconcileOfficeActionReceipt,
   registerOfficeExecution,
+  reportOfficeHostWrites,
   refreshFolder,
   resumeFolderExecution,
   scanFolderByPath,
   selectFolder,
   startOfficeAction,
   suspendOfficeExecution,
+  armResultRefFault,
+  cancelResultRefFault,
+  getResultRefFaultStatus,
 } from "./api";
 import { ClarificationFields } from "./components/ClarificationFields";
 import { brandLogoUrl } from "./brandLogo";
@@ -132,6 +140,7 @@ import {
   redactCredentials,
   selectFormatActions
 } from "@excel-bro/core";
+import { sourceAnchorFromBinding } from "@excel-bro/core/planSourceAnchor";
 import type { CellValue } from "@excel-bro/core";
 import type { RangeChangeReview } from "@excel-bro/core/changeReview";
 import { demoWorkbook } from "./demo";
@@ -143,6 +152,7 @@ import {
   captureWorkbookCatalog,
   dataEpochsChanged,
   currentOfficeWorkbookIdentity,
+  currentOfficeBridgeWorkbookIdentity,
   assertUndoPostState,
   executePlan,
   isExplicitA1Address,
@@ -1400,6 +1410,7 @@ export default function App() {
   const rawPromptRef = useRef("");
   const folderRecoveryAttachStartedRef = useRef(false);
   const officeRecoveryAttachStartedRef = useRef(false);
+  const officeRecoveryActionLock = useRef(false);
   /**
    * `plan.id` → 产出这份计划的规划任务。
    *
@@ -2525,6 +2536,16 @@ export default function App() {
   }
 
   async function resumeInterruptedOfficeExecution(message: ChatMessage): Promise<void> {
+    if (officeRecoveryActionLock.current) return;
+    officeRecoveryActionLock.current = true;
+    try {
+      await resumeInterruptedOfficeExecutionOwned(message);
+    } finally {
+      officeRecoveryActionLock.current = false;
+    }
+  }
+
+  async function resumeInterruptedOfficeExecutionOwned(message: ChatMessage): Promise<void> {
     if (!(await targetGuard.check())) return;
     const resume = message.officeResume;
     const pending = loadPendingOfficeExecution();
@@ -2554,6 +2575,7 @@ export default function App() {
       }
     );
     setStatus("executing");
+    const hostWriteAudits: HostWriteAudit[] = [];
     let state: Awaited<ReturnType<typeof getOfficeExecutionStatus>> | null = null;
     try {
       state = await getOfficeExecutionStatus(resume.operationId);
@@ -2607,6 +2629,7 @@ export default function App() {
         allowedExternalFiles: new Set(state.allowedExternalFiles),
         operationId: state.operationId,
         onProgress: applyProgressEvent,
+        onHostWrite: entry => { hostWriteAudits.push(entry); },
         recovery: {
           startActionIndex: state.nextActionIndex,
           undoSnapshot: state.checkpoint,
@@ -2719,6 +2742,12 @@ export default function App() {
       }));
       finishActivity("warning", "Office 任务仍需核对");
     } finally {
+      // Report only this invocation's suffix, after finish/suspend. Telemetry never retries writes.
+      if (state && hostWriteAudits.length > 0) {
+        void reportOfficeHostWrites(state.operationId, {
+          ownerToken: state.ownerToken ?? null, entries: [...hostWriteAudits]
+        }).catch(() => { /* Missing observation must not change recovery results. */ });
+      }
       setActivePlanId(null);
       setStatus("idle");
     }
@@ -2900,19 +2929,25 @@ export default function App() {
       enqueueProducedPlan(resultMessageId, plan);
       return "completed";
     }
-    const plan: AnalysisPlan = attestSourceDependency(
+    /*
+     * 续跑通道的锚点同样取**桥绑定**，与首轮一条口径。
+     *
+     * `baseline.sourceFingerprint` 是暂停卡上记下来的值，它的来源可能是快照
+     * （`fnv1a32:`）、也可能是服务端回传，与写前复核用的读取器（`fnv1a32x2:`）
+     * 不一定同源；拿它当基线要么把自己写成"永远不相等"，要么把"缺锚点"伪装成
+     * "来源变了"。服务端在计划里自报的指纹更不能采信（那是声明，不是读数）。
+     * 拿不到就留空 —— 写前闸门会拒绝"有固定值却没有锚点"的计划。
+     */
+    const turnAnchor = sourceAnchorFromBinding(sdkBridge.binding(), baseline.turnId);
+    const plan: AnalysisPlan = stampLiteralPlanOrigin(attestSourceDependency(
       {
         ...response.plan,
-        sourceFingerprint:
-          baseline.sourceFingerprint ?? response.plan.sourceFingerprint,
-        sourceFingerprintSheets:
-          baseline.sourceFingerprintSheets?.length
-            ? baseline.sourceFingerprintSheets
-            : response.plan.sourceFingerprintSheets
+        sourceFingerprint: turnAnchor?.fingerprint ?? null,
+        sourceFingerprintSheets: turnAnchor ? [...turnAnchor.sheets] : []
       },
       // 续跑通道这一轮没有本机读取记录：**不采信计划自报的来源依赖**，删掉该字段。
       null
-    );
+    ), response.planOrigin);
     planningTurnByPlanIdRef.current.set(plan.id, baseline.turnId);
     updateFolderResumeMessage(resultMessageId, (current) => ({
       ...current,
@@ -3278,7 +3313,8 @@ export default function App() {
          * 上面几道闸只是"先停下"，它们读的仍是本地状态。真正交给服务端、也是唯一
          * 能证明"现在的还是一样"的东西，是这里现读出来的三项：
          *
-         * - 工作簿身份：`currentOfficeWorkbookIdentity()` 现读文档 URL；读不到就停，
+         * - 工作簿身份：`currentOfficeBridgeWorkbookIdentity()`（已保存 → `url:`，
+         *   未保存 → 会话内对象身份）；读不到就停，
          *   **不**退回文件名或记录里的值（`name:` 身份在检查点契约里本来就不合法）；
          * - 授权成员：已提交的授权集合（与桥的授权复核同一个来源）；
          * - 来源指纹：服务端判定原任务依赖来源时才重读，并且**读取失败 != 尚未采集**。
@@ -3291,7 +3327,10 @@ export default function App() {
             ? [...selectedNamesFor(workbook)]
             : [];
         const evidenceResult = await buildPlanningContinuationEvidence({
-          workbookIdentity: currentOfficeWorkbookIdentity(),
+          // 与规划请求、桥绑定**同一份**身份：检查点里记的就是它。未保存的工作簿
+          // 拿到的是会话内对象身份（`unsaved:`），重开后令牌变了 ⇒ 服务端判
+          // `TARGET_CHANGED`，必须重新发起 —— 这正是"不能证明是同一簿就不续"。
+          workbookIdentity: currentOfficeBridgeWorkbookIdentity(),
           authorizedSheetNames: authorizedNames,
           // 服务端从检查点判定；缺省按"需要核实"处理，宁可按当前数据重读一次，
           // 也不要把"数据已经变了"的现场放过去。
@@ -3355,7 +3394,8 @@ export default function App() {
           return {
             workbookIdentity: bridgeWorkbookIdentity(
               workbook?.name ?? "",
-              currentOfficeWorkbookIdentity() ?? null
+              // 与主路径同一份身份来源（未保存 ⇒ 会话内对象身份）。
+              currentOfficeBridgeWorkbookIdentity() ?? null
             ),
             sourceFingerprint: liveFingerprint,
             authorizedSheetNames: scopeNames,
@@ -4342,9 +4382,6 @@ export default function App() {
     if (refreshed) immediateScope.request();
   }
 
-  /** 收起保留勾选，不撤回授权，也不取消在途核验。 */
-  function discardWorkbookScopeEdit(): void { setContextOpen(false); }
-
   async function confirmSheetSelection(isCurrent: () => boolean): Promise<boolean> {
     scopeCommitLock.current = true;
     setScopeCheckingCommit(true);
@@ -4881,7 +4918,8 @@ export default function App() {
        * 旧实现把 `latestWorkbook` / `effectiveSheetNames` 闭包进来，等价于用一
        * 个静止的现场去"证明"等待期间什么都没变 —— 用户收窄/撤销授权、换簿、
        * 改源值全都漏过去。这里改成真的重读：
-       *   - 身份：`currentOfficeWorkbookIdentity()`（读当前 Office 上下文）
+       *   - 身份：`currentOfficeBridgeWorkbookIdentity()`（已保存读文档 URL；未保存
+       *     用会话内对象身份，绝不退回同名兜底）
        *   - 来源指纹：`captureWorkbookSourceFingerprint`（真读单元格内容）
        *   - 当前授权：`committedSheetNamesRef`（用户此刻已确认的范围）
        *   - 活动表：`captureSelectionContext()`
@@ -4904,7 +4942,10 @@ export default function App() {
         return {
           workbookIdentity: bridgeWorkbookIdentity(
             latestWorkbook.name,
-            currentOfficeWorkbookIdentity() ?? null
+            // 桥身份 = 已保存的 `url:`，未保存的**会话内对象身份**（`unsaved:`）。
+            // 不能用 `currentOfficeWorkbookIdentity()`：它在未保存时是空的，
+            // 会退回 `name:<名字>`，两个同名的未保存簿在复核里三项全等。
+            currentOfficeBridgeWorkbookIdentity() ?? null
           ),
           sourceFingerprint,
           authorizedSheetNames: scopeNames,
@@ -5235,10 +5276,26 @@ export default function App() {
           provider: response.provider
         });
       } else {
-        const sourceFingerprint =
-          sourceMode === "workbook" && isRunningInExcel()
-            ? await captureWorkbookSourceFingerprint(effectiveSheetNames)
-            : latestWorkbook.sourceFingerprint;
+        /*
+         * **来源锚点 = 模型读到的那一版，不是"计划到达这一刻"的那一版。**
+         *
+         * 以前这里现读一次 `captureWorkbookSourceFingerprint(...)` 当计划指纹。
+         * 只要用户在"模型读完数据"到"计划到达面板"之间改了源表，这份现读的指纹
+         * 记的就是**改后**的现场，写前复核再读一次当然相等 —— 于是一份按旧来源
+         * 算出来的固定值被静默写进单元格（2026-10-25 实测：新增写入 1 次）。
+         *
+         * 现在锚点只有一个来源：**本轮桥绑定**。它由 `begin` / `pinSourceFingerprint`
+         * 在第一次受控读取那一刻固定下来，也就是模型手里那一版 —— 与 WPS 端同一个
+         * 函数（`sourceAnchorFromBinding`），两端不再各写一套"差不多"的口径。
+         *
+         * 取不到（没建桥、任务不是本轮、桥还没定指纹）就**让它空着**：写前闸门按
+         * `planHasBakedValues` 判"本应有却没有"并拒绝写入。绝不退回"到达后现读"
+         * 或快照指纹 —— 前者是自己跟自己比，后者连算法都不同（`fnv1a32:` vs
+         * `fnv1a32x2:`），拿它当基线只会把"缺锚点"伪装成"来源变了"。
+         */
+        const turnAnchor = sourceAnchorFromBinding(sdkBridge.binding(), planningTurnId);
+        const sourceFingerprint = turnAnchor?.fingerprint ?? null;
+        const sourceFingerprintSheets = turnAnchor ? [...turnAnchor.sheets] : [];
         /*
          * 计划来自服务端（SDK 编译结果），来源依赖**不能采信它自报的**：只认本端
          * 这一轮桥上的确定性读取记录（`recordTrustedToolReads` 在执行器读完那一刻
@@ -5253,14 +5310,14 @@ export default function App() {
         const basePlan: AnalysisPlan = {
           ...response.plan,
           sourceFingerprint,
-          sourceFingerprintSheets: effectiveSheetNames
+          sourceFingerprintSheets
         };
-        const plan: AnalysisPlan = basePlan.localResultRef
+        const plan: AnalysisPlan = stampLiteralPlanOrigin(basePlan.localResultRef
           ? attestResultSourceDependency(
               basePlan,
               trustedReads ? [trustedReads] : []
             )
-          : attestSourceDependency(basePlan, trustedReads);
+          : attestSourceDependency(basePlan, trustedReads), response.planOrigin);
         planningTurnByPlanIdRef.current.set(plan.id, planningTurnId);
         appendMessage({
           role: "assistant",
@@ -7517,6 +7574,21 @@ export default function App() {
     let workbookActivityStatus: "completed" | "warning" | "failed" =
       "completed";
     let workbookActivitySummary: string | undefined;
+    /*
+     * 「实际写入了几次」的事实源：执行器在**真的调用宿主写 API 的地方**累加，
+     * 这里只收着，等账本动作都提交完再 best-effort 补报（失败不挡写入）。
+     * 失败路径也要带走已收集的条目 —— 那正是"写了一半"最需要证据的时候。
+     */
+    const hostWriteAudits: HostWriteAudit[] = [];
+    const flushHostWriteAudits = () => {
+      if (!officeState || hostWriteAudits.length === 0) return;
+      void reportOfficeHostWrites(operationId, {
+        ownerToken: officeState.ownerToken ?? null,
+        entries: [...hostWriteAudits]
+      }).catch(() => {
+        // 观测失败只少一条证据：不重试、不打断、不改变任何执行结论。
+      });
+    };
     try {
       if (nativeReview) await Excel.run(context => assertExcelNativeComparisonUnchanged(context, nativeReview, authorizedSheetNames, plan));
       if (recoverySupport.supported) {
@@ -7556,6 +7628,10 @@ export default function App() {
         recoveryLimitation = `${recoverySupport.reason ?? "该计划包含复杂对象操作"}；本次不承诺跨重启自动续跑。`;
       }
       bindRecoveryProbe((import.meta.env.DEV || import.meta.env.VITE_ENABLE_RECOVERY_PROBE === "true"), currentOfficeWorkbookIdentity(), operationId, plan.actions, Boolean(officeState?.ownerToken));
+      /*
+       * 「实际写入了几次」的事实源：执行器在**真的调用宿主写 API 的地方**累加，
+       * 这里只收着，等账本动作都提交完再 best-effort 补报（失败不挡写入）。
+       */
       const result = await executePlan(plan, {
         /*
        * 直接执行**也**挂 `beforeFirstWrite`：这就是"只跳过副本比对"的落点。
@@ -7568,6 +7644,7 @@ export default function App() {
         allowedExternalFiles,
         acknowledgeStaleSource,
         operationId,
+        onHostWrite: (entry) => { hostWriteAudits.push(entry); },
         onProgress: applyProgressEvent,
         onChangeReview: (reviews) => {
           if (reviews.length > 0) {
@@ -7634,6 +7711,8 @@ export default function App() {
           result
         });
         clearPendingOfficeExecution(operationId);
+        // 账本已收尾之后才补报宿主观测：不插在"写入 → 账本提交"之间。
+        flushHostWriteAudits();
       }
       recordDiagnosticEvent({
         timestamp: new Date().toISOString(),
@@ -7679,6 +7758,8 @@ export default function App() {
             code: "OFFICE_EXECUTION_INTERRUPTED",
             message: reason instanceof Error ? reason.message : String(reason)
           });
+          // 暂停已落账：把"写了几个、结果是否确定"补报上去（best-effort）。
+          flushHostWriteAudits();
           if (!officeState.requiresReconciliation && officeState.nextActionIndex === 0) {
             clearPendingOfficeExecution(operationId);
           }
@@ -12013,7 +12094,7 @@ export default function App() {
               所以这里的层不是靠多写几条 padding 对齐的，而是靠**结构**对齐：
               两端读同一份声明（`.scope-action-buttons, .wps-scope-actions` 写在
               共享样式表里），任一端把容器搬回去，两端就会立刻重新分叉。
-              按钮集合同样对齐 WPS：刷新 / 确认。勾选自动核验，确认只关闭面板。
+              按钮集合同样对齐 WPS：刷新 / 确认。勾选自动核验，确认重新核验当前工作表，成功后关闭面板。
             */}
             {sourceMode === "workbook" && (
               <div className="scope-action-buttons">
@@ -12030,7 +12111,7 @@ export default function App() {
                   >↻</i>
                   {" "}刷新
                 </button>
-                <button type="button" className="scope-close" data-scope-pending={immediateScope.pending} onClick={discardWorkbookScopeEdit}>确认</button>
+                <button type="button" className="scope-close" data-scope-pending={immediateScope.pending} onClick={() => immediateScope.request(() => setContextOpen(false))}>确认</button>
               </div>
             )}
             {sourceMode === "workbook" && scopeConfirmationError &&
@@ -12054,7 +12135,7 @@ export default function App() {
                     </span>
                   </details>
                 </div>
-                <button type="button" className="scope-close" data-scope-pending={immediateScope.pending} onClick={discardWorkbookScopeEdit}>确认</button>
+                <button type="button" className="scope-close" data-scope-pending={immediateScope.pending} onClick={() => { if (immediateScope.isPending()) immediateScope.request(() => setContextOpen(false)); else setContextOpen(false); }}>确认</button>
               </div>
             )}
             {sourceMode === "folder" && <ScopeAdmissionSummary items={scopeAdmission.report?.items ?? []}
@@ -12141,7 +12222,7 @@ export default function App() {
           <div className="composer-resize-handle" {...composerResizeHandleProps}>
             <i />
           </div>
-          <TaskExecutionControls state={composerPauseButton}
+          <TaskExecutionControls reviewing={resultReviewState.phase === "reviewing"} state={composerPauseButton}
             pausing={pauseRequestState?.phase === "requesting"}
             disabled={busy && composerPauseButton.kind === "continue"}
             onPause={() => stopTurn()}
@@ -12276,6 +12357,21 @@ export default function App() {
           </div>
         </div>
         {(import.meta.env.DEV || import.meta.env.VITE_ENABLE_RECOVERY_PROBE === "true") && <RecoveryProbeControl identity={resultWorkbookIdentity} disabled={busy} />}
+        {/*
+          A1-E1 验收入口：让本工作簿的下一次规划任务的第一个 Python 结果引用在
+          "已登记、尚未首次写入"处失效。可见性由共享判据决定；未开启开发模式时
+          服务端端点本身就是 404，界面按钮按了也不会有效。
+        */}
+        <ResultRefFaultControl
+          visible={resultRefFaultVisible(
+            import.meta.env.DEV || import.meta.env.VITE_ENABLE_RECOVERY_PROBE === "true"
+          )}
+          disabled={busy}
+          target={resultRefFaultTarget("excel-office", workbook?.name, resultWorkbookIdentity)}
+          load={getResultRefFaultStatus}
+          arm={armResultRefFault}
+          cancel={cancelResultRefFault}
+        />
       </footer>
       {petVisible && <PetCompanion busy={busy} />}
       <ThemePanel

@@ -2,13 +2,15 @@ import type { PauseButtonState } from "@excel-bro/core/pauseControl";
 import "./taskExecutionControls.css";
 
 /** Task actions never submit the composer. Each action owns a different DOM node. */
-export function TaskExecutionControls({ state, pausing, disabled, onPause, onResume }: {
+export function TaskExecutionControls({ state, pausing, reviewing, disabled, onPause, onResume }: {
   state: PauseButtonState;
   pausing: boolean;
+  reviewing?: boolean;
   disabled?: boolean;
   onPause: () => void;
   onResume: () => void;
 }) {
+  if (reviewing) return <div className="task-execution-controls" aria-label="当前任务控制"><span>等待审阅结果</span></div>;
   if (state.kind === "send" && !pausing) return null;
   const action = pausing ? "pending" : state.kind;
   const label = pausing ? "正在暂停" : state.label;

@@ -144,6 +144,7 @@ def test_literal_compiler_preserves_type_and_matrix(operation, value, key, expec
     action = result.plan.actions[0]
     assert action.sheet == "Sheet2"
     assert getattr(action, key) == [[expected], [expected]]
+    assert result.planOrigin == ("literal_range_edit" if operation == "writeValues" else None)
 
 
 @pytest.mark.parametrize("args,code", [
@@ -194,3 +195,12 @@ def test_sdk_can_clarify_after_tool_error_then_continue_same_task(monkeypatch, t
     assert second.kind == "plan"
     assert [a.sheet for a in second.plan.actions] == ["Sheet3"]
     assert request.workbook == answered.workbook
+
+def test_model_json_cannot_attest_literal_origin():
+    from server.app.excel_agent import _parse_content
+    result = compile_plan_tool(plan_request(), "plan_range_edit", {
+        "sheet": "Sheet1", "range": "A1", "operation": "writeValues", "value": "完成",
+    })
+    assert result.planOrigin == "literal_range_edit"
+    parsed = _parse_content(result.model_dump_json())
+    assert parsed.planOrigin is None

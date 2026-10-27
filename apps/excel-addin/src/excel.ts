@@ -1,4 +1,13 @@
+import { isTrustedLiteralPlan } from "@excel-bro/core/literalPlanOrigin";
 import { copyRangePlan } from "@excel-bro/core/copyRangePlan";
+import {
+  judgePlanSourceGate,
+  PLAN_SOURCE_MISSING_MESSAGE,
+  planHasBakedValues,
+  planSourceAnchor,
+  planSourceComparisonNeeded,
+  planSourceGateMessage
+} from "@excel-bro/core/planSourceAnchor";
 import { filteredSourceRows } from "./filteredSourceRows";
 import { writeTableValues, WRITE_TABLE_HEADER_FILL } from "@excel-bro/core/writeTableLayout";
 import type {
@@ -43,6 +52,8 @@ import type {
   RangeChangeReview
 } from "@excel-bro/core/changeReview";
 import { buildRangeChangeReview } from "@excel-bro/core/changeReview";
+// 「实际写入了几次」的唯一口径（与 WPS、服务端读同一份定义）。
+import type { HostWriteAudit } from "@excel-bro/core/hostWriteAudit";
 // EB 系统遗留表的名单与判定在共享层：WPS 端的工作目录勾选也要用同一份名单。
 import { isEBSystemSheet } from "@excel-bro/core/folderScope";
 import {
@@ -5181,6 +5192,50 @@ export function currentOfficeWorkbookIdentity(): string | undefined {
   return officeIdentityFromUrl(url) ?? undefined;
 }
 
+/**
+ * 桥/读路径的工作簿身份（**唯一折叠点**：规划请求、桥绑定、执行前复核、续跑证据
+ * 都读这一份）。
+ *
+ * 已保存 → `url:<...>`，与写入账本、恢复检查点同一口径。
+ *
+ * **未保存 → 会话内对象身份**（`unsaved:<序号>-<随机>`），按宿主的工作簿对象分配：
+ * 同一个对象每次拿到同一个令牌，换一个未保存簿就是另一个令牌。这样做是因为
+ * Office.js 在文件未保存时 `document.url` 为空，退回 `name:<名字>` 会让两个都叫
+ * 「工作簿1」的未保存簿在桥的匹配（`hostId + workbookName + workbookIdentity`）
+ * 上**三项全等** —— 授权是给 A 的，读表却可能落到 B。
+ *
+ * 作用域**只在本次加载内**：窗格重开 = 新的 JS 运行环境 = 新的文档对象 = 新令牌。
+ * 因此它只能证明"同一次加载里是同一个对象"，不能证明重开后还是同一本簿；服务端
+ * 拿它跟检查点里记录的身份比对时会判 `PLANNING_CONTEXT_TARGET_CHANGED`，界面上表现
+ * 为"不能继续旧任务，请按当前工作簿重新发起需求"。这是宿主边界，不是缺陷。
+ *
+ * 刻意**不**用这些东西当身份：
+ * - 名字：两个未保存簿可以同名（这正是本函数要解决的撞车）；
+ * - 表结构或数据指纹：编辑一下就变，"同一本簿"会被判成"换了一本"；
+ * - `document.settings` 里的随机 GUID：那会把"读一次表"变成"改用户的文件"，
+ *   也等于要求用户先保存。宁可只保证会话内身份。
+ */
+const unsavedWorkbookIdentities = new WeakMap<object, string>();
+let unsavedWorkbookCounter = 0;
+
+export function currentOfficeBridgeWorkbookIdentity(): string | undefined {
+  const stable = currentOfficeWorkbookIdentity();
+  if (stable !== undefined) return stable;
+  if (typeof Office === "undefined") return undefined;
+  const documentRef = (Office as { context?: { document?: unknown } }).context
+    ?.document;
+  if (!documentRef || typeof documentRef !== "object") return undefined;
+  const key = documentRef as object;
+  const existing = unsavedWorkbookIdentities.get(key);
+  if (existing !== undefined) return existing;
+  unsavedWorkbookCounter += 1;
+  const token = `unsaved:${unsavedWorkbookCounter}-${Math.random()
+    .toString(16)
+    .slice(2, 10)}`;
+  unsavedWorkbookIdentities.set(key, token);
+  return token;
+}
+
 /** 共享层内部表示。折叠回字符串只在出网时发生（方案 §2.3 第 1 条）。 */
 export function currentOfficeWorkbookLocator(): WorkbookLocator | undefined {
   const identity = currentOfficeWorkbookIdentity();
@@ -6204,6 +6259,15 @@ export interface ExecutePlanOptions {
    * 而完整前后矩阵按隐私边界只允许停留在会话内内存。
    */
   onChangeReview?: (reviews: RangeChangeReview[]) => void;
+  /**
+   * 每个动作的**宿主写入事实**（A1-E3 的"实际写入次数"口径）。
+   *
+   * 只报计数与状态，不含单元格值或公式正文。口径与判据见
+   * `@excel-bro/core/hostWriteAudit`：一个动作可能分块写（多次刷新），所以
+   * "动作数"不等于"宿主写调用数"，只有这里数字才是真的向宿主发起的次数。
+   * 回调是**观测**：它抛错不应该挡住写入，调用方自己兜住。
+   */
+  onHostWrite?: (entry: HostWriteAudit) => void;
 }
 
 export async function executePlan(
@@ -6216,6 +6280,12 @@ export async function executePlan(
   if (startActionIndex < 0 || startActionIndex > plan.actions.length) {
     throw new PlanExecutionError(
       "Office 断点的下一动作位置无效，已停止续跑。",
+      incompleteActionResults(plan, new Map())
+    );
+  }
+  if (startActionIndex > 0 && !options.recovery?.undoSnapshot) {
+    throw new PlanExecutionError(
+      "Office 断点缺少已完成动作的恢复快照，已停止续跑；请保留现场并重新核对，不能仅为剩余动作创建撤销点。",
       incompleteActionResults(plan, new Map())
     );
   }
@@ -6269,14 +6339,24 @@ export async function executePlan(
     );
   }
 
-  if (plan.sourceFingerprint && plan.sourceFingerprintSheets?.length) {
-    if (isToolSchemaFingerprint(plan.sourceFingerprint)) {
+  /*
+   * **写前来源闸门（计划级）**：这份计划里的固定值，是对哪一版源算出来的。
+   *
+   * 以前这一段的入口条件是 `plan.sourceFingerprint && plan.sourceFingerprintSheets?.length`
+   * —— 没有指纹就整块跳过，于是一份"写了固定值、却不知道自己按哪一版算的"计划
+   * 会被直接写进工作表。判据现在拆到共享层（`judgePlanSourceGate`，与 WPS 同一份）：
+   * 缺锚点、锚点不完整、覆盖范围与当前授权不一致，一律**拒绝**；
+   * **不拿"现在读一次"补一个基线**（那正是 2026-10-25 那个缺陷的另一种写法）。
+   */
+  const anchor = planSourceAnchor(plan);
+  if (!isTrustedLiteralPlan(plan) && (anchor || planHasBakedValues(plan))) {
+    if (anchor && isToolSchemaFingerprint(anchor.fingerprint)) {
       // 固化工具：基线本身就是 schema 指纹，照原样比。
       const current = toolSchemaFingerprintForSnapshot(
         plan,
-        await captureWorkbookStructure(plan.sourceFingerprintSheets)
+        await captureWorkbookStructure([...anchor.sheets])
       );
-      if (current !== plan.sourceFingerprint) {
+      if (current !== anchor.fingerprint) {
         throw new PlanExecutionError(
           "工具所需的来源工作表或字段已发生变化，请重新选择后再执行",
           incompleteActionResults(plan, new Map())
@@ -6287,7 +6367,7 @@ export async function executePlan(
       // 就放行。
       const missing = missingSchemaRequirements(
         plan,
-        await captureWorkbookStructure(plan.sourceFingerprintSheets)
+        await captureWorkbookStructure([...anchor!.sheets])
       );
       if (missing.length > 0) {
         throw new PlanExecutionError(
@@ -6296,24 +6376,59 @@ export async function executePlan(
         );
       }
     } else {
-      // 含烘焙矩阵：这些值是预览时算出来的，源数据一变就过期。不直接堵死，
-      // 交给用户判断是重新生成预览还是坚持写入旧结果。
-      const current = await captureWorkbookSourceFingerprint(
-        plan.sourceFingerprintSheets
-      );
-      if (current !== plan.sourceFingerprint && !options.acknowledgeStaleSource) {
-        const bakedActionCount = plan.actions.filter((action) =>
-          BAKED_ACTION_TYPES.has(action.type)
-        ).length;
-        throw new StaleSourceError(
-          `数据来源在预览后发生了变化，这份计划里有 ${bakedActionCount} 处写入的是预览时算出的固定值，执行会写入旧结果。建议重新生成预览；也可以坚持执行。`,
-          incompleteActionResults(plan, new Map()),
-          bakedActionCount
+      // 含烘焙矩阵（或根本没有锚点）：这些值是预览时算出来的，源数据一变就过期。
+      const current = planSourceComparisonNeeded({ plan, anchor })
+        ? await captureWorkbookSourceFingerprint([...anchor!.sheets])
+        : null;
+      const verdict = judgePlanSourceGate({
+        plan,
+        anchor,
+        authorizedSheets: options.authorizedSheetNames,
+        liveFingerprint: current
+      });
+      const bakedActionCount = plan.actions.filter((action) =>
+        BAKED_ACTION_TYPES.has(action.type)
+      ).length;
+      /*
+       * 「仍要执行旧结果」只覆盖**已确认变化**这一档：用户知道源变了还坚持写，
+       * 那是一个明确的决定。`missing` / `unverifiable` / 覆盖范围不一致不给他
+       * 这个选项 —— 那不是"我知道旧但仍然要"，而是"根本不知道它是按哪一版算的"。
+       */
+      if (verdict.verdict === "changed") {
+        if (!options.acknowledgeStaleSource) {
+          throw new StaleSourceError(
+            `数据来源在预览后发生了变化，这份计划里有 ${bakedActionCount} 处写入的是预览时算出的固定值，执行会写入旧结果。建议重新生成预览；也可以坚持执行。`,
+            incompleteActionResults(plan, new Map()),
+            bakedActionCount
+          );
+        }
+      } else if (verdict.verdict !== "ok") {
+        throw new PlanExecutionError(
+          planSourceGateMessage(verdict) ?? PLAN_SOURCE_MISSING_MESSAGE,
+          incompleteActionResults(plan, new Map())
         );
       }
     }
   }
   return Excel.run(async (context) => {
+    /*
+     * 「实际写入了几次」的观测点。
+     *
+     * Office.js 把排队的写操作在 `sync()` 时按批提交 —— 真正到达宿主的是**刷新**，
+     * 不是某个 `range.values = ...` 赋值。所以要数的就是动作窗口内的刷新次数：
+     * 它同时覆盖"一个动作分块写多次"（每个块各刷一次）与"还没写就失败"（0 次）。
+     * 只包这一个实例，不动宿主对象原型，也不改任何写入语义。
+     */
+    let hostFlushes = 0;
+    const flushContext = context.sync.bind(context) as (
+      ...args: unknown[]
+    ) => Promise<unknown>;
+    (context as unknown as { sync: (...args: unknown[]) => Promise<unknown> }).sync = (
+      ...args: unknown[]
+    ) => {
+      hostFlushes += 1;
+      return flushContext(...args);
+    };
     const worksheets = context.workbook.worksheets;
     worksheets.load("items/name,items/position");
     const tables = context.workbook.tables;
@@ -6415,6 +6530,9 @@ export async function executePlan(
     for (let index = startActionIndex; index < plan.actions.length; index += 1) {
       const action = plan.actions[index];
       let undoRange: ExecutionUndoSnapshot["ranges"][number] | null = null;
+      // 本动作的宿主观测：只在成功路径报一次，失败路径由 catch 兜底报一次。
+      let hostWriteReported = false;
+      let flushesBeforeAction = hostFlushes;
       let undoCollected = false;
       let deletedCapture: Awaited<ReturnType<typeof captureDeletedWorksheet>> | null = null;
       const actionUndo: ActionUndoCollector = {
@@ -6493,6 +6611,8 @@ export async function executePlan(
           target: { sheet: action.sheet }
         });
         if (index === startActionIndex) await options.beforeFirstWrite?.(context);
+        // 窗口起点：撤销快照的读取刷新不算本动作的写入。
+        flushesBeforeAction = hostFlushes;
         const actionCriteria = await executeAction(
           context,
           action,
@@ -6534,6 +6654,25 @@ export async function executePlan(
           skippedWorksheets.push(action.sheet);
         }
         undoCollected = true;
+        /*
+         * 上报本动作的宿主观测。`hostWriteCalls` 是窗口内的刷新次数：
+         * 0 次说明**没有真的向宿主提交过写入**（此时下面若失败只能记 failed_before_write）。
+         * 回读口径：恢复模式下动作级写后指纹已核对 ⇒ verified；其余模式本次不做
+         * 动作级回读（整份计划的回读核对在 executePlan 之后），如实记 not_applicable。
+         */
+        hostWriteReported = true;
+        try {
+          options.onHostWrite?.({
+            actionIndex: index,
+            actionType: action.type,
+            hostWriteCalls: Math.max(hostFlushes - flushesBeforeAction, 0),
+            mutatingCalls: 1,
+            outcome: "written",
+            readback: options.recovery ? "verified" : "not_applicable"
+          });
+        } catch {
+          // 观测失败不许影响写入：这是统计，不是判据。
+        }
         if (options.recovery) {
           if (!undoRange) {
             throw new Error(`第 ${index + 1} 步无法生成写后核对证据`);
@@ -6561,6 +6700,31 @@ export async function executePlan(
           });
         }
       } catch (reason) {
+        if (!hostWriteReported) {
+          /*
+           * 失败也要如实记一次，而且**区分有没有进过宿主**：
+           * - 窗口内刷新 0 次 ⇒ 写入根本没提交（failed_before_write，不能算已写入）；
+           * - 刷新过但随后失败 ⇒ 可能写了一部分（failed_after_write，要回读核对）。
+           * 这一条是"认领后、写入前失败不能被统计成已写入"的依据。
+           */
+          hostWriteReported = true;
+          try {
+            options.onHostWrite?.({
+              actionIndex: index,
+              actionType: action.type,
+              hostWriteCalls: Math.max(hostFlushes - flushesBeforeAction, 0),
+              mutatingCalls: 1,
+              outcome:
+                hostFlushes > flushesBeforeAction
+                  ? "failed_after_write"
+                  : "failed_before_write",
+              readback: "not_applicable",
+              errorCode: "EXCEL_ACTION_FAILED"
+            });
+          } catch {
+            // 同上：统计失败不改变执行结果。
+          }
+        }
         if (!undoCollected) {
           if (undoRange) undoRanges.push(undoRange);
           if (actionUndo.overwrittenRanges.length > 0) {

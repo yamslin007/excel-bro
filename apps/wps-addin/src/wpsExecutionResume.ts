@@ -1,3 +1,5 @@
+import type {HostWriteAudit} from "@excel-bro/core/hostWriteAudit";
+import {reportWpsHostWrites} from "../../excel-addin/src/api";
 import { sameJsonEvidence } from "@excel-bro/core/jsonEvidence";
 import type { WpsExecutionState } from "../../excel-addin/src/contracts";
 import type { WpsApplication } from "./wpsHost";
@@ -23,6 +25,7 @@ export async function resumeWpsExecution(application: WpsApplication, initial: W
   prepareWpsResume(application, initial, selectedIndexes());
   let state = await claimWpsExecutionResume(initial.operationId, initial.revision);
   if (!state.ownerToken) throw new Error("未取得执行权，未续写。");
+  const hostWriteAudits: HostWriteAudit[] = [];
   try {
     if (state.operationId !== initial.operationId || state.taskId !== initial.taskId ||
         state.nextActionIndex !== initial.nextActionIndex || state.workbookIdentity !== initial.workbookIdentity ||
@@ -38,7 +41,7 @@ export async function resumeWpsExecution(application: WpsApplication, initial: W
         ? await startWpsAction(initial.operationId, {...common, beforeSnapshot: evidence})
         : await completeWpsAction(initial.operationId, {...common, checkpoint: {...evidence, afterFingerprint: checkpoint.afterFingerprint}});
     }, initial.operationId, {resume: {record, startActionIndex: state.nextActionIndex,
-      check: () => assertWpsResumeSources(application, state, selectedIndexes())}});
+      check: () => assertWpsResumeSources(application, state, selectedIndexes())}}, entry => { hostWriteAudits.push(entry); });
     await finishWpsExecution(initial.operationId, {expectedRevision: state.revision, ownerToken: state.ownerToken!,
       result: {actionCount: state.totalActions}});
     return resumed;
@@ -46,5 +49,12 @@ export async function resumeWpsExecution(application: WpsApplication, initial: W
     try { await suspendWpsExecution(initial.operationId, {expectedRevision: state.revision, ownerToken: state.ownerToken!,
       code: "WPS_RESUME_INTERRUPTED", message: "续跑中断，须重新核对动作现场。"}); } catch { /* No retry; durable in-flight fence stays authoritative. */ }
     throw error;
+  } finally {
+    // Only the resumed suffix is observed; report after the durable finish/suspend boundary.
+    if (hostWriteAudits.length > 0) {
+      void reportWpsHostWrites(initial.operationId, {
+        ownerToken: state.ownerToken ?? null, entries: [...hostWriteAudits]
+      }).catch(() => { /* Observation failure cannot change execution or recovery. */ });
+    }
   }
 }

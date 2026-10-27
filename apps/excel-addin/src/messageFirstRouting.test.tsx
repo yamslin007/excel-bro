@@ -1012,7 +1012,7 @@ describe("Excel actual composer: message first", () => {
     expect(view.container.textContent).not.toContain("已按所选范围继续。");
     expect(checkIntent).not.toHaveBeenCalled();
     expect(captureWorkbookStructure).not.toHaveBeenCalled();
-    expect(view.container.querySelector(".scope-popover")).toBeNull();
+    await waitFor(() => expect(view.container.querySelector(".scope-popover")).toBeNull());
     expect(view.queryByRole("dialog")).toBeNull();
   });
 

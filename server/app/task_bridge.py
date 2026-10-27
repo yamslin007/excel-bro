@@ -36,7 +36,12 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
 from .capabilities import capability_int
+from . import dev_fault_target, dev_result_ref_fault, dev_source_changed_fault
 from .local_results import fallback_workbook_identity, local_results
+from .planning_source_guard import (
+    SOURCE_CHANGED_RECEIPT_CODE,
+    is_source_changed_receipt,
+)
 from .python_coordinator import coordinator
 from .python_datasets import registry
 from .models import (
@@ -186,6 +191,9 @@ class ToolBridgeSession:
         self.on_complete = on_complete
         self.generation = 0
         self.cancel_reason: str | None = None
+        # 来源变化是**本次规划的终态**：一经生产守卫确认，之后的工具调用不再派给
+        # 宿主（也就不会再有读取），并且回同一个固定码，让模型知道原因不是"用户取消"。
+        self.source_stopped = False
         self.call_count = 0
         self.total_read_cells = 0
         self.created_at = time.monotonic()
@@ -227,7 +235,25 @@ class ToolBridgeSession:
 
     async def request(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if self.cancel_reason is not None:
-            return await self._notify_complete(tool, "op_none", _error_receipt("cancelled"))
+            # 来源变化不是"用户取消"：回同一个固定码，且**不**再产生一次宿主读表。
+            # 回 `cancelled` 会让模型以为是用户停的，进而以为"再试一次也许可以"。
+            code = (
+                SOURCE_CHANGED_RECEIPT_CODE
+                if self.cancel_reason == SOURCE_CHANGED_RECEIPT_CODE
+                else "cancelled"
+            )
+            return await self._notify_complete(tool, "op_none", _error_receipt(code))
+        if dev_source_changed_fault.take(self.binding.task_id):
+            # 开发验收专用（`EXCEL_BRO_SOURCE_CHANGED_FAULT=1` 时才可能为真）：
+            # 只有 `open()` 绑定到**这一次任务**的启用才会命中（`bind_task`），
+            # 另一本簿 / 同一个簿的另一个任务照常派给宿主。
+            # 让"来源变化"在真实面板上成为一次**真实发生**的终止，而不是靠
+            # "希望模型再读一次"。回执与生产完全同一份固定码，且**不派发**给
+            # 宿主 —— 顺序也与生产一致：先交回这次回执，再停桥。
+            receipt = _error_receipt(SOURCE_CHANGED_RECEIPT_CODE)
+            await self._notify_complete(tool, "op_none", receipt)
+            self.stop_for_source_change()
+            return receipt
         max_calls = capability_int("agentToolBridge", "maxToolCallsPerTask")
         if self.call_count >= max_calls:
             return await self._notify_complete(
@@ -371,6 +397,12 @@ class ToolBridgeSession:
         self.updated_at = time.monotonic()
         if not pending.future.done():
             pending.future.set_result(receipt)
+        if is_source_changed_receipt(receipt):
+            # 这一次调用拿到的是**本次规划的最后一次**宿主读取结果：来源已经不成立，
+            # 之后任何再次读取、重新计算或提交都只能建立在旧版本数据上。
+            # 必须在交回这次的 `source_changed` 之后再停 —— 顺序反了，模型收到的
+            # 就会是 `cancelled`，看不出真正原因。
+            self.stop_for_source_change()
         return {"status": "accepted"}
 
     def _deliver_python_datasets(
@@ -523,6 +555,24 @@ class ToolBridgeSession:
         self._pending.clear()
         self.updated_at = time.monotonic()
 
+    def stop_for_source_change(self) -> None:
+        """生产守卫确认来源变化：本次规划到此为止。
+
+        做三件事，缺一件都会留出"无效重试"的空间：
+
+        1. 在飞调用失败（不能等它们慢慢超时）；
+        2. 会话进入**停止**态，后续 ``request`` 直接回固定码，**不再派给宿主**
+           —— 否则模型每重试一次，宿主就真读一次来源表，读到的仍是新数据，
+           而守卫每次都拒，白白烧掉模型轮数直到 ``MODEL_TURN_LIMIT``；
+        3. 作废本任务的 Python 数据登记、协调器绑定与已登记结果
+           —— 旧结果不能再被提交成计划。
+
+        与 ``cancel`` 的区别只有一个：停止原因不可被后续动作改写，也不允许
+        重新派发。重复调用是幂等的（同一次规划里可能有多条在飞调用）。
+        """
+        self.source_stopped = True
+        self.cancel(SOURCE_CHANGED_RECEIPT_CODE)
+
     def supersede(self) -> None:
         """Invalidate in-flight calls after re-authorization / turn restart."""
         self.generation += 1
@@ -581,6 +631,34 @@ class TaskToolBridge:
             authorized_key=binding.authorized_key,
             source_fingerprint=binding.source_fingerprint,
         )
+        # 开发验收入口（A1-E1）：此刻才知道"哪一次规划任务"，把用户的显式启用
+        # 绑定到这个 task_id。另一本簿 / 另一个宿主的任务不会消费它。
+        # 判据是可核验身份相等（`dev_fault_target`），任务侧只报名字时不绑。
+        dev_result_ref_fault.bind_task(
+            task_id=binding.task_id,
+            host_id=binding.host_id,
+            workbook_name=binding.workbook_name,
+            workbook_identity=binding.identity,
+        )
+        # 开发验收入口（A1-E3）：此刻才知道"哪一次规划任务"，把用户的显式启用
+        # 绑定到这个 task_id。归属放在这里而不是"下一次调用"—— 否则先说话的那本
+        # 簿（可能是并发任务、另一本打开的簿）会把注入抢走：被抢的那轮莫名停在
+        # 半路，而真正要验的簿一次都看不到停止。
+        dev_source_changed_fault.bind_task(
+            task_id=binding.task_id,
+            host_id=binding.host_id,
+            workbook_name=binding.workbook_name,
+            workbook_identity=binding.identity,
+        )
+        # 两个开发入口共用一份"服务端见过哪本簿"的证据（`dev_fault_target`）：
+        # 用户只报名字时，靠它判断这个名字下是不是只有一个可核验身份。只在开发
+        # 开关打开时记录 —— 生产不留下任何额外状态。
+        if dev_source_changed_fault.enabled() or dev_result_ref_fault.enabled():
+            dev_fault_target.note_target(
+                host_id=binding.host_id,
+                workbook_name=binding.workbook_name,
+                workbook_identity=binding.identity,
+            )
         session = ToolBridgeSession(
             binding, on_request=on_request, on_complete=on_complete
         )
@@ -615,6 +693,17 @@ class TaskToolBridge:
         session = self._sessions.get(task_id)
         if session is not None:
             session.cancel(reason)
+        drop_python_state(task_id)
+
+    def stop_for_source_change(self, task_id: str) -> None:
+        """来源变化终态：会话停止派发 + 本次规划的全部中间态作废。
+
+        作废的是**基于旧来源快照**算出来的东西：数据集登记、协调器绑定、
+        已登记结果。留着任何一项，模型都还有机会把旧结果提交成白名单计划。
+        """
+        session = self._sessions.get(task_id)
+        if session is not None:
+            session.stop_for_source_change()
         drop_python_state(task_id)
 
     def release(self, task_id: str) -> None:

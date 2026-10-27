@@ -21,6 +21,11 @@ from .assistant_identity import with_runtime_model_identity
 from .task_context import TASK_CONTEXT_PROMPT, task_context_payload
 from .agent_runtime import AGENT_DECISION_PROMPT
 from .plan_tools import PLAN_COMPILERS, compile_plan_tool, plan_compiler_definitions
+from .planning_source_guard import (
+    SOURCE_CHANGED_STOP_MESSAGE,
+    SourceChangedDuringPlanning,
+    is_source_changed_receipt,
+)
 from .llm.config import DEEPSEEK_ANTHROPIC_URL, ModelConnection, ModelNotAvailableError
 from .llm.errors import (
     LLMError, LLMHTTPStatusError, LLMResponseError, LLMTimeoutError,
@@ -236,7 +241,25 @@ def _sdk_failure(result: Any, assistant_error: str | None = None) -> LLMError:
     return LLMResponseError("Claude Agent SDK 未能完成本轮请求。")
 
 
-async def _result(sdk: Any, prompt: Any, options: Any, timeout: float) -> str:
+async def _close_stream(stream: Any) -> None:
+    """把 SDK 的流**真的关掉**，而不是让它在后台继续跑。
+
+    `async for` 里 `break` 不会自动关闭异步生成器：不显式 `aclose()`，SDK 的
+    子进程会继续把消息往一个没人消费的队列里写，本轮"已停止"只是表面现象。
+    """
+    closer = getattr(stream, "aclose", None)
+    if closer is None:
+        return
+    try:
+        await closer()
+    except Exception:
+        # 关闭失败只影响进程回收时间，不能把已经确定的终态改成别的错误。
+        logger.warning("关闭 SDK 流失败", exc_info=True)
+
+
+async def _result(
+    sdk: Any, prompt: Any, options: Any, timeout: float, *, stop_event: Any | None = None
+) -> str:
     # Uvicorn's Windows reload/multi-worker mode installs a Selector loop,
     # which has no subprocess transport. Fail before invoking the SDK rather
     # than misreporting NotImplementedError as a model-network failure.
@@ -251,9 +274,17 @@ async def _result(sdk: Any, prompt: Any, options: Any, timeout: float) -> str:
     final = None
     assistant_error = None
     assistant_stop_reason = None
+    stopped = False
+    stream = sdk.query(prompt=prompt, options=options)
     try:
         async with asyncio.timeout(timeout):
-            async for item in sdk.query(prompt=prompt, options=options):
+            async for item in stream:
+                # 生产守卫已经确认"来源已变化"：本轮规划**到此为止**。
+                # 检查放在处理消息之前 —— 已停止之后收到的那条消息（多半是模型的
+                # 第二次工具调用）没有任何价值，处理它只会让停下的时刻更晚。
+                if stop_event is not None and stop_event.is_set():
+                    stopped = True
+                    break
                 if isinstance(item, sdk.ResultMessage):
                     final = item
                 elif isinstance(item, getattr(sdk, "AssistantMessage", ())):
@@ -280,6 +311,10 @@ async def _result(sdk: Any, prompt: Any, options: Any, timeout: float) -> str:
         ) from error
     except sdk.CLIJSONDecodeError as error:
         raise LLMResponseError("Claude Agent SDK 返回了无法解析的响应。") from error
+    finally:
+        await _close_stream(stream)
+    if stopped:
+        raise SourceChangedDuringPlanning()
     if final is None:
         if assistant_error in {"billing_error", "rate_limit"}:
             raise _sdk_failure(None, assistant_error)
@@ -492,6 +527,10 @@ async def run_sdk_plan(
     ]
     failed_tool: dict[str, str] | None = None
     confirmations = _context_confirmations(request)
+    # 来源变化是本次规划的终态：一经生产守卫确认，本轮的**全部**工具都必须停下。
+    # 用一个 Event 而不是布尔：`_result` 的流式循环要在拿到下一条消息时立刻看到它。
+    source_stop = asyncio.Event()
+    source_stop_reason: dict[str, str] = {}
 
     def _note_step(name: str, payload: dict[str, Any] | None = None) -> None:
         nonlocal failed_tool
@@ -582,6 +621,35 @@ async def run_sdk_plan(
     tools = []
     allowed = []
 
+    async def _stop_for_source_changed(tool_name: str) -> None:
+        """来源变化在生产守卫那里确认之后，**在这一层**就停住本轮规划。
+
+        只做"提示模型别重试"是无效的：模型看不到"再读也不会变"这件事，于是会
+        一次一次地读、一次一次地被拒，直到 ``MODEL_TURN_LIMIT`` —— 轮数用光了，
+        用户看到的还是一个与来源无关的失败。所以这里要真的停：
+
+        1. 桥进入停止态（后续调用不再派给宿主，也就不再读来源）；
+        2. 本轮所有工具在入口处被拒（模型拿不到计算结果，也提交不了旧结果）；
+        3. 流式循环在拿到下一条消息时结束（``source_stop`` 交给 ``_result``）。
+
+        幂等：同一条规划里可能有多条在飞调用，第二次进来直接返回。
+        """
+        if source_stop.is_set():
+            return
+        source_stop_reason["code"] = "source_changed"
+        task_tool_bridge.stop_for_source_change(task_id)
+        source_stop.set()
+        if on_event is not None:
+            await on_event({
+                "phase": "planning",
+                # 独立步骤身份：父阶段 `planning.model` 的终态由 `_result` 之后那条
+                # 事件关掉，这里说明的是**为什么**停 —— 界面上这两件事必须分开显示。
+                "stepId": "planning.source_changed",
+                "status": "failed",
+                "title": "数据来源在规划期间发生了变化，本次规划已停止",
+                "toolName": tool_name,
+            })
+
     async def _emit_submitted(tool_name: str) -> None:
         if on_event is not None:
             await on_event({
@@ -609,6 +677,13 @@ async def run_sdk_plan(
                 nonlocal terminal, unsupported_query_message
                 if terminal is not None:
                     return {"content": [{"type": "text", "text": "本轮结果已提交。"}], "is_error": True}
+                if source_stop.is_set():
+                    # 来源已变：本轮不得再读取、再计算、再提交。
+                    # 连 `describe_tables` 一并拒 —— 继续给结构只会让模型以为还能干点什么。
+                    return {
+                        "content": [{"type": "text", "text": SOURCE_CHANGED_STOP_MESSAGE}],
+                        "is_error": True,
+                    }
                 if tool_name == DESCRIBE_TABLES_TOOL:
                     payload = {"tables": authorized_structure_payload(request)}
                     return {
@@ -636,7 +711,9 @@ async def run_sdk_plan(
                     unsupported_query_message = None
                     receipt = await session.request(tool_name, normalized)
                     _note_step(tool_name, receipt)
-                    if receipt.get("status") == "ok":
+                    if is_source_changed_receipt(receipt):
+                        await _stop_for_source_changed(tool_name)
+                    elif receipt.get("status") == "ok":
                         await _save_checkpoint("after_tool")
                     return {
                         "content": [{"type": "text", "text": _non_terminal_tool_content(tool_name, receipt)}],
@@ -656,7 +733,9 @@ async def run_sdk_plan(
                     normalized = {"sources": sources}
                     receipt = await session.request(tool_name, normalized)
                     _note_step(tool_name, receipt)
-                    if receipt.get("status") == "ok":
+                    if is_source_changed_receipt(receipt):
+                        await _stop_for_source_changed(tool_name)
+                    elif receipt.get("status") == "ok":
                         await _save_checkpoint("after_tool")
                     return {
                         "content": [{"type": "text", "text": _non_terminal_tool_content(tool_name, receipt)}],
@@ -824,7 +903,17 @@ async def run_sdk_plan(
             content = await _result(
                 sdk, _image_prompt(prompt, request.images) if request.images else prompt, options,
                 capability_float("taskRecovery", "planningHardWallTimeSeconds"),
+                stop_event=source_stop,
             )
+        except SourceChangedDuringPlanning:
+            # 父阶段也必须如实收尾：停在这一步的是"来源变了"，不是模型失败，
+            # 更不是用户暂停。父阶段不关掉，界面会永远停在"正在生成操作方案"。
+            if on_event is not None:
+                await on_event({
+                    "phase": "planning", "stepId": "planning.model", "status": "failed",
+                    "title": "本次规划已停止：数据来源发生变化",
+                })
+            raise
         except LLMError as error:
             # 模型这一轮**确实结束了**（失败）：这一步必须如实收尾，不能挂在
             # "正在生成操作方案"上。父阶段的终态与子工具步骤的终态是两件事。

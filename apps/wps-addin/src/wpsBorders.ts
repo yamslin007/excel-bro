@@ -3,6 +3,7 @@ import { columnLetterFromIndex } from "@excel-bro/core/range";
 import { normalizeBorderAction, type ExcelAction } from "../../excel-addin/src/contracts";
 import { wpsOleColorFromHex } from "./wpsFormatCapability";
 import type { WpsRange } from "./wpsHost";
+import { countHostWrite } from "./wpsHostWriteCounter";
 export type BorderAction = Extract<ExcelAction,{type:"setBorders"}>;
 export const BORDER_FIELDS = ["borderTop","borderBottom","borderLeft","borderRight"] as const;
 export type BorderField = typeof BORDER_FIELDS[number];
@@ -36,6 +37,9 @@ export function restoreWpsBorder(range:WpsRange,field:BorderField,saved:string):
   const values:unknown=JSON.parse(saved);
   if(!Array.isArray(values)||values.length!==6||!values.every(v=>typeof v==="number"&&Number.isFinite(v))) throw new Error("边框恢复快照无效。");
   const [style,weight,color,mode,theme,tint]=values as number[];
+  // 计数口径：一条边算**一次**宿主写调用（同一个 Border 对象的属性组）。
+  // 撤销用的格式回滚也会走到这里，但那时没有活动作用域 ⇒ 不计。
+  countHostWrite(true);
   const b=edge(range,field);
   b.Weight=weight;
   if(mode===2) b.ThemeColor=theme;

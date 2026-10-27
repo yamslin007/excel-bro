@@ -1,5 +1,10 @@
+import { stampLiteralPlanOrigin } from "@excel-bro/core/literalPlanOrigin";
+import { assertWpsPlanSourceCurrent } from "./wpsPlanExecutor";
 import { RecoveryProbeControl } from "@excel-bro/core/RecoveryProbeControl";
 import { bindRecoveryProbe, interruptRecoveryProbe } from "@excel-bro/core/recoveryProbe";
+import { ResultRefFaultControl } from "@excel-bro/core/ResultRefFaultControl";
+import { resultRefFaultVisible } from "@excel-bro/core/resultRefFault";
+import { wpsResultRefFaultTarget } from "./wpsResultRefFaultTarget";
 import { canResumeWpsExecution, resumeWpsExecution, wpsResumeUnavailableReason } from "./wpsExecutionResume";
 import { prepareWpsResume, prepareWpsCompletedReview } from "./wpsPlanExecutor";
 import { TaskExecutionControls } from "../../excel-addin/src/components/TaskExecutionControls";
@@ -17,7 +22,12 @@ import {
   tailOf,
   withPauseTimeout
 } from "@excel-bro/core/pauseControl";
-import { pausePlanningTask } from "../../excel-addin/src/api";
+import {
+  armResultRefFault,
+  cancelResultRefFault,
+  getResultRefFaultStatus,
+  pausePlanningTask
+} from "../../excel-addin/src/api";
 import checkpointCapabilities from "../../../config/capabilities.json";
 import { planningRecoveryCandidates, isOfferedPlanningRecovery } from "@excel-bro/core/planningRecoveryRouting";
 import { usePrePlanningPause } from "../../excel-addin/src/hooks/usePrePlanningPause";
@@ -86,11 +96,13 @@ import {
   ApiRequestError,
   apiErrorCategory,
   listModels,
+  reportWpsHostWrites,
   understandMessage,
   validatePlan,
   type ModelCatalogStatus,
   type ModelOption
 } from "../../excel-addin/src/api";
+import type { HostWriteAudit } from "@excel-bro/core/hostWriteAudit";
 import { assertEditablePlan, type AnalysisPlan, type ClarificationField, type IntentOption, type ResultContext } from "../../excel-addin/src/contracts";
 import { ClarificationFields } from "../../excel-addin/src/components/ClarificationFields";
 import { useTheme } from "../../excel-addin/src/hooks/useTheme";
@@ -319,6 +331,8 @@ import {
   attestResultSourceDependency,
   attestSourceDependency,
   planningPausedEntriesFromHistory,
+  sourceAnchorFromBinding,
+  stampPlanSourceAnchor,
   trustedToolReads
 } from "@excel-bro/core";
 import { LocalResultCard as LocalResultCardView } from "../../excel-addin/src/components/LocalResultCard";
@@ -440,6 +454,7 @@ type ChatMessage = {
     awaitingStatus?: boolean;
     clientLastSequence?: number;
     resolved?: boolean;
+    terminalReason?: string;
   };
   clarification?: {
     summary: string;
@@ -1562,6 +1577,7 @@ export default function WpsAgentPanel({
    * 于是两次请求都发出去 —— 正好是幂等键要防的那种重复。ref 的读写是同步的，
    * 第二次点击必然看到第一次已经置位。
    */
+  const invalidPlanningTurnsRef = useRef(new Set<string>());
   const resumingPauseRef = useRef(false);
   const [continuingTurnId, setContinuingTurnId] = useState<string | null>(null);
   /**
@@ -2105,6 +2121,35 @@ export default function WpsAgentPanel({
     [checkpointWorkbookPath]
   );
   /*
+   * A1-E1 验收入口的绑定目标：交给 `wpsResultRefFaultTarget` 一处构造，
+   * 它读的正是桥建绑定时发出去的那一组同源取值（名字 = `Workbook.Name`，
+   * 身份 = `wpsWorkbookBridgeIdentity`）。服务端按这三者全等匹配任务，
+   * 任何一项自己拼装都会让"点了按钮却没生效"。
+   *
+   * 依赖**只**是"当前这本工作簿"（`checkpointWorkbookPath` 是它的稳定身份）：
+   * 绑定目标与选中表、与授权版本无关 —— 换表不换簿，目标还是同一个；
+   * 换簿（含另存为、未保存→保存）才会变。
+   *
+   * 这个依赖在函数体里**真的参与判断**，不是"缓存失效开关"：读现场的同时核对
+   * "读到的仍是面板刚观察过的那本簿吗"。两者不一致（切簿/另存为的中间态）就不给
+   * 目标 —— 宁可这一次入口不可用（按钮置灰），也不把另一本簿的名字与身份交给
+   * 服务端，让这次启用悄悄绑到别的任务上去。
+   */
+  const resultRefFaultTargetOfPanel = useMemo(() => {
+    try {
+      const application = getWpsApplication();
+      // 未保存的簿没有路径（`checkpointWorkbookPath` 为 null）：桥那时发的是会话
+      // 内令牌，目标照样要能给，所以这里只做"有路径就核对"，不是拿路径当闸门。
+      if (checkpointWorkbookPath && (listWpsWorksheets(application).fullName || null) !== checkpointWorkbookPath) {
+        return null;
+      }
+      return wpsResultRefFaultTarget(application);
+    } catch {
+      // 读不到现场 ⇒ 没有可绑定的目标；`ResultRefFaultControl` 据此禁用启用按钮。
+      return null;
+    }
+  }, [checkpointWorkbookPath]);
+  /*
    * 刷新后只查询**当前会话 + 当前工作簿**里已有操作的状态：不重新执行删除，
    * 也不把别的会话/工作簿的删除卡带进聊天流。
    */
@@ -2356,6 +2401,7 @@ export default function WpsAgentPanel({
      * 真实状态，并对身份与现场做核对。索引里只有 operationId / 身份 / taskId，
      * 完整计划、授权与写前/写后指纹都在服务端账本 —— 本地记录不是权威。
      */
+    if (scopeSource !== "workbook" || recoveryActionLock.current) return;
     let active = true;
     const pending = loadPendingWpsExecution();
     if (!pending) return;
@@ -2415,7 +2461,9 @@ export default function WpsAgentPanel({
     return () => {
       active = false;
     };
-  }, []);
+    // Scope changes only repeat GET + local inspection, never claim/reconcile/write.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authorizationKey, scopeMode, scopeSource]);
 
   /**
    * CAP-02 第 5 条：面板刷新后恢复可恢复的规划任务。
@@ -2610,12 +2658,13 @@ export default function WpsAgentPanel({
     if (!current || current.checking || current.acting || busy || !current.state || recoveryActionLock.current) return;
     if (action === "replan" && !recoveryScopeConfirmed) return;
     if (!wpsReconcileActions(current.verdict).includes(action)) return;
-    if (action !== "dismiss" && !(await targetGuard.check())) return;
     const operationId = current.operationId;
     let revision = current.state.revision;
     recoveryActionLock.current = true;
-    setWpsRecovery({ ...current, acting: true });
     try {
+      // Lock before the first await: two clicks can otherwise pass the same render's guard.
+      if (action !== "dismiss" && !(await targetGuard.check())) return;
+      setWpsRecovery({ ...current, acting: true });
       if (action === "dismiss") {
         clearPendingWpsExecution(operationId);
         setWpsRecovery(null);
@@ -2685,7 +2734,8 @@ export default function WpsAgentPanel({
             append({role: "system", text: action === "resume" ? "已按原执行身份续跑剩余动作并回读验证，已完成动作未重复写入。请审阅主表结果。" : "已补记完成回执，未重写原表。请审阅主表结果。"});
             return {record, executionId: record.executionId, verified: true, undoable: true};
           },
-          mark: async () => { const marks = markWpsResult(application, prepared); formula = marks.formula; return marks; },
+          // 公式在第一次 Add 之前就到手：标记部分失败时双视图仍能按它清本次残留。
+          mark: async () => { const marks = markWpsResult(application, prepared, value => { formula = value; }); return marks; },
           clearMarker: async marks => { clearWpsResultMarks(application, marks); },
           showBefore: async before => {
             const staged = stageWpsBeforeComparison(application, before, formula ?? undefined);
@@ -2696,6 +2746,11 @@ export default function WpsAgentPanel({
               writeSheet: {index: staged.writeSheet.index, name: staged.writeSheet.name}});
             if (rearrangeWpsComparison(application, staged) !== "arranged") throw new Error("双视图未能排列，请手动查看执行前副本。");
             return staged;
+          },
+          comparisonNotice: copy => {
+            const marks = copy.reviewMarks;
+            if (!marks || marks.unconfirmed === 0) return null;
+            return `执行前副本的审阅标记未能核实清理（${marks.unconfirmed} 处区域，可能读不到或删不掉）；两张表可能显示相同底色，请以原表与回读结果为准。`;
           },
           closeBefore: async copy => {
             const outcome = discardWpsNativeComparison(copy);
@@ -3989,7 +4044,7 @@ export default function WpsAgentPanel({
 
   const inspectPlanningMessage = async (message: ChatMessage): Promise<NonNullable<typeof planningPause> | undefined> => {
     const metadata = message.planningPause;
-    if (!metadata || metadata.resolved || planningInspectionRef.current || resumingPauseRef.current) return;
+    if (!metadata || metadata.resolved || invalidPlanningTurnsRef.current.has(metadata.turnId) || planningInspectionRef.current || resumingPauseRef.current) return;
     retainPlanningContext();
     const saved = planningContextsRef.current.get(metadata.turnId);
     if (saved && saved.conversationId === chatHistory.activeConversationId) {
@@ -4122,6 +4177,15 @@ export default function WpsAgentPanel({
       evidence.sourceFingerprint !== expectedFingerprint
     ) {
       // 读到了但与原任务记录的不同：数据变过，不能沿用旧现场。
+      const reason = "来源数据已变化，请按当前数据重新发送需求。";
+      invalidPlanningTurnsRef.current.add(turnId);
+      updateMessages((items) => items.map((item) => item.planningPause?.turnId === turnId
+        ? { ...item, planningPause: { ...item.planningPause, resolved: true,
+            terminalReason: reason, canContinue: false, awaitingStatus: false, detail: reason } }
+        : item));
+      setPlanningPause((current) => current?.turnId === turnId ? null : current);
+      setPlanningPauseReload((current) => current?.turnId === turnId ? null : current);
+
       append({
         role: "system",
         text: "原任务使用的数据已经变化，不能继续旧的规划现场；请按当前数据重新发送需求。"
@@ -4673,17 +4737,41 @@ export default function WpsAgentPanel({
         const planWithDependency = normalizedPlan.localResultRef
           ? attestResultSourceDependency(normalizedPlan, trustedReads ? [trustedReads] : [])
           : attestSourceDependency(normalizedPlan, trustedReads);
+        /*
+         * **来源锚点 = 模型读到的那一版。**
+         *
+         * 服务端编译出来的计划里是**固定值**（隔离容器算完的矩阵）。它到达面板时
+         * 再读一次"现在的指纹"是错的：只要用户在"模型读完数据"到"计划到达"之间
+         * 改了源表，这次现读记的就是改后的现场，写前复核再读一次当然相等，
+         * 一份按旧来源算出来的值就被静默写进单元格（2026-10-25 实测：新增写入 1 次）。
+         *
+         * 所以锚点取**本轮桥绑定**的指纹（`pinSourceFingerprint` 在第一个受控读取
+         * 时固定下来的那一版），与 Excel 端同一个来源、同一份判据
+         * （`@excel-bro/core/planSourceAnchor`）。
+         *
+         * 本地映射计划（`computedLocally`）不套这个锚点：它的值是**刚刚**从现场读出来
+         * 算的，且执行器已经按 `prepared.sources` 的 `previewFingerprint` 逐区域复核。
+         */
+        const anchoredPlan = stampLiteralPlanOrigin(result.computedLocally
+          ? planWithDependency
+          : stampPlanSourceAnchor(
+              planWithDependency,
+              sourceAnchorFromBinding(
+                sdkBridge.binding(),
+                result.turnId ?? turnIdRefForStream.current ?? ""
+              )
+            ), result.planOrigin);
         if (result.computedLocally && !result.sourceSnapshots?.length) {
           throw new Error("本地映射计划缺少源区域快照，不能安全预览写入。");
         }
         if (!(await waitForPlanning(targetGuard.check(), signal))) throw new TargetConfirmationRequiredError();
         checkActive();
-        if (isWorksheetDeletion(planWithDependency)) {
-          const outcome = await executeStructuralDeletion(planWithDependency, turnSheetIndexes, activity.id);
+        if (isWorksheetDeletion(anchoredPlan)) {
+          const outcome = await executeStructuralDeletion(anchoredPlan, turnSheetIndexes, activity.id);
           endActivity(activity, outcome);
           return;
         }
-        const prepared = prepareWpsPlan(application, turnSheetIndexes, planWithDependency, result.sourceSnapshots);
+        const prepared = prepareWpsPlan(application, turnSheetIndexes, anchoredPlan, result.sourceSnapshots, { requireSourceAnchor: !result.computedLocally });
         updateActivity(activity, { id: "preflight-plan", label: "写入计划与授权已校验", phase: "preflight", status: "completed" });
         endActivity(activity, "awaiting_input");
         setPendingPlan(prepared);
@@ -4804,7 +4892,8 @@ export default function WpsAgentPanel({
    * 全程**不写任何单元格**：续跑只推进"规划"，写入仍要经过既有的预览与确认。
    */
   const resumePlanningFromPause = async (pause: NonNullable<typeof planningPause>) => {
-    if (busy) return;
+    if (busy || invalidPlanningTurnsRef.current.has(pause.turnId) ||
+        messages.some((message) => message.planningPause?.turnId === pause.turnId && message.planningPause.resolved)) return;
     /*
      * 幂等键：**一次点击 = 一个 requestId**。
      *
@@ -5146,7 +5235,7 @@ export default function WpsAgentPanel({
           ? fixedValueFallbackFromFormula(pendingPlan.plan)
           : null;
         if (!fallback) throw error;
-        const fixedPrepared = prepareWpsPlan(application, currentSheetIndexes, fallback, pendingPlan.sourceSnapshots);
+        const fixedPrepared = prepareWpsPlan(application, currentSheetIndexes, fallback, pendingPlan.sourceSnapshots, { requireSourceAnchor: pendingPlan.sourceAnchorRequired });
         staged = stageWpsNativeComparison(application, fixedPrepared);
         setPendingPlan(fixedPrepared);
         usedFixedFallback = true;
@@ -5398,6 +5487,22 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
      */
     let completedRecord: WpsUndoRecord | null = null;
     let wpsLedgerState: Awaited<ReturnType<typeof registerWpsWriteIntent>> | null = null;
+    /*
+     * 宿主观测（A1-E3）：执行器在每个动作窗口里数**真的进入宿主写 API 的调用**
+     * （`wpsHostWriteCounter`），这里先收着，等账本 finish/suspend **之后**再补报。
+     * 顺序是有意的：观测不能插在"写入 → 账本提交"之间，否则上报失败会变成新的
+     * 中断窗口。失败也没关系 —— 少一条证据，不改执行结论。
+     */
+    const hostWriteAudits: HostWriteAudit[] = [];
+    const flushHostWriteAudits = () => {
+      if (!operationId || hostWriteAudits.length === 0) return;
+      void reportWpsHostWrites(operationId, {
+        ownerToken: wpsLedgerState?.ownerToken ?? null,
+        entries: [...hostWriteAudits]
+      }).catch(() => {
+        // 观测失败只少一条证据：不重试、不打断、不改写任何执行结论。
+      });
+    };
     try {
       // 副本未被改动这一项只属于副本路径；直接执行没有副本可核对。
       if (review) verifyWpsNativeComparison(getWpsApplication(), review);
@@ -5559,7 +5664,8 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
             }
           }
         : undefined,
-        operationId, {taskId: wpsLedgerState?.taskId});
+        operationId, {taskId: wpsLedgerState?.taskId},
+        (entry) => { hostWriteAudits.push(entry); });
       let comparison: "matched" | "different" | "unavailable" = "unavailable";
       let comparisonFailed = false;
       if (review) {
@@ -5602,6 +5708,7 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
         } catch (error) {
           append({ role: "system", text: `写入已完成，但完成回执提交失败；重开面板后可核对本次执行。${turnErrorMessage(error)}` });
         }
+        flushHostWriteAudits();
       }
       if (!review) {
         // 直接执行：如实说"没有副本可比"，而不是让"与副本不同"这类话缺席 ——
@@ -5699,6 +5806,7 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
         } catch {
           // 挂起失败：服务端账本保持 running + 在途动作，重开后核对路径仍能接手。
         }
+        flushHostWriteAudits();
       }
       // WPS reopens an existing pane by setting Visible=true; React need not remount.
       // Publish the recovery state now, after suspension, using the same read-only
@@ -5813,7 +5921,7 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
       const validated = pendingPlan.sourceSnapshots.length
         ? parsed
         : await validatePlan(parsed, selectedNames, metadata.sheets.map((sheet) => sheet.name));
-      const updated = prepareWpsPlan(application, currentSheetIndexes, validated, pendingPlan.sourceSnapshots);
+      const updated = prepareWpsPlan(application, currentSheetIndexes, validated, pendingPlan.sourceSnapshots, { requireSourceAnchor: pendingPlan.sourceAnchorRequired });
       setPendingPlan(updated);
       if (pendingPlanMessageId) {
         updateMessages((current) => current.map((message) =>
@@ -6010,6 +6118,7 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
        */
       prepare: async () => {
         if (!isCurrent()) throw new Error('当前计划或授权已变化，未执行。');
+        assertWpsPlanSourceCurrent(getWpsApplication(), prepared);
         return captureWpsBeforeResult(getWpsApplication(), prepared);
       },
       execute: async () => {
@@ -6018,8 +6127,9 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
         return { record, executionId: record.executionId, verified: true, undoable: true };
       },
       mark: () => {
-        const marks = markWpsResult(getWpsApplication(), prepared);
-        currentMarkFormula = marks.formula;
+        // 公式在**第一次 Add 之前**就交给这里：标记建到一半失败时双视图仍能按它
+        // 精确清掉本次残留（`markWpsResult` 会先回调公式、再抛错）。
+        const marks = markWpsResult(getWpsApplication(), prepared, formula => { currentMarkFormula = formula; });
         return Promise.resolve(marks);
       },
       clearMarker: marks => Promise.resolve(clearWpsResultMarks(getWpsApplication(), marks)),
@@ -6055,6 +6165,15 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
           throw new Error('未能打开双视图，请手动查看本次执行前副本；执行结果与撤销不受影响。');
         }
         return staged;
+      },
+      /*
+       * 副本侧"本次标记没清干净"**必须说出来**：那种情况下两张表可能显示同样的
+       * 高亮，用户会把执行前状态看成执行后状态。清掉了就返回 null，保留原有提示。
+       */
+      comparisonNotice: copy => {
+        const marks = copy.reviewMarks;
+        if (!marks || marks.unconfirmed === 0) return null;
+        return `执行前副本的审阅标记未能核实清理（${marks.unconfirmed} 处区域，可能读不到或删不掉）；两张表可能显示相同底色，请以原表与回读结果为准。`;
       },
       closeBefore: async before => {
         const outcome = discardWpsNativeComparison(before);
@@ -8259,7 +8378,7 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
                     <div className="wps-planning-pause-status" role="status">
                       {message.text && <p>{message.text}</p>}
                       <strong>
-                        {message.planningPause!.resolved ? "本段已接续，查看后续结果"
+                        {message.planningPause!.resolved ? (message.planningPause!.terminalReason ?? "本段已接续，查看后续结果")
                           : continuing ? "正在继续"
                           : reloading ? "正在核对原任务"
                           : message.planningPause!.awaitingStatus ? "已暂停接收，待核对原任务"
@@ -8583,7 +8702,7 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
           <div className="composer-resize-handle" {...composerResizeHandleProps}>
             <i />
           </div>
-          <TaskExecutionControls state={composerPauseButton}
+          <TaskExecutionControls reviewing={resultReviewState.phase === "reviewing"} state={composerPauseButton}
             pausing={pauseRequestState?.phase === "requesting"}
             disabled={busy && composerPauseButton.kind === "continue"}
             onPause={() => pauseCurrentTurn("composer")}
@@ -8673,6 +8792,22 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
           </p>
         )}
         {(import.meta.env.DEV || import.meta.env.VITE_ENABLE_RECOVERY_PROBE === "true") && <RecoveryProbeControl identity={(checkpointWorkbookPath ? wpsWorkbookIdentity(checkpointWorkbookPath) : null)} disabled={busy} />}
+        {/*
+          A1-E1 验收入口：让本工作簿的下一次规划任务的第一条 Python 结果引用在
+          "已登记、尚未首次写入"处失效。可见性与文案都来自共享层（Excel 端读同一份），
+          本端只负责把 WPS 的宿主名与工作簿身份填进去；失效本身发生在服务端解析引用
+          的那一刻，界面无法伪造"已过期"。
+        */}
+        <ResultRefFaultControl
+          visible={resultRefFaultVisible(
+            import.meta.env.DEV || import.meta.env.VITE_ENABLE_RECOVERY_PROBE === "true"
+          )}
+          disabled={busy}
+          target={resultRefFaultTargetOfPanel}
+          load={getResultRefFaultStatus}
+          arm={armResultRefFault}
+          cancel={cancelResultRefFault}
+        />
       </footer>
 
       {newConversationConfirmOpen && (

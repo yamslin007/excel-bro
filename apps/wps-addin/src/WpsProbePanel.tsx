@@ -25,6 +25,7 @@ import { reportDevProbe } from "./devProbe";
 import { brandLogoUrl } from "../../excel-addin/src/brandLogo";
 import { initializeRestoredTaskPaneWidth } from "./ribbon";
 import WpsAgentPanel from "./WpsAgentPanel";
+import { loadWpsPinnedSelection, saveWpsPinnedSelection } from "./wpsPinnedSelection";
 import { getWpsApplication, readWpsHostProbe, type WpsHostProbe } from "./wpsHost";
 import {
   listWpsWorksheets,
@@ -50,6 +51,7 @@ function runProbe(): ProbeState {
 export default function WpsProbePanel() {
   const [probe, setProbe] = useState<ProbeState>({ status: "loading" });
   const [metadata, setMetadata] = useState<WpsWorkbookMetadata | null>(null);
+  const manualScopeMetadata = useRef<WpsWorkbookMetadata | null>(null);
   /** 当前已核实的授权。勾选、取消勾选或切换模式自动核验并提交，期间阻止读写。 */
   const [selectedIndexes, setSelectedIndexes] = useState<number[]>([]);
   const [scopeMode, setScopeMode] = useState<"auto" | "manual">("auto");
@@ -147,7 +149,19 @@ export default function WpsProbePanel() {
     if (nextProbe.status === "ready") {
       const nextMetadata = listWpsWorksheets(getWpsApplication());
       setMetadata(nextMetadata);
-      setSelectedIndexes(nextMetadata.sheets.filter((sheet) => sheet.isActive).map((sheet) => sheet.index));
+      const restored = loadWpsPinnedSelection(nextMetadata);
+      if (restored.kind === "none") {
+        setSelectedIndexes(nextMetadata.sheets.filter((sheet) => sheet.isActive).map((sheet) => sheet.index));
+      } else {
+        const indexes = restored.kind === "fixed" ? restored.indexes : [];
+        manualScopeMetadata.current = nextMetadata;
+        setScopeMode("manual"); setDraftMode("manual");
+        setSelectedIndexes(indexes); setDraftIndexes(indexes);
+        if (restored.kind === "invalid") {
+          setScopeError("原固定工作表无法核实，请重新选择；未授权当前表或其他表。");
+          setScopeOpen(true);
+        }
+      }
     }
     reportDevProbe("taskpane", {
       connected: nextProbe.status === "ready",
@@ -430,10 +444,13 @@ export default function WpsProbePanel() {
       }
       setProbe(nextProbe);
       setMetadata(nextMetadata);
+      manualScopeMetadata.current = draftMode === "manual" ? nextMetadata : null;
       setScopeMode(draftMode);
       setScopeSource("workbook");
       setSelectedIndexes(nextIndexes);
       setDraftIndexes(nextIndexes);
+      try { saveWpsPinnedSelection(nextMetadata, draftMode, nextIndexes); }
+      catch { setScopeError("本次选择已生效，但无法保存；重开后请重新核实范围。"); }
       return true;
     } catch (reason) {
       if (isCurrent()) setScopeError(reason instanceof Error ? reason.message : "暂时无法读取目标身份，请刷新后重试。");
@@ -457,10 +474,16 @@ export default function WpsProbePanel() {
         return [];
       }
       const nextMetadata = listWpsWorksheets(getWpsApplication());
-      const available = new Set(nextMetadata.sheets.map((sheet) => sheet.index));
+      const previous = manualScopeMetadata.current;
+      if (scopeMode === "manual" && (!previous || previous.fullName !== nextMetadata.fullName || previous.name !== nextMetadata.name ||
+          selectedIndexes.some(index => !nextMetadata.sheets.some(live => live.index === index &&
+            live.name === previous.sheets.find(saved => saved.index === index)?.name)))) {
+        setScopeError("固定工作表身份已变化，请重新选择；未变更原授权。");
+        return [];
+      }
       const nextIndexes = scopeMode === "auto"
         ? nextMetadata.sheets.filter((sheet) => sheet.isActive).map((sheet) => sheet.index)
-        : selectedIndexes.filter((index) => available.has(index));
+        : selectedIndexes;
       setProbe(nextProbe);
       setMetadata(nextMetadata);
       setSelectedIndexes(nextIndexes);
@@ -897,7 +920,7 @@ export default function WpsProbePanel() {
                   <span role="note">切换文件不会丢失已勾选的工作表</span>
                 </details>
               </div>
-              <button type="button" className="scope-close" data-scope-pending={immediateScope.pending} onClick={discardScopeEdit}>确认</button>
+              <button type="button" className="scope-close" data-scope-pending={immediateScope.pending} onClick={() => { if (immediateScope.isPending()) immediateScope.request(() => setScopeOpen(false)); else setScopeOpen(false); }}>确认</button>
             </div>
           )}
           {draftSource === "folder" && (
@@ -917,7 +940,7 @@ export default function WpsProbePanel() {
                 >↻</i>
                 {" "}刷新
               </button>
-              <button type="button" className="scope-close" data-scope-pending={immediateScope.pending} onClick={discardScopeEdit}>确认</button>
+              <button type="button" className="scope-close" data-scope-pending={immediateScope.pending} onClick={() => immediateScope.request(() => setScopeOpen(false))}>确认</button>
             </div>
           )}
           {folderError && <p role="alert" className="authorized-target-error">{folderError}</p>}

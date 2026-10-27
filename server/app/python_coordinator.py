@@ -38,6 +38,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .capabilities import capability_int
+from . import dev_result_ref_fault
 from .local_results import local_results
 from .python_code_artifacts import python_code_artifacts
 from .models import (
@@ -339,6 +340,10 @@ def run_prepared_execution(
         )
     except ValueError:
         return _unavailable_receipt(REASON_EXECUTION_ERROR)
+
+    # 开发验收入口（A1-E1）：本条是**该任务的第一条 Python 结果**时，把用户的显式
+    # 启用绑定到这个句柄。绑定只做登记，不改值、不改 TTL；失效发生在引用被使用那一刻。
+    dev_result_ref_fault.bind_python_result(binding.task_id, registered.handle)
 
     # 构建结果卡（用于 SSE 事件投递）
     headers = [

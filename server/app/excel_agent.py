@@ -1487,6 +1487,7 @@ def _parse_content(content: str) -> AssistantResponse:
                 **payload,
                 "provider": "model",
                 "plan": _normalize_submitted_plan(payload.get("plan")),
+                "planOrigin": None,  # Only the trusted literal compiler can attest this.
             }
         )
     raise ValueError("模型返回了未知响应类型")

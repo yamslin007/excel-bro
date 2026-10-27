@@ -1,9 +1,15 @@
 import type { CellValue } from "../../excel-addin/src/contracts";
 import type { WpsRange } from "./wpsHost";
+import { countHostWrite } from "./wpsHostWriteCounter";
 
 /** Preserve literal strings during WPS coercion, then restore the original formats.
  * All callers must still verify the exact values/formulas after this operation.
  * Older hosts without cell-format access retain the existing strict readback path.
+ *
+ * 计数口径见 `wpsHostWriteCounter`：真正赋值给 `range[property]` 的那一次记为
+ * **计划写**（`mutating`），前后为了保持文本原样而改 `NumberFormat` 的记为
+ * **同动作内的辅助调用**（只进 `hostWriteCalls`）。撤销/审阅副本调用本函数时
+ * 没有活动作用域 ⇒ 一次都不计，不会被当成"重放"。
  */
 export function writeWpsMatrix(
   range: WpsRange,
@@ -25,13 +31,16 @@ export function writeWpsMatrix(
   try {
     for (const item of formats) {
       touched.push(item);
+      countHostWrite(false);
       item.cell.NumberFormat = "@";
     }
+    countHostWrite(true);
     range[property] = single ? values[0][0] : values;
   } finally {
     const failures: unknown[] = [];
     for (const item of touched.reverse()) {
       try {
+        countHostWrite(false);
         item.cell.NumberFormat = item.format;
         if (item.cell.NumberFormat !== item.format) throw new Error("WPS 数字格式恢复回读不一致");
       } catch (error) { failures.push(error); }

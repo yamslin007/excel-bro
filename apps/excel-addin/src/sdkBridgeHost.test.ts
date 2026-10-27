@@ -338,6 +338,27 @@ describe("createSdkBridgeHostPorts", () => {
   });
 
   /*
+   * 表**改名**和表**减少**在服务端看到的是同一件事：绑定时的名字不在当前集合里了。
+   *
+   * 单独钉一遍的理由：WPS 端有专门的改名用例（`wpsSdkBridgeHost.test.ts`
+   * 「换簿（同名不同路径）」与面板级「已授权表改名」），Excel 端此前只有"少了一张"。
+   * 张数与顺序都没变、只有名字变的场景如果被实现成"数量相等就放行"，这里必须红。
+   */
+  it("已授权表改名（张数与顺序都不变，只有名字变）：一样拒读，零宿主调用", async () => {
+    stubFetch([{ status: "accepted", code: null }]);
+    const execute = vi.fn();
+    const renamed = ports(
+      { execute },
+      { ...LIVE, authorizedSheetNames: ["Sheet1", "被改名的工作表"] }
+    );
+    await expect(renamed.verify(BINDING, call())).resolves.toEqual({
+      ok: false,
+      errorCode: "unauthorized_scope"
+    });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  /*
    * 读不到现场 ≠ 没变化。这里必须产出**一张拒绝回执**，而不是让 verify 抛异常：
    * 抛出去会被 hook 的 drain 吞掉，服务端一个回执都收不到，只能干等到超时 ——
    * 那正是"无人回执的等待"。

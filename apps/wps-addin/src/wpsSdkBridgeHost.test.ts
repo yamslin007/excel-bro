@@ -216,6 +216,22 @@ describe("WPS 桥绑定与现场读取", () => {
     expect(other.startsWith("wps-session:")).toBe(true);
   });
 
+  it("窗格重开后的未保存工作簿是另一个会话身份（不能据此续跑）", () => {
+    // 重开 = 新的 JS 运行环境 = 新的工作簿对象 ⇒ 新令牌。检查点里记的是旧令牌，
+    // 服务端比对会判 `TARGET_CHANGED`：这不是缺陷，是"只能证明会话内身份"的边界。
+    const before = bindingOf(
+      cinemaApplication({ fullName: null, path: "" })
+    ).workbookIdentity;
+    const afterReload = bindingOf(
+      cinemaApplication({ fullName: null, path: "" })
+    ).workbookIdentity;
+    expect(afterReload).not.toBe(before);
+    // 已保存的工作簿换的是运行环境、不是文件：磁盘身份不变，续跑仍成立。
+    const savedBefore = bindingOf(cinemaApplication()).workbookIdentity;
+    const savedAfterReload = bindingOf(cinemaApplication()).workbookIdentity;
+    expect(savedAfterReload).toBe(savedBefore);
+  });
+
   it("身份无法核实时明确阻断（连工作簿对象都没有 → 抛错，不退回名字）", () => {
     const application = cinemaApplication();
     (application as { ActiveWorkbook: unknown }).ActiveWorkbook = undefined;

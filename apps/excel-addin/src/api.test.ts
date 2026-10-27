@@ -1009,6 +1009,37 @@ describe("streaming assistant response", () => {
     });
   });
 
+  /*
+   * A1-E3：`source_changed` 的轮次终态要**原样**穿过这一层。
+   *
+   * 这一条走真实 SSE 帧解析（真 fetch、真 reader），不是给面板塞一个构造好的
+   * 异常：`code`、`retryable`、`message` 三者任何一项在这一层被改写，面板就会
+   * 把"来源变了、必须重新发起"读成"再点一次就好"，或者干脆读成"已完成"。
+   */
+  it("keeps the source-changed stop frame verbatim (not retryable, not completed)", async () => {
+    const message =
+      "来源已变化，当前任务已停止：没有继续读取来源、没有继续计算，也没有写入。请按最新数据重新发起需求。";
+    const fetchMock = vi.fn().mockResolvedValue(
+      sseStreamResponse([
+        'event: error\n' +
+          `data: ${JSON.stringify({
+            status: 409,
+            code: "SOURCE_CHANGED",
+            message,
+            retryable: false
+          })}\n\n`
+      ])
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(streamAssistantResponse(streamPlanRequest)).rejects.toMatchObject({
+      status: 409,
+      code: "SOURCE_CHANGED",
+      message,
+      retryable: false
+    });
+  });
+
   it("falls back to the non-streaming endpoint when the stream endpoint is missing", async () => {
     const fetchMock = vi
       .fn()

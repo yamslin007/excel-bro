@@ -141,6 +141,7 @@ export type WpsTurnResult =
     }
   | {
       kind: "plan";
+      planOrigin?: "literal_range_edit" | null;
       plan: AnalysisPlan;
       turnId?: string | null;
       /**
@@ -548,7 +549,7 @@ function finalizeResponse(response: AssistantResponse): WpsTurnResult {
     // 明确抛错而不是静默当成计划：真走到了说明调用顺序被改坏了。
     throw new Error("本地计算规则需要先读取授权工作表，不能在此处直接转成计划。");
   }
-  return { kind: "plan", plan: response.plan, turnId: response.turnId };
+  return { kind: "plan", plan: response.plan, turnId: response.turnId, planOrigin: response.planOrigin };
 }
 
 export async function runWpsTurn(

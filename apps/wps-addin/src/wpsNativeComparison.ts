@@ -30,7 +30,7 @@ import {
   type WpsPreparedPlan
 } from "./wpsPlanExecutor";
 import { captureWpsFormatSnapshot, restoreWpsFormatSnapshot, sameWpsFormatSnapshot, type WpsFormatSnapshot } from "./wpsFormatSnapshot";
-import { clearReviewMarksFromCopySheet } from "./wpsResultReviewMarkers";
+import { clearReviewMarksFromCopySheet, type WpsCopyMarkCleanup } from "./wpsResultReviewMarkers";
 
 export class WpsFormulaTrialError extends Error {}
 
@@ -72,6 +72,13 @@ export type WpsNativeComparison = {
    * 区域部分重叠，按各自区域采集得到的仍是同一次未变更的现场。
    */
   originalFormatBefore: Array<WpsFormatSnapshot | undefined>;
+  /**
+   * 副本侧"清掉本次审阅标记"的结果（详情见 `clearReviewMarksFromCopySheet`）。
+   *
+   * 没传本次公式时不存在（那时**故意**不清，宁可副本也高亮）；`unconfirmed > 0`
+   * 表示这次没核实干净，界面必须如实提示，不能声称"执行前副本已无标记"。
+   */
+  reviewMarks?: WpsCopyMarkCleanup;
 };
 
 type WpsComparisonWorkbookIdentity = {
@@ -412,9 +419,13 @@ export function stageWpsBeforeComparison(
    * 误以为"执行前也是这个颜色"。这里只清副本里**本次**审阅的规则（按完整随机
    * 公式 `reviewFormula` 认领），用户自己的条件格式（及其顺序、语义）一个不碰。
    * 没有本次公式就不清（宁可副本多一圈高亮，也不误删别人的规则）。
+   *
+   * 标记**建到一半失败**时原表留有本次残留，调用方拿 `markWpsResult` 的
+   * `onFormula` 把同一个公式传进来即可；清不干净的结果如实带出去，不谎称干净。
    */
+  let reviewMarks: WpsCopyMarkCleanup | undefined;
   if (reviewFormula) {
-    clearReviewMarksFromCopySheet(sheet, prepared.actions.map(action => action.range), reviewFormula);
+    reviewMarks = clearReviewMarksFromCopySheet(sheet, prepared.actions.map(action => action.range), reviewFormula);
   }
   const copyAfter: WpsActionAfter[] = [];
   const copyFingerprints: string[] = [];
@@ -467,7 +478,8 @@ export function stageWpsBeforeComparison(
     originalFormatBefore: before.formats,
     copyFormatFinal: before.formats,
     copyFingerprints,
-    copyAfter
+    copyAfter,
+    ...(reviewMarks ? { reviewMarks } : {})
   };
 }
 

@@ -14,6 +14,12 @@ import type {
   PythonCodeLimits,
   PythonCodeStage
 } from "@excel-bro/core/pythonCodeArtifact";
+// 宿主观测的类型与判据都在 core（唯一口径），协议层只转发。
+import type {
+  HostWriteAudit,
+  HostWriteObservation,
+  HostWriteSummary
+} from "@excel-bro/core/hostWriteAudit";
 // 大小/折叠上限的唯一出处：`config/capabilities.json`（代码只做兜底）。
 import capabilities from "../../../config/capabilities.json";
 
@@ -1103,6 +1109,27 @@ export interface SdkBridgeResultResponse {
   complete: boolean;
   calculation: string;
   scannedRows: number;
+}
+
+/**
+ * 开发验收专用的「结果引用过期」入口（A1-E1）。
+ *
+ * 请求里**只有工作簿身份**：没有 `taskId`、没有 `resultRef`。任务与句柄由服务端在
+ * 可信路径上绑定（开桥那一刻 = 哪次任务；该任务第一条 Python 结果登记那一刻 = 哪个
+ * 引用），模型无从指定别的任务或别的引用。服务端未开启开发模式时这些端点表现为 404。
+ */
+export interface DevResultRefFaultArmRequest {
+  hostId: "excel-office" | "wps-et";
+  workbookName: string;
+  workbookIdentity?: string;
+}
+
+export interface DevResultRefFaultStatus {
+  enabled: boolean;
+  phase: "off" | "idle" | "armed" | "bound" | "consumed" | "expired";
+  expiresInSeconds: number;
+  taskBound: boolean;
+  refBound: boolean;
 }
 
 /**
@@ -2342,6 +2369,7 @@ export type AssistantResponse =
     }
   | {
       kind: "plan";
+      planOrigin?: "literal_range_edit" | null;
       plan: AnalysisPlan;
       provider: "model" | "local";
       turnId?: string | null;
@@ -3817,4 +3845,18 @@ export function assertWorksheetRestoreResult(
   if (item.status === "partial" && (!item.restoredSheets!.length || !item.failedSheets!.length)) {
     throw new Error("撤销回执声称部分完成，但清单与状态不一致；请核对工作表列表。");
   }
+}
+
+/**
+ * 宿主观测的读回形状（A1-E3）。**只读诊断**，不参与任何写入判断。
+ *
+ * `observation` 是"这批数字能不能当证据"的判据，由服务端给出（只有服务端知道
+ * 账本里的动作认领边界）。空数组不等于零写入 —— 判读一律走
+ * `describeHostWriteObservation()`，不要自己看 `totals.hostWriteCalls === 0`。
+ */
+export interface HostWritesSummaryResponse {
+  operationId: string;
+  entries: HostWriteAudit[];
+  totals: HostWriteSummary;
+  observation: HostWriteObservation;
 }

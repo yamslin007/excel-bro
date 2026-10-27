@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { executePlan, undoExecution } from "./excel";
+import { captureWorkbookSourceFingerprint, executePlan, undoExecution } from "./excel";
 import type { AnalysisPlan, ExcelAction } from "./contracts";
 import { createOfficeTestHost, installOfficeTestHost, type TestOfficeHost } from "./officeTestHost";
 
@@ -29,6 +29,25 @@ function plan(actions: ExcelAction[], overrides: Partial<AnalysisPlan> = {}): An
     warnings: [],
     actions,
     ...overrides
+  };
+}
+
+
+/**
+ * 计划带上**生产形态**的来源锚点。
+ *
+ * 写闸门要求：写了固定值的计划必须记录"它是按哪一版源算出来的"（缺失即拒绝）。
+ * 这里用产品自己的读取器在"计划生成那一刻"读一次 —— 与 App 给桥绑定记的那枚是
+ * 同一个口径。审阅/撤销的多數用例不需要它，但凡动手 **写值** 的用例都必须有。
+ */
+async function anchoredPlan(
+  actions: ExcelAction[],
+  sheets: string[] = [SHEET]
+): Promise<AnalysisPlan> {
+  return {
+    ...plan(actions),
+    sourceFingerprintSheets: [...sheets],
+    sourceFingerprint: await captureWorkbookSourceFingerprint(sheets)
   };
 }
 
@@ -429,7 +448,7 @@ describe("值动作的撤销不碰任何格式（按实际影响拆分恢复）"
     host.setCellStyle(SHEET, "B1", { fontSize: 16 });
 
     const result = await executePlan(
-      plan([{ type: "writeValues", sheet: SHEET, range: "A1:B1", values: [["新甲", "新乙"]] }]),
+      await anchoredPlan([{ type: "writeValues", sheet: SHEET, range: "A1:B1", values: [["新甲", "新乙"]] }]),
       { authorizedSheetNames: [SHEET] }
     );
 

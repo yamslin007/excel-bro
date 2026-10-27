@@ -390,3 +390,70 @@ def test_source_change_makes_the_registered_result_unresolvable(monkeypatch):
     drop_python_state("task-py")
     assert local_results.resolve("task-py", handle) is None
     assert local_results.count_task("task-py") == 0
+
+
+# ---------------------------------------------------------------------------
+# A1-E1：结果引用过期入口在**真实登记路径**上的接线
+# ---------------------------------------------------------------------------
+
+
+def test_armed_fault_expires_the_real_python_registration(monkeypatch):
+    """绑定发生在生产的 `python_coordinator` 里，而不是测试自己调出来的。
+
+    这条用例不替 `bind_python_result` 说一句话：arm 由测试模拟"用户点了开发入口"，
+    **任务绑定走真实的 `task_tool_bridge.open()`**，**句柄绑定走真实的
+    `execute_python_analysis()` → `local_results.register()`**。只有这条链成立，
+    "已登记、尚未首次写入"才是真的精确位置。
+    """
+    from server.app import dev_result_ref_fault
+    from server.app.result_submission import (
+        RESULT_REF_INVALID_CODE,
+        ResultSubmissionError,
+        resolve_result_ref,
+    )
+    from server.app.task_bridge import BridgeBinding, task_tool_bridge
+
+    monkeypatch.setenv("EXCEL_BRO_RESULT_REF_FAULT", "1")
+    dev_result_ref_fault.reset()
+    task_tool_bridge.reset()
+    try:
+        dev_result_ref_fault.arm(
+            host_id="excel-office",
+            workbook_name="w.xlsx",
+            workbook_identity="url:https://example.com/w.xlsx",
+        )
+        # 真实的开桥路径 = 这次规划任务真正开始，故障在此刻绑到 task_id。
+        task_tool_bridge.open(BridgeBinding(
+            task_id="task-py",
+            host_id="excel-office",
+            workbook_name="w.xlsx",
+            source_fingerprint=None,
+            authorized_key="a" * 64,
+            workbook_identity="url:https://example.com/w.xlsx",
+        ))
+        assert dev_result_ref_fault.status()["taskBound"] is True
+
+        scope, receipt = _bind()
+        monkeypatch.setattr(
+            python_analysis, "run_registered_analysis_internal", _fake_runner_summing()
+        )
+        result = coord.execute_python_analysis(
+            SimpleNamespace(turnId="task-py"),
+            {"code": "result = ...", "datasetHandles": [receipt.datasetHandle]},
+        )
+        assert result["status"] == "completed"
+        handle = result["resultHandle"]
+        # 生产代码里的登记已经把它绑成"那一个要失效的引用"。
+        assert dev_result_ref_fault.status()["refBound"] is True
+        # 登记之后、任何写入之前：引用还读得出来（说明不是"根本没登记"）。
+        assert local_results.resolve("task-py", handle) is not None
+
+        with pytest.raises(ResultSubmissionError) as error:
+            resolve_result_ref("task-py", handle)
+        assert error.value.code == RESULT_REF_INVALID_CODE
+        # 失效是"真的没了"：登记器里不留正文，也就不存在复用缓存的余地。
+        assert local_results.resolve("task-py", handle) is None
+        assert dev_result_ref_fault.status()["phase"] == "consumed"
+    finally:
+        dev_result_ref_fault.reset()
+        task_tool_bridge.reset()

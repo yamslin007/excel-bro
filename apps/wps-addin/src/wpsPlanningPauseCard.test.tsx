@@ -913,6 +913,77 @@ describe("继续分析的读表桥", () => {
    * `not_collected`，服务端只能拒绝（SOURCE_UNVERIFIED）。界面上看不出区别 ——
    * 用户只看到"点继续没反应"。所以判据必须落在**交上去的请求体**上。
    */
+  it("来源变化拒绝后撤下旧任务继续入口，重开也不复活", async () => {
+    await seedHistoryThenReload();
+    statusMock.mockResolvedValue({ turnId: "turn-pause-1", status: "waiting_user", revision: 12,
+      lastSequence: 30, canContinue: true, pauseType: "budget", reason: null,
+      sourceFingerprint: "old-source-fingerprint", sourceFingerprintSheets: ["Sheet1"],
+      continuation: { available: true, code: null, message: "", stage: "after_tool", sourceVerificationRequired: true } });
+    const { container } = await mount(panel());
+    await until(() => Boolean(findButton(container, "继续分析")), "应出现继续入口");
+    await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="继续任务"]')!.click());
+    await until(() => (container.textContent ?? "").includes("原任务使用的数据已经变化"), "应拒绝旧现场");
+    expect(continueMock).not.toHaveBeenCalled();
+    expect(container.querySelector('button[aria-label="继续任务"]')).toBeNull();
+    expect(findButton(container, "继续分析")).toBeNull();
+    mounted.forEach((entry) => entry.unmount()); mounted = [];
+    const reopened = await mount(panel());
+    expect(reopened.container.querySelector('button[aria-label="继续任务"]')).toBeNull();
+    expect(continueMock).not.toHaveBeenCalled();
+  });
+
+  /**
+   * 作废一条任务**只作废那一条**。
+   *
+   * 判据不是"界面上还剩几个按钮"，而是**哪一条**：暂停状态、落盘历史、输入框 ▶
+   * 全都按 `turnId` 认人。把 `current?.turnId === turnId ? null : current` 写成
+   * `setPlanningPause(null)`、或把落盘更新写成"所有暂停消息一起 resolved"，这条就红。
+   */
+  it("来源失效只作废该任务：另一条独立暂停任务仍保有继续入口", async () => {
+    const stored = await seedHistoryThenReload();
+    // 历史里再放一条**更早**的独立暂停任务（另一个 turnId），它必须活下来。
+    const history = JSON.parse(stored);
+    const messages = history.conversations[0].messages as Array<{ id: string; planningPause?: { turnId: string } }>;
+    const latest = messages.find((item) => item.planningPause)!;
+    const independent = JSON.parse(JSON.stringify(latest)) as { id: string; planningPause: { turnId: string } };
+    independent.id = "independent-pause-message";
+    independent.planningPause.turnId = "turn-pause-2";
+    messages.splice(messages.indexOf(latest), 0, independent);
+    localStorage.setItem("excel-bro.wps.chat.v1", JSON.stringify(history));
+
+    statusMock.mockImplementation(async (turnId: string) => (turnId === "turn-pause-1"
+      ? { turnId, status: "waiting_user", revision: 12, lastSequence: 30, canContinue: true,
+          pauseType: "budget", reason: null, sourceFingerprint: "old-source-fingerprint",
+          sourceFingerprintSheets: ["Sheet1"],
+          continuation: { available: true, code: null, message: "", stage: "after_tool", sourceVerificationRequired: true } }
+      : { turnId, status: "waiting_user", revision: 5, lastSequence: 8, canContinue: true,
+          pauseType: "budget", reason: null,
+          continuation: { available: true, code: null, message: "", stage: "after_tool" } }));
+
+    const { container } = await mount(panel());
+    await until(() => Boolean(container.querySelector('button[aria-label="继续任务"]')), "最新暂停任务应有继续入口");
+    await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="继续任务"]')!.click());
+    await until(() => textOf(container).includes("原任务使用的数据已经变化"), "应拒绝旧现场");
+
+    const persisted = JSON.parse(localStorage.getItem("excel-bro.wps.chat.v1") ?? "null");
+    const after = persisted.conversations[0].messages as Array<{
+      planningPause?: { turnId: string; resolved?: boolean; canContinue?: boolean; terminalReason?: string } }>;
+    const invalidated = after.find((item) => item.planningPause?.turnId === "turn-pause-1")!.planningPause!;
+    const survivor = after.find((item) => item.planningPause?.turnId === "turn-pause-2")!.planningPause!;
+    expect(invalidated.resolved).toBe(true);
+    expect(invalidated.terminalReason).toContain("来源数据已变化");
+    // 独立任务没有被一起作废：它仍是"未解决、可继续"，▶ 也仍然指向它。
+    expect(survivor.resolved).toBeUndefined();
+    expect(survivor.canContinue).toBe(true);
+    expect(container.querySelector('button[aria-label="继续任务"]')).not.toBeNull();
+
+    const before = statusMock.mock.calls.length;
+    await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="继续任务"]')!.click());
+    await until(() => statusMock.mock.calls.slice(before).some(([turnId]) => turnId === "turn-pause-2"),
+      "▶ 必须指向那条独立任务");
+    expect(continueMock.mock.calls.some(([request]) => (request as { turnId?: string }).turnId === "turn-pause-1")).toBe(false);
+  });
+
   it("服务端要求核实来源时，继续请求必须带上此刻重读的指纹（变异点：不采集必要来源指纹）", async () => {
     await seedHistoryThenReload();
     const live = createWpsBridgeLiveContext(

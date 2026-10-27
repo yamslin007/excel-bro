@@ -30,7 +30,7 @@ export function ResultReviewBar({ state, title, onCompare, onConfirm, onDiscard,
   }
   return <section className="result-review-bar" aria-label="本次结果审阅" aria-busy={state.pending}>
     <strong>{state.phase === 'executing' ? '正在执行并准备结果' : state.phase === 'reviewing' ? '请查看主表中的执行结果'
-      : state.phase === 'confirmed' ? '已确认变更' : state.phase === 'discarded' ? '已放弃并恢复' : '本次执行需要核对'}</strong>
+      : state.phase === 'confirmed' ? '已确认变更' : state.phase === 'discarded' ? '已放弃并恢复' : state.phase === 'not_started' ? '未执行' : '本次执行需要核对'}</strong>
     <span>{title}</span>
     {state.phase === 'reviewing' && <>
       <p>主表已更新。{state.marked ? '变更区域用浅黄底色或边框标出，避免遮住实际格式；同时修改填充与边框的区域直接显示实际效果；' : ''}双视图中的副本展示执行前状态，仅比较本次修改区域。公式采用当时的值，不重新计算；图表、合并与条件格式效果不作为本次对比依据。</p>

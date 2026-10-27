@@ -274,3 +274,21 @@ describe('adopt recovered result without execution',()=>{
     expect(operations.execute).not.toHaveBeenCalled();expect(operations.prepare).not.toHaveBeenCalled();
   });
 });
+
+describe('preparation refusal versus uncertain execution', () => {
+  it('a preflight refusal reports not started and never enters execute or review', async () => {
+    const {review,operations}=setup();
+    vi.mocked(operations.prepare).mockRejectedValue(new Error('source anchor missing'));
+    await review.start('preflight',operations);
+    expect(review.getSnapshot().phase).toBe('not_started');
+    expect(operations.execute).not.toHaveBeenCalled();
+    expect(operations.mark).not.toHaveBeenCalled();
+  });
+  it('an exception after entering execute remains failed, never claimed zero write', async () => {
+    const {review,operations}=setup();
+    vi.mocked(operations.execute).mockRejectedValue(new Error('host response lost'));
+    await review.start('in-flight',operations);
+    expect(review.getSnapshot().phase).toBe('failed');
+    expect(operations.execute).toHaveBeenCalledOnce();
+  });
+});

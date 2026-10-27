@@ -685,6 +685,9 @@
     "maxResultCellChars": 32767,
     "maxTotalReadCells": 400000
   },
+  "devResultRefFault": {
+    "ttlSeconds": 600
+  },
   "progress": {
     "heartbeatSeconds": 10,
     "minUpdateIntervalMs": 150,

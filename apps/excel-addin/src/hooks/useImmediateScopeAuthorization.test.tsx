@@ -10,6 +10,36 @@ function deferred<T>() {
 }
 
 describe("checkbox authorization", () => {
+  it("closes only after the latest explicit confirmation succeeds", async () => {
+    const first = deferred<boolean>();
+    const apply = vi.fn().mockReturnValueOnce(first.promise).mockResolvedValueOnce(false).mockResolvedValue(true);
+    const obsoleteClose = vi.fn();
+    const rejectedClose = vi.fn();
+    const close = vi.fn();
+    const { result } = renderHook(() => useImmediateScopeAuthorization({ ready: true, apply }));
+    act(() => result.current.request(obsoleteClose));
+    expect(obsoleteClose).not.toHaveBeenCalled();
+    act(() => result.current.request(rejectedClose));
+    await act(async () => first.resolve(true));
+    await waitFor(() => expect(apply).toHaveBeenCalledTimes(2));
+    expect(obsoleteClose).not.toHaveBeenCalled();
+    expect(rejectedClose).not.toHaveBeenCalled();
+    expect(result.current.pending).toBe(true);
+    await act(async () => result.current.request(close));
+    expect(close).toHaveBeenCalledOnce();
+    expect(result.current.pending).toBe(false);
+  });
+
+  it("does not close an unmounted picker after a successful late response", async () => {
+    const pending = deferred<boolean>();
+    const close = vi.fn();
+    const { result, unmount } = renderHook(() => useImmediateScopeAuthorization({ ready: true, apply: () => pending.promise }));
+    act(() => result.current.request(close));
+    unmount();
+    await act(async () => pending.resolve(true));
+    expect(close).not.toHaveBeenCalled();
+  });
+
   it("requires a picker gesture; catalog readiness alone never grants access", async () => {
     const apply = vi.fn(async () => true);
     const { result, rerender } = renderHook(({ ready }) => useImmediateScopeAuthorization({ ready, apply }), { initialProps: { ready: false } });

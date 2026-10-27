@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { executePlan, undoExecution } from "./excel";
+import { captureWorkbookSourceFingerprint, executePlan, undoExecution } from "./excel";
 import type { AnalysisPlan, ExcelAction } from "./contracts";
 import { createOfficeTestHost, installOfficeTestHost, type TestOfficeHost } from "./officeTestHost";
 
@@ -33,6 +33,25 @@ function plan(actions: ExcelAction[], overrides: Partial<AnalysisPlan> = {}): An
     warnings: [],
     actions,
     ...overrides
+  };
+}
+
+
+/**
+ * 计划带上**生产形态**的来源锚点。
+ *
+ * 写闸门要求：写了固定值的计划必须记录"它是按哪一版源算出来的"（缺失即拒绝）。
+ * 这里用产品自己的读取器在"计划生成那一刻"读一次 —— 与 App 给桥绑定记的那枚是
+ * 同一个口径。审阅/撤销的多数用例不需要它，但凡动手 **写值** 的用例都必须有。
+ */
+async function anchoredPlan(
+  actions: ExcelAction[],
+  sheets: string[] = [SHEET]
+): Promise<AnalysisPlan> {
+  return {
+    ...plan(actions),
+    sourceFingerprintSheets: [...sheets],
+    sourceFingerprint: await captureWorkbookSourceFingerprint(sheets)
   };
 }
 
@@ -349,7 +368,7 @@ describe("⑤ 同区域多个格式动作：反序撤销不得用旧现场把较
   it("恢复中途失败：如实抛错，不把部分恢复当成成功", async () => {
     // 用 writeValues：撤销时经 `range.formulas` 写回（宿主里走 commitWrite，可被 failWrites 拦截）。
     const result = await executePlan(
-      plan([{ type: "writeValues", sheet: SHEET, range: "A1:A2", values: [["X"], ["Y"]] }]),
+      await anchoredPlan([{ type: "writeValues", sheet: SHEET, range: "A1:A2", values: [["X"], ["Y"]] }]),
       { authorizedSheetNames: [SHEET] }
     );
     expect(host.cell(SHEET, "A1")).toBe("X");

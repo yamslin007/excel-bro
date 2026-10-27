@@ -141,6 +141,7 @@ function metadataWith(sheets: Array<{ index: number; name: string; isActive?: bo
 
 beforeEach(() => {
   vi.clearAllMocks();
+  localStorage.clear();
   scopeAuthorization.mockResolvedValue(true);
   getWpsApplicationMock.mockReturnValue(hostApplication());
   listWpsWorksheetsMock.mockReturnValue(
@@ -158,6 +159,58 @@ afterEach(() => {
 });
 
 describe("数据范围：勾选即授权", () => {
+  it("a rejected footer confirmation keeps the picker open and the old authorization", async () => {
+    const { container } = await mount(<WpsProbePanel />);
+    getWpsApplicationMock.mockReturnValue(hostApplication(2));
+    listWpsWorksheetsMock.mockReturnValue(metadataWith([{ index: 1, name: "订单" }, { index: 2, name: "明细", isActive: true }]));
+    await click(byText(container, ".scope-trigger", ""));
+    scopeAuthorization.mockResolvedValueOnce(false);
+    await click(byText(container, ".scope-close", "确认"));
+    expect(committed(container)).toBe("1");
+    expect(container.querySelector(".scope-popover")).not.toBeNull();
+    expect(container.textContent).toContain("暂时无法核实文件与工作表");
+    await click(byText(container, ".scope-close", "确认"));
+    expect(committed(container)).toBe("2");
+    expect(container.querySelector(".scope-popover")).toBeNull();
+  });
+  it("footer confirmation verifies the changed active sheet without a mode gesture", async () => {
+    const { container } = await mount(<WpsProbePanel />);
+    getWpsApplicationMock.mockReturnValue(hostApplication(2));
+    listWpsWorksheetsMock.mockReturnValue(metadataWith([
+      { index: 1, name: "订单" }, { index: 2, name: "明细", isActive: true }
+    ]));
+    await click(byText(container, ".scope-trigger", ""));
+    expect(scopeAuthorization).not.toHaveBeenCalled();
+    await click(byText(container, ".scope-close", "确认"));
+    expect(scopeAuthorization.mock.lastCall?.[0].selected).toEqual(["2"]);
+    expect(committed(container)).toBe("2");
+    expect(container.querySelector(".scope-popover")).toBeNull();
+  });
+
+  it("restores fixed selections after unmount without following the active sheet", async () => {
+    const first = await mount(<WpsProbePanel />);
+    await click(byText(first.container, ".scope-trigger", ""));
+    await click(byText(first.container, ".scope-mode-list button", "选择多个"));
+    await click(sheetButton(first.container, "明细"));
+    expect(committed(first.container)).toBe("1,2");
+    act(() => mounted.pop()!.unmount());
+    const calls = scopeAuthorization.mock.calls.length;
+    const second = await mount(<WpsProbePanel />);
+    expect(committed(second.container)).toBe("1,2");
+    expect(second.container.textContent).toContain("已固定 2 个工作表");
+    expect(scopeAuthorization.mock.calls.length).toBe(calls);
+  });
+  it("fails closed when a saved selected sheet is replaced at the same index", async () => {
+    const first = await mount(<WpsProbePanel />);
+    await click(byText(first.container, ".scope-trigger", ""));
+    await click(byText(first.container, ".scope-mode-list button", "选择多个"));
+    await click(sheetButton(first.container, "明细"));
+    act(() => mounted.pop()!.unmount());
+    listWpsWorksheetsMock.mockReturnValue(metadataWith([{index:1,name:"订单",isActive:true},{index:2,name:"新表"}]));
+    const second = await mount(<WpsProbePanel />);
+    expect(committed(second.container)).toBe("");
+    expect(second.container.textContent).toContain("原固定工作表无法核实");
+  });
   it("opening and refreshing an unchanged picker never grants new access", async () => {
     const { container } = await mount(<WpsProbePanel />);
     await click(byText(container, ".scope-trigger", ""));
@@ -182,7 +235,7 @@ describe("数据范围：勾选即授权", () => {
     expect(committed(container)).toBe("2");
   });
 
-  it("closing preserves the new authorization and reopening unchanged does not reauthorize", async () => {
+  it("confirmation rechecks the selection and reopening unchanged does not reauthorize", async () => {
     const { container } = await mount(<WpsProbePanel />);
     await click(byText(container, ".scope-trigger", ""));
     await click(byText(container, ".scope-mode-list button", "选择多个"));
@@ -192,7 +245,7 @@ describe("数据范围：勾选即授权", () => {
     expect(committed(container)).toBe("1,2");
     await click(byText(container, ".scope-trigger", ""));
     expect(sheetButton(container, "明细").getAttribute("aria-pressed")).toBe("true");
-    expect(scopeAuthorization.mock.calls.length).toBe(calls);
+    expect(scopeAuthorization.mock.calls.length).toBe(calls + 1);
   });
 
   it("clearing the last checkbox revokes all sheets", async () => {

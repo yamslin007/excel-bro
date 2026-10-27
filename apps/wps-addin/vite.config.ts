@@ -48,7 +48,9 @@ export default defineConfig({
     strictPort: true,
     proxy: {
       "/api": {
-        target: "http://127.0.0.1:8765",
+        // 默认连本机 8765；原生验收可用 `EB_TEST_API_TARGET` 指到独立测试服务端
+        // （例如 http://127.0.0.1:8877），让真实 WPS 窗格连接测试实例而不是碰用户 8765。
+        target: process.env.EB_TEST_API_TARGET ?? "http://127.0.0.1:8765",
         changeOrigin: false,
         ws: true
       }

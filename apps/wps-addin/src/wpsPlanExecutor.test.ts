@@ -728,3 +728,85 @@ describe("预览之后的身份变化：旧计划不得写入", () => {
     expect(target.values()).toEqual([["旧值"]]);
   });
 });
+
+describe("SDK fixed value provenance at the host boundary", () => {
+  it.each([{}, {sourceFingerprint: ""}, {sourceFingerprint: "forged", sourceFingerprintSheets: []}])(
+    "rejects missing/incomplete SDK anchors before any mutation: %j", async (fields) => {
+      const fixture = host([["before"]]);
+      const request = {...plan([{type: "writeValues", sheet: "明细", range: "A1", values: [["after"]]}]), ...fields};
+      const prepared = prepareWpsPlan(fixture.application, [1], request, [], {requireSourceAnchor: true});
+      await expect(executeWpsPlan(fixture.application, prepared)).rejects.toThrow("没有记录");
+      expect(fixture.values()).toEqual([["before"]]);
+      expect(fixture.storedRecords()).toEqual([]);
+    }
+  );
+  it("cannot disable the SDK gate after preparation", async () => {
+    const fixture = host([["before"]]);
+    const prepared = prepareWpsPlan(fixture.application, [1], plan([
+      {type: "writeValues", sheet: "明细", range: "A1", values: [["after"]]}
+    ]), [], {requireSourceAnchor: true});
+    prepared.sourceAnchorRequired = false;
+    await expect(executeWpsPlan(fixture.application, prepared)).rejects.toThrow("计划或预览已变化");
+    expect(fixture.values()).toEqual([["before"]]);
+  });
+});
+
+
+describe("SDK anchor source scope is checked before host writes", () => {
+  async function setup() {
+    const {capabilityHost} = await import("./wpsCapabilityTestHost");
+    const {wpsAuthorizedSourceFingerprint} = await import("./wpsWorkbookReader");
+    const fixture = capabilityHost(["Source", "Target"]);
+    const request = {...plan([{type:"writeValues",sheet:"Target",range:"A1",values:[[123]]}]),
+      sourceFingerprint:wpsAuthorizedSourceFingerprint(fixture.application,[1]), sourceFingerprintSheets:["Source"]};
+    return {fixture,request};
+  }
+  it("a source subset is compared as that subset, not all authorized sheets", async () => {
+    const {fixture,request} = await setup();
+    const prepared = prepareWpsPlan(fixture.application,[1,2],request,[],{requireSourceAnchor:true});
+    await executeWpsPlan(fixture.application,prepared);
+    expect(fixture.grids[1][0][0].value).toBe(123);
+    expect(fixture.grids[0][0][0].value).toBe("old-0-0");
+  });
+  it("a source outside current authorization is refused without reading it", async () => {
+    const {fixture,request} = await setup();
+    const prepared = prepareWpsPlan(fixture.application,[2],request,[],{requireSourceAnchor:true});
+    Object.defineProperty(fixture.sheets[0], "UsedRange", {get:()=>{throw new Error("unauthorized read");}});
+    await expect(executeWpsPlan(fixture.application,prepared)).rejects.toThrow("来源范围与当前授权范围不一致");
+    expect(fixture.writes()).toBe(0);
+  });
+  it("unreadable live source is not accepted as unchanged", async () => {
+    const {fixture,request} = await setup();
+    const prepared = prepareWpsPlan(fixture.application,[1,2],request,[],{requireSourceAnchor:true});
+    Object.defineProperty(fixture.sheets[0], "UsedRange", {get:()=>{throw new Error("temporarily unavailable");}});
+    await expect(executeWpsPlan(fixture.application,prepared)).rejects.toThrow("无法核对当前数据来源");
+    expect(fixture.writes()).toBe(0);
+  });
+  it("local source snapshots do not exempt SDK fixed values from provenance", async () => {
+    const {fixture,request} = await setup();
+    const prepared = prepareWpsPlan(fixture.application,[1,2], {...request,sourceFingerprint:null},
+      [{sheetName:"Source",range:"A1",values:[["old-0-0"]]}], {requireSourceAnchor:true});
+    expect(prepared.sources).toHaveLength(1);
+    await expect(executeWpsPlan(fixture.application,prepared)).rejects.toThrow("没有记录");
+    expect(fixture.writes()).toBe(0);
+  });
+  it("a local result reference requires provenance even without caller options", async () => {
+    const {fixture,request} = await setup();
+    const prepared = prepareWpsPlan(fixture.application,[1,2], {...request,sourceFingerprint:null,localResultRef:"res_"+"a".repeat(32)});
+    await expect(executeWpsPlan(fixture.application,prepared)).rejects.toThrow("没有记录");
+    expect(fixture.writes()).toBe(0);
+  });
+});
+
+it("recomputes multi-sheet anchors in their original order", async () => {
+  const {capabilityHost} = await import("./wpsCapabilityTestHost");
+  const {wpsAuthorizedSourceFingerprint} = await import("./wpsWorkbookReader");
+  const fixture = capabilityHost(["SourceA", "SourceB", "Target"]);
+  const request = {...plan([{type:"writeValues",sheet:"Target",range:"A1",values:[[123]]}]),
+    sourceFingerprint:wpsAuthorizedSourceFingerprint(fixture.application,[2,1]),
+    sourceFingerprintSheets:["SourceB","SourceA"]};
+  expect(request.sourceFingerprint).not.toBeNull();
+  const prepared = prepareWpsPlan(fixture.application,[1,2,3],request,[],{requireSourceAnchor:true});
+  await executeWpsPlan(fixture.application,prepared);
+  expect(fixture.grids[2][0][0].value).toBe(123);
+});

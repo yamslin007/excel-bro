@@ -1,4 +1,6 @@
 import { assertWorksheetCheckpointResult, assertWorksheetRestoreResult } from "./contracts";
+import type { HostWriteAudit } from "@excel-bro/core/hostWriteAudit";
+import type { HostWritesSummaryResponse } from "./contracts";
 import { waitForPlanning } from "@excel-bro/core/planningReplay";
 import type { PlanningPauseAck } from "./contracts";
 import type { ModelCatalog } from "./contracts";
@@ -28,6 +30,8 @@ import {
   type TaskProgressEvent,
   type TurnStepEvent,
   type AnalysisPlan,
+  type DevResultRefFaultArmRequest,
+  type DevResultRefFaultStatus,
   type DataToolRequest,
   type DataToolResult,
   type FolderCatalog,
@@ -478,6 +482,51 @@ export async function streamAssistantResponse(
   );
 }
 
+/**
+ * 「结果引用过期」验收入口（A1-E1）的三个本机回环调用。
+ *
+ * 服务端未开启开发模式时它们表现为 404；客户端**不**因为按了按钮就宣称已启用，
+ * 状态一律以服务端返回为准。
+ */
+async function resultRefFaultCall(
+  path: "arm" | "cancel" | "",
+  body?: DevResultRefFaultArmRequest
+): Promise<DevResultRefFaultStatus> {
+  const response = await fetch(
+    `${API_BASE_URL}/api/dev/result-ref-fault${path ? `/${path}` : ""}`,
+    body
+      ? {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        }
+      : path === "cancel"
+        ? { method: "POST", headers: { "Content-Type": "application/json" } }
+        : { method: "GET" }
+  );
+  if (!response.ok) {
+    throw await requestError(
+      response,
+      path === "arm" ? "未能启用结果引用过期验收" : "未能读取结果引用过期验收状态"
+    );
+  }
+  return await response.json() as DevResultRefFaultStatus;
+}
+
+export function getResultRefFaultStatus(): Promise<DevResultRefFaultStatus> {
+  return resultRefFaultCall("");
+}
+
+export function armResultRefFault(
+  request: DevResultRefFaultArmRequest
+): Promise<DevResultRefFaultStatus> {
+  return resultRefFaultCall("arm", request);
+}
+
+export function cancelResultRefFault(): Promise<DevResultRefFaultStatus> {
+  return resultRefFaultCall("cancel");
+}
+
 export async function pausePlanningTask(turnId: string): Promise<PlanningPauseAck> {
   const response = await fetch(`${API_BASE_URL}/api/turn/${encodeURIComponent(turnId)}/pause`, { method: "POST" });
   if (!response.ok) throw await requestError(response, "未能向原任务发送暂停请求");
@@ -924,6 +973,61 @@ export async function claimOfficeExecutionResume(
     }
   );
   return officeExecutionResponse(response, "无法领取 Office 断点任务");
+}
+
+/** 宿主观测的读回形状在 `contracts.ts`（与两端共用的协议层同一份）。 */
+export type { HostWritesSummaryResponse };
+
+/**
+ * 补报本次执行每个动作的**宿主写入事实**（A1-E3 的"实际写入次数"口径）。
+ *
+ * 为什么单独一条请求而不是塞进 `actions/complete`：它是**观测**，不是恢复点。
+ * 塞进完成回执就等于给"写入 → 账本提交"之间加一个可能失败的环节；这里由调用方
+ * 在账本已提交之后 best-effort 补报，失败只少一条证据，不影响写入与回执。
+ *
+ * 服务端只存计数与状态（不存单元格值、公式正文、工具参数），并按
+ * `(operationId, actionIndex)` 取最后一条。
+ */
+async function reportHostWrites(
+  namespace: "office" | "wps",
+  operationId: string,
+  input: { ownerToken?: string | null; entries: HostWriteAudit[] }
+): Promise<HostWritesSummaryResponse> {
+  const response = await fetch(
+    `${API_BASE_URL}/api/${namespace}/executions/${encodeURIComponent(operationId)}/host-writes`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        ...(input.ownerToken ? { ownerToken: input.ownerToken } : {}),
+        entries: input.entries
+      })
+    }
+  );
+  if (!response.ok) throw new Error("无法补报宿主写入次数");
+  return (await response.json()) as HostWritesSummaryResponse;
+}
+
+/** Office 通道的补报。 */
+export function reportOfficeHostWrites(
+  operationId: string,
+  input: { ownerToken?: string | null; entries: HostWriteAudit[] }
+): Promise<HostWritesSummaryResponse> {
+  return reportHostWrites("office", operationId, input);
+}
+
+/**
+ * WPS 通道的补报（同一端点形状、同一份口径，只有命名空间不同）。
+ *
+ * WPS 的 `hostWriteCalls` 记的是**宿主写 API 调用次数**（分块写每块一次），
+ * 与 Excel 的"刷新批次"不是同一粒度 —— 服务端在 `observation.unit` 里标明，
+ * 两边数字不许互相折算。
+ */
+export function reportWpsHostWrites(
+  operationId: string,
+  input: { ownerToken?: string | null; entries: HostWriteAudit[] }
+): Promise<HostWritesSummaryResponse> {
+  return reportHostWrites("wps", operationId, input);
 }
 
 export async function reconcileOfficeActionReceipt(

@@ -38,3 +38,13 @@ it("does not permit resume while pause is settling", () => {
   fireEvent.click(button);
   expect(resume).not.toHaveBeenCalled();
 });
+
+it("reviewing suppresses historical resume without consuming the independent paused task", () => {
+  const resume = vi.fn();
+  const view = render(<TaskExecutionControls state={state(false)} reviewing pausing={false} onPause={vi.fn()} onResume={resume} />);
+  expect(screen.getByText("等待审阅结果")).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "继续任务" })).toBeNull();
+  view.rerender(<TaskExecutionControls state={state(false)} pausing={false} onPause={vi.fn()} onResume={resume} />);
+  fireEvent.click(screen.getByRole("button", { name: "继续任务" }));
+  expect(resume).toHaveBeenCalledOnce();
+});

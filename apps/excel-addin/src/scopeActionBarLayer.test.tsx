@@ -192,7 +192,7 @@ describe("数据范围动作条的层：Excel 必须与 WPS 同层", () => {
     fireEvent.click(sheetRow(view.container, "Selected"));
     await waitFor(() => expect(view.container.querySelector(".scope-close")?.getAttribute("data-scope-pending")).toBe("false"));
     fireEvent.click(view.container.querySelector(".scope-close")!);
-    expect(view.container.querySelector(".scope-popover")).toBeNull();
+    await waitFor(() => expect(view.container.querySelector(".scope-popover")).toBeNull());
     expect(view.container.querySelector(".scope-trigger")?.textContent).toContain("已固定 2 个工作表");
     openPicker(view);
     expect(sheetRow(view.container, "Selected").getAttribute("aria-pressed")).toBe("true");

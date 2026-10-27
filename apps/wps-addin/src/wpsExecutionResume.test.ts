@@ -1,3 +1,4 @@
+import {reportWpsHostWrites} from "../../excel-addin/src/api";
 import {armRecoveryProbe,bindRecoveryProbe,interruptRecoveryProbe} from "@excel-bro/core/recoveryProbe";
 import {inspectWpsRecoveryState} from "./wpsRecoveryInspection";
 import {fixture, operationId} from "./wpsResume.testHost";
@@ -9,6 +10,7 @@ import {canResumeWpsExecution, resumeWpsExecution} from "./wpsExecutionResume";
 import {wpsReconcileVerdict, wpsReconcileActions} from "./wpsExecutionReconcile";
 import * as ledger from "./wpsExecutionLedger";
 
+vi.mock("../../excel-addin/src/api", async original => ({...await original<typeof import("../../excel-addin/src/api")>(), reportWpsHostWrites: vi.fn(async () => ({}))}));
 vi.mock("./wpsExecutionLedger", async original => ({...await original<typeof import("./wpsExecutionLedger")>(),
   claimWpsExecutionResume: vi.fn(), startWpsAction: vi.fn(), completeWpsAction: vi.fn(),
   finishWpsExecution: vi.fn(), suspendWpsExecution: vi.fn()}));
@@ -100,6 +102,15 @@ describe("WPS exact remaining action recovery",()=>{
     expect(f.writes).toEqual(Array.from({length:3-next},(_,i)=>`Target!A${next+i+1}`));
     expect(record.executionId).toBe(operationId); expect(record.state).toBe("verified");expect(record.resume).toBeUndefined();
     expect(ledger.startWpsAction).toHaveBeenCalledTimes(3-next);expect(ledger.finishWpsExecution).toHaveBeenCalledTimes(1);
+    expect(reportWpsHostWrites).toHaveBeenCalledTimes(1);
+    const report = vi.mocked(reportWpsHostWrites).mock.calls[0];
+    expect(report[0]).toBe(operationId);
+    expect(report[1].entries.map(entry => entry.actionIndex)).toEqual(Array.from({length: 3-next}, (_, i) => next+i));
+    for (const entry of report[1].entries) {
+      expect(entry).toMatchObject({outcome: "written", readback: "verified"});
+      expect(entry.hostWriteCalls).toBeGreaterThan(0);
+    }
+
     await undoWpsExecution(reopened,operationId);
     expect([1,2,3].map(i=>f.cells.get(`Target!A${i}`))).toEqual(["old1","old2","old3"]);
   });
@@ -131,10 +142,17 @@ describe("WPS exact remaining action recovery",()=>{
     await expect(resumeWpsExecution(f.application,f.state,()=>indexes)).rejects.toThrow();
     expect(ledger.claimWpsExecutionResume).not.toHaveBeenCalled();expect(f.writes).toEqual([]);
   });
-  it.each(["claim","checkpoint"])("rechecks changed source after awaited %s",async point=>{
-    const f=await interrupted(); const change=()=>{f.cells.set("Source!A1","changed during await");};
+  it.each([
+    ["claim","source"], ["checkpoint","source"],
+    ["claim","authorization"], ["checkpoint","authorization"]
+  ])("rechecks after awaited %s when %s changes",async (point, issue)=>{
+    const f=await interrupted(); let indexes=[1,2];
+    const change=()=>{
+      if(issue==="source") f.cells.set("Source!A1","changed during await");
+      else indexes=[2];
+    };
     wire(f.state,point==="claim"?change:undefined,point==="checkpoint"?change:undefined);
-    await expect(resumeWpsExecution(f.application,f.state,()=>[1,2])).rejects.toThrow();
+    await expect(resumeWpsExecution(f.application,f.state,()=>indexes)).rejects.toThrow();
     expect(f.writes).toEqual([]);expect(ledger.suspendWpsExecution).toHaveBeenCalledTimes(1);
   });
   it("lost claim / concurrent owner never writes",async()=>{

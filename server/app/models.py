@@ -2299,6 +2299,171 @@ class BridgeResultResponse(BaseModel):
     scannedRows: int = Field(ge=0)
 
 
+class DevFaultSeenTarget(BaseModel):
+    """服务端见过的一本工作簿（开发入口专用，只在开关打开时记录）。
+
+    给**人**抄身份用：要知道 `workbookIdentity` 该填什么，就从这里取，而不是猜
+    `url:` 的归一规则。没有任务 ID、没有数据内容。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    hostId: str
+    workbookName: str
+    workbookIdentity: str
+
+
+class DevResultRefFaultArmRequest(BaseModel):
+    """开发验收专用的结果引用过期入口（A1-E1）。
+
+    **只有"哪本工作簿"**：没有 ``taskId``，也没有 ``resultRef``。
+    任务与句柄由服务端在可信路径上绑定（开桥那一刻 + 该任务第一条 Python 结果
+    登记那一刻），所以模型既不能指定别的任务，也不能指定别的引用。
+
+    ``workbookIdentity`` 可以省略，但省略时服务端必须"只见过这个名字下的一个
+    可核验身份"才肯补全；否则拒绝启用（见 ``dev_fault_target``）。只凭名字认簿
+    会把启用落到同名的另一本簿上。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    hostId: str = Field(min_length=1, max_length=40)
+    workbookName: str = Field(min_length=1, max_length=255)
+    workbookIdentity: str = Field(default="", max_length=4000)
+
+
+class DevResultRefFaultStatus(BaseModel):
+    """入口状态；不含任务 ID 与结果句柄（不把归属凭据送回界面）。"""
+
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool
+    phase: Literal["off", "idle", "armed", "bound", "consumed", "expired"]
+    expiresInSeconds: int = Field(ge=0)
+    taskBound: bool
+    refBound: bool
+    identityBound: bool = False
+    identitySource: Literal["declared", "observed", "none"] = "none"
+
+
+class DevSourceChangedFaultArmRequest(BaseModel):
+    """开发验收专用的来源变化入口（A1-E3）。
+
+    ``hostId`` / ``workbookName`` **必填**：只按"下一次调用"命中会让注入落到并发
+    任务或另一本打开的簿上，被抢的那一轮莫名停住、要验的簿反而看不到停止。
+    ``workbookIdentity`` 可以省略，但省略时服务端必须"只见过这个名字下的一个
+    可核验身份"才肯补全（``identitySource = observed``）；见过零个或多个 ⇒
+    拒绝启用并说明原因。**不能**退回只认名字：同名不同簿在名字上完全一样。
+
+    这里仍然**没有** ``taskId``：任务归属由服务端在开桥那一刻绑定（可信路径），
+    调用方（更不用说模型）无从指定"注入给哪一次任务"。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    hostId: str = Field(min_length=1, max_length=40)
+    workbookName: str = Field(min_length=1, max_length=255)
+    workbookIdentity: str = Field(default="", max_length=4000)
+
+
+class DevSourceChangedFaultStatus(BaseModel):
+    """入口状态；不含任务 ID（不把归属凭据送回界面）。"""
+
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool
+    phase: Literal["off", "idle", "armed", "bound", "consumed", "expired"]
+    expiresInSeconds: int = Field(ge=0)
+    hostBound: bool
+    workbookBound: bool
+    taskBound: bool
+    identityBound: bool = False
+    identitySource: Literal["declared", "observed", "none"] = "none"
+    #: 服务端见过的工作簿（最近的在前，最多 16 条）。给验收入抄身份用。
+    seenTargets: list[DevFaultSeenTarget] = Field(default_factory=list, max_length=16)
+
+
+class HostWriteAuditEntry(BaseModel):
+    """一次动作的宿主写入事实（A1-E3）。
+
+    **没有**单元格值、公式正文、文件名或工具参数：这里只回答"向宿主发起了几次
+    写调用、结果如何、回读有没有过"。计数口径见 ``packages/core/src/hostWriteAudit.ts``
+    （两端读同一份）。
+
+    ``outcome`` 是四态而不是布尔：``unknown`` 既不是成功也不是零写入 ——
+    宿主抛异常、断线、只写了一半时只能是它，据实记录才谈得上"不宣称"。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    actionIndex: int = Field(ge=0, le=10000)
+    actionType: str = Field(min_length=1, max_length=40)
+    hostWriteCalls: int = Field(ge=0, le=100000)
+    mutatingCalls: int = Field(ge=0, le=100000)
+    outcome: Literal["written", "failed_before_write", "failed_after_write", "unknown"]
+    readback: Literal["verified", "failed", "not_applicable"]
+    errorCode: str | None = Field(default=None, max_length=60)
+
+
+class HostWritesRequest(BaseModel):
+    """端上补报一次宿主观测。
+
+    ``ownerToken`` 可选：给了就必须与账本一致（防止另一个执行者往别人的账本里
+    写字）；不给只允许**只读身份**（同一 operationId）补报，仍然不能改状态。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    ownerToken: str | None = Field(default=None, min_length=32, max_length=100)
+    entries: list[HostWriteAuditEntry] = Field(min_length=1, max_length=64)
+
+
+class HostWritesTotals(BaseModel):
+    """汇总只做加法，不做推断。"""
+
+    model_config = ConfigDict(extra="forbid")
+    reportedActions: int = Field(ge=0)
+    hostWriteCalls: int = Field(ge=0)
+    actionsWritten: int = Field(ge=0)
+    actionsFailedBeforeWrite: int = Field(ge=0)
+    actionsFailedAfterWrite: int = Field(ge=0)
+    actionsUnknown: int = Field(ge=0)
+    readbackVerified: int = Field(ge=0)
+    readbackFailed: int = Field(ge=0)
+
+
+class HostWritesObservation(BaseModel):
+    """**观测覆盖**：这批数字能不能当成"零写入"的证据。
+
+    空数组不等于零写入 —— 上报是 best-effort，可能一条都没到。所以这里把"没有
+    观测"和"明确观测到零调用"分开，并且**明确零只能从账本执行边界 + 完整覆盖
+    推出**：
+
+    - ``attemptedActions``：账本判定"有可能已经写过"的动作数
+      （``next_action_index`` 个已完成 + 在途的那一个）。这是可信执行边界 ——
+      没有认领就进不了宿主写 API；
+    - ``reportedActions`` / ``missingActions`` / ``unexpectedReports``：覆盖情况；
+    - ``observation``：``not_collected``（还没收到）/ ``partial``（收到一部分）/
+      ``complete``（边界内每个动作都有观测）；
+    - ``callEvidence``：``none``（没有观测）/ ``zero``（**覆盖完整且明确 0 次**）/
+      ``nonzero``（至少一次非零，无论覆盖是否完整）/ ``unknown``（覆盖不全或有
+      结果未知的条目 ⇒ 不能下"零"的结论）；
+    - ``unit``：两端**计量单位不同**，不能互相折算（Excel = 刷新批次，
+      WPS = 宿主写 API 调用次数）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    observation: Literal["not_collected", "partial", "complete"]
+    callEvidence: Literal["none", "zero", "nonzero", "unknown"]
+    attemptedActions: int = Field(ge=0)
+    reportedActions: int = Field(ge=0)
+    missingActions: int = Field(ge=0)
+    unexpectedReports: int = Field(ge=0)
+    unit: Literal["excel_sync_batches", "wps_api_calls"]
+    lastReportedAt: float | None = None
+
+
+class HostWritesResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    operationId: str
+    entries: list[HostWriteAuditEntry]
+    totals: HostWritesTotals
+    observation: HostWritesObservation
+
+
 class PythonCodeRequest(BaseModel):
     """Loopback-only request for the generated code body.
 
@@ -3123,6 +3288,8 @@ class LocalPlanRuleResponse(BaseModel):
 
 
 class PlanResponse(BaseModel):
+    # Trusted compiler metadata, never accepted from model-authored JSON.
+    planOrigin: Literal["literal_range_edit"] | None = None
     kind: Literal["plan"] = "plan"
     plan: AnalysisPlan
     provider: Literal["model", "local"]

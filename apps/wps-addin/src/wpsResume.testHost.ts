@@ -7,11 +7,11 @@ export const operationId = "wps-resume-0001";
 export function fixture() {
   const storage = new Map<string, unknown>(), writes: string[] = [];
   const cells = new Map<string, CellValue>([["Source!A1", "private-source"], ["Target!A1", "old1"], ["Target!A2", "old2"], ["Target!A3", "old3"]]);
-  const sheets: WpsWorksheet[] = ["Source", "Target"].map(Name => ({Name, ProtectContents: false, Range(address: string) {
-    const rect = parseExplicitA1Rect(address)!;
+  const sheets: WpsWorksheet[] = ["Source", "Target"].map(Name => ({Name, ProtectContents: false, Range(address: string | WpsRange, end?: WpsRange) {
+    const rect = parseExplicitA1Rect(typeof address === "string" ? address : `A${address.Row}:A${end?.Row ?? address.Row}`)!;
     if (!rect || rect.startColumn !== 1 || rect.endColumn !== 1) throw new Error("fixture range");
     const read = () => Array.from({length: rect.endRow - rect.startRow + 1}, (_, i) => [cells.get(`${Name}!A${rect.startRow+i}`) ?? null]);
-    const range: WpsRange = {MergeCells: false, Rows: {Count: rect.endRow-rect.startRow+1}, Columns:{Count:1}};
+    const range: WpsRange = {Row: rect.startRow, Column: 1, Item: (row: number) => ({Row:rect.startRow+row-1, Column:1}), MergeCells: false, Rows: {Count: rect.endRow-rect.startRow+1}, Columns:{Count:1}};
     const write = (value: CellValue[][] | CellValue) => {
       writes.push(`${Name}!${address}`);
       const matrix = Array.isArray(value) ? value as CellValue[][] : [[value]];
@@ -20,6 +20,7 @@ export function fixture() {
     Object.defineProperties(range, {Value2: {get:read,set:write}, Formula:{get:read,set:write}});
     return range;
   }}));
+  for (const sheet of sheets) Object.defineProperty(sheet, "UsedRange", {get: () => sheet.Range!("A1:A3")});
   const application: WpsApplication = {Version:"12.0", ActiveWorkbook: {Name:"test.xlsx", FullName:"C:\\Data\\test.xlsx",
     Path:"C:\\Data", ReadOnly:false, Worksheets:{Count:2,Item:i=>sheets[Number(i)-1]}, ActiveSheet:sheets[1]},
     ActiveSheet:sheets[1], PluginStorage:{getItem:k=>storage.get(k),setItem:(k,v)=>{storage.set(k,v);}},

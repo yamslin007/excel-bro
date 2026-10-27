@@ -1037,3 +1037,42 @@ def test_bridge_register_endpoint_requires_valid_result():
             assert bad.status_code == 422
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("host_id", ["excel-office", "wps-et"])
+def test_result_expiry_requery_keeps_old_reference_unavailable(host_id):
+    from server.app.local_results import local_results
+    from server.app.result_submission import resolve_result_ref, ResultSubmissionError
+    from server.app.capabilities import capability_int
+    import time
+
+    task_id = "turn-expiry-chain"
+    local_results.bind(task_id=task_id, host_id=host_id, workbook_name="测试.xlsx", workbook_identity=None,
+                       authorized_key="a" * 64, source_fingerprint="fp-source-1")
+    old = local_results.register(task_id, _result(), "fp-source-1")
+    body = {**_binding_body(task_id), "hostId": host_id}
+
+    async def scenario():
+        async with _localhost_client() as client:
+            async def fetch(ref):
+                return await client.post("/api/sdk/tool-bridge/result", json={**body, "resultRef": ref})
+            assert (await fetch(old.handle)).status_code == 200
+            # Expire only this result, leaving the authorization claim valid.
+            old.created_at = time.monotonic() - capability_int("agentToolBridge", "resultTtlSeconds") - 1
+            for _ in range(2):
+                unavailable = await fetch(old.handle)
+                assert unavailable.status_code == 404
+                assert unavailable.json()["detail"]["code"] == "BRIDGE_RESULT_UNAVAILABLE"
+                assert SENTINEL not in unavailable.text
+            with pytest.raises(ResultSubmissionError):
+                resolve_result_ref(task_id, old.handle)
+            fresh = local_results.register(task_id, _result(rows=[["新结果", 9]]), "fp-source-1")
+            assert fresh.handle != old.handle
+            assert (await fetch(fresh.handle)).json()["rows"] == [["新结果", 9]]
+            plan = compile_result_plan(resolve_result_ref(task_id, fresh.handle),
+                _plan_request(turnId=task_id, hostId=host_id), target_sheet="Sheet1", target_range="D1:E2")
+            assert plan.actions[0].values == [["类别", "数量"], ["新结果", 9]]
+            assert (await fetch(old.handle)).status_code == 404
+            with pytest.raises(ResultSubmissionError):
+                resolve_result_ref(task_id, old.handle)
+    asyncio.run(scenario())

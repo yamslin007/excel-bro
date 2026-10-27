@@ -4,7 +4,7 @@ import { assertExcelNativeComparisonUnchanged, closeCompatReviewCopy, closeExcel
 import { nativeColumnName } from "./nativeReviewFile";
 import { parseExplicitA1Rect } from "./planCore";
 import { readSeedEntries as unzipSeed } from "./nativeReviewTestHelpers";
-import { executePlan } from "./excel";
+import { captureWorkbookSourceFingerprint, executePlan } from "./excel";
 import { ExcelReviewLayoutVersionError } from "./api";
 
 const layout = vi.hoisted(() => ({prepare: vi.fn(), arrange: vi.fn(), close: vi.fn()}));
@@ -13,6 +13,18 @@ beforeEach(() => { layout.prepare.mockReset().mockRejectedValue(new Error('unava
   layout.close.mockReset().mockResolvedValue({status:'closed', layoutVersion:4, copyClosed:true, recoveryCopyPath:'E:/recovery/review-copy.xlsx'}); });
 
 const plan = (actions: AnalysisPlan["actions"] = [{ type: "writeValues", sheet: "Ledger", range: "C2:C3", values: [["LOCAL_PRIVATE_SENTINEL"], ["done"]] }]): AnalysisPlan => ({ id: "p", title: "Update", summary: "Update", assumptions: [], warnings: [], actions });
+/**
+ * 带**生产形态来源锚点**的计划。
+ *
+ * 写闸门要求写了固定值的计划必须能说出"它是按哪一版源算出来的"，所以这里用产品
+ * 自己的读取器在"计划生成那一刻"读一次 —— 与 App 给桥绑定记的那枚同一个口径。
+ * 本文件里只有真的要跑 `executePlan` 的用例需要它。
+ */
+const anchoredPlan = async (actions?: AnalysisPlan["actions"], sheets: string[] = ["Ledger"]): Promise<AnalysisPlan> => ({
+  ...plan(actions),
+  sourceFingerprintSheets: [...sheets],
+  sourceFingerprint: await captureWorkbookSourceFingerprint(sheets)
+});
 const load = () => undefined;
 function host() {
   const writes: string[] = [], colors: string[] = [], windows: any[] = [];
@@ -43,6 +55,12 @@ function host() {
         get values() { return matrix("value"); }, set values(value) { write(value, false); },
         get formulas() { return matrix("formula"); }, set formulas(value) { write(value, true); },
         get numberFormat() { return matrix("format"); }, set numberFormat(value) { value.forEach((row: string[], r: number) => row.forEach((v, c) => { const old = cell(rect.startRow + r, rect.startColumn + c); cells.set(`${rect.startRow + r},${rect.startColumn + c}`, { ...old, format: v }); })); },
+        /*
+         * 下面两个访问器（DisplayText 与按行列取区域）是为了让**产品自己的来源指纹
+         * 读取器**（`captureWorkbookSourceFingerprint`）能在这个替身宿主上真读到东西：
+         * 计划上的锚点必须是真读出来的，不是测试自己凑的一个字符串。
+         */
+        get text() { return matrix("value").map(row => row.map(value => String(value ?? ""))); },
         format: rangeFormat,
         clear() { write(Array.from({ length: rect.rows }, () => Array(rect.columns).fill("")), false); },
         conditionalFormats: { getCount: () => ({ value: 0 }) },
@@ -84,6 +102,8 @@ function host() {
       };
     }
     s.getRange = range;
+    s.getRangeByIndexes = (row: number, column: number, rows: number, columns: number) =>
+      range(`${nativeColumnName(column + 1)}${row + 1}:${nativeColumnName(column + columns)}${row + rows}`);
     s.getUsedRangeOrNullObject = () => {
       const coords = [...cells.keys()].map(key => key.split(",").map(Number));
       return range(`A1:${nativeColumnName(Math.max(...coords.map(p => p[1])))}${Math.max(...coords.map(p => p[0]))}`);
@@ -175,7 +195,7 @@ describe("native authorized copy", () => {
     expect(await closeExcelNativeComparison(session)).toBe('already_closed');
   });
   it("runs the actual executor guard AFTER the durable callback and BEFORE any target write", async () => {
-    const h = host(), p = plan(), session = await stageExcelNativeComparison(p, ["Ledger"]);
+    const h = host(), p = await anchoredPlan(), session = await stageExcelNativeComparison(p, ["Ledger"]);
     const order: string[] = [];
     h.writes.length = 0;
     const guard = vi.fn(async (context: Excel.RequestContext) => {
@@ -373,7 +393,7 @@ describe("Office 2024 manual native review", () => {
     expect(h.writes).toEqual([]);
   });
   it("rejects a source edit during durable registration at the manual executor's last write boundary", async () => {
-    const h = manualHost(), p = plan(), session = await stageExcelNativeComparison(p, ['Ledger']);
+    const h = manualHost(), p = await anchoredPlan(), session = await stageExcelNativeComparison(p, ['Ledger']);
     const order: string[] = [];
     await expect(executePlan(p, {
       authorizedSheetNames: ['Ledger'],

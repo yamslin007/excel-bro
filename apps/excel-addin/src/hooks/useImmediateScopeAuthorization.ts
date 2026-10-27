@@ -11,18 +11,27 @@ export function useImmediateScopeAuthorization(options: {
   const attempted = useRef(0);
   const applied = useRef(0);
   const running = useRef(false);
+  const onApplied = useRef<(() => void) | undefined>(undefined);
   const mounted = useRef(true);
   const [revision, setRevision] = useState(0);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
-  const request = () => { generation.current++; setRevision((value) => value + 1); };
+  const request = (afterApplied?: () => void) => {
+    generation.current++;
+    onApplied.current = afterApplied;
+    setRevision((value) => value + 1);
+  };
   useEffect(() => {
     const turn = generation.current;
     if (!turn || attempted.current === turn || running.current || !live.current.ready) return;
     attempted.current = turn;
     running.current = true;
+    const afterApplied = onApplied.current;
     const isCurrent = () => mounted.current && generation.current === turn;
     void live.current.apply(isCurrent).then((ok) => {
-      if (ok && isCurrent()) applied.current = turn;
+      if (ok && isCurrent()) {
+        applied.current = turn;
+        afterApplied?.();
+      }
     }).catch(() => { /* The picker retains the selection and reports its failure. */ }).finally(() => {
       running.current = false;
       if (mounted.current) setRevision((value) => value + 1);

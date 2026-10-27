@@ -1,4 +1,12 @@
 import { sameJsonEvidence } from "@excel-bro/core/jsonEvidence";
+import {
+  anchorSheetsWithin,
+  judgePlanSourceGate,
+  planHasBakedValues,
+  planSourceAnchor,
+  planSourceComparisonNeeded,
+  planSourceGateMessage
+} from "@excel-bro/core/planSourceAnchor";
 import { BORDER_FIELDS, borderField, borderTarget, applyWpsBorders, expandWpsBorders, type BorderAction } from "./wpsBorders";
 import type { CellBorderSide } from "@excel-bro/core/borderEdges";
 import { filteredSourceRows } from "./wpsFilteredPlan";
@@ -8,6 +16,12 @@ import { writeTableLayout, WRITE_TABLE_HEADER_FILL } from "@excel-bro/core/write
 import capabilities from "../../../config/capabilities.json";
 import { readWpsRangeValues } from "./wpsRangeValues";
 import { writeWpsMatrix } from "./wpsWriteMatrix";
+import {
+  beginHostWriteScope,
+  endHostWriteScope,
+  countHostWrite
+} from "./wpsHostWriteCounter";
+import type { HostWriteAudit } from "@excel-bro/core/hostWriteAudit";
 import type { WorkbookLocator } from "@excel-bro/core/contracts";
 import {
   buildRangeChangeReview,
@@ -30,6 +44,7 @@ import {
   assertWpsAuthorization,
   authorizeWpsSheets,
   normalizeWpsMatrix,
+  wpsAuthorizedSourceFingerprint,
   type WpsReadAuthorization
 } from "./wpsWorkbookReader";
 import { wpsWriteVersionStatus } from "./wpsWriteVersionGate";
@@ -218,6 +233,17 @@ export type WpsPreparedPlan = {
   actions: WpsPreparedAction[];
   sources: WpsPreparedSource[];
   totalCells: number;
+  /**
+   * 这份 SDK / 本地结果引用计划需要来源锚点。由宿主入口提供出处，
+   * 准备时在动作展开之前按 `planHasBakedValues` 固定，并纳入不可变快照。
+   *
+   * 为什么要记而不是事后从 `prepared.plan` 反推：`copyRange` / `computeValues`
+   * 会被准备阶段展开成带具体值的 `writeValues`，可它们的值**是刚刚读出来的**，
+   * 由 `sources` 的逐区域指纹复核兜住。反过来，一份"服务端算好的 writeValues
+   * 顺带一个 copyRange"的计划展开后也长这样，但它那部分固定值没有任何本机依据。
+   * 事后反推就会把两者混成一种，等于给混装计划开后门。
+   */
+  sourceAnchorRequired: boolean;
   previewRevision: string;
   confirmationSnapshot: string;
 };
@@ -457,6 +483,7 @@ function confirmationSnapshot(prepared: WpsPreparedPlan): string {
     hostVersion: prepared.hostVersion,
     actions: prepared.actions,
     sources: prepared.sources,
+    sourceAnchorRequired: prepared.sourceAnchorRequired,
     totalCells: prepared.totalCells,
     previewRevision: prepared.previewRevision
   });
@@ -808,7 +835,8 @@ export function prepareWpsPlan(
   application: WpsApplication,
   selectedSheetIndexes: readonly number[],
   plan: AnalysisPlan,
-  sourceSnapshots: readonly WpsSourceSnapshot[] = []
+  sourceSnapshots: readonly WpsSourceSnapshot[] = [],
+  options: { requireSourceAnchor?: boolean } = {}
 ): WpsPreparedPlan {
   if (!capabilities.wpsWrite.enabled) throw new Error("WPS 写入功能当前已由能力开关关闭。");
   const hostVersion = String(application.Version ?? "").trim();
@@ -818,6 +846,14 @@ export function prepareWpsPlan(
   const workbook = wpsReadWorkbook(application);
   if (!workbook || workbook.ReadOnly !== false) throw new Error("当前 WPS 工作簿没有明确处于可编辑状态。");
   if (!plan.actions.length) throw new Error("计划中没有可执行操作。");
+  /*
+   * **展开之前**的形状才说明"这份计划本来有没有服务端算好的固定值"。
+   * 展开之后 `copyRange` / `computeValues` 也会变成 `writeValues`，那时再反推
+   * 就分不清"本机刚读出来算的"和"服务端送来就算好的"（见类型注释）。
+   */
+  // Host-owned provenance, never accepted from model-supplied plan fields.
+  const sourceAnchorRequired = planHasBakedValues(plan) &&
+    (options.requireSourceAnchor === true || Boolean(plan.localResultRef));
   plan.actions.forEach(assertFormatActionFields);
   /*
    * 去重会**物理删除行**并把下方数据上移，属于结构变更：没有经过实机取证的
@@ -1012,6 +1048,7 @@ export function prepareWpsPlan(
     actions,
     sources,
     totalCells,
+    sourceAnchorRequired,
     previewRevision: randomId(),
     confirmationSnapshot: ""
   };
@@ -1215,10 +1252,14 @@ export function applyFormatAction(
     for (let r = 0; r < (range.Rows?.Count ?? 0); r += 1) {
       for (let c = 0; c < (range.Columns?.Count ?? 0); c += 1) {
         const cell = range.Item ? range.Item(r + 1, c + 1) : range;
-        if (action.type === "setNumberFormat") cell.NumberFormat = action.formatCode;
-        else {
+        if (action.type === "setNumberFormat") {
+          countHostWrite(true);
+          cell.NumberFormat = action.formatCode;
+        } else {
           if (!cell.Interior) throw new Error("WPS 未提供可恢复的填充接口。");
+          countHostWrite(true);
           cell.Interior.Color = wpsOleColorFromHex(action.color);
+          countHostWrite(true);
           cell.Interior.Pattern = 1;
         }
       }
@@ -1231,11 +1272,11 @@ export function applyFormatAction(
         const cell = range.Item ? range.Item(r + 1, c + 1) : range;
         const font = cell.Font;
         if (!font) continue;
-        if (action.bold != null) font.Bold = action.bold;
-        if (action.italic != null) font.Italic = action.italic;
-        if (action.name != null) font.Name = action.name;
-        if (action.size != null) font.Size = action.size;
-        if (action.color != null) font.Color = wpsColorFromHex(action.color);
+        if (action.bold != null) { countHostWrite(true); font.Bold = action.bold; }
+        if (action.italic != null) { countHostWrite(true); font.Italic = action.italic; }
+        if (action.name != null) { countHostWrite(true); font.Name = action.name; }
+        if (action.size != null) { countHostWrite(true); font.Size = action.size; }
+        if (action.color != null) { countHostWrite(true); font.Color = wpsColorFromHex(action.color); }
       }
     }
     return;
@@ -1244,9 +1285,9 @@ export function applyFormatAction(
     for (let r = 0; r < (range.Rows?.Count ?? 0); r += 1) {
       for (let c = 0; c < (range.Columns?.Count ?? 0); c += 1) {
         const cell = range.Item ? range.Item(r + 1, c + 1) : range;
-        if (action.horizontal != null) cell.HorizontalAlignment = wpsHorizontalAlignment(action.horizontal);
-        if (action.vertical != null) cell.VerticalAlignment = wpsVerticalAlignment(action.vertical);
-        if (action.wrapText != null) cell.WrapText = action.wrapText;
+        if (action.horizontal != null) { countHostWrite(true); cell.HorizontalAlignment = wpsHorizontalAlignment(action.horizontal); }
+        if (action.vertical != null) { countHostWrite(true); cell.VerticalAlignment = wpsVerticalAlignment(action.vertical); }
+        if (action.wrapText != null) { countHostWrite(true); cell.WrapText = action.wrapText; }
       }
     }
     return;
@@ -1255,6 +1296,7 @@ export function applyFormatAction(
   if (action.rowHeight != null) {
     for (let r = 0; r < (range.Rows?.Count ?? 0); r += 1) {
       const cell = range.Item ? range.Item(r + 1, 1) : range;
+      countHostWrite(true);
       cell.RowHeight = action.rowHeight;
     }
   }
@@ -1696,6 +1738,37 @@ export type WpsActionCheckpointHook = (
   checkpoint: WpsActionCheckpoint
 ) => Promise<void>;
 
+export function assertWpsPlanSourceCurrent(application: WpsApplication, prepared: WpsPreparedPlan): void {
+    const anchor = planSourceAnchor(prepared.plan);
+    // Literal/local plans have their own preflight and per-range source checks.
+    // SDK fixed values must never borrow an unrelated local source snapshot.
+    if (!prepared.sourceAnchorRequired && !anchor) return;
+    const independentSourceReview = !prepared.sourceAnchorRequired && prepared.sources.length > 0;
+    const authorizedSheets = prepared.authorization.sheets.map((sheet) => sheet.name);
+    const liveFingerprint = anchor && anchorSheetsWithin(anchor, authorizedSheets) && planSourceComparisonNeeded({
+      plan: prepared.plan,
+      anchor,
+      independentSourceReview
+    })
+      ? wpsAuthorizedSourceFingerprint(
+          application,
+          // Fingerprints are ordered; authorization membership was checked above.
+          anchor.sheets.map((name) => prepared.authorization.sheets.find((sheet) =>
+            name.toLocaleLowerCase() === sheet.name.toLocaleLowerCase()
+          )!.index)
+        )
+      : null;
+    const verdict = judgePlanSourceGate({
+      plan: prepared.plan,
+      anchor,
+      authorizedSheets: prepared.authorization.sheets.map((sheet) => sheet.name),
+      liveFingerprint,
+      independentSourceReview
+    });
+    const message = planSourceGateMessage(verdict);
+    if (message) throw new Error(message);
+}
+
 export async function executeWpsPlan(
   application: WpsApplication,
   prepared: WpsPreparedPlan,
@@ -1719,7 +1792,14 @@ export async function executeWpsPlan(
    * 账本的 `operationId` 对齐，使撤销、核对、续跑都指向同一份执行身份。
    */
   executionIdOverride?: string,
-  recovery?: {taskId?: string; resume?: {record: WpsUndoRecord; startActionIndex: number; check(): void}}
+  recovery?: {taskId?: string; resume?: {record: WpsUndoRecord; startActionIndex: number; check(): void}},
+  /**
+   * 宿主观测（A1-E3）：每个动作**真的向宿主发起了几次写调用**、结果如何、回读过没过。
+   *
+   * 只在动作窗口内计数（`wpsHostWriteCounter`），所以审阅副本、撤销、清标记这些
+   * 辅助写不会被算成"计划写调用"。回调抛错不影响执行 —— 这是统计，不是判据。
+   */
+  onHostWrite?: (entry: HostWriteAudit) => void
 ): Promise<WpsUndoRecord> {
   if (!capabilities.wpsWrite.enabled) throw new Error("WPS 写入功能当前已由能力开关关闭。");
   const hostVersion = String(application.Version ?? "").trim();
@@ -1755,6 +1835,25 @@ export async function executeWpsPlan(
     }
   }
   };
+  /*
+   * **写前来源复核（计划级）**：这份计划里的固定值，是对哪一版源算出来的。
+   *
+   * 逐区域的 `assertSourcesCurrent()` 只覆盖"本计划自己读过哪些源区域"
+   * （`prepared.sources`）—— 由服务端编译的计划一个都没有（它读的是隔离容器里
+   * 的数据），于是那一层对"模型算完之后源表被改"完全无感。计划级锚点补这一层：
+   * 锚点来自本轮桥绑定（模型读到的那一版），现场现算一次再比。
+   *
+   * 判据与 Excel 端**同一份**（`@excel-bro/core/planSourceAnchor` 的
+   * `judgePlanSourceGate`）。三条边界：
+   * - 执行时求值（排序/格式等）没有固定值 ⇒ 不需要锚点；
+   * - 本地计算 / `copyRange` / `computeValues` 已在准备阶段把源读成具体值并逐区域
+   *   登记 `prepared.sources` ⇒ 非 SDK 固定值通道用独立来源复核；
+   * - SDK / 结果引用计划**有固定值就必须有锚点**，不能借其他动作的快照豁免：
+   *   缺锚点、锚点不完整、覆盖范围与授权不一致
+   *   一律拒绝。以前这里 `if (!anchor) return` 直接放行，等于"没有记录"就当作
+   *   "没变化"。
+   */
+  assertWpsPlanSourceCurrent(application, prepared);
   assertSourcesCurrent();
   onProgress?.({
     stage: "snapshot",
@@ -1852,6 +1951,29 @@ export async function executeWpsPlan(
   // 回读矩阵按 actionIndex 存，只活在这次调用的闭包里。
   const afterByIndex = new Map<number, WpsActionAfter>();
   const matchByIndex = new Map<number, boolean>();
+  /*
+   * 动作级宿主观测账目。只在动作窗口内累加（`wpsHostWriteCounter` 的作用域），
+   * 成功时记 `written`，失败时按"窗口内有没有调用过写 API"分成
+   * `failed_before_write` / `failed_after_write` —— 认领后写前失败不许算成已写入。
+   */
+  let currentAudit: {
+    actionIndex: number;
+    actionType: string;
+    calls: number;
+    mutating: number;
+  } | null = null;
+  const emitHostWrite = (entry: HostWriteAudit) => {
+    try {
+      onHostWrite?.(entry);
+    } catch {
+      // 观测失败不改执行结果：这是统计，不是判据。
+    }
+  };
+  const absorbHostWrites = (totals: { calls: number; mutating: number }) => {
+    if (!currentAudit) return;
+    currentAudit.calls += totals.calls;
+    currentAudit.mutating += totals.mutating;
+  };
   const emitReviews = () => {
     onChangeReview?.(
       record.actions.map((action) =>
@@ -1871,6 +1993,12 @@ export async function executeWpsPlan(
     for (const [position, action] of record.actions.entries()) {
       if (position < (recovery?.resume?.startActionIndex ?? 0)) continue;
       recovery?.resume?.check();
+      currentAudit = {
+        actionIndex: action.actionIndex,
+        actionType: action.type,
+        calls: 0,
+        mutating: 0
+      };
       let sheet = getStoredSheet(application, record, action);
 
       // 格式动作：执行前现场采集逐格/逐行格式快照（撤销依据 + 回读基线）。
@@ -1935,7 +2063,12 @@ export async function executeWpsPlan(
         action.appliedRows = action.rowCount;
         upsertRecord(application, record);
         interruptedHostWrite = true;
-        applyFormatAction(formatRange, formatAction);
+        const formatScope = beginHostWriteScope();
+        try {
+          applyFormatAction(formatRange, formatAction);
+        } finally {
+          absorbHostWrites(endHostWriteScope(formatScope));
+        }
         refreshAppliedFormatEvidence();
         interruptedHostWrite = false;
         // 回读格式快照，比对目标属性是否改到、未声明属性是否保持写前值。
@@ -1970,6 +2103,17 @@ export async function executeWpsPlan(
           });
         }
         upsertRecord(application, record);
+        if (currentAudit) {
+          emitHostWrite({
+            actionIndex: currentAudit.actionIndex,
+            actionType: currentAudit.actionType,
+            hostWriteCalls: currentAudit.calls,
+            mutatingCalls: currentAudit.mutating,
+            outcome: "written",
+            readback: "verified"
+          });
+          currentAudit = null;
+        }
         await yieldControl();
         continue;
       }
@@ -2019,8 +2163,13 @@ export async function executeWpsPlan(
         action.appliedRows = offset + rows;
         upsertRecord(application, record);
         interruptedValueAction = action.actionIndex;
-        if (action.type === "writeFormulas") setRangeFormulas(chunk, chunkValues);
-        else setRangeValues(chunk, chunkValues);
+        const chunkScope = beginHostWriteScope();
+        try {
+          if (action.type === "writeFormulas") setRangeFormulas(chunk, chunkValues);
+          else setRangeValues(chunk, chunkValues);
+        } finally {
+          absorbHostWrites(endHostWriteScope(chunkScope));
+        }
         const afterChunk = readMatrices(rangeFor(sheet, action.range), action.rowCount, action.columnCount);
         action.afterFingerprint = afterChunk.fingerprint;
         interruptedValueAction = null;
@@ -2081,6 +2230,17 @@ export async function executeWpsPlan(
         });
       }
       upsertRecord(application, record);
+      if (currentAudit) {
+        emitHostWrite({
+          actionIndex: currentAudit.actionIndex,
+          actionType: currentAudit.actionType,
+          hostWriteCalls: currentAudit.calls,
+          mutatingCalls: currentAudit.mutating,
+          outcome: "written",
+          readback: "verified"
+        });
+        currentAudit = null;
+      }
     }
     // 整份计划全部执行完后再采集格式动作的**最终**格式快照（每个格式动作按其区域）。
     // 撤销冲突检测按最终状态比 —— 同属性后续覆盖时，中间态代表不了计划产出。
@@ -2100,6 +2260,18 @@ export async function executeWpsPlan(
     emitReviews();
     return record;
   } catch (error) {
+    if (currentAudit) {
+      emitHostWrite({
+        actionIndex: currentAudit.actionIndex,
+        actionType: currentAudit.actionType,
+        hostWriteCalls: currentAudit.calls,
+        mutatingCalls: currentAudit.mutating,
+        outcome: currentAudit.calls > 0 ? "failed_after_write" : "failed_before_write",
+        readback: "not_applicable",
+        errorCode: "WPS_ACTION_FAILED"
+      });
+      currentAudit = null;
+    }
     for (const action of record.actions) {
       // A failed pre-write check is not proof that this execution changed the sheet.
       if (!attemptedActions.has(action.actionIndex)) continue;

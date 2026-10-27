@@ -73,6 +73,19 @@ export {
   changeReviewSummary,
   onlyChangedRows
 } from "./changeReview";
+// 「实际写入了几次」的唯一口径：请求次数、认领结果、宿主写调用数、结果与回读
+// 各自能证明什么。两端执行器与验收说明读这一份，不各写一套。
+export type {
+  HostWriteAudit,
+  HostWriteObservation,
+  HostWriteObservationVerdict,
+  HostWriteSummary
+} from "./hostWriteAudit";
+export {
+  describeHostWriteObservation,
+  normalizeHostWriteAudit,
+  summarizeHostWrites
+} from "./hostWriteAudit";
 
 // 常用格式操作的宿主无关语义：要改哪些属性、真实影响范围（行高=整行 / 列宽=整列）、
 // 以及「属性 × 修改前/修改后」对照。三端共用，宿主 API 差异留在各端适配层。
@@ -355,3 +368,28 @@ export {
   attestSourceDependency
 } from "./planSourceDependency";
 export { attestResultSourceDependency } from "./planSourceDependency";
+
+export type {
+  SourceAnchorPlan,
+  PlanSourceAnchor,
+  PlanSourceVerdict,
+  PlanSourceAnchorProblem,
+  PlanSourceGateVerdict
+} from "./planSourceAnchor";
+export {
+  PLAN_SOURCE_STALE_MESSAGE,
+  PLAN_SOURCE_UNVERIFIABLE_MESSAGE,
+  PLAN_SOURCE_MISSING_MESSAGE,
+  PLAN_SOURCE_SCOPE_MISMATCH_MESSAGE,
+  BAKED_WRITE_ACTION_TYPES,
+  planHasBakedValues,
+  planSourceComparisonNeeded,
+  judgePlanSourceGate,
+  anchorSheetsWithin,
+  planSourceGateMessage,
+  planSourceAnchor,
+  comparePlanSourceAnchor,
+  sourceAnchorFromBinding,
+  stampPlanSourceAnchor,
+  sameSheetSet
+} from "./planSourceAnchor";

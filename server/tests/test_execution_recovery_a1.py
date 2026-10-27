@@ -65,6 +65,7 @@ def execution(request, monkeypatch, tmp_path):
             return response.json()
 
     value = Execution()
+    value.db_path = tmp_path / "ledger.sqlite3"
     value.client, value.base, value.host = client, base, host
     yield value
     client.close()
@@ -151,3 +152,91 @@ def test_a1_concurrent_resume_has_one_owner_and_rejects_stale_receipt(execution)
     assert e.status() == before
     e.complete(0)
     assert e.state["nextActionIndex"] == 1
+
+
+def test_a1_killed_process_keeps_inflight_and_new_process_reads_same_state(execution, tmp_path, monkeypatch):
+    """Real process termination; no suspend. Host application itself is not killed."""
+    import json
+    import subprocess
+    import sys
+    import time
+    from pathlib import Path
+    import server.app.task_ledger as ledger_module
+    e = execution
+    e.start(0)
+    e.complete(0)
+    request = dict(method="POST", path=e.base + "/actions/start", body=dict(
+        expectedRevision=e.state["revision"], ownerToken=e.state["ownerToken"],
+        actionIndex=1, beforeSnapshot=e.evidence(1)))
+    ready = tmp_path / "committed.json"
+    worker = Path(__file__).with_name("execution_process_worker.py")
+    process = subprocess.Popen([sys.executable, str(worker), str(e.db_path), str(ready)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        process.stdin.write(json.dumps(request) + "\n")
+        process.stdin.flush()
+        deadline = time.monotonic() + 30
+        while not ready.exists():
+            assert process.poll() is None, "worker exited before committing"
+            assert time.monotonic() < deadline, "worker did not commit in time"
+            time.sleep(.02)
+        committed = json.loads(ready.read_text())
+        assert committed["status"] == 200, committed
+        assert committed["body"]["inFlightActionIndex"] == 1
+        process.kill()
+        process.wait(timeout=10)
+        assert process.returncode != 0
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.communicate(timeout=10)
+    # A fresh interpreter and ledger, not the killed process's in-memory state.
+    reopened = subprocess.run([sys.executable, str(worker), str(e.db_path)],
+        input=json.dumps(dict(method="GET", path=e.base))+"\n", capture_output=True,
+        text=True, timeout=30, check=True)
+    state = json.loads(reopened.stdout)["body"]
+    assert (state["nextActionIndex"], state["inFlightActionIndex"]) == (1, 1)
+    assert state["revision"] == committed["body"]["revision"]
+    e.state = state
+    # WPS owner leases survive process death. Simulate expiry explicitly, without
+    # altering the persisted record or pretending a suspend occurred.
+    if e.host == "wps":
+        assert state["ownerActive"] is True
+        assert e.post("actions/reconcile", actionIndex=1, outcome="applied", confirmed=True,
+                      checkpoint=e.evidence(1, True)).status_code == 409
+        now = time.time()
+        lease = ledger_module.capability_int("taskRecovery", "wpsOwnerLeaseSeconds")
+        monkeypatch.setattr(ledger_module.time, "time", lambda: now + lease + 1)
+    e.accept("actions/reconcile", actionIndex=1, outcome="applied", confirmed=True,
+             checkpoint=e.evidence(1, True))
+    assert e.state["nextActionIndex"] == 2
+    e.start(2)
+    e.complete(2)
+    e.accept("complete", ownerToken=e.state["ownerToken"],
+             result=dict(actionCount=3) if e.host == "wps" else dict(actionResults=[]))
+    assert e.status()["status"] == "completed"
+
+
+def test_a1_separate_processes_compete_for_same_revision(execution):
+    import json
+    import subprocess
+    import sys
+    from pathlib import Path
+    e = execution
+    e.suspend()
+    barrier = Barrier(2)
+    worker = Path(__file__).with_name("execution_process_worker.py")
+    request = json.dumps(dict(method="POST", path=e.base + "/resume",
+        body=dict(expectedRevision=e.state["revision"], confirmed=True))) + "\n"
+    def claim():
+        barrier.wait(timeout=10)
+        result = subprocess.run([sys.executable, str(worker), str(e.db_path)],
+            input=request, capture_output=True, text=True, timeout=40, check=True)
+        return json.loads(result.stdout)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(claim) for _ in range(2)]
+        results = [f.result(timeout=50) for f in futures]
+    assert sorted(r["status"] for r in results) == [200, 409]
+    winner = next(r["body"] for r in results if r["status"] == 200)
+    assert winner["revision"] == e.state["revision"] + 1
+    assert e.status()["revision"] == winner["revision"]

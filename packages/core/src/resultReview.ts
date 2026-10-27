@@ -1,7 +1,7 @@
 /** Review an already executed result. Confirmation never executes the plan again.
  * Host data and undo handles stay in memory; only host adapters touch workbooks.
  */
-export type ResultReviewPhase = 'idle' | 'executing' | 'reviewing' | 'confirmed' | 'discarded' | 'failed';
+export type ResultReviewPhase = 'idle' | 'executing' | 'reviewing' | 'confirmed' | 'discarded' | 'not_started' | 'failed';
 export type ResultReviewState = {
   phase: ResultReviewPhase;
   key: string | null;
@@ -75,10 +75,12 @@ export class ResultReview<Before, Receipt extends ResultReviewReceipt, Marker, C
     this.operations = operations;
     this.before = undefined; this.receipt = undefined; this.marker = undefined; this.copy = undefined;
     this.update({ phase: 'executing', key, pending: true, executionId: null, comparing: false, notice: null, marked: false });
+    let executionStarted = false;
     try {
       this.assertCurrent();
       this.before = await operations.prepare();
       this.assertCurrent();
+      executionStarted = true;
       this.receipt = await operations.execute(this.before);
       this.update({ executionId: this.receipt.executionId || null });
       if (!this.receipt.executionId || !this.receipt.verified || !this.receipt.undoable) {
@@ -90,7 +92,7 @@ export class ResultReview<Before, Receipt extends ResultReviewReceipt, Marker, C
       this.update({ phase: 'reviewing' });
       return true;
     } catch (reason) {
-      this.update({ phase: 'failed', notice: this.reason(reason) });
+      this.update({ phase: executionStarted ? 'failed' : 'not_started', notice: this.reason(reason) });
       return false;
     } finally { this.update({ pending: false }); }
   }

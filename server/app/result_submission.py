@@ -40,6 +40,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
+from . import dev_result_ref_fault
 from .local_results import RegisteredResult, local_results
 from .models import AnswerResponse, LocalResultCard, PlanRequest, PlanResponse
 from .result_plan import ResultPlanError, compile_result_plan
@@ -77,8 +78,19 @@ def resolve_result_ref(task_id: str, result_ref: Any) -> RegisteredResult:
     The registry checks ownership (``item.task_id != task_id``), TTL and the
     authorization revision the result was registered under; this function only
     turns "no such result" into the fixed refusal.
+
+    开发验收入口（A1-E1）在这一层生效：被绑定的那个句柄**第一次**走到这里时立刻
+    作废并从登记器里删除，然后按同一个固定码拒绝。放在这条漏斗上而不是某个后端
+    适配器里，是为了让两个后端、结果卡渲染和计划编译看到同一个结论；删掉句柄则
+    保证没有"缓存正文"或重试能把一个已过期的引用救回来。
     """
-    item = local_results.resolve(task_id, str(result_ref or ""))
+    handle = str(result_ref or "")
+    if dev_result_ref_fault.take_expiry(task_id, handle):
+        local_results.discard(handle)
+        raise ResultSubmissionError(
+            RESULT_REF_INVALID_CODE, RESULT_REF_INVALID_MESSAGE
+        )
+    item = local_results.resolve(task_id, handle)
     if item is None:
         raise ResultSubmissionError(
             RESULT_REF_INVALID_CODE, RESULT_REF_INVALID_MESSAGE

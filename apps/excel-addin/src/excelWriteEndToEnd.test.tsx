@@ -32,6 +32,7 @@ import { prepareExcelReviewLayout, arrangeExcelReviewLayout, executeWorksheetDel
 import { inspectOfficeAuthorizedTarget } from "./officeAuthorizedTarget";
 import { checkIntent, streamAssistantResponse, understandMessage, continuePlanningTask, getPlanningTaskStatus } from "./api";
 import {
+  reportOfficeHostWrites,
   completeOfficeAction,
   finishOfficeExecution,
   getOfficeExecutionStatus,
@@ -43,6 +44,8 @@ import {
   suspendOfficeExecution
 } from "./api";
 import {
+  executePlan,
+  reconcileOfficeRangeAction,
   captureWorkbook,
   captureWorkbookCatalog,
   captureWorkbookStructure,
@@ -125,6 +128,7 @@ vi.mock("./api", async (importOriginal) => ({
   streamAssistantResponse: vi.fn(),
   getPlanningTaskStatus: vi.fn(),
   continuePlanningTask: vi.fn(),
+  reportOfficeHostWrites: vi.fn(async () => ({})),
   registerOfficeExecution: vi.fn(),
   startOfficeAction: vi.fn(),
   completeOfficeAction: vi.fn(),
@@ -411,6 +415,7 @@ const BRIDGE_OP = `op_${"7".repeat(32)}`;
 const BRIDGE_FP = "c".repeat(64);
 
 interface PlanTurnOptions {
+  planOrigin?: "literal_range_edit";
   pauseBeforePlan?: boolean;
   probe?: boolean;
   /** 通过真实范围选择弹层建立的授权范围。 */
@@ -501,7 +506,7 @@ async function sendPlan(
       activeElapsedSeconds: 1, currentModelId: "claude-agent-sdk", modelSwitchCount: 0,
       canSwitchModel: false, availableModelConnections: []
     } as never;
-    return { kind: "plan", provider: "model", plan: plan as never };
+    return { kind: "plan", provider: "model", plan: plan as never, planOrigin: options.planOrigin };
   });
 
   const view = render(<App />);
@@ -660,7 +665,8 @@ describe("主表执行结果审阅（真实 App/执行器，宿主与网络替�
     if (sourceChanged) host.setCell(SHEET,"B3",999);
     const reopened=render(<App/>);
     const button=await reopened.findByRole("button",{name:"核对并继续"});
-    await waitFor(()=>expect((button as HTMLButtonElement).disabled).toBe(false));fireEvent.click(button);
+    await waitFor(()=>expect((button as HTMLButtonElement).disabled).toBe(false));
+    act(()=>{fireEvent.click(button);fireEvent.click(button);});
     if (sourceChanged) {
       await waitFor(()=>expect(text(reopened)).toContain("数据来源在预览后发生了变化"));
       expect(finishOfficeExecution).not.toHaveBeenCalled();
@@ -673,6 +679,10 @@ describe("主表执行结果审阅（真实 App/执行器，宿主与网络替�
     expect(vi.mocked(startOfficeAction).mock.calls.map(c=>c[1].actionIndex)).toEqual([0,1,2]);
     expect(vi.mocked(completeOfficeAction).mock.calls.map(c=>c[1].actionIndex)).toEqual([0,2]);
     expect(registerOfficeExecution).toHaveBeenCalledTimes(1);expect(loadPendingOfficeExecution()).toBeNull();
+    await waitFor(() => expect(vi.mocked(reportOfficeHostWrites).mock.calls.flatMap(call => call[1].entries).map(entry => entry.actionIndex)).toEqual([0, 1, 2]));
+    const resumedAudit = vi.mocked(reportOfficeHostWrites).mock.calls.flatMap(call => call[1].entries).find(entry => entry.actionIndex === 2)!;
+    expect(resumedAudit).toMatchObject({outcome: "written", readback: "verified"});
+    expect(resumedAudit.hostWriteCalls).toBeGreaterThan(0);
     await stageReview(reopened);
     expect(reopened.container.querySelector('.result-review-bar')?.textContent).not.toContain('执行未完成');
     expect(text(reopened)).toContain('从第 3 步继续并完成');
@@ -741,7 +751,7 @@ describe("主表执行结果审阅（真实 App/执行器，宿主与网络替�
       lastSequence: 0, canContinue: true, pauseType: "interrupted", reason: "规划已暂停",
       extensionSeconds: 60, activeElapsedSeconds: 1, currentModelId: "claude-agent-sdk",
       canSwitchModel: false, availableModelConnections: [],
-      continuation: { available: true, code: null, message: "", stage: "after_tool", sourceVerificationRequired: false }
+      continuation: { available: true, code: null, message: "", stage: "after_tool", sourceVerificationRequired: true }
     } as never);
     vi.mocked(continuePlanningTask).mockResolvedValue({ kind: "plan", provider: "model", plan: reviewPlan } as never);
     const view = await sendPlan(reviewPlan, "更新结果", { pauseBeforePlan: true });
@@ -760,6 +770,38 @@ describe("主表执行结果审阅（真实 App/执行器，宿主与网络替�
     expect(contentWrites(host.originalWrites())).toHaveLength(writes);
     expect(continuePlanningTask).toHaveBeenCalledOnce();
   });
+  /**
+   * **规划继续**这一条入口也要核对锚点（不是只有"正常收计划"那条路）。
+   *
+   * 服务端明确说"这次断点不需要核实来源" ⇒ 本轮**没有**现场读数，也就没有可信锚点；
+   * 而计划里写的是固定值 ⇒ 必须拒绝，不能拿"续跑那一刻再读一次"凑一个基线出来。
+   */
+  it("续跑没有核实来源时：写固定值的计划写入 0 次，并说明缺的是记录而不是数据变化", async () => {
+    vi.mocked(getPlanningTaskStatus).mockResolvedValue({
+      kind: "planning_pause", turnId: "resumed-no-verify-turn", status: "interrupted", revision: 1,
+      lastSequence: 0, canContinue: true, pauseType: "interrupted", reason: "规划已暂停",
+      extensionSeconds: 60, activeElapsedSeconds: 1, currentModelId: "claude-agent-sdk",
+      canSwitchModel: false, availableModelConnections: [],
+      continuation: { available: true, code: null, message: "", stage: "after_tool", sourceVerificationRequired: false }
+    } as never);
+    vi.mocked(continuePlanningTask).mockResolvedValue({ kind: "plan", provider: "model", plan: reviewPlan } as never);
+    const view = await sendPlan(reviewPlan, "更新结果", { pauseBeforePlan: true });
+    const before = host.originalWrites().length;
+    expect(before).toBe(0);
+    fireEvent.click(await view.findByRole("button", { name: /继续分析/ }));
+    await waitFor(() => {
+      if (!(view.container.textContent ?? "").includes("没有记录它是按哪一版数据算出来的")) {
+        throw new Error(
+          `续跑的计划没有被"缺锚点"拦下；当前写入 ${host.originalWrites().length} 次`
+        );
+      }
+    });
+    // 目标区一格没动；文案说的是"没有记录"，不是"数据已经变化"。
+    expect(host.originalWrites()).toHaveLength(0);
+    expect(host.cell(SHEET, "G1")).not.toBe("合计");
+    expect(view.container.textContent).not.toContain("数据来源在预览后发生了变化");
+  }, 30_000);
+
   it.each(["workbook-name", "cross-sheet-formula"])("含 %s 时双视图展示执行前目标值，不重写且放弃恢复", async kind => {
     host = createHost({ workbookNameCount: kind === "workbook-name" ? 1 : 0 });
     installOfficeTestHost(host);
@@ -796,7 +838,8 @@ describe("主表执行结果审阅（真实 App/执行器，宿主与网络替�
   it("副本降级后执行恢复快照读取失败仍拒绝写入", async () => {
     host = createHost({ workbookNameCount: 1, corruptFormatRead: () => { throw new Error("恢复快照不可读"); } }); installOfficeTestHost(host);
     const view = await sendPlan({ ...reviewPlan, actions: [{ type: "setFont", sheet: SHEET, range: "E1:F3", bold: true }], acceptanceCriteria: [] });
-    await waitFor(() => expect(text(view)).toContain("本次执行需要核对"));
+    await waitFor(() => expect(text(view)).toContain("未执行"));
+    expect(text(view)).toContain("恢复快照不可读");
     expect(host.originalWrites()).toHaveLength(0);
     expect(view.queryByRole("button", { name: "确认变更" })).toBeNull();
   });
@@ -1315,6 +1358,15 @@ describe("Excel 写侧：中断后先核对再续跑", () => {
     };
   }
 
+  it("已完成前缀但恢复快照丢失：拒绝续写，不能生成仅含后缀的撤销点", async () => {
+    await expect(executePlan(liveTargetPlan, {
+      authorizedSheetNames:SCOPE, allowedExternalFiles:new Set<string>(), operationId:"office-material-test",
+      recovery:{startActionIndex:1,undoSnapshot:null,
+        onBeforeAction:async()=>undefined,onActionCompleted:async()=>undefined}
+    })).rejects.toThrow("缺少已完成动作的恢复快照");
+    expect(host.writes()).toEqual([]);
+  });
+
   it("重载后按挂接索引核对回执：只汇报，不重复执行已完成的动作", async () => {
     pendingIndex();
     vi.mocked(getOfficeExecutionStatus).mockResolvedValue({
@@ -1330,6 +1382,16 @@ describe("Excel 写侧：中断后先核对再续跑", () => {
     expect(getOfficeExecutionStatus).toHaveBeenCalledTimes(1);
     expect(host.writes()).toEqual([]);
     // 挂接索引在核对完成后被清掉：下次启动不会再提示同一件事。
+    expect(loadPendingOfficeExecution()).toBeNull();
+    view.unmount();
+    const reopened = render(<App />);
+    await waitFor(() => expect(reopened.container.querySelector(".composer textarea")).not.toBeNull());
+    expect(getOfficeExecutionStatus).toHaveBeenCalledTimes(1);
+    expect(host.writes()).toEqual([]);
+    for (const mutation of [registerOfficeExecution, startOfficeAction, completeOfficeAction,
+      reconcileOfficeActionReceipt, finishOfficeExecution, suspendOfficeExecution]) {
+      expect(mutation).not.toHaveBeenCalled();
+    }
     expect(loadPendingOfficeExecution()).toBeNull();
   });
 
@@ -1347,9 +1409,15 @@ describe("Excel 写侧：中断后先核对再续跑", () => {
     const plan = { ...liveTargetPlan, sourceFingerprintSheets: SCOPE, sourceDependencySheets: [SHEET],
       actions: [...liveTargetPlan.actions, { type: "writeFormulas" as const, sheet: TARGET, range: "A3:B3", formulas: [['="丙"', "=600"]] }] };
     pendingIndex();
+    const prior=await reconcileOfficeRangeAction({plan,operationId:OPERATION_ID,
+      workbookIdentity:resumeState().workbookIdentity,actionIndex:0,
+      before:resumeState().beforeSnapshot!,previous:null});
+    expect(prior.outcome).toBe("applied");
     vi.mocked(getOfficeExecutionStatus).mockResolvedValue(resumeState({ plan, nextActionIndex: 1, inFlightActionIndex: 1,
+      checkpoint:prior.checkpoint,
       beforeSnapshot: { ...resumeState().beforeSnapshot, actionIndex: 1, range: "A2:B2", formulas: [["", ""]], fillColor: "" } }) as never);
-    vi.mocked(reconcileOfficeActionReceipt).mockResolvedValue(resumeState({ plan,
+    vi.mocked(reconcileOfficeActionReceipt).mockImplementation(async (_id, request)=>resumeState({ plan,
+      checkpoint:request.checkpoint ?? prior.checkpoint,
       nextActionIndex: outcome === "applied" ? 2 : 1, inFlightActionIndex: null, requiresReconciliation: false, revision: 3 }) as never);
     const view = render(<App />);
     const button = await view.findByRole("button", { name: "核对并继续" });
@@ -1379,8 +1447,8 @@ describe("Excel 写侧：中断后先核对再续跑", () => {
 
     pendingIndex();
     vi.mocked(getOfficeExecutionStatus).mockResolvedValue(resumeState() as never);
-    vi.mocked(reconcileOfficeActionReceipt).mockResolvedValue(
-      resumeState({ nextActionIndex: 1, inFlightActionIndex: null, requiresReconciliation: false, revision: 3 }) as never
+    vi.mocked(reconcileOfficeActionReceipt).mockImplementation(async (_id,request)=>
+      resumeState({checkpoint:request.checkpoint, nextActionIndex: 1, inFlightActionIndex: null, requiresReconciliation: false, revision: 3 }) as never
     );
     vi.mocked(finishOfficeExecution).mockResolvedValue(
       officeLedgerState({ status: "finished", revision: 4 }) as never
@@ -1816,11 +1884,7 @@ describe("Excel native worksheet checkpoint routing", () => {
     if (!view.container.querySelector(".scope-popover")) {
       fireEvent.click(view.container.querySelector(".scope-trigger")!);
     }
-    const discard = await waitFor(() => {
-      const node = view.container.querySelector<HTMLButtonElement>(".scope-close");
-      if (!node) throw new Error("范围选择器没有关闭入口");
-      return node;
-    });
+    const discard = view.getByRole("button", { name: "关闭数据范围选择" });
     fireEvent.click(discard);
     await waitFor(() => expect(view.container.querySelector(".scope-popover")).toBeNull());
     expect(view.container.querySelector(".scope-trigger")?.textContent).toContain("已固定 3 个工作表");
@@ -1923,6 +1987,25 @@ describe("数据范围授权同步（真实 App / 守卫 / 范围 Hook）", () =
    *
    * 判据的顺序是有意的：先证"下一句需求真的跑通了"，再证"没有范围提示"。
    */
+  it("scope confirmation commits the changed active sheet without toggling the mode", async () => {
+    const view = await bootApp();
+    await backgroundCheck(view);
+    host.activateSheet(TARGET);
+    await backgroundCheck(view);
+    await waitFor(() => expect(scopeNotice(view)).toContain("工作表范围发生变化"));
+    await openScopePicker(view);
+    await waitFor(() => expect(view.container.querySelector(".scope-current-file")?.textContent ?? view.container.querySelector(".scope-popover")?.textContent).toContain(TARGET));
+    // Only the footer confirmation is clicked; no checkbox or mode gesture.
+    fireEvent.click(view.container.querySelector<HTMLButtonElement>(".scope-close")!);
+    await waitFor(() => expect(view.container.querySelector(".scope-popover")).toBeNull());
+    await waitFor(() => expect(scopeNotice(view)).toBeNull());
+    await sendAndExpectAnswer(view, "检查当前目标表", "已核验新目标表");
+    expect(registerOfficeExecution).not.toHaveBeenCalled();
+    host.activateSheet(SHEET);
+    await backgroundCheck(view);
+    await waitFor(() => expect(scopeNotice(view)).toContain("工作表范围发生变化"));
+  });
+
   it("①多表确认后：后台检查与下一条需求都不再要求确认", async () => {
     const view = await bootApp();
     await setAuthorizedScope(view, [SHEET, TARGET]);
@@ -2120,4 +2203,19 @@ describe("数据范围授权同步（真实 App / 守卫 / 范围 Hook）", () =
     expect(text(view)).not.toContain("不该跑到这一步。");
     expect(streamAssistantResponse).not.toHaveBeenCalled();
   });
+});
+
+
+it("executes a trusted literal without a source read and confirmation does not rewrite", async () => {
+  host.setCell(SHEET, "A1", "旧值");
+  const plan = {id: "literal-native-s3", title: "写入完成", summary: "写入完成", assumptions: [], warnings: [],
+    actions: [{type: "writeValues", sheet: SHEET, range: "A1", values: [["完成"]]}],
+    acceptanceCriteria: [{type: "rangeEquals", sheet: SHEET, range: "A1", expected: [["完成"]]}]};
+  const view = await sendPlan(plan, "仅在 A1 写入完成", {planOrigin: "literal_range_edit"});
+  await waitFor(() => expect(view.queryByRole("button", {name: "确认变更"}), text(view)).not.toBeNull());
+  expect(host.cell(SHEET, "A1")).toBe("完成");
+  const writes = contentWrites(host.originalWrites()); expect(writes).toHaveLength(1);
+  fireEvent.click(await view.findByRole("button", {name: "确认变更"}));
+  await waitFor(() => expect(text(view)).toContain("已确认变更"));
+  expect(contentWrites(host.originalWrites())).toEqual(writes);
 });

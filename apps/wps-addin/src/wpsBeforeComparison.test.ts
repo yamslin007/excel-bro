@@ -40,6 +40,10 @@ function makeHost(options: {
   rowHeight?: number;
   /** 原表上已有的条件格式规则（模拟"标记已打上" + 用户规则 + 另一轮审阅规则）。 */
   conditions?: CondRule[];
+  /** 副本的条件格式集合读不出来（宿主偶发）：用来钉"无法确认清理结果时要如实说"。 */
+  copyConditionsUnreadable?: boolean;
+  /** 直接替换副本上的集合，用来钉 `Count` 缺失 / 空句柄 / 缺公式 / 非表达式类型这几种读数形态。 */
+  copyConditionsOverride?: unknown;
 }) {
   const rows = options.values.length;
   const columns = options.values[0]?.length ?? 1;
@@ -185,7 +189,10 @@ function makeHost(options: {
         MergeCells: false,
         get RowHeight() { return copyRowHeight; },
         set RowHeight(next: number) { copyRowHeight = next; },
-        get FormatConditions() { return conditionsOf(copyConditions); },
+        get FormatConditions() {
+          if (options.copyConditionsOverride !== undefined) return options.copyConditionsOverride;
+          return options.copyConditionsUnreadable ? undefined : conditionsOf(copyConditions);
+        },
         get Font() {
           const cell = get(box.startRow, box.startColumn);
           return {
@@ -380,9 +387,73 @@ describe("执行前副本不带入本次审阅标记", () => {
     const before = captureWpsBeforeResult(host.application, prepared);
     host.originalCells()[0][0].value = "新值A";
     // 只给本次完整公式：另一轮审阅规则即使同 EB_REVIEW_ 前缀也不删。
-    stageWpsBeforeComparison(host.application, before, THIS_RUN);
+    const staged = stageWpsBeforeComparison(host.application, before, THIS_RUN);
+    // 清了几条必须**报告出来**：面板据此决定要不要提示"副本可能仍然同色"。
+    expect(staged.reviewMarks).toEqual({ cleared: 1, unconfirmed: 0 });
     expect(host.copyConditions().filter(rule => !rule.deleted).map(rule => rule.formula))
       .toEqual([OTHER_RUN, USER_RULE]);
+  });
+
+  it("副本集合读不出来：报告 unconfirmed，不假装已经清干净", () => {
+    const host = makeHost({
+      values: [["旧值A"]],
+      conditions: [{ formula: THIS_RUN, deleted: false }],
+      copyConditionsUnreadable: true
+    });
+    const prepared = prepareWpsPlan(host.application, [1], plan("写值", [
+      { type: "writeValues", sheet: sheetName, range: "A1", values: [["新值A"]] }
+    ]), []);
+    const before = captureWpsBeforeResult(host.application, prepared);
+    const staged = stageWpsBeforeComparison(host.application, before, THIS_RUN);
+    expect(staged.reviewMarks).toEqual({ cleared: 0, unconfirmed: 1 });
+    // 读不出来就一个都不删（宁可副本高亮，也不按区域批量删）。
+    expect(host.copyConditions().filter(rule => !rule.deleted)).toHaveLength(1);
+  });
+
+  /** 跑一遍真实 staging，只换掉副本上的条件格式读数形态。 */
+  function stageWithCopyConditions(conditions: unknown) {
+    const host = makeHost({
+      values: [["旧值A"]],
+      conditions: [{ formula: THIS_RUN, deleted: false }],
+      copyConditionsOverride: conditions
+    });
+    const prepared = prepareWpsPlan(host.application, [1], plan("写值", [
+      { type: "writeValues", sheet: sheetName, range: "A1", values: [["新值A"]] }
+    ]), []);
+    const before = captureWpsBeforeResult(host.application, prepared);
+    return stageWpsBeforeComparison(host.application, before, THIS_RUN);
+  }
+
+  it("副本读数不完整（缺条数 / 空句柄 / 缺公式 / 未知类型）：一律 unconfirmed", () => {
+    const deleted: string[] = [];
+    const ours = {
+      Type: 2,
+      get Formula1() { return THIS_RUN; },
+      Delete: () => { deleted.push("ours"); }
+    };
+    // 缺 `Count`：旧实现当成 0 条 ⇒ 副本还黄着，却报"已清理"。
+    expect(stageWithCopyConditions({ Item: () => ours }).reviewMarks).toEqual({ cleared: 0, unconfirmed: 1 });
+    // 表达式规则却读不出公式。
+    expect(stageWithCopyConditions({ Count: 1, Item: () => ({ Type: 2, Formula1: null }) }).reviewMarks)
+      .toEqual({ cleared: 0, unconfirmed: 1 });
+    // 类型不认识、公式也读不出。
+    expect(stageWithCopyConditions({ Count: 1, Item: () => ({ Type: 99, Formula1: null }) }).reviewMarks)
+      .toEqual({ cleared: 0, unconfirmed: 1 });
+    // 以上三种都是"读数不可信"：一次都不许删（宁可副本多一圈高亮）。
+    expect(deleted).toEqual([]);
+    // 空句柄：读得出的本次规则照常删，但整个区域仍报"没核实干净"。
+    expect(stageWithCopyConditions({ Count: 2, Item: (index: number) => (index === 1 ? null : ours) }).reviewMarks)
+      .toEqual({ cleared: 1, unconfirmed: 1 });
+  });
+
+  it("副本上的色阶规则不算\"无法核实\"：本次标记照常清掉，不产生假警报", () => {
+    const staged = stageWithCopyConditions({
+      Count: 2,
+      Item: (index: number) => (index === 1
+        ? { Type: 3 } // xlColorScale：结构上就没有 Formula1
+        : { Type: 2, Formula1: THIS_RUN, Delete: () => {} })
+    });
+    expect(staged.reviewMarks).toEqual({ cleared: 1, unconfirmed: 0 });
   });
 
   it("没给本次公式就不清理：副本多一圈高亮，也好过误删别人的规则", () => {

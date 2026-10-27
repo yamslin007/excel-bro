@@ -176,13 +176,23 @@ from .models import (
     BridgeRegisterResponse,
     BridgeResultRequest,
     BridgeResultResponse,
+    DevResultRefFaultArmRequest,
+    DevResultRefFaultStatus,
+    DevSourceChangedFaultArmRequest,
+    DevSourceChangedFaultStatus,
+    HostWriteAuditEntry,
+    HostWritesObservation,
+    HostWritesRequest,
+    HostWritesResponse,
+    HostWritesTotals,
     PythonCodeRequest,
     PythonCodeResponse,
 )
 from .task_bridge import BridgeError, register_bridge_result, task_tool_bridge
+from .planning_source_guard import SourceChangedDuringPlanning
 from .local_results import local_results
 from .python_code_artifacts import python_code_artifacts
-from . import planning_context
+from . import dev_result_ref_fault, dev_source_changed_fault, planning_context
 from .ledger_privacy import ledger_recovery_descriptor
 
 load_dotenv("server/.env")
@@ -309,13 +319,20 @@ def _bridge_local_guard(request: Request) -> None:
     请求与值回执，绝不能因 CORS 或可猜 taskId 而放行。
     """
     origin = request.headers.get("origin")
+    # 无体方法（GET/HEAD）根本没有 JSON 声明可言：对它们也要求 content-type，
+    # 端点就会永远 403 —— 那会让"查一下入口状态"这件事做不到。只放松这一条，
+    # 回环与来源判据一字未动。
+    bodyless = request.method in {"GET", "HEAD"}
     if (
         not request.client
         or request.client.host not in {"127.0.0.1", "::1"}
         or request.url.hostname not in {"127.0.0.1", "localhost", "::1"}
         or (origin is not None and origin not in ALLOWED_ORIGINS)
-        or request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-        != "application/json"
+        or (
+            not bodyless
+            and request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+            != "application/json"
+        )
     ):
         raise HTTPException(
             403,
@@ -464,6 +481,111 @@ async def sdk_tool_bridge_result(payload: BridgeResultRequest, request: Request)
     )
     response.headers["Cache-Control"] = "no-store"
     return response
+
+
+_DEV_FAULT_UNAVAILABLE = "DEV_FAULT_UNAVAILABLE"
+
+
+def _require_result_ref_fault() -> None:
+    """开发验收入口的唯一开关。默认关闭时端点表现为**不存在**。"""
+    if not dev_result_ref_fault.enabled():
+        raise service_error(
+            404,
+            _DEV_FAULT_UNAVAILABLE,
+            "当前服务没有开启结果引用过期验收入口。",
+            retryable=False,
+        )
+
+
+@app.post("/api/dev/result-ref-fault/arm", response_model=DevResultRefFaultStatus)
+async def dev_result_ref_fault_arm(
+    payload: DevResultRefFaultArmRequest, request: Request
+):
+    """显式启用一次：该工作簿的下一次规划任务的第一个 Python 结果引用将失效。
+
+    请求里**没有**任务与引用字段（``extra="forbid"``）—— 绑定由服务端在
+    "任务真正开始"和"结果真正登记"两处可信路径上完成，模型无从指定别的对象。
+    """
+    _bridge_local_guard(request)
+    _require_result_ref_fault()
+    try:
+        return DevResultRefFaultStatus(**dev_result_ref_fault.arm(
+            host_id=payload.hostId,
+            workbook_name=payload.workbookName,
+            workbook_identity=payload.workbookIdentity,
+        ))
+    except dev_result_ref_fault.FaultDisabled as error:
+        raise service_error(
+            409, "DEV_FAULT_NOT_ARMED", str(error), retryable=False
+        ) from error
+
+
+@app.post("/api/dev/result-ref-fault/cancel", response_model=DevResultRefFaultStatus)
+async def dev_result_ref_fault_cancel(request: Request):
+    _bridge_local_guard(request)
+    _require_result_ref_fault()
+    return DevResultRefFaultStatus(**dev_result_ref_fault.cancel())
+
+
+@app.get("/api/dev/result-ref-fault", response_model=DevResultRefFaultStatus)
+async def dev_result_ref_fault_status(request: Request):
+    _bridge_local_guard(request)
+    _require_result_ref_fault()
+    return DevResultRefFaultStatus(**dev_result_ref_fault.status())
+
+
+def _require_source_changed_fault() -> None:
+    """开发验收入口的唯一开关。默认关闭时端点表现为**不存在**。"""
+    if not dev_source_changed_fault.enabled():
+        raise service_error(
+            404,
+            _DEV_FAULT_UNAVAILABLE,
+            "当前服务没有开启来源变化验收入口。",
+            retryable=False,
+        )
+
+
+@app.post(
+    "/api/dev/source-changed-fault/arm", response_model=DevSourceChangedFaultStatus
+)
+async def dev_source_changed_fault_arm(
+    payload: DevSourceChangedFaultArmRequest, request: Request
+):
+    """显式启用一次并绑定到**这一本**工作簿。
+
+    请求里没有任务字段（``extra="forbid"``）：注入发生在桥的 ``request`` 里，
+    归属由服务端在开桥那一刻按 taskId 绑定，模型无从指定别的任务。
+    """
+    _bridge_local_guard(request)
+    _require_source_changed_fault()
+    try:
+        return DevSourceChangedFaultStatus(**dev_source_changed_fault.arm(
+            host_id=payload.hostId,
+            workbook_name=payload.workbookName,
+            workbook_identity=payload.workbookIdentity,
+        ))
+    except dev_source_changed_fault.FaultDisabled as error:
+        raise service_error(
+            409, "DEV_FAULT_NOT_ARMED", str(error), retryable=False
+        ) from error
+
+
+@app.post(
+    "/api/dev/source-changed-fault/cancel", response_model=DevSourceChangedFaultStatus
+)
+async def dev_source_changed_fault_cancel(request: Request):
+    _bridge_local_guard(request)
+    _require_source_changed_fault()
+    return DevSourceChangedFaultStatus(**dev_source_changed_fault.cancel())
+
+
+@app.get(
+    "/api/dev/source-changed-fault", response_model=DevSourceChangedFaultStatus
+)
+async def dev_source_changed_fault_status(request: Request):
+    _bridge_local_guard(request)
+    _require_source_changed_fault()
+    return DevSourceChangedFaultStatus(**dev_source_changed_fault.status())
 
 
 @app.post("/api/sdk/python-code", response_model=PythonCodeResponse)
@@ -622,6 +744,11 @@ def _map_turn_error(error: Exception) -> tuple[int, str, str, bool]:
 
     if isinstance(error, LLMUsageLimitError):
         return (502, error.code, str(error), False)
+    if isinstance(error, SourceChangedDuringPlanning):
+        # 409：现场与本次任务的前提冲突（来源已经不是规划时那一版）。
+        # `retryable=False` 是这句话的一部分：原样重试只会再撞一次同一份新数据，
+        # 必须**按最新数据重新发起**才是正确动作。
+        return (409, error.code, str(error), False)
     if isinstance(error, LLMHTTPStatusError) and error.usage_code:
         return (502, error.usage_code, MODEL_USAGE_MESSAGES[error.usage_code], False)
     if isinstance(error, LLMTimeoutError):
@@ -965,6 +1092,7 @@ async def turn(request: TurnRequest, http_request: Request = None) -> TurnRespon
         ModelNotConfiguredError,
         ModelNotAvailableError,
         TurnStateError,
+        SourceChangedDuringPlanning,
         ValueError,
     ) as error:
         status, code, message, retryable = _map_turn_error(error)
@@ -2358,6 +2486,7 @@ async def _planning_task_stream(
             ModelNotConfiguredError,
             ModelNotAvailableError,
             TurnStateError,
+            SourceChangedDuringPlanning,
             ValueError,
         ) as error:
             status, code, message, retryable = _map_turn_error(error)
@@ -3002,6 +3131,232 @@ async def finish_office_execution(
     except Exception as error:
         raise _office_conflict(error) from error
     return _office_state_payload(record)
+
+
+_HOST_WRITE_IDENTITY_PREFIX = {"office": "url:", "wps": "wps-path:"}
+#: 两端的**计量单位不同**，不许互相折算（`hostWriteCalls` 是什么，取决于这一段）。
+_HOST_WRITE_UNIT = {"office": "excel_sync_batches", "wps": "wps_api_calls"}
+
+
+def _host_write_record(namespace: str, operation_id: str):
+    """按命名空间取执行记录：另一端的操作 ID 一律当成"不存在"。
+
+    两端账本同一个表，靠 `workbook_identity` 前缀分开（`_require_office_namespace`
+    与 `_wps_record` 是同一套判据）；审计端点不能成为跨宿主探测工具。
+    """
+    record = _folder_operation_ledger.office_execution(operation_id)
+    if record is None:
+        return None
+    if not record.workbook_identity.startswith(_HOST_WRITE_IDENTITY_PREFIX[namespace]):
+        return None
+    return record
+
+
+def _host_write_totals(entries: list[HostWriteAuditEntry]) -> HostWritesTotals:
+    """与 `packages/core/src/hostWriteAudit.ts` 的 `summarizeHostWrites` **同一口径**：
+    只做加法。`unknown` 单独计数，既不并进"已写入"，也不当成零写入。"""
+    host_write_calls = 0
+    written = before = after = unknown = verified = failed = 0
+    for entry in entries:
+        if entry.outcome != "failed_before_write":
+            host_write_calls += entry.hostWriteCalls
+        if entry.outcome == "written":
+            written += 1
+        elif entry.outcome == "failed_before_write":
+            before += 1
+        elif entry.outcome == "failed_after_write":
+            after += 1
+        else:
+            unknown += 1
+        if entry.readback == "verified":
+            verified += 1
+        elif entry.readback == "failed":
+            failed += 1
+    return HostWritesTotals(
+        reportedActions=len(entries),
+        hostWriteCalls=host_write_calls,
+        actionsWritten=written,
+        actionsFailedBeforeWrite=before,
+        actionsFailedAfterWrite=after,
+        actionsUnknown=unknown,
+        readbackVerified=verified,
+        readbackFailed=failed,
+    )
+
+
+def _host_write_boundary(record) -> int:
+    """账本判定"**有可能已经写过**"的动作数 —— 这是"明确零"的可信执行边界。
+
+    写入路径只有一个入口：`actions/start` 认领 → 宿主写 API。所以
+    `next_action_index`（已完成的动作前缀）与 `in_flight_action_index`（认领了但
+    还没交回执的那一个）合起来就是"真的可能被写过"的动作集合；没认领过的动作
+    **不可能**碰过宿主。超过计划动作数说明账本被外部改坏，按计划数截断，不让它
+    虚增。
+    """
+    plan = record.plan if isinstance(record.plan, dict) else {}
+    actions = plan.get("actions")
+    total = len(actions) if isinstance(actions, list) else 0
+    attempted = max(int(record.next_action_index or 0), 0)
+    if record.in_flight_action_index is not None:
+        attempted = max(attempted, int(record.in_flight_action_index) + 1)
+    return min(attempted, total) if total else attempted
+
+
+def _host_write_observation(
+    namespace: str, record, entries: list[HostWriteAuditEntry], last_reported_at
+) -> HostWritesObservation:
+    """把"收到的观测"与"账本执行边界"对起来，得出能说的话。
+
+    三条不许混的语义：
+
+    - **空数组不是零**：一条上报都没收到 ⇒ `observation=not_collected`、
+      `callEvidence=none`。上报是 best-effort，丢了就什么都没收到；
+    - **明确零**必须同时满足"边界内每个动作都有观测"且"每次观测都是 0 次调用、
+      且没有 unknown/failed_after_write 这类说不清的条目"。缺一个就只能是
+      `partial` + `unknown`；
+    - **非零**只要有一次观测到 ≥1 次调用就成立（覆盖不全也成立，但 `observation`
+      会同时标成 `partial`，两件事分别看）。
+    """
+    attempted = _host_write_boundary(record)
+    reported = {entry.actionIndex for entry in entries}
+    missing = len([index for index in range(attempted) if index not in reported])
+    unexpected = len([index for index in reported if index >= attempted])
+    calls = sum(
+        entry.hostWriteCalls
+        for entry in entries
+        if entry.outcome != "failed_before_write"
+    )
+    undetermined = any(
+        entry.outcome in {"unknown", "failed_after_write"} for entry in entries
+    )
+    if not entries:
+        observation = "not_collected"
+        call_evidence = "none"
+    else:
+        observation = "complete" if missing == 0 else "partial"
+        if calls > 0:
+            call_evidence = "nonzero"
+        elif missing or unexpected or undetermined:
+            call_evidence = "unknown"
+        else:
+            call_evidence = "zero"
+    return HostWritesObservation(
+        observation=observation,
+        callEvidence=call_evidence,
+        attemptedActions=attempted,
+        reportedActions=len(reported),
+        missingActions=missing,
+        unexpectedReports=unexpected,
+        unit=_HOST_WRITE_UNIT[namespace],
+        lastReportedAt=last_reported_at,
+    )
+
+
+def _host_writes_response(namespace: str, record) -> HostWritesResponse:
+    operation_id = record.operation_id
+    rows = _folder_operation_ledger.office_host_writes(operation_id)
+    entries: list[HostWriteAuditEntry] = []
+    for row in rows:
+        try:
+            entries.append(HostWriteAuditEntry(**row))
+        except TypeError:
+            # 落库内容不合法（不应发生）：当作没有这条证据，而不是猜一个值。
+            continue
+    return HostWritesResponse(
+        operationId=operation_id,
+        entries=entries,
+        totals=_host_write_totals(entries),
+        observation=_host_write_observation(
+            namespace,
+            record,
+            entries,
+            _folder_operation_ledger.office_host_writes_last_recorded_at(operation_id),
+        ),
+    )
+
+
+async def _record_host_writes(
+    namespace: str, operation_id: str, request: HostWritesRequest
+) -> HostWritesResponse:
+    """端上补报一次宿主观测。**只追加**：不改执行状态、不推进 revision。
+
+    这条通路是观测，不是恢复点：它失败只会少一条证据（端上是 best-effort），
+    绝不能挡住写入或回执。真正能证明"写了"的仍是账本动作与回读，而不是这里。
+    """
+    record = await run_in_threadpool(_host_write_record, namespace, operation_id)
+    if record is None:
+        raise service_error(
+            404,
+            "EXECUTION_NOT_FOUND",
+            "未找到这次执行记录；上报不会创建新的写入任务。",
+            retryable=False,
+        )
+    if request.ownerToken is not None and request.ownerToken != record.owner_token:
+        # 另一个执行者不许往别人的账本里写字（哪怕是计数）。
+        raise service_error(
+            409,
+            "HOST_WRITES_REJECTED",
+            "这次上报不属于当前执行者；未记录。",
+            retryable=False,
+        )
+    await run_in_threadpool(
+        _folder_operation_ledger.append_office_host_writes,
+        operation_id,
+        [entry.model_dump(mode="json", exclude_none=True) for entry in request.entries],
+    )
+    # 追加之后再读一次账本：上报与"账本刚推进完动作"可能交错，边界要按最新现场算。
+    fresh = await run_in_threadpool(_host_write_record, namespace, operation_id)
+    return await run_in_threadpool(
+        _host_writes_response, namespace, fresh or record
+    )
+
+
+async def _host_writes_summary(namespace: str, operation_id: str) -> HostWritesResponse:
+    record = await run_in_threadpool(_host_write_record, namespace, operation_id)
+    if record is None:
+        raise service_error(
+            404,
+            "EXECUTION_NOT_FOUND",
+            "未找到这次执行记录。",
+            retryable=False,
+        )
+    return await run_in_threadpool(_host_writes_response, namespace, record)
+
+
+@app.post(
+    "/api/office/executions/{operation_id}/host-writes",
+    response_model=HostWritesResponse,
+)
+async def record_office_host_writes(
+    operation_id: str, request: HostWritesRequest
+) -> HostWritesResponse:
+    return await _record_host_writes("office", operation_id, request)
+
+
+@app.get(
+    "/api/office/executions/{operation_id}/host-writes",
+    response_model=HostWritesResponse,
+)
+async def office_host_writes(operation_id: str) -> HostWritesResponse:
+    return await _host_writes_summary("office", operation_id)
+
+
+@app.post(
+    "/api/wps/executions/{operation_id}/host-writes",
+    response_model=HostWritesResponse,
+)
+async def record_wps_host_writes(
+    operation_id: str, request: HostWritesRequest
+) -> HostWritesResponse:
+    return await _record_host_writes("wps", operation_id, request)
+
+
+@app.get(
+    "/api/wps/executions/{operation_id}/host-writes",
+    response_model=HostWritesResponse,
+)
+async def wps_host_writes(operation_id: str) -> HostWritesResponse:
+    return await _host_writes_summary("wps", operation_id)
 
 
 @app.post(

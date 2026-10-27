@@ -23,6 +23,7 @@
     "dev:server": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start_claude_sdk_server.ps1",
     "test:server": "python -m pytest server/tests --basetemp=.tmp-pytest",
     "test:cross-process": "node scripts/run_cross_process_chain.mjs",
+    "test:a1-e2": "node scripts/run_a1_e2_chain.mjs",
     "test:online": "node scripts/run_online_link.mjs",
     "test:wps-format-ledger": "node scripts/run_wps_format_ledger_link.mjs",
     "test": "npm run test:addin && npm run test:wps && npm run test:server"

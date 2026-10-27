@@ -128,4 +128,7 @@ def compile_plan_tool(request: PlanRequest, name: str, arguments: dict[str, Any]
         "summary": title, "actions": actions,
     })
     _enforce_action_capabilities(request, plan)
-    return PlanResponse(provider="model", plan=plan)
+    return PlanResponse(
+        provider="model", plan=plan,
+        planOrigin="literal_range_edit" if name == "plan_range_edit" and args.operation == "writeValues" else None,
+    )
