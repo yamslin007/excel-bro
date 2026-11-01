@@ -311,7 +311,8 @@ export {
   isTaskResumeRecord,
   newTaskId,
   withTaskResumeState,
-  withTaskResumeConfirmation
+  withTaskResumeConfirmation,
+  planSettlesExecution
 } from "./taskResume";
 
 // L2 semantics：规划流式消费与检查点续跑的身份/游标/终态口径。
@@ -393,3 +394,96 @@ export {
   stampPlanSourceAnchor,
   sameSheetSet
 } from "./planSourceAnchor";
+
+export type {
+  PendingExecutionNamespace,
+  PendingExecutionStatus,
+  PendingExecutionCandidate,
+  PendingExecutionDiscoveryResponse,
+  PendingExecutionSelection
+} from "./pendingExecutionDiscovery";
+export {
+  PENDING_DISCOVERY_SCHEMA_VERSION,
+  PENDING_DISCOVERY_LIMIT,
+  PENDING_DISCOVERY_MAX_IDENTITY_CHARS,
+  PENDING_DISCOVERY_CHOOSE_DETAIL,
+  PENDING_DISCOVERY_TRUNCATED_DETAIL,
+  PENDING_DISCOVERY_UNAVAILABLE_DETAIL,
+  assertPendingExecutionDiscovery,
+  orderPendingExecutionCandidates,
+  pendingExecutionCandidateLabel,
+  pendingExecutionSelection
+} from "./pendingExecutionDiscovery";
+
+export type {
+  PendingResumeBlockReason,
+  PendingResumeReadiness,
+  PendingResumeInput
+} from "./pendingExecutionResume";
+export {
+  pendingResumeReadiness,
+  pendingResumeTargetSheets
+} from "./pendingExecutionResume";
+
+export type {
+  ExecutionRecoveryAction,
+  ExecutionRecoveryKind,
+  ExecutionReconcileOutcome,
+  ExecutionRecoverySourceVerdict,
+  ExecutionRecoveryTerminalReason,
+  ExecutionRecoveryVerdict
+} from "./executionRecoveryView";
+export {
+  EXECUTION_RECOVERY_ACTION_LABEL,
+  EXECUTION_RECOVERY_ENTRY_HINT,
+  EXECUTION_RECOVERY_NOTE,
+  EXECUTION_RECOVERY_STATE_LABEL,
+  EXECUTION_RECOVERY_TERMINAL_SUMMARY,
+  EXECUTION_RECOVERY_TITLE,
+  EXECUTION_RECOVERY_UNDONE_DETAIL,
+  EXECUTION_RECOVERY_UNDONE_NOTE,
+  executionRecoveryActions,
+  executionRecoveryBadge,
+  executionRecoveryDetail,
+  executionRecoveryIsTerminal,
+  executionRecoveryNote,
+  executionRecoveryProgress,
+  executionRecoveryResumeVerdict,
+  executionRecoveryTerminalReason,
+  executionRecoveryTerminalSummary,
+  selectExecutionRecoveryEntry
+} from "./executionRecoveryView";
+
+export type {
+  ResumeSceneInput,
+  ResumeSceneObservation,
+  ResumeSceneObservationState,
+  ResumeSceneOutcome,
+  ResumeSceneReason
+} from "./executionResumeScene";
+export { verifyResumeScene } from "./executionResumeScene";
+export type {
+  ExecutionDisposition,
+  ExecutionDispositionOutcome
+} from "./executionDisposition";
+export {
+  EXECUTION_DISPOSITION_LABEL,
+  executionDispositionTarget,
+  normalizeExecutionDisposition,
+  recordExecutionDisposition
+} from "./executionDisposition";
+
+export type {
+  UndoRebuildBlockReason,
+  UndoRebuildCheckpoint,
+  UndoRebuildDisposition,
+  UndoRebuildInput,
+  UndoRebuildOutcome,
+  UndoRebuildRange,
+  UndoRebuildTarget
+} from "./executionUndoRebuild";
+export {
+  UNDO_RECOVERY_LABEL,
+  rebuildExecutionUndo,
+  undoRecoveryDetail
+} from "./executionUndoRebuild";

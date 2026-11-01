@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
 import re
+from datetime import datetime
 from typing import Annotated, Any, Literal
 
 from pydantic import (
@@ -389,6 +391,12 @@ class WriteFormulasAction(BaseModel):
     sheet: SheetName
     range: RangeAddress
     formulas: list[list[str]] = Field(min_length=1, max_length=500)
+    # R1C1 铺满公式的原始写法（端上 `contracts.ts` 的 `writeFormulas` 自带这个字段）。
+    # 必须在这里显式声明：pydantic 默认 `extra="ignore"`，未声明的字段会被**静默丢弃**，
+    # 而 `_validate_office_recovery_plan` 要读它来拒绝"R1C1 铺满公式"的跨重启核对 ——
+    # 字段不在，读属性直接 AttributeError，整条公式计划连登记都过不去（500）。
+    # 丢掉它也不只是丢失一个提示：恢复时拿普通公式比对 R1C1 铺满的结果会误判。
+    formulaR1C1: str | None = Field(default=None, max_length=512)
 
     @model_validator(mode="after")
     def validate_matrix(self) -> "WriteFormulasAction":
@@ -1162,6 +1170,14 @@ class AnalysisPlan(BaseModel):
     # 工具执行记录、已保存工具模板声明），服务端不采信模型自报的来源集合；
     # 缺失即"依赖不确定"，恢复登记退回既有的保守拒绝条件。
     sourceDependencySheets: list[SheetName] = Field(default_factory=list, max_length=100)
+    # 公式来源证据：登记断点恢复那一刻，公式依赖的那几张表的值指纹（口径 = 公式文本
+    # 读到的表集合，不是本次授权范围的整张快照）。续跑前由宿主重新读同一批表比对，
+    # 不一致就停止续跑。缺失 = 没有证据 = 公式计划不能精确续跑（fail-closed）。
+    #
+    # **必须在这里声明**：客户端会带这个字段上来，而 pydantic 默认
+    # `extra="ignore"` 会把它静默丢掉 —— `formulaR1C1` 就这样漏过一次，
+    # 结果"只声明在 TS 里"的字段到了服务端读出来永远为空，闸门永假。
+    sourceDependencyFingerprint: str | None = Field(default=None, min_length=1, max_length=128)
     assumptions: list[str] = Field(default_factory=list, max_length=20)
     warnings: list[str] = Field(default_factory=list, max_length=20)
     actions: list[ExcelAction] = Field(min_length=1, max_length=50)
@@ -2045,8 +2061,16 @@ class MessageRecoveryResponse(BaseModel):
     provider: Literal["model"] = "model"
 
 
+class MessageClarificationResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["clarification"] = "clarification"
+    clarification: "IntentClarification"
+    provider: Literal["model"] = "model"
+
+
 MessageUnderstandingResponse = Annotated[
-    MessageConversationResponse | MessageContextResponse | MessageRecoveryResponse, Field(discriminator="kind")
+    MessageConversationResponse | MessageContextResponse | MessageRecoveryResponse | MessageClarificationResponse,
+    Field(discriminator="kind")
 ]
 
 
@@ -2619,7 +2643,7 @@ class IntentClarification(BaseModel):
     question: str = Field(min_length=1, max_length=300)
     reason: str = Field(min_length=1, max_length=300)
     scopeLabel: str = Field(min_length=1, max_length=300)
-    options: list[IntentOption] = Field(default_factory=list, max_length=4)
+    options: list[IntentOption] = Field(default_factory=list, max_length=capability_int("clarification", "maxOptions"))
     fields: list[ClarificationField] = Field(default_factory=list, max_length=4)
 
     @model_validator(mode="after")
@@ -2859,6 +2883,36 @@ class OfficeExecutionFinishRequest(BaseModel):
     result: dict[str, Any]
 
 
+class OfficeExecutionDispositionRequest(BaseModel):
+    """用户对这次执行的终态处置（`abandoned` = 放弃变更，`undone` = 撤销本次执行）。
+
+    只有取值本身；执行身份在路径上。**没有** `expectedRevision` / `ownerToken`：
+    留痕不是一次带 CAS 的进度推进，它不该因为"别人刚推进了游标"而失败。
+    """
+
+    disposition: Literal["abandoned", "undone"]
+
+
+class WpsExecutionDispositionRequest(BaseModel):
+    disposition: Literal["abandoned", "undone"]
+
+
+class OfficeExecutionDispositionState(BaseModel):
+    """这次执行被用户终态处置的**首次时刻**（只读投影）。
+
+    为什么放进状态响应（2026-10-31）：撤销/放弃留痕早就落在账本两列上，但接口一直
+    不回它，于是重开窗格只能凭"账本还没完成"重建出一个撤销入口 —— 用户明明已经撤销
+    过，界面又递给他一次同样的按钮。两个取值不互冒充：`undoneAt` = 撤销本次执行，
+    `abandonedAt` = 审阅阶段放弃变更。
+
+    `null` 的含义必须读作「**没有这条留痕**」：本功能上线前发生过的处置、以及从未
+    处置过的执行看起来一样 —— 不许把 `None` 说成"用户没放弃过"。
+    """
+
+    undoneAt: float | None = None
+    abandonedAt: float | None = None
+
+
 class OfficeExecutionStateResponse(BaseModel):
     operationId: str
     status: Literal["running", "needs_reconciliation", "completed", "failed"]
@@ -2876,6 +2930,7 @@ class OfficeExecutionStateResponse(BaseModel):
     canResume: bool
     requiresReconciliation: bool
     ownerToken: str | None = None
+    disposition: OfficeExecutionDispositionState | None = None
 
 
 # WPS 格式动作**可以声明**的属性名（= 端上 `declaredFormatFields` 的输出集合，也是
@@ -2976,9 +3031,16 @@ class WpsResumeSource(BaseModel):
 
 class WpsResumeContext(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    version: Literal[1] = 1
+    # v1 needs source evidence; v2 is a trusted literal plan with no source dependency.
+    version: Literal[1, 2] = 1
     hostVersion: str = Field(min_length=1, max_length=80)
-    sources: list[WpsResumeSource] = Field(min_length=1, max_length=500)
+    sources: list[WpsResumeSource] = Field(max_length=500)
+
+    @model_validator(mode="after")
+    def validate_source_basis(self) -> "WpsResumeContext":
+        if (self.version == 1 and not self.sources) or (self.version == 2 and self.sources):
+            raise ValueError("续跑来源证据版本与来源列表不一致")
+        return self
 
 
 class WpsRecoveryDescriptor(BaseModel):
@@ -2996,6 +3058,14 @@ class WpsRecoveryDescriptor(BaseModel):
 
     actions: list[WpsRecoveryActionDescriptor] = Field(min_length=1, max_length=500)
     resumeContext: WpsResumeContext | None = None
+
+    @model_validator(mode="after")
+    def validate_literal_actions(self) -> "WpsRecoveryDescriptor":
+        if self.resumeContext and self.resumeContext.version == 2 and any(
+            action.type != "writeValues" for action in self.actions
+        ):
+            raise ValueError("无来源依赖的恢复只支持字面值写入")
+        return self
 
 
 class WpsExecutionRegisterRequest(BaseModel):
@@ -3128,6 +3198,256 @@ class WpsExecutionStateResponse(BaseModel):
     requiresReconciliation: bool
     ownerActive: bool
     ownerToken: str | None = None
+    # 处置留痕只读投影（2026-10-31）：与 Excel 侧 `OfficeExecutionStateResponse` 同口径。
+    # WPS 撤销入口在**结果卡**上，撤销成功后 `undoWpsExecution` 只把宿主缓存里的
+    # `record.state` 改成 `restored`，账本 `status` / 游标都不动；重开窗格后宿主缓存没了、
+    # 恢复包又被 `retireWpsRecoveryPackage` 删掉（best-effort，可能失败），于是续跑判据
+    # 找不到"已撤销"的依据，可能把一次已经回退的执行重新开放续跑。投影这两列，
+    # 客户端才能在续跑判据里先判终态（与 `officeExecutionTerminalReason` 同一条纪律）。
+    disposition: OfficeExecutionDispositionState | None = None
+
+
+# --------------------------------------------------------------------------- #
+# 未完成执行的**发现**（浏览器索引只是缓存，丢了也要能找回来）
+#
+# 2026-10-27 真实 WPS：完整退出宿主后浏览器 `localStorage` 的单条发现索引消失，账本里的
+# 进度与原表现场都在，界面却再也找不到这次执行。修复思路是把索引降级为缓存，由后端按
+# **当前工作簿稳定身份**精确查找。
+#
+# 这两个模型是本轮唯一的出站面：只给"定位 + 时间 + 进度"。执行权令牌（`ownerToken`）、
+# 单元格值/写前写后矩阵、恢复包正文、完整值计划**一律不下发** —— 发现入口不等于写入资格，
+# 认领与续跑仍走既有的状态查询与材料水合。
+# --------------------------------------------------------------------------- #
+
+
+class PendingExecutionCandidate(BaseModel):
+    """一条未完成执行的最小元数据（与 `packages/core/src/pendingExecutionDiscovery.ts` 同形）。
+
+    `extra="forbid"` 是出站闸的服务端一侧：想在这里顺手塞一个 `values` / `descriptor` /
+    `ownerToken`，会直接 500（模型校验失败）而不是被静默忽略后照常下发。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    operationId: str = Field(min_length=8, max_length=200)
+    taskId: str = Field(min_length=1, max_length=200)
+    status: Literal["running", "needs_reconciliation", "failed"]
+    # epoch 毫秒：账本里是秒，换算只在这一层做，客户端不猜单位。
+    createdAt: int = Field(gt=0)
+    updatedAt: int = Field(gt=0)
+    nextActionIndex: int = Field(ge=0)
+    totalActions: int = Field(ge=1)
+    inFlightActionIndex: int | None = Field(default=None, ge=0)
+    ownerActive: bool
+    requiresReconciliation: bool
+    canResume: bool
+
+
+class PendingExecutionsResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schemaVersion: Literal[1]
+    namespace: Literal["wps", "office"]
+    workbookIdentity: str
+    limit: int = Field(ge=1)
+    truncated: bool
+    candidates: list[PendingExecutionCandidate]
+
+
+# --------------------------------------------------------------------------- #
+# 未完成任务恢复包（本机后端应用数据目录）
+#
+# 与 `office_executions` 账本分工明确：账本保存**可变执行进度**（游标、在途动作、
+# 租约），恢复包保存**不可变的原始恢复材料**（原计划动作顺序、授权、来源证据、
+# 每一步的写前值/公式与预期写后指纹）。恢复包不上云、不进模型、不进普通账本事件。
+#
+# 与 `WpsRecoveryDescriptor` 的差别是刻意的：描述是**出站闸**（值矩阵一律不落服务端
+# 账本），恢复包是**本机受控材料**（必须含原值，否则无法核对"是否已经写过"或撤销）。
+# 两者都不得进入日志/遥测/诊断环。
+# --------------------------------------------------------------------------- #
+
+_RECOVERY_FINGERPRINT = r"^v2:\d+:[0-9a-f]{8}$"
+
+
+def recovery_package_plan_fingerprint(actions: list[dict[str, Any]]) -> str:
+    """与 `packages/core/src/executionRecoveryPackage.ts` 同一口径的计划指纹。
+
+    只用于发现"恢复包与账本登记的不是同一版计划"，**不是密码学认证**。两个实现
+    （TS / Python）的一致性由 `config/execution_recovery_package_cases.json` 锁住。
+    """
+
+    parts = [
+        [
+            action.get("actionIndex"),
+            action.get("type"),
+            action.get("sheet"),
+            action.get("range"),
+            action.get("rowCount"),
+            action.get("columnCount"),
+            action.get("cellCount"),
+            action.get("previewFingerprint"),
+            action.get("expectedFingerprint"),
+        ]
+        for action in actions
+    ]
+    text = json.dumps(parts, separators=(",", ":"), ensure_ascii=False)
+    value = 0x811C9DC5
+    for character in text:
+        value ^= ord(character)
+        value = (value * 0x01000193) & 0xFFFFFFFF
+    return f"plan:v1:{len(actions)}:{value:08x}"
+
+
+class ExecutionRecoveryPackageAction(BaseModel):
+    """恢复包里的单个动作：**目标值 + 写前值 + 写前公式**缺一不可。
+
+    少了目标值就不知道"还要继续写什么"；少了写前值/公式，既不能核对某一步是否
+    已经写过，也不能把原表恢复回去。
+
+    目标矩阵按动作类型**二选一**：`writeValues` 用 ``values``，`writeFormulas` 用
+    ``formulas``（逐格 `=` 开头的公式文本）。**不许用计算值顶替公式** —— 两条公式可以
+    算出同一个数，拿值当目标会把公式写成常量，之后的来源变化也不会重算。
+    格式、删表等动作仍然不在本模型的登记范围内。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    actionIndex: int = Field(ge=0, le=499)
+    type: Literal["writeValues", "writeFormulas"]
+    sheet: str = Field(min_length=1, max_length=31)
+    range: str = Field(max_length=40, pattern=r"^\$?[A-Z]{1,3}\$?[1-9]\d*(?::\$?[A-Z]{1,3}\$?[1-9]\d*)?$")
+    rowCount: int = Field(ge=1, le=1048576)
+    columnCount: int = Field(ge=1, le=16384)
+    cellCount: int = Field(ge=1)
+    previewFingerprint: str = Field(max_length=80, pattern=_RECOVERY_FINGERPRINT)
+    expectedFingerprint: str = Field(max_length=80, pattern=_RECOVERY_FINGERPRINT)
+    # 目标矩阵二选一：值动作给 values，公式动作给 formulas。另一个必须是 None。
+    # 老包（只登记 writeValues）没有 formulas 这个键，缺省 None 即兼容。
+    values: list[list[CellValue]] | None = None
+    formulas: list[list[str]] | None = None
+    beforeValues: list[list[CellValue]] = Field(min_length=1)
+    beforeFormulas: list[list[CellValue]] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_shape(self) -> "ExecutionRecoveryPackageAction":
+        if self.cellCount != self.rowCount * self.columnCount:
+            raise ValueError("恢复包动作的格数与形状不一致")
+
+        def shaped(matrix: list[list[object]]) -> bool:
+            return len(matrix) == self.rowCount and all(len(row) == self.columnCount for row in matrix)
+
+        if self.type == "writeValues":
+            if self.values is None or self.formulas is not None:
+                raise ValueError("值动作必须给 values，且不得携带 formulas")
+            if not shaped(self.values):
+                raise ValueError("恢复包动作矩阵形状与会话登记不一致")
+        else:
+            if self.values is not None:
+                raise ValueError("公式动作不得携带 values：计算值不能顶替公式")
+            if self.formulas is None or not shaped(self.formulas):
+                raise ValueError("恢复包动作矩阵形状与会话登记不一致")
+            for row_index, row in enumerate(self.formulas):
+                for column_index, formula in enumerate(row):
+                    if not formula.startswith("="):
+                        raise ValueError(
+                            f"writeFormulas 第 {row_index + 1} 行第 {column_index + 1} 列不是公式文本"
+                        )
+        for matrix in (self.beforeValues, self.beforeFormulas):
+            if not shaped(matrix):
+                raise ValueError("恢复包动作矩阵形状与会话登记不一致")
+        return self
+
+
+class ExecutionRecoveryPackage(BaseModel):
+    """未完成任务恢复包正文（`host: wps`）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schemaVersion: Literal[1]
+    host: Literal["wps"]
+    operationId: str = Field(min_length=8, max_length=100, pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$")
+    taskId: str = Field(min_length=1, max_length=100)
+    workbookIdentity: str = Field(min_length=5, max_length=4000)
+    authorizedSheetNames: list[str] = Field(min_length=1, max_length=200)
+    planId: str = Field(min_length=1, max_length=200)
+    planTitle: str = Field(max_length=500)
+    planFingerprint: str = Field(pattern=r"^plan:v1:\d+:[0-9a-f]{8}$")
+    hostVersion: str = Field(min_length=1, max_length=80)
+    createdAt: str = Field(min_length=10, max_length=40)
+    actions: list[ExecutionRecoveryPackageAction] = Field(min_length=1, max_length=500)
+    sourceEvidence: WpsResumeContext
+
+    @field_validator("workbookIdentity")
+    @classmethod
+    def validate_identity(cls, value: str) -> str:
+        if not value.startswith("wps-path:"):
+            raise ValueError("恢复包工作簿身份必须以 wps-path: 前缀表示已保存的磁盘路径")
+        return value
+
+    @field_validator("authorizedSheetNames")
+    @classmethod
+    def validate_sheet_names(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != len(value) or any(not name or len(name) > 31 for name in value):
+            raise ValueError("恢复包授权表名重复或超长")
+        return value
+
+    @field_validator("createdAt")
+    @classmethod
+    def validate_created_at(cls, value: str) -> str:
+        try:
+            datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise ValueError("恢复包创建时间不是有效时间") from error
+        return value
+
+    @model_validator(mode="after")
+    def validate_binding(self) -> "ExecutionRecoveryPackage":
+        names = set(self.authorizedSheetNames)
+        for index, action in enumerate(self.actions):
+            if action.actionIndex != index:
+                raise ValueError("恢复包动作顺序与索引不一致")
+            if action.sheet not in names:
+                raise ValueError("恢复包动作落在授权范围之外")
+        source_sheets = {source.sheetName for source in self.sourceEvidence.sources}
+        if any(action.sheet in source_sheets for action in self.actions):
+            raise ValueError("恢复包的来源与写入目标重叠")
+        if not source_sheets <= names:
+            raise ValueError("恢复包来源超出授权范围")
+        if self.sourceEvidence.hostVersion != self.hostVersion:
+            raise ValueError("恢复包来源证据与宿主版本不一致")
+        fingerprint = recovery_package_plan_fingerprint(
+            [action.model_dump(include={"actionIndex", "type", "sheet", "range", "rowCount",
+                                        "columnCount", "cellCount", "previewFingerprint",
+                                        "expectedFingerprint"}) for action in self.actions]
+        )
+        if fingerprint != self.planFingerprint:
+            raise ValueError("恢复包计划指纹与动作不一致")
+        return self
+
+
+class ExecutionRecoveryPackageWriteRequest(BaseModel):
+    """保存恢复包。正文是**客户端生成的 JSON 文本**，原样保存、原样读回。
+
+    为什么不是结构化对象再序列化：两端必须是**同一串字节**，客户端才能在读回时
+    逐字比对"落盘的确实是它写的那一份"。摘要由服务端按这段字节算，客户端不参与，
+    因此不依赖浏览器 WebCrypto（WPS 内嵌浏览器不保证 `crypto.subtle` 可用）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    packageJson: str = Field(min_length=2)
+    size: int = Field(ge=2)
+
+
+class ExecutionRecoveryPackageMaterial(BaseModel):
+    """读回的恢复包材料。`expiresAt` 由服务端按保留期算出，客户端不得自行延长。"""
+
+    packageJson: str
+    digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    size: int = Field(ge=1)
+    createdAt: str
+    expiresAt: str
+    savedAt: str
 
 
 class ColumnMappingPair(BaseModel):
@@ -3288,7 +3608,7 @@ class LocalPlanRuleResponse(BaseModel):
 
 
 class PlanResponse(BaseModel):
-    # Trusted compiler metadata, never accepted from model-authored JSON.
+    # Trusted single/batch literal compiler metadata, never accepted from model-authored JSON.
     planOrigin: Literal["literal_range_edit"] | None = None
     kind: Literal["plan"] = "plan"
     plan: AnalysisPlan

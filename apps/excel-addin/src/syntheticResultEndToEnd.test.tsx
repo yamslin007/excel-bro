@@ -174,6 +174,19 @@ vi.mock("./api", async (importOriginal) => ({
   finishOfficeExecution: vi.fn(),
   suspendOfficeExecution: vi.fn(),
   getOfficeExecutionStatus: vi.fn(),
+  /* 用户处置留痕（放弃/撤销）：真实网络出口，必须替身 —— 否则等于测试往用户服务端发请求。 */
+  recordExecutionDisposition: vi.fn(async () => undefined),
+  /* 发现未完成执行：默认"这个工作簿没有待续写的执行"。
+     未替身时产品会真发 GET，测试的网络闸门会直接让用例失败 —— 也就是说，
+     每条挂载 App 的用例都必须显式表态"这个簿有没有未完成执行"。 */
+  listPendingOfficeExecutions: vi.fn(async (workbookIdentity: string) => ({
+    schemaVersion: 1 as const,
+    namespace: "office" as const,
+    workbookIdentity,
+    limit: 20,
+    truncated: false,
+    candidates: []
+  })),
   claimOfficeExecutionResume: vi.fn(),
   reconcileOfficeActionReceipt: vi.fn(),
   pollSdkBridgeTool: vi.fn(async () => ({ calls: [], generation: 0 })),

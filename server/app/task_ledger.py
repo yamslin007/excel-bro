@@ -16,7 +16,20 @@ from .capabilities import capability_int
 
 _READONLY_RETRY_ATTEMPTS = 6
 # 当前 schema 版本（与 _initialize_schema 里的 PRAGMA user_version 一致）。
-_SCHEMA_VERSION = 9
+_SCHEMA_VERSION = 13
+# `office_executions` 上"后加的列"清单：`_schema_is_current` 必须逐个确认它们**真的存在**。
+# 版本号只是意图，列才是事实 —— 版本号被写成最新而列没建时，早退会让补列永久跳过
+# （2026-10-27 真机：恢复包 PUT 因此 500）。新增列必须同时进这里与迁移。
+_REQUIRED_OFFICE_COLUMNS = (
+    "recovery_package_expires_at",
+    "discovery_dismissed_at",
+    "abandoned_at",
+    "undone_at",
+    "recovery_package_digest",
+    "recovery_package_bytes",
+    "recovery_package_retired_at",
+    "recovery_package_removed_at",
+)
 # SQLite 只读相关错误码（用于按**准确类别**判定重试，而非匹配错误字符串）。
 # 见 https://www.sqlite.org/rescode.html ：SQLITE_READONLY(8) 及其扩展码。
 _SQLITE_READONLY_CODES = {8, 8 | (1 << 8), 8 | (2 << 8), 8 | (3 << 8)}
@@ -41,6 +54,10 @@ def _is_readonly_error(error: sqlite3.Error) -> bool:
 def _schema_is_current(path: Path) -> bool:
     """判断已有库是否已达当前 schema 版本（避免重跑 bootstrap 与迁移）。
 
+    **版本号不等于列存在**：只有版本号够新、且所有必填列都在，才算就绪。旧库的
+    `user_version` 可能已经被写成最新而列还没建（升级中途失败、或升级前就在的库），
+    只看版本号会让补列永久跳过 —— 2026-10-27 真机的 `no such column` 就是这么来的。
+
     库不存在、不是 SQLite 库或读取失败 → 返回 False（走完整 bootstrap，
     由 bootstrap 自己失败关闭）。
     """
@@ -49,9 +66,14 @@ def _schema_is_current(path: Path) -> bool:
     try:
         with sqlite3.connect(path, timeout=5) as connection:
             row = connection.execute("PRAGMA user_version").fetchone()
+            columns = {str(column[1]) for column in connection.execute("PRAGMA table_info(office_executions)")}
     except sqlite3.Error:
         return False
-    return bool(row) and int(row[0]) >= _SCHEMA_VERSION
+    return (
+        bool(row)
+        and int(row[0]) >= _SCHEMA_VERSION
+        and all(column in columns for column in _REQUIRED_OFFICE_COLUMNS)
+    )
 
 
 def _connection_is_writable(connection: sqlite3.Connection) -> bool:
@@ -155,6 +177,10 @@ class OfficeExecutionRecord:
     revision: int
     created_at: float
     updated_at: float
+    #: 用户终态处置的首次时刻（`abandoned_at` = 放弃变更，`undone_at` = 撤销本次执行）。
+    #: `None` 只表示"没有这条留痕"，不代表"用户没处置过"（上线前的处置没有留痕）。
+    abandoned_at: float | None = None
+    undone_at: float | None = None
 
 
 ManagedDirectoryStatus = Literal["active", "unavailable", "unsafe", "removed"]
@@ -410,6 +436,37 @@ class FolderOperationLedger:
                 checkpoint_json TEXT,
                 result_json TEXT,
                 error_json TEXT,
+                -- 恢复材料的**首次**到期时间（ISO 文本）。只写一次，之后只读：
+                -- 重复 PUT、读回水合、保留期清理都不许改写这个值，否则"幂等保存"
+                -- 就变成了免费的续期按钮。这里只存时间戳，不存任何单元格正文。
+                recovery_package_expires_at TEXT,
+                -- 「恢复提示已被用户清除」的处置时间（epoch 秒）。**只**用来抑制发现提示：
+                -- 它不推进 revision、不改 status、不动动作游标、不删恢复材料 —— "清除了提示"
+                -- 与"任务已经结束"是两件不同的事实。`dismissed_at >= updated_at` 时该记录
+                -- 不再出现在发现结果里；执行一旦有新变化（updated_at 前进）就重新可见。
+                discovery_dismissed_at REAL,
+                -- 用户对这次执行的**处置留痕**：各自记"第一次发生"的时刻（epoch 秒）。
+                -- `abandoned_at` = 审阅阶段点了「放弃变更」；`undone_at` = 确认之后点了
+                -- 「撤销本次执行」。两列都**只写一次**（首次写赢）、都不推进 `revision`、
+                -- 不改 `status`、不动动作游标、不删恢复材料 —— 它们是"用户做过什么"的
+                -- 审计事实，不是进度。`NULL` 只有一个含义：**没有这条记录**（不是"没做过"）。
+                abandoned_at REAL,
+                undone_at REAL,
+                -- 「被回收的那份恢复材料是哪一份」的留痕（U5，2026-10-30）。
+                -- **只存指纹与字节数，不存材料正文**：恢复包里含单元格原值，账本里一个值
+                -- 都不许有（`test_recovery_material_never_enters_the_task_ledger` 钉着这条）。
+                -- 前两列 + `retired_at` **一起**写、**只写一次**（首次写赢）；`NULL` = 没有这条
+                -- 留痕，不是"材料没被回收过"。它回答的只有一件事：删除那一刻磁盘上那堆字节
+                -- 是什么 —— 拿它跟任何一份留底比，就能确认"当时删的是不是这一份"。
+                recovery_package_digest TEXT,
+                recovery_package_bytes INTEGER,
+                recovery_package_retired_at REAL,
+                -- **文件确已删除**的时刻（epoch 秒）。`NULL` = **没有确认**删除（可能是删除
+                -- 报错、也可能探测到有材料却删到时已不在）。
+                -- 关键区别：`retired_at` 只说明"我记下了要删的是哪一份"，**不能**当成删除成功；
+                -- 只有 `retired_at` 与 `removed_at` 都有，才能说"那一份确实被删掉了"。
+                -- 单独一列而不是复用 `retired_at`：落账成功、删除失败时两者必须能分开读。
+                recovery_package_removed_at REAL,
                 owner_token TEXT NOT NULL,
                 revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1),
                 created_at REAL NOT NULL,
@@ -485,6 +542,40 @@ class FolderOperationLedger:
         if "task_id" not in office_columns:
             connection.execute(
                 "ALTER TABLE office_executions ADD COLUMN task_id TEXT"
+            )
+        if "recovery_package_expires_at" not in office_columns:
+            connection.execute(
+                "ALTER TABLE office_executions ADD COLUMN recovery_package_expires_at TEXT"
+            )
+        if "discovery_dismissed_at" not in office_columns:
+            connection.execute(
+                "ALTER TABLE office_executions ADD COLUMN discovery_dismissed_at REAL"
+            )
+        if "abandoned_at" not in office_columns:
+            connection.execute(
+                "ALTER TABLE office_executions ADD COLUMN abandoned_at REAL"
+            )
+        if "undone_at" not in office_columns:
+            connection.execute(
+                "ALTER TABLE office_executions ADD COLUMN undone_at REAL"
+            )
+        # U5：旧库补三列。**列才是事实**，版本号只是意图 —— 三列必须逐个补，
+        # 漏一列就会让"删除前的留痕"在旧库上静默变成 no-op。
+        if "recovery_package_digest" not in office_columns:
+            connection.execute(
+                "ALTER TABLE office_executions ADD COLUMN recovery_package_digest TEXT"
+            )
+        if "recovery_package_bytes" not in office_columns:
+            connection.execute(
+                "ALTER TABLE office_executions ADD COLUMN recovery_package_bytes INTEGER"
+            )
+        if "recovery_package_retired_at" not in office_columns:
+            connection.execute(
+                "ALTER TABLE office_executions ADD COLUMN recovery_package_retired_at REAL"
+            )
+        if "recovery_package_removed_at" not in office_columns:
+            connection.execute(
+                "ALTER TABLE office_executions ADD COLUMN recovery_package_removed_at REAL"
             )
         connection.execute("PRAGMA user_version = %d" % _SCHEMA_VERSION)
 
@@ -567,6 +658,10 @@ class FolderOperationLedger:
             revision=int(row["revision"]),
             created_at=float(row["created_at"]),
             updated_at=float(row["updated_at"]),
+            abandoned_at=(
+                float(row["abandoned_at"]) if row["abandoned_at"] is not None else None
+            ),
+            undone_at=float(row["undone_at"]) if row["undone_at"] is not None else None,
         )
 
     @classmethod
@@ -1711,6 +1806,56 @@ class FolderOperationLedger:
             ).fetchone()
         return row is not None
 
+    def reserve_recovery_package_expiry(self, operation_id: str, expires_at: str) -> str | None:
+        """登记一次执行的恢复材料**首次**到期时间，返回最终生效的值。
+
+        语义（"首次写赢"）：
+
+        - 该执行不存在 ⇒ 返回 `None`（调用方按"未登记"处理，不许自己造一个期限）；
+        - 已登记 ⇒ 原样返回**第一次**写入的值，绝不被后来的调用推后；
+        - 未登记 ⇒ 只在这时写入 `expires_at`。
+
+        为什么放在账本：保留期清掉磁盘材料之后，仍然要能回答"这次执行的恢复材料本来
+        什么时候到期"，否则删掉文件再 PUT 就能白拿一个新的 7 天。这里只存时间戳，
+        不含任何计划或单元格正文，也不推进 `revision`（它不是执行进度）。
+        """
+
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT recovery_package_expires_at FROM office_executions WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            existing = row["recovery_package_expires_at"]
+            if existing is not None:
+                return str(existing)
+            connection.execute(
+                """
+                UPDATE office_executions SET recovery_package_expires_at = ?
+                WHERE operation_id = ? AND recovery_package_expires_at IS NULL
+                """,
+                (expires_at, operation_id),
+            )
+            connection.commit()
+            row = connection.execute(
+                "SELECT recovery_package_expires_at FROM office_executions WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+        value = None if row is None else row["recovery_package_expires_at"]
+        return str(value) if value is not None else None
+
+    def recovery_package_expiry(self, operation_id: str) -> str | None:
+        """只读：已登记的首次到期时间（没有就 `None`）。"""
+
+        with self._connect_readonly() as connection:
+            row = connection.execute(
+                "SELECT recovery_package_expires_at FROM office_executions WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+        value = None if row is None else row["recovery_package_expires_at"]
+        return str(value) if value is not None else None
+
     def office_execution(self, operation_id: str) -> OfficeExecutionRecord | None:
         with self._connect_readonly() as connection:
             row = connection.execute(
@@ -1718,6 +1863,268 @@ class FolderOperationLedger:
                 (operation_id,),
             ).fetchone()
         return self._office_record(row) if row is not None else None
+
+    def pending_office_executions(
+        self, workbook_identity: str, *, limit: int
+    ) -> tuple[list[OfficeExecutionRecord], bool]:
+        """按**完整相等**的工作簿身份找出未完成执行（只读）。
+
+        这是"重新发现未完成执行"的唯一后端入口：浏览器里的发现索引只是缓存，丢了也能
+        从这里找回来。三条纪律钉在 SQL 里：
+
+        - `workbook_identity = ?` **完整串相等**：不按文件名、不按前缀、不按"最近一条"；
+        - `status IN ('running','needs_reconciliation','failed')`：**已完成不是待续写**；
+        - `discovery_dismissed_at IS NULL OR < updated_at`：用户清掉的提示不再复活，但
+          执行一旦有新变化（`updated_at` 前进）就重新可见。处置列不参与进度判断。
+
+        排序把"有在途动作的"放最前、"写前失败（一个动作都没推进）"放最后 —— 一条刚失败
+        的写前记录不许盖住真正可能已落表的那条。返回 `(records, truncated)`，
+        `truncated` 由多取一条判定，**不得**把截断静默当成"只有这些"。
+        """
+
+        maximum = capability_int("taskRecovery", "pendingDiscoveryMaxCandidates")
+        effective = max(1, min(int(limit), maximum))
+        with self._connect_readonly() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM office_executions
+                WHERE workbook_identity = ?
+                    AND status IN ('running', 'needs_reconciliation', 'failed')
+                    AND (discovery_dismissed_at IS NULL OR discovery_dismissed_at < updated_at)
+                ORDER BY
+                    CASE
+                        WHEN in_flight_action_index IS NOT NULL
+                            OR status = 'needs_reconciliation' THEN 0
+                        WHEN status = 'failed'
+                            AND next_action_index = 0
+                            AND in_flight_action_index IS NULL THEN 2
+                        ELSE 1
+                    END,
+                    updated_at DESC,
+                    operation_id ASC
+                LIMIT ?
+                """,
+                (workbook_identity, effective + 1),
+            ).fetchall()
+        records = [self._office_record(row) for row in rows[:effective]]
+        return records, len(rows) > effective
+
+    def dismiss_office_execution_discovery(self, operation_id: str) -> bool:
+        """记下"用户已核对并清除了这条发现提示"（幂等）。
+
+        **只写一列时间戳**：不改 `status`、不推进 `revision`、不动动作游标与在途动作、
+        不删恢复材料。拿它冒充"任务已完成"或"没写过"，会让下一次真正的续跑失去依据。
+        返回该执行是否存在（不存在就是 `False`，调用方不得事后补建）。
+        """
+
+        now = time.time()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            changed = connection.execute(
+                "UPDATE office_executions SET discovery_dismissed_at = ? WHERE operation_id = ?",
+                (now, operation_id),
+            ).rowcount
+            connection.commit()
+        return changed == 1
+
+    #: 用户处置的两条合法取值 → `office_executions` 上对应的列名。
+    #: 不放进数据库 CHECK：SQLite 的 `ADD COLUMN` 加不了带 CHECK 的列，两处各写一份
+    #: 约束只会在迁移后不一致。合法取值只在这里判一次。
+    DISPOSITION_COLUMNS = {"abandoned": "abandoned_at", "undone": "undone_at"}
+
+    def record_office_disposition(
+        self, operation_id: str, disposition: str
+    ) -> tuple[bool, float | None]:
+        """记下用户对这次执行做过的终态处置（**首次写赢**）。
+
+        只写一列时间戳，别的一概不做：
+
+        - **不推进 `revision`**、不改 `status`、不动 `next/in_flight`、不删恢复材料 ——
+          "用户放弃了/撤销了"不是执行进度，写进进度会让续跑判据错位；
+        - **重复上报不改写历史**：这一列回答的是"第一次发生在什么时候"，重试、双端各报一次、
+          用户再点一次，都不该把那一刻往后退（与 `reserve_recovery_package_expiry` 同一口径）；
+        - 记录不存在就返回 `(False, None)`：**绝不**为了留痕补建一条账本。
+
+        返回 `(记录是否存在, 该处置第一次被记下的时刻)`。
+        """
+
+        column = self.DISPOSITION_COLUMNS.get(disposition)
+        if column is None:
+            raise ValueError("未知的执行处置类型")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            exists = connection.execute(
+                "SELECT 1 FROM office_executions WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            if exists is None:
+                connection.rollback()
+                return False, None
+            connection.execute(
+                f"UPDATE office_executions SET {column} = ? "
+                f"WHERE operation_id = ? AND {column} IS NULL",
+                (time.time(), operation_id),
+            )
+            row = connection.execute(
+                f"SELECT {column} FROM office_executions WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            connection.commit()
+        recorded = None if row is None else row[column]
+        return True, (float(recorded) if recorded is not None else None)
+
+    def office_disposition(self, operation_id: str) -> dict[str, float | None] | None:
+        """只读：这次执行被放弃/撤销的**首次时刻**（没有记录就是 `None`）。
+
+        `NULL` 的含义必须读作"**没有这条留痕**"：本功能上线前发生过的放弃/撤销，
+        以及从未做过处置的执行，看起来完全一样。**不要**把 `None` 说成"用户没放弃过"。
+        """
+
+        with self._connect_readonly() as connection:
+            row = connection.execute(
+                "SELECT abandoned_at, undone_at FROM office_executions WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "abandonedAt": None if row["abandoned_at"] is None else float(row["abandoned_at"]),
+            "undoneAt": None if row["undone_at"] is None else float(row["undone_at"]),
+        }
+
+    def record_recovery_package_retirement(
+        self, operation_id: str, digest: str, size: int
+    ) -> tuple[bool, dict[str, Any] | None]:
+        """记下「这次执行的恢复材料被交出回收」（U5，**删除前**写、**首次写赢**）。
+
+        为什么需要它：材料一删就没得算了。删掉之后任何"当时那份材料是不是这一份"的回答
+        都只能是推断 —— 而终态回收恰恰是唯一合法删除点（原地撤销成功），验收时最想知道
+        的正是"消失的是哪一份"。
+
+        **和 `record_office_disposition` 的两处差别，不许照抄**：
+
+        - **时机相反**：处置留痕必须等宿主恢复**成功之后**才写（没恢复就不许说"撤销了"）；
+          这一条必须在删除**之前**写 —— 它记的是"即将被删掉的那堆字节"，删完只剩猜。
+        - **失败不许被吞掉**：调用方（DELETE 端点）拿不到留痕就**不许删**。否则"删了但
+          没记录"正是这一列要防的那种状态。上报方（端上 `retireWpsRecoveryPackage`）本来
+          就吞错，于是失败的表现是"材料留着、等保留期到期"，不是"材料没了还没证据"。
+
+        三列（指纹/字节数/时刻）**同一次 UPDATE 一起写**：拆成三次会出现"有指纹没时刻"
+        这种半条记录。`NULL` = 没有留痕，不是"材料没被回收过"。
+        """
+
+        fingerprint = (digest or "").strip().lower()
+        if len(fingerprint) != 64 or any(ch not in "0123456789abcdef" for ch in fingerprint):
+            raise ValueError("恢复材料指纹必须是 64 位十六进制摘要")
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            raise ValueError("恢复材料字节数必须是非负整数")
+        now = time.time()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            exists = connection.execute(
+                "SELECT 1 FROM office_executions WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            if exists is None:
+                connection.rollback()
+                return False, None
+            connection.execute(
+                "UPDATE office_executions "
+                "SET recovery_package_digest = ?, recovery_package_bytes = ?, "
+                "    recovery_package_retired_at = ? "
+                "WHERE operation_id = ? AND recovery_package_retired_at IS NULL",
+                (fingerprint, int(size), now, operation_id),
+            )
+            row = connection.execute(
+                "SELECT recovery_package_digest, recovery_package_bytes, "
+                "       recovery_package_retired_at, recovery_package_removed_at "
+                "FROM office_executions WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            connection.commit()
+        if row is None or row["recovery_package_retired_at"] is None:
+            # 记录在、但这一列仍空：只可能是并发下 UPDATE 没命中（不会发生），
+            # 或者从来没写过。两种都读作"没有留痕"，不编一个时刻出来。
+            return True, None
+        return True, self._retirement_row(row)
+
+    def mark_recovery_package_removed(
+        self, operation_id: str
+    ) -> tuple[bool, dict[str, Any] | None]:
+        """记下「文件**确实**删掉了」（U5 的第二个事实，首次写赢）。
+
+        为什么必须单独一列，不能复用 `retired_at`：落账成功、删除失败是完全可能的状态
+        （磁盘占用、权限、进程还在读）。那时 `retired_at` 已经有值，如果拿它当"删掉了"，
+        读取方就会得到一条**假的删除结论**。所以：
+
+        - `retired_at` = "我记下了要删的是这一份"（删前摘要，**只是记录**）；
+        - `removed_at` = "`remove()` 报告真的删掉了"（**确认删除**）；
+        - 只有两者都有，才能说"那一份确实被删掉了"。
+
+        调用点**只**在 `remove()` 返回 True 之后。`remove()` 返回 False（探测到有、删到时
+        已不在）或抛错，都不写这一列 —— "不是删掉的"就不许记成删掉的。
+        """
+
+        now = time.time()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            exists = connection.execute(
+                "SELECT 1 FROM office_executions WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            if exists is None:
+                connection.rollback()
+                return False, None
+            connection.execute(
+                "UPDATE office_executions SET recovery_package_removed_at = ? "
+                "WHERE operation_id = ? AND recovery_package_removed_at IS NULL",
+                (now, operation_id),
+            )
+            row = connection.execute(
+                "SELECT recovery_package_digest, recovery_package_bytes, "
+                "       recovery_package_retired_at, recovery_package_removed_at "
+                "FROM office_executions WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            connection.commit()
+        if row is None:
+            return True, None
+        return True, self._retirement_row(row)
+
+    @staticmethod
+    def _retirement_row(row: Any) -> dict[str, Any] | None:
+        """把留痕那一行折成对外形状；`retired_at` 为空就是"没有留痕"。"""
+
+        if row["recovery_package_retired_at"] is None:
+            return None
+        return {
+            "digest": row["recovery_package_digest"],
+            "bytes": None if row["recovery_package_bytes"] is None else int(row["recovery_package_bytes"]),
+            "retiredAt": float(row["recovery_package_retired_at"]),
+            "removedAt": None if row["recovery_package_removed_at"] is None
+            else float(row["recovery_package_removed_at"]),
+        }
+
+    def recovery_package_retirement(self, operation_id: str) -> dict[str, Any] | None:
+        """只读：这份恢复材料被回收时的指纹与两个时刻（没有留痕就是 `None`）。
+
+        `None` 必须读作"**没有这条留痕**"：本功能上线前删掉的材料、以及从未回收过的
+        执行，看起来完全一样。**不要**把 `None` 说成"材料还在"。
+
+        `removedAt is None` 必须读作"**没有确认删除**"：不能因为 `retiredAt` 有值就宣称
+        删掉了 —— 那正是这条留痕最容易读错的地方。
+        """
+
+        with self._connect_readonly() as connection:
+            row = connection.execute(
+                "SELECT recovery_package_digest, recovery_package_bytes, "
+                "       recovery_package_retired_at, recovery_package_removed_at "
+                "FROM office_executions WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._retirement_row(row)
 
     def append_office_host_writes(
         self, operation_id: str, entries: list[dict[str, Any]]

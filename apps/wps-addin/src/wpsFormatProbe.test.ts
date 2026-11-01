@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   runWpsFormatProbe,
   assertWpsFormatProbeTarget,
@@ -10,6 +10,16 @@ import {
   XL_LINE_STYLE
 } from "./wpsFormatProbe";
 import type { WpsApplication, WpsRange, WpsWorksheet } from "./wpsHost";
+
+/*
+ * DEV 探针是**真实网络出口**（`POST /__wps_probe`，打到 dev server 的 console）。
+ * 生产里它只在 `import.meta.env.DEV` 生效、失败被吞，所以没有任何人注意到测试也在发它。
+ * 测试不需要这条遥测：显式替身，别让"跑一遍测试"变成"往网络发一堆请求"。
+ */
+vi.mock("./devProbe", () => ({
+  reportDevProbe: vi.fn(),
+  reportDevProbeDetail: vi.fn()
+}));
 
 /**
  * 替身宿主：一个带可读可写格式成员的单元格。

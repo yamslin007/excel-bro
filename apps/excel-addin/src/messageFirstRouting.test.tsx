@@ -1,3 +1,4 @@
+import * as historyApi from "./api";
 // @vitest-environment jsdom
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -51,8 +52,11 @@ const fixtures = vi.hoisted(() => ({  order: [] as string[],
   target: { fileKey: "office:book-1", name: "book.xlsx", sheets: [{ id: "sheet-1", name: "Sheet1" }], selected: ["sheet-1"] }
 }));
 
-vi.mock("./api", async (importOriginal) => ({
-  ...await importOriginal<typeof import("./api")>(),
+vi.mock("./api", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./api")>();
+  const { guardNetworkSeam } = await import("@excel-bro/core/testNetworkGate");
+  return {
+  ...actual,
   checkHealth: vi.fn(async () => ({ status: "ok", modelConfigured: true })),
   listModels: vi.fn(async () => ({ defaultModelId: "model-1", models: [{ id: "model-1", label: "模型", modelId: "test-model", baseUrl: "http://localhost", supportsVision: true, available: true }] })),
   getModelSettings: vi.fn(async () => ({ connectionCount: 1 })),
@@ -68,8 +72,16 @@ vi.mock("./api", async (importOriginal) => ({
    * 默认**读不到**：绝大多数用例走到"仍在运行"就该停下，不偷偷发真请求。
    * 需要这条路径的用例自己 `mockResolvedValueOnce` 提供分页。
    */
-  getPlanningTaskEvents: vi.fn(async () => { throw new TypeError("Failed to fetch"); })
-}));
+  getPlanningTaskEvents: vi.fn(async () => { throw new TypeError("Failed to fetch"); }),
+  /*
+   * 只读轮询桥（`POST /api/sdk/tool-bridge/poll`）：接回原任务进度时会问一次有没有
+   * 待执行的读表指针。以前没有替身 —— 这条请求真打到 `127.0.0.1:8765`，用例却断言
+   * "宿主写入 0"。这条接缝有几条用例要**故意**跑真实实现（自己 stub fetch 驱动轮询），
+   * 所以用 `guardNetworkSeam`：本用例装了 fetch 替身才真的调用，否则按"连不上"失败。
+   */
+  pollSdkBridgeTool: vi.fn(guardNetworkSeam(actual.pollSdkBridgeTool))
+  };
+});
 vi.mock("./excel", async (importOriginal) => ({
   ...await importOriginal<typeof import("./excel")>(),
   isRunningInExcel: () => true,
@@ -160,6 +172,41 @@ async function send(text: string) {
 }
 
 describe("Excel actual composer: message first", () => {
+  it("history alignment: cancel/confirm deletion preserves other guards and navigation never writes", async () => {
+    const host = createOfficeTestHost({ url: "file:///C:/Data/book.xlsx", sheets: [{ name: "Sheet1", values: [["合成数据"]] }] }); vi.stubGlobal("Excel", host.Excel);
+    const mutations = [
+      vi.spyOn(historyApi, "registerOfficeExecution"), vi.spyOn(historyApi, "startOfficeAction"),
+      vi.spyOn(historyApi, "completeOfficeAction"), vi.spyOn(historyApi, "finishOfficeExecution"),
+      vi.spyOn(historyApi, "claimOfficeExecutionResume"), vi.spyOn(historyApi, "reconcileOfficeActionReceipt"),
+      vi.spyOn(historyApi, "recordExecutionDisposition"), vi.spyOn(historyApi, "deleteExecutionRecoveryPackage")
+    ];
+    for (const mutation of mutations) mutation.mockRejectedValue(new Error("History must never mutate execution"));
+    const key = "excel-bro.chat.v4";
+    localStorage.setItem(key, JSON.stringify({ activeConversationId: "alpha", legacyCredentialConversationIds: ["guarded"],
+      conversations: ["alpha", "beta", "guarded"].map((id) => ({ id, title: id,
+        createdAt: "2026-10-01T00:00:00Z", updatedAt: "2026-10-01T00:00:00Z",
+        messages: [{ id: `m-${id}`, role: "user", text: `普通聊天 ${id}`, createdAt: "2026-10-01T00:00:00Z" }] })) }));
+    const view = render(<App />);
+    await waitFor(() => expect(view.container.textContent).toContain("普通聊天 alpha"));
+    fireEvent.click(view.getByRole("button", { name: "更多" }));
+    expect(view.container.textContent).toContain("查看并打开已保存的对话");
+    fireEvent.click(view.getByRole("menuitem", { name: /^历史对话/ }));
+    const saved = () => JSON.parse(localStorage.getItem(key)!);
+    fireEvent.click(view.getByRole("button", { name: "删除「beta」" }));
+    fireEvent.click(view.getByRole("button", { name: /^取消$/ }));
+    expect(saved().conversations.map((c: {id: string}) => c.id)).toEqual(["alpha", "beta", "guarded"]);
+    fireEvent.click(view.getByRole("button", { name: "删除「beta」" }));
+    fireEvent.click(view.getByRole("button", { name: /^确认删除$/ }));
+    expect(saved().conversations.map((c: {id: string}) => c.id)).toEqual(["alpha", "guarded"]);
+    expect(saved().legacyCredentialConversationIds).toEqual(["guarded"]);
+    fireEvent.click([...view.container.querySelectorAll<HTMLButtonElement>(".history-open-button")].find((b) => b.textContent?.includes("guarded"))!);
+    expect(view.container.querySelector(".message-stream")?.textContent).toContain("普通聊天 guarded");
+    expect(saved().legacyCredentialConversationIds).toEqual(["guarded"]);
+    expect(host.writes()).toHaveLength(0);
+    for (const mutation of mutations) expect(mutation).not.toHaveBeenCalled();
+    expect(understandMessage).not.toHaveBeenCalled(); expect(streamAssistantResponse).not.toHaveBeenCalled();
+  });
+
   it.each([
     ["MODEL_QUOTA_EXHAUSTED", "模型 API 余额不足或调用额度已用尽", "模型设置"],
     ["MODEL_CONTEXT_LIMIT", "上下文长度上限", "拆分任务"],
@@ -184,9 +231,16 @@ describe("Excel actual composer: message first", () => {
       .mockResolvedValue({ kind: "proceed", confirmedPrompt: "根据类别填写等级", summary: "填写等级", provider: "model" });
     vi.mocked(streamAssistantResponse).mockResolvedValue({ kind: "answer", provider: "model", message: "收到新口径" });
     const view = await send("根据类别填写等级");
-    await waitFor(() => expect(view.container.querySelector(".clarification-custom-input textarea")).not.toBeNull());
-    fireEvent.change(view.container.querySelector(".clarification-custom-input textarea")!, { target: { value: "逐行填写" } });
-    fireEvent.click(view.getByRole("button", { name: "提交补充" }));
+    await waitFor(() => expect(view.container.querySelector(".composer textarea")).not.toBeNull());
+    /*
+     * 自由输入就在输入框本身：不再有第二个光标（`.clarification-custom-input`），
+     * 也不再有自己的「提交补充」按钮 —— 提交统一发生在右下角那一颗
+     * （此时它的可访问名是「发送回答」）。
+     */
+    expect(view.container.querySelector(".clarification-custom-input")).toBeNull();
+    expect(view.queryByRole("button", { name: "提交补充" })).toBeNull();
+    fireEvent.change(view.container.querySelector(".composer textarea")!, { target: { value: "逐行填写" } });
+    fireEvent.click(view.getByRole("button", { name: "发送回答" }));
     await waitFor(() => expect(view.container.textContent).toContain("确认连接中断"));
     const history = JSON.parse(localStorage.getItem("excel-bro.chat.v4")!);
     const card = history.conversations.flatMap((item: { messages: unknown[] }) => item.messages)
@@ -194,8 +248,8 @@ describe("Excel actual composer: message first", () => {
     expect(card.clarification.taskContext.confirmations).toEqual([
       { questionId: "retry-mode", label: "填写口径", value: "逐行填写" }
     ]);
-    fireEvent.change(view.container.querySelector(".clarification-custom-input textarea")!, { target: { value: "分组汇总" } });
-    fireEvent.click(view.getByRole("button", { name: "提交补充" }));
+    fireEvent.change(view.container.querySelector(".composer textarea")!, { target: { value: "分组汇总" } });
+    fireEvent.click(view.getByRole("button", { name: "发送回答" }));
     await waitFor(() => expect(view.container.textContent).toContain("收到新口径"));
     const request = vi.mocked(checkIntent).mock.calls[2][0];
     expect(request.taskContext?.confirmations).toEqual([
@@ -216,10 +270,18 @@ describe("Excel actual composer: message first", () => {
     vi.mocked(streamAssistantResponse).mockResolvedValueOnce(clarification("blank", "空值处理", "空值不写入", "清空目标"))
       .mockResolvedValue({ kind: "answer", provider: "model", message: "完整规则已收到" });
     const view = await send("根据类别填写等级");
-    await waitFor(() => expect(view.getByRole("button", { name: /逐行填写/ })).toBeTruthy());
-    fireEvent.click(view.getByRole("button", { name: /逐行填写/ }));
+    /*
+     * 快捷回答**点只选中、不提交**：以前点一下就把这一轮答案发出去了，
+     * 想改口径没机会回头。现在选中只是本地草稿，发送才提交。
+     */
+    const yes = await view.findByRole("button", { name: /逐行填写/ });
+    fireEvent.click(yes);
+    expect(yes.getAttribute("aria-pressed")).toBe("true");
+    expect(streamAssistantResponse).not.toHaveBeenCalled();
+    fireEvent.click(view.getByRole("button", { name: "发送回答" }));
     await waitFor(() => expect(view.getByRole("button", { name: /空值不写入/ })).toBeTruthy());
     fireEvent.click(view.getByRole("button", { name: /空值不写入/ }));
+    fireEvent.click(view.getByRole("button", { name: "发送回答" }));
     await waitFor(() => expect(streamAssistantResponse).toHaveBeenCalledTimes(2));
     const context = vi.mocked(streamAssistantResponse).mock.calls[1][0].taskContext;
     expect(context?.originalPrompt).toBe("根据类别填写等级");
@@ -230,6 +292,140 @@ describe("Excel actual composer: message first", () => {
     await waitFor(() => expect(streamAssistantResponse).toHaveBeenCalledTimes(3));
     expect(vi.mocked(streamAssistantResponse).mock.calls[2][0].taskContext)
       .toEqual({ schemaVersion: 1, originalPrompt: "调整列宽", confirmations: [] });
+  });
+
+  /*
+   * 回车在**澄清回答**这件事上的三种真实输入。
+   *
+   * 中文输入法的组合期按 Enter 是"选定候选词"，不是"发送"：以前这里只判
+   * `key === "Enter" && !shiftKey`，一句话还没选完词就整句发出去了 —— 在问题待回答
+   * 的时候它还会被当成"答案"，把这道题用半截话结掉。
+   *
+   * **口径**：组合期那一拍**允许候选字上屏**（我们一个字节都不拦：不 `preventDefault`），
+   * 要求的是"不发送消息、不触发暂停／继续"。别把它写成"不上屏" —— 那是把输入法
+   * 本来该做的事也当成了要禁止的行为。
+   */
+  it("组合期的 Enter 只确认候选词：候选字照常上屏，但不发送、不触发暂停或继续", async () => {
+    vi.mocked(understandMessage).mockResolvedValue({ kind: "needs_workbook_context", summary: "填写等级", provider: "model" });
+    vi.mocked(checkIntent).mockResolvedValue({ kind: "clarification", provider: "model", clarification: {
+      id: "ime-mode", summary: "填写口径", question: "如何填写？", reason: "需要口径",
+      scopeLabel: "Sheet1", options: []
+    } });
+    const view = await send("根据类别填写等级");
+    await waitFor(() => expect(view.getByRole("button", { name: "发送回答" })).toBeTruthy());
+    const textarea = view.container.querySelector<HTMLTextAreaElement>(".composer textarea")!;
+    fireEvent.change(textarea, { target: { value: "汇总一下" } });
+    const before = vi.mocked(checkIntent).mock.calls.length;
+
+    /*
+     * ① 组合期（`isComposing`）：这一拍是"确认候选词"。我们**不拦默认行为**
+     *    （`fireEvent` 返回 true = 没有 `preventDefault`），所以候选字照常进输入框；
+     *    但一个字节都不发、也不暂停。
+     */
+    const composingSunk = fireEvent.keyDown(textarea, { key: "Enter", isComposing: true });
+    await act(async () => {});
+    expect(composingSunk).toBe(true);
+    expect(vi.mocked(checkIntent).mock.calls.length).toBe(before);
+    // ② 有的输入法在组词结束那一拍只留 `keyCode === 229`；同样不许发送。
+    const composingEnd = fireEvent.keyDown(textarea, { key: "Enter", keyCode: 229 });
+    await act(async () => {});
+    expect(composingEnd).toBe(true);
+    expect(vi.mocked(checkIntent).mock.calls.length).toBe(before);
+    // 输入框里的字**还在**（既没清空，也没被当成新需求发走）。
+    expect(textarea.value).toBe("汇总一下");
+    expect(view.container.querySelector(".message-row.user")).not.toBeNull();
+
+    // ③ Shift + Enter 是换行，同样不提交。
+    fireEvent.keyDown(textarea, { key: "Enter", shiftKey: true });
+    await act(async () => {});
+    expect(vi.mocked(checkIntent).mock.calls.length).toBe(before);
+
+    // ④ 组合结束后的那一次 Enter 才是提交。
+    fireEvent.keyDown(textarea, { key: "Enter" });
+    await waitFor(() => expect(vi.mocked(checkIntent).mock.calls.length).toBe(before + 1));
+    expect(vi.mocked(checkIntent).mock.calls.at(-1)![0].prompt).toContain("汇总一下");
+  });
+
+  it("不读表的追问替换输入框：其他与框选互斥，提交仍不读取或写入", async () => {
+    vi.mocked(understandMessage).mockResolvedValueOnce({ kind: "clarification", provider: "model", clarification: {
+      id: "before-read", summary: "规则", question: "如何分级？", reason: "先确认", scopeLabel: "仅讨论",
+      options: [
+        { id: "range", label: "区间分级", description: "按区间", resolution: "按区间分级" },
+        { id: "map", label: "逐项对应", description: "按映射", resolution: "按映射分级" }
+      ]
+    }}).mockResolvedValue({ kind: "needs_workbook_context", summary: "需要读表", provider: "model" });
+    const view = await send("先询问分级规则，不要读取或修改工作表");
+    const option = await view.findByRole("button", { name: /区间分级/ });
+    const other = view.getByPlaceholderText("其他");
+    expect(view.container.querySelector(".message-stream .clarification-card.pending")).toBeNull();
+    expect(view.getAllByText("如何分级？")).toHaveLength(1);
+    expect(option.closest(".composer-box.is-answering")).not.toBeNull();
+    fireEvent.click(option);
+    expect(option.getAttribute("aria-pressed")).toBe("true");
+    fireEvent.change(other, { target: { value: "我的规则" } });
+    expect(option.getAttribute("aria-pressed")).toBe("false");
+    fireEvent.click(option);
+    expect((other as HTMLTextAreaElement).value).toBe("");
+    expect(understandMessage).toHaveBeenCalledTimes(1);
+    fireEvent.click(view.getByRole("button", { name: "发送回答" }));
+    await waitFor(() => expect(view.container.textContent).toContain("回答已记录，尚未读取或修改工作表"));
+    expect(understandMessage).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(understandMessage).mock.calls[1][0].prompt).toContain("不要读取或修改工作表");
+    expect(captureWorkbookStructure).not.toHaveBeenCalled();
+    expect(checkIntent).not.toHaveBeenCalled();
+    expect(streamAssistantResponse).not.toHaveBeenCalled();
+    expect(view.container.querySelector(".composer-box.is-answering")).toBeNull();
+    expect(view.container.querySelector(".message-stream .clarification-card.resolved")?.textContent).toContain("如何分级？");
+  });
+
+  it("选中选项后回车即可提交，且点选项本身不提交", async () => {
+    vi.mocked(understandMessage).mockResolvedValue({ kind: "needs_workbook_context", summary: "填写等级", provider: "model" });
+    vi.mocked(checkIntent).mockResolvedValueOnce({ kind: "clarification", provider: "model", clarification: {
+      id: "enter-mode", summary: "填写口径", question: "如何填写？", reason: "需要口径", scopeLabel: "Sheet1",
+      options: [{ id: "row", label: "逐行填写", description: "逐行填写", resolution: "逐行填写" }]
+    } }).mockResolvedValue({ kind: "proceed", confirmedPrompt: "根据类别填写等级", summary: "填写等级", provider: "model" });
+    vi.mocked(streamAssistantResponse).mockResolvedValue({ kind: "answer", provider: "model", message: "已收到口径" });
+    const view = await send("根据类别填写等级");
+    const option = await view.findByRole("button", { name: /逐行填写/ });
+    expect(option.closest(".composer-box")).not.toBeNull();
+    expect(view.container.querySelector(".clarification-bypass-toggle")?.closest(".composer-box")).not.toBeNull();
+    expect(view.container.querySelectorAll(".clarification-composer")).toHaveLength(1);
+    fireEvent.click(option);
+    expect(option.getAttribute("aria-pressed")).toBe("true");
+    expect(vi.mocked(checkIntent).mock.calls).toHaveLength(1);
+    fireEvent.keyDown(view.container.querySelector(".composer textarea")!, { key: "Enter" });
+    await waitFor(() => expect(view.container.textContent).toContain("已收到口径"));
+    expect(view.container.querySelector(".composer-box.is-answering")).toBeNull();
+    expect(vi.mocked(checkIntent).mock.calls).toHaveLength(2);
+  });
+
+  /*
+   * 「旧问题不得重复提交」+「对话切换时答案失效」。
+   *
+   * 绑定身份是 `conversationId + messageId + clarificationId`。换到新对话之后，
+   * 那道题属于**上一段**对话，输入框必须回到"提新需求"，而不是继续给旧题发答案。
+   */
+  it("换到新对话后旧题的选中与答案一起失效，发送恢复成新需求", async () => {
+    vi.mocked(understandMessage).mockResolvedValue({ kind: "needs_workbook_context", summary: "填写等级", provider: "model" });
+    vi.mocked(checkIntent).mockResolvedValueOnce({ kind: "clarification", provider: "model", clarification: {
+      id: "switch-mode", summary: "填写口径", question: "如何填写？", reason: "需要口径", scopeLabel: "Sheet1",
+      options: [{ id: "row", label: "逐行填写", description: "逐行填写", resolution: "逐行填写" }]
+    } }).mockResolvedValue({ kind: "proceed", confirmedPrompt: "新的需求", summary: "新的需求", provider: "model" });
+    vi.mocked(streamAssistantResponse).mockResolvedValue({ kind: "answer", provider: "model", message: "新需求已收到" });
+    const view = await send("根据类别填写等级");
+    fireEvent.click(await view.findByRole("button", { name: /逐行填写/ }));
+    expect(view.getByRole("button", { name: "发送回答" })).toBeTruthy();
+
+    fireEvent.click(view.getByRole("button", { name: "新对话" }));
+    await waitFor(() => expect(view.queryByRole("button", { name: "发送回答" })).toBeNull());
+    expect(view.queryByLabelText("回答待确认的问题")).toBeNull();
+    expect(view.container.querySelector(".clarification-answer-region")).toBeNull();
+
+    fireEvent.change(view.container.querySelector(".composer textarea")!, { target: { value: "新的需求" } });
+    fireEvent.keyDown(view.container.querySelector(".composer textarea")!, { key: "Enter" });
+    await waitFor(() => expect(view.container.textContent).toContain("新需求已收到"));
+    // 走的是新需求链路（understandMessage 又跑了一次），不是给旧题补答案。
+    expect(vi.mocked(understandMessage).mock.calls).toHaveLength(2);
   });
   it.each(["new", "history"])("clears the previous conversation's progress hint on %s chat navigation, showing the idle anchor for a finished turn", async (navigation) => {
     vi.mocked(understandMessage).mockResolvedValue({ kind: "conversation", message: "历史回答", provider: "model" });
@@ -870,6 +1066,15 @@ describe("Excel actual composer: message first", () => {
     expect(after).toHaveLength(originalTimelineCount + 1);
     expect(after.slice(0, originalTimelineCount).map((segment) => segment.steps.length))
       .toEqual(beforeSegments.map((segment) => segment.steps.length));
+    /*
+     * 新段正常结束 ⇒ 过程框**收起成一行**（阶段结论 + 耗时）。
+     * 所以"这一步带来了新动作"不能再靠 DOM 里现成的 `<li>` 数量证明，
+     * 要先把它展开：收起是呈现，不是内容被删。
+     */
+    const newCard = view.container
+      .querySelectorAll<HTMLElement>(".task-progress-timeline")[originalTimelineCount];
+    expect(newCard?.getAttribute("data-expanded")).toBe("false");
+    fireEvent.click(newCard!.querySelector<HTMLButtonElement>(".task-progress-toggle")!);
     expect(view.container.querySelectorAll(".activity-steps > li").length)
       .toBeGreaterThan(originalStepCount);
     expect(liveSegmentCount(view.container)).toBeLessThanOrEqual(1);
@@ -895,7 +1100,11 @@ describe("Excel actual composer: message first", () => {
     expect(view.container.textContent).not.toContain("读取已授权表结构");
     expect(view.getByRole("button", { name: "展开" }).getAttribute("aria-expanded")).toBe("false");
     fireEvent.click(view.getByRole("button", { name: "展开" }));
-    expect(view.container.textContent).toContain("理解消息");
+    // 完成后的普通聊天只保留真实完成说明，不重复准备阶段文案。
+    expect(view.container.textContent).toContain("已理解并直接回复；未读取工作表");
+    expect(view.container.textContent).not.toContain("本次没有需要你处理的后续操作");
+    expect(view.container.querySelector(".task-progress-timeline")?.closest(".message-row")?.querySelector(".message-author")).toBeNull();
+    expect(view.container.textContent).not.toContain("先判断是否需要工作簿上下文");
     expect(captureWorkbookStructure).not.toHaveBeenCalled();
   });
 
@@ -1178,12 +1387,22 @@ describe("Excel actual composer: message first", () => {
     // 第一轮：等到按钮真的出现再点（这一轮派发时界面已提交）。
     fireEvent.click(await view.findByRole("button", { name: "暂停任务" }));
     await waitFor(() => expect(view!.queryByRole("button", { name: "暂停任务" })).toBeNull());
-    const sendButton = view.getByRole("button", { name: "发送" });
-    expect(sendButton.hasAttribute("disabled")).toBe(true);
+    /*
+     * 已暂停（且有真检查点）⇒ 主按钮就是「继续任务」，不是"灰掉的 ■"、也不是"发送"。
+     * 按钮只有一颗、位置只有一个：右下角。
+     */
+    const continueButton = view.getByRole("button", { name: "继续任务" });
+    expect(continueButton.hasAttribute("disabled")).toBe(false);
+    expect(continueButton.closest(".composer")).not.toBeNull();
+    /*
+     * 而回车**不会**顺手继续：回车只表达"把这段话发出去"，此时输入框是空的，
+     * 所以什么也不该发生。谁把分派改回"运行中/暂停中按回车就继续"，这条会立刻红。
+     */
     fireEvent.keyDown(view.container.querySelector("textarea")!, { key: "Enter" });
     await act(async () => {});
     expect(checkIntent).toHaveBeenCalledOnce();
-    expect(view.getByRole("button", { name: "继续任务" }).closest(".task-execution-controls")).not.toBeNull();
+    // 输入框上方只剩一句状态说明，没有第二颗按钮。
+    expect(view.getByRole("button", { name: "继续任务" }).closest(".task-execution-notice")).toBeNull();
     // 第二轮：点「继续任务」触发的这次派发，界面还没提交。
     fireEvent.click(await view.findByRole("button", { name: "继续任务" }));
     await waitFor(() => expect(checkIntent).toHaveBeenCalledTimes(2));

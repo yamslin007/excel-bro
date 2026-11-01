@@ -1,5 +1,16 @@
 import { sameJsonEvidence } from "@excel-bro/core/jsonEvidence";
 import {
+  FORMULA_SOURCE_CHANGED_MESSAGE,
+  FORMULA_SOURCE_EVIDENCE_MISSING_MESSAGE,
+  FORMULA_SOURCE_UNVERIFIABLE_MESSAGE,
+  formulaMatrixSite,
+  formulaResumeGate,
+  formulaSheetReferences,
+  formulaSourceEvidenceRequirement,
+  formulaWriteMatrixIssue
+} from "@excel-bro/core/formulaWriteback";
+import {isTrustedLiteralPlan, stampLiteralPlanOrigin} from "@excel-bro/core/literalPlanOrigin";
+import {
   anchorSheetsWithin,
   judgePlanSourceGate,
   planHasBakedValues,
@@ -219,6 +230,16 @@ type WpsPreparedSource = {
   rowCount: number;
   columnCount: number;
   previewFingerprint: string;
+  /**
+   * 这条证据**只为精确恢复**而采（公式依赖表的整张有效区域），不参与"预览后源变了就
+   * 不许执行"那道闸。
+   *
+   * 为什么要分开：公式写下去的是**文本**，宿主执行时按当时的源值自己算 —— 预览之后
+   * 源值变了，正常执行本来就该按新值算（产品规则：该规则针对恢复，不改变正常公式的
+   * 自动重算）。把恢复用的基线也塞进执行期复核，等于让"来源变了就停"顺手改掉了
+   * 正常写入行为，还会和 Excel 端不一致（那边这份基线只喂续跑闸）。
+   */
+  coverageOnly?: boolean;
 };
 
 export type WpsPreparedPlan = {
@@ -244,6 +265,22 @@ export type WpsPreparedPlan = {
    * 事后反推就会把两者混成一种，等于给混装计划开后门。
    */
   sourceAnchorRequired: boolean;
+  /**
+   * 公式依赖表的**覆盖记账**：表名 → 已经登记证据的那块区域（含该表当时的整张有效区域）。
+   *
+   * 为什么表名不够（2026-10-30 补的缺口）：`sources` 里的证据是**读过的区域**，
+   * 不是整张表。以前只要"这张表出现在读取记录里"就放行，于是"公式读 `来源!B10`、
+   * 读取记录只盖到 `来源!A1:A3`"这种形状能登记，改掉 B10 也拦不住续跑。
+   * 现在登记时按依赖表的整张有效区域补一块证据，并把"哪块区域算覆盖"记在这里；
+   * 续跑前还要核对现场的有效区域仍落在登记的那块里（见 `assertWpsFormulaSourceCoverage`）。
+   *
+   * 这张**映射表**只在内存里：`wpsRecoveryDescriptor` 是白名单投影，不取这个字段。
+   * 别把它读成"覆盖证据不落盘"：那块矩形与两个指纹会作为 `resumeContext.sources` 进登记请求，
+   * 并随恢复包（`sourceEvidence`）由本机后端落盘；只有**值矩阵**留在 `sourceSnapshots`。
+   * 续跑侧的判据靠持久化的"公式文本 + `context.sources` 的矩形/行列数/两个指纹"重建
+   * （第二十三轮核实）。
+   */
+  formulaSourceCoverage?: Record<string, string>;
   previewRevision: string;
   confirmationSnapshot: string;
 };
@@ -276,6 +313,17 @@ export type WpsActionAfter = {
 
 export type WpsUndoRecord = {
   resume?: { taskId: string; context: WpsResumeContext };
+  /**
+   * 本机恢复包的到期时间（ISO）。**只有从持久恢复包水合出来的记录才有这个字段。**
+   *
+   * 两个窗口必须分开：
+   * - 仅宿主缓存（同一进程/同一窗格）：沿用 `wpsResumeMaxAgeSeconds`（默认 30 分钟），
+   *   这是"临时缓存还能信多久"的经验值；
+   * - 持久恢复包：按服务端登记的保留期（默认 7 天）。完整退出宿主后还能续跑，
+   *   靠的正是这一条，而不是把 30 分钟调大。
+   * 到期时间不随查询刷新：它是保存那一刻算出来的固定点。
+   */
+  resumeExpiresAt?: string;
   version: 1 | 2;
   executionId: string;
   planId: string;
@@ -330,6 +378,39 @@ function rangeFor(sheet: WpsWorksheet, address: string): WpsRange {
   const range = sheet.Range?.(address);
   if (!range) throw new Error(`WPS 无法读取区域「${sheet.Name}!${address}」。`);
   return range;
+}
+
+/** `inner` 是否整块落在 `outer` 里（含边界）。 */
+function rectContains(outer: Rect, inner: Rect): boolean {
+  return (
+    outer.startRow <= inner.startRow &&
+    outer.startColumn <= inner.startColumn &&
+    outer.endRow >= inner.endRow &&
+    outer.endColumn >= inner.endColumn
+  );
+}
+
+/**
+ * 工作表**当前**的已用区域（可读时）。
+ *
+ * 只认宿主明确给出的四个整数；缺一个就返回 `null` —— "不知道有效区域多大"和
+ * "有效区域是 A1"是两件事，后者会让覆盖判定凭空通过。
+ */
+function usedSheetRect(sheet: WpsWorksheet): Rect | null {
+  let used: WpsRange | undefined;
+  try {
+    used = sheet.UsedRange;
+  } catch {
+    return null;
+  }
+  if (!used) return null;
+  const startRow = Number(used.Row);
+  const startColumn = Number(used.Column);
+  const rows = Number(used.Rows?.Count ?? 0);
+  const columns = Number(used.Columns?.Count ?? 0);
+  if (!Number.isInteger(startRow) || startRow < 1 || !Number.isInteger(startColumn) || startColumn < 1) return null;
+  if (!Number.isInteger(rows) || rows < 1 || !Number.isInteger(columns) || columns < 1) return null;
+  return { startRow, startColumn, endRow: startRow + rows - 1, endColumn: startColumn + columns - 1 };
 }
 
 function canonicalCell(value: unknown): CellValue {
@@ -688,7 +769,14 @@ function valuesForAction(action: ValueAction, rows: number, columns: number): Ce
     return blankCellMatrix(rows, columns);
   }
   if (action.type === "writeFormulas") {
-    if (action.formulaR1C1 !== undefined) {
+    /*
+     * 按**真值**判，与 Excel（`excel.ts` 的 `if (action.formulaR1C1)`）和服务端
+     * （`main.py` 的 `if action.formulaR1C1`）同一口径：`""`/`null`/省略 都是
+     * "没有 R1C1"。这里以前写的是 `!== undefined`，于是同一个 `""` 在 Excel 是
+     * "照常写 A1 公式"、在 WPS 变成"整份计划被拒" —— 一份合法的 A1 计划会因为
+     * 一个空字段在两个宿主上有两种命运。
+     */
+    if (action.formulaR1C1) {
       throw new Error("WPS 的 R1C1 铺满公式尚未完成独立回读验收；请使用与目标区域同形的 A1 公式矩阵。");
     }
     if (!Array.isArray(action.formulas) || action.formulas.some((row) => !Array.isArray(row))) {
@@ -1034,6 +1122,19 @@ export function prepareWpsPlan(
   if (totalCells > capabilities.wpsWrite.maxCells) {
     throw new Error(`本次计划涉及 ${totalCells} 个单元格，超过 WPS 单次 ${capabilities.wpsWrite.maxCells} 个单元格的上限。`);
   }
+  /*
+   * 公式计划的**依赖覆盖**：给每张依赖表补一块含它整张有效区域的证据。
+   *
+   * 必须放在这里而不是"等续跑时再补读"：续跑那一刻读到的值是**现场**，拿它当
+   * "当时是什么值"的基线，等于自己跟自己对账。证据只在这里采一次，续跑只做比对。
+   * 采不到（没授权、读不全、有效区域超限）就**不登记精确恢复**，但计划本身照常执行 ——
+   * 产品规则针对的是恢复，不是普通写入。
+   */
+  const coverageCapture = captureWpsFormulaSourceCoverage(application, plan, authorization, sources);
+  if (coverageCapture) {
+    sources.push(...coverageCapture.sources);
+    sourceSnapshots = [...sourceSnapshots, ...coverageCapture.snapshots];
+  }
   const prepared: WpsPreparedPlan = {
     plan,
     ...(originalPlan ? {originalPlan} : {}),
@@ -1049,6 +1150,7 @@ export function prepareWpsPlan(
     sources,
     totalCells,
     sourceAnchorRequired,
+    ...(coverageCapture ? { formulaSourceCoverage: coverageCapture.coverage } : {}),
     previewRevision: randomId(),
     confirmationSnapshot: ""
   };
@@ -1056,11 +1158,117 @@ export function prepareWpsPlan(
   return prepared;
 }
 
+/**
+ * 给公式依赖表补**整块有效区域**的来源证据（只在准备阶段跑一次，值不出本机）。
+ *
+ * 返回 `null` 表示**无法证明覆盖**：没授权、有效区域读不出/超限、含合并单元格。
+ * 调用方不得把它当成"没有依赖"—— 那正是这条缺口以前的样子。
+ */
+function captureWpsFormulaSourceCoverage(
+  application: WpsApplication,
+  plan: AnalysisPlan,
+  authorization: WpsReadAuthorization,
+  sources: readonly WpsPreparedSource[]
+): { coverage: Record<string, string>; sources: WpsPreparedSource[]; snapshots: WpsSourceSnapshot[] } | null {
+  const requirement = formulaSourceEvidenceRequirement(plan);
+  if (!requirement.ok) return null;
+  if (requirement.sheets.length === 0) return null;
+  const coverage: Record<string, string> = {};
+  const added: WpsPreparedSource[] = [];
+  const snapshots: WpsSourceSnapshot[] = [];
+  try {
+    for (const name of requirement.sheets) {
+      // 不在本次授权里就不读：授权与证据是两道闸，不能互相冒充。
+      const authorized = authorization.sheets.find((sheet) => sheet.name === name);
+      if (!authorized) return null;
+      const sheet = assertWpsAuthorization(application, authorization, authorized);
+      const used = usedSheetRect(sheet);
+      if (!used) return null;
+      const rowCount = used.endRow - used.startRow + 1;
+      const columnCount = used.endColumn - used.startColumn + 1;
+      if (rowCount * columnCount > capabilities.taskRecovery.wpsResumeMaxSourceCells) return null;
+      // 已经有证据盖住整张有效区域（比如模型读得比有效区域还大）就复用，不重复读。
+      const existing = sources
+        .concat(added)
+        .find((source) => source.sheetName === name && rectContains(parseA1Range(source.range), used));
+      if (existing) {
+        coverage[name] = existing.range;
+        continue;
+      }
+      const address = rangeAddress(used);
+      const hostRange = rangeFor(sheet, address);
+      if (hostRange.MergeCells !== false) return null;
+      const read = readMatrices(hostRange, rowCount, columnCount);
+      if (!read.valuesCaptured) return null;
+      added.push({
+        sheetIndex: authorized.index,
+        sheetName: name,
+        range: address,
+        rowCount,
+        columnCount,
+        previewFingerprint: read.fingerprint,
+        coverageOnly: true
+      });
+      snapshots.push({ sheetName: name, range: address, values: read.values.map((row) => [...row]) });
+      coverage[name] = address;
+    }
+  } catch {
+    // 读不到就是读不到：不登记精确恢复，也不让异常打断普通执行。
+    return null;
+  }
+  return { coverage, sources: added, snapshots };
+}
+
+/**
+ * 精确续写放行的动作类型：**值写入**与**公式写入**。
+ *
+ * 为什么公式可以进来：`writeFormulas` 的恢复点结构与 `writeValues` 同构（行×列矩阵），
+ * 差别只在"矩阵里装的是公式文本"。写后身份由 `matrixFingerprintV2` 的 formula-first
+ * 规则给出（公式格按文本记，不按显示值），共享判据在
+ * `@excel-bro/core/formulaWriteback`。
+ *
+ * 为什么别的不进来：格式动作的恢复点是**属性快照**，`StoredAction` 装不下；
+ * 结构动作（删行/插行）需要实机行插入链路。两者都不在本闸的授权范围内。
+ */
+function isResumableValueAction(type: string): type is "writeValues" | "writeFormulas" {
+  return type === "writeValues" || type === "writeFormulas";
+}
+
 /** Only complete, disjoint source evidence qualifies; no cell matrix leaves this host. */
 export function wpsResumeContext(prepared: WpsPreparedPlan): WpsResumeContext | null {
+  /*
+   * **公式依赖面**（与 Excel 读同一份判据，产品规则 2026-10-30）：
+   * `writeFormulas` 写的是公式文本，宿主执行时自己求值，所以它不会出现在下面
+   * "读写重叠"的判断里（依赖表≠读过的表）。要求是三条，缺一条都不登记：
+   * - 依赖面必须可分离（同表引用／动态／外部工作簿／名称／引用表=写入目标 ⇒ 不登记）；
+   * - 公式读的那几张表必须都在 `sourceDependencySheets` 里，从而在 `sources` 里
+   *   有对应的值指纹（下面那条 `deps.some(...)` 保证 dep ⊆ sources）；
+   * - **证据必须真的盖住那块表**：只有"表名出现在读取记录里"不算数 —— 读取记录
+   *   可能只盖到 `A1:A3`，公式却读 `B10`。`formulaSourceCoverage` 是准备阶段
+   *   按依赖表整张有效区域补证据时留下的记账（见 `captureWpsFormulaSourceCoverage`）。
+   *
+   * 证据粒度说清楚：登记的是**依赖表当时的整张有效区域**这块矩形，不是"引用到的
+   * 那几个单元格"。矩形之外的格（当时为空、后来被填上）由续跑前的有效区域核对兜住
+   * （`assertWpsFormulaSourceCoverage`：现场有效区域必须仍落在登记的那块矩形里）。
+   */
+  const formulaRequirement = formulaSourceEvidenceRequirement(prepared.plan);
+  if (!formulaRequirement.ok) return null;
+  // Only a live trusted compiler seal can create this context. Missing read
+  // evidence on an ordinary calculated plan never becomes a literal context.
+  if (prepared.hostVersion && isTrustedLiteralPlan(prepared.plan) && prepared.actions.every(a => isResumableValueAction(a.type)))
+    return formulaRequirement.sheets.length === 0
+      ? {version:2,hostVersion:prepared.hostVersion,sources:[]}
+      // 公式要证据：不能走"没有来源"的 version 2 通道。
+      : null;
   const deps = prepared.plan.sourceDependencySheets;
+  const coverage = prepared.formulaSourceCoverage ?? {};
+  if (formulaRequirement.sheets.some(name => {
+    const range = coverage[name];
+    return !range || !prepared.sources.some(source => source.sheetName === name && source.range === range);
+  })) return null;
   if (!deps?.length || !prepared.hostVersion || !prepared.sources.length ||
-      prepared.actions.some(a => a.type !== "writeValues") ||
+      formulaRequirement.sheets.some(name => !deps.includes(name)) ||
+      prepared.actions.some(a => !isResumableValueAction(a.type)) ||
       deps.some(name => prepared.actions.some(a => a.sheetName === name) || !prepared.sources.some(s => s.sheetName === name)) ||
       prepared.sources.some(s => s.presentationFingerprint !== undefined || !deps.includes(s.sheetName)) ||
       prepared.sources.reduce((n, s) => n + s.rowCount * s.columnCount, 0) > capabilities.taskRecovery.wpsResumeMaxSourceCells) return null;
@@ -1083,10 +1291,25 @@ export function assertWpsResumeSources(application: WpsApplication, state: WpsEx
   assertWpsRecoveryDescriptor(state.descriptor);
   const authorization = authorizeWpsSheets(application, selectedIndexes);
   const names = authorization.sheets.map(s => s.name).sort();
-  if (`wps-path:${String(authorization.workbookFullName).trim().toLowerCase()}` !== state.workbookIdentity ||
-      JSON.stringify(names) !== JSON.stringify([...state.authorizedSheetNames].sort()) ||
-      String(application.Version ?? "").trim() !== context.hostVersion)
-    throw new Error("工作簿、宿主版本或授权已变化，不能续跑。");
+  /*
+   * 三个条件必须分开说。合成一句"工作簿、宿主版本或授权已变化"时，用户无法判断该改哪一处：
+   * 真机（2026-10-28）把"授权比登记多了/少了一张表"读成了"材料丢了"，于是去重开材料而不是
+   * 收回勾选。判据一个字没放宽：三条仍然全部必须成立，顺序仍是身份 → 授权 → 宿主版本，
+   * 任一不成立就停（fail-closed）。这里只说**哪一类**不成立，不打印路径与表名。
+   */
+  if (`wps-path:${String(authorization.workbookFullName).trim().toLowerCase()}` !== state.workbookIdentity)
+    throw new Error("当前工作簿与原执行登记的身份不一致；请打开原工作簿后再续跑，不猜是不是同一个文件。");
+  const recordedNames = [...state.authorizedSheetNames].sort();
+  if (JSON.stringify(names) !== JSON.stringify(recordedNames))
+    throw new Error(
+      `当前授权 ${names.length} 张表，原执行登记 ${recordedNames.length} 张表，两者不是同一组；` +
+        "授权范围与原执行不同，不能沿用原执行的写入边界续跑。"
+    );
+  const hostVersion = String(application.Version ?? "").trim();
+  if (hostVersion !== context.hostVersion)
+    throw new Error(
+      `宿主版本已变化（登记 ${context.hostVersion || "未知"}，当前 ${hostVersion || "未知"}），不能续跑。`
+    );
   let cells = 0;
   for (const source of context.sources) {
     const rect = parseA1Range(source.range);
@@ -1108,21 +1331,97 @@ export function assertWpsResumeSources(application: WpsApplication, state: WpsEx
   }
 }
 
+/**
+ * 公式依赖表的**覆盖核对**（续跑前唯一出处，`prepareWpsResume` 与逐动作复检都读它）。
+ *
+ * 比 `assertWpsResumeSources` 多回答一件事：登记的矩形**还盖得住这张表吗**。
+ * 指纹只比"登记时那块矩形里的值"，所以挡不住"矩形之外的一格被填上"—— 那会让
+ * 有效区域变大，公式结果就可能变，而它的变化不在任何证据里。于是这里要求：
+ * 现场的有效区域仍整块落在某块登记证据里。不满足就按**来源已变化**停下，
+ * 不是"猜它没变"。
+ *
+ * 三句话分开说（与 core 一致）：没有登记证据 / 读不到现场 / 现场变了。
+ */
+export function assertWpsFormulaSourceCoverage(
+  application: WpsApplication,
+  state: WpsExecutionState,
+  selectedIndexes: readonly number[],
+  plan: { actions: AnalysisPlan["actions"] }
+): void {
+  const requirement = formulaSourceEvidenceRequirement(plan);
+  if (!requirement.ok) throw new Error(`公式依赖无法核对：${requirement.reason}`);
+  if (requirement.sheets.length === 0) return;
+  const sources = state.descriptor.resumeContext?.sources ?? [];
+  const authorization = authorizeWpsSheets(application, selectedIndexes);
+  for (const name of requirement.sheets) {
+    const recorded = sources
+      .filter(source => source.sheetName === name)
+      .map(source => parseA1Range(source.range));
+    // 这块表一格证据都没有：说不清"当时是什么值"，也不拿现场的值补基线。
+    if (!recorded.length) throw new Error(FORMULA_SOURCE_EVIDENCE_MISSING_MESSAGE);
+    const authorized = authorization.sheets.find(sheet => sheet.name === name);
+    const used = authorized ? usedSheetRect(assertWpsAuthorization(application, authorization, authorized)) : null;
+    if (!used) throw new Error(FORMULA_SOURCE_UNVERIFIABLE_MESSAGE);
+    if (!recorded.some(rect => rectContains(rect, used)))
+      throw new Error(`${FORMULA_SOURCE_CHANGED_MESSAGE}（「${name}」的有效区域已超出登记的来源证据）`);
+  }
+}
+
+/**
+ * 续跑资格的有效期判定 —— **唯一**判据，前后两处条件都读它的结论。
+ *
+ * 两个窗口不是同一个，不能互相冒充：
+ * - 有持久恢复包（`resumeExpiresAt`，服务端首次保存时算定）⇒ 按那个时间点判，
+ *   与 `wpsResumeMaxAgeSeconds`（30 分钟，只是"宿主缓存还能信多久"）**无关**。
+ *   把它们并列检查正是旧缺陷：7 天的材料被 30 分钟的门挡住。
+ * - 只有旧宿主缓存（无 `resumeExpiresAt`）⇒ 继续按缓存期限判，兼容历史记录。
+ *
+ * 三条边界：
+ * - `resumeExpiresAt` 存在但解析不出时间 ⇒ **拒绝**，绝不退回另一种期限去放行；
+ * - `createdAt` 无效或指向未来 ⇒ 拒绝（未来时间会让任何期限都"没到"）；
+ * - `now >= deadline` 即到期，与服务端 `execution_recovery.load` 的
+ *   `deadline <= moment` 同一口径（恰好到期那一刻就算过期，不给 1ms 的灰区）。
+ */
+export type WpsResumeWindow =
+  | {ok: true; persistent: boolean; deadline: number}
+  | {ok: false; reason: string};
+
+export function wpsResumeWindow(record: WpsUndoRecord | null, now = Date.now()): WpsResumeWindow {
+  if (!record) return {ok: false, reason: "找不到原执行的本机恢复记录。"};
+  const createdAt = Date.parse(record.createdAt);
+  if (!Number.isFinite(createdAt) || createdAt > now)
+    return {ok: false, reason: "本机恢复记录已过期或创建时间无效。"};
+  if (record.resumeExpiresAt != null) {
+    const deadline = Date.parse(record.resumeExpiresAt);
+    if (!Number.isFinite(deadline))
+      return {ok: false, reason: "本机恢复包的保留期限字段无效，不能续跑。"};
+    if (now >= deadline) return {ok: false, reason: "本机恢复包已超过保留期。"};
+    return {ok: true, persistent: true, deadline};
+  }
+  const deadline = createdAt + capabilities.taskRecovery.wpsResumeMaxAgeSeconds * 1000;
+  if (now >= deadline) return {ok: false, reason: "本机恢复记录已过期或创建时间无效。"};
+  return {ok: true, persistent: false, deadline};
+}
+
 /** Reconstruct ONLY the recorded writeValues, preserving the original undo snapshots. */
 export function prepareWpsResume(application: WpsApplication, state: WpsExecutionState,
   selectedIndexes: readonly number[], now = Date.now()): {prepared: WpsPreparedPlan; record: WpsUndoRecord} {
   const record = wpsUndoRecordFor(application, state.operationId);
-  const age = now - Date.parse(record?.createdAt ?? "");
   if (!record) throw new Error("找不到原执行的本机恢复记录。");
   if (!record.resume) throw new Error("原执行未保留精确续跑材料；可能已完成或不是支持的可恢复计划。");
   if (record.resume.taskId !== state.taskId) throw new Error("本机恢复记录与服务端任务身份不一致。");
-  if (!Number.isFinite(age) || age < 0 || age > capabilities.taskRecovery.wpsResumeMaxAgeSeconds * 1000)
-    throw new Error("本机恢复记录已过期或创建时间无效。");
+  /*
+   * 有效期只看一个来源：`wpsResumeWindow`。
+   * 下面那条综合条件**不再**单独查 30 分钟 —— 两套条件并存时，持久材料会被更短的那个挡住。
+   * 有效期内 ≠ 可以跳过核对：后面的身份、授权、来源、目标现场、计划指纹、在途动作、
+   * 执行权校验一条都没少。
+   */
+  const window = wpsResumeWindow(record, now);
+  if (!window.ok) throw new Error(window.reason);
   if (!sameJsonEvidence(record.resume.context, state.descriptor.resumeContext))
     throw new Error("本机与服务端的来源证据不一致。");
   if (!record || record.version !== 2 || !["ready", "applying", "partial_write_recoverable"].includes(record.state) ||
-      !record.resume || record.resume.taskId !== state.taskId || !Number.isFinite(age) || age < 0 ||
-      age > capabilities.taskRecovery.wpsResumeMaxAgeSeconds * 1000 ||
+      !record.resume || record.resume.taskId !== state.taskId ||
       !sameJsonEvidence(record.resume.context, state.descriptor.resumeContext) ||
       state.inFlightActionIndex != null || state.requiresReconciliation ||
       !Number.isInteger(state.nextActionIndex) || state.nextActionIndex < 0 || state.nextActionIndex >= state.totalActions ||
@@ -1134,7 +1433,7 @@ export function prepareWpsResume(application: WpsApplication, state: WpsExecutio
   // Validate stored matrices and descriptors, never trust arbitrary PluginStorage action fields.
   const actions: AnalysisPlan["actions"] = record.actions.map((a, index) => {
     const d = state.descriptor.actions[index];
-    if (a.type !== "writeValues" || d.type !== "writeValues" || a.actionIndex !== index || d.actionIndex !== index ||
+    if (!isResumableValueAction(a.type) || a.type !== d.type || a.actionIndex !== index || d.actionIndex !== index ||
         a.sheetName !== d.sheet || a.range !== d.range || a.rowCount !== d.rowCount || a.columnCount !== d.columnCount ||
         a.cellCount !== d.cellCount || a.beforeFingerprint !== d.previewFingerprint ||
         ![a.values, a.beforeValues, a.beforeFormulas].every(m => Array.isArray(m) && m.length === d.rowCount && m.every(row =>
@@ -1142,11 +1441,51 @@ export function prepareWpsResume(application: WpsApplication, state: WpsExecutio
         matrixFingerprintV2(a.values, a.values) !== d.expectedFingerprint ||
         matrixFingerprintV2(a.beforeValues, a.beforeFormulas) !== d.previewFingerprint)
       throw new Error("本机动作与已登记计划不一致，拒绝续跑。");
+    if (a.type === "writeFormulas") {
+      /*
+       * 公式动作的写后矩阵必须**仍是公式文本**。
+       *
+       * 记录里只剩计算值、或被人替换成常量时，算出来的数可能一模一样，但写下去已经不是
+       * 用户确认过的那份计划（公式会被粘成常量，后续改来源也不会重算）。判据只认文本，
+       * 见 `@excel-bro/core/formulaWriteback` 的 `formulaWriteMatrixIssue`。
+       */
+      const issue = formulaWriteMatrixIssue(a.values);
+      if (issue)
+        throw new Error(
+          `本机动作的写后矩阵在第 ${issue.row + 1} 行第 ${issue.column + 1} 列不是公式文本，拒绝续跑。`
+        );
+      // 上面那条诊断已经保证逐格都是 `=` 开头的字符串；这里只做类型收窄，不再重复判定。
+      return {type: "writeFormulas", sheet: d.sheet, range: d.range, formulas: a.values.map(row => row.map(cell => cell as string))};
+    }
     return {type: "writeValues", sheet: d.sheet, range: d.range, values: a.values.map(row => [...row])};
   });
-  const prepared = prepareWpsPlan(application, selectedIndexes, {id: record.planId, title: record.planTitle,
+  /*
+   * 公式引用的表必须仍在**本次授权**里。否则一条 `=Other!A1*2` 可以绕过
+   * "来源变了就不许续跑"：来源复核只覆盖登记的 `sources`，公式文本里的依赖没人看。
+   * 动态引用（INDIRECT / OFFSET）解析不出来 ⇒ 一律拒绝，不猜依赖。
+   */
+  const formulaCells = actions.flatMap((action) =>
+    action.type === "writeFormulas" ? action.formulas : []
+  );
+  const references = formulaSheetReferences(formulaCells);
+  if (references.dynamic) throw new Error("公式含动态引用（INDIRECT / OFFSET），无法核对依赖表，拒绝续跑。");
+  const unauthorizedReferences = references.sheets.filter(name => !state.authorizedSheetNames.includes(name));
+  if (unauthorizedReferences.length)
+    throw new Error(
+      `公式引用了本次授权之外的表：${unauthorizedReferences.join("、")}；不能沿用原写入边界续跑。`
+    );
+  /*
+   * 公式依赖的**覆盖**也要在续跑前复核一次：指纹闸只比登记时那块矩形里的值，
+   * 矩形之外的一格被填上（有效区域变大）它看不见 —— 那同样可能让公式结果变掉。
+   */
+  assertWpsFormulaSourceCoverage(application, state, selectedIndexes, { actions });
+  const resumedPlan: AnalysisPlan = {id: record.planId, title: record.planTitle,
     summary: "继续已登记计划的剩余动作", assumptions: [], warnings: [], acceptanceCriteria: [], actions,
-    sourceDependencySheets: [...new Set(record.resume.context.sources.map(s => s.sheetName))]});
+    sourceDependencySheets: [...new Set(record.resume.context.sources.map(s => s.sheetName))]};
+  // Reattest only after durable record/ledger identity, context, geometry and
+  // every expected value fingerprint above have matched. JSON alone cannot do this.
+  const prepared = prepareWpsPlan(application, selectedIndexes, record.resume.context.version===2
+    ? stampLiteralPlanOrigin(resumedPlan,"literal_range_edit") : resumedPlan);
   for (const [index, action] of prepared.actions.entries()) {
     const descriptor = state.descriptor.actions[index];
     if (action.previewFingerprint !== (index < state.nextActionIndex ? descriptor.expectedFingerprint : descriptor.previewFingerprint))
@@ -1178,13 +1517,23 @@ export function prepareWpsCompletedReview(application: WpsApplication, state: Wp
     throw new Error("完成记录、当前授权或工作簿不匹配，不能接入审阅。");
   const actions: AnalysisPlan["actions"] = record.actions.map((a, index) => {
     const d = state.descriptor.actions[index];
-    if (a.type !== "writeValues" || d.type !== "writeValues" || a.actionIndex !== index || d.actionIndex !== index ||
+    if (!isResumableValueAction(a.type) || a.type !== d.type || a.actionIndex !== index || d.actionIndex !== index ||
         a.sheetName !== d.sheet || a.range !== d.range || a.rowCount !== d.rowCount || a.columnCount !== d.columnCount ||
         ![a.values, a.beforeValues, a.beforeFormulas].every(m => Array.isArray(m) && m.length === d.rowCount &&
           m.every(row => Array.isArray(row) && row.length === d.columnCount)) ||
         matrixFingerprintV2(a.values, a.values) !== d.expectedFingerprint ||
         matrixFingerprintV2(a.beforeValues, a.beforeFormulas) !== d.previewFingerprint)
       throw new Error("完成记录与原计划不一致，不能接入审阅。");
+    if (a.type === "writeFormulas") {
+      // 与续跑同一条口径：完成记录里的写后矩阵必须仍是公式文本，不能被值矩阵顶替。
+      const issue = formulaWriteMatrixIssue(a.values);
+      if (issue)
+        throw new Error(
+          `完成记录的写后矩阵在第 ${issue.row + 1} 行第 ${issue.column + 1} 列不是公式文本，不能接入审阅。`
+        );
+      // 同上：`formulaWriteMatrixIssue` 已保证逐格是公式文本。
+      return {type: "writeFormulas", sheet: d.sheet, range: d.range, formulas: a.values.map(row => row.map(cell => cell as string))};
+    }
     return {type: "writeValues", sheet: d.sheet, range: d.range, values: a.values};
   });
   if (inspectWpsUndoRecord(application, state.operationId).kind !== "completed")
@@ -1743,7 +2092,7 @@ export function assertWpsPlanSourceCurrent(application: WpsApplication, prepared
     // Literal/local plans have their own preflight and per-range source checks.
     // SDK fixed values must never borrow an unrelated local source snapshot.
     if (!prepared.sourceAnchorRequired && !anchor) return;
-    const independentSourceReview = !prepared.sourceAnchorRequired && prepared.sources.length > 0;
+    const independentSourceReview = !prepared.sourceAnchorRequired && prepared.sources.some((source) => !source.coverageOnly);
     const authorizedSheets = prepared.authorization.sheets.map((sheet) => sheet.name);
     const liveFingerprint = anchor && anchorSheetsWithin(anchor, authorizedSheets) && planSourceComparisonNeeded({
       plan: prepared.plan,
@@ -1792,7 +2141,18 @@ export async function executeWpsPlan(
    * 账本的 `operationId` 对齐，使撤销、核对、续跑都指向同一份执行身份。
    */
   executionIdOverride?: string,
-  recovery?: {taskId?: string; resume?: {record: WpsUndoRecord; startActionIndex: number; check(): void}},
+  recovery?: {
+    taskId?: string;
+    resume?: {record: WpsUndoRecord; startActionIndex: number; check(): void};
+    /**
+     * 首次宿主写入**之前**把不可变恢复材料落盘（A1-GATE 之后的本机持久化）。
+     *
+     * 只要这次执行带 `resume`（即可精确续跑），它就是**必须**的：没有它，
+     * 完整退出宿主后既核不了"第几步写过"也续不了剩余动作。缺失或抛错一律中止，
+     * 绝不允许"只存内存也继续写"。
+     */
+    persistMaterial?: (record: WpsUndoRecord) => Promise<unknown>;
+  },
   /**
    * 宿主观测（A1-E3）：每个动作**真的向宿主发起了几次写调用**、结果如何、回读过没过。
    *
@@ -1815,6 +2175,12 @@ export async function executeWpsPlan(
   if (!workbook || workbook.ReadOnly !== false) throw new Error("当前 WPS 工作簿已不再处于可编辑状态。");
   const assertSourcesCurrent = () => {
   for (const source of prepared.sources) {
+    /*
+     * 只为恢复而采的基线（`coverageOnly`）不参与执行闸：公式写下去是文本，宿主按
+     * 那一刻的源值自己算；预览之后源值变了，正常执行本来就该用新值。那份基线仍然
+     * 会进续跑材料（`wpsResumeContext` 映射全部 `sources`），由续跑侧比对。
+     */
+    if (source.coverageOnly) continue;
     const authorized = prepared.authorization.sheets.find((sheet) => sheet.index === source.sheetIndex);
     if (!authorized || authorized.name !== source.sheetName) {
       throw new Error(`源工作表「${source.sheetName}」不在预览时的授权范围，请重新预览。`);
@@ -1988,6 +2354,18 @@ export async function executeWpsPlan(
   };
 
   try {
+    /*
+     * 写前落盘：恢复包必须在第一次动原表之前就原子落到本机数据目录，并完成读回校验。
+     * 失败即中止（落到下面的 catch 归一为"未写入"）—— 一次"写了一半却没有材料"的
+     * 执行比不写更糟：用户会照着界面去手动改原表，把真正的现场彻底搞乱。
+     */
+    if (record.resume && !recovery?.resume) {
+      // 只在新执行时落盘：续跑时包已经在盘上（正是刚才读出来构建这份记录的），
+      // 重写会把 `expiresAt` 顺带刷新一次 —— 那等于"每次继续都偷偷延长保留期"。
+      if (!recovery?.persistMaterial)
+        throw new Error("这次执行需要先保存本机恢复包，但未提供持久化通道；未执行写入。");
+      await recovery.persistMaterial(record);
+    }
     record.state = "applying";
     upsertRecord(application, record);
     for (const [position, action] of record.actions.entries()) {
@@ -2346,6 +2724,20 @@ export function wpsUndoRecordFor(
 }
 
 /**
+ * 把一份**从持久恢复包水合出来**的记录写回宿主缓存。
+ *
+ * 存在的唯一理由是"完整退出宿主后 `PluginStorage` 里没有记录"：既有的
+ * `prepareWpsResume` / `prepareWpsCompletedReview` / `inspectWpsUndoRecord` /
+ * `undoWpsExecution` 都读这份缓存，水合之后它们原样工作 —— 不另写一套"从包里读"
+ * 的并行判据（两套判据必然漂移）。
+ *
+ * `createdAt` 必须保持**原始执行时间**；这里不刷新它，也不延长任何有效期。
+ */
+export function adoptWpsUndoRecord(application: WpsApplication, record: WpsUndoRecord): void {
+  upsertRecord(application, record);
+}
+
+/**
  * 一次写入尝试的**只读**核对结果。
  *
  * `conflict` 同时覆盖"被人工改过"和"只写了一部分"：两者的下一步都是"先核对、
@@ -2416,6 +2808,43 @@ export function inspectWpsUndoRecord(
       return {
         kind: "conflict",
         detail: `区域「${action.sheetName}!${action.range}」的格式与写前、写后都不一致。`
+      };
+    }
+
+    /*
+     * 公式动作：按**公式文本**判三态（写前 / 写后 / 判不出来）。
+     *
+     * 为什么不只比整块指纹：写前与写后的公式文本**可能本来就一样**（把 `=A1` 再写成 `=A1`），
+     * 这时指纹相同并不能证明"写过了"。同一个指纹既可能是写前也可能是写后，按"已完成"
+     * 直接放行撤销，会把一次没发生过的写入当成已发生。共享判据见
+     * `@excel-bro/core/formulaWriteback`（`formulaMatrixSite` / `formulaResumeGate`）。
+     */
+    if (action.type === "writeFormulas") {
+      let current: ReturnType<typeof readMatrices>;
+      try {
+        current = readMatrices(rangeFor(sheet, action.range), action.rowCount, action.columnCount, record.version);
+      } catch (error) {
+        return {kind: "unknown", detail: error instanceof Error ? error.message : "读取原表现场失败。"};
+      }
+      const site = formulaMatrixSite(
+        toChangeFormulas(action.beforeFormulas),
+        toChangeFormulas(action.values),
+        toChangeFormulas(current.formulas)
+      );
+      const gate = formulaResumeGate(site);
+      // `write` = 现场仍是写前（这个动作没落地）；`skip` = 现场已是写后（已落地，跳过不重写）。
+      if (gate === "write") { atBefore += 1; continue; }
+      if (gate === "skip") { atAfter += 1; continue; }
+      if (site.kind === "partial")
+        return {
+          kind: "conflict",
+          detail: `区域「${action.sheetName}!${action.range}」只写了一部分公式，与写前、写后都不一致。`
+        };
+      return {
+        kind: "unknown",
+        detail: site.kind === "indeterminate"
+          ? `区域「${action.sheetName}!${action.range}」写前写后的公式文本相同，仅凭现场无法判断是否写过。`
+          : `区域「${action.sheetName}!${action.range}」的公式与写前、写后都不一致。`
       };
     }
 

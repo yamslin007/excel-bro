@@ -1,4 +1,5 @@
 {
+  "clarification": { "maxOptions": 3 },
   "worksheetCheckpoint": {
     "allowedActions": ["deleteWorksheet", "restoreWorksheet"],
     "maxBytes": 104857600,
@@ -578,6 +579,10 @@
     "maxStoredConversations": 20,
     "maxMessagesPerConversation": 100,
     "persistedMessagesPerConversation": 60,
+    "wps": {
+      "maxStoredConversations": 30,
+      "persistedMessagesPerConversation": 120
+    },
     "intentHistoryMessages": 6,
     "intentMessageCharacters": 1000,
     "maxClarificationRounds": 2
@@ -703,6 +708,7 @@
     "maxCopyChars": 20000
   },
   "agentPlanTools": {
+    "maxLiteralActions": 50,
     "maxLiteralCells": 1000
   },
   "controlledScript": {
@@ -717,7 +723,16 @@
   "taskRecovery": {
     "wpsOwnerLeaseSeconds": 120,
     "wpsResumeMaxAgeSeconds": 1800,
+    "pendingDiscoveryMaxCandidates": 20,
+    "pendingDiscoveryMaxIdentityChars": 4000,
+    "workbookIdentityWatchIntervalMs": 3000,
     "wpsResumeMaxSourceCells": 250000,
+    "unfinishedRecoveryPackageRetentionDays": 7,
+    "recoveryPackageMaxBytes": 33554432,
+    "recoveryPackageTotalMaxBytes": 268435456,
+    "recoveryPackageMaxOperations": 200,
+    "recoveryPackageWriteAttempts": 4,
+    "recoveryPackageWriteRetryDelayMs": 75,
     "maxRegisteredDirectories": 50,
     "operationRetentionDays": 30,
     "maxCheckpointBytes": 67108864,
@@ -725,5 +740,9 @@
     "planningExtensionSeconds": 60,
     "planningHardWallTimeSeconds": 1800,
     "planningMaxExtensions": 4
+  },
+  "devServers": {
+    "excelPort": 3000,
+    "wpsPortCandidates": [3889, 3890, 3987, 3988]
   }
 }

@@ -36,6 +36,9 @@ import type { WpsApplication, WpsRange, WpsWorkbook, WpsWorksheet } from "./wpsH
 
 vi.mock("../../excel-addin/src/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../excel-addin/src/api")>();
+  const discovery = await import("./wpsPendingDiscovery.testHost");
+  const recovery = await import("./wpsRecoveryStore.testHost");
+  const audit = await import("@excel-bro/core/hostWriteAudit");
   const wpsRunningState = (
     operationId: string,
     revision = 1,
@@ -62,7 +65,7 @@ vi.mock("../../excel-addin/src/api", async (importOriginal) => {
     ...overrides
   });
   return {
-    ...actual,
+    ...actual, ...discovery.pendingDiscoveryApiStubs(),
     understandMessage: vi.fn(async () => ({ kind: "needs_workbook_context", summary: "需要字段结构", provider: "model" })),
     listModels: vi.fn(),
     getModelSettings: vi.fn(),
@@ -76,10 +79,38 @@ vi.mock("../../excel-addin/src/api", async (importOriginal) => {
     suspendWpsExecution: vi.fn(async (operationId: string) => wpsRunningState(operationId)),
     claimWpsExecutionResume: vi.fn(async (operationId: string) => wpsRunningState(operationId)),
     reconcileWpsActionReceipt: vi.fn(async (operationId: string) => wpsRunningState(operationId)),
+    /* 用户处置留痕（放弃/撤销）：真实网络出口，必须替身。 */
+    recordExecutionDisposition: vi.fn(
+      async (_namespace: string, _operationId: string, _disposition: string) => undefined
+    ),
     finishWpsExecution: vi.fn(async (operationId: string) => ({
       ...wpsRunningState(operationId),
       status: "completed" as const
-    }))
+    })),
+    /*
+     * 三个**真实网络出口**，以前漏了替身：宿主写入次数补报、恢复材料的保存与回收。
+     * 面板会在账本提交之后 best-effort 补报、在终态回收材料 —— 调用方 `void` + `catch`
+     * 掉，所以"测试在向用户那台 8765 发请求"能安静很久。现在按本机后端替身的语义给：
+     * 补报只回一份自洽的汇总，材料读写走同一个内存后端。
+     */
+    reportWpsHostWrites: vi.fn(async (operationId: string, input: { entries: import("@excel-bro/core/hostWriteAudit").HostWriteAudit[] }) => ({
+      operationId,
+      entries: input.entries,
+      totals: audit.summarizeHostWrites(input.entries),
+      observation: {
+        observation: "complete" as const,
+        callEvidence: input.entries.some((entry) => entry.hostWriteCalls > 0) ? "nonzero" as const : "zero" as const,
+        attemptedActions: input.entries.length,
+        reportedActions: input.entries.length,
+        missingActions: 0,
+        unexpectedReports: 0,
+        unit: "wps_api_calls" as const,
+        lastReportedAt: Date.now()
+      }
+    })),
+    saveExecutionRecoveryPackage: vi.fn(async (id: string, text: string) => recovery.backendSave(id, text)),
+    loadExecutionRecoveryPackage: vi.fn(async (id: string) => recovery.backendLoad(id)),
+    deleteExecutionRecoveryPackage: vi.fn(async (id: string) => recovery.backendRemove(id))
   };
 });
 

@@ -89,10 +89,48 @@ describe("变更摘要卡 · 侧栏", () => {
   it("撤销说明仍保留历史定位和计数，不包含单元格值", async () => {
     const container = await mount(<ChangeReviewUndoNote summaries={[changeReviewSummary(review())]} />);
     expect(container.textContent).toContain("Sheet1!A1:A2");
-    expect(container.textContent).toContain("1 / 2");
+    expect(container.textContent).toContain("共 2 个单元格");
+    expect(container.textContent).toContain("经回读确认改动 1 个");
     expect(container.textContent).toContain("现已撤销");
     expect(container.textContent).not.toContain("旧");
     expect(container.textContent).not.toContain("新");
     expect(container.querySelector("button")).toBeNull();
+  });
+
+  it("中断过的执行：三分之一未执行时标出阶段，且不把未核对算成改动", async () => {
+    // 真机现场：B2 写入并回读、B3 写后回执丢失（写后快照缺失）、B4 未执行。
+    // 旧文案会把这 3 格报成「改动 2 / 3 个单元格」—— 多出来的那 1 格是
+    // 「写前非空 → 写后快照缺失」被当成"改成了空"。
+    const summaries = [
+      { sheet: "目标表", range: "B2", status: "applied", phase: "actual",
+        changedCount: 1, totalCount: 1, truncated: false },
+      { sheet: "目标表", range: "B3", status: "readback_failed", phase: "actual",
+        changedCount: 1, totalCount: 1, truncated: false },
+      { sheet: "目标表", range: "B4", status: "not_executed", phase: "actual",
+        changedCount: 0, totalCount: 1, truncated: false }
+    ] as const;
+    const container = await mount(<ChangeReviewUndoNote summaries={summaries} />);
+    const text = container.textContent ?? "";
+    expect(text).toContain("这次执行中断时");
+    expect(text).toContain("共 3 个单元格");
+    expect(text).toContain("经回读确认改动 1 个");
+    expect(text).toContain("写入但未通过回读核对 1 个");
+    expect(text).toContain("未执行 1 个");
+    // 旧口径的假改动不许复活。
+    expect(text).not.toContain("改动 2 / 3");
+    expect(text).not.toContain("2 / 3");
+  });
+
+  it("全部回读通过时不标「中断」，也不补出多余的分类", async () => {
+    const summaries = [
+      { sheet: "目标表", range: "B2", status: "applied", phase: "actual",
+        changedCount: 1, totalCount: 1, truncated: false }
+    ] as const;
+    const container = await mount(<ChangeReviewUndoNote summaries={summaries} />);
+    const text = container.textContent ?? "";
+    expect(text).toContain("这次执行涉及");
+    expect(text).not.toContain("中断");
+    expect(text).not.toContain("未执行");
+    expect(text).toContain("经回读确认改动 1 个");
   });
 });

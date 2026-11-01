@@ -50,6 +50,7 @@
 | 结果引用过期 | 结果可读→404→连续重开不复用；真实 API 拒绝旧引用 | 同类证据 | 真实 SDK 产出与双端替身宿主消费已串联（A1-E2）；**B 路（模型确实再读一次被 `source_changed` 拒交值）已补真实模型证据**（§ 2026-10-25 第七轮）；原生同链写入次数、故障交错仍缺 |
 | 恢复材料缺失 / 过期 | 缺少前缀恢复快照时在读写前拒绝 | 真实本机材料过期/删除测试；重新规划→新执行→确认→重开全链自动化 | Excel 没有同款过期重新规划入口；不能强加 WPS 30 分钟机制；任意新计划不保证跳过前缀 |
 | 完成后连续重开 | 自动化无重复写入；清发现索引 | 自动化无重复写入/补记；允许只读历史提示 | 终态/确认/撤销与重开组合证据补齐并归档 |
+| 完整退出宿主（浏览器索引 + 宿主缓存都丢） | 同一发现入口已接线（`/api/office/executions/pending`），面板级回归未补 | 自动化：经后端发现找回入口、显示待核对、零自动动作；自动化无重复写入/补记 | 双端真实宿主**完整退出**后重开一次；真实窗格里点一次「核对在途动作」 |
 
 ### 恢复能力的明确限制
 
@@ -69,7 +70,7 @@
 | 2 / A1-E1 | 引用过期的精确故障入口 | 2026-10-25 已实现；自动化通过（服务端 12 条 + 真实登记路径 1 条；共享判据 14 条、控件 13 条、WPS 目标 6 条、WPS 面板接线 2 条；10 个单点变异）；**原生待复验** | 入口仅开发模式、用户显式单次启用、绑定具体任务与结果引用；生效位置 = 「已登记、尚未首次写入」；旧引用在任何宿主写入前被拒且句柄已删（无缓存正文可复用）；不改生产 TTL、不清空全部结果、不借用第二步写入中断；两端接入，判据在共享层；不加执行前确认 |
 | 2 / A1-E2 | 真实 SDK 过期恢复全链 | 2026-10-25 已串联真实链（真实模型 + 真实服务端 + 真实登记器 + 真实 Docker）：两端各一份工件，旧引用 404 / 新引用可读 / 计划用新引用编译；消费侧两端各 3 条门控用例（执行一次 → 回读 → 确认不重执行 → 放弃/撤销回执行前）；`npm run test:a1-e2` 一条命令复跑（门控用例修完已整套重跑：lint / 双端 test+build / pytest / compileall / `git diff --check` / `test:a1-e2` 退出码全 0）。**「恢复期间来源变化」A 路（模型没有再次读取）已闭环**：确定性屏障在首次交值后改源，两轮真实 SDK 都是 `prepareCount=1 / refusals=[] / planSourceBasis=old`，并由此挖出并修掉一个真实缺陷（计划指纹取"到达那一刻"⇒ 旧结果被静默写入；WPS 更本没有计划级写前复核）；**B 路（模型确实再 prepare）已补真实模型证据**（第七轮：两端各一轮有效实验，第二次真实工具调用被生产共享判据拒 `source_changed`，随后的旧计划在两端真实面板上 0 写入）；本轮补齐缺锚点拒写、响应指纹清除、WPS 本地与 SDK 来源分类及顺序复核，双端全量与开门控用例通过；**原生实机未做** | 保持来源不变以单独验证过期；旧引用拒绝；SDK 重新读算并生成新引用；新计划执行一次并回读；确认不重写、放弃可恢复；两端分别留日志 |
 | 3 / A1-E3 | 补齐故障矩阵与原生写入计数 | 自动化部分完成；2026-10-26 验收工具缺陷已修，Excel/WPS S1 注入停止均已取得原生观察与精确账本证据；S2 续写漏报观测已修并实机复测，WPS 完整重载待验 | 12 行双端缺口矩阵 + `source_changed` 终态修复 + 并发认领真并发证据 + 19 个单点变异（见 [A1-E3](SDK_A1_E3_STOP_AND_GAPS_2026-10-25.md)）；第九轮修掉**未保存同名簿的读路径身份撞车**与**验收入口可被别的簿抢走**，并把"实际写入次数"改成四档口径；**第十轮**补齐三处：①「没有观测」不再冒充「明确零写入」（`HostWritesObservation`，只有 `complete+zero` 才算零）②**WPS 宿主写调用计数已实现**（作用域式，计划写与辅助写分开）③故障入口的目标收敛到**可核验工作簿身份**（`dev_fault_target`，两个开发入口共用）；**第十一轮**把 S1 的准备/故障绑定/证据采集做成脚本（`scripts/a1e3_native.*` + `make_a1e3_native_fixture.py`），用户只负责在窗格里发需求点按钮；2026-10-26 另修验收脚本的实例/任务归属、观测口径、进程与目录隔离；当前原生剩余见本轮记录，不把脚本准备当作验收通过。**原生待完成项**（[原生验收包](A1_E3_NATIVE_ACCEPTANCE_2026-10-25.md) S1–S3：来源变化停止、双击只续剩余、确认/放弃后重开） |
-| 4 / A1-GATE | A0/A1 阶段验收 | 未达标 | 九场景逐项结论明确；原生与自动化证据分别齐全；支持范围明确；关键未闭环项解决或获批分批交付；相关全量检查通过 |
+| 4 / A1-GATE | A0/A1 阶段验收 | 未达标（2026-10-27 先补持久恢复材料链、再补**发现入口**（索引降级为缓存 + 后端只读发现），两批均仅自动化；原生未做） | 九场景逐项结论明确；原生与自动化证据分别齐全；支持范围明确；关键未闭环项解决或获批分批交付；相关全量检查通过 |
 | 5 / A2 | 生命周期收口 | 未开始，依赖 A1-GATE | 清理后旧 operationId 仍拒重放；终态去值与保留身份；清理失败可见；损坏/旧版本记录行为明确；历史转录清理有入口和删前确认 |
 
 E2 的来源变化反向分支单独验：若来源被改，不能拿旧计划续写；重新发起新任务成功不算同一任务恢复成功。
@@ -597,6 +598,31 @@ lint 0 error / 36 warning；双端构建通过；`compileall server/app` 与 `gi
 时间落在本轮工作窗口内，原因（用户自行关闭或崩溃）**未证实**，已在下文与最终报告里标注，
 不视为本轮脚本造成，也不据此判定验收状态。
 
+### 2026-10-27（第十二轮）：发现入口 —— 浏览器索引降级为缓存（不推进 A1-GATE）
+
+**现场**：三步常量写入在第二步回执前中断，保存并**完整退出 WPS** 后重开同一文件：账本
+`needs_reconciliation / nextActionIndex=1 / inFlightActionIndex=1 / ownerActive=false`、原表仍是
+111/222/-303、授权仍是两张表，但**恢复入口消失**，面板显示的是另一条历史任务的"已撤销"。
+只读取证结论：进度、材料、现场都在，缺的是"重新发现未完成执行"的入口。
+
+**已实现**：浏览器 `pending-wps-execution.v1` 从唯一入口降级为**缓存**；权威发现改为
+`GET /api/{wps|office}/executions/pending`（按当前工作簿稳定身份精确查找，WPS 用
+`wps-path:`、Excel 用 `url:`，命名空间互不冒充）。响应只带最小元数据；多候选只给选择入口；
+"清除提示"只写处置时间戳；发现全程只读。共享判据在
+`packages/core/src/pendingExecutionDiscovery.ts`，宿主身份读取在
+`apps/wps-addin/src/wpsRecoveryDiscovery.ts`。**Excel 侧同一入口与本轮一起接线**（同一份协议、
+同一份共享判据、同一组服务端用例），面板级回归只在 WPS 侧补齐。
+
+**证据**：共享判据 13 条、服务端 16 条（先红 16 failed → 16 passed）、账本迁移 9/10/11 三档、
+WPS 面板新增 10 条（A 完整丢失缓存 / B 完整恢复链 / C 身份与竞态）；反向变异 D1–D6 逐条四判据
+成立并逐字节还原。**测试隔离同时补上**：两端 `setupFiles` 装网络闸门，未替身的
+`fetch`/XHR/WebSocket/beacon 一律令用例失败（本轮据此抓出 8 个真实出口并封住，含
+`/host-writes`、`/execution-recovery/{id}` DELETE、`/worksheet-checkpoints/list`、
+`/api/turn/{id}/events`、`/__wps_probe`）。
+
+**没做的事**：真实 Excel / WPS 窗格里没有点过"待核对在途动作"；真实宿主完整退出后的自动发现
+没有原生复核。**A1-GATE 仍未通过、A2 未启动**；本轮只解决发现能力，不把自动化写成原生验收。
+
 ## 6. 后续阶段的交付边界
 
 - **A2**：按恢复设计完善执行账本保留期（既定目标含 30 天后 plan_json 去值）、规划账本清理、历史转录清理、迁移与损坏记录处置。清理不得让旧执行 ID 可以重新执行，不静默删除用户历史转录。
@@ -735,3 +761,157 @@ Codex MSIX 将默认账本读取重定向到自己的 LocalCache 旧主文件，
 WPS S3 确认 c4244afe… 与放弃 d1545de6… 两轮均 completed，动作推进 1/1；每轮 hostWriteCalls=3 wps_api_calls、mutatingCalls=1、readback=verified。服务端均返回 complete/nonzero、无缺失/越界观测；记录内未见确认/重开导致重复计划内容写入。放弃/审阅辅助写不属于该计数。Excel S3 此轮未匹配到记录，不借用 WPS 计数。
 
 最终证据：outputs/ledger-diagnosis-20261027/REPORT.md、handle-snapshot-111950/verification.json、s3-live-host-writes.json。旧505页/损坏结论及相应阻塞项已被本条取代；旧错误样本保留且标记 superseded。A1-GATE 仍未通过，A2 未启动；原生矩阵与完整重载等缺口不因本条被标完。
+
+### 2026-10-27：完整退出宿主后的本机恢复包（材料丢失去根因）
+
+真实现场：第二步写入并回读后、完成回执前中断，完整退出 WPS 重开，账本能核对第二步并显示
+「已补记写入，未重复写入」，但随后提示「找不到原执行的本机恢复记录」，第三步续不了。
+
+两个问题分开定责：①材料丢——`prepareWpsResume` 只读宿主 `PluginStorage`，退出后为空且没有第二个来源；
+②资格过期——`wpsResumeMaxAgeSeconds=1800` 是当时唯一的窗口期。**没有**把①归因于②，也**没有**只延长 TTL。
+
+改动：恢复材料改存本机后端应用数据目录（`application_data_root()/execution-recovery/<op>/material.dat`，
+首行元数据 + 原样正文，原子写 + `fsync` + 只重试替换）；共享协议 `packages/core/src/executionRecoveryPackage.ts`
+与 `server/app/models.py` 同步，双端共读 `config/execution_recovery_package_cases.json`。WPS 侧新增
+写前落盘硬闸（失败即零宿主写入）、跨进程水合（`ensureWpsRecoveryMaterial`）与终态回收
+（`DELETE /api/execution-recovery/{id}`，只在撤销收尾调用）。Excel 既有 before-image 持久化复用未改。
+
+窗口期分离：仅宿主缓存按 1800s；有持久材料按服务端算定的 `expiresAt`（`unfinishedRecoveryPackageRetentionDays=7`），
+首次落盘算定，重复保存同正文、查询、打开窗格都不延长；配额不足只清已过期的，不淘汰未结束任务的包。
+
+本轮证据（自动化）：core 859 passed；Excel 1564 passed / 9 skipped；WPS 1139 passed / 8 skipped；
+两端 `tsc --noEmit` 退出码 0；恢复包服务端 19 passed（`--basetemp` 在 OS 临时目录）。
+新增失败回归先于修复：清空 `PluginStorage` 后 `canResumeWpsExecution` 原为 `false`（`找不到原执行的本机恢复记录`），
+修复后为 `true` 且只写第三步。反向变异 `scripts/mutate_wps_recovery_material.mjs` 两个 SEED 各打掉一条机制，
+四判据齐全，还原后 `sha256` 与基线逐字节一致。
+
+**原生未做**：真实 WPS「完整退出 → 重启后端 → 重开同一簿 → 核对第二步 → 仅续写第三步」一次都没跑过，
+因此 **A1-GATE 仍未通过，A2 未启动**。本机恢复包只覆盖 `writeValues`；格式/公式/结构/删表不承诺跨进程精确续跑。
+设计与边界见 [本机恢复包](SDK_WPS_RECOVERY_PACKAGE_2026-10-27.md)。
+
+### 2026-10-27：持久恢复包的有效期判据与"保存不可续期"（第二轮）
+
+第一轮把材料搬到跨进程可读的位置后，留下两个已确认缺陷，本轮都先写失败回归再改生产代码：
+
+1. **有效期内仍被 30 分钟拦住**：`prepareWpsResume` 前段已按 `resumeExpiresAt` 判过，后段综合条件里
+   仍有无条件的 `age > wpsResumeMaxAgeSeconds*1000` —— 同一份材料被两套期限同时裁决。收敛为唯一判据
+   `wpsResumeWindow(record, now)`：有持久期限只认它、字段非法明确拒绝、无该字段才用旧缓存窗口、
+   `now >= deadline` 即过期（与服务端 `deadline <= moment` 同口径）。身份/授权/来源/现场/计划指纹/
+   在途/执行权校验一条未删 —— 有效期内不等于免检。
+2. **过期后重存又拿满一个保留期**：`execution_recovery.save()` 对"同正文但已过期"继续生成新的
+   `savedAt`/`expiresAt` 覆盖文件。改为过期即 `RecoveryPackageExpired`、损坏即 `RecoveryPackageCorrupt`
+   （不再被 `except (OSError, RecoveryPackageCorrupt)` 当成"没有旧文件"），并在账本新增
+   `office_executions.recovery_package_expires_at`（**首次写赢**，只存时间戳），`PUT` 先用它登记/读取
+   首次期限 —— 文件被过期清理后再 PUT 也拿不到新期限，不靠"删了再建"实现幂等。
+3. 顺带修掉同一纪律下的第三个缺口：面板**点击前复核**另算一套（不看本机材料），材料过期时
+   "需重新规划"的按钮点下去被判成"可以继续"后直接返回 —— 按钮看似失效。现在三处（挂载/刷新/
+   点击前复核）共用 `wpsRecoveryVerdictFor`。
+
+自动化证据：WPS 1145 passed / 8 skipped、Excel 1564 passed / 9 skipped、core 860 passed、
+服务端 1870 passed / 1 skipped、恢复包专项 26 passed、续跑专项 33 passed；双端 `tsc --noEmit` 0、
+`compileall` 0、lint 0 error（36 既有 warning）、`git diff --check` 0。反向变异 M3（插回无条件 30 分钟）
+打红「a durable package older than the 30-minute cache window…」，M4（过期就返回同正文）
+打红「test_expired_material_cannot_be_re_saved_into_a_new_window」，还原后 `sha256` 与基线逐字节一致。
+
+**仍无原生证据**：真实 WPS「完整退出 → 重启后端 → 重开同一簿 → 核对第二步 → 仅续写第三步」一次都没跑，
+面板那几条"完整退出"是替身宿主模拟的。**A1-GATE 仍未通过，A2 未启动**；本机恢复包只覆盖 `writeValues`。
+细节见 [本机恢复包](SDK_WPS_RECOVERY_PACKAGE_2026-10-27.md) §10–§15。
+
+### 2026-10-27：恢复包的期限解析与"单条坏材料"（第三轮）
+
+两个独立缺陷，都先写失败回归再改实现：
+
+1. **无时区 `expiresAt` → `TypeError`**：`datetime.fromisoformat("2035-01-01T00:00:00")` 不报错，
+   返回 naive 时间，与带 UTC 的 `now` 比较直接抛 `TypeError: can't compare offset-naive and
+   offset-aware datetimes`。当时**三处各写了一份**解析（`_deadline()`、`load()`、`_prune_locked()`），
+   所以读回、同正文重存、清理三个入口全炸；接口层实测是 503（`TypeError` 走不进状态映射表）。
+   收敛为一个解析口 `_instant()`：必须是 `str`、非空、可解析、且 `tzinfo`/`utcoffset()` 都有值；
+   无时区**不猜本机时区、不自动补 UTC**，一律按损坏处理（`load`/`save` → `RecoveryPackageCorrupt`，
+   账本传入的首次期限无效 → 422），另加 `_aware()` 守内部 `now` 与 `default_expiry(moment)` 的调用约定。
+2. **单条坏材料拖垮整批清理**：期限比较在 `for` 里裸奔 ⇒ 一条坏包让同目录其它包全不处理；
+   非法文本又被当成"已过期"直接删掉（连排查依据都没了）。改为逐条 `try/except`，计数协议扩为
+   `{removed, failed, unconfirmed}`：期限读不出 ⇒ 保留 + 记 `unconfirmed`，既不删也不重算期限。
+
+自动化：恢复包专项 26 → **41 passed**（先红 13 failed / 2 passed）；相关 API/账本 103 passed；
+WPS 1145/8、Excel 1564/9、core 860、服务端 1870 → **1885 passed / 1 skipped**；双端
+`build` 0/0、`compileall` 0、lint 0 error（36 既有 warning）、`git diff --check` 0。
+反向变异 `M5`（去掉时区校验）打红四条新增用例、失败原文即 `TypeError`，还原后
+`execution_recovery.py=97e69f8d…` 与基线逐字节一致。
+
+**原生未做**：没有打开真实 WPS/Excel。**A1-GATE 仍未通过，A2 未启动。**
+细节见 [本机恢复包](SDK_WPS_RECOVERY_PACKAGE_2026-10-27.md) §16–§20。
+
+## 2026-10-27：三步明确常量被来源闸拒绝
+
+用户原生截图：目标 B2/B3/B4 仍为 -101/-202/-303，写入111/222/333的三步计划被
+“缺少计算来源”拒绝。可信单区域编译器和内存封印原先都只支持单动作。
+新增 plan_literal_edits 并保留三个独立动作；双端共用完整动作序列封印，计算结果
+来源闸继续执行。自动化又抓到无来源常量未生成持久材料，增加恢复来源证据 v2：
+只从活体可信常量计划产生，sources为空；v1继续要求非空来源。跨缓存丢失恢复后
+经原账本和目标核对，只续第三步；撤销还原原始三步快照。
+
+两端：代码已实现、自动化验证；真实 Excel/WPS 本轮未运行。WPS 完整退出恢复
+仍待用户按新版入口复验，未把它标成完成。A1-GATE 未通过，A2 未启动。
+实现、实跑日志与用户下一步见 [有序常量修复](SDK_ORDERED_LITERAL_WRITES_2026-10-27.md)。
+
+本轮实跑：Excel 1566/9、WPS 1148/8、core 866、服务端1901/1；双端 build、
+compileall、diff-check 退出码0；lint 0 error/36 warning；A1-E2 门控Excel6/WPS194。
+最后新增v2 HTTP参数后相关三文件161 passed。真实宿主未运行，未提交/推送Git。
+
+## 2026-10-27：旧账本缺列把恢复包 PUT 打成 500
+
+真机诊断链：execution register 200 → 恢复包 `OPTIONS` 200 → **恢复包 `PUT` 500**
+（`no such column: recovery_package_expires_at`）→ suspend 200 → `GET` 404。浏览器只报
+`Failed to fetch`。
+
+根因是**判据读意图不读事实**：`_schema_is_current` 只比 `PRAGMA user_version`，版本号被写到 10
+而列没建时永久跳过补列。修法与纪律见
+[本机恢复包](SDK_WPS_RECOVERY_PACKAGE_2026-10-27.md) §21–§22 与 `ARCHITECTURE.md`
+「版本号是意图，列是事实」。
+
+客户端同轮补的是**"失败之后敢不敢说没写过"**：`noActionStarted` 四条判据（正面证据 / 账本游标 /
+在途动作 / 执行权）缺一条都保留本机待办；`ReviewNotStartedError` 是唯一允许把审阅置为
+`not_started` 的口。第一版多加的 `status !== "running"` 被 M6 证明抓不到任何变异（服务端
+`ownerActive` 与它同源），已撤回 —— **冗余判据不是防线**。
+
+自动化：服务端专项 72 → **74 passed**；core 审阅 28；WPS 面板 194/5（199）；全量 core **867**、
+WPS **1153/8**、Excel **1566/9**、服务端 1885 → **1907 passed / 1 skipped**；双端 `tsc` 0/0、
+`build` 0/0、`compileall` 0、lint 0 error（36 既有 warning）、`git diff --check` 0。
+反向变异 M6–M10 各自**只**打红一条用例、还原后 `WpsAgentPanel.tsx=07682414…`、
+`wpsExecutionRecovery.ts=61b7273b…`、`task_ledger.py=124b4ec5…` 与基线逐字节一致。
+
+升级只需重启服务进程（自动补列，保留任务/进度/检查点/首次期限）；不重建账本、不删 WAL。
+**原生未做**：没有重启运行实例、没有打开真实 Excel/WPS。**A1-GATE 仍未通过，A2 未启动。**
+# 2026-10-27：开发中断旧绑定收尾
+
+WPS 用户原生截图显示三个动作已执行但探针仍等待第二步回读；后端只读记录确认本次完成，
+不能计入“第二步中断→完整退出→只续第三步”验收。已确认并修复双端执行结束时未释放本次
+未触发绑定、控件到期不刷新两项遗漏；新增真实 WPS 面板中断及写前失败收尾回归。
+此处原生根因仍缺窗格绑定 operationId，不能把自动化通过当作现场根因完全闭环。
+A1-GATE 保持未通过、A2 未启动。细节见 SDK_PRECISE_INTERRUPT_2026-10-24.md 新增章节。
+
+# 2026-10-27：完整退出后的发现入口（索引降级为缓存）
+
+WPS 三步写入在第二步回执前中断，保存并**完整退出**后重开：账本 `needs_reconciliation/1/1`、
+原表 111/222/-303、授权两张表都在，**恢复入口没了**。根因形状 = 唯一入口是浏览器
+`localStorage` 的单条索引（`pending-wps-execution.v1`），完整退出即消失；账本记录、恢复材料、
+原表现场都不参与发现。既有"完整退出"用例在清宿主缓存后又手工写回索引，恰好绕过了缺口。
+
+修法：索引降级为**缓存**，权威发现改为 `GET /api/{wps|office}/executions/pending`（按当前宿主 +
+当前工作簿稳定身份精确查找）。响应只带最小元数据；多候选只给选择入口；"清除提示"只写处置
+时间戳（`discovery_dismissed_at`，账本 `user_version` 10 → 11）；发现全程只读。共享判据
+`packages/core/src/pendingExecutionDiscovery.ts`，WPS 宿主身份读取在
+`apps/wps-addin/src/wpsRecoveryDiscovery.ts`，Excel 侧同轮接线。
+
+自动化：共享判据 13 条（先红后绿）、服务端 16 条（先红 16 failed → 16 passed）、账本迁移
+9/10/11 三档、WPS 面板新增 10 条（完整丢失缓存 / 完整恢复链 / 身份与竞态）；全量 core **881**、
+WPS **1168/8**、Excel **1566/9**、服务端 **1926 passed / 1 skipped**；双端 `tsc`/`build` 0/0、
+`compileall` 0、lint 0 error（36 既有 warning）、`git diff --check` 0。反向变异
+`scripts/mutate_wps_recovery_discovery.mjs` D1–D6 逐条四判据成立，还原后
+`WpsAgentPanel.tsx=aa0b20c8…` 与基线逐字节一致。
+
+测试隔离同时补上：两端 `setupFiles` 装 `packages/core/src/testNetworkGate.ts`，未替身的
+`fetch`/XHR/WebSocket/beacon 直接令用例失败（无允许列表），据此抓出并封住 8 个真实出口。
+
+**原生未做**：真实 Excel/WPS 窗格里没有点过"核对在途动作"，完整退出后的自动发现没有原生复核。
+**A1-GATE 仍未通过，A2 未启动。** 细节见 [本机恢复包](SDK_WPS_RECOVERY_PACKAGE_2026-10-27.md) §28。

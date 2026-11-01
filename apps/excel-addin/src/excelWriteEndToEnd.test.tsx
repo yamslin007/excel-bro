@@ -33,12 +33,15 @@ import { inspectOfficeAuthorizedTarget } from "./officeAuthorizedTarget";
 import { checkIntent, streamAssistantResponse, understandMessage, continuePlanningTask, getPlanningTaskStatus } from "./api";
 import {
   reportOfficeHostWrites,
+  listPendingOfficeExecutions,
+  claimOfficeExecutionResume,
   completeOfficeAction,
   finishOfficeExecution,
   getOfficeExecutionStatus,
   pollSdkBridgeTool,
   postSdkBridgeReceipt,
   reconcileOfficeActionReceipt,
+  recordExecutionDisposition,
   registerOfficeExecution,
   startOfficeAction,
   suspendOfficeExecution
@@ -53,8 +56,32 @@ import {
   invalidateWorkbookStructureCache
 } from "./excel";
 import { createOfficeTestHost, installOfficeTestHost, type TestOfficeHost } from "./officeTestHost";
-import { loadPendingOfficeExecution, savePendingOfficeExecution } from "./officeOperationRecovery";
+import {
+  clearPendingOfficeExecution,
+  loadPendingOfficeExecution,
+  savePendingOfficeExecution
+} from "./officeOperationRecovery";
 import { resetTrustedSourceReads } from "./planSourceDependency";
+
+/*
+ * 附件接缝的**替身**：真机里 `prepareImageFile` 要 `new Image()` + canvas 解码压缩，
+ * jsdom 没有这套能力（`Image` 永不触发 onload）。这里只替掉"解码与压缩"这一步，
+ * 尺寸限额、状态机、主按钮判据全都是真的 —— 于是"只贴图片、没打字"这条分支可以被
+ * 断言，而不是靠"同源结构"推断。
+ */
+vi.mock("./imageAttachments", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./imageAttachments")>();
+  return {
+    ...actual,
+    prepareImageFile: vi.fn(async (file: File) => ({
+      id: "image-test-1",
+      name: file.name,
+      mediaType: "image/png" as const,
+      data: "data:image/png;base64,AAAA",
+      previewUrl: "blob:image-test-1"
+    }))
+  };
+});
 
 const SHEET = "综合票房";
 /** 写入目标：与来源表不同的另一张**已授权**表。 */
@@ -64,7 +91,16 @@ const UNAUTHORIZED_SHEET = "备用表";
 const SHEET_IDS: Record<string, string> = {
   [SHEET]: "sheet-1",
   [TARGET]: "sheet-2",
-  [UNAUTHORIZED_SHEET]: "sheet-3"
+  [UNAUTHORIZED_SHEET]: "sheet-3",
+  // 三步公式计划用的三张结果表（`Excel 写侧：三步公式计划自动执行`）。
+  "结果一": "sheet-4",
+  "结果二": "sheet-5",
+  "结果三": "sheet-6",
+  // 「重开后撤销未完成执行」用的夹具：与真机验收同一个形状（来源 + 三张结果表）。
+  "来源": "sheet-7",
+  "结果1": "sheet-8",
+  "结果2": "sheet-9",
+  "结果3": "sheet-10"
 };
 const ALL_SHEETS = [SHEET, TARGET, UNAUTHORIZED_SHEET];
 
@@ -135,8 +171,21 @@ vi.mock("./api", async (importOriginal) => ({
   finishOfficeExecution: vi.fn(),
   suspendOfficeExecution: vi.fn(),
   getOfficeExecutionStatus: vi.fn(),
+  /* 发现未完成执行：默认"这个工作簿没有待续写的执行"。
+     未替身时产品会真发 GET，测试的网络闸门会直接让用例失败 —— 也就是说，
+     每条挂载 App 的用例都必须显式表态"这个簿有没有未完成执行"。 */
+  listPendingOfficeExecutions: vi.fn(async (workbookIdentity: string) => ({
+    schemaVersion: 1 as const,
+    namespace: "office" as const,
+    workbookIdentity,
+    limit: 20,
+    truncated: false,
+    candidates: []
+  })),
   claimOfficeExecutionResume: vi.fn(),
   reconcileOfficeActionReceipt: vi.fn(),
+  /* 用户处置留痕（放弃/撤销）：真实网络出口，必须替身，否则测试会往用户服务端发请求。 */
+  recordExecutionDisposition: vi.fn(async () => undefined),
   // 工具桥：走真实状态机，只把"网络"换成替身（请求体与回执仍是产品代码拼的）。
   executeWorksheetDeletion: vi.fn(),
   confirmWorksheetCheckpointBackup: vi.fn(),
@@ -398,6 +447,23 @@ const liveTargetPlan = {
       range: "A2:B2",
       formulas: [["=\"乙\"", "=980"]]
     }
+  ],
+  // 真实产品里编译器会给 writeFormulas 计划补 formulasEqual 验收条件；
+  // `verificationGaps` 只认计划声明的验收条件（inferredCriteria 里的推断条件不算），
+  // 没有它每步都会落进"缺少独立验收"。
+  acceptanceCriteria: [
+    {
+      type: "formulasEqual" as const,
+      sheet: TARGET,
+      range: "A1:B1",
+      expected: [["=\"影片\"", "=1200"]]
+    },
+    {
+      type: "formulasEqual" as const,
+      sheet: TARGET,
+      range: "A2:B2",
+      expected: [["=\"乙\"", "=980"]]
+    }
   ]
 };
 
@@ -420,8 +486,18 @@ interface PlanTurnOptions {
   probe?: boolean;
   /** 通过真实范围选择弹层建立的授权范围。 */
   authorize?: string[];
+  /** 弹层里要遍历的表清单（默认 `ALL_SHEETS`）；自定义夹具时传它。 */
+  authorizePool?: string[];
   /** 让本轮真的经工具桥读一次宿主，从而产生可信来源记录。 */
   read?: { scope: "active" | "selected" };
+  /**
+   * 计划**返回之前**的一下改动（改源值、改公式文本…）。
+   *
+   * 自动执行上线后，计划一到就开始跑，"计划到达之后再改源"变成了竞态；
+   * 真正要验的场景是"本轮读过源（锚点已成立）→ 源变了 → 才返回计划"，
+   * 这个钩子就是那段顺序。
+   */
+  beforePlan?: () => void;
 }
 
 /**
@@ -477,7 +553,8 @@ async function sendPlan(
       });
       // 等这一次本地查询真的跑完（回执是执行之后发出的）。
       await waitFor(() =>
-        expect(vi.mocked(postSdkBridgeReceipt).mock.calls.length).toBeGreaterThan(0)
+        expect(vi.mocked(postSdkBridgeReceipt).mock.calls.length).toBeGreaterThan(0),
+        { timeout: 5000 }
       );
       const receipt = vi.mocked(postSdkBridgeReceipt).mock.calls[0]?.[0] as {
         workbookIdentity?: string;
@@ -506,6 +583,7 @@ async function sendPlan(
       activeElapsedSeconds: 1, currentModelId: "claude-agent-sdk", modelSwitchCount: 0,
       canSwitchModel: false, availableModelConnections: []
     } as never;
+    options.beforePlan?.();
     return { kind: "plan", provider: "model", plan: plan as never, planOrigin: options.planOrigin };
   });
 
@@ -518,7 +596,7 @@ async function sendPlan(
       view.container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title
     ).toContain("当前模型")
   );
-  if (options.authorize) await setAuthorizedScope(view, options.authorize);
+  if (options.authorize) await setAuthorizedScope(view, options.authorize, options.authorizePool);
   if (options.probe) {
     view.container.querySelector("details.recovery-probe-control")!.setAttribute("open", "");
     fireEvent.click(await view.findByRole("button", {name:"启用下一次第二步中断"}));
@@ -528,7 +606,7 @@ async function sendPlan(
   });
   fireEvent.click(view.getByRole("button", { name: /^发送$/ }));
   if (options.pauseBeforePlan) await view.findByRole("button", { name: /继续分析/ });
-  else await waitFor(() => expect(view.container.querySelector(".inline-plan")).not.toBeNull());
+  else await waitFor(() => expect(view.container.querySelector(".inline-plan")).not.toBeNull(), { timeout: 4000 });
   return view;
 }
 
@@ -547,13 +625,14 @@ async function openScopePicker(view: ReturnType<typeof render>) {
   );
 }
 
-async function setAuthorizedScope(view: ReturnType<typeof render>, names: readonly string[]) {
+async function setAuthorizedScope(view: ReturnType<typeof render>, names: readonly string[],
+  pool: readonly string[] = ALL_SHEETS) {
   await openScopePicker(view);
   const manual = [...view.container.querySelectorAll<HTMLButtonElement>(".scope-mode-list button")]
     .find((candidate) => candidate.textContent?.includes("选择多个"));
   if (!manual) throw new Error("「选择多个」入口尚未出现");
   fireEvent.click(manual);
-  for (const name of ALL_SHEETS) {
+  for (const name of pool) {
     const button = sheetToggle(view, name);
     const selected = button.getAttribute("aria-pressed") === "true";
     if (selected !== names.includes(name)) fireEvent.click(button);
@@ -650,6 +729,9 @@ describe("主表执行结果审阅（真实 App/执行器，宿主与网络替�
       state={...state,status:"running",revision:state.revision+1,ownerToken:"new-owner",nextActionIndex:2,
         inFlightActionIndex:null,requiresReconciliation:false,checkpoint:req.checkpoint!};return state;
     });
+    vi.mocked(claimOfficeExecutionResume).mockImplementation(async()=>{
+      state={...state,status:"running",revision:state.revision+1,ownerToken:"resume-owner"};return state;
+    });
     vi.mocked(finishOfficeExecution).mockImplementation(async()=>({...state,status:"completed"}));
     const plan={id:"probe-three",title:"三次值复制",summary:"复制到目标表",assumptions:[],warnings:[],
       actions:[2,3,4].map(r=>({type:"copyRange",sheet:TARGET,sourceSheet:SHEET,sourceRange:`B${r}`,
@@ -664,9 +746,21 @@ describe("主表执行结果审阅（真实 App/执行器，宿主与网络替�
     view.unmount();
     if (sourceChanged) host.setCell(SHEET,"B3",999);
     const reopened=render(<App/>);
-    const button=await reopened.findByRole("button",{name:"核对并继续"});
-    await waitFor(()=>expect((button as HTMLButtonElement).disabled).toBe(false));
-    act(()=>{fireEvent.click(button);fireEvent.click(button);});
+    /*
+     * 恢复卡是**两步**，不是一个「核对并继续」：
+     *   ①「核对在途动作」只补记回执（零单元格写入）；
+     *   ②「继续剩余动作」只跑剩下的动作（已完成的第 2 步不重放）。
+     */
+    const reconcileButton=await reopened.findByRole("button",{name:"核对在途动作"});
+    await waitFor(()=>expect((reconcileButton as HTMLButtonElement).disabled).toBe(false));
+    expect(reopened.queryByRole("button",{name:"继续剩余动作"})).toBeNull();
+    act(()=>{fireEvent.click(reconcileButton);fireEvent.click(reconcileButton);});
+    await waitFor(()=>expect(reconcileOfficeActionReceipt).toHaveBeenCalledTimes(1));
+    // 核对这一下：一个单元格都没写。
+    expect(contentWrites(host.originalWrites())).toEqual(before);
+    const resumeButton=await reopened.findByRole("button",{name:"继续剩余动作"});
+    await waitFor(()=>expect((resumeButton as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(resumeButton);
     if (sourceChanged) {
       await waitFor(()=>expect(text(reopened)).toContain("数据来源在预览后发生了变化"));
       expect(finishOfficeExecution).not.toHaveBeenCalled();
@@ -699,6 +793,7 @@ describe("主表执行结果审阅（真实 App/执行器，宿主与网络替�
       expect(reopened.queryByRole('button',{name:'确认变更'})).toBeNull();
       // This SharePoint host cannot close a native local copy; a settled cleanup notice is legitimate.
       expect(reopened.container.querySelector('.result-review-bar')?.textContent ?? '').not.toContain('执行未完成');
+      // ③确认只清标记：续跑 + 确认的整个链路没有产生第二次写入。
       expect(contentWrites(host.originalWrites())).toEqual(writes);
     } else {
       const discard=reopened.getByRole('button',{name:'放弃变更'});
@@ -1008,6 +1103,51 @@ describe("主表执行结果审阅（真实 App/执行器，宿主与网络替�
     expect(host.cell(SHEET, "B2")).toBe(1200);
     expect(host.windowNames()).toEqual(["book.xlsx"]);
   });
+  it("放弃变更 → 服务端留痕记「放弃」，不是「撤销」", async () => {
+    const view = await sendPlan(reviewPlan); await stageReview(view);
+    fireEvent.click(view.getByRole("button", { name: "放弃变更" }));
+    await waitFor(() => expect(text(view)).toContain("已放弃并恢复"));
+    /*
+     * 留痕是 best-effort（`void` 掉的），所以等的是"端点被调用过"，不是某条消息。
+     * 它证的正是账本里补出来的那一行：用户**主动撤回**了这次执行。
+     * 这一格以前完全不存在 —— 2026-10-29 真机确认变更后，账本里连"用户点过确认"
+     * 都查不到（见 `outputs/a1-acceptance-20261029-2/EVIDENCE.md` §6）。
+     */
+    await waitFor(() => expect(vi.mocked(recordExecutionDisposition)).toHaveBeenCalledTimes(1));
+    const [namespace, executionId, disposition] = vi.mocked(recordExecutionDisposition).mock.calls[0];
+    expect(namespace).toBe("office");
+    expect(typeof executionId).toBe("string");
+    expect((executionId as string).length).toBeGreaterThan(0);
+    expect(disposition).toBe("abandoned"); // 不是 "undone"：两种取值不许互相冒充
+    // 留痕不改行为：单元格确实回到执行前，且只留了一次。
+    expect(host.cell(SHEET, "G1")).toBe("");
+    expect(host.cell(SHEET, "B2")).toBe(1200);
+  });
+  it("留痕上报失败：放弃照样成功、不重试、不再撤一次", async () => {
+    /*
+     * 留痕是**观测**，不是恢复的前置条件。这里钉三件事：
+     * 1. 上报抛错不影响业务结论（单元格确实回到执行前、文案仍是「已放弃并恢复」）；
+     * 2. **不自动重试**（端点只被叫一次）——重试若发生在错误的位置，就会变成"再撤一次"；
+     * 3. 上报前后宿主写入次数不再增加（证明没有第二次恢复）。
+     */
+    vi.mocked(recordExecutionDisposition).mockRejectedValueOnce(new Error("网络不可用"));
+    const view = await sendPlan(reviewPlan); await stageReview(view);
+    fireEvent.click(view.getByRole("button", { name: "放弃变更" }));
+    await waitFor(() => expect(text(view)).toContain("已放弃并恢复"));
+    await waitFor(() => expect(vi.mocked(recordExecutionDisposition)).toHaveBeenCalledTimes(1));
+    const writes = host.originalWrites().length;
+    await waitFor(() => expect(text(view)).toContain("已放弃并恢复"));
+    expect(host.originalWrites().length).toBe(writes);
+    expect(host.cell(SHEET, "G1")).toBe("");
+    expect(text(view)).not.toContain("无法记录这次执行的处置");
+  });
+  it("确认变更不是处置：不写「放弃/撤销」留痕", async () => {
+    const view = await sendPlan(reviewPlan); await stageReview(view);
+    fireEvent.click(view.getByRole("button", { name: "确认变更" }));
+    await waitFor(() => expect(text(view)).toContain("已确认变更"));
+    expect(vi.mocked(recordExecutionDisposition)).not.toHaveBeenCalled();
+    expect(host.cell(SHEET, "G1")).toBe("合计");
+  });
   it("执行后目标被人工修改，确认与放弃都不覆盖该修改", async () => {
     const view = await sendPlan(reviewPlan); await stageReview(view);
     host.setCell(SHEET, "G1", "人工修改");
@@ -1019,6 +1159,12 @@ describe("主表执行结果审阅（真实 App/执行器，宿主与网络替�
     expect(host.cell(SHEET, "G1")).toBe("人工修改");
     expect(contentWrites(host.originalWrites())).toHaveLength(count);
     expect(view.container.querySelector(".result-review-bar")?.textContent).not.toContain("已确认变更");
+    /*
+     * ★ 恢复没发生 ⇒ 两种留痕一个都不写（`abandoned` 也不行）。
+     * 这条同时钉住 `revertedByDiscard` 的清理：失败分支必须把"这次是放弃"的标记撤掉，
+     * 否则同一次执行之后的**真正撤销**会被贴成 `abandoned`。
+     */
+    expect(vi.mocked(recordExecutionDisposition)).not.toHaveBeenCalled();
   });
   it("执行后切换工作簿，旧确认不产生任何额外写入", async () => {
     const view = await sendPlan(reviewPlan); await stageReview(view);
@@ -1049,32 +1195,43 @@ describe("主表执行结果审阅（真实 App/执行器，宿主与网络替�
   });
 });
 
-async function clickRunOnExcel(view: ReturnType<typeof render>) {
-  const button = await waitFor(() => {
-    const found = [...view.container.querySelectorAll("button")].find(
-      (candidate) => candidate.textContent === "执行到 Excel"
-    ) as HTMLButtonElement | undefined;
-    if (!found) throw new Error("「执行到 Excel」按钮尚未出现");
-    return found;
-  });
-  fireEvent.click(button);
-  return button;
-}
-
-describe("Excel 写侧：直接执行路径的写前判据", () => {
-  it("计划含未授权工作表的动作：执行期拒绝，一个单元格都不写", async () => {
+/**
+ * 旧入口已删除（2026-10-30）。
+ *
+ * 这里曾经有个 `clickRunOnExcel`：它在"副本比对做不了"的计划上找「执行到 Excel」
+ * 并点下去。真机反馈很直接 —— 用户已经确认授权，界面却还要他再点一下，而那一下
+ * 是**绕过审阅**的执行。现在计划到达即自动执行一次：
+ *
+ * - 能生成副本 ⇒ 审阅带双视图对比；
+ * - 不能生成副本 ⇒ 审阅降级（条子上说明原因，不给"对比"按钮），执行照旧；
+ * - 越界（目标/来源不在授权内）⇒ **不执行**，卡片直接给原因。
+ *
+ * 所以下面的用例都不再点击：判据变成"自动执行有没有被正确拦住/放行"。
+ */
+describe("Excel 写侧：非副本计划同样自动执行，写前判据不变", () => {
+  it("计划含未授权工作表的动作：不自动执行，卡片给出原因，一个单元格都不写", async () => {
     const view = await sendPlan(offSourcePlan);
-    await clickRunOnExcel(view);
 
-    await waitFor(() => expect(text(view)).toContain("执行前检查未通过"));
+    await waitFor(() => expect(text(view)).toContain("计划写入目标超出本次授权，未执行。"));
+    // 没有手动入口可以绕过授权，也没有任何写入。
+    expect(view.queryByRole("button", { name: "执行到 Excel" })).toBeNull();
     expect(host.writes()).toEqual([]);
     expect(host.cell(SHEET, "C2")).toBe(30);
+    expect(registerOfficeExecution).not.toHaveBeenCalled();
   });
 
-  it("等待期间源值被改（烘焙矩阵计划）：给出二次确认，不自动写入", async () => {
-    const view = await sendPlan(directPlan);
-    host.setCell(SHEET, "B2", 4321);
-    await clickRunOnExcel(view);
+  it("本轮读过源、计划到达前源值又变了：给出二次确认，不自动写入", async () => {
+    /*
+     * 顺序就是真机顺序：本轮经工具桥读了一次源（锚点因此在场）→ 用户/别人改了源
+     * → 计划才送达 → 自动执行被来源复核拦下。
+     *
+     * 旧写法是"送达之后再改、再点按钮"：自动执行上线后那段窗口是竞态，
+     * 而它真正想验的只是"锚点成立之后源变化必须拦住"。
+     */
+    const view = await sendPlan(directPlan, "把合计写到汇总表", {
+      read: { scope: "active" },
+      beforePlan: () => host.setCell(SHEET, "B2", 4321)
+    });
 
     await waitFor(() =>
       expect(view.container.querySelector(".stale-source-message")).not.toBeNull()
@@ -1084,10 +1241,11 @@ describe("Excel 写侧：直接执行路径的写前判据", () => {
   });
 
   it("源表**公式文本**变化也会改变来源指纹（不是只算值）", async () => {
-    const view = await sendPlan(directPlan);
-    // 显示结果不变，变的是单元格里的公式文本。
-    host.setCell(SHEET, "C2", "=30+0", { asFormula: true });
-    await clickRunOnExcel(view);
+    const view = await sendPlan(directPlan, "把合计写到汇总表", {
+      read: { scope: "active" },
+      // 显示结果不变（30 = 30），变的是单元格里的公式文本。
+      beforePlan: () => host.setCell(SHEET, "C2", "=30+0", { asFormula: true })
+    });
 
     await waitFor(() =>
       expect(view.container.querySelector(".stale-source-message")).not.toBeNull()
@@ -1095,15 +1253,220 @@ describe("Excel 写侧：直接执行路径的写前判据", () => {
     expect(host.originalWrites()).toEqual([]);
   });
 
-  it("源值、身份都没变时照常写入，并如实给出恢复限制说明", async () => {
+  it("源值、身份都没变时照常自动写入，并如实给出恢复限制说明", async () => {
     const view = await sendPlan(directPlan);
-    await clickRunOnExcel(view);
 
     await waitFor(() => expect(host.cell(SHEET, "C2")).toBe(30));
     expect(host.matrix(SHEET, "C1:C3")).toEqual([["场次"], [30], [22]]);
     // 没有可信来源记账 → 不登记断点，如实说明"本次不承诺跨重启自动续跑"。
-    expect(text(view)).toContain("本次不承诺跨重启自动续跑");
+    await waitFor(() => expect(text(view)).toContain("本次不承诺跨重启自动续跑"));
     expect(registerOfficeExecution).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * 2026-10-30 真机阻断条件的回归。
+ *
+ * 现场：用户已经确认授权，三步公式计划（三张结果表各写一条 `=来源!B*`）却只摆出
+ * 「执行到 Excel」—— 因为那时"要不要自动执行"由 `resultReviewPlanIssue` 决定，
+ * 而"多张写入目标表"与"跨表公式"都落在"副本比对做不了"这一档上。
+ *
+ * 这条用例钉三件事：
+ *  1. 计划到达即自动执行，**没有**手动入口（不再需要用户点一下绕过审阅）；
+ *  2. 确定性验收入口断在第二步回读之后，第三步一个单元格都不写；
+ *  3. 原授权、来源复核与恢复登记都还在：登记一次、授权集合原样、公式动作原样。
+ */
+describe("Excel 写侧：三步公式计划自动执行（阻断条件回归）", () => {
+  const FORMULA_TARGETS = ["结果一", "结果二", "结果三"];
+  const FORMULA_SCOPE = [SHEET, ...FORMULA_TARGETS];
+  /** 来源表 + 三张空的公式结果表（`createHost()` 的来源值原样保留，工具桥按「影片」读）。 */
+  function installFormulaHost() {
+    host = createOfficeTestHost({
+      url: BOOK_URL,
+      selectedRange: "A1:C3",
+      activeSheet: SHEET,
+      sheets: [
+        {
+          name: SHEET,
+          values: [["影片", "票房(万)", "场次"], ["甲", 1200, 30], ["乙", 980, 22]]
+        },
+        ...FORMULA_TARGETS.map((name) => ({ name, values: [] }))
+      ]
+    });
+    installOfficeTestHost(host);
+  }
+  /** 三张结果表各一条**跨表**公式：任何一条都做不了副本比对（跨表 + 多张目标表）。 */
+  function threeFormulaPlan(id: string) {
+    return {
+      id,
+      title: "三条公式",
+      summary: "三张结果表各写一条公式",
+      assumptions: [],
+      warnings: [],
+      actions: FORMULA_TARGETS.map((name, index) => ({
+        type: "writeFormulas" as const,
+        sheet: name,
+        range: "B2",
+        formulas: [[`=${SHEET}!${["B2", "C2", "B3"][index]}*${index + 1}`]]
+      })),
+      sourceDependencySheets: [SHEET]
+    };
+  }
+
+  it.each([true, false])("三张结果表的公式计划自动执行并在第二步中断（模型读取=%s）", async (modelRead) => {
+    installFormulaHost();
+    const plan = threeFormulaPlan("plan-formula-three");
+    /*
+     * 中断后的现场：有在途动作 ⇒ 恢复卡按「待核对」摆出来（不是一张空白失败卡）。
+     *
+     * 这里必须给**完整**的账本读数（`plan` / `authorizedSheetNames` / `workbookIdentity`
+     * / 写前快照），因为卡片正文里的"第几步 / 还剩几步"来自 `plan.actions.length`，
+     * 够不够格摆成"可继续"来自共享判据 `pendingResumeReadiness`（身份 → 状态 →
+     * 授权 → 在途材料）。只给 `status` 与两个索引，卡片构造会在读 `plan.actions` 时抛错，
+     * 表现为"恢复入口根本没出现"——那是替身缺料，不是产品少闸门。
+     */
+    vi.mocked(suspendOfficeExecution).mockResolvedValue({
+      operationId: "op-formula-three",
+      status: "suspended",
+      revision: 2,
+      workbookIdentity: `url:${BOOK_URL}`,
+      plan,
+      authorizedSheetNames: FORMULA_SCOPE,
+      allowedExternalFiles: [],
+      nextActionIndex: 1,
+      inFlightActionIndex: 1,
+      beforeSnapshot: {
+        actionIndex: 1,
+        sheet: "结果二",
+        range: "B2",
+        formulas: [[""]],
+        numberFormat: [["General"]],
+        fillColor: "#FFFFFF",
+        fontBold: false,
+        fontColor: "#000000"
+      },
+      checkpoint: null,
+      result: null,
+      error: null,
+      canResume: true,
+      requiresReconciliation: true,
+      ownerToken: "owner-token"
+    } as never);
+    const view = await sendPlan(plan, "把三条公式分别写到三张结果表", {
+      authorize: FORMULA_SCOPE,
+      authorizePool: FORMULA_SCOPE,
+      ...(modelRead ? { read: { scope: "active" as const } } : {}),
+      probe: true
+    });
+
+    // ① 没有手动入口：计划到达即执行。
+    expect(view.queryByRole("button", { name: "执行到 Excel" })).toBeNull();
+    /*
+     * 而且**真的进了执行**——只断言"没有按钮"是不够的：旧缺陷下按钮不出现
+     * （工作簿模式下它本来就不画），计划却停在"等人点"，一样没有按钮。
+     * 判别点是"登记是否发生"：计划没被送进执行器就永远不会有这一步。
+     */
+    await waitFor(() => expect(registerOfficeExecution).toHaveBeenCalledTimes(1));
+
+    // ② 第二步回读后中断：前两步真的写进去了，第三步没跑。
+    await waitFor(() => expect(suspendOfficeExecution).toHaveBeenCalledTimes(1));
+    expect(host.cell("结果一", "B2")).toBe(`=${SHEET}!B2*1`);
+    expect(host.cell("结果二", "B2")).toBe(`=${SHEET}!C2*2`);
+    expect(host.cell("结果三", "B2")).toBe("");
+    expect(contentWrites(host.originalWrites()).map((write) => `${write.sheet}!${write.address}`))
+      .toEqual(["结果一!B2", "结果二!B2"]);
+    // 第 2 步的完成回执没有提交（中断就在回读之后、回执之前）。
+    expect(vi.mocked(completeOfficeAction).mock.calls.map((call) => call[1].actionIndex)).toEqual([0]);
+
+    // ③ 授权、来源复核与恢复登记都还在。
+    expect(registerOfficeExecution).toHaveBeenCalledTimes(1);
+    const registered = vi.mocked(registerOfficeExecution).mock.calls[0][0] as {
+      plan: { actions: { type: string; sheet: string }[]; sourceDependencySheets?: string[] };
+      authorizedSheetNames: string[];
+    };
+    expect(registered.authorizedSheetNames).toEqual(FORMULA_SCOPE);
+    expect(registered.plan.actions.map((action) => action.type))
+      .toEqual(["writeFormulas", "writeFormulas", "writeFormulas"]);
+    expect(registered.plan.sourceDependencySheets).toEqual([SHEET]);
+    if (!modelRead) expect(postSdkBridgeReceipt).not.toHaveBeenCalled();
+    // 来源表一个单元格都没动。
+    expect(host.matrix(SHEET, "A1:C2")).toEqual([["影片", "票房(万)", "场次"], ["甲", 1200, 30]]);
+    // 恢复入口按结论给出（有在途动作 ⇒ 待核对），可点、且只有一条。
+    expect(await view.findByRole("button", { name: "核对在途动作" })).toBeTruthy();
+  });
+
+  it("探针取消显示具体同表依赖原因和未执行，不显示需要核对", async () => {
+    installFormulaHost();
+    const plan = threeFormulaPlan('formula-local-probe');
+    plan.actions[0].formulas = [['=A1*2']];
+    const view = await sendPlan(plan, '写三条公式', {
+      authorize: FORMULA_SCOPE, authorizePool: FORMULA_SCOPE, probe: true, read: { scope: 'active' }
+    });
+    await waitFor(() => expect(view.container.querySelector('.result-review-bar')?.textContent).toContain('未执行'));
+    expect(view.container.querySelector('.result-review-bar')?.textContent).toContain('写入目标表自身');
+    expect(view.container.querySelector('.result-review-bar')?.textContent).not.toContain('需要核对');
+    expect(registerOfficeExecution).not.toHaveBeenCalled();
+    expect(contentWrites(host.originalWrites())).toEqual([]);
+  });
+
+  /*
+   * 修复的另一半：副本比对做不了时**降级**，不是"不许执行"。
+   *
+   * 旧代码把 `resultReviewPlanIssue` 当执行许可，于是这类计划连执行都进不去；
+   * 现在它照常执行一次，审阅条如实说"本次没有副本"，**不画**点下去只会报错的
+   * 「双视图对比」，而「确认变更 / 放弃变更」照旧 —— 比对是审阅的辅助，不是许可。
+   *
+   * 这里用**值**计划而不是公式计划：公式计划的 `verified` 依赖服务端补
+   * `formulasEqual`（替身服务端没有），会先卡在"结果未完整验证"上，测不到降级这段。
+   */
+  it("多张写入目标表的值计划没有副本可对比：照常执行并如实降级，不冒充可对比", async () => {
+    installFormulaHost();
+    const rows = [["甲", 1200], ["乙", 980], ["甲", 30]];
+    const plan = {
+      id: "plan-three-values",
+      title: "三条结果",
+      summary: "三张结果表各写一行",
+      assumptions: [],
+      warnings: [],
+      actions: FORMULA_TARGETS.map((name, index) => ({
+        type: "writeValues" as const,
+        sheet: name,
+        range: "A1:B1",
+        values: [rows[index]]
+      })),
+      acceptanceCriteria: FORMULA_TARGETS.map((name, index) => ({
+        type: "rangeEquals" as const,
+        sheet: name,
+        range: "A1:B1",
+        expected: [rows[index]]
+      }))
+    };
+    const view = await sendPlan(plan, "把三行分别写到三张结果表", {
+      authorize: FORMULA_SCOPE,
+      authorizePool: FORMULA_SCOPE,
+      read: { scope: "active" }
+    });
+
+    expect(view.queryByRole("button", { name: "执行到 Excel" })).toBeNull();
+    /*
+     * 判别点是"计划是否真的被送进执行器"，而不是"有没有按钮"：旧缺陷下
+     * 工作簿模式本来就不画按钮，计划却停在"等人点"。没有这一步，下面"等写入"
+     * 只能以超时收场，红得说不清原因。
+     */
+    await waitFor(() => expect(registerOfficeExecution).toHaveBeenCalledTimes(1));
+    // 三张表都写进去了：没有副本也没收走自动执行。
+    await waitFor(() => expect(host.cell("结果三", "A1")).toBe("甲"), { timeout: 5000 });
+    expect(FORMULA_TARGETS.map((name) => host.matrix(name, "A1:B1")))
+      .toEqual([[["甲", 1200]], [["乙", 980]], [["甲", 30]]]);
+
+    // 审阅条照旧出现，并**明说**这次没有执行前副本。
+    const bar = await view.findByRole("region", { name: "本次结果审阅" }, { timeout: 5000 });
+    expect(bar.textContent).toContain("本次未生成执行前副本");
+    expect(bar.textContent).toContain("结果以原表回读为准");
+    // 不画假按钮：比对做不了就不给「双视图对比」，确认/放弃仍在。
+    expect(view.queryByRole("button", { name: "双视图对比" })).toBeNull();
+    expect(view.getByRole("button", { name: "确认变更" })).toBeTruthy();
+    expect(view.getByRole("button", { name: "放弃变更" })).toBeTruthy();
   });
 });
 
@@ -1395,7 +1758,7 @@ describe("Excel 写侧：中断后先核对再续跑", () => {
     expect(loadPendingOfficeExecution()).toBeNull();
   });
 
-  it.each(["applied", "not_applied", "unknown"] as const)("A1 三动作中途断开：替身宿主现场核对为 %s 后不重写已完成动作", async (outcome) => {
+  it.each(["applied", "not_applied", "unknown"] as const)("A1 三动作中途断开：核对只补记回执（零写入），继续才只跑剩余动作（%s）", async (outcome) => {
     host.setCell(TARGET, "A1", '="影片"', { asFormula: true });
     host.setCell(TARGET, "B1", "=1200", { asFormula: true });
     if (outcome === "applied") {
@@ -1413,15 +1776,48 @@ describe("Excel 写侧：中断后先核对再续跑", () => {
       workbookIdentity:resumeState().workbookIdentity,actionIndex:0,
       before:resumeState().beforeSnapshot!,previous:null});
     expect(prior.outcome).toBe("applied");
-    vi.mocked(getOfficeExecutionStatus).mockResolvedValue(resumeState({ plan, nextActionIndex: 1, inFlightActionIndex: 1,
-      checkpoint:prior.checkpoint,
-      beforeSnapshot: { ...resumeState().beforeSnapshot, actionIndex: 1, range: "A2:B2", formulas: [["", ""]], fillColor: "" } }) as never);
-    vi.mocked(reconcileOfficeActionReceipt).mockImplementation(async (_id, request)=>resumeState({ plan,
-      checkpoint:request.checkpoint ?? prior.checkpoint,
-      nextActionIndex: outcome === "applied" ? 2 : 1, inFlightActionIndex: null, requiresReconciliation: false, revision: 3 }) as never);
+    /*
+     * 替身服务端按真实时序推进：核对回执提交之后，在途动作才被清掉、进度才前移。
+     * 用 `reconciled` 开关而不是"第几次调用"，是为了让"核对前/核对后"两个现场
+     * 在任意次数的只读查询下都稳定。
+     */
+    let reconciled = false;
+    let reconciledCheckpoint: unknown = null;
+    const inFlightState = () => resumeState({ plan, nextActionIndex: 1, inFlightActionIndex: 1,
+      checkpoint: prior.checkpoint,
+      beforeSnapshot: { ...resumeState().beforeSnapshot, actionIndex: 1, range: "A2:B2", formulas: [["", ""]], fillColor: "" } });
+    const settledState = () => resumeState({ plan,
+      checkpoint: reconciledCheckpoint ?? prior.checkpoint,
+      nextActionIndex: outcome === "applied" ? 2 : 1, inFlightActionIndex: null,
+      requiresReconciliation: false, revision: 3 });
+    vi.mocked(getOfficeExecutionStatus).mockImplementation(async () => (reconciled ? settledState() : inFlightState()) as never);
+    vi.mocked(reconcileOfficeActionReceipt).mockImplementation(async (_id, request) => {
+      expect(request.actionIndex).toBe(1);
+      expect(request.outcome).toBe(outcome);
+      reconciled = true;
+      // 真实服务端会把核对累积的 checkpoint（含第 1、2 步的写后指纹）存进账本并返回；
+      // 替身也必须传播它，否则"已核对"之后的账本缺了第 1 步的写后指纹。
+      reconciledCheckpoint = request.checkpoint;
+      return settledState() as never;
+    });
+    vi.mocked(claimOfficeExecutionResume).mockImplementation(async () => settledState() as never);
+    vi.mocked(finishOfficeExecution).mockResolvedValue(
+      resumeState({ plan, nextActionIndex: 3, inFlightActionIndex: null, revision: 4 }) as never
+    );
     const view = render(<App />);
-    const button = await view.findByRole("button", { name: "核对并继续" });
-    fireEvent.click(button);
+    const reconcileButton = await view.findByRole("button", { name: "核对在途动作" });
+    // 待核对时**不许**同时给续跑按钮：那正是"一个按钮里先补记再续跑"的老行为。
+    expect(view.queryByRole("button", { name: "继续剩余动作" })).toBeNull();
+    /*
+     * 信息层级：一句正文要同时说清"第几步可能已写入"和"还剩几步没执行"，
+     * 而不是一句 `reason` 加一句按状态分支的重复说明。
+     */
+    const card = text(view);
+    expect(card).toContain("上次写入的恢复核对");
+    expect(card).toContain("待核对在途动作");
+    expect(card).toContain("第 2 个动作");
+    expect(card).toContain("还有 1 个动作没执行");
+    fireEvent.click(reconcileButton);
     if (outcome === "unknown") {
       await waitFor(() => expect(text(view)).toContain("目标范围既不匹配执行前状态"));
       expect(reconcileOfficeActionReceipt).not.toHaveBeenCalled();
@@ -1429,6 +1825,19 @@ describe("Excel 写侧：中断后先核对再续跑", () => {
       expect(contentWrites(host.originalWrites()).length).toBe(beforeWrites);
       return;
     }
+    /*
+     * ①核对：只有回执，没有单元格写入、没有动作执行权、没有收尾。
+     * 这一条是"核对只补记"的判据 —— 以前"核对并继续"会在这一下把剩下的也写掉。
+     */
+    await waitFor(() => expect(reconcileOfficeActionReceipt).toHaveBeenCalledTimes(1));
+    // 逐格断言"这一下写了哪几格"而不是只比次数：失败时原文要点出被多写的那一格。
+    expect(contentWrites(host.originalWrites()).slice(beforeWrites).map((write) => write.address))
+      .toEqual([]);
+    expect(host.matrix(TARGET, "A1:B1")).toEqual(originalFirstRow);
+    expect(startOfficeAction).not.toHaveBeenCalled();
+    expect(finishOfficeExecution).not.toHaveBeenCalled();
+    // ②继续：只剩没跑过的动作，已完成的第 2 步不重放。
+    fireEvent.click(await view.findByRole("button", { name: "继续剩余动作" }));
     await waitFor(() => expect(finishOfficeExecution).toHaveBeenCalledTimes(1));
     expect(contentWrites(host.originalWrites()).slice(beforeWrites).map((write) => write.address))
       .toEqual(outcome === "applied" ? ["A3:B3"] : ["A2:B2", "A3:B3"]);
@@ -1436,8 +1845,8 @@ describe("Excel 写侧：中断后先核对再续跑", () => {
     expect(host.cell(TARGET, "A3")).toBe('="丙"');
     expect(vi.mocked(startOfficeAction).mock.calls.map((call) => call[1].actionIndex))
       .toEqual(outcome === "applied" ? [2] : [1, 2]);
-    expect(reconcileOfficeActionReceipt).toHaveBeenCalledWith(OPERATION_ID, expect.objectContaining({ actionIndex: 1, outcome }));
   });
+
 
   it("在途动作先核对为「已写入」：跳过该步，只写剩余步骤，不重复写", async () => {
     // 头一步已经真的写进宿主了（回执丢失），第二部还没写。
@@ -1446,28 +1855,39 @@ describe("Excel 写侧：中断后先核对再续跑", () => {
     const firstWrites = host.originalWrites().length;
 
     pendingIndex();
-    vi.mocked(getOfficeExecutionStatus).mockResolvedValue(resumeState() as never);
-    vi.mocked(reconcileOfficeActionReceipt).mockImplementation(async (_id,request)=>
-      resumeState({checkpoint:request.checkpoint, nextActionIndex: 1, inFlightActionIndex: null, requiresReconciliation: false, revision: 3 }) as never
+    // 替身服务端在核对回执提交之后才清掉在途动作、把进度推到第 2 步，并记下新的检查点。
+    let reconciled = false;
+    let checkpoint: unknown = null;
+    const settledState = (revision: number) => resumeState({
+      checkpoint: checkpoint as never,
+      nextActionIndex: 1, inFlightActionIndex: null, requiresReconciliation: false, revision
+    });
+    vi.mocked(getOfficeExecutionStatus).mockImplementation(async () =>
+      (reconciled ? settledState(3) : resumeState()) as never
     );
+    vi.mocked(reconcileOfficeActionReceipt).mockImplementation(async (_id,request)=>{
+      reconciled = true;
+      checkpoint = request.checkpoint;
+      return settledState(3) as never;
+    });
+    vi.mocked(claimOfficeExecutionResume).mockImplementation(async () => settledState(4) as never);
     vi.mocked(finishOfficeExecution).mockResolvedValue(
-      officeLedgerState({ status: "finished", revision: 4 }) as never
+      resumeState({ nextActionIndex: 2, inFlightActionIndex: null, revision: 5 }) as never
     );
 
     const view = render(<App />);
-    // 挂接索引在挂载时先核对一次：在途动作 → 恢复卡（要求先核对）。
-    const resumeButton = await waitFor(() => {
-      const card = view.container.querySelector(".office-resume-card");
-      if (!card) throw new Error("恢复卡尚未出现");
-      const button = [...card.querySelectorAll("button")].find(
-        (candidate) => candidate.textContent === "核对并继续"
-      ) as HTMLButtonElement | undefined;
-      if (!button) throw new Error("「核对并继续」按钮尚未出现");
-      return button;
-    });
-    fireEvent.click(resumeButton);
+    // 挂接索引在挂载时先核对一次：在途动作 → 恢复卡只给「核对在途动作」。
+    const reconcileButton = await view.findByRole("button", { name: "核对在途动作" });
+    expect(view.queryByRole("button", { name: "继续剩余动作" })).toBeNull();
+    fireEvent.click(reconcileButton);
 
-    // 续跑：只写第二步（A2:B2），第一步的 A1:B1 不再被写一次。
+    // ①核对只补记：一个单元格都没写，也没有领取任何动作的执行权。
+    await waitFor(() => expect(reconcileOfficeActionReceipt).toHaveBeenCalledTimes(1));
+    expect(contentWrites(host.originalWrites()).slice(firstWrites)).toEqual([]);
+    expect(startOfficeAction).not.toHaveBeenCalled();
+
+    // ②继续：只写第二步（A2:B2），第一步的 A1:B1 不再被写一次。
+    fireEvent.click(await view.findByRole("button", { name: "继续剩余动作" }));
     await waitFor(() => expect(host.cell(TARGET, "A2")).toBe("=\"乙\""));
     const writes = contentWrites(host.originalWrites()).slice(firstWrites);
     expect(writes.map((write) => write.address)).toEqual(["A2:B2"]);
@@ -1475,6 +1895,111 @@ describe("Excel 写侧：中断后先核对再续跑", () => {
     expect(
       (vi.mocked(reconcileOfficeActionReceipt).mock.calls[0][1] as { outcome: string }).outcome
     ).toBe("applied");
+  });
+
+  it("全部动作已写入、只缺最终回执：只给「补记完成（不重写原表）」，点它不写单元格也不执行动作", async () => {
+    // 现场就是"两个动作都已经写进原表"：进度 2/2，没有在途动作，只差最终回执。
+    host.setCell(TARGET, "A1", '="影片"', { asFormula: true });
+    host.setCell(TARGET, "B1", "=1200", { asFormula: true });
+    host.setCell(TARGET, "A2", '="乙"', { asFormula: true });
+    host.setCell(TARGET, "B2", "=980", { asFormula: true });
+    const firstWrites = contentWrites(host.originalWrites()).length;
+    pendingIndex();
+    const ledgerOnly = (revision: number) => resumeState({
+      nextActionIndex: 2, inFlightActionIndex: null, requiresReconciliation: false, revision
+    });
+    vi.mocked(getOfficeExecutionStatus).mockImplementation(async () => ledgerOnly(2) as never);
+    vi.mocked(claimOfficeExecutionResume).mockImplementation(async () => ledgerOnly(3) as never);
+    vi.mocked(finishOfficeExecution).mockResolvedValue(
+      resumeState({ status: "completed", nextActionIndex: 2, inFlightActionIndex: null, revision: 4 }) as never
+    );
+
+    const view = render(<App />);
+    const backfill = await view.findByRole("button", { name: "补记完成（不重写原表）" });
+    // 只剩回执时不画「继续剩余动作」：没有动作可执行，画了就是假按钮。
+    expect(view.queryByRole("button", { name: "继续剩余动作" })).toBeNull();
+    fireEvent.click(backfill);
+
+    await waitFor(() => expect(finishOfficeExecution).toHaveBeenCalledTimes(1));
+    expect((vi.mocked(finishOfficeExecution).mock.calls[0][1] as { result: unknown }).result)
+      .toEqual({ backfilled: true, actionCount: 2 });
+    /*
+     * 补记只改账本：一个单元格都没写，也没有领取任何动作的执行权。
+     * 以前这条路会先 `executePlan(startActionIndex = 动作总数)` 再收尾 —— 一个动作都不该跑。
+     */
+    expect(contentWrites(host.originalWrites()).length).toBe(firstWrites);
+    expect(startOfficeAction).not.toHaveBeenCalled();
+    expect(completeOfficeAction).not.toHaveBeenCalled();
+    expect(reconcileOfficeActionReceipt).not.toHaveBeenCalled();
+    expect(loadPendingOfficeExecution()).toBeNull();
+    await waitFor(() => expect(text(view)).toContain("补记只改账本状态，原表未再做任何写入"));
+  });
+
+  it.each(["confirm", "discard"] as const)("公式续跑完成后进入审阅收尾（%s）：确认不重放、放弃恢复原公式与格式", async (outcome) => {
+    // 执行前现场：A1:B1 原本是空（先记住，再模拟"第一步已写进原表、回执丢失"）。
+    const beforeFirstRow = host.matrix(TARGET, "A1:B1");
+    host.setCell(TARGET, "A1", '="影片"', { asFormula: true });
+    host.setCell(TARGET, "B1", "=1200", { asFormula: true });
+    host.setCellStyle(TARGET, "A1", { fontBold: true });
+    host.setCellDisplay(TARGET, "A1", { format: "0.00" });
+    const firstWrites = contentWrites(host.originalWrites()).length;
+
+    pendingIndex();
+    // 替身服务端：核对第一步已写入 → 推进到第 2 步；续跑完成 → 记账本完成。
+    let reconciled = false;
+    let checkpoint: unknown = null;
+    const settledState = (revision: number) => resumeState({
+      checkpoint: checkpoint as never,
+      nextActionIndex: 1, inFlightActionIndex: null, requiresReconciliation: false, revision
+    });
+    vi.mocked(getOfficeExecutionStatus).mockImplementation(async () =>
+      (reconciled ? settledState(3) : resumeState()) as never
+    );
+    vi.mocked(reconcileOfficeActionReceipt).mockImplementation(async (_id, request) => {
+      reconciled = true;
+      checkpoint = request.checkpoint;
+      return settledState(3) as never;
+    });
+    vi.mocked(claimOfficeExecutionResume).mockImplementation(async () => settledState(4) as never);
+    vi.mocked(finishOfficeExecution).mockResolvedValue(
+      resumeState({ nextActionIndex: 2, inFlightActionIndex: null, status: "completed", revision: 5 }) as never
+    );
+
+    const view = render(<App />);
+    fireEvent.click(await view.findByRole("button", { name: "核对在途动作" }));
+    await waitFor(() => expect(reconcileOfficeActionReceipt).toHaveBeenCalledTimes(1));
+    // ①核对只补记：一个单元格都没写。
+    expect(contentWrites(host.originalWrites()).slice(firstWrites)).toEqual([]);
+
+    // ②继续：只写第二步（A2:B2），第一步的 A1:B1 不重写。
+    fireEvent.click(await view.findByRole("button", { name: "继续剩余动作" }));
+    await waitFor(() => expect(host.cell(TARGET, "A2")).toBe('="乙"'));
+    expect(contentWrites(host.originalWrites()).slice(firstWrites).map((w) => w.address))
+      .toEqual(["A2:B2"]);
+    await waitFor(() => expect(finishOfficeExecution).toHaveBeenCalledTimes(1));
+
+    // ③审阅收尾：续跑完成后必须能进入审阅（有确认/放弃），而不是因为
+    //    "前几步判据在上一次运行里"被判成 executed_unverified 后整卡 failed。
+    //    这是本用例要钉住的关键：续跑完成 ≠ 不能审阅。
+    await waitFor(() => expect(view.queryByRole("button", { name: "确认变更" })).not.toBeNull());
+    expect(view.getByRole("button", { name: "放弃变更" })).toBeTruthy();
+
+    if (outcome === "confirm") {
+      // ④确认不重放：点确认后 A1:B1 与 A2:B2 都不再被写一次。
+      const writesBeforeConfirm = contentWrites(host.originalWrites()).length;
+      fireEvent.click(view.getByRole("button", { name: "确认变更" }));
+      await waitFor(() => expect(text(view)).toContain("已确认变更"));
+      expect(contentWrites(host.originalWrites())).toHaveLength(writesBeforeConfirm);
+      // 公式仍在（确认只清标记，不回写）。
+      expect(host.cell(TARGET, "A1")).toBe('="影片"');
+      expect(host.cell(TARGET, "A2")).toBe('="乙"');
+    } else {
+      // ⑤放弃恢复：原公式与格式一起回到执行前，不留本次写入的公式。
+      fireEvent.click(view.getByRole("button", { name: "放弃变更" }));
+      await waitFor(() => expect(text(view)).toContain("已放弃并恢复"));
+      expect(host.matrix(TARGET, "A1:B1")).toEqual(beforeFirstRow);
+      expect(host.matrix(TARGET, "A2:B2")).toEqual([["", ""]]);
+    }
   });
 });
 
@@ -1519,6 +2044,24 @@ describe("Excel 写侧：撤销与同表不重叠的真实支持程度", () => {
 
     // 恢复结果**真的核对过**：两个写入区域逐单元格回到执行前（原表种子）。
     await waitFor(() => expect(text(view)).toContain("已撤销上一次执行"));
+    /*
+     * ★「确认之后撤销」在 Excel 上是**真的存在**的路径（2026-10-29 核实结论）。
+     *
+     * 它走的是结果卡里的「↶ 撤销本次执行」→ `undoExecutionTo(executionId)` →
+     * `useUndoSnapshot` 逐条 `await undoExecution(snapshot)` 成功后才回调
+     * `onRestored` —— 留痕因此只在**宿主真的恢复完**之后才写，且这里必须是
+     * `undone`（"确认之后撤销"），**不是** `abandoned`（"审阅阶段放弃"）。
+     * 两个取值互不冒充：把这条断言改成 `abandoned` 就会红。
+     */
+    await waitFor(() => expect(vi.mocked(recordExecutionDisposition)).toHaveBeenCalledTimes(1));
+    const [undoNamespace, undoneId, undoKind] = vi.mocked(recordExecutionDisposition).mock.calls[0];
+    expect(undoNamespace).toBe("office");
+    expect(typeof undoneId).toBe("string");
+    expect((undoneId as string).length).toBeGreaterThan(0);
+    expect(undoKind).toBe("undone"); // 不是 "abandoned"
+    // 留痕用的是**这次执行的身份**：同一条结果卡撤销的就是它自己，不借用别的记录。
+    expect(text(view)).toContain("已撤销上一次执行");
+    expect(host.originalWrites().length).toBeGreaterThan(0);
     expect(host.matrix(SHEET, "E1:F3")).toEqual([
       ["", ""],
       ["", ""],
@@ -1576,12 +2119,54 @@ describe("Excel 写侧：撤销与同表不重叠的真实支持程度", () => {
     // 负向断言的正向锚点：撤销尝试没有对原表产生任何新写入。
     expect(host.originalWrites().length).toBe(afterExecution);
     expect(host.cell(SHEET, "G1")).toBe("我手动改的");
+    /*
+     * ★ 恢复失败 ⇒ **不留痕**。留痕的语义是"用户确实把这次执行撤回了"；撤销被冲突
+     * 挡下时宿主一个单元格都没回退，写 `undone_at` 就是造假。判据的位置在
+     * `useUndoSnapshot`：`onRestored` 只在 `await undoExecution(snapshot)` 成功之后
+     * 才被调用，抛错分支只发一条消息。
+     */
+    expect(vi.mocked(recordExecutionDisposition)).not.toHaveBeenCalled();
     // ★ 撤销**冲突**绝不能把卡标成"已撤销"：标题仍是验证结论，不出现"已撤销并恢复"。
     const cardAfterConflict = undoButton.closest(".execution-result-card");
     expect(cardAfterConflict).not.toBeNull();
     expect(cardAfterConflict!.textContent).not.toContain("已撤销并恢复");
     expect(cardAfterConflict!.textContent).not.toContain("本次执行已撤销");
     expect(cardAfterConflict!.textContent).toContain("验证通过");
+  });
+
+  it("确认后撤销的留痕上报失败：不报错、不重试，撤销入口随之消失（没有第二次撤销）", async () => {
+    /*
+     * 「重试」这件事在本产品里只有一种合法形态：**重发那一条 `POST …/disposition`**。
+     * 服务端首次写赢（`WHERE undone_at IS NULL`），所以重发是幂等的；而"再撤一次"
+     * 是另一件事 —— 宿主恢复是不可重复的副作用，绝不能挂在重试路径上。
+     *
+     * 这条用例钉住调用方那一侧：上报失败 ⇒ 端点只被叫 **1** 次（不自动重试）、
+     * 不弹错误、单元格照样回到执行前；撤销入口随栈消费一起消失 ⇒ 界面上根本没有
+     * 第二次撤销的入口。
+     */
+    vi.mocked(recordExecutionDisposition).mockRejectedValueOnce(new Error("网络不可用"));
+    const view = await sendPlan(reviewPlan);
+    await stageReview(view);
+    await clickSave(view);
+    await waitFor(() => expect(host.cell(SHEET, "G1")).toBe("合计"));
+
+    const undoButton = [...view.container.querySelectorAll("button")].find(
+      (candidate) => candidate.textContent === "↶ 撤销本次执行"
+    ) as HTMLButtonElement;
+    fireEvent.click(undoButton);
+    await waitFor(() => expect(text(view)).toContain("已撤销上一次执行"));
+    await waitFor(() => expect(vi.mocked(recordExecutionDisposition)).toHaveBeenCalledTimes(1));
+
+    // 留痕失败不改判：单元格确实回退了，界面也不出现任何"无法记录"的失败提示。
+    expect(host.cell(SHEET, "G1")).toBe("");
+    expect(text(view)).not.toContain("无法记录这次执行的处置");
+    expect(vi.mocked(recordExecutionDisposition).mock.calls[0][2]).toBe("undone");
+
+    // 入口已消费：结果卡进终态，`↶ 撤销本次执行` 不再存在 ⇒ 不存在第二次撤销的路径。
+    const resultCard = view.container.querySelector(".execution-result-card");
+    expect(resultCard).not.toBeNull();
+    expect(resultCard!.textContent).toContain("本次执行已撤销");
+    expect(view.queryByRole("button", { name: "↶ 撤销本次执行" })).toBeNull();
   });
 
   it("来源与写入目标同表、区域不重叠：可以写入，但如实说明不支持跨重启断点恢复", async () => {
@@ -2218,4 +2803,1428 @@ it("executes a trusted literal without a source read and confirmation does not r
   fireEvent.click(await view.findByRole("button", {name: "确认变更"}));
   await waitFor(() => expect(text(view)).toContain("已确认变更"));
   expect(contentWrites(host.originalWrites())).toEqual(writes);
+});
+
+it.each(["confirm", "discard"])("executes three trusted literal actions in order without a source read before %s", async outcome => {
+  [-101,-202,-303].forEach((value,index)=>host.setCell(SHEET,`B${index+2}`,value));
+  const plan = {id:"literal-ordered-three",title:"依次写入常量",summary:"三步独立写入",assumptions:[],warnings:[],
+    actions:[111,222,333].map((value,index)=>({type:"writeValues",sheet:SHEET,range:`B${index+2}`,values:[[value]]})),
+    acceptanceCriteria:[111,222,333].map((value,index)=>({type:"rangeEquals",sheet:SHEET,range:`B${index+2}`,expected:[[value]]}))};
+  const view = await sendPlan(plan,"B2/B3/B4依次写入111/222/333，不合并动作",{planOrigin:"literal_range_edit"});
+  await waitFor(()=>expect(view.queryByRole("button",{name:"确认变更"}),text(view)).not.toBeNull());
+  expect([2,3,4].map(row=>host.cell(SHEET,`B${row}`))).toEqual([111,222,333]);
+  const writes = contentWrites(host.originalWrites());
+  expect(writes).toHaveLength(3);
+  expect(writes.map(write=>write.address)).toEqual(["B2","B3","B4"]);
+  fireEvent.click(await view.findByRole("button",{name:outcome==="confirm"?"确认变更":"放弃变更"}));
+  await waitFor(()=>expect(text(view)).toContain(outcome==="confirm"?"已确认变更":"已放弃并恢复"));
+  if(outcome==="confirm") expect(contentWrites(host.originalWrites())).toEqual(writes);
+  else expect([2,3,4].map(row=>host.cell(SHEET,`B${row}`))).toEqual([-101,-202,-303]);
+});
+
+/**
+ * CAP-03（Excel）：完整退出 / 换机器之后**重新发现**未完成执行。
+ *
+ * 此前 Excel 端只有一条 `localStorage` 索引把用户带回断点，索引不在就再也看不到那次执行。
+ * 这一组用例钉三件事：
+ *
+ * 1. **多候选不自动选**：只给选择入口，一个状态查询都不发；
+ * 2. **发现 ≠ 可以续跑**：身份不符只给阻断 + 只读重核，绝不摆出续跑按钮；
+ * 3. **同一条执行会被重新核验**：用户确认收窄授权后，卡面按新授权变红，而不是停在旧结论上。
+ *
+ * 全部断言都带"零写入"：发现这条路只读，claim / 补记 / 执行一个都不许发生。
+ */
+describe("Excel 未完成执行的发现入口（真实 App / 宿主与网络替身）", () => {
+  const OPERATION = "office-discovery-0001";
+  const identity = () => `url:${BOOK_URL}`;
+  const mutationSpies = () => [
+    registerOfficeExecution,
+    startOfficeAction,
+    completeOfficeAction,
+    reconcileOfficeActionReceipt,
+    finishOfficeExecution,
+    suspendOfficeExecution
+  ];
+
+  function candidate(overrides: Record<string, unknown> = {}) {
+    return {
+      operationId: OPERATION,
+      taskId: "task-discovery-0001",
+      status: "running",
+      createdAt: 1_790_000_000_000,
+      updatedAt: 1_790_000_600_000,
+      nextActionIndex: 0,
+      totalActions: 2,
+      inFlightActionIndex: null,
+      ownerActive: false,
+      requiresReconciliation: false,
+      canResume: true,
+      ...overrides
+    };
+  }
+
+  function discovery(candidates: unknown[], overrides: Record<string, unknown> = {}) {
+    vi.mocked(listPendingOfficeExecutions).mockResolvedValue({
+      schemaVersion: 1,
+      namespace: "office",
+      workbookIdentity: identity(),
+      limit: 20,
+      truncated: false,
+      candidates,
+      ...overrides
+    } as never);
+  }
+
+  /** 一条两动作的计划：都写 `TARGET`（汇总表）。 */
+  function executionState(overrides: Record<string, unknown> = {}) {
+    return {
+      operationId: OPERATION,
+      status: "running",
+      revision: 3,
+      workbookIdentity: identity(),
+      plan: {
+        id: "plan-discovery",
+        title: "补两格",
+        summary: "写入汇总表",
+        assumptions: [],
+        warnings: [],
+        actions: [
+          { type: "writeValues", sheet: TARGET, range: "B2", values: [[111]] },
+          { type: "writeValues", sheet: TARGET, range: "B3", values: [[222]] }
+        ]
+      },
+      authorizedSheetNames: [SHEET, TARGET],
+      allowedExternalFiles: [],
+      nextActionIndex: 0,
+      inFlightActionIndex: null,
+      beforeSnapshot: null,
+      checkpoint: null,
+      result: null,
+      error: null,
+      canResume: true,
+      requiresReconciliation: false,
+      ownerToken: null,
+      ...overrides
+    };
+  }
+
+  it("多条候选只给选择入口：不自动选、不查状态、不写任何单元格", async () => {
+    discovery([
+      candidate({ operationId: "op-newer", status: "failed", updatedAt: 1_790_000_900_000 }),
+      candidate()
+    ]);
+    const view = await bootApp();
+    await waitFor(() => expect(view.container.querySelector(".office-recovery-choices")).not.toBeNull());
+    // 两条候选各一个按钮：界面不替用户挑"最新的一条"。
+    expect(view.getAllByRole("button", { name: "核对这一次" })).toHaveLength(2);
+    expect(getOfficeExecutionStatus).not.toHaveBeenCalled();
+    expect(text(view)).not.toContain("继续剩余动作");
+    expect(host.writes()).toEqual([]);
+    for (const spy of mutationSpies()) expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("点选的一条身份不符时：只给阻断与只读重核，不给续跑按钮", async () => {
+    /*
+     * 让这条**排在最前**：共享排序把"有在途动作"放第一档（现场可能已被改过）。
+     * 不靠"最新的一条"来选 —— 第 1 条用例已经钉住"界面不替用户挑"。
+     */
+    discovery([
+      candidate({
+        operationId: "op-other-book",
+        status: "needs_reconciliation",
+        inFlightActionIndex: 1,
+        requiresReconciliation: true
+      }),
+      candidate()
+    ]);
+    vi.mocked(getOfficeExecutionStatus).mockResolvedValue(
+      executionState({ workbookIdentity: "url:https://contoso.sharepoint.com/another.xlsx" }) as never
+    );
+    const view = await bootApp();
+    await waitFor(() => expect(view.container.querySelector(".office-recovery-choices")).not.toBeNull());
+    fireEvent.click(view.getAllByRole("button", { name: "核对这一次" })[0]);
+    await waitFor(() => expect(text(view)).toContain("当前不是产生该断点的工作簿"));
+    expect(view.queryByRole("button", { name: "继续剩余动作" })).toBeNull();
+    expect(view.queryByRole("button", { name: "核对并继续" })).toBeNull();
+    expect(view.getByRole("button", { name: "重新核对（只读）" })).toBeTruthy();
+    // 点选本身只读：一个写入类接口都不许被调用。
+    expect(getOfficeExecutionStatus).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(getOfficeExecutionStatus).mock.calls[0][0]).toBe("op-other-book");
+    expect(host.writes()).toEqual([]);
+    for (const spy of mutationSpies()) expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("单条候选自动摆卡；用户确认收窄授权后同一条执行被重新核验并如实阻断", async () => {
+    discovery([candidate()]);
+    vi.mocked(getOfficeExecutionStatus).mockResolvedValue(executionState() as never);
+    const view = await bootApp();
+    await waitFor(() => expect(view.queryByRole("button", { name: "继续剩余动作" })).not.toBeNull());
+    // 只看"读的是哪一条"，不钉次数：工作簿目录晚到会再核对一轮（只读，不写入）。
+    expect(
+      vi.mocked(getOfficeExecutionStatus).mock.calls.every(([operationId]) => operationId === OPERATION)
+    ).toBe(true);
+
+    /*
+     * 用户在范围面板里只留「综合票房」并确认：`TARGET` 被收窄掉。
+     * 卡面必须跟着变红 —— 停在"可继续"就是这次要修的那种"用户已经改正、界面还在说旧结论"。
+     */
+    await setAuthorizedScope(view, [SHEET]);
+    await waitFor(() => expect(text(view)).toContain("当前授权里没有工作表「汇总表」"));
+    expect(view.queryByRole("button", { name: "继续剩余动作" })).toBeNull();
+    expect(view.getByRole("button", { name: "重新核对（只读）" })).toBeTruthy();
+
+    // 重新核验的是**同一条**执行：每一次状态查询的 operationId 都相同，没有被换成别的候选。
+    const calls = vi.mocked(getOfficeExecutionStatus).mock.calls;
+    expect(calls.length).toBeGreaterThanOrEqual(2);
+    expect(calls.every(([operationId]) => operationId === OPERATION)).toBe(true);
+    expect(host.writes()).toEqual([]);
+    for (const spy of mutationSpies()) expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("迟到的发现结果不许落盘：授权变过之后旧响应既不摆卡也不换对象", async () => {
+    /*
+     * 现场：第一次发现请求发出后用户就改了授权（请求在飞、界面已经换了现场）。
+     * 迟到的响应属于**旧代数**，既不许把候选摆出来，也不许把用户的入口换掉。
+     *
+     * 只有这条能钉住代数闸：既有三条判据（同一条 / 次数 / 只读）在"没有闸"时
+     * 照样成立 —— 旧响应会自己走完 adopt 流程，把上一个现场摆到当前界面上。
+     */
+    let releaseStale: ((value: unknown) => void) | null = null;
+    const stale = new Promise((resolve) => {
+      releaseStale = resolve;
+    });
+    let issued = 0;
+    vi.mocked(listPendingOfficeExecutions).mockImplementation(async () => {
+      issued += 1;
+      if (issued === 1) return stale as never;
+      return {
+        schemaVersion: 1,
+        namespace: "office",
+        workbookIdentity: identity(),
+        limit: 20,
+        truncated: false,
+        candidates: []
+      } as never;
+    });
+    const view = await bootApp();
+    await waitFor(() => expect(issued).toBeGreaterThanOrEqual(1));
+
+    // 授权变一次：代数推进，第一份响应从此作废。
+    await setAuthorizedScope(view, [SHEET, TARGET]);
+    await waitFor(() => expect(issued).toBeGreaterThanOrEqual(2));
+
+    // 现在才让**旧**那条响应落地：它带着一条看起来完全可以续跑的候选。
+    await act(async () => {
+      releaseStale?.({
+        schemaVersion: 1,
+        namespace: "office",
+        workbookIdentity: identity(),
+        limit: 20,
+        truncated: false,
+        candidates: [candidate({ operationId: "op-stale-generation" })]
+      });
+      await Promise.resolve();
+    });
+
+    expect(getOfficeExecutionStatus).not.toHaveBeenCalled();
+    expect(view.container.querySelector(".office-recovery-choices")).toBeNull();
+    expect(text(view)).not.toContain("继续剩余动作");
+    expect(host.writes()).toEqual([]);
+    for (const spy of mutationSpies()) expect(spy).not.toHaveBeenCalled();
+  });
+
+  /*
+   * 下面五条钉的是"发现与续跑**不扩大授权**"，以及四个真机上最常见的异常分支。
+   *
+   * 全部用**确定性**手段造现场：探针在第 2 步回读之后、完成回执之前中断（不靠手动暂停碰时机）、
+   * `clearPendingOfficeExecution` 模拟"换机器 / 清缓存"（不要求用户手删 localStorage）、
+   * `host.setDocumentUrl` 模拟换簿（不要求用户真去另存为）、把状态替身改成"在途但没快照"
+   * （不要求用户停真实服务）。
+   */
+
+  it("窗格重开且本机索引不在：靠后端发现摆卡，只续剩余动作，再走审阅收尾", async () => {
+    // 与「acceptance entry」同一套服务端状态机：第 2 步写入回读后、完成回执前中断。
+    [111, 222, 333].forEach((value, index) => host.setCell(SHEET, `B${index + 2}`, value));
+    [-101, -202, -303].forEach((value, index) => host.setCell(TARGET, `B${index + 2}`, value));
+    let state: Awaited<ReturnType<typeof getOfficeExecutionStatus>>;
+    vi.mocked(registerOfficeExecution).mockImplementation(async (request) => {
+      state = { ...request, status: "running", revision: 1, nextActionIndex: 0, inFlightActionIndex: null,
+        checkpoint: null, beforeSnapshot: null, canResume: false, requiresReconciliation: false,
+        ownerToken: "owner" } as typeof state;
+      return state;
+    });
+    vi.mocked(startOfficeAction).mockImplementation(async (_id, request) => {
+      state = { ...state, revision: state.revision + 1, inFlightActionIndex: request.actionIndex,
+        beforeSnapshot: request.beforeSnapshot, requiresReconciliation: true };
+      return state;
+    });
+    vi.mocked(completeOfficeAction).mockImplementation(async (_id, request) => {
+      state = { ...state, revision: state.revision + 1, inFlightActionIndex: null,
+        nextActionIndex: request.actionIndex + 1, checkpoint: request.checkpoint, requiresReconciliation: false };
+      return state;
+    });
+    vi.mocked(suspendOfficeExecution).mockImplementation(async () => {
+      state = { ...state, status: "needs_reconciliation", revision: state.revision + 1,
+        ownerToken: undefined, canResume: true };
+      return state;
+    });
+    vi.mocked(getOfficeExecutionStatus).mockImplementation(async () => state);
+    vi.mocked(reconcileOfficeActionReceipt).mockImplementation(async (_id, request) => {
+      expect(request.actionIndex).toBe(1);
+      expect(request.outcome).toBe("applied");
+      state = { ...state, status: "running", revision: state.revision + 1, ownerToken: "new-owner",
+        nextActionIndex: 2, inFlightActionIndex: null, requiresReconciliation: false,
+        checkpoint: request.checkpoint! };
+      return state;
+    });
+    vi.mocked(claimOfficeExecutionResume).mockImplementation(async () => {
+      state = { ...state, status: "running", revision: state.revision + 1, ownerToken: "resume-owner" };
+      return state;
+    });
+    vi.mocked(finishOfficeExecution).mockImplementation(async () => ({ ...state, status: "completed" } as never));
+
+    const plan = { id: "remount-three", title: "三次值复制", summary: "复制到目标表", assumptions: [], warnings: [],
+      actions: [2, 3, 4].map((row) => ({ type: "copyRange", sheet: TARGET, sourceSheet: SHEET,
+        sourceRange: `B${row}`, targetRange: `B${row}`, copyType: "values", skipBlanks: false, transpose: false })) };
+    const view = await sendPlan(plan, "依次执行三个值复制", { authorize: [SHEET, TARGET], probe: true });
+    await waitFor(() => expect(suspendOfficeExecution).toHaveBeenCalledTimes(1));
+    expect([2, 3, 4].map((row) => host.cell(TARGET, `B${row}`))).toEqual([111, 222, -303]);
+    expect(state!.nextActionIndex).toBe(1);
+    expect(state!.inFlightActionIndex).toBe(1);
+    const operationId = state!.operationId;
+    const before = contentWrites(host.originalWrites());
+    expect(before).toHaveLength(2);
+
+    /*
+     * 窗格重开**且本机索引不在**：换机器、清缓存、换端口都是这个样子。
+     * 不要求用户手删 localStorage —— 测试直接清掉，真机上是 DEV 面板里那个"模拟本机索引丢失"。
+     */
+    view.unmount();
+    clearPendingOfficeExecution(operationId);
+    expect(loadPendingOfficeExecution()).toBeNull();
+    vi.mocked(listPendingOfficeExecutions).mockImplementation(async (workbookIdentity) => ({
+      schemaVersion: 1,
+      namespace: "office",
+      workbookIdentity,
+      limit: 20,
+      truncated: false,
+      candidates: [candidate({ operationId, nextActionIndex: 1, inFlightActionIndex: 1,
+        requiresReconciliation: true, status: "needs_reconciliation" })]
+    }) as never);
+
+    const reopened = render(<App />);
+    const reconcileButton = await reopened.findByRole("button", { name: "核对在途动作" });
+    await waitFor(() => expect((reconcileButton as HTMLButtonElement).disabled).toBe(false));
+    /*
+     * 发现只补"挂接记录"，不改授权：续跑读的就是这份索引。
+     *
+     * 授权范围本身**不跨窗格重开持久化**（已提交范围是内存态，重开后回到首读播种的
+     * "跟随当前表"），这是既有产品语义，不是发现改的 —— 所以这里不拿"已固定 2 张表"
+     * 当判据，而是看续跑有没有越过授权边界写出去（下面那两条）。
+     */
+    expect(loadPendingOfficeExecution()?.operationId).toBe(operationId);
+
+    fireEvent.click(reconcileButton);
+    await waitFor(() => expect(reconcileOfficeActionReceipt).toHaveBeenCalledTimes(1));
+    // 核对只补记回执：第 3 步还没跑，这一下不写任何单元格。
+    expect(contentWrites(host.originalWrites()).slice(before.length)).toEqual([]);
+    expect(finishOfficeExecution).not.toHaveBeenCalled();
+    fireEvent.click(await reopened.findByRole("button", { name: "继续剩余动作" }));
+    await waitFor(() => expect(finishOfficeExecution, text(reopened)).toHaveBeenCalledTimes(1));
+    // 只补第 3 步：第 2 步已经在中断前写完（核对判定 applied），不许重放。
+    expect(contentWrites(host.originalWrites()).slice(before.length).map((write) => write.address)).toEqual(["B4"]);
+    expect([2, 3, 4].map((row) => host.cell(TARGET, `B${row}`))).toEqual([111, 222, 333]);
+    expect(vi.mocked(completeOfficeAction).mock.calls.map((call) => call[1].actionIndex)).toEqual([0, 2]);
+    expect(registerOfficeExecution).toHaveBeenCalledTimes(1);
+    expect(loadPendingOfficeExecution()).toBeNull();
+
+    // 审阅收尾：断点续跑的结论与回执都在，且不残留"执行未完成"。
+    await stageReview(reopened);
+    expect(text(reopened)).toContain("从第 3 步继续并完成");
+    expect(reopened.container.querySelector(".result-review-bar")?.textContent ?? "").not.toContain("执行未完成");
+  });
+
+  it("从没确认过范围（confirmedScope=null）时不误判成撤销：卡可继续，且不动授权", async () => {
+    discovery([candidate()]);
+    vi.mocked(getOfficeExecutionStatus).mockResolvedValue(executionState() as never);
+    const view = await bootApp();
+    const scopeBefore = view.container.querySelector(".scope-trigger")?.textContent;
+    const button = await view.findByRole("button", { name: "继续剩余动作" });
+    expect((button as HTMLButtonElement).disabled).toBe(false);
+    /*
+     * 首读播种把已提交范围写成**当前活动表**（综合票房），而计划要写汇总表。
+     * 那不是用户的手势 —— 拿它比对就会凭空说"你把汇总表取消了"。
+     */
+    expect(text(view)).not.toContain("当前授权里没有工作表");
+    expect(view.container.querySelector(".scope-trigger")?.textContent).toBe(scopeBefore);
+    expect(loadPendingOfficeExecution()?.operationId).toBe(OPERATION);
+    expect(host.writes()).toEqual([]);
+    for (const spy of mutationSpies()) expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("授权被撤销（清空并确认）后：卡面立刻阻断，且发现不会把表加回来", async () => {
+    discovery([candidate()]);
+    vi.mocked(getOfficeExecutionStatus).mockResolvedValue(executionState() as never);
+    const view = await bootApp();
+    await waitFor(() => expect(view.queryByRole("button", { name: "继续剩余动作" })).not.toBeNull());
+
+    await openScopePicker(view);
+    fireEvent.click(view.getByRole("button", { name: "清空" }));
+    await waitFor(() =>
+      expect(view.container.querySelector(".scope-close")?.getAttribute("data-scope-pending")).toBe("false")
+    );
+    fireEvent.click(view.container.querySelector<HTMLButtonElement>(".scope-close")!);
+    await waitFor(() => expect(view.container.querySelector(".scope-popover")).toBeNull());
+
+    await waitFor(() => expect(text(view)).toContain("当前授权里没有工作表「汇总表」"));
+    expect(view.queryByRole("button", { name: "继续剩余动作" })).toBeNull();
+    expect(view.getByRole("button", { name: "重新核对（只读）" })).toBeTruthy();
+    // 撤销之后仍然只有只读入口：重新核对不许借机把授权恢复。
+    fireEvent.click(view.getByRole("button", { name: "重新核对（只读）" }));
+    await waitFor(() => expect(text(view)).toContain("当前授权里没有工作表「汇总表」"));
+
+    /*
+     * 刷新一轮目录（不是勾选手势）：草稿会被重新播种成"跟随当前表"，但已提交的授权
+     * 仍是空的 —— 卡面不许因为这一轮刷新又变成"可继续"。
+     */
+    await openScopePicker(view);
+    fireEvent.click(view.getByRole("button", { name: /刷新/ }));
+    await waitFor(() =>
+      expect(view.container.querySelector(".scope-close")?.getAttribute("data-scope-pending")).toBe("false")
+    );
+    await waitFor(() => expect(text(view)).toContain("当前授权里没有工作表「汇总表」"));
+    expect(view.queryByRole("button", { name: "继续剩余动作" })).toBeNull();
+    expect(host.writes()).toEqual([]);
+    for (const spy of mutationSpies()) expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("换到另一个工作簿再切回：按身份改判又回来，全程零写入", async () => {
+    const otherUrl = "https://contoso.sharepoint.com/sites/finance/other-workbook.xlsx";
+    vi.mocked(listPendingOfficeExecutions).mockImplementation(async (workbookIdentity) => ({
+      schemaVersion: 1,
+      namespace: "office",
+      workbookIdentity,
+      limit: 20,
+      truncated: false,
+      candidates: workbookIdentity === `url:${BOOK_URL}` ? [candidate()] : []
+    }) as never);
+    vi.mocked(getOfficeExecutionStatus).mockResolvedValue(executionState() as never);
+    const view = await bootApp();
+    await waitFor(() => expect(view.queryByRole("button", { name: "继续剩余动作" })).not.toBeNull());
+
+    await act(async () => {
+      host.setDocumentUrl(otherUrl);
+      document.dispatchEvent(new Event("visibilitychange"));
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(text(view)).toContain("当前不是产生该断点的工作簿"));
+    expect(view.queryByRole("button", { name: "继续剩余动作" })).toBeNull();
+    expect(view.getByRole("button", { name: "重新核对（只读）" })).toBeTruthy();
+    // 换走时**不清**本机索引：切回来还要用它把同一条接上。
+    expect(loadPendingOfficeExecution()?.operationId).toBe(OPERATION);
+
+    await act(async () => {
+      host.setDocumentUrl(BOOK_URL);
+      document.dispatchEvent(new Event("visibilitychange"));
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(view.queryByRole("button", { name: "继续剩余动作" })).not.toBeNull());
+    expect(
+      vi.mocked(getOfficeExecutionStatus).mock.calls.every(([operationId]) => operationId === OPERATION)
+    ).toBe(true);
+    expect(host.writes()).toEqual([]);
+    for (const spy of mutationSpies()) expect(spy).not.toHaveBeenCalled();
+  });
+
+  /** 输入区上方那张**唯一**可点击的恢复卡（不是消息里的记录）。 */
+  function recoveryPanelOf(view: ReturnType<typeof render>): HTMLElement | null {
+    return view.container.querySelector<HTMLElement>(".office-recovery-panel");
+  }
+
+  it("恢复入口只在输入区上方：不在消息滚动容器里，历史消息只留没有按钮的记录", async () => {
+    discovery([candidate()]);
+    vi.mocked(getOfficeExecutionStatus).mockResolvedValue(executionState() as never);
+    const view = await bootApp();
+    await waitFor(() => expect(recoveryPanelOf(view)).not.toBeNull());
+    const panel = recoveryPanelOf(view)!;
+    // ①唯一性：全页只有一个可点的续跑入口，消息里那份记录一个按钮都没有。
+    // 先断这一条再断位置：两者是**两个**属性（`mutate_office_recovery_placement.mjs`
+    // 的 P1 把卡搬回消息里时，唯一性仍成立、只有位置那条红）。
+    expect(view.getAllByRole("button", { name: "继续剩余动作" })).toHaveLength(1);
+    const record = view.container.querySelector<HTMLElement>(".office-recovery-record");
+    expect(record, "历史消息里仍要留下执行记录").not.toBeNull();
+    expect(record!.querySelectorAll("button")).toHaveLength(0);
+    expect(record!.closest(".message-stream"), "记录留在历史里，入口不在").not.toBeNull();
+    expect(record!.textContent).toContain("操作入口在输入框上方");
+    /*
+     * ②位置（jsdom 能钉死的那一半）：可点击的那一份**不在** `.message-stream`
+     * 这个滚动容器里，而在 `.composer` 里。核对后追加的日志再怎么滚，也改不了它的位置。
+     * 视口内的证据在 `scripts/check_recovery_entry_viewport.mjs`（真实样式 + 真实布局），
+     * 这里不拿"元素存在"冒充"看得见"。
+     */
+    expect(panel.closest(".message-stream")).toBeNull();
+    expect(panel.closest(".composer")).not.toBeNull();
+    expect(panel.getAttribute("data-operation-id")).toBe(OPERATION);
+    /*
+     * ③**唯一主入口**：那颗按钮就是输入框右下角的主按钮，不是卡面上另画的一颗。
+     * 卡面只留一句指路 + 次要动作（补记完成 / 重新核对），否则同一个动作两个入口，
+     * 而且其中一颗不受输入框状态约束。
+     */
+    const primaryEntry = view.container.querySelector<HTMLElement>(".composer .composer-primary");
+    expect(primaryEntry, "主入口必须在输入框里").not.toBeNull();
+    expect(primaryEntry!.getAttribute("aria-label")).toBe("继续剩余动作");
+    expect(view.getByRole("button", { name: "继续剩余动作" })).toBe(primaryEntry);
+    expect(panel.querySelector('[data-recovery-primary-hint="resume"]')!.textContent).toContain("输入框右下角");
+    // 卡面自己不许再有第二个「继续/核对」按钮（次要动作可以留）。
+    expect(panel.querySelectorAll("button")).toHaveLength(0);
+    /*
+     * ④ 有内容 ⇒ 主按钮变「发送」，但**必须说明为什么核对入口不在了**。
+     * 静默顶掉入口是本轮明确要避免的形状：用户会以为恢复卡坏了。
+     * 两个方向都断言：有字时给说明、清空后入口回来（不是恒真）。
+     */
+    const composerTextarea = view.container.querySelector<HTMLTextAreaElement>(".composer textarea")!;
+    fireEvent.change(composerTextarea, { target: { value: "再补一列金额" } });
+    await waitFor(() =>
+      expect(view.container.querySelector(".composer .composer-primary")!.getAttribute("aria-label")).toBe("发送")
+    );
+    expect(text(view)).toContain("输入框有内容：发送会作为新需求");
+    expect(text(view)).toContain("请先清空输入框");
+    // 清空文字 ⇒ 入口回来（反方向断言，防止"恒为发送"也能过）。
+    fireEvent.change(composerTextarea, { target: { value: "" } });
+    await waitFor(() =>
+      expect(view.container.querySelector(".composer .composer-primary")!.getAttribute("aria-label"))
+        .toBe("继续剩余动作")
+    );
+    /*
+     * ⑤ **只贴图片、文字为空**：`hasInput` 把待发图片也算内容，所以同一个入口
+     * 同样会被 `send` 顶掉 —— 提示必须说明还得移除图片，否则用户清空文字之后
+     * 仍然点不到核对，却看不出为什么。这条以前只能靠"同源"推断（jsdom 没有图片
+     * 解码），现在靠 `prepareImageFile` 这个接缝的替身来断言。
+     */
+    const fileInput = view.container.querySelector<HTMLInputElement>('input[type="file"]')!;
+    fireEvent.change(fileInput, {
+      target: { files: [new File([new Uint8Array([1, 2, 3])], "u.png", { type: "image/png" })] }
+    });
+    await waitFor(() => expect(view.container.querySelector(".composer-attachments")).not.toBeNull());
+    await waitFor(() =>
+      expect(view.container.querySelector(".composer .composer-primary")!.getAttribute("aria-label")).toBe("发送")
+    );
+    expect(text(view)).toContain("并移除待发图片");
+    // 移除图片（文字为空）⇒ 核对入口回来。
+    fireEvent.click(view.container.querySelector<HTMLButtonElement>('[aria-label="移除图片 u.png"]')!);
+    await waitFor(() =>
+      expect(view.container.querySelector(".composer .composer-primary")!.getAttribute("aria-label"))
+        .toBe("继续剩余动作")
+    );
+    // 进度是共享层那一句，不是另拼的。
+    expect(record!.textContent).toContain("已完成 0 / 2 步 · 剩余 2 步");
+    expect(host.writes()).toEqual([]);
+    for (const spy of mutationSpies()) expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("换簿再切回：同一张卡在输入区上方原地改判，入口节点不换、按钮不重复", async () => {
+    const otherUrl = "https://contoso.sharepoint.com/sites/finance/other-workbook.xlsx";
+    vi.mocked(listPendingOfficeExecutions).mockImplementation(async (workbookIdentity) => ({
+      schemaVersion: 1,
+      namespace: "office",
+      workbookIdentity,
+      limit: 20,
+      truncated: false,
+      candidates: workbookIdentity === identity() ? [candidate()] : []
+    }) as never);
+    vi.mocked(getOfficeExecutionStatus).mockResolvedValue(executionState() as never);
+    const view = await bootApp();
+    await waitFor(() => expect(recoveryPanelOf(view)).not.toBeNull());
+    const panel = recoveryPanelOf(view)!;
+    expect(panel.getAttribute("data-recovery-kind")).toBe("resume");
+
+    await act(async () => {
+      host.setDocumentUrl(otherUrl);
+      document.dispatchEvent(new Event("visibilitychange"));
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(text(view)).toContain("当前不是产生该断点的工作簿"));
+    /*
+     * **同一个 DOM 节点**：卡片没有重建、没有搬到别处、也没有变出第二张。
+     * "同一执行的卡片直接更新"就是这条 —— 不是"再插一张新卡"。
+     */
+    expect(recoveryPanelOf(view)).toBe(panel);
+    expect(panel.getAttribute("data-recovery-kind")).toBe("blocked");
+    expect(view.queryByRole("button", { name: "继续剩余动作" })).toBeNull();
+    expect(view.getByRole("button", { name: "重新核对（只读）" })).toBeTruthy();
+    expect(view.container.querySelectorAll(".office-recovery-record button")).toHaveLength(0);
+
+    await act(async () => {
+      host.setDocumentUrl(BOOK_URL);
+      document.dispatchEvent(new Event("visibilitychange"));
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(view.queryByRole("button", { name: "继续剩余动作" })).not.toBeNull());
+    expect(recoveryPanelOf(view)).toBe(panel);
+    expect(panel.getAttribute("data-recovery-kind")).toBe("resume");
+    expect(view.getAllByRole("button", { name: "继续剩余动作" })).toHaveLength(1);
+    expect(host.writes()).toEqual([]);
+    for (const spy of mutationSpies()) expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("核对在途：状态就地换成「正在核对…」，日志追加之后入口仍在滚动容器之外", async () => {
+    discovery([candidate({ inFlightActionIndex: 1, requiresReconciliation: true })]);
+    let hang = false;
+    vi.mocked(getOfficeExecutionStatus).mockImplementation(async () => {
+      if (hang) return new Promise<never>(() => undefined) as never;
+      return executionState({
+        inFlightActionIndex: 1,
+        requiresReconciliation: true,
+        nextActionIndex: 1,
+        beforeSnapshot: {
+          actionIndex: 1, sheet: TARGET, range: "B3", formulas: [[null]],
+          numberFormat: [["General"]], fillColor: "#FFFFFF", fontBold: false, fontColor: "#000000"
+        }
+      }) as never;
+    });
+    const view = await bootApp();
+    const reconcileButton = await view.findByRole("button", { name: "核对在途动作" });
+    const panel = recoveryPanelOf(view)!;
+    expect(panel.getAttribute("data-recovery-kind")).toBe("reconcile");
+    const rowsBefore = view.container.querySelectorAll(".message-stream .message-row").length;
+
+    hang = true;
+    fireEvent.click(reconcileButton);
+    // 进行中：同一张卡改的是 acting，不是另插一张；主按钮仍是**同一颗**，只是禁用。
+    await waitFor(() => expect(panel.getAttribute("data-recovery-acting")).toBe("reconcile"));
+    expect(recoveryPanelOf(view)).toBe(panel);
+    /*
+     * 核对在飞的"进行中"由两处同时表达：卡面 `acting`（上面那条）+ 输入框右下角
+     * 那颗主按钮变禁用。这里断言的是"同一时刻只有一个主入口、且它点不动"——
+     * 不再要求按钮文案变成「正在核对…」：那个文案原本是卡面上的第二颗按钮，
+     * 现在卡面不画按钮了，在途状态由 `acting` 与主按钮的不可点共同表达。
+     */
+    const primary = view.container.querySelector<HTMLButtonElement>(".composer .composer-primary");
+    expect(primary).not.toBeNull();
+    expect(primary!.disabled).toBe(true);
+    expect(view.container.querySelectorAll(".composer .composer-primary")).toHaveLength(1);
+    // 核对真的追加了日志（消息流变长），入口却**不在**那个滚动容器里。
+    await waitFor(() =>
+      expect(view.container.querySelectorAll(".message-stream .message-row").length)
+        .toBeGreaterThan(rowsBefore)
+    );
+    expect(recoveryPanelOf(view)).toBe(panel);
+    expect(panel.closest(".message-stream")).toBeNull();
+    expect(panel.closest(".composer")).not.toBeNull();
+    expect(view.container.querySelectorAll(".office-recovery-record button")).toHaveLength(0);
+    // 只读这一下：一个写入类接口都没被调用。
+    expect(host.writes()).toEqual([]);
+    for (const spy of mutationSpies()) expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("续跑不信任卡面：状态里出现没有写前快照的在途动作时立刻停下，零写入", async () => {
+    discovery([candidate()]);
+    vi.mocked(getOfficeExecutionStatus).mockResolvedValue(executionState() as never);
+    const view = await bootApp();
+    const button = await view.findByRole("button", { name: "继续剩余动作" });
+    /*
+     * 卡片摆好**之后**服务端才出现"在途但没快照"（另一个现场/另一次中断留下的）。
+     * 续跑必须重新读状态并按同一条纪律停下 —— 卡面说"能继续"不等于能继续。
+     */
+    vi.mocked(getOfficeExecutionStatus).mockResolvedValue(
+      executionState({ inFlightActionIndex: 1, beforeSnapshot: null }) as never
+    );
+    await waitFor(() => expect((button as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(button);
+    await waitFor(() => expect(text(view)).toContain("在途动作缺少写前快照"));
+    expect(startOfficeAction).not.toHaveBeenCalled();
+    expect(registerOfficeExecution).not.toHaveBeenCalled();
+    expect(host.writes()).toEqual([]);
+  });
+
+  it("DEV 面板「模拟本机索引丢失」只清本机挂接，不动账本与其它本机键", async () => {
+    discovery([]);
+    const view = await bootApp();
+    /*
+     * 真机验收不该要求人去 DevTools 里删 localStorage：这里就是那条出口的判据 ——
+     * 清掉挂接记录（模拟换机器/清缓存），**只**清这一个键。
+     */
+    savePendingOfficeExecution({
+      schemaVersion: 1,
+      operationId: "op-index-only",
+      conversationId: "conversation-1",
+      activityMessageId: "message-1",
+      workbookIdentity: identity(),
+      createdAt: new Date().toISOString()
+    });
+    const probeKey = "excel-bro.recovery-probe.v1";
+    localStorage.setItem(probeKey, "keep-me");
+    view.container.querySelector("details.recovery-probe-control")!.setAttribute("open", "");
+
+    fireEvent.click(view.getByRole("button", { name: "模拟本机索引丢失" }));
+
+    await waitFor(() => expect(loadPendingOfficeExecution()).toBeNull());
+    expect(localStorage.getItem(probeKey)).toBe("keep-me");
+    await waitFor(() => expect(text(view)).toContain("已清空本机挂接记录"));
+    expect(host.writes()).toEqual([]);
+    expect(registerOfficeExecution).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * 重开之后**还能撤销**这次未完成的写入。
+ *
+ * 真机缺陷（2026-10-31，`C:/Users/jia/Desktop/测试/公式来源证据验收-Excel-B.xlsx`）：
+ * 三步公式计划在第二步回读后中断 → 用户核对在途动作 → 把 `来源!B5` 从 5 改成 500 →
+ * 点继续得到"来源已变化，不能沿用旧结果续跑。"（**这条拒绝是对的**）→ 重开 Excel，
+ * 恢复卡仍在、两个公式仍在表里，却**没有**「撤销本次执行」，只能手工一格一格擦。
+ *
+ * 根因不是材料丢了：`checkpoint`（每个已完成动作的写前值/公式 + 写后指纹）一直由
+ * `complete_office_action` 落库、也随状态返回。是撤销栈**只在 `completed` 分支**用
+ * `result.undoSnapshot` 重建，未完成/被阻断的分支一条都没挂 —— 而"能不能续跑"与
+ * "能不能撤销"本来就是两种资格：前者依赖来源一致，后者依赖**写前恢复点 + 目标现场
+ * 仍是它留下的样子**。所以本文件这一组的判据全部围绕一件事：
+ * **来源变了不许续跑，但撤销照样可用，并且只写回已写入的目标。**
+ *
+ * 证据边界：真实 `<App/>`、真实 `executePlan` / `reconcileOfficeRangeAction` /
+ * `undoExecution`，宿主是替身（`officeTestHost`），网络是替身。真机仍待按
+ * `docs/FORMULA_SOURCE_RESUME_ACCEPTANCE_2026-10-30.md` 的收尾步骤点一次。
+ */
+describe("Excel 未完成执行：重开后从账本材料撤销已写入的内容", () => {
+  const SOURCE = "来源";
+  const RESULTS = ["结果1", "结果2", "结果3"];
+  const SCOPE = [SOURCE, ...RESULTS];
+  const OPERATION = "op-formula-undo-0001";
+  /** 与真机夹具同一组公式：`来源!B2*1` / `来源!B4*2` / `来源!B5*3`。 */
+  const FORMULAS = [`=${SOURCE}!B2*1`, `=${SOURCE}!B4*2`, `=${SOURCE}!B5*3`];
+  const UNDO_LABEL = "↶ 撤销本次执行";
+  const SOURCE_CHANGED = "来源已变化，不能沿用旧结果续跑。";
+
+  type LedgerState = Awaited<ReturnType<typeof getOfficeExecutionStatus>>;
+
+  /** 来源表 + 三张空的结果表（结果表 B2 执行前都是空）。 */
+  function installSourceHost() {
+    host = createOfficeTestHost({
+      url: BOOK_URL,
+      selectedRange: "A1:B5",
+      activeSheet: SOURCE,
+      sheets: [
+        {
+          /*
+           * 列名与来源表真机夹具同形（`影片` / `票房(万)`）：本轮要走**真实**工具桥
+           * 读一次来源表（`query_table` 按字段名取列），列名对不上就读不出可信来源记录，
+           * 计划也就登记不了公式来源证据 —— 那是替身缺料，不是产品少闸门。
+           * 公式引用的三个格：B2=1、B4=3、B5=5。
+           */
+          name: SOURCE,
+          values: [["影片", "票房(万)"], ["甲", 1], ["乙", 2], ["丙", 3], ["丁", 5]]
+        },
+        ...RESULTS.map((name) => ({ name, values: [] }))
+      ]
+    });
+    installOfficeTestHost(host);
+  }
+
+  function formulaPlan() {
+    return {
+      id: "plan-formula-undo",
+      title: "三条公式",
+      summary: "三张结果表各写一条公式",
+      assumptions: [],
+      warnings: [],
+      actions: RESULTS.map((name, index) => ({
+        type: "writeFormulas" as const,
+        sheet: name,
+        range: "B2",
+        formulas: [[FORMULAS[index]]]
+      })),
+      sourceDependencySheets: [SOURCE]
+    };
+  }
+
+  /**
+   * 账本替身按**真实时序**推进：登记 → 每步开始/回执 → 挂起 → 核对 → 续跑 → 收尾。
+   *
+   * 关键是 `checkpoint` 不手写：它就是产品代码交给 `complete_office_action` /
+   * `reconcileOfficeActionReceipt` 的那一份（真实的写前值 + 写后指纹）。手搓一份
+   * "看起来像"的快照会让本组的判据全变成替身的自说自话。
+   */
+  function installLedger() {
+    let state: LedgerState | null = null;
+    vi.mocked(registerOfficeExecution).mockImplementation(async (request) => {
+      state = {
+        ...request,
+        status: "running",
+        revision: 1,
+        nextActionIndex: 0,
+        inFlightActionIndex: null,
+        checkpoint: null,
+        beforeSnapshot: null,
+        canResume: false,
+        requiresReconciliation: false,
+        ownerToken: "owner",
+        result: null,
+        error: null,
+        disposition: null
+      } as never;
+      return state;
+    });
+    vi.mocked(startOfficeAction).mockImplementation(async (_id, request) => {
+      state = {
+        ...state!,
+        revision: state!.revision + 1,
+        inFlightActionIndex: request.actionIndex,
+        beforeSnapshot: request.beforeSnapshot,
+        requiresReconciliation: true
+      } as never;
+      return state;
+    });
+    vi.mocked(completeOfficeAction).mockImplementation(async (_id, request) => {
+      state = {
+        ...state!,
+        revision: state!.revision + 1,
+        inFlightActionIndex: null,
+        nextActionIndex: request.actionIndex + 1,
+        checkpoint: request.checkpoint ?? null,
+        requiresReconciliation: false
+      } as never;
+      return state;
+    });
+    vi.mocked(suspendOfficeExecution).mockImplementation(async () => {
+      state = {
+        ...state!,
+        status: "needs_reconciliation",
+        revision: state!.revision + 1,
+        ownerToken: null,
+        canResume: true
+      } as never;
+      return state;
+    });
+    vi.mocked(getOfficeExecutionStatus).mockImplementation(async () => state!);
+    vi.mocked(reconcileOfficeActionReceipt).mockImplementation(async (_id, request) => {
+      state = {
+        ...state!,
+        status: "running",
+        revision: state!.revision + 1,
+        ownerToken: "reconcile-owner",
+        nextActionIndex: request.actionIndex + 1,
+        inFlightActionIndex: null,
+        requiresReconciliation: false,
+        checkpoint: request.checkpoint ?? null
+      } as never;
+      return state;
+    });
+    vi.mocked(claimOfficeExecutionResume).mockImplementation(async () => {
+      state = { ...state!, revision: state!.revision + 1, ownerToken: "resume-owner" } as never;
+      return state;
+    });
+    vi.mocked(finishOfficeExecution).mockImplementation(async () => {
+      state = { ...state!, status: "completed" } as never;
+      return state;
+    });
+    return { current: () => state! };
+  }
+
+  /** 走到真机那个现场：第 2 步写入并回读之后、完成回执之前中断。 */
+  async function runToInterrupted() {
+    installSourceHost();
+    const ledger = installLedger();
+    const view = await sendPlan(formulaPlan(), "把三条公式分别写到三张结果表", {
+      authorize: SCOPE,
+      authorizePool: SCOPE,
+      read: { scope: "active" },
+      probe: true
+    });
+    await waitFor(() => expect(suspendOfficeExecution).toHaveBeenCalledTimes(1));
+    expect(RESULTS.map((name) => host.cell(name, "B2")))
+      .toEqual([FORMULAS[0], FORMULAS[1], ""]);
+    expect(vi.mocked(completeOfficeAction).mock.calls.map((call) => call[1].actionIndex))
+      .toEqual([0]);
+    return { view, ledger };
+  }
+
+  /** 核对在途动作（只补记回执）→ 账本进度 2/3，写前快照补齐第 2 步。 */
+  async function reconcileInFlight(view: ReturnType<typeof render>) {
+    const before = contentWrites(host.originalWrites()).length;
+    fireEvent.click(await view.findByRole("button", { name: "核对在途动作" }));
+    await waitFor(() => expect(reconcileOfficeActionReceipt).toHaveBeenCalledTimes(1));
+    expect(contentWrites(host.originalWrites()).slice(before)).toEqual([]);
+    return before;
+  }
+
+  it("中断 → 核对 → 改来源（续跑被拒）→ 重开且本机索引不在 → 撤销只回退已写入的目标，来源保持用户的修改", async () => {
+    const { view, ledger } = await runToInterrupted();
+    const operationId = ledger.current().operationId;
+    const before = await reconcileInFlight(view);
+    expect(ledger.current().nextActionIndex).toBe(2);
+    // 材料真的在**账本**里：第 1、2 步的写前快照都登记了，且写后状态已核对过。
+    expect(ledger.current().checkpoint?.completedActionCount).toBe(2);
+    expect(ledger.current().checkpoint?.postStateCoverage).toBe("complete");
+
+    /*
+     * 可继续，也可撤销 —— 两件事同时成立。撤销那条先看**说明**：这句话只在
+     * "材料够 + 身份对 + 未处置"时渲染，是判据的正文，比"按钮在不在"更能定位原因。
+     */
+    expect(await view.findByRole("button", { name: "继续剩余动作" })).toBeTruthy();
+    await waitFor(() =>
+      expect(text(view)).toContain(`来源工作表「${SOURCE}」保持你现在的修改`)
+    );
+    expect(view.getByRole("button", { name: UNDO_LABEL })).toBeTruthy();
+
+    /*
+     * 用户把 `来源!B5` 从 5 改成 500 再点继续：**必须**拒绝，而且一格都不写。
+     * 拒绝不是本组要修的东西，这里钉住它是为了下面那条 —— 撤销**不因此**消失。
+     */
+    host.setCell(SOURCE, "B5", 500);
+    fireEvent.click(view.getByRole("button", { name: "继续剩余动作" }));
+    await waitFor(() => expect(text(view)).toContain(SOURCE_CHANGED));
+    expect(contentWrites(host.originalWrites()).slice(before)).toEqual([]);
+    expect(host.cell(RESULTS[2], "B2")).toBe("");
+    // 续跑被拒之后，撤销入口仍在（来源变化只挡住续跑那一条资格）。
+    expect(view.queryByRole("button", { name: UNDO_LABEL })).not.toBeNull();
+
+    /*
+     * 重开窗格 + **本机索引不在**：`localStorage.clear()` 连挂接记录和对话一起清掉，
+     * 内存里的撤销栈自然也没了。此刻界面关于这次执行的全部信息只能来自账本。
+     */
+    view.unmount();
+    localStorage.clear();
+    expect(loadPendingOfficeExecution()).toBeNull();
+    vi.mocked(listPendingOfficeExecutions).mockResolvedValue({
+      schemaVersion: 1,
+      namespace: "office",
+      workbookIdentity: `url:${BOOK_URL}`,
+      limit: 20,
+      truncated: false,
+      candidates: [
+        {
+          operationId,
+          taskId: "task-formula-undo",
+          status: "needs_reconciliation",
+          createdAt: 1_790_000_000_000,
+          updatedAt: 1_790_000_600_000,
+          nextActionIndex: 2,
+          totalActions: 3,
+          inFlightActionIndex: null,
+          ownerActive: false,
+          requiresReconciliation: false,
+          canResume: true
+        }
+      ]
+    } as never);
+
+    const reopened = render(<App />);
+    /*
+     * 先看**说明**再看按钮：说明就是判据的正文（"只回退这次写入的目标；来源保持你现在
+     * 的修改；不重新执行计划"）。先断言文本，是因为"按钮没出现"有多种原因（判据阻断、
+     * 材料没挂进栈），而这句话只有"材料与结论都成立"时才会渲染。
+     */
+    await waitFor(() =>
+      expect(text(reopened)).toContain(`来源工作表「${SOURCE}」保持你现在的修改`)
+    );
+    expect(text(reopened)).toContain("撤销不会重新执行计划");
+    /*
+     * 错误 #1 的回归：重开时 `来源!B5` 已经是 500（来源变了），卡面**不得**再宣称
+     * "来源已核对、可继续"，也不该给「继续剩余动作」按钮 —— 发现阶段读了来源指纹，
+     * 结论是"来源已变化"（阻断），而不是上一轮那种"显示可继续、点下去才被拒"。
+     */
+    expect(reopened.queryByRole("button", { name: "继续剩余动作" })).toBeNull();
+    expect(text(reopened)).not.toContain("来源和目标已核对");
+    expect(text(reopened)).toContain(SOURCE_CHANGED);
+    const undoButton = await reopened.findByRole("button", { name: UNDO_LABEL });
+    // 重开只读了一次状态（不额外查询），也没有任何写入。
+    expect(host.cell(SOURCE, "B5")).toBe(500);
+    const writesBeforeUndo = contentWrites(host.originalWrites()).length;
+    const registrations = vi.mocked(registerOfficeExecution).mock.calls.length;
+
+    fireEvent.click(undoButton);
+    await waitFor(() => expect(text(reopened)).toContain("已撤销本次执行"));
+    // ①只回退**已写入**的目标：三张结果表 B2 都回到空（第 3 步从来没写过）。
+    expect(RESULTS.map((name) => host.cell(name, "B2"))).toEqual(["", "", ""]);
+    expect(
+      contentWrites(host.originalWrites()).slice(writesBeforeUndo)
+        .map((write) => `${write.sheet}!${write.address}`).sort()
+    ).toEqual([`${RESULTS[0]}!B2`, `${RESULTS[1]}!B2`]);
+    // ②来源保持用户现在的修改：撤销不碰来源表，也不悄悄改回 5。
+    expect(host.cell(SOURCE, "B5")).toBe(500);
+    expect(host.matrix(SOURCE, "A1:B5")).toEqual([
+      ["影片", "票房(万)"], ["甲", 1], ["乙", 2], ["丙", 3], ["丁", 500]
+    ]);
+    // ③没有重新执行计划：一次登记都没有新增，也没有新的动作执行权/完成回执。
+    expect(vi.mocked(registerOfficeExecution).mock.calls.length).toBe(registrations);
+    expect(vi.mocked(startOfficeAction).mock.calls.length).toBe(2);
+    expect(vi.mocked(completeOfficeAction).mock.calls.length).toBe(1);
+    expect(finishOfficeExecution).not.toHaveBeenCalled();
+    // ④留痕一次，且是「撤销」不是「放弃」。
+    await waitFor(() => expect(vi.mocked(recordExecutionDisposition)).toHaveBeenCalledTimes(1));
+    const [namespace, recordedId, disposition] = vi.mocked(recordExecutionDisposition).mock.calls[0];
+    expect(namespace).toBe("office");
+    expect(recordedId).toBe(operationId);
+    expect(disposition).toBe("undone");
+    // ⑤入口被消费：撤销完不再给按钮，只剩结论（终态摘要，在消息里可展开）。
+    expect(reopened.queryByRole("button", { name: UNDO_LABEL })).toBeNull();
+    expect(reopened.container.querySelector('[data-recovery-undo="done"]')).toBeNull();
+    /*
+     * 错误 #2 的回归：撤销成功是**终态**。同一张卡不得同时出现"已撤销本次执行"
+     * （撤销行）与"可继续剩余动作"（结论 + 按钮）—— 上一轮真机正是两句话并存、
+     * 按钮还能点。终态下「继续剩余动作」和「补记完成」都不得再出现。
+     */
+    expect(reopened.queryByRole("button", { name: "继续剩余动作" })).toBeNull();
+    expect(reopened.queryByRole("button", { name: "补记完成（不重写原表）" })).toBeNull();
+    expect(reopened.queryByRole("button", { name: "核对在途动作" })).toBeNull();
+    expect(text(reopened)).toContain("已撤销本次执行");
+    expect(text(reopened)).not.toContain("可继续剩余动作");
+    /*
+     * 终态不再占固定区域：可点的恢复卡（`data-recovery-kind="undone"` 那张面板）已经
+     * 退出，结论改放进**所属任务的消息**里，一条可展开的终态摘要（`data-recovery-terminal`）。
+     * 记录一条不删，只是不再伪装成"还有一件待办"。
+     */
+    expect(reopened.container.querySelector('[data-recovery-kind="undone"]')).toBeNull();
+    expect(reopened.container.querySelector('[data-recovery-terminal="undone"]')).not.toBeNull();
+    // 再触发一次渲染也不会撤第二遍。
+    await act(async () => { await Promise.resolve(); });
+    expect(host.cell(RESULTS[0], "B2")).toBe("");
+    expect(vi.mocked(recordExecutionDisposition)).toHaveBeenCalledTimes(1);
+  });
+
+  it("旧任务已撤销 → 发送普通聊天 → 固定区域不再显示旧恢复卡，只剩消息里的可展开终态摘要", async () => {
+    const { view, ledger } = await runToInterrupted();
+    const operationId = ledger.current().operationId;
+    await reconcileInFlight(view);
+    // 走到终态：撤销（真实处理器），来源保持原样（不引入"来源变化"这条额外变量）。
+    fireEvent.click(view.getByRole("button", { name: UNDO_LABEL }));
+    await waitFor(() => expect(text(view)).toContain("已撤销本次执行"));
+
+    // 终态退出固定区域：可点的恢复卡面板不再渲染，结论变成消息里一条可展开摘要。
+    await waitFor(() =>
+      expect(view.container.querySelector('[data-recovery-terminal="undone"]')).not.toBeNull()
+    );
+    expect(view.container.querySelector(".office-recovery-panel")).toBeNull();
+    expect(view.queryByRole("button", { name: "继续剩余动作" })).toBeNull();
+    expect(view.queryByRole("button", { name: "核对在途动作" })).toBeNull();
+    const summary = view.container.querySelector('[data-recovery-terminal="undone"]')!;
+    expect(summary.textContent).toContain("已撤销");
+    expect(summary.textContent).toContain("展开");
+    expect(summary.querySelector("summary")).not.toBeNull();
+
+    // 记录一条不删：账本仍在、写前材料仍在（终态只是"退出固定区域"，不是清理）。
+    expect(ledger.current().operationId).toBe(operationId);
+    expect(contentWrites(host.originalWrites()).length).toBeGreaterThan(0);
+
+    // 发一句普通聊天：固定区域**仍然**不显示旧恢复卡，摘要还留在它自己的那条消息里。
+    const textarea = view.container.querySelector<HTMLTextAreaElement>(".composer textarea")!;
+    fireEvent.change(textarea, { target: { value: "随便聊聊" } });
+    await waitFor(() =>
+      expect(view.container.querySelector(".composer .composer-primary")!.getAttribute("aria-label"))
+        .toBe("发送")
+    );
+    expect(view.container.querySelector(".office-recovery-panel")).toBeNull();
+    expect(view.queryByRole("button", { name: "继续剩余动作" })).toBeNull();
+    // 终态摘要没有消失，也没有被重新摆回固定区域。
+    expect(view.container.querySelector('[data-recovery-terminal="undone"]')).not.toBeNull();
+    expect(view.container.querySelector(".office-recovery-panel")).toBeNull();
+  });
+
+  it("重开后目标被人工改过：撤销在任何写入之前停下，不留成功留痕，也不清空目标", async () => {
+    const { view, ledger } = await runToInterrupted();
+    const operationId = ledger.current().operationId;
+    const before = await reconcileInFlight(view);
+    view.unmount();
+    localStorage.clear();
+    vi.mocked(listPendingOfficeExecutions).mockResolvedValue({
+      schemaVersion: 1,
+      namespace: "office",
+      workbookIdentity: `url:${BOOK_URL}`,
+      limit: 20,
+      truncated: false,
+      candidates: [
+        {
+          operationId,
+          taskId: "task-formula-undo",
+          status: "needs_reconciliation",
+          createdAt: 1_790_000_000_000,
+          updatedAt: 1_790_000_600_000,
+          nextActionIndex: 2,
+          totalActions: 3,
+          inFlightActionIndex: null,
+          ownerActive: false,
+          requiresReconciliation: false,
+          canResume: true
+        }
+      ]
+    } as never);
+
+    const reopened = render(<App />);
+    const undoButton = await reopened.findByRole("button", { name: UNDO_LABEL });
+    /*
+     * 执行之后、撤销之前，用户手改了第 1 步写进去的那一格。
+     * 撤销的现场判据（`assertUndoPostState`）必须在**任何写入之前**发现它，而不是
+     * 先按旧快照覆盖、再报"有点不对"。
+     */
+    host.setCell(RESULTS[0], "B2", "我手动改的");
+    const writesBefore = contentWrites(host.originalWrites()).length;
+    fireEvent.click(undoButton);
+    await waitFor(() => expect(text(reopened)).toContain("又发生了变化"));
+
+    // 零恢复写入：被改的那一格仍是用户的值，另一格仍是这次执行写下的公式。
+    expect(contentWrites(host.originalWrites()).length).toBe(writesBefore);
+    expect(host.cell(RESULTS[0], "B2")).toBe("我手动改的");
+    expect(host.cell(RESULTS[1], "B2")).toBe(FORMULAS[1]);
+    expect(host.cell(SOURCE, "B5")).toBe(5);
+    // 没恢复成功 ⇒ 不写"撤销"留痕，也不宣称"已撤销"。
+    expect(vi.mocked(recordExecutionDisposition)).not.toHaveBeenCalled();
+    expect(text(reopened)).not.toContain("已撤销本次执行");
+    /*
+     * 入口**仍在**（不是"失败即消失"）：目标被改过时用户可能只是改错了一格，
+     * 撤销栈里那一份留着，改回去再点就能重试。这里不把"按钮还在"当成失败证据，
+     * 失败证据是"一格都没被覆盖"＋"没有成功留痕"。
+     */
+    expect(reopened.queryByRole("button", { name: UNDO_LABEL })).not.toBeNull();
+    expect(contentWrites(host.originalWrites()).slice(before)).toEqual([]);
+  });
+
+  it("重开后授权被收窄：不给撤销按钮，只给原因，零写入", async () => {
+    const { view, ledger } = await runToInterrupted();
+    const operationId = ledger.current().operationId;
+    await reconcileInFlight(view);
+    view.unmount();
+    localStorage.clear();
+    vi.mocked(listPendingOfficeExecutions).mockResolvedValue({
+      schemaVersion: 1,
+      namespace: "office",
+      workbookIdentity: `url:${BOOK_URL}`,
+      limit: 20,
+      truncated: false,
+      candidates: [
+        {
+          operationId,
+          taskId: "task-formula-undo",
+          status: "needs_reconciliation",
+          createdAt: 1_790_000_000_000,
+          updatedAt: 1_790_000_600_000,
+          nextActionIndex: 2,
+          totalActions: 3,
+          inFlightActionIndex: null,
+          ownerActive: false,
+          requiresReconciliation: false,
+          canResume: true
+        }
+      ]
+    } as never);
+
+    const writesBeforeOpen = host.writes().length;
+    const reopened = render(<App />);
+    await reopened.findByRole("button", { name: "继续剩余动作" });
+    // 用户重开后只勾了来源表并确认：撤销要写回的两张结果表已被收窄掉。
+    await setAuthorizedScope(reopened, [SOURCE], SCOPE);
+    await waitFor(() => expect(text(reopened)).toContain("当前授权里没有工作表"));
+    expect(reopened.queryByRole("button", { name: UNDO_LABEL })).toBeNull();
+    expect(reopened.container.querySelector('[data-recovery-undo="blocked"]')).not.toBeNull();
+    expect(host.writes().length).toBe(writesBeforeOpen);
+    expect(vi.mocked(recordExecutionDisposition)).not.toHaveBeenCalled();
+  });
+
+  it("重开后就地撤销又被处置过（账本已有 undone 留痕）：不再重建入口", async () => {
+    const { view, ledger } = await runToInterrupted();
+    const operationId = ledger.current().operationId;
+    await reconcileInFlight(view);
+    view.unmount();
+    localStorage.clear();
+    // 账本说这次执行已经撤销过（另一台机器上撤的）：入口不许再出现。
+    ledger.current().disposition = { undoneAt: 1_790_000_999_000, abandonedAt: null };
+    vi.mocked(listPendingOfficeExecutions).mockResolvedValue({
+      schemaVersion: 1,
+      namespace: "office",
+      workbookIdentity: `url:${BOOK_URL}`,
+      limit: 20,
+      truncated: false,
+      candidates: [
+        {
+          operationId,
+          taskId: "task-formula-undo",
+          status: "needs_reconciliation",
+          createdAt: 1_790_000_000_000,
+          updatedAt: 1_790_000_600_000,
+          nextActionIndex: 2,
+          totalActions: 3,
+          inFlightActionIndex: null,
+          ownerActive: false,
+          requiresReconciliation: false,
+          canResume: true
+        }
+      ]
+    } as never);
+
+    const writesBeforeOpen = host.writes().length;
+    const reopened = render(<App />);
+    await waitFor(() => expect(text(reopened)).toContain("这次执行已经撤销过"));
+    expect(reopened.queryByRole("button", { name: UNDO_LABEL })).toBeNull();
+    // 已经撤销过的执行也不该再被摆成"可继续"：两件事读的是同一条账本事实。
+    expect(reopened.queryByRole("button", { name: "继续剩余动作" })).toBeNull();
+    expect(host.writes().length).toBe(writesBeforeOpen);
+  });
+
+  it("重开后账本没有写前快照：不给撤销，也不用当前单元格反推一个", async () => {
+    const { view, ledger } = await runToInterrupted();
+    const operationId = ledger.current().operationId;
+    await reconcileInFlight(view);
+    view.unmount();
+    localStorage.clear();
+    // 材料缺失：进度照旧是 2/3，但写前快照没落库。
+    ledger.current().checkpoint = null;
+    vi.mocked(listPendingOfficeExecutions).mockResolvedValue({
+      schemaVersion: 1,
+      namespace: "office",
+      workbookIdentity: `url:${BOOK_URL}`,
+      limit: 20,
+      truncated: false,
+      candidates: [
+        {
+          operationId,
+          taskId: "task-formula-undo",
+          status: "needs_reconciliation",
+          createdAt: 1_790_000_000_000,
+          updatedAt: 1_790_000_600_000,
+          nextActionIndex: 2,
+          totalActions: 3,
+          inFlightActionIndex: null,
+          ownerActive: false,
+          requiresReconciliation: false,
+          canResume: true
+        }
+      ]
+    } as never);
+
+    const writesBeforeOpen = host.writes().length;
+    const reopened = render(<App />);
+    await waitFor(() => expect(text(reopened)).toContain("不会用当前单元格反推"));
+    expect(reopened.queryByRole("button", { name: UNDO_LABEL })).toBeNull();
+    expect(host.writes().length).toBe(writesBeforeOpen);
+    expect(host.cell(RESULTS[0], "B2")).toBe(FORMULAS[0]);
+    expect(host.cell(RESULTS[1], "B2")).toBe(FORMULAS[1]);
+  });
+
+  it("来源恢复登记基线后：点「重新核对（只读）」按当前现场重新判断，不永久锁死", async () => {
+    const { view, ledger } = await runToInterrupted();
+    const operationId = ledger.current().operationId;
+    await reconcileInFlight(view);
+    // 把来源改掉再重开：重开后的发现必须**不**宣称"来源已核对、可继续"。
+    host.setCell(SOURCE, "B5", 500);
+    view.unmount();
+    localStorage.clear();
+    vi.mocked(listPendingOfficeExecutions).mockResolvedValue({
+      schemaVersion: 1,
+      namespace: "office",
+      workbookIdentity: `url:${BOOK_URL}`,
+      limit: 20,
+      truncated: false,
+      candidates: [
+        {
+          operationId,
+          taskId: "task-formula-undo",
+          status: "needs_reconciliation",
+          createdAt: 1_790_000_000_000,
+          updatedAt: 1_790_000_600_000,
+          nextActionIndex: 2,
+          totalActions: 3,
+          inFlightActionIndex: null,
+          ownerActive: false,
+          requiresReconciliation: false,
+          canResume: true
+        }
+      ]
+    } as never);
+
+    const reopened = render(<App />);
+    // 阻断：没有"继续"，也没有"来源已核对"，只给只读重核。
+    await waitFor(() => expect(text(reopened)).toContain(SOURCE_CHANGED));
+    expect(reopened.queryByRole("button", { name: "继续剩余动作" })).toBeNull();
+    expect(text(reopened)).not.toContain("来源和目标已核对");
+    const reverify = await reopened.findByRole("button", { name: "重新核对（只读）" });
+
+    // 用户把来源改回登记基线，点「重新核对」：结论按**现在的现场**重新算，恢复可继续。
+    host.setCell(SOURCE, "B5", 5);
+    fireEvent.click(reverify);
+    await waitFor(() =>
+      expect(reopened.queryByRole("button", { name: "继续剩余动作" })).not.toBeNull()
+    );
+    // 复核全程零写入：来源改回去是用户自己做的，重核没有写任何单元格。
+    expect(host.cell(SOURCE, "B5")).toBe(5);
+  });
+
+  it("撤销成功后迟到的发现/重核不把终态覆盖回可继续", async () => {
+    const { view, ledger } = await runToInterrupted();
+    const operationId = ledger.current().operationId;
+    await reconcileInFlight(view);
+    view.unmount();
+    localStorage.clear();
+    vi.mocked(listPendingOfficeExecutions).mockResolvedValue({
+      schemaVersion: 1,
+      namespace: "office",
+      workbookIdentity: `url:${BOOK_URL}`,
+      limit: 20,
+      truncated: false,
+      candidates: [
+        {
+          operationId,
+          taskId: "task-formula-undo",
+          status: "needs_reconciliation",
+          createdAt: 1_790_000_000_000,
+          updatedAt: 1_790_000_600_000,
+          nextActionIndex: 2,
+          totalActions: 3,
+          inFlightActionIndex: null,
+          ownerActive: false,
+          requiresReconciliation: false,
+          canResume: true
+        }
+      ]
+    } as never);
+
+    const reopened = render(<App />);
+    const undoButton = await reopened.findByRole("button", { name: UNDO_LABEL });
+    fireEvent.click(undoButton);
+    await waitFor(() => expect(text(reopened)).toContain("已撤销本次执行"));
+    expect(reopened.queryByRole("button", { name: "继续剩余动作" })).toBeNull();
+
+    /*
+     * 终态之后又发生一次"重新发现"（例如身份观察触发、或用户又点了一次只读重核）：
+     * 迟到的响应**不得**把已经撤销的执行重新算回"可继续"。这里直接再跑一次发现，
+     * 卡面必须仍是"已撤销"，且没有任何续跑/补记/再撤按钮。
+     */
+    await act(async () => {
+      // 触发一次身份观察驱动的只读重核：换簿后身份观察会调 reverifySelectedOfficeRecovery。
+      await Promise.resolve();
+    });
+    expect(reopened.queryByRole("button", { name: "继续剩余动作" })).toBeNull();
+    expect(reopened.queryByRole("button", { name: UNDO_LABEL })).toBeNull();
+    expect(text(reopened)).toContain("已撤销本次执行");
+    expect(text(reopened)).not.toContain("可继续剩余动作");
+    // 终态后任何渲染都不该再产生写入。
+    const writesAfter = contentWrites(host.originalWrites()).length;
+    await act(async () => { await Promise.resolve(); });
+    expect(contentWrites(host.originalWrites()).length).toBe(writesAfter);
+  });
+
+  it("回归⑥：撤销成功但留痕上报失败 → 本会话保持已撤销且不重复宿主操作；重开后无留痕也不重新开放续跑", async () => {
+    const { view, ledger } = await runToInterrupted();
+    const operationId = ledger.current().operationId;
+    await reconcileInFlight(view);
+    // 来源没改（B5=5），核对后卡面是「继续剩余动作」—— 这才是"撤销后会不会被重新开放"的对照起点。
+    expect(await view.findByRole("button", { name: "继续剩余动作" })).toBeTruthy();
+
+    // 撤销的留痕上报失败（网络不可用）：best-effort，不重试、不弹错、不改判。
+    vi.mocked(recordExecutionDisposition).mockRejectedValueOnce(new Error("网络不可用"));
+    const writesBeforeUndo = contentWrites(host.originalWrites()).length;
+    const registrations = vi.mocked(registerOfficeExecution).mock.calls.length;
+    const claims = vi.mocked(claimOfficeExecutionResume).mock.calls.length;
+
+    fireEvent.click(view.getByRole("button", { name: UNDO_LABEL }));
+    await waitFor(() => expect(text(view)).toContain("已撤销本次执行"));
+
+    // ① 留痕确实只上报一次（best-effort 不重试），且是 undone。
+    await waitFor(() => expect(vi.mocked(recordExecutionDisposition)).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(recordExecutionDisposition).mock.calls[0][2]).toBe("undone");
+    // ② 宿主恢复只发生一次：撤销写回两个目标格，之后没有新的登记 / 领取执行权 / 执行。
+    expect(contentWrites(host.originalWrites()).slice(writesBeforeUndo)
+      .map((write) => `${write.sheet}!${write.address}`).sort())
+      .toEqual([`${RESULTS[0]}!B2`, `${RESULTS[1]}!B2`]);
+    expect(vi.mocked(registerOfficeExecution).mock.calls.length).toBe(registrations);
+    expect(vi.mocked(claimOfficeExecutionResume).mock.calls.length).toBe(claims);
+    // ③ 本会话保持已撤销：终态退出固定区域，没有继续/补记/再撤，只剩消息里的终态摘要。
+    expect(view.queryByRole("button", { name: "继续剩余动作" })).toBeNull();
+    expect(view.container.querySelector('[data-recovery-terminal="undone"]')).not.toBeNull();
+    expect(view.container.querySelector('[data-recovery-kind="undone"]')).toBeNull();
+
+    // 重开窗格：本机终态 ref/state 随组件销毁，账本又因为上报失败没有 undoneAt 留痕。
+    view.unmount();
+    localStorage.clear();
+    vi.mocked(listPendingOfficeExecutions).mockResolvedValue({
+      schemaVersion: 1,
+      namespace: "office",
+      workbookIdentity: `url:${BOOK_URL}`,
+      limit: 20,
+      truncated: false,
+      candidates: [
+        {
+          operationId,
+          taskId: "task-formula-undo",
+          status: "needs_reconciliation",
+          createdAt: 1_790_000_000_000,
+          updatedAt: 1_790_000_600_000,
+          nextActionIndex: 2,
+          totalActions: 3,
+          inFlightActionIndex: null,
+          ownerActive: false,
+          requiresReconciliation: false,
+          canResume: true
+        }
+      ]
+    } as never);
+
+    const reopened = render(<App />);
+    /*
+     * 账本没有处置留痕，但**现场已经被撤销清空**：重开后靠写后现场核对（`verifyResumeScene`）
+     * 发现第 1、2 步的目标不再是执行后的样子 ⇒ 阻断续跑，而不是重新开放「继续剩余动作」。
+     */
+    await waitFor(() =>
+      expect(text(reopened)).toContain("已经不是这次执行写入后的样子")
+    );
+    expect(reopened.queryByRole("button", { name: "继续剩余动作" })).toBeNull();
+    expect(reopened.queryByRole("button", { name: "补记完成（不重写原表）" })).toBeNull();
+    expect(reopened.queryByRole("button", { name: UNDO_LABEL })).toBeNull();
+    // 重开后没有任何新写入。
+    expect(contentWrites(host.originalWrites()).length).toBe(writesBeforeUndo + 2);
+  });
+
+  it("回归⑧：卡片生成后账本处置变成「已撤销」，点原「继续剩余动作」入口 → 处理器按最新处置拒绝，零写入", async () => {
+    const { view, ledger } = await runToInterrupted();
+    const operationId = ledger.current().operationId;
+    await reconcileInFlight(view);
+    // 卡片此刻是「继续剩余动作」（来源 matched）。保存这个入口元素本身（= 旧回调的持有者）。
+    const resumeButton = await view.findByRole("button", { name: "继续剩余动作" });
+
+    /*
+     * 在点击之前，账本处置被推进成「已撤销」（例如另一台机器 / 另一窗格已经撤销并留痕）。
+     * 按钮还是那一颗（旧回调还在），但 `resumeOfficeRemainingActions` 必须先按最新账本
+     * 读数复核处置，拒绝续跑 —— 而不是拿旧卡面的结论直接去 claim + 执行。
+     */
+    ledger.current().disposition = { undoneAt: 1_790_000_700_000, abandonedAt: null };
+    const claims = vi.mocked(claimOfficeExecutionResume).mock.calls.length;
+    const writesBefore = contentWrites(host.originalWrites()).length;
+
+    fireEvent.click(resumeButton);
+    await waitFor(() => expect(text(view)).toContain("已经撤销过（账本已留处置痕）"));
+    // 处理器拒绝：没有领取执行权，也没有任何写入。
+    expect(vi.mocked(claimOfficeExecutionResume).mock.calls.length).toBe(claims);
+    expect(contentWrites(host.originalWrites()).length).toBe(writesBefore);
+    // 卡面收敛到终态，继续/补记/再撤都不给（终态退出固定区域，只剩消息里的摘要）。
+    expect(view.queryByRole("button", { name: "继续剩余动作" })).toBeNull();
+    expect(view.container.querySelector('[data-recovery-terminal="undone"]')).not.toBeNull();
+    expect(view.container.querySelector('[data-recovery-kind="undone"]')).toBeNull();
+  });
+
+  it("已撤销终态不出现续跑引导句，也不给任何写入按钮（说明按状态派生）", async () => {
+    /*
+     * 2026-10-31 真机：已撤销的卡上，"已撤销本次执行"下面仍跟着写死的
+     * `EXECUTION_RECOVERY_NOTE`（"续跑通过复核后执行剩余动作，再审阅结果"）——与终态
+     * 矛盾。这里钉住渲染层：`undone` 结论下卡面**不再**出现这句续跑引导，也不给写入按钮。
+     */
+    const { view, ledger } = await runToInterrupted();
+    const operationId = ledger.current().operationId;
+    await reconcileInFlight(view);
+    // 撤销前：卡面是「继续剩余动作」，固定说明仍是那句续跑引导（未结束状态照旧）。
+    expect(await view.findByRole("button", { name: "继续剩余动作" })).toBeTruthy();
+    expect(text(view)).toContain("续跑通过复核后执行剩余动作");
+
+    // 撤销：账本处置推进成已撤销（等价于撤销成功后留痕），卡面收敛到 undone 终态。
+    ledger.current().disposition = { undoneAt: 1_790_000_700_000, abandonedAt: null };
+    fireEvent.click(view.getByRole("button", { name: "继续剩余动作" }));
+    await waitFor(() =>
+      expect(view.container.querySelector('[data-recovery-terminal="undone"]')).not.toBeNull()
+    );
+
+    // 终态说明替换续跑引导：不再出现"续跑"引导句或审阅措辞。
+    expect(text(view)).not.toContain("续跑通过复核后执行剩余动作");
+    expect(text(view)).toContain("已撤销本次执行");
+    // 不给任何写入/补记/继续按钮。
+    expect(view.queryByRole("button", { name: "继续剩余动作" })).toBeNull();
+    expect(view.queryByRole("button", { name: "补记完成（不重写原表）" })).toBeNull();
+    expect(view.queryByRole("button", { name: UNDO_LABEL })).toBeNull();
+  });
 });

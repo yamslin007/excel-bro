@@ -1,4 +1,9 @@
 import {
+  followingAfterScroll,
+  isNearScrollBottom,
+  shouldFollowAfterLayout
+} from "@excel-bro/core/scrollFollow";
+import {
   useCallback,
   useLayoutEffect,
   useRef,
@@ -8,25 +13,13 @@ import {
 
 // Keep this custom hook in a .tsx module so Vite generates a Fast Refresh
 // signature. Otherwise adding a primitive hook can reuse incompatible state.
-const DEFAULT_BOTTOM_THRESHOLD = 120;
 
-interface ScrollMetrics {
-  scrollHeight: number;
-  scrollTop: number;
-  clientHeight: number;
-}
-
-export function isNearScrollBottom(
-  metrics: ScrollMetrics,
-  threshold = DEFAULT_BOTTOM_THRESHOLD
-): boolean {
-  return (
-    Math.max(
-      0,
-      metrics.scrollHeight - metrics.scrollTop - metrics.clientHeight
-    ) <= threshold
-  );
-}
+/**
+ * 判据本身住在共享层（`@excel-bro/core/scrollFollow`）：执行过程框内部的滚动
+ * 读的是**同一份**，否则"贴底跟随 / 上翻保持"在两个容器里会各长一套。
+ * 这里只做转发，保持原有导出名不变。
+ */
+export { isNearScrollBottom };
 
 /**
  * 消息流的自动跟随 + 「回到底部」的可见性。
@@ -50,7 +43,7 @@ export function useMessageAutoFollow(signal: string, conversationId: string) {
   const [awayFromBottom, setAwayFromBottom] = useState(false);
 
   const handleScroll = useCallback((event: UIEvent<HTMLElement>) => {
-    const following = isNearScrollBottom(event.currentTarget);
+    const following = followingAfterScroll(event.currentTarget);
     followingRef.current = following;
     // 滚出去就放出来、滚回来就收回 —— **不要求**期间有新内容。
     setAwayFromBottom(!following);
@@ -73,7 +66,8 @@ export function useMessageAutoFollow(signal: string, conversationId: string) {
     }
     const container = containerRef.current;
     if (!container) return;
-    if (followingRef.current || isNearScrollBottom(container)) {
+    // 意图优先、位置兜底：这一句就是"用户上翻后新内容不许抢滚动"的落点。
+    if (shouldFollowAfterLayout({ following: followingRef.current, metrics: container })) {
       followingRef.current = true;
       container.scrollTop = container.scrollHeight;
       setAwayFromBottom(false);

@@ -599,9 +599,11 @@ describe("图片附件的真实 fetch 链路", () => {
     expect(captured.filter((r) => r.url.includes("/api/turn"))).toHaveLength(0);
     await submit(textarea);
     if (container.querySelector('[role="dialog"]')) await confirmBeforeAnalysis(container);
-    await until(() => textOf(container).includes("补充图片目标"), "应出现图片任务澄清");
+    await until(() => textOf(container).includes("如何使用图片？"), "应出现图片任务澄清");
+    // 点选项只选中；提交是右下角那颗「发送回答」。
     await click(Array.from(container.querySelectorAll("button")).find((button) =>
       button.textContent?.includes("只分析图片")) ?? null);
+    await click(container.querySelector<HTMLButtonElement>('button[aria-label="发送回答"]'));
     await until(() => textOf(container).includes("已结合附件图片分析"), "图片续答应完成");
     const bodies = captured.filter((r) => r.url.includes("/api/turn")).map((r) => JSON.parse(r.body));
     const intents = bodies.filter((b) => b.imageCount !== undefined);
@@ -1114,7 +1116,7 @@ describe("local_plan_rule 的真实出站请求体", () => {
 
       await ask(container);
       await until(
-        () => Boolean(container.querySelector(".clarification-card.pending")),
+        () => Boolean(container.querySelector(".composer-box .clarification-composer")),
         "缺类别时应先弹澄清卡，而不是算出一个猜的矩阵"
       );
 

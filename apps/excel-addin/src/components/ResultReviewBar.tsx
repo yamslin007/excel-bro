@@ -1,8 +1,41 @@
 import type { ResultReviewState } from '@excel-bro/core/resultReview';
 
+/**
+ * 审阅栏这一刻会不会画出来 —— **唯一**出处。
+ *
+ * 固定区域容器（`ComposerActionDock`）要按"有没有这一块"决定展开谁，如果它自己
+ * 另判一次（例如只看 `phase === 'reviewing'`），"未执行"/"需要核对"这些形态就会被
+ * 判成没有审阅栏，于是被执行摘要或恢复卡顶掉 —— 那正是"算出一个名字、界面却少一块"。
+ */
+export function resultReviewVisible(state: ResultReviewState): boolean {
+  const settled = state.phase === 'confirmed' || state.phase === 'discarded';
+  const needsAttention = state.pending || Boolean(state.markerPending) || Boolean(state.notice);
+  return !(state.phase === 'idle' || (settled && !needsAttention));
+}
+
+/**
+ * 这块审阅栏是不是**在等你决定**（确认 / 放弃 / 重试清理标记）。
+ *
+ * 与"会不会画出来"分开：`未执行`、`正在执行`、`需要核对`这些形态也会画出来，
+ * 但它们身上没有决定可做 —— 它们是**状态**。固定区域容器据此决定谁是主视图：
+ * 一条状态行不该把真正的恢复入口挤成 chip（那会变成"卡片说去恢复，恢复卡片却不在"）。
+ */
+export function resultReviewNeedsDecision(state: ResultReviewState): boolean {
+  const settled = state.phase === 'confirmed' || state.phase === 'discarded';
+  const needsAttention = state.pending || Boolean(state.markerPending) || Boolean(state.notice);
+  return state.phase === 'reviewing' || (settled && needsAttention);
+}
+
 /** Kept outside the scrolling conversation so the decision stays reachable. */
-export function ResultReviewBar({ state, title, onCompare, onConfirm, onDiscard, onRetryMarker }: {
+export function ResultReviewBar({ state, title, compareUnavailable, onCompare, onConfirm, onDiscard, onRetryMarker }: {
   state: ResultReviewState; title: string;
+  /**
+   * 本次**没有**执行前副本可对比时的原因（多张写入目标表、跨表公式、区域超限…）。
+   *
+   * 有它就说明"比对做不了"，于是不画「双视图对比」——画一个点下去只会报错的按钮
+   * 等于骗人。执行与确认/放弃都不受影响：比对是审阅的辅助，不是执行许可。
+   */
+  compareUnavailable?: string;
   onCompare(): void; onConfirm(): void; onDiscard(): void;
   /** 只重试"移除本次标记"：不重新执行、不重新撤销。 */
   onRetryMarker?(): void;
@@ -17,7 +50,7 @@ export function ResultReviewBar({ state, title, onCompare, onConfirm, onDiscard,
    * 紧凑提示，并附上它需要的操作。
    */
   const needsAttention = state.pending || Boolean(state.markerPending) || Boolean(state.notice);
-  if (state.phase === 'idle' || (settled && !needsAttention)) return null;
+  if (!resultReviewVisible(state)) return null;
   if (settled) {
     return <section className="result-review-bar is-settled" aria-label="本次结果审阅" aria-busy={state.pending}>
       {state.notice && <p role="status">{state.notice}</p>}
@@ -34,8 +67,9 @@ export function ResultReviewBar({ state, title, onCompare, onConfirm, onDiscard,
     <span>{title}</span>
     {state.phase === 'reviewing' && <>
       <p>主表已更新。{state.marked ? '变更区域用浅黄底色或边框标出，避免遮住实际格式；同时修改填充与边框的区域直接显示实际效果；' : ''}双视图中的副本展示执行前状态，仅比较本次修改区域。公式采用当时的值，不重新计算；图表、合并与条件格式效果不作为本次对比依据。</p>
+      {compareUnavailable && <p role="status">{compareUnavailable}</p>}
       <div className="result-review-actions">
-        <button type="button" className="secondary-button" disabled={state.pending || state.comparing} onClick={onCompare}>双视图对比</button>
+        {!compareUnavailable && <button type="button" className="secondary-button" disabled={state.pending || state.comparing} onClick={onCompare}>双视图对比</button>}
         <button type="button" className="secondary-button" disabled={state.pending} onClick={onDiscard}>放弃变更</button>
         <button type="button" className="primary-button" disabled={state.pending} onClick={onConfirm}>确认变更</button>
       </div>

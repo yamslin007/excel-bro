@@ -365,4 +365,60 @@ describe("useUndoSnapshot", () => {
 
     expect(onRestored).not.toHaveBeenCalled();
   });
+
+  /*
+   * 恢复卡「撤销本次执行」的时序：`ensureUndoSnapshot(...)` 与 `undoExecutionTo(...)`
+   * 在**同一个 tick** 里连着调（挂一次是幂等保险，紧接着就撤）。React 的状态更新要等
+   * 下一次渲染 —— 撤销如果读闭包里的 `undoStack`，刚挂进去的那一条就找不到，
+   * 表现为"按钮点了没反应，连失败文案都没有"。
+   */
+  it("ensure 之后同一 tick 里撤销：刚挂进栈的那一条真的被撤到", async () => {
+    const { result } = renderHook(() =>
+      useUndoSnapshot({ isBusy: false, onStatusChange: vi.fn(), onMessage: vi.fn() })
+    );
+    const rebuilt = makeSnapshot("plan-1", "execution-1");
+
+    let restored: boolean | undefined;
+    await act(async () => {
+      result.current.ensureUndoSnapshot(rebuilt);
+      restored = await result.current.undoExecutionTo("execution-1");
+    });
+
+    expect(undoExecutionMock).toHaveBeenCalledWith(rebuilt);
+    expect(restored).toBe(true);
+    expect(result.current.undoStack).toEqual([]);
+  });
+
+  it("ensure 按 executionId 去重：同一执行读两次账本不会攒出两条", async () => {
+    const { result } = renderHook(() =>
+      useUndoSnapshot({ isBusy: false, onStatusChange: vi.fn(), onMessage: vi.fn() })
+    );
+    const rebuilt = makeSnapshot("plan-1", "execution-1");
+    act(() => result.current.ensureUndoSnapshot(rebuilt));
+    act(() => result.current.ensureUndoSnapshot({ ...rebuilt }));
+
+    expect(result.current.undoStack).toHaveLength(1);
+    expect(result.current.undoStack[0]).toBe(rebuilt);
+  });
+
+  /*
+   * 一次执行可能先后产生两份快照（断点重建的"已完成前缀" + 续跑完成后的整份）。
+   * 两份都留在栈里，LIFO 就会把同一批区域恢复两遍：先按整份还原，再按前缀那份核对
+   * 「写后指纹」必然对不上 ⇒ 用户点「放弃变更/撤销」得到"恢复未成功"。
+   */
+  it("同一执行只保留最新的一份快照（后写覆盖先写，不从栈底再恢复一遍）", async () => {
+    const { result } = renderHook(() =>
+      useUndoSnapshot({ isBusy: false, onStatusChange: vi.fn(), onMessage: vi.fn() })
+    );
+    const prefix = makeSnapshot("plan-1", "execution-1");
+    const complete = makeSnapshot("plan-1", "execution-1");
+    act(() => result.current.pushUndoSnapshot(prefix));
+    act(() => result.current.pushUndoSnapshot(complete));
+
+    expect(result.current.undoStack).toEqual([complete]);
+    await act(async () => {
+      await result.current.undoExecutionTo("execution-1");
+    });
+    expect(undoExecutionMock.mock.calls.map((call) => call[0])).toEqual([complete]);
+  });
 });

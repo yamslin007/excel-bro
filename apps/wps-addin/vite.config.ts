@@ -1,6 +1,44 @@
+import fs from "node:fs";
 import path from "node:path";
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+
+/**
+ * 开发端口只有一个来源：`config/capabilities.json` 的 `devServers`。
+ *
+ * 后端来源白名单从同一份配置派生，启动器（`scripts/start_wps_dev.mjs`）按声明顺序
+ * 实测挑出真正能绑定的那个，再经 `EB_WPS_DEV_PORT` 传进来。这里**拒绝**列表外的端口：
+ * 那会让任务窗格与后端白名单错位，只剩 `Failed to fetch`。
+ * 也不用端口扫描（wpsjs + portfinder 就是这样静默漂到 3987 的）。
+ */
+const CAPABILITIES_PATH = path.resolve(__dirname, "../../config/capabilities.json");
+const DEV_SERVERS = JSON.parse(fs.readFileSync(CAPABILITIES_PATH, "utf8"))?.devServers ?? {};
+const WPS_PORT_CANDIDATES: number[] = DEV_SERVERS.wpsPortCandidates ?? [];
+
+function resolveDevPort(): number {
+  if (!Array.isArray(WPS_PORT_CANDIDATES) || WPS_PORT_CANDIDATES.length === 0) {
+    throw new Error(
+      "config/capabilities.json 缺少 devServers.wpsPortCandidates，无法确定 WPS 开发端口"
+    );
+  }
+  const raw = process.env.EB_WPS_DEV_PORT;
+  if (!raw) {
+    // 直接跑 `vite` 时退到首个候选：仍是声明过的端口，不做扫描、不漂移。
+    console.info(
+      `[wps-dev] 未指定 EB_WPS_DEV_PORT，使用候选列表首个端口 ${WPS_PORT_CANDIDATES[0]}；` +
+        "推荐用 npm run dev:wps（自动挑可用端口并同步登记与后端白名单）。"
+    );
+    return WPS_PORT_CANDIDATES[0];
+  }
+  const port = Number(raw);
+  if (!Number.isInteger(port) || !WPS_PORT_CANDIDATES.includes(port)) {
+    throw new Error(
+      `EB_WPS_DEV_PORT=${raw} 不在 devServers.wpsPortCandidates（${WPS_PORT_CANDIDATES.join("、")}）内；` +
+        "后端只允许该列表内的来源，用列表外端口会直接被拒。"
+    );
+  }
+  return port;
+}
 
 export default defineConfig({
   base: "./",
@@ -35,7 +73,13 @@ export default defineConfig({
               : request.headers["user-agent"]?.includes("Chrome")
                 ? "Chromium"
                 : "other";
-            console.info(`[wps-request] ${request.method ?? "GET"} ${path} ${userAgent}`);
+            // 带 Origin 的请求能直接说明"任务窗格是从哪个端口加载的"，是端口对齐的现场证据；
+            // Origin 只是回环来源，不含工作簿名/表名/单元格值。
+            const origin = request.headers.origin;
+            console.info(
+              `[wps-request] ${request.method ?? "GET"} ${path} ${userAgent}` +
+                `${origin ? ` from=${origin}` : ""}`
+            );
           }
           next();
         });
@@ -44,7 +88,8 @@ export default defineConfig({
   ],
   server: {
     host: "127.0.0.1",
-    port: 3889,
+    port: resolveDevPort(),
+    // 端口不许漂移：绑定失败就报错退出，而不是悄悄换一个后端不认识的端口。
     strictPort: true,
     proxy: {
       "/api": {
@@ -60,6 +105,8 @@ export default defineConfig({
     outDir: "dist"
   },
   test: {
-    environment: "jsdom"
+    environment: "jsdom",
+    // 未替身的网络出口直接让用例失败（见 `@excel-bro/core/testNetworkGate`）。
+    setupFiles: ["./src/testSetup.ts"]
   }
 });

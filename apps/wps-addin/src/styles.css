@@ -1849,6 +1849,69 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
   font-weight: 750;
 }
 
+/*
+ * 开发诊断（仅 DEV）：恢复卡里一段可折叠的原因码。
+ *
+ * 用户可见结论在上面那句人话里，这段只给排查用，所以：①默认收起；②等宽小字；
+ * ③长行折行而不是横向滚动（窗格很窄，横向滚动条会把动作条挤走）。
+ */
+.wps-recovery-diag {
+  margin-top: 10px;
+  color: var(--color-text-tertiary, #6b6b6b);
+  font-size: var(--font-size-caption);
+}
+.wps-recovery-diag summary { cursor: pointer; }
+.wps-recovery-diag pre {
+  margin: 6px 0 0;
+  padding: 8px;
+  border-radius: var(--radius-xs);
+  background: var(--color-surface-soft, #f3f4f2);
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Consolas, monospace);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/*
+ * 多候选：只给选择入口。每行是「执行短号 + 进度 + 时间」，**没有**单元格值、
+ * 没有计划正文 —— 选一行只等于"查这一次的状态"，不写任何单元格。
+ *
+ * 行高与上面那排按钮同档（34px），否则"看起来像文本、其实可点"。
+ */
+.wps-recovery-candidates {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0 0 8px;
+}
+.wps-recovery-candidate {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 34px;
+  padding: 6px 10px;
+  border: 1px solid var(--color-border, #e9e9e7);
+  border-radius: var(--radius-sm);
+  corner-shape: squircle;
+  background: var(--color-background);
+  color: var(--color-text-primary, #37352f);
+  font-size: var(--font-size-caption);
+  text-align: left;
+  cursor: pointer;
+}
+.wps-recovery-candidate:hover { border-color: var(--color-brand-text, #2f6b47); }
+.wps-recovery-candidate:disabled { cursor: default; opacity: 0.6; }
+.wps-recovery-candidate-id {
+  flex: none;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-weight: 700;
+  color: var(--color-text-secondary);
+}
+.wps-recovery-candidate-progress { flex: 1 1 auto; min-width: 0; }
+.wps-recovery-candidate-time { flex: none; color: var(--color-text-secondary); }
+
 .composer .wps-scope-dock {
   display: contents;
 }
@@ -2249,6 +2312,8 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
   opacity: 0.6;
 }
 
+/* 表单里只有输入框：提交按钮与提示句都随 `ClarificationFields` 一起删了，
+   提交由输入框右下角那颗主按钮负责（这里再出现 button 规则 = 第二个入口）。 */
 .clarification-fields { display: grid; gap: 12px; margin-top: 14px; }
 .clarification-fields label { display: grid; gap: 6px; font-weight: 600; }
 .clarification-fields textarea {
@@ -2257,8 +2322,6 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
   corner-shape: squircle;
   color: inherit; background: transparent; font: inherit; resize: vertical;
 }
-.clarification-fields small { color: var(--muted); }
-.clarification-fields button { justify-self: start; padding: 10px 14px; }
 
 /*
  * 执行方式选择（直接执行 / 副本比对）。与 Excel 端同一套结构与措辞，
@@ -2288,3 +2351,25 @@ button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focu
 .wps-execution-mode-label { grid-area: label; font-size: 13px; font-weight: 700; }
 .wps-execution-mode-detail { grid-area: detail; font-size: 12px; line-height: 1.5; color: var(--color-text-secondary, #787774); }
 .wps-execution-mode-blocked { grid-area: detail; font-size: 12px; color: var(--color-warning, #a4262c); }
+
+/*
+ * 终态摘要（撤销确认 / 放弃 / 收尾）：恢复卡已经退出固定区域，消息里只留这一条
+ * **可展开**的记录。折叠时一行 = 结论 + 一句"结束了、去哪看"，展开后是正文与边界说明。
+ * 没有按钮、不写单元格，所以不违反"要用户点的那一下不许画在历史消息下面"。
+ */
+.wps-recovery-record.is-terminal {
+  margin-top: 8px;
+  padding: 8px 12px;
+  border-left: 3px solid var(--color-border, #e9e9e7);
+  border-radius: var(--radius-xs);
+  background: color-mix(in srgb, var(--color-surface-hover, #f4f4f2) 70%, transparent);
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-caption);
+  line-height: 1.5;
+}
+.wps-recovery-record.is-terminal > summary { cursor: pointer; }
+.wps-recovery-record.is-terminal > p { margin: 4px 0 0; }
+
+/* 跨重启没有归属消息时，固定区域退成的只读终态摘要（同样可展开，没有按钮）。 */
+.wps-write-recovery.is-terminal > summary { cursor: pointer; }
+.wps-write-recovery.is-terminal > p { margin: 4px 0 0; }

@@ -69,6 +69,10 @@ export default defineConfig(async ({ command }) => {
           planEditor: path.resolve(__dirname, "plan-editor.html")
         }
       }
+    },
+    test: {
+      // 未替身的网络出口直接让用例失败（见 `@excel-bro/core/testNetworkGate`）。
+      setupFiles: ["./src/testSetup.ts"]
     }
   };
 });

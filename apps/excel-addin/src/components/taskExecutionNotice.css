@@ -1,0 +1,15 @@
+/*
+ * 状态说明行：**不是**控件，所以没有边框、没有底色、没有圆形按钮位。
+ * 以前它是一条带边框的窄卡（`border + border-radius: 12px`），看起来像"又一块面板"，
+ * 与输入框抢视觉。现在只是一行小字，安静地贴在输入区上方。
+ */
+.task-execution-notice {
+  margin: 0 auto 6px;
+  padding: 0 4px;
+  width: 100%;
+  max-width: var(--composer-max-width, 100%);
+  color: var(--text-secondary, #52675b);
+  font-size: var(--font-size-caption, 12px);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}

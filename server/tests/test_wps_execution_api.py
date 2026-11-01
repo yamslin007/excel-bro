@@ -850,9 +850,12 @@ def _resume_payload() -> dict:
     return payload
 
 
-def test_wps_resume_context_roundtrip_is_value_free() -> None:
+@pytest.mark.parametrize("version", [1, 2])
+def test_wps_resume_context_roundtrip_is_value_free(version: int) -> None:
     client = TestClient(app)
     payload = _resume_payload()
+    if version == 2:
+        payload["descriptor"]["resumeContext"] = {"version": 2, "hostVersion": "12.0", "sources": []}
     response = client.post("/api/wps/executions/register", json=payload)
     assert response.status_code == 200, response.text
     fetched = client.get("/api/wps/executions/" + payload["operationId"]).json()

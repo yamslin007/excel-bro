@@ -171,12 +171,47 @@ stolen = True      phase after other = consumed
 | 6 | **旧桥事件迟到** | 桥按 `operationId + requestFingerprint` 判 `duplicate / conflict / late`；停止态一律 `cancelled`（**S2**）✅ | 同判据（共享 `packages/core/src/sdkToolBridge.ts`）；`WpsAgentPanel.test.tsx`「不把刷新后的在途活动当仍在运行」✅ | ⏳ 两端：真实窗格里把进度事件拖到收尾之后再让它到 |
 | 7 | **旧执行者迟到 / 被替代** | `test_resume_claim_is_compare_and_swap_and_fences_old_executor`（旧执行者 commit 被"过期执行者"拒）+ **C1**（旧 `owner_token` 开动作被拒）✅ | `wpsExecutionResume.test.ts:147`「lost claim / concurrent owner never writes」（409 owner active → 写入 `[]`）✅ | ⏳ 真实双窗格 |
 | 8 | **同时恢复 / 快速重复点击** | `excelWriteEndToEnd.test.tsx:620` 连点两次"核对并继续"：`registerOfficeExecution` 1 次、`startOfficeAction` 索引 `[0,1,2]`、续跑只写剩余 1 格 ✅；**C1/C2** 提供权威侧真并发证据 ✅ | `wpsExecutionResume.test.ts:147` + `claimWpsExecutionResume` CAS ✅；**C2** 同 | ⏳ 两端：真实双击 / 真实两个面板 |
-| 9 | **写入后回执丢失** | `excelWriteEndToEnd.test.tsx:1359`「重载后按挂接索引核对回执：只汇报，不重复执行已完成动作」（6 个写接口一个都没再调）✅、`:1354`「已完成前缀但恢复快照丢失：拒绝续写」（生成不了只含后缀的撤销点）✅ | `wpsExecutionReconcile.test.ts:75 / :109 / :158 / :172 / :200`（分类正确 + 剩余 0 只补记）+ `test_task_ledger.py:592`（in-flight 未核对不许认领；补记后 `next_action_index=1`、旧 token 失效）✅ | ⏳ 两端：真实断开（关任务窗格 / 断网）后再回执 |
-| 10 | **第二步中断后只续第三步** | `excelWriteEndToEnd.test.tsx:620`（`从第 3 步继续并完成`、`completeOfficeAction` 索引 `[0,2]`）✅ | `wpsExecutionResume.test.ts:38`「resumes only third」、`:106`（只写 `Target!A3`、`startWpsAction` 1 次）✅ | ⏳ 真实宿主 |
-| 11 | **异常退出后恢复** | `test_abrupt_child_process_exit_keeps_committed_event_for_reconciliation`（服务端）+ Excel 重开链 ✅ | `wpsExecutionResume` 的重开夹具 + `wpsRecoveryInspection.test.ts` ✅ | ⏳ 真杀进程（Excel / WPS 被任务管理器结束） |
-| 12 | **完成 / 确认 / 放弃 / 撤销后重开** | `excelWriteEndToEnd.test.tsx:620` 的 `confirm` / `discard` 两分支重开后各自的终态与写次数 ✅ | `wpsResultReviewMarkers.test.ts:143 / :488 / :515`；`wpsExecutionResume.test.ts:166`（第二次中断保留原年龄与回滚内容）；`:360`「空句柄无法找回时仍能 confirm/discard，**审阅与比较不会重执行**」✅ | ⏳ 两端：真实重开 + 真实撤销 |
+| 9 | **写入后回执丢失** | `excelWriteEndToEnd.test.tsx:1359`「重载后按挂接索引核对回执：只汇报，不重复执行已完成动作」（6 个写接口一个都没再调）✅、`:1354`「已完成前缀但恢复快照丢失：拒绝续写」（生成不了只含后缀的撤销点）✅ | `wpsExecutionReconcile.test.ts:75 / :109 / :158 / :172 / :200`（分类正确 + 剩余 0 只补记）+ `test_task_ledger.py:592`（in-flight 未核对不许认领；补记后 `next_action_index=1`、旧 token 失效）✅；**原生 2026-10-28 ✅**：`wps-execution-1fd938fd…` 第二步 `failed_after_write` 后补记，`office_host_writes` 里 `actionIndex=1` 仍只有原失败那一刻的 1 行（见 `A1_E3_NATIVE_ACCEPTANCE_2026-10-25.md` 同日条） | ⏳ Excel：真实断开（关任务窗格 / 断网）后再回执。WPS 原生还缺"补记时刻"的独立记录——账本无逐次修订历史 |
+| 10 | **第二步中断后只续第三步** | `excelWriteEndToEnd.test.tsx:620`（`从第 3 步继续并完成`、`completeOfficeAction` 索引 `[0,2]`）✅；**原生 2026-10-29 ✅（账本级）**：`execution-c52ad791…` 三步写入，`office_host_writes` 0/1 号同秒（16:03:44）、2 号在 18:37:11（相隔 2h33m27s），`next_action_index=3`、`in_flight=NULL`、`checkpoint.uncertainActionIndexes=[]`、回读 B2/B3/B4 逐格一致（`outputs/a1-acceptance-20261029-2/EVIDENCE.md`） | `wpsExecutionResume.test.ts:38`「resumes only third」、`:106`（只写 `Target!A3`、`startWpsAction` 1 次）✅；**原生 2026-10-28 ✅**：同一执行 15:49:06 只新增 `actionIndex=2` 一行（1 次变更调用 + 回读 verified），B4 检查点 `-303 → 333` 两个指纹可重算命中 | ⏳ 两端：**中断是开发探针制造的**，不是"回执丢失"（#9 仍空）；Excel 的"核对零写入"只是账本推断（核对不写 `office_host_writes`，中间没有第三个写入时刻），计数口径仍是端上自报 |
+| 11 | **异常退出后恢复** | `test_abrupt_child_process_exit_keeps_committed_event_for_reconciliation`（服务端）+ Excel 重开链 ✅ | `wpsExecutionResume` 的重开夹具 + `wpsRecoveryInspection.test.ts` ✅；**原生 2026-10-28 夜间（正常退出重开）✅**：`wps-execution-3f00ea0d…` 完整退出 WPS 后重开，恢复材料跨会话可用、补记不重写、只续第三步（`ABANDON_AFTER_RESUME_ACCEPTANCE_2026-10-28.md` §16） | ⏳ **崩溃/被杀进程**（Excel / WPS 被任务管理器结束）——正常退出版不算；两端都还没有 |
+| 12 | **完成 / 确认 / 放弃 / 撤销后重开** | `excelWriteEndToEnd.test.tsx:620` 的 `confirm` / `discard` 两分支重开后各自的终态与写次数 ✅ | `wpsResultReviewMarkers.test.ts:143 / :488 / :515`；`wpsExecutionResume.test.ts:166`（第二次中断保留原年龄与回滚内容）；`:360`「空句柄无法找回时仍能 confirm/discard，**审阅与比较不会重执行**」✅；**原生 2026-10-28 两半都有证据**：①确认后**保存并完整退出重开**，结果仍为 `111/222/333`、该执行 `status=completed` 不再出现在恢复候选（`pending_office_executions` 只取 `running/needs_reconciliation/failed`），账本侧只见证"无新写入、无新执行"（"确认"本身无服务端记录）；②**续跑后放弃**（同会话）：三个动作全部回到 `-101/-202/-303`、恢复材料目录被收走、账本 `revision` 未再推进（`ABANDON_AFTER_RESUME_ACCEPTANCE_2026-10-28.md` §10）；③**跨进程版**（同日 23:25→23:39，`wps-execution-3f00ea0d…`）：第二步中断→保存→**完整退出 WPS**→重开→核对→续跑→放弃，三个动作回 `-101/-202/-303`，保存后与原始副本**逐格 0 差异**、条件格式规则 0 条，重开不再出现恢复卡（同文档 §16）；④**收尾轮**（19:38/19:42）：放弃之后**原对话直接发只读查询**正常出结果（`turn-68fd1b…`），确认之后同样能继续（`turn-4ec317…`，但那一轮账本**没有中断记录**，只算"普通确认执行后"），同 §15 | ⏳ 两端：真实**撤销**（结果卡「撤销本次执行」）未验；「**续跑后**确认 + 随后对话」未验（跨进程的放弃版已过，见上）；「确认后重开」的单元格值仍只有截图（放弃版的磁盘值已有：逐格 0 差异） |
 
 ### 3.1 真正的缺口现在只剩"原生没跑过"
+
+> **2026-10-28 更新**：WPS 的 #9 / #10 已有原生证据（用户跑完"中断 → 补记 → 只续第三步 → 确认变更"，
+> 账本与宿主观测只读核验通过）。#12 的 WPS 两半也补上了：确认后**保存并完整退出重开**
+> 结果保持、以及**续跑后放弃**回到三个动作的执行前值（同会话，非跨进程）。
+> Excel 同类路径仍是 `⏳`（#9 / #10 / #12 都没有原生证据）。
+> 同日还修掉两个真机收尾缺陷（恢复完成后 `pendingPlan` 不收尾 ⇒ 新任务被永久挡住；
+> 撤销说明的"改动 2 / 3"把中断阶段统计说成整次执行、且把"回读失败"算成改动），
+> 见 `ABANDON_AFTER_RESUME_ACCEPTANCE_2026-10-28.md` §11。**A1-GATE 仍不通过**：
+> 真实 Excel 一端、崩溃版恢复、真实撤销都还空着。
+>
+> **2026-10-29 更新（Excel 真机一轮）**：Excel 的 #10 拿到**账本级原生证据**
+> （`execution-c52ad791…`，中断由开发探针制造）；#11 只是**窗格重开**（`EXCEL.EXE` 未退出），
+> 不算跨进程；#12 的"确认"分支只有"终态由账本支撑 + 界面口述"，**"确认"这个动作本身服务端
+> 无记录**（U4 缺口实证，本轮已实现 `abandoned_at` / `undone_at`，见
+> `docs/EXECUTION_DISPOSITION_2026-10-29.md`，**不追溯**这一轮）。
+> 同轮还确认两件不能宣称的事：**夹具从未保存**（mtime 早于执行、`汇总表 B2:B4` 仍是
+> `-101/-202/-303`），"保存落盘"一档不成立；**"本机索引丢失后由后端发现"证据不足**
+> （账本无发现记录、`discovery_dismissed_at` 仍为 `NULL`），不得因恢复卡出现了就标通过。
+> 证据分档见 `outputs/a1-acceptance-20261029-2/EVIDENCE.md`。**A1-GATE 仍不通过**：
+> 崩溃版恢复、真实撤销、S1、Excel 的"放弃"分支仍空着。
+>
+> **2026-10-28 收尾轮补充**：#12 的"收尾之后还能不能接着聊"这一问，在 WPS 上分开记两笔 ——
+> **放弃之后可以继续对话 = 真机通过**（`5a2d84be` 中断+续跑 → `turn-68fd1b…` 正常出结果）；
+> **确认之后可以继续对话 = 真机通过，但那一轮账本没有中断记录**（`7afd3dc6` 三步同一毫秒写完、
+> `revision=8`），所以只能记成"普通确认执行后"，"续跑后确认 + 随后对话"仍缺。
+> 同日另记一个**未修复**的独立待查项（明确查 `B2:B4` 却提示"结果不完整（扫描已达上限）"）。
+> 全部剩余项按"尚未实现 / 自动化已验但真机未验 / 证据待补"三分类见
+> `A1_GATE_REMAINING_2026-10-28.md`。
+>
+> **2026-10-28 夜间再补一笔**：#11 与 #12 的 WPS **跨进程（正常退出重开）**版通过
+> （`wps-execution-3f00ea0d…`：第二步中断 → 保存 → 完整退出 → 重开 → 核对 → 续跑 → 放弃；
+> 保存后与原始副本逐格 0 差异、条件格式规则 0 条；重开不再出现恢复卡）。
+> 这是第一次拿到**落盘后的**单元格证据，此前每一轮都只能靠截图。
+> 但重开首次出现「证据不足」、点一次「重新核对（只读）」才恢复，**未归因**，单列为待查项
+> （同文档 §6）。**崩溃/被杀进程**仍未验，不得用正常退出版代替。
 
 第 2 行 Excel 未保存同名簿的**读路径**已修（§2.0 与新的一节 §7）。写路径从来是安全的：
 服务端 `OfficeExecutionRegisterRequest` / `WpsExecutionRegisterRequest` 要求

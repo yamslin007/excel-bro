@@ -74,6 +74,50 @@ describe("Office action checkpoint recovery", () => {
     ).toBe("unknown");
   });
 
+  it("judges formula actions by formula text, never by the computed result", () => {
+    /*
+     * `=数据!A1*2` 与 `=2*2` 在真实 Excel 里算出同一个数，但它们是两个写入目标。
+     * 判据比的是 `range.formulas`（公式文本），所以"结果相同"永远不会被认成"已写入"。
+     */
+    const action: ExcelAction = {
+      type: "writeFormulas",
+      sheet: "Sheet1",
+      range: "A1",
+      formulas: [["=数据!A1*2"]]
+    };
+    const beforeFormula = { ...before, formulas: [["=数据!A1"]] as CellValue[][] };
+
+    expect(
+      classifyOfficeActionState(action, beforeFormula, {
+        ...baseObserved,
+        formulas: [["=数据!A1*2"]]
+      })
+    ).toBe("applied");
+    expect(
+      classifyOfficeActionState(action, beforeFormula, {
+        ...baseObserved,
+        formulas: [["=2*2"]]
+      })
+    ).toBe("unknown");
+    expect(classifyOfficeActionState(action, beforeFormula, { ...baseObserved, formulas: [["=数据!A1"]] })).toBe(
+      "not_applied"
+    );
+    // 只写了一部分（矩阵里一格对、一格不对）同样不给"已写入"。
+    const pair: ExcelAction = {
+      type: "writeFormulas",
+      sheet: "Sheet1",
+      range: "A1:A2",
+      formulas: [["=数据!A1*2"], ["=数据!A1*3"]]
+    };
+    expect(
+      classifyOfficeActionState(
+        pair,
+        { ...beforeFormula, range: "A1:A2", formulas: [["=数据!A1"], ["=数据!A1"]] },
+        { ...baseObserved, formulas: [["=数据!A1*2"], ["=数据!A1"]] }
+      )
+    ).toBe("unknown");
+  });
+
   it("limits automatic resume to independently verifiable range actions", () => {
     const supported: AnalysisPlan = {
       id: "plan-1",
@@ -111,6 +155,25 @@ describe("Office action checkpoint recovery", () => {
         ]
       }).supported
     ).toBe(false);
+    // `copyRange` 走 `copyFrom` 原生路径，不是"展开成 writeValues"的模式，
+    // 所以不在跨重启恢复白名单里 —— 这是**明确拒绝**，不是静默失败或忘了实现。
+    expect(
+      officeRecoverySupport({
+        ...supported,
+        actions: [
+          {
+            type: "copyRange",
+            sheet: "Sheet1",
+            sourceSheet: "Sheet2",
+            sourceRange: "A1",
+            targetRange: "B1",
+            copyType: "values",
+            skipBlanks: false,
+            transpose: false
+          }
+        ]
+      })
+    ).toEqual({ supported: false, reason: "第 1 步 copyRange 暂不支持跨重启自动续跑" });
   });
 
   it("judges read/write overlap by the attested source dependency, not the fingerprint scope", () => {
@@ -623,6 +686,60 @@ describe("Excel plan preflight", () => {
         message: "动作 createWorksheet 尝试写入未授权的工作表「秘密」"
       }
     ]);
+  });
+
+  it("rejects formulas that read existing sheets outside the authorization", () => {
+    /*
+     * 公式的跨表依赖藏在**文本**里：动作只声明了写入目标「结果」，`=秘密!A1*2`
+     * 却会读一张没被勾选的工作表。只看 `action.sheet` 的授权闸完全看不到它。
+     *
+     * 口径与读/写闸一致（只拒"已存在且未授权"）：计划自己新建的表此刻还不存在，
+     * 外部工作簿引用由 `assertSafeFormula` 的外部文件白名单单独把关。
+     */
+    const formulaPlan: AnalysisPlan = {
+      ...plan,
+      actions: [
+        { type: "writeFormulas", sheet: "结果", range: "B2", formulas: [["=秘密!A1*2"]] },
+        { type: "writeFormulas", sheet: "结果", range: "C2", formulas: [["=数据!A1*2"]] },
+        { type: "writeFormulas", sheet: "结果", range: "D2", formulas: [["=后续步骤!A1*2"]] },
+        { type: "writeFormulas", sheet: "结果", range: "E2", formulas: [["=INDIRECT(\"A1\")*2"]] },
+        { type: "writeFormulas", sheet: "结果", range: "F2", formulas: [["='[外部.xlsx]表1'!A1"]] }
+      ]
+    };
+
+    expect(
+      preflightPlanActions(
+        formulaPlan,
+        ["结果", "数据", "秘密"],
+        () => true,
+        {},
+        ["结果", "数据"]
+      )
+    ).toEqual([
+      { index: 0, message: "公式引用了未授权的工作表「秘密」" },
+      { index: 3, message: "公式含动态引用（INDIRECT / OFFSET），无法核对依赖的工作表" }
+    ]);
+  });
+
+  it("does not reject same-sheet relative or absolute references as cross-sheet", () => {
+    /*
+     * 正向锚点：同表引用（`=A1*2`、`=$A$1*2`、`=SUM(A1:A3)`）里没有 `!`，
+     * `formulaSheetReferences` 不该把写入目标表「结果」当成"跨表依赖"。
+     * 若哪天有人把同表引用也误判成跨表，这个用例会红（preflight 不该对
+     * 合法同表公式报"引用了未授权的工作表"）。
+     */
+    const sameSheetPlan: AnalysisPlan = {
+      ...plan,
+      actions: [
+        { type: "writeFormulas", sheet: "结果", range: "A1", formulas: [["=A2*2"]] },
+        { type: "writeFormulas", sheet: "结果", range: "A3", formulas: [["=$A$2*2"]] },
+        { type: "writeFormulas", sheet: "结果", range: "A4", formulas: [["=SUM(A1:A3)"]] }
+      ]
+    };
+
+    expect(
+      preflightPlanActions(sameSheetPlan, ["结果"], () => true, {}, ["结果"])
+    ).toEqual([]);
   });
 
   it("allows plans to create genuinely new output sheets", () => {

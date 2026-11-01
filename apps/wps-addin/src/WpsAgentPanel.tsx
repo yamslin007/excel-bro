@@ -1,13 +1,25 @@
+import { removeHistoryConversation } from "@excel-bro/core/conversationHistory";
+import { HistoryDeleteDialog, HISTORY_MENU_DESCRIPTION } from "../../excel-addin/src/components/HistoryDeleteDialog";
 import { stampLiteralPlanOrigin } from "@excel-bro/core/literalPlanOrigin";
+import {
+  PENDING_DISCOVERY_CHOOSE_DETAIL,
+  PENDING_DISCOVERY_TRUNCATED_DETAIL,
+  PENDING_DISCOVERY_UNAVAILABLE_DETAIL,
+  pendingExecutionCandidateLabel,
+  type PendingExecutionCandidate
+} from "@excel-bro/core/pendingExecutionDiscovery";
+import { currentWpsWorkbookIdentity, discoverWpsPendingExecutions } from "./wpsRecoveryDiscovery";
 import { assertWpsPlanSourceCurrent } from "./wpsPlanExecutor";
 import { RecoveryProbeControl } from "@excel-bro/core/RecoveryProbeControl";
-import { bindRecoveryProbe, interruptRecoveryProbe } from "@excel-bro/core/recoveryProbe";
+import { bindRecoveryProbe, interruptRecoveryProbe, settleRecoveryProbe } from "@excel-bro/core/recoveryProbe";
 import { ResultRefFaultControl } from "@excel-bro/core/ResultRefFaultControl";
 import { resultRefFaultVisible } from "@excel-bro/core/resultRefFault";
 import { wpsResultRefFaultTarget } from "./wpsResultRefFaultTarget";
 import { canResumeWpsExecution, resumeWpsExecution, wpsResumeUnavailableReason } from "./wpsExecutionResume";
 import { prepareWpsResume, prepareWpsCompletedReview } from "./wpsPlanExecutor";
-import { TaskExecutionControls } from "../../excel-addin/src/components/TaskExecutionControls";
+import { ensureWpsRecoveryMaterial, persistWpsRecoveryPackage, retireWpsRecoveryPackage } from "./wpsRecoveryPackage";
+import { TaskExecutionNotice } from "../../excel-addin/src/components/TaskExecutionNotice";
+import { ComposerPrimaryButton } from "../../excel-addin/src/components/ComposerPrimaryButton";
 import { acceptsPlanningReplay, planningReceivedSequence, waitForPlanning } from "@excel-bro/core/planningReplay";
 import {
   PAUSE_UNAVAILABLE_REASON,
@@ -25,8 +37,10 @@ import {
 import {
   armResultRefFault,
   cancelResultRefFault,
+  dismissWpsExecutionDiscovery,
   getResultRefFaultStatus,
-  pausePlanningTask
+  pausePlanningTask,
+  recordExecutionDisposition as sendExecutionDisposition
 } from "../../excel-addin/src/api";
 import checkpointCapabilities from "../../../config/capabilities.json";
 import { planningRecoveryCandidates, isOfferedPlanningRecovery } from "@excel-bro/core/planningRecoveryRouting";
@@ -49,8 +63,8 @@ import {
 import { isFormatActionType } from "./wpsPlanExecutor";
 import { agentModelAvailable, agentModelUnavailableReason } from "../../excel-addin/src/modelSelection";
 import { Fragment, type ReactNode, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
-import { ResultReview } from '@excel-bro/core/resultReview';
-import { ResultReviewBar } from '../../excel-addin/src/components/ResultReviewBar';
+import { ResultReview, ReviewNotStartedError } from '@excel-bro/core/resultReview';
+import { ResultReviewBar, resultReviewNeedsDecision, resultReviewVisible } from '../../excel-addin/src/components/ResultReviewBar';
 import { ControlledScriptEditor } from '../../excel-addin/src/components/ControlledScriptEditor';
 import { markWpsResult, clearWpsResultMarks, recoverWpsResultMarks, type WpsResultMarks } from './wpsResultReviewMarkers';
 import {
@@ -67,6 +81,7 @@ import { createAgentTaskContext, confirmAgentTaskDecision, type AgentTaskContext
 import { workDirectorySendRefusal } from "@excel-bro/core/folderScope";
 import {
   newTaskId,
+  planSettlesExecution,
   PLAN_NOTE_SECTIONS,
   redactCredentials,
   sanitizeTaskResumeRecord,
@@ -104,7 +119,6 @@ import {
 } from "../../excel-addin/src/api";
 import type { HostWriteAudit } from "@excel-bro/core/hostWriteAudit";
 import { assertEditablePlan, type AnalysisPlan, type ClarificationField, type IntentOption, type ResultContext } from "../../excel-addin/src/contracts";
-import { ClarificationFields } from "../../excel-addin/src/components/ClarificationFields";
 import { useTheme } from "../../excel-addin/src/hooks/useTheme";
 import { useLongPress } from "../../excel-addin/src/hooks/useLongPress";
 import { useModelManagement } from "../../excel-addin/src/hooks/useModelManagement";
@@ -131,6 +145,20 @@ import {
 } from "../../excel-addin/src/storage";
 import { executeQueryTableData } from "../../excel-addin/src/dataTools";
 import TaskProgressTimeline from "../../excel-addin/src/components/TaskProgressTimeline";
+import { ProcessResultSummary } from "../../excel-addin/src/components/ProcessResultSummary";
+import { ComposerActionDock } from "../../excel-addin/src/components/ComposerActionDock";
+import { processOutcomePhaseFrom } from "@excel-bro/core/processOutcome";
+import { isCompactMessageProcess } from "@excel-bro/core/processPanel";
+import {
+  selectCurrentAction,
+  type CurrentActionKind
+} from "@excel-bro/core/currentActionCard";
+import {
+  composerPrimaryAction,
+  type PrimaryActionInvoke
+} from "@excel-bro/core/composerPrimaryAction";
+import { clarificationSubmission } from "@excel-bro/core/clarificationComposer";
+import { ClarificationComposer } from "../../excel-addin/src/components/ClarificationComposer";
 import { SaveToolDialog } from "../../excel-addin/src/components/SaveToolDialog";
 import MessageCopyButton from "../../excel-addin/src/components/MessageCopyButton";
 import { ExecutionResultCard, ExecutionResultDetails } from "../../excel-addin/src/components/ExecutionResultCard";
@@ -259,15 +287,12 @@ import {
 import {
   compareCommittedWpsResultToCopy,
   discardWpsNativeComparison,
-  stageWpsNativeComparison,
   stageWpsBeforeComparison,
   captureWpsBeforeResult,
   type WpsBeforeResult,
   verifyWpsNativeComparison,
-  WpsFormulaTrialError,
   type WpsNativeComparison
 } from "./wpsNativeComparison";
-import { fixedValueFallbackFromFormula } from "./wpsColumnMappingPlan";
 import { describeWpsFormatAction } from "./wpsFormatCapability";
 import {
   advanceWpsActivity,
@@ -305,15 +330,33 @@ import {
   wpsIdentityVerdict,
   wpsReconcileVerdict,
   wpsReconcileActions,
-  WPS_RECONCILE_LABEL,
   WPS_RECOVERY_ACTION_LABEL,
   WPS_RECOVERY_DETAIL,
   type WpsIdentityVerdict,
   type WpsReconcileAction,
   type WpsReconcileVerdict
 } from "./wpsExecutionReconcile";
+// 标题、badge 与固定说明住在共享层：Excel 端读同一份，措辞不会各写一套。
+import {
+  EXECUTION_RECOVERY_TITLE,
+  executionRecoveryBadge,
+  executionRecoveryNote,
+  executionRecoveryProgress,
+  executionRecoveryTerminalReason,
+  executionRecoveryTerminalSummary
+} from "@excel-bro/core/executionRecoveryView";
+import {
+  recordExecutionDisposition,
+  type ExecutionDisposition
+} from "@excel-bro/core/executionDisposition";
 import type { WpsExecutionState } from "../../excel-addin/src/contracts";
-import { inspectWpsRecoveryState } from "./wpsRecoveryInspection";
+import { inspectWpsRecoveryState, inspectWpsRecoveryStateDetail } from "./wpsRecoveryInspection";
+import {
+  recordWpsRecoveryDiagnostic,
+  safeDiagnosticErrorName,
+  wpsRecoveryDiagnosticReport,
+  type WpsRecoveryDiagnosticStage
+} from "./wpsRecoveryDiagnostics";
 import { useImageAttachments } from "../../excel-addin/src/hooks/useImageAttachments";
 import type { PendingImage } from "../../excel-addin/src/imageAttachments";
 import {
@@ -518,6 +561,7 @@ type WpsChatHistory = {
 };
 
 type PendingClarification = {
+  messageOnly?: boolean;
   messageId: string;
   originalPrompt: string;
   round: number;
@@ -615,6 +659,27 @@ const WPS_PLANNING_PAUSE_LABEL: Record<
   model_error: "模型连接中断，进度已保存",
   interrupted: "规划被中断，进度已保存"
 };
+
+/**
+ * 候选行里的执行身份短号。
+ *
+ * 只截断显示，**不**参与任何归属判断：真正绑定永远是完整 `operationId`。截断是为了让
+ * 用户能区分"两条不同的未完成执行"，不是让人按短号去核对。
+ */
+function shortWpsOperationId(operationId: string): string {
+  const marker = operationId.lastIndexOf("-");
+  const tail = marker >= 0 ? operationId.slice(marker + 1) : operationId;
+  return tail.length >= 8 ? `…${tail.slice(-8)}` : operationId;
+}
+
+/** 候选行的账本时间（本地时区、固定格式，便于两条并排比较先后）。 */
+function pendingCandidateTimeLabel(epochMs: number): string {
+  const moment = new Date(epochMs);
+  if (Number.isNaN(moment.getTime())) return "时间不可读";
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${moment.getFullYear()}-${pad(moment.getMonth() + 1)}-${pad(moment.getDate())} ` +
+    `${pad(moment.getHours())}:${pad(moment.getMinutes())}`;
+}
 
 function messageId(): string {
   return `wps-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -1194,10 +1259,10 @@ function serializeHistoryForStorage(history: WpsChatHistory): string {
     ) as string[],
     conversations: [...history.conversations]
       .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
-      .slice(0, 30)
+      .slice(0, checkpointCapabilities.conversation.wps.maxStoredConversations)
       .map((conversation) => ({
         ...conversation,
-        messages: conversation.messages.slice(-120)
+        messages: conversation.messages.slice(-checkpointCapabilities.conversation.wps.persistedMessagesPerConversation)
       }))
   };
   return JSON.stringify(redactHistoryCredentials(compact as never));
@@ -1403,6 +1468,16 @@ export default function WpsAgentPanel({
   const [progress, setProgress] = useState<WpsReadonlyTurnProgress | null>(null);
   const [activeActivityMessageId, setActiveActivityMessageId] = useState<string | null>(null);
   const [writeProgress, setWriteProgress] = useState<string | null>(null);
+  /**
+   * 宿主正在做**不可中断**的事（写前快照 / 写入 / 回读 / 撤销）。
+   *
+   * 取值来自执行器自己的阶段（`executeWpsPlan` 的 `update.stage`）与撤销链路，
+   * **不是**从"界面上有没有那行进度文字"反推：那行文字是呈现，文案一改、或某条分支
+   * 忘了设置，按钮就会悄悄变得"可以暂停"。暂停判据只认这个值。
+   */
+  const [hostStage, setHostStage] = useState<
+    "snapshot" | "writing" | "verifying" | "undoing" | null
+  >(null);
   const [pendingPlan, setPendingPlan] = useState<WpsPreparedPlan | null>(null);
   type ResultReceipt = { executionId: string; verified: boolean; undoable: boolean; record: WpsUndoRecord };
   const [resultReview] = useState(() => new ResultReview<WpsBeforeResult, ResultReceipt, WpsResultMarks, WpsNativeComparison>());
@@ -1421,6 +1496,15 @@ export default function WpsAgentPanel({
   }, []);
   const resultReviewState = useSyncExternalStore(resultReview.subscribe, resultReview.getSnapshot, resultReview.getSnapshot);
   const [resultTitle, setResultTitle] = useState('');
+  /**
+   * 「结果摘要」要按阶段说"下一步点哪"。
+   *
+   * `resultReviewState` 描述的是**当前**那次审阅 = 最近一条带执行的回复；
+   * 历史消息拿它去说自己"正在待审阅"就是假的。所以只喂给最后一条，
+   * 其余消息按撤销/恢复结论自行判定（`processOutcomePhaseFrom`）。
+   */
+  const lastExecutionMessageId = [...messages].reverse().find((message) =>
+    Boolean(message.changeReviewExecutionId || message.verification))?.id ?? null;
   /*
    * 终态**写回对话**：固定操作条在确认/放弃成功后收起，业务状态不能跟着消失。
    * 这里只补一条状态行（去重），保存工具与撤销入口仍由结果卡承载。
@@ -1477,6 +1561,25 @@ export default function WpsAgentPanel({
   // 首次生成副本时调整窗格；消息更新不会主动重新排列。
   const reviewPaneNeedsResize = useWpsReviewPaneRatio(stagedReview);
   const [pendingPlanMessageId, setPendingPlanMessageId] = useState<string | null>(null);
+  /**
+   * 这份待执行计划**属于哪一次执行**。
+   *
+   * `pendingPlan` 是"待执行"的现场；执行一开始它就绑定了账本里的执行身份
+   * （`operationId`）。写失败时它被刻意留着（用户还要靠它看计划），于是恢复动作
+   * 把这次执行推到终态之后，必须收尾**它自己那张**计划卡 —— 否则 `pendingPlan`
+   * 会一直非空，新任务永远被"请先确认或取消当前写入计划"挡住，用户只能靠
+   * 「＋ → 放弃计划并新建」绕行。
+   *
+   * 归属同时记**计划对象引用**与 `operationId`，收尾时两者都要对上：
+   * 重新规划会换一个新的计划对象，按"当前 pendingPlan"收尾就会清掉别人的计划。
+   * 用 ref 而不是 state：收尾发生在异步回调里，读渲染闭包只会拿到点击那一刻的旧值。
+   */
+  const pendingPlanExecutionRef = useRef<{
+    plan: WpsPreparedPlan;
+    messageId: string | null;
+    operationId: string;
+    revised: boolean;
+  } | null>(null);
   const [planEditDraft, setPlanEditDraft] = useState<string | null>(null);
   const [planEditError, setPlanEditError] = useState<string | null>(null);
   useEffect(() => {
@@ -1514,7 +1617,58 @@ export default function WpsAgentPanel({
     checking: boolean;
     /** 正在提交补记/核对/重新预览。防止连点造成重复回执。 */
     acting: boolean;
+    /**
+     * 这张卡是谁摆出来的：`selected` = 用户点选的候选，`auto` = 自动发现/刷新得到的。
+     *
+     * 用户点选过之后，自动发现不许把它改判（详见 `discoverWpsRecovery`）—— 否则用户
+     * 选的是一场执行，"需重新规划/需人工核对"的却是另一场。
+     */
+    source: "selected" | "auto";
   } | null>(null);
+  /**
+   * 同一工作簿有**多条**未完成执行时的候选列表。
+   *
+   * 与 `wpsRecovery` 互斥：有候选就没有已选定的那一条。这里刻意不自动挑最新的一条 ——
+   * 替用户选一次就等于替用户决定"哪次写入可以不管"。
+   */
+  const [wpsRecoveryChoices, setWpsRecoveryChoices] = useState<{
+    candidates: PendingExecutionCandidate[];
+    truncated: boolean;
+  } | null>(null);
+  /**
+   * 发现失败的原因（服务不可达 / 身份被拒 / 响应不合规）。
+   *
+   * **不是**"没有未完成任务"：这两种结论的后果完全不同，界面必须分开说。所以这里存的是
+   * 一句"暂时读不到"，而不是把卡片直接清空。
+   */
+  const [wpsDiscoveryFailure, setWpsDiscoveryFailure] = useState<string | null>(null);
+  /**
+   * 当前活动工作簿身份（`wps-path:` 字符串，未保存/不可读时为 `null`）。
+   *
+   * 它是发现 effect 的依赖：工作簿一换（或元数据晚到），这个值变了，发现就重跑一次。
+   * 读取入口与登记/状态核对**同一个函数**，不另拼一份"差不多的身份"。
+   */
+  const [workbookIdentityKey, setWorkbookIdentityKey] = useState<string | null>(() =>
+    currentWpsWorkbookIdentity(getWpsApplication())
+  );
+  /** 代数闸：身份/范围变化后，旧查询的迟到响应不得覆盖新现场。 */
+  const discoveryGenerationRef = useRef(0);
+  /**
+   * 最近一次渲染出来的恢复卡（只用于异步流程里"现在摆着的是哪一条"的判断）。
+   *
+   * 发现流程跨多个 `await`，那时闭包里的 `wpsRecovery` 已经过期；拿它判断"是否已经是同一条"
+   * 会得出错误结论（重复查询，或把刚摆好的卡当成没有）。
+   */
+  const wpsRecoveryRef = useRef<{
+    operationId: string;
+    /** 与 `wpsRecovery.taskId` 同一个值；重新核验要按它判断"还是不是同一条"。 */
+    taskId: string;
+    source: "selected" | "auto";
+    state: WpsExecutionState | null;
+  } | null>(null);
+  wpsRecoveryRef.current = wpsRecovery;
+  /** 只读发现/选定去重闸：与"执行动作锁"分开 —— 读不该被写锁挡，写也不该被读放开。 */
+  const discoveryBusyRef = useRef(false);
   // 双栏的完整前后矩阵只活在这里（按 executionId 索引的会话内内存）。
   const recoveryActionLock = useRef(false);
   const [recoveryScopeConfirmed, setRecoveryScopeConfirmed] = useState(false);
@@ -1526,7 +1680,16 @@ export default function WpsAgentPanel({
   // 留下的是 changeReviewSummary 形态：只有定位与计数，没有任何单元格内容。
   const changeReviewSummariesRef = useRef(new Map<string, ChangeReviewSummary[]>());
   const [clarification, setClarification] = useState<PendingClarification | null>(null);
-  const [clarificationDraft, setClarificationDraft] = useState("");
+  /*
+   * 澄清回答的新形态：**点选项只选中，发送才提交**。
+   *
+   * 选中状态按「哪道题 + 第几个选项」记，而不是只记序号：换题、换对话、重开面板
+   * 之后 `messageId` 变了，这份选中就自动作废 —— 不需要一个容易漏掉的 effect 去清。
+   * 自由输入就是输入框本身（不再开第二个光标）。
+   */
+  const [clarificationChoice, setClarificationChoice] =
+    useState<{ messageId: string; index: number } | null>(null);
+  /** 当前题目的字段草稿。 */
   const [clarificationFieldDrafts, setClarificationFieldDrafts] = useState<Record<string, string>>({});
   /**
    * 当前活跃的规划暂停（CAP-02）。
@@ -1759,6 +1922,7 @@ export default function WpsAgentPanel({
   const [toolsOpen, setToolsOpen] = useState(false);
   const [backupOpen, setBackupOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [pendingDeleteConversationId, setPendingDeleteConversationId] = useState<string | null>(null);
   const [moreMenuOpen, setMoreMenuOpen] = useState(false);
   // 开发期能力探针只活在当前面板内存，不进入聊天历史或本地存储。
   const [wideViewProbe, setWideViewProbe] = useState<WideViewDialogProbe | null>(null);
@@ -2395,75 +2559,391 @@ export default function WpsAgentPanel({
     }
   }, []);
 
-  useEffect(() => {
+  /**
+   * 本机恢复材料是否可用于这次执行。返回 `null` = 可用/无需材料；否则是给用户的原因。
+   *
+   * 读取顺序在 `ensureWpsRecoveryMaterial` 里：宿主缓存优先，缺失时从本机数据目录的
+   * 恢复包水合。这里只负责把"不可用"的原因原样带到判定里 —— 不能因为读不到材料
+   * 就悄悄把结论降级成"可以继续"。
+   *
+   * `none` 必须与"宿主缓存里没有这条记录"分开说：前者是**这次执行根本没有恢复材料**
+   * （宿主缓存与持久恢复包都读不到），后者只是缓存没了、持久包还在。两种情况都还叫
+   * "找不到原执行的本机恢复记录"会把一个材料齐全的任务说成材料丢了。
+   */
+  const recoveryMaterialReason = async (state: WpsExecutionState | null): Promise<string | null> => {
+    if (!state) return null;
+    try {
+      const material = await ensureWpsRecoveryMaterial(getWpsApplication(), state);
+      if (material.kind === "unavailable") return material.detail;
+      if (material.kind === "none") {
+        return "本机没有这次执行的恢复材料（宿主缓存与持久恢复包都读不到），不能精确续跑。";
+      }
+      return null;
+    } catch (error) {
+      return error instanceof Error ? error.message : "本机恢复材料不可用。";
+    }
+  };
+
+  /**
+   * 恢复结论的**唯一**计算点：身份、当前现场、本机恢复材料一起判。
+   *
+   * 挂载、刷新、点击前复核三处必须同源。以前点击前那次另算一套（不看材料），于是
+   * 「显示需要重新规划 → 点下去按"可以继续"复核 → 判定不含该动作 → 直接返回」，
+   * 用户看到的是按钮点了没反应、界面还停在原地（2026-10-27 真机：持久包过期时如此）。
+   * 材料结果因此只在这里取一次，`resumeAvailable` 与 `resumeUnavailableReason` 同出
+   * 一次判断 —— 这两者一旦分开写，就会各自代表一种"期限"。
+   */
+  const wpsRecoveryVerdictFor = async (
+    state: WpsExecutionState | null,
+    stage: WpsRecoveryDiagnosticStage
+  ): Promise<{ identity: WpsIdentityVerdict; verdict: WpsReconcileVerdict }> => {
+    const indexes = resolveSelectedSheetIndexes?.() ?? selectedSheetIndexes;
+    const currentIdentity = (() => {
+      try {
+        return wpsWorkbookIdentity(wpsReadWorkbook(getWpsApplication())?.FullName);
+      } catch {
+        return null;
+      }
+    })();
+    const identity = wpsIdentityVerdict({
+      currentIdentity,
+      recordedIdentity: state?.workbookIdentity ?? ""
+    });
     /*
-     * CAP-03 重载恢复：从本地发现索引找回上次未完成的 WPS 写入，查服务端账本
-     * 真实状态，并对身份与现场做核对。索引里只有 operationId / 身份 / taskId，
-     * 完整计划、授权与写前/写后指纹都在服务端账本 —— 本地记录不是权威。
+     * 现场核对的结果带**原因码**（`inspectWpsRecoveryStateDetail`）。结论本身仍是
+     * 那四个字符串，判定照旧；原因码只写进 DEV 诊断，用来区分"读不到现场"到底是
+     * 授权没解析、身份读不出、还是宿主把值返回成 undefined。
+     *
+     * 这一层的 `catch` 不再静默：以前它把异常吞成 `"unknown"`，真机上就只剩
+     * 「证据不足」四个字。现在只多记一个 `panel_threw`（连同异常 `name`），
+     * 结论、按钮集合、授权边界全部不变。
      */
-    if (scopeSource !== "workbook" || recoveryActionLock.current) return;
-    let active = true;
-    const pending = loadPendingWpsExecution();
-    if (!pending) return;
+    const inspection = (() => {
+      try {
+        return state
+          ? inspectWpsRecoveryStateDetail(getWpsApplication(), state, indexes)
+          : {
+              outcome: "unknown" as const,
+              code: "state_missing" as const,
+              phase: "authorize" as const,
+              selectedSheetCount: indexes.length,
+              authorizedSheetCount: 0
+            };
+      } catch (error) {
+        return {
+          outcome: "unknown" as const,
+          code: "panel_threw" as const,
+          phase: "authorize" as const,
+          selectedSheetCount: indexes.length,
+          authorizedSheetCount: 0,
+          ...(safeDiagnosticErrorName(error) ? { errorName: safeDiagnosticErrorName(error)! } : {})
+        };
+      }
+    })();
+    const materialReason = await recoveryMaterialReason(state);
+    const verdict = wpsReconcileVerdict({
+      state,
+      identityMatch: identity.kind === "match",
+      localInspection: inspection.outcome,
+      resumeUnavailableReason: materialReason ??
+        wpsResumeUnavailableReason(getWpsApplication(), state, indexes),
+      resumeAvailable: materialReason ? false :
+        canResumeWpsExecution(getWpsApplication(), state, indexes)
+    });
+    /*
+     * 诊断记录**只在这一个点**写：挂载发现、点选候选、只读重试、已选卡重算、点击动作前复核
+     * 五条路都从这里出结论，`stage` 是唯一的区别。字段全是标量（原因码/阶段/计数/ID 尾部），
+     * 非 DEV 直接丢弃。它不参与上面的任何判断 —— 记不下来也照样出结论。
+     */
+    recordWpsRecoveryDiagnostic({
+      stage,
+      verdict: verdict.kind,
+      outcome: inspection.outcome,
+      ...(inspection.code ? { code: inspection.code } : {}),
+      ...(inspection.phase ? { phase: inspection.phase } : {}),
+      operationIdTail: tailOf(state?.operationId ?? null),
+      taskIdTail: tailOf(state?.taskId ?? null),
+      ...(state && Number.isFinite(state.revision) ? { revision: state.revision } : {}),
+      ...(state && Number.isFinite(state.nextActionIndex) ? { nextActionIndex: state.nextActionIndex } : {}),
+      ...(state && Number.isFinite(state.totalActions) ? { totalActions: state.totalActions } : {}),
+      ...(state && state.inFlightActionIndex != null ? { inFlightActionIndex: state.inFlightActionIndex } : {}),
+      ...(inspection.selectedSheetCount != null ? { selectedSheetCount: inspection.selectedSheetCount } : {}),
+      ...(inspection.authorizedSheetCount != null ? { authorizedSheetCount: inspection.authorizedSheetCount } : {}),
+      ...(inspection.actionIndex != null ? { actionIndex: inspection.actionIndex } : {}),
+      ...(inspection.errorName ? { errorName: inspection.errorName } : {})
+    });
+    return { identity, verdict };
+  };
+
+  /**
+   * 采纳一条未完成执行：查服务端真实状态，再按**同一份**判定（身份 + 现场 + 材料）出结论。
+   *
+   * `isCurrent` 是代数闸：身份/范围已经变化时，这次查询的结论一律作废 —— 否则"切到另一个
+   * 工作簿"之后迟到的旧响应会把上一个簿的恢复卡画到当前簿上。
+   *
+   * `source` 记录这张卡是**用户点出来的**还是自动发现给的。它不是装饰：
+   * - `selected`：用户已经做过选择，后续自动发现（授权元数据晚到、身份观察、焦点切换）
+   *   不许把它改判或换成候选列表 —— 那等于把用户的选择丢掉；
+   * - `auto`：自动发现摆出来的卡，命中缓存或更权威的结论时可以替换。
+   *
+   * 返回值让调用方区分三种结果，**不**把"读不到"折成"没有"：`adopted` 带判定种类，
+   * `unavailable` 是状态读不出来，`abandoned` 是这次查询已作废。
+   */
+  const adoptWpsRecoveryCandidate = async (
+    candidate: { operationId: string; taskId: string },
+    isCurrent: () => boolean,
+    source: "selected" | "auto"
+  ): Promise<
+    | { kind: "adopted"; verdictKind: WpsReconcileVerdict["kind"] }
+    | { kind: "unavailable" }
+    | { kind: "abandoned" }
+  > => {
     setWpsRecovery({
-      operationId: pending.operationId,
-      taskId: pending.taskId,
+      operationId: candidate.operationId,
+      taskId: candidate.taskId,
       state: null,
       identity: { kind: "match" },
       verdict: { kind: "insufficient", detail: "正在查询服务端写入现场…" },
       checking: true,
-      acting: false
+      acting: false,
+      source
     });
-    void (async () => {
-      let state: WpsExecutionState | null = null;
-      try {
-        state = await getWpsExecutionStatus(pending.operationId);
-      } catch {
-        state = null;
+    setWpsRecoveryChoices(null);
+    let state: WpsExecutionState | null = null;
+    try {
+      state = await getWpsExecutionStatus(candidate.operationId);
+    } catch {
+      state = null;
+    }
+    if (!isCurrent()) return { kind: "abandoned" };
+    if (!state) {
+      // 发现说"有"、状态却读不出：不许退化成"没有未完成任务"。
+      setWpsRecovery(null);
+      setWpsDiscoveryFailure(PENDING_DISCOVERY_UNAVAILABLE_DETAIL);
+      return { kind: "unavailable" };
+    }
+    // 「首次发现」与「点选候选」在这里分开记：两者结论往往不同，混成一个 stage 就没法对照。
+    const { identity, verdict } = await wpsRecoveryVerdictFor(state, source === "selected" ? "select" : "discovery");
+    if (!isCurrent()) return { kind: "abandoned" };
+    setWpsRecovery({
+      operationId: candidate.operationId,
+      taskId: candidate.taskId,
+      state,
+      identity,
+      verdict,
+      checking: false,
+      acting: false,
+      source
+    });
+    setWpsDiscoveryFailure(null);
+    return { kind: "adopted", verdictKind: verdict.kind };
+  };
+
+  /**
+   * 对**用户已选定的那一条**执行重新核验（只读）。
+   *
+   * 2026-10-28 真机：授权从三张表收回两张后，`discoverWpsRecovery` 里的 `selected`
+   * 保护直接 `return`，卡面永远停在按旧授权算出的"需重新规划"。保护的本意是
+   * "不许被别的候选改判"，不是"不许对同一条重算结论" —— 于是刷新在这条路径上等于没刷新。
+   *
+   * 三条边界：
+   * - **同一条**：operationId/taskId 取自当前卡，绝不换成浏览器缓存或后端发现的别的候选；
+   * - **只读**：只 `GET` 状态 + 本机判定（`wpsRecoveryVerdictFor` 里的现场/材料读取都是只读），
+   *   不认领、不补记、不推进 revision、不执行动作、不写单元格；
+   * - **不改判据**：结论仍由 `wpsRecoveryVerdictFor` 算（与首次摆卡、点击前复核对源），
+   *   这里不新增任何"宽松版本"。
+   *
+   * 失败与竞态：
+   * - 状态读不到时**保留卡片**，只把"暂时读不到"挂出去 —— 清卡等于把用户的入口弄丢；
+   * - 核对/续跑已经开始（`recoveryActionLock`）就整轮作罢，由那次操作自己刷新结论；
+   * - 代数变了、或卡已经换成另一条，就不写回 —— 迟到响应不许覆盖新现场。
+   */
+  const reverifySelectedWpsRecovery = async (isCurrent: () => boolean): Promise<void> => {
+    const current = wpsRecoveryRef.current;
+    if (!current || current.source !== "selected") return;
+    if (recoveryActionLock.current) return;
+    const operationId = current.operationId;
+    const taskId = current.taskId;
+    let latest: WpsExecutionState | null = null;
+    try {
+      latest = await getWpsExecutionStatus(operationId);
+    } catch {
+      latest = null;
+    }
+    if (!isCurrent()) return;
+    if (!latest) {
+      setWpsDiscoveryFailure(PENDING_DISCOVERY_UNAVAILABLE_DETAIL);
+      return;
+    }
+    const { identity: nextIdentity, verdict } = await wpsRecoveryVerdictFor(latest, "reverify");
+    if (!isCurrent()) return;
+    // 读结论期间用户可能已经点了核对/续跑，或者卡被换成另一条：两种情况都不写回。
+    if (recoveryActionLock.current) return;
+    setWpsRecovery((previous) =>
+      previous && previous.operationId === operationId && previous.taskId === taskId
+        ? { ...previous, state: latest, identity: nextIdentity, verdict, checking: false }
+        : previous
+    );
+    setWpsDiscoveryFailure(null);
+  };
+
+  /**
+   * CAP-03 重新发现未完成执行。
+   *
+   * 顺序是**缓存优先、后端兜底**：
+   *
+   * 1. 本地索引还在（**且身份对得上**）就先查它 —— 那只是同一件事的快捷方式，不是权威；
+   * 2. 索引不在、或它指向的记录读不到 / 已完成 / **根本没法续跑**，就走**后端发现**（按
+   *    当前工作簿稳定身份精确查找）。完整退出 WPS 后浏览器索引消失，走的正是这一步；
+   * 3. 多条候选只给选择入口，一条也不自动选；服务不可达就说"暂时读不到"。
+   *
+   * 全程只读：不 claim、不补记、不推进 revision、不写单元格。
+   */
+  const discoverWpsRecovery = async (identity: string | null, isCurrent: () => boolean): Promise<void> => {
+    if (scopeSource !== "workbook" || recoveryActionLock.current) return;
+    /*
+     * 用户已经点选过一条：那张卡就是用户的决定，自动发现只能"补"，不能改判或退回候选列表。
+     *
+     * 真机（2026-10-28）：点选之后授权元数据/身份观察又跑了一次发现，缓存里那条无材料的旧
+     * 记录把卡换成了"需重新规划"—— 用户选的是在处理的那次，界面给的却是另一次的结论。
+     *
+     * 但"不许换掉这一条"不等于"不许重新算这一条"：授权范围、授权模式或身份变化后，必须对
+     * **同一条**重新读状态、复用同一份判定（`reverifySelectedWpsRecovery`）。否则卡面停在
+     * 按旧范围算出的结论上 —— 用户已经改正了授权，界面却还在说上次的阻断理由。
+     *
+     * 边界：身份**读不出来**（`null`）时既不拦也不重算（读不到 ≠ 换簿，也没有可比的现场）；
+     * 身份读得出来且明显是另一个工作簿时才继续往下走（那时卡本身已经过期）。
+     */
+    const current = wpsRecoveryRef.current;
+    if (current?.source === "selected" && identity !== null) {
+      const recordedIdentity = current.state?.workbookIdentity ?? null;
+      if (recordedIdentity === null || recordedIdentity === identity) {
+        await reverifySelectedWpsRecovery(isCurrent);
+        return;
       }
-      if (!active || loadPendingWpsExecution()?.operationId !== pending.operationId) return;
-      const currentIdentity = (() => {
-        try {
-          return wpsWorkbookIdentity(wpsReadWorkbook(getWpsApplication())?.FullName);
-        } catch {
-          return null;
-        }
-      })();
-      const identity = wpsIdentityVerdict({
-        currentIdentity,
-        recordedIdentity: state?.workbookIdentity ?? ""
-      });
-      const localInspection = (() => {
-        try {
-          return state ? inspectWpsRecoveryState(getWpsApplication(), state,
-            resolveSelectedSheetIndexes?.() ?? selectedSheetIndexes) : "unknown" as const;
-        } catch {
-          return "unknown" as const;
-        }
-      })();
-      const verdict = wpsReconcileVerdict({
-        state,
-        identityMatch: identity.kind === "match",
-        localInspection,
-        resumeUnavailableReason: wpsResumeUnavailableReason(getWpsApplication(), state, resolveSelectedSheetIndexes?.() ?? selectedSheetIndexes),
-        resumeAvailable: canResumeWpsExecution(getWpsApplication(), state, resolveSelectedSheetIndexes?.() ?? selectedSheetIndexes)
-      });
-      setWpsRecovery({
-        operationId: pending.operationId,
-        taskId: pending.taskId,
-        state,
-        identity,
-        verdict,
-        checking: false,
-        acting: false
-      });
-    })();
-    return () => {
-      active = false;
+    } else if (current?.source === "selected") {
+      return;
+    }
+    const pending = loadPendingWpsExecution();
+    /**
+     * 缓存路径是否已经摆出一张**还能做事**的卡。
+     *
+     * 只有"可核对 / 可续跑"算能做事。`completed` 是终态；**`replan` 更不算** ——
+     * "这条记录没法继续"不等于"这个工作簿没有在途执行"。把 `replan` 当成能做事，一条
+     * 材料早已不存在的旧键就会把后端发现挡在门外，用户于是永远看不到真正待核对的执行
+     * （2026-10-28 真机：面板列出三条候选、选中在途那条，卡面却仍是旧记录的"还有 1 个动作没写"）。
+     */
+    let actionable = false;
+    if (pending && identity !== null && pending.workbookIdentity === identity) {
+      const adopted = await adoptWpsRecoveryCandidate(
+        { operationId: pending.operationId, taskId: pending.taskId },
+        isCurrent,
+        "auto"
+      );
+      if (adopted.kind === "abandoned") return;
+      actionable = adopted.kind === "adopted" &&
+        (adopted.verdictKind === "reconcile" || adopted.verdictKind === "resume");
+      if (actionable) return;
+    }
+    if (identity === null) {
+      /*
+       * 身份不可读（未保存 / 宿主还没就绪）：**不**用文件名猜，也**不**采纳浏览器索引 ——
+       * 那条索引只说明"某个时候在这里写过"，不说明它属于当前这个工作簿。同名异路径的
+       * 两个簿正是这样互相串台的。已经摆出来的卡不动（读不到 ≠ 换簿）。
+       */
+      if (!pending) {
+        setWpsRecovery(null);
+        setWpsRecoveryChoices(null);
+        setWpsDiscoveryFailure(null);
+      }
+      return;
+    }
+    const outcome = await discoverWpsPendingExecutions(getWpsApplication());
+    if (!isCurrent()) return;
+    if (outcome.kind === "no_identity") return;
+    const keepCurrentCard = () => {
+      // 后端这条路没给出更好答案时，已经摆出来的卡**不许**被顺手清掉。
+      if (pending) return;
+      setWpsRecovery(null);
+      setWpsRecoveryChoices(null);
     };
-    // Scope changes only repeat GET + local inspection, never claim/reconcile/write.
+    if (outcome.kind === "unavailable") {
+      keepCurrentCard();
+      setWpsDiscoveryFailure(outcome.reason ? `${outcome.detail}（${outcome.reason}）` : outcome.detail);
+      return;
+    }
+    const selection = outcome.selection;
+    if (selection.kind === "mismatch") {
+      keepCurrentCard();
+      setWpsDiscoveryFailure(selection.detail);
+      return;
+    }
+    if (selection.kind === "none") {
+      keepCurrentCard();
+      setWpsDiscoveryFailure(null);
+      return;
+    }
+    if (selection.kind === "choose") {
+      setWpsRecovery(null);
+      setWpsRecoveryChoices({ candidates: selection.candidates, truncated: selection.truncated });
+      setWpsDiscoveryFailure(null);
+      return;
+    }
+    if (wpsRecoveryRef.current?.operationId === selection.candidate.operationId) {
+      // 已经摆着同一条（缓存给的，判定已完成）：不重复查询。
+      return;
+    }
+    await adoptWpsRecoveryCandidate(selection.candidate, isCurrent, "auto");
+  };
+
+  useEffect(() => {
+    /*
+     * 触发条件三个，缺一不可：
+     *  - `workbookIdentityKey`：挂载、切工作簿、工作簿元数据晚到；
+     *  - `authorizationKey` / `scopeMode`：授权范围刷新后重新核对（只重算结论，不写入）；
+     *  - `scopeSource`：从工作目录切回工作簿模式。
+     *
+     * 依赖只有"身份 + 范围"，**不**依赖选表序号的变化本身：同一个序号在另一个工作簿上
+     * 指向另一张表，靠序号变化触发会在"换簿但序号相同"时完全不重跑。
+     */
+    if (scopeSource !== "workbook") return;
+    const generation = (discoveryGenerationRef.current += 1);
+    const isCurrent = () => generation === discoveryGenerationRef.current;
+    void discoverWpsRecovery(workbookIdentityKey, isCurrent);
+    return () => {
+      // 依赖变化（身份/范围）即作废旧代数，迟到的响应不会再落到界面上。
+      if (discoveryGenerationRef.current === generation) discoveryGenerationRef.current += 1;
+    };
+    // Scope/identity changes only repeat GET + local inspection, never claim/reconcile/write.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [authorizationKey, scopeMode, scopeSource]);
+  }, [workbookIdentityKey, authorizationKey, scopeMode, scopeSource]);
+
+  /**
+   * 工作簿身份观察：界面没有"文档已切换"事件，但**不能**只靠 React 初次挂载查一次。
+   *
+   * 三个来源合起来覆盖真机上的三种时机：宿主窗口重新获得焦点、窗格从隐藏变可见、
+   * 以及身份在挂载之后才可读（`FullName` 晚到，或用户此时才保存工作簿）。间隔读的是
+   * `config/capabilities.json` 的限额，不在代码里另写一个数。
+   *
+   * 只有**值真的变了**才更新状态 ⇒ 不会因为定时器反复触发发现与网络请求。
+   */
+  useEffect(() => {
+    const read = () => {
+      const next = currentWpsWorkbookIdentity(getWpsApplication());
+      setWorkbookIdentityKey((previous) => (previous === next ? previous : next));
+    };
+    const timer = window.setInterval(
+      read,
+      checkpointCapabilities.taskRecovery.workbookIdentityWatchIntervalMs
+    );
+    window.addEventListener("focus", read);
+    document.addEventListener("visibilitychange", read);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("focus", read);
+      document.removeEventListener("visibilitychange", read);
+    };
+  }, []);
 
   /**
    * CAP-02 第 5 条：面板刷新后恢复可恢复的规划任务。
@@ -2585,49 +3065,81 @@ export default function WpsAgentPanel({
   }, []);
 
   /**
+   * 候选列表里显式选定一条（只读：查状态 + 核对现场，不认领、不写）。
+   *
+   * 与自动发现共用 `adoptWpsRecoveryCandidate`，所以"选定"和"唯一候选自动摆卡"走的是
+   * **同一套**判定 —— 不会出现"手选时宽松一点"的第二套规则。
+   */
+  const selectWpsRecoveryCandidate = async (candidate: PendingExecutionCandidate): Promise<void> => {
+    if (busy || recoveryActionLock.current || discoveryBusyRef.current) return;
+    discoveryBusyRef.current = true;
+    /*
+     * 作废判据只看"工作簿有没有换"，**不**看发现代数。
+     *
+     * 用代数闸会有一个真实后果：用户点选的那一瞬间如果授权元数据/身份观察正好触发了
+     * 另一次发现（代数 +1），这次点击的结论就被判"作废"，界面悄悄退回候选列表 ——
+     * 用户看到的就是"点了没反应"。用户显式选择只该被"换了工作簿"作废。
+     */
+    const identity = currentWpsWorkbookIdentity(getWpsApplication());
+    const isCurrent = () =>
+      currentWpsWorkbookIdentity(getWpsApplication()) === identity;
+    try {
+      await adoptWpsRecoveryCandidate(candidate, isCurrent, "selected");
+    } finally {
+      discoveryBusyRef.current = false;
+    }
+  };
+
+  /**
+   * 只读重查：重新走一遍"缓存 → 后端发现"。
+   *
+   * 拿不到服务时**不改口**成"没有未完成任务"：入口按钮旁边那句"暂时读不到"就是它的结论。
+   */
+  const refreshWpsDiscovery = async (): Promise<void> => {
+    if (busy || recoveryActionLock.current || discoveryBusyRef.current) return;
+    discoveryBusyRef.current = true;
+    const generation = (discoveryGenerationRef.current += 1);
+    try {
+      await discoverWpsRecovery(
+        currentWpsWorkbookIdentity(getWpsApplication()),
+        () => generation === discoveryGenerationRef.current
+      );
+    } finally {
+      discoveryBusyRef.current = false;
+    }
+  };
+
+  /**
    * 重开后重算恢复结论：拿到了新的服务端状态就重新核对一次。
    *
    * 与初始化那次走**同一条** `wpsReconcileVerdict`，不另写一套宽松规则 ——
    * 补记/核对之后再判断"接下来还能做什么"，必须和第一次一样严。
-   */
-  const refreshWpsRecoveryVerdict = (
+   */  const refreshWpsRecoveryVerdict = async (
     operationId: string,
     taskId: string,
     state: WpsExecutionState | null
   ) => {
-    const currentIdentity = (() => {
-      try {
-        return wpsWorkbookIdentity(wpsReadWorkbook(getWpsApplication())?.FullName);
-      } catch {
-        return null;
-      }
-    })();
-    const identity = wpsIdentityVerdict({
-      currentIdentity,
-      recordedIdentity: state?.workbookIdentity ?? ""
-    });
-    const localInspection = (() => {
-      try {
-        return state ? inspectWpsRecoveryState(getWpsApplication(), state,
-          resolveSelectedSheetIndexes?.() ?? selectedSheetIndexes) : "unknown" as const;
-      } catch {
-        return "unknown" as const;
-      }
-    })();
+    /*
+     * 先把本机材料补齐再算结论：完整退出宿主后 `PluginStorage` 可能是空的，
+     * 这时必须从**本机后端数据目录的恢复包**水合，否则界面会如实报"找不到原执行的
+     * 本机恢复记录"——那正是这次要修的缺陷。水合只读：读不到就带着原因显示，
+     * 不因为没有材料就放宽任何判据。
+     */
+    const {identity, verdict} = await wpsRecoveryVerdictFor(state, "recheck");
+    /*
+     * 来源标记随卡片一起保留：刷新只是把结论算新，不改"这张卡是用户点出来的"这件事 ——
+     * 否则刷新一次就等于把用户的选择降级成自动发现，下一次自动发现又能把它改判。
+     */
+    const previous = wpsRecoveryRef.current;
     setWpsRecovery({
       operationId,
       taskId,
       state,
       identity,
-      verdict: wpsReconcileVerdict({
-        state,
-        identityMatch: identity.kind === "match",
-        localInspection,
-        resumeUnavailableReason: wpsResumeUnavailableReason(getWpsApplication(), state, resolveSelectedSheetIndexes?.() ?? selectedSheetIndexes),
-        resumeAvailable: canResumeWpsExecution(getWpsApplication(), state, resolveSelectedSheetIndexes?.() ?? selectedSheetIndexes)
-      }),
+      verdict,
       checking: false,
-      acting: false
+      acting: false,
+      source: previous?.operationId === operationId ? previous.source : "auto"
     });
   };
 
@@ -2645,12 +3157,54 @@ export default function WpsAgentPanel({
     recoveryActionLock.current = true;
     setWpsRecovery({ ...current, acting: true });
     try {
-      refreshWpsRecoveryVerdict(current.operationId, current.taskId,
+      await refreshWpsRecoveryVerdict(current.operationId, current.taskId,
         await getWpsExecutionStatus(current.operationId));
     } catch (error) {
       append({ role: "system", text: `恢复状态查询失败；未进行写入。${turnErrorMessage(error)}` });
       setWpsRecovery((previous) => previous ? { ...previous, acting: false } : previous);
     } finally { recoveryActionLock.current = false; }
+  };
+
+  /**
+   * 恢复动作把某次执行推到终态之后，收尾**它自己那张**计划卡。
+   *
+   * 为什么必须有这一步：计划卡是"待执行"的现场。执行在第二步中断时它被刻意留着
+   * （用户还要靠它看计划、决定撤销还是重来）。但续跑 / 补记 / 核对最后一步一旦
+   * 真的把这次执行做完，它就不再是"待执行"了；不收尾，`pendingPlan` 会一直非空，
+   * 新任务永远被"请先确认或取消当前写入计划，再开始新的任务。"挡住。
+   * 用户当时是点「＋ → 放弃计划并新建」绕过去的 —— 那是绕行，不是修复。
+   *
+   * 归属必须**两侧都对上**才动手（判据在 `@excel-bro/core` 的 `planSettlesExecution`）：
+   * - 绑定里的 `operationId` 必须就是这次执行的；
+   * - 当前 `pendingPlan` 必须还是**同一个计划对象**（按引用比），消息 id 也要一致。
+   * 任一侧对不上就什么都不做 —— 宁可让用户手动处理，也不清掉别人的计划：
+   * 用户可能已经重新规划、拿到了另一份预览。
+   *
+   * 只做"这份计划不再是待执行"这件事：标预览已执行、留住计划摘要供事后复核、
+   * 把任务恢复记录置成不可续跑。**不重放任何动作、不加执行前确认按钮。**
+   */
+  const settleRecoveredPlan = (operationId: string): boolean => {
+    const binding = pendingPlanExecutionRef.current;
+    if (!planSettlesExecution({
+      binding,
+      pendingPlan: resultFacts.current.pendingPlan,
+      pendingPlanMessageId: resultFacts.current.pendingPlanMessageId,
+      operationId
+    })) return false;
+    // 判据已确认归属，这里 `binding` 一定非空。
+    const owned = binding!;
+    pendingPlanExecutionRef.current = null;
+    advanceTaskResume(owned.messageId, taskResumePatchForEvidence({
+      kind: "completed",
+      executionId: operationId
+    }));
+    if (owned.messageId) {
+      setExecutedPlan({ messageId: owned.messageId, plan: owned.plan, revised: owned.revised });
+    }
+    markPlanPreview("executed", owned.messageId);
+    setPendingPlan(null);
+    setPendingPlanMessageId(null);
+    return true;
   };
 
   const runWpsRecoveryAction = async (action: WpsReconcileAction) => {
@@ -2666,22 +3220,43 @@ export default function WpsAgentPanel({
       if (action !== "dismiss" && !(await targetGuard.check())) return;
       setWpsRecovery({ ...current, acting: true });
       if (action === "dismiss") {
+        /*
+         * 「清除恢复提示」的语义刻意很小：只记下"这条提示用户已看过"。
+         *
+         * - 不许伪造账本完成、不许删恢复材料、不许改动作进度（那会毁掉下一次续跑的依据）；
+         * - 但要写服务端处置元数据，否则后端发现会在每次重开时把同一条提示重新摆出来；
+         * - 写不进去就如实说"只清掉了本窗口的提示"，不假装已经处置成功。
+         */
+        const recorded = await dismissWpsExecutionDiscovery(operationId)
+          .then(() => true)
+          .catch(() => false);
         clearPendingWpsExecution(operationId);
         setWpsRecovery(null);
+        setWpsRecoveryChoices((previous) =>
+          previous
+            ? { ...previous, candidates: previous.candidates.filter((item) => item.operationId !== operationId) }
+            : previous
+        );
+        if (!recorded) {
+          append({
+            role: "system",
+            text:
+              "这次只清掉了本窗口的提示：没能把「已核对」记到服务端，重新打开窗格后这条提示可能再次出现。" +
+              "原表与执行记录未改动。"
+          });
+        }
         return;
       }
       // A displayed badge is not authority. Requery AND reread on each click.
       const fresh = await getWpsExecutionStatus(operationId);
-      const identity = wpsIdentityVerdict({
-        currentIdentity: wpsWorkbookIdentity(wpsReadWorkbook(getWpsApplication())?.FullName),
-        recordedIdentity: fresh.workbookIdentity
-      });
-      const verdict = wpsReconcileVerdict({ state: fresh,
-        resumeAvailable: canResumeWpsExecution(getWpsApplication(), fresh, resolveSelectedSheetIndexes?.() ?? selectedSheetIndexes), identityMatch: identity.kind === "match",
-        localInspection: inspectWpsRecoveryState(getWpsApplication(), fresh,
-          resolveSelectedSheetIndexes?.() ?? selectedSheetIndexes) });
+      /*
+       * 复核必须与显示结论**同源**（身份 + 现场 + 本机材料）。这一处以前自己算了一份
+       * 不含材料的样子，于是"材料已过期 ⇒ 界面说需要重新规划"点下去会被判成"可以继续"，
+       * 判定不含该动作就直接 return —— 按钮看似失效，界面也没换说法。
+       */
+      const {identity, verdict} = await wpsRecoveryVerdictFor(fresh, "pre-action");
       if (!wpsReconcileActions(verdict).includes(action)) {
-        refreshWpsRecoveryVerdict(operationId, current.taskId, fresh);
+        await refreshWpsRecoveryVerdict(operationId, current.taskId, fresh);
         return;
       }
       current = { ...current, state: fresh, identity, verdict };
@@ -2712,7 +3287,7 @@ export default function WpsAgentPanel({
           execute: async () => {
             let record = prior;
             if (action === "resume") {
-              record = await resumeWpsExecution(application, fresh, indexes, update => setWriteProgress(update.message));
+              record = await resumeWpsExecution(application, fresh, indexes, update => { setHostStage(update.stage); setWriteProgress(update.message); });
             } else {
               const claimed = await claimWpsExecutionResume(operationId, fresh.revision);
               if (!claimed.ownerToken) throw new Error("没有取得补记执行权。");
@@ -2727,10 +3302,13 @@ export default function WpsAgentPanel({
                 throw error;
               }
             }
-            setWriteProgress(null);
+            setHostStage(null);
+      setWriteProgress(null);
             setUndoRecord(record);
             clearPendingWpsExecution(operationId);
             setWpsRecovery(null);
+            // 这次执行到这里是真做完了：它自己的计划卡不再是"待执行"。
+            settleRecoveredPlan(operationId);
             append({role: "system", text: action === "resume" ? "已按原执行身份续跑剩余动作并回读验证，已完成动作未重复写入。请审阅主表结果。" : "已补记完成回执，未重写原表。请审阅主表结果。"});
             return {record, executionId: record.executionId, verified: true, undoable: true};
           },
@@ -2766,11 +3344,12 @@ export default function WpsAgentPanel({
           accepted: receipt => { verifiedPlanForSaveRef.current = {plan: prepared.plan,
             sourceSheetNames: prepared.authorization.sheets.map(sheet => sheet.name), executionId: receipt.executionId}; }
         });
-        setWriteProgress(null);
+        setHostStage(null);
+      setWriteProgress(null);
         // ResultReview captures errors in its notice; retain recovery discovery and allow a fresh inspection.
         setWpsRecovery(previous => previous ? {...previous, acting: false} : previous);
         if (resultReview.getSnapshot().phase !== "reviewing") {
-          refreshWpsRecoveryVerdict(operationId, fresh.taskId, await getWpsExecutionStatus(operationId));
+          await refreshWpsRecoveryVerdict(operationId, fresh.taskId, await getWpsExecutionStatus(operationId));
         }
         return;
       }
@@ -2781,7 +3360,7 @@ export default function WpsAgentPanel({
             role: "system",
             text: "服务端没有授予补记这次执行的权限，账本未改动；请重开面板后重新核对。"
           });
-          refreshWpsRecoveryVerdict(operationId, current.taskId, claimed);
+          await refreshWpsRecoveryVerdict(operationId, current.taskId, claimed);
           return;
         }
         if (inspectWpsRecoveryState(getWpsApplication(), fresh,
@@ -2797,6 +3376,7 @@ export default function WpsAgentPanel({
         });
         clearPendingWpsExecution(operationId);
         setWpsRecovery(null);
+        settleRecoveredPlan(operationId);
         append({
           role: "system",
           text:
@@ -2833,6 +3413,7 @@ export default function WpsAgentPanel({
             ownerToken: reconciled.ownerToken, result: { backfilled: true, actionCount: reconciled.totalActions } });
           clearPendingWpsExecution(operationId);
           setWpsRecovery(null);
+          settleRecoveredPlan(operationId);
           append({ role: "system", text: "已核对最后一个动作并补记完成；原表未重复写入。" });
           return;
         }
@@ -2841,7 +3422,7 @@ export default function WpsAgentPanel({
           code: "WPS_RECOVERY_RECHECK_REQUIRED", message: "核对完成，剩余动作等待来源与本机材料复核。"
         });
         const suspended = await getWpsExecutionStatus(operationId);
-        refreshWpsRecoveryVerdict(operationId, current.taskId, suspended);
+        await refreshWpsRecoveryVerdict(operationId, current.taskId, suspended);
         append({
           role: "system",
           text:
@@ -2894,7 +3475,7 @@ export default function WpsAgentPanel({
       if (loadPendingWpsExecution()?.operationId === operationId) {
         const state = await getWpsExecutionStatus(operationId);
         if (loadPendingWpsExecution()?.operationId === operationId)
-          refreshWpsRecoveryVerdict(operationId, current.taskId, state);
+          await refreshWpsRecoveryVerdict(operationId, current.taskId, state);
       } else {
         setWpsRecovery(previous => previous?.operationId === operationId ? null : previous);
       }
@@ -3347,10 +3928,14 @@ export default function WpsAgentPanel({
     return plan;
   };
 
-  const markPlanPreview = (status: "executed" | "cancelled") => {
-    if (!pendingPlanMessageId) return;
+  const markPlanPreview = (
+    status: "executed" | "cancelled",
+    targetMessageId: string | null | undefined = pendingPlanMessageId
+  ) => {
+    const messageId = targetMessageId === undefined ? pendingPlanMessageId : targetMessageId;
+    if (!messageId) return;
     updateMessages((current) => current.map((message) =>
-      message.id === pendingPlanMessageId && message.planPreview
+      message.id === messageId && message.planPreview
         ? { ...message, planPreview: { ...message.planPreview, status } }
         : message
     ));
@@ -3383,12 +3968,12 @@ export default function WpsAgentPanel({
           ...current.conversations.map((item) => item.id === current.activeConversationId
             ? { ...item, messages: invalidatePendingClarifications(item.messages) }
             : item)
-        ].slice(0, 30),
-        // 标记跟着会话走：只保留切到最后 30 条里仍然存在的那些。
+        ].slice(0, checkpointCapabilities.conversation.wps.maxStoredConversations),
+        // 标记跟着会话走，只保留配置限额内仍存在的记录。
         legacyCredentialConversationIds: (
           current.legacyCredentialConversationIds ?? []
         ).filter((id) =>
-          current.conversations.slice(0, 29).some((item) => item.id === id)
+          current.conversations.slice(0, checkpointCapabilities.conversation.wps.maxStoredConversations - 1).some((item) => item.id === id)
         )
       }));
     }
@@ -3455,7 +4040,7 @@ export default function WpsAgentPanel({
     );
     setPrompt("");
     setClarification(null);
-    setClarificationDraft("");
+    setClarificationChoice(null);
     setPendingPlan(null);
     setPendingPlanMessageId(null);
     setCopiedMessageId(null);
@@ -3467,23 +4052,16 @@ export default function WpsAgentPanel({
       append({ role: "system", text: "请先保存或放弃右侧审阅副本，再删除对话。" });
       return;
     }
-    setChatHistory((current) => {
-      const remaining = current.conversations.filter(
-        (conversation) => conversation.id !== conversationId
-      );
-      if (remaining.length === current.conversations.length) return current;
-      if (remaining.length === 0) {
-        const replacement = createWpsConversation();
-        return { activeConversationId: replacement.id, conversations: [replacement] };
-      }
-      return {
-        activeConversationId:
-          current.activeConversationId === conversationId
-            ? remaining[0].id
-            : current.activeConversationId,
-        conversations: remaining
-      };
-    });
+    if (busy || !chatHistory.conversations.some((item) => item.id === conversationId)) return;
+    setPendingDeleteConversationId(conversationId);
+  };
+
+  const confirmDeleteConversation = () => {
+    if (busy || stagedReview || !pendingDeleteConversationId) return;
+    setChatHistory((current) => removeHistoryConversation(
+      current, pendingDeleteConversationId, createWpsConversation
+    ));
+    setPendingDeleteConversationId(null);
     setClarification(null);
     setPendingPlan(null);
     setPendingPlanMessageId(null);
@@ -3509,7 +4087,7 @@ export default function WpsAgentPanel({
 
   const runTurn = async (
     question: string,
-    options: { intentConfirmed?: boolean; clarificationRound?: number; showUser?: boolean; targetConfirmedRetry?: boolean; images?: PendingImage[]; messageUnderstanding?: Awaited<ReturnType<typeof understandMessage>>; taskContext?: AgentTaskContext; restartingAnalysis?: boolean; activityMessageId?: string } = {}
+    options: { messageOnlyContinuation?: boolean; intentConfirmed?: boolean; clarificationRound?: number; showUser?: boolean; targetConfirmedRetry?: boolean; images?: PendingImage[]; messageUnderstanding?: Awaited<ReturnType<typeof understandMessage>>; taskContext?: AgentTaskContext; restartingAnalysis?: boolean; activityMessageId?: string } = {}
   ) => {
     const sentImages = options.images ?? (options.showUser === false && !pendingImages.length
       ? taskImagesRef.current.get(taskIdRef.current) ?? [] : pendingImages);
@@ -3654,6 +4232,21 @@ export default function WpsAgentPanel({
       }, messageController.signal), messageController.signal);
       if (messageController.signal.aborted) throw new DOMException("Aborted", "AbortError");
       updateActivity(activity, { id: "message-intent", label: "理解消息", phase: "intent", status: "completed" });
+      if (messageUnderstanding.kind === "clarification") {
+        const question = messageUnderstanding.clarification;
+        const messageId = append({ role: "assistant", text: "", clarification: {
+          ...question, status: "pending"
+        } });
+        setClarification({ messageId, originalPrompt: text, round: 0, options: question.options, messageOnly: true });
+        setPrompt("");
+        endActivity(activity, "awaiting_input");
+        return;
+      }
+      if (options.messageOnlyContinuation && messageUnderstanding.kind !== "conversation") {
+        append({ role: "assistant", text: "回答已记录，尚未读取或修改工作表。若要开始处理，请另行发送明确需求。" });
+        endActivity(activity, "completed");
+        return;
+      }
       if (messageUnderstanding.kind === "conversation") {
         append({ role: "assistant", text: messageUnderstanding.message });
         setPrompt("");
@@ -3976,6 +4569,37 @@ export default function WpsAgentPanel({
    */
   const composerCanContinue = Boolean(composerPausedMessage);
   /*
+   * 待回答问题的**当前身份**与它的选中状态。
+   *
+   * 选中只记在本地、按 `messageId` 绑定：换题/换对话后 `messageId` 变了，
+   * 这份选中自动作废 —— 「旧问题不得重复提交」靠的是身份，不是清空时机。
+   */
+  const clarificationSelectedIndex =
+    clarification && clarificationChoice?.messageId === clarification.messageId
+      ? clarificationChoice.index
+      : null;
+  const answeringClarification =
+    Boolean(clarification);
+  /** 这道题的字段定义在消息上（`PendingClarification` 里只有选项）。 */
+  const clarificationFields =
+    (clarification
+      ? messages.find((message) => message.id === clarification.messageId)?.clarification?.fields
+      : undefined) ?? [];
+  /**
+   * 这道题"现在发送会提交什么"—— 也是"能不能发送"的**唯一**判据。
+   * 与回答区里的预览行读同一个函数：不许一处算"还差几项"、另一处自己猜"够不够"。
+   */
+  const activeClarificationSubmission = clarificationSubmission({
+    options: clarification?.options.map((option, index) => ({
+      id: String(index), label: option.label, description: option.description,
+      resolution: option.resolution
+    })) ?? [],
+    selected: clarificationSelectedIndex === null ? [] : [String(clarificationSelectedIndex)],
+    freeText: prompt,
+    fields: clarificationFields,
+    fieldValues: clarificationFieldDrafts
+  });
+  /*
    * 按钮该长什么样，由**共享判据**决定（`pauseButtonState`，Excel 端读同一份）。
    *
    * 三件事在这里被显式分开，不再靠 `progress` 一个变量推断：
@@ -3986,25 +4610,317 @@ export default function WpsAgentPanel({
    * 旧写法 `progress ? ■ : ↑` 的实际后果：`progress` 非空但没有可中止对象时，
    * 界面画出一个"能暂停"的按钮，点下去却静默返回。
    */
-  const composerPauseButton = pauseButtonState({
-    hasInput: false,
+  /**
+   * 主按钮该替**哪一条**规划暂停去核对。
+   *
+   * 与卡面读同一份事实（`messages[].planningPause`），不读"当前活跃暂停"就够 ——
+   * 一次只读核对之后 `planningPause` 会被清空，卡却还在（那是历史记录），
+   * 只看活跃态会让核对的入口凭空消失。
+   *
+   * 多条并存时取**最后一条**未收尾的：与恢复入口的选择规则（
+   * `selectExecutionRecoveryEntry` 取最后一条）一致，绝不把多条合并成一个按钮。
+   */
+  const planningPauseTarget = (() => {
+    if (planningPause) {
+      const active = messages.find((message) => message.id === planningPause.sourceMessageId);
+      if (active) return active;
+    }
+    return messages
+      .filter((message) => message.planningPause && !message.planningPause.resolved &&
+        (message.planningPause.awaitingStatus !== false || message.planningPause.canContinue))
+      .at(-1);
+  })();
+  /**
+   * 「核对 / 继续」这两步现在由**输入框右下角**那颗按钮承接（与 Excel 同一份决定）。
+   *
+   * 这里只算"现在该显示哪一步、是不是正在飞"，处理器仍在分派时按同一份事实选：
+   *  - 写入恢复卡（`wpsRecovery`）：结论说待核对 → 核对；说可继续 → 继续剩余动作；
+   *  - 规划暂停卡（`planningPause`）：核对过、可续跑 → 继续分析；还没核对 → 核对。
+   *
+   * `busy` 单独带出来，是为了**在飞行中禁用而不是让按钮消失**：消失会让用户以为
+   * 点错了，再点一次就成了第二个请求。
+   */
+  const wpsRecoveryPrimary = (() => {
+    /*
+     * 这里**不**因为"正在跑"就返回 null：判据（`composerPrimaryAction`）本来就把
+     * `taskRunning` 排在核对/续跑之前，跑着的时候这两档根本不会出现。
+     * 在这里再挡一次，只会让"任务刚跑完、进度还没清"的那一瞬按钮凭空消失。
+     */
+    if (wpsRecovery) {
+      const actions = wpsReconcileActions(wpsRecovery.verdict);
+      const busy = Boolean(wpsRecovery.checking || wpsRecovery.acting);
+      if (actions.includes("reconcile")) {
+        return { kind: "reconcile" as const, busy, label: WPS_RECOVERY_ACTION_LABEL.reconcile };
+      }
+      if (actions.includes("resume")) {
+        return { kind: "resume" as const, busy, label: WPS_RECOVERY_ACTION_LABEL.resume };
+      }
+    }
+    if (planningPause) {
+      /*
+       * 先看"当前这条暂停还能不能继续"：判据与卡面**同一条**（`view.canContinue`
+       * 且 `action === continue_checkpoint`）。有的场景里主动态还在、对应消息却
+       * 已经翻页/换会话了 —— 这时仍要以主动态为准，否则按钮会凭空消失。
+       */
+      const activeView = planningPause.view;
+      const reloading =
+        planningPauseReload?.checking === true && planningPauseReload.turnId === planningPause.turnId;
+      if (activeView?.canContinue && activeView.action === "continue_checkpoint") {
+        return { kind: "resume" as const, busy: reloading, label: activeView.actionLabel || "继续分析" };
+      }
+    }
+    if (planningPauseTarget) {
+      const meta = planningPauseTarget.planningPause!;
+      const reloading =
+        planningPauseReload?.checking === true && planningPauseReload.turnId === meta.turnId;
+      const canRecheck = !(
+        planningPauseReload?.turnId === meta.turnId &&
+        planningPauseReload.checking === false &&
+        planningPauseReload.canRecheck === false
+      );
+      if ((meta.awaitingStatus === true || meta.canContinue) && canRecheck) {
+        return { kind: "reconcile" as const, busy: reloading, label: "核对任务状态" };
+      }
+    }
+    return null;
+  })();
+  const composerPrimary = composerPrimaryAction({
+    // 有图也算"有内容"：带图发送是常规操作，按钮不该还停在 ▶。
+    hasInput: Boolean(prompt.trim() || pendingImages.length > 0),
     paused: composerCanContinue,
     taskRunning: progress !== null || writeProgress !== null,
     controllerAlive: Boolean(controllerRef.current && !controllerRef.current.signal.aborted),
-    uninterruptible: writeProgress !== null
+    uninterruptible: hostStage !== null,
+    pausing: pauseRequestState?.phase === "requesting",
+    /*
+     * 有待回答的问题时，"发送"发出去的是**回答**，不是新需求。
+     * 判据在共享层（`composerPrimaryAction`），这里只把事实交过去。
+     *
+     * 恢复卡的「核对 / 继续」也归这颗按钮：卡面不再画同名按钮（同一个动作两个入口，
+     * 用户只能靠试）。判据一行没改 —— 核对只补记/只查询，续跑只跑剩下的，
+     * 中间**必须**由用户再点一下。有字时判据把"发送"排在前面，绝不吞掉正在写的话。
+     */
+    needsReconcile: wpsRecoveryPrimary?.kind === "reconcile",
+    recoveryResume: wpsRecoveryPrimary?.kind === "resume",
+    /* 文案跟着**这一步属于什么**走：写入恢复说"核对在途动作"，规划暂停说"核对任务状态"。 */
+    reconcileLabel: wpsRecoveryPrimary?.kind === "reconcile" ? wpsRecoveryPrimary.label : undefined,
+    resumeLabel: wpsRecoveryPrimary?.kind === "resume" ? wpsRecoveryPrimary.label : undefined,
+    answeringClarification: answeringClarification,
+    /* "能不能提交"直接问共享判据，不在这里另算一遍（必填只填一半 ≠ 可以发送）。 */
+    hasAnswerContent: activeClarificationSubmission.ok
   });
+  /** 固定区域里用户**显式**切到了哪一件事（`ComposerActionDock` 的切换入口）。 */
+  const [dockPinned, setDockPinned] = useState<Exclude<CurrentActionKind, "none"> | null>(null);
+  /**
+   * 这条恢复记录**是不是已经结束**（撤销确认 / 放弃 / 收尾）。
+   *
+   * 判据在共享层（`executionRecoveryTerminalReason`，Excel 读同一份）。终态不再占
+   * 固定区域的主视图，也不进"还有 N 项" —— 它已经没有下一步可做。记录与材料都不删：
+   * 归属的任务消息里留一条可展开的终态摘要。
+   *
+   * 边界（不许扩大）：待核对（在途未知）、可继续、需重新规划、普通 blocked（现场冲突 /
+   * 执行权被占 / 来源变化）、证据不足都**不是**终态，照旧留在固定区域。
+   */
+  const wpsRecoveryTerminal = wpsRecovery
+    ? executionRecoveryTerminalReason(wpsRecovery.verdict)
+    : null;
+  /**
+   * 终态摘要在消息里的**归属**：同一次执行（`executionId`）的写入结果卡。
+   *
+   * 跨重启或换会话时可能一条都没有（历史里没有这张卡）—— 那时不能把结论直接丢掉，
+   * 固定区域退成一条**只读**终态摘要（无按钮、不占主视图）；有归属消息时固定区域
+   * 一个像素都不再画。
+   */
+  const wpsRecoveryHomeMessageId = wpsRecovery
+    ? (messages.find((message) => message.verification?.executionId === wpsRecovery.operationId)?.id ?? null)
+    : null;
+  /** 固定区域里"现在最该处理哪一件"—— 判据在共享层（`selectCurrentAction`，与 Excel 同一份）。 */
+  const currentAction = selectCurrentAction(
+    {
+      /*
+       * `review` = 审阅栏**在等你决定**（与组件读同一份判据）：纯状态行（未执行 /
+       * 正在执行 / 需要核对）不参与主视图竞争，否则它会把要点的恢复卡挤成 chip。
+       */
+      review: resultReviewNeedsDecision(resultReviewState),
+      /*
+       * 恢复：写入恢复卡 / 多候选 / 读不到 / 规划暂停卡 —— 都用**已经算好的事实**，
+       * 不按"有没有某张卡"猜。终态（撤销/放弃/收尾）**一律不进固定区域**：摘要已经
+       * 移到消息流的只读历史记录（有归属消息挂结果卡内、无归属消息单独一条），
+       * 这里只剩非终态的恢复卡要占版面。
+       */
+      recovery:
+        (Boolean(wpsRecovery) && wpsRecoveryTerminal === null) ||
+        Boolean(wpsRecoveryChoices) ||
+        Boolean(wpsDiscoveryFailure) ||
+        Boolean(planningPause),
+      clarification: answeringClarification,
+      running: progress !== null || writeProgress !== null
+    },
+    dockPinned
+  );
   /** 过程卡/进度条上的「停止」：同一条判据，但不受输入影响。 */
   const cardPauseButton = executionPauseState({
     taskRunning: progress !== null || writeProgress !== null,
     controllerAlive: Boolean(controllerRef.current && !controllerRef.current.signal.aborted),
-    uninterruptible: writeProgress !== null
+    uninterruptible: hostStage !== null
   });
   /** 写入/回读期间**禁止**中断：按钮据此置灰（其余"不可暂停"仍要给反馈，不置灰）。 */
 
   const submitComposer = async () => {
+    /*
+     * 有待回答的问题时，右下角那颗按钮发出去的是**回答**，不是新需求。
+     * 取消本次任务后恢复普通输入，不按文字猜测用户是否换题。
+     */
+    if (answeringClarification) return submitClarificationAnswer();
     if (busy || preparingImages || (!prompt.trim() && pendingImages.length === 0)) return;
     return runTurn(prompt);
   };
+  /**
+   * 提交对**当前这道**澄清题的回答（唯一入口：右下角那颗主按钮 / 回车）。
+   *
+   * 三种内容按**同一份**共享判据的顺序取：字段 > 选项 > 自由输入
+   * （`clarificationSubmission`）。这里只做分派，不自己重排顺序 ——
+   * 两端读同一份，才不会出现"Excel 先看选项、WPS 先看文字"。
+   */
+  const submitClarificationAnswer = async () => {
+    if (!clarification || busy) return;
+    const fields = clarificationFields;
+    const fieldValues = clarificationFieldDrafts;
+    const freeText = prompt.trim();
+    const submission = activeClarificationSubmission;
+    if (!submission.ok) {
+      // 必填没填完 / 什么都没选：一个字节都不发，原因说清楚。
+      append({ role: "system", text: submission.reason });
+      return;
+    }
+    if (clarification.messageOnly) {
+      const card = messages.find((message) => message.id === clarification.messageId)?.clarification;
+      if (card?.status !== "pending") return;
+      const answer = submission.kind === "option"
+        ? submission.options.map((option) => option.resolution).join("\n") : submission.answer;
+      const nextPrompt = `${clarification.originalPrompt}\n已回答问题：${card.question}\n回答：${answer}`;
+      updateMessages((items) => items.map((item) => item.id === clarification.messageId && item.clarification
+        ? { ...item, clarification: { ...item.clarification, status: "resolved", answer: submission.answer } } : item));
+      append({ role: "user", text: submission.answer });
+      setClarification(null); setClarificationChoice(null); setPrompt(""); setClarificationFieldDrafts({});
+      await runTurn(nextPrompt, { showUser: false, images: [], messageOnlyContinuation: true });
+      return;
+    }
+    setClarificationFieldDrafts({});
+    setPrompt("");
+    setClarificationChoice(null);
+    if (submission.kind === "fields") {
+      // 字段答案的拼法只有一份：共享层 `clarificationSubmission`，不在这里另拼一遍。
+      await resolveClarificationWithText(submission.answer);
+      return;
+    }
+    if (submission.kind === "option") {
+      const index = Number(submission.options[0]?.id);
+      if (!Number.isInteger(index)) return;
+      /*
+       * 选了选项又写了补充：两句话都要留下。只走 `resolveClarification(index)`
+       * 会把用户写的那句丢掉（它提交的是 `option.resolution`）。
+       */
+      if (freeText) {
+        await resolveClarificationWithText(`${submission.options[0].resolution}\n补充：${freeText}`);
+        return;
+      }
+      await resolveClarification(index);
+      return;
+    }
+    await resolveClarificationWithText(submission.answer);
+  };
+  /** 选中/取消一个快捷选项。只改本地选中态 —— 提交发生在「发送」那一刻。 */
+  const toggleClarificationChoice = (index: number) => {
+    if (!clarification) return;
+    const messageId = clarification.messageId;
+    setClarificationChoice((current) =>
+      current?.messageId === messageId && current.index === index ? null : { messageId, index }
+    );
+  };
+  /**
+   * 主按钮按下去之后**唯一**的分派点（按钮点击与回车都走这里）。
+   * 点击和回车各写一套 if 就会重演"同一位置两种行为"，用户只能靠试。
+   */
+  const invokeComposerPrimary = async (invoke: NonNullable<PrimaryActionInvoke>) => {
+    if (invoke === "answer") return submitClarificationAnswer();
+    if (invoke === "pause") return pauseCurrentTurn("composer");
+    if (invoke === "resume") {
+      /*
+       * 同一个 `resume` 有三个真实含义，按**同一份**事实分开（与 `wpsRecoveryPrimary`
+       * 的判定同源）：写入剩余动作 / 从规划检查点继续分析 / 普通续聊。
+       * 三个处理器都是原有的；这里只做分派，不改任何安全语义。
+       */
+      if (wpsRecovery && wpsReconcileActions(wpsRecovery.verdict).includes("resume")) {
+        return void runWpsRecoveryAction("resume");
+      }
+      if (planningPause?.view?.canContinue && planningPause.view.action === "continue_checkpoint") {
+        return resumePlanningFromPause(planningPause);
+      }
+      return resumeComposerTask();
+    }
+    if (invoke === "reconcile") {
+      /*
+       * 核对：只有查询/补记，**不自动续跑**（续跑是下一颗按钮、用户再点一次）。
+       * 写入侧走 `runWpsRecoveryAction`，规划暂停走 `inspectPlanningMessage` ——
+       * 两个都是原处理器，各自带身份/终态/防重入守卫。
+       */
+      if (wpsRecovery && wpsReconcileActions(wpsRecovery.verdict).includes("reconcile")) {
+        return void runWpsRecoveryAction("reconcile");
+      }
+      const paused = planningPauseTarget;
+      if (paused) await inspectPlanningMessage(paused);
+      return;
+    }
+    await submitComposer();
+  };
+  /** 输入框下方提示的**唯一**来源：只描述回车会发生什么，跟着同一份判据走。 */
+  const composerHint =
+    answeringClarification
+      ? "选择一项或填写其他，发送后继续"
+      : composerPrimary.kind === "pausing"
+        ? "正在停止当前处理…"
+        : composerPrimary.kind === "pause" && composerPrimary.disabled
+          ? (composerPrimary.reason ?? "正在处理，请稍候")
+          : /*
+             * 冲突如实说：有内容时主按钮一定是"发送"，核对/续跑排在后面。
+             * 不许写"顺便核对一下" —— 那会把用户正在写的话丢掉。
+             *
+             * 判据读**主按钮自己的输出**（`kind === "send"`），不在这里再写一遍
+             * `prompt.trim()`：`hasInput` 把待发图片也算内容，重写一遍就会漏掉
+             * "只贴了图片、没打字"的情形 —— 入口被顶掉却没有任何说明。
+             */
+            composerPrimary.kind === "send" && wpsRecoveryPrimary
+            ? `输入框有内容：${
+                /* 暂停之后发出去是**重新判断**这条要求，不是重放已暂停的计划 —— 说法必须跟着路由走。 */
+                composerCanContinue ? "发送会重新判断这条要求（不重放已暂停的计划）" : "发送会作为新需求"
+              }；要${
+                wpsRecoveryPrimary.kind === "reconcile" ? "核对任务状态" : "继续上次的任务"
+              }请先清空输入框${pendingImages.length > 0 ? "并移除待发图片" : ""}`
+            : resultReviewState.phase === "reviewing" && !resultReviewState.pending
+              ? "等待审阅结果：可确认变更、放弃变更或打开双视图"
+              : busy
+                ? "正在处理，请稍候"
+                : "Enter 发送 · Shift + Enter 换行 · 可粘贴截图";
+  /**
+   * 宿主侧**额外**的禁用条件（判据本身不认为它该禁用），每条都带原因。
+   *
+   * 注意**不按 `busy` 置灰**：`busy` 的时候主按钮可能就是 ■（暂停），
+   * 以前"忙碌就禁用整颗按钮"的结果是运行中根本没地方暂停。
+   */
+  const composerPrimaryBlocked =
+    preparingImages
+      ? "图片还在处理，稍候再发送"
+      : pendingImages.length > 0 && !selectedModel?.supportsVision
+        ? "当前模型不支持图片：先切换到支持视觉的模型再发送"
+        : composerPrimary.invoke === "send" && selectedSheetIndexes.length === 0
+          ? "先在数据范围里勾选工作表"
+          : /*
+             * 核对/续跑在飞：禁用并说明，而不是让用户连点出第二个请求。
+             */
+            wpsRecoveryPrimary?.busy
+            ? "正在核对或继续上次的任务，稍候…"
+            : null;
   const resumeComposerTask = async () => {
     if (busy || preparingImages || !composerPausedMessage || pauseRequestState?.phase === "requesting") return;
     const early = prePlanningPause.pendingEntries().find((entry) =>
@@ -4651,7 +5567,7 @@ export default function WpsAgentPanel({
         }
         const response = result.clarification.response;
         if (!response) return;
-        setClarificationDraft("");
+        setClarificationChoice(null);
         setClarificationFieldDrafts({});
         const clarificationMessageId = append({
           role: "assistant",
@@ -5213,52 +6129,6 @@ export default function WpsAgentPanel({
     }
   };
 
-  const stagePendingPlan = async () => {
-    if (!(await targetGuard.check())) return;
-    if (!pendingPlan || busy || planEditDraft !== null || stagedReview) return;
-    setWriteProgress("正在创建独立副本并核对结果…");
-    try {
-      const currentSheetIndexes = [...(resolveSelectedSheetIndexes?.() ?? selectedSheetIndexes)].sort((a, b) => a - b);
-      const previewSheetIndexes = pendingPlan.authorization.sheets.map((sheet) => sheet.index).sort((a, b) => a - b);
-      if (JSON.stringify(currentSheetIndexes) !== JSON.stringify(previewSheetIndexes)) {
-        throw new Error("授权工作表范围在预览后发生变化，请重新预览。");
-      }
-      const application = getWpsApplication();
-      let staged: WpsNativeComparison;
-      let usedFixedFallback = false;
-      try {
-        staged = stageWpsNativeComparison(application, pendingPlan);
-      } catch (error) {
-        // An edited plan may carry a user-edited expected matrix. It is no longer proof of
-        // the deterministic mapping result, so only the unedited local plan may auto-fallback.
-        const fallback = error instanceof WpsFormulaTrialError && !planRevised
-          ? fixedValueFallbackFromFormula(pendingPlan.plan)
-          : null;
-        if (!fallback) throw error;
-        const fixedPrepared = prepareWpsPlan(application, currentSheetIndexes, fallback, pendingPlan.sourceSnapshots, { requireSourceAnchor: pendingPlan.sourceAnchorRequired });
-        staged = stageWpsNativeComparison(application, fixedPrepared);
-        setPendingPlan(fixedPrepared);
-        usedFixedFallback = true;
-        if (pendingPlanMessageId) {
-          updateMessages((current) => current.map((message) =>
-            message.id === pendingPlanMessageId && message.planPreview
-              ? { ...message, planPreview: { ...message.planPreview, title: fixedPrepared.plan.title, revised: true } }
-              : message
-          ));
-        }
-      }
-      setStagedReview(staged);
-      append({
-        role: "assistant",
-        text: `${usedFixedFallback ? "公式试算未能通过计算值核对，已关闭试写副本并改用固定值重新生成。" : ""}已在右侧独立副本生成「${staged.plan.plan.title}」的结果，并标记 ${staged.changedCells.length} 个变化单元格。左侧原表尚未写入；请并排核对后选择保存或放弃。`
-      });
-    } catch (error) {
-      append({ role: "system", text: turnErrorMessage(error) });
-    } finally {
-      setWriteProgress(null);
-    }
-  };
-
   const discardStagedPlan = () => {
     if (!stagedReview || busy) return;
     /*
@@ -5473,6 +6343,7 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
       phase: "preflight",
       detail: `${plan.actions.length} 个动作，目标 ${plan.totalCells} 个单元格；执行前重新核对工作簿与授权。`
     });
+    setHostStage("snapshot");
     setWriteProgress("正在保存执行前恢复点…");
     // 失败路径也要拿到 executionId 才能把明细挂到提示消息上，而那时 record 拿不到。
     let reviewExecutionId: string | null = null;
@@ -5618,9 +6489,22 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
       // The persisted discovery index now belongs to this replacement execution.
       setWpsRecovery(previous => previous && previous.operationId !== operationId &&
         previous.taskId === carried().taskId ? null : previous);
+      /*
+       * 从这里起，这份计划**属于** `operationId` 这一次执行。
+       *
+       * 必须在拿到写入权之后才记：登记失败会当场返回，那时并没有可恢复的执行身份，
+       * 记下去只会留下一个"谁也收不了尾"的绑定。
+       */
+      pendingPlanExecutionRef.current = {
+        plan,
+        messageId: pendingPlanMessageId,
+        operationId,
+        revised: planRevised
+      };
       bindRecoveryProbe((import.meta.env.DEV || import.meta.env.VITE_ENABLE_RECOVERY_PROBE === "true"), workbookIdentity, operationId, plan.plan.actions, Boolean(wpsLedgerState?.ownerToken && wpsLedgerState.descriptor.resumeContext));
       const registeredOperationId = operationId;
       const record = await executeWpsPlan(getWpsApplication(), plan, (update) => {
+        setHostStage(update.stage);
         setWriteProgress(update.message);
         updateActivity(activity, executionActivityUpdate(update));
       }, (reviews, executionId) => {
@@ -5664,7 +6548,11 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
             }
           }
         : undefined,
-        operationId, {taskId: wpsLedgerState?.taskId},
+        operationId, {
+          taskId: wpsLedgerState?.taskId,
+          // 首写前落盘：恢复包失败会在这里抛出，执行器不会动原表一格。
+          persistMaterial: persistWpsRecoveryPackage
+        },
         (entry) => { hostWriteAudits.push(entry); });
       let comparison: "matched" | "different" | "unavailable" = "unavailable";
       let comparisonFailed = false;
@@ -5808,12 +6696,6 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
         }
         flushHostWriteAudits();
       }
-      // WPS reopens an existing pane by setting Visible=true; React need not remount.
-      // Publish the recovery state now, after suspension, using the same read-only
-      // identity/authorization/target verdict as reload. Never automatically reconcile.
-      if (operationId && wpsLedgerState) {
-        refreshWpsRecoveryVerdict(operationId, wpsLedgerState.taskId, wpsLedgerState);
-      }
       let latest: WpsUndoRecord | null = null;
       /** 读取宿主存储本身失败 —— 与"读到了但没有记录"是两件事，不能合并。 */
       let evidenceReadFailed = false;
@@ -5856,6 +6738,26 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
         record: rawRecord,
         readFailed: evidenceReadFailed
       });
+      // Positive local evidence plus the acknowledged ledger cursor: material
+      // preparation failed before action 0. Missing/uncertain receipts never qualify.
+      /*
+       * `ownerActive === false` 是"这次执行在账本侧确实没人还在跑"的唯一出口：
+       * 服务端按 `status == "running"` 且租约未过期算 `ownerActive`（见 `_wps_state_payload`），
+       * 所以**挂起失败**（`suspend` 被下面的 `catch` 吞掉、账本仍 running）时它是 `true`，
+       * 本端仍握着执行权 —— 这时清掉本机待办与恢复入口，等于把一份服务端认为仍在进行的
+       * 执行从本端抹掉。别再补一行 `status !== "running"`：它与这条判据是同一件事的两种
+       * 写法，服务端保证二者同步，多写一层只会多一层抓不到变异的装饰。
+       */
+      const noActionStarted = evidence.kind === "not_started" && operationId != null &&
+        wpsLedgerState?.operationId === operationId && wpsLedgerState.nextActionIndex === 0 &&
+        wpsLedgerState.inFlightActionIndex == null && wpsLedgerState.ownerActive === false;
+      if (noActionStarted) {
+        clearPendingWpsExecution(operationId!);
+        setWpsRecovery(current=>current?.operationId===operationId ? null : current);
+      } else if (operationId && wpsLedgerState) {
+        // A write may have started: preserve the durable recovery entrance.
+        await refreshWpsRecoveryVerdict(operationId, wpsLedgerState.taskId, wpsLedgerState);
+      }
       const partiallyWritten = evidence.kind === "needs_review";
       if (pendingPlanMessageId) {
         // 这条不需要抢在某个动作之前，走常规的异步落盘即可。
@@ -5897,8 +6799,12 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
             }
           : {})
       });
+      if (afterExecutionReview && noActionStarted)
+        throw new ReviewNotStartedError(error instanceof Error ? error.message : "写前恢复准备失败；原表未被修改。");
     } finally {
+      settleRecoveryProbe((import.meta.env.DEV || import.meta.env.VITE_ENABLE_RECOVERY_PROBE === "true"), operationId);
       writeBackInFlight.current = false;
+      setHostStage(null);
       setWriteProgress(null);
     }
     return completedRecord ?? undefined;
@@ -5935,6 +6841,7 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
     } catch (error) {
       setPlanEditError(error instanceof Error ? error.message : "计划编辑内容无效。");
     } finally {
+      setHostStage(null);
       setWriteProgress(null);
     }
   };
@@ -5961,11 +6868,34 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
      * 内部的身份校验、逐动作恢复与回读核对一步都没少（见 `undoWpsExecution`）。
      */
     setUndoingExecutionId(executionId);
+    setHostStage("undoing");
     setWriteProgress("正在核对撤销条件…");
     try {
       await undoWpsExecution(getWpsApplication(), record.executionId, (update) => {
         setWriteProgress(update.message);
       });
+      /*
+       * 原表已经回到执行前 ⇒ 这份本机恢复材料再没有任何用途（续跑、核对、放弃都失效了）。
+       * 这里是**唯一**的终态回收点：执行成功时**不许**删，那时审阅还没做。
+       * 回收失败不影响撤销结果（`retireWpsRecoveryPackage` 内部吞掉），材料随保留期到期。
+       */
+      retireWpsRecoveryPackage(record.executionId);
+      /*
+       * 服务端留痕：用户**确实**把这次执行撤回了（原表已回到执行前）。
+       *
+       * 两条入口在这里合流，区别只由 `origin` 给出 —— 它就是那个已经在用的区分：
+       * `"discard"` = 审阅阶段点「放弃变更」⇒ `abandoned`；`"undo"` = 确认之后点
+       * 「撤销本次执行」⇒ `undone`。两者**不许互相冒充**（服务端只有一个判据）。
+       *
+       * best-effort：`recordExecutionDisposition` 永不抛错。留痕只是观测，失败不该把
+       * 一次已经成功的恢复改判成失败，也不该再弹一条错误。
+       */
+      const disposition: ExecutionDisposition = origin === "discard" ? "abandoned" : "undone";
+      void recordExecutionDisposition(
+        (id, kind) => sendExecutionDisposition("wps", id, kind),
+        record.executionId,
+        disposition
+      );
       // 重新问宿主：撤销成功后那条记录已变成 `restored`，不再是活跃恢复点；
       // 若更早的执行还留着可撤销记录，`latestWpsUndo` 会把它交出来（真正的 LIFO 栈）。
       try {
@@ -6058,6 +6988,7 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
       return false;
     } finally {
       setUndoingExecutionId(null);
+      setHostStage(null);
       setWriteProgress(null);
     }
   };
@@ -6069,8 +7000,8 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
    * 两条路径都复用同一个恢复实现（算法不变），只是**反馈分工**不同。
    */
   resultUndoRef.current = (id, origin) => undoExecution(id, true, origin ?? "undo");
-  const resultFacts = useRef({ pendingPlan, authorizationRevision });
-  resultFacts.current = { pendingPlan, authorizationRevision };
+  const resultFacts = useRef({ pendingPlan, pendingPlanMessageId, authorizationRevision });
+  resultFacts.current = { pendingPlan, pendingPlanMessageId, authorizationRevision };
   /*
    * 结果审阅通道：计划就绪即在**既有授权范围内**执行到主表，随后由固定操作条
    * 承担「双视图对比 / 放弃变更 / 确认变更」。
@@ -6112,8 +7043,8 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
       /*
        * 执行前只留**内存快照**，不建副本。
        *
-       * 旧写法在这里就 `stageWpsNativeComparison(..., true)`：于是"宿主支持工作表复制"
-       * 变成了写入的前置条件，用户根本没点双视图也会被挡下（真机与替身都会）。
+       * 旧实现（已删）在这里就直接建副本：于是"宿主支持工作表复制"变成了写入的前置条件，
+       * 用户根本没点双视图也会被挡下（真机与替身都会）。
        * 副本改在 `showBefore` 里建 —— 那是用户真的要看执行前状态的时候。
        */
       prepare: async () => {
@@ -6138,8 +7069,8 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
          * 只有用户**真的**点「双视图对比」时才建立副本，而且必须按**执行前快照**重建。
          *
          * 不能拿"复制当前表"当执行前副本：执行已经发生，复制到的是执行后状态，
-         * 对比就失去意义；`stageWpsNativeComparison(..., true)` 还会拿预览快照去比对
-         * 已经变过的原表而直接抛错。所以走 `stageWpsBeforeComparison`。
+         * 对比就失去意义；拿预览快照去比对已经变过的原表还会直接抛错。所以走
+         * `stageWpsBeforeComparison`。
          */
         const staged = stageWpsBeforeComparison(getWpsApplication(), before, currentMarkFormula ?? undefined);
         /*
@@ -6621,7 +7552,7 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
     if (verdict === "changed") {
       // 范围确实变了：原需求还回去，让用户按新范围重发。
       setPrompt(clarification.originalPrompt);
-      setClarificationDraft("");
+      setClarificationChoice(null);
     } else {
       // 证明不了：把原需求连同他刚写的回答一起放回输入框，
       // 他确认范围后直接发送即为一轮**全新**请求（重新读取、规划、预览），
@@ -6631,8 +7562,7 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
           ? `${clarification.originalPrompt}\n补充确认：${preservedAnswer}`
           : clarification.originalPrompt
       );
-      setClarificationDraft(preservedAnswer ?? "");
-    }
+          }
     return verdict;
   };
 
@@ -6858,7 +7788,7 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
     if (lastTurnFailedRef.current) markTaskInterrupted(targetMessageId);
   };
 
-  const resolveClarificationWithText = async (submittedAnswer = clarificationDraft) => {
+  const resolveClarificationWithText = async (submittedAnswer = prompt) => {
     if (!clarification || !submittedAnswer.trim() || busy) return;
     if (!(await targetGuard.check())) return;
     const answer = submittedAnswer.trim();
@@ -7038,7 +7968,7 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
           : item
       ));
       setClarification(null);
-      setClarificationDraft("");
+      setClarificationChoice(null);
       // 系统说明，不是答案：只进消息流，不写进任何卡片的 `answer`。
       append({ role: "system", text: REAUTHORIZATION_NOTICE });
       if (canResumeLocal && localResume) {
@@ -7149,7 +8079,7 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
     ));
     if (clarification?.messageId === message.id) {
       setClarification(null);
-      setClarificationDraft("");
+      setClarificationChoice(null);
     }
   };
 
@@ -7293,7 +8223,7 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
         : message
     ));
     setClarification(null);
-    setClarificationDraft("");
+    setClarificationChoice(null);
   };
 
   const closeModelSettings = () => {
@@ -7716,6 +8646,155 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
     </section>
   );
 
+  /**
+   * 审阅栏节点只构造一次：有决定要做时它是固定区域的主视图；只是**状态**
+   * （未执行 / 正在执行 / 需要核对）时单独排在容器上方，不参与主视图竞争。
+   */
+  const wpsReviewBarNode = (
+    <ResultReviewBar state={resultReviewState} title={resultTitle}
+      onCompare={() => void resultReview.compare(resultReviewState.key ?? '')}
+      onConfirm={() => void resultReview.confirm(resultReviewState.key ?? '')}
+      onDiscard={() => void resultReview.discard(resultReviewState.key ?? '')}
+      onRetryMarker={() => void resultReview.retryMarkerCleanup(resultReviewState.key ?? '')} />
+  );
+
+  /**
+   * 固定区域里的**恢复视图**（三张卡：已选定的恢复、多候选、读不到）。
+   *
+   * 三件事：
+   *  - 位置：从消息流搬到输入区上方的固定区域（与 Excel 2026-10-29 的修法一致）。
+   *    卡在消息末尾时，点一下追加的日志会把入口顶出视口 —— 而"要用户点的那一下"
+   *    绝不能住在某条历史消息下面。
+   *  - 按钮：`核对 / 继续` 已经搬到输入框右下角那颗主按钮，卡面只留一句话指路，
+   *    外加 `replan / dismiss / backfill`（它们既不是核对也不是续跑）与"重新核对（只读）"。
+   *  - 多候选照旧**一条也不自动挑**：候选行只显示执行身份、时间与进度。
+   */
+  const wpsRecoveryViewNode = (
+    <>
+      {/*
+        终态（撤销确认 / 放弃 / 收尾）**不占固定区域**：结论、进度与边界说明一律
+        移到消息流里的只读历史记录（有归属消息挂在结果卡内、无归属消息单独一条），
+        固定区域这里一个像素都不画 —— 它已经没有下一步可做，不该再和"还有 N 项"抢版面。
+      */}
+      {wpsRecovery && wpsRecoveryTerminal === null && (
+        <article className="wps-write-recovery" role="status">
+          <div className="wps-write-recovery-head">
+            <strong>{EXECUTION_RECOVERY_TITLE}</strong>
+            <span className={`wps-write-recovery-badge wps-write-recovery-${wpsRecovery.verdict.kind}`}>
+              {executionRecoveryBadge(wpsRecovery.verdict)}
+            </span>
+          </div>
+          {wpsRecovery.identity.kind !== "match" && (
+            <p className="wps-write-recovery-detail">{wpsRecovery.identity.detail}</p>
+          )}
+          <p className="wps-write-recovery-detail">
+            {wpsRecovery.checking
+              ? "正在查询服务端写入现场…"
+              : WPS_RECOVERY_DETAIL(wpsRecovery.verdict)}
+          </p>
+          <p className="wps-write-recovery-detail">
+            {executionRecoveryNote(wpsRecovery.verdict)}
+          </p>
+          {/*
+           * 按钮**只**来自判定给的 `wpsReconcileActions`，并去掉已搬到主按钮的
+           * `reconcile / resume`：判定说证据不足/现场冲突就一个写入或补记按钮都不画，
+           * "继续"只在真的能安全续跑时出现（在主按钮上）。
+           */}
+          {wpsRecovery.verdict.kind === "replan" && <label>
+            <input type="checkbox" checked={recoveryScopeConfirmed}
+              onChange={(event) => setRecoveryScopeConfirmed(event.target.checked)} />
+            使用当前已选工作表重新读取和规划；校验通过后执行，再审阅结果。
+          </label>}
+          <div className="wps-write-recovery-actions">
+            {(wpsRecovery.verdict.kind === "reconcile" || wpsRecovery.verdict.kind === "resume") && (
+              <p className="wps-recovery-primary-hint" data-recovery-primary-hint={wpsRecovery.verdict.kind}>
+                {wpsRecovery.verdict.kind === "reconcile"
+                  ? "下一步「核对」在输入框右下角：只查现场、不写任何单元格。"
+                  : "下一步「继续」在输入框右下角：只执行剩下的动作，已写过的不会重写。"}
+              </p>
+            )}
+            {wpsReconcileActions(wpsRecovery.verdict)
+              .filter((action) => action !== "reconcile" && action !== "resume")
+              .map((action) => (
+                <button
+                  key={action}
+                  className="wps-recovery-action"
+                  type="button"
+                  disabled={busy || wpsRecovery.checking || wpsRecovery.acting || (action === "replan" && !recoveryScopeConfirmed)}
+                  onClick={() => void runWpsRecoveryAction(action)}
+                >
+                  {WPS_RECOVERY_ACTION_LABEL[action]}
+                </button>
+              ))}
+            {(wpsRecovery.verdict.kind === "blocked" || wpsRecovery.verdict.kind === "insufficient") &&
+              <button type="button" disabled={busy || wpsRecovery.checking || wpsRecovery.acting}
+                onClick={() => void refreshWpsRecovery()}>重新核对（只读）</button>}
+          </div>
+          {/*
+           * 开发诊断（仅 DEV，收起状态）。只放原因码与计数，不放任何单元格内容。
+           * 用 `<details>` 而不是按钮：不往动作区里塞可执行项。
+           */}
+          {import.meta.env.DEV && (
+            <details className="wps-recovery-diag">
+              <summary>开发诊断（仅 DEV）</summary>
+              <pre>{wpsRecoveryDiagnosticReport()}</pre>
+            </details>
+          )}
+        </article>
+      )}
+
+      {wpsRecoveryChoices && (
+        <article className="wps-write-recovery" role="status">
+          <div className="wps-write-recovery-head">
+            <strong>这个工作簿有未完成的写入</strong>
+            <span className="wps-write-recovery-badge wps-write-recovery-insufficient">需要选择</span>
+          </div>
+          <p className="wps-write-recovery-detail">{PENDING_DISCOVERY_CHOOSE_DETAIL}</p>
+          {wpsRecoveryChoices.truncated && (
+            <p className="wps-write-recovery-detail">{PENDING_DISCOVERY_TRUNCATED_DETAIL}</p>
+          )}
+          <div className="wps-recovery-candidates">
+            {wpsRecoveryChoices.candidates.map((candidate) => (
+              <button
+                key={candidate.operationId}
+                type="button"
+                className="wps-recovery-candidate"
+                disabled={busy}
+                onClick={() => void selectWpsRecoveryCandidate(candidate)}
+              >
+                <span className="wps-recovery-candidate-id">{shortWpsOperationId(candidate.operationId)}</span>
+                <span className="wps-recovery-candidate-progress">{pendingExecutionCandidateLabel(candidate)}</span>
+                <span className="wps-recovery-candidate-time">{pendingCandidateTimeLabel(candidate.updatedAt)}</span>
+              </button>
+            ))}
+          </div>
+          <div className="wps-write-recovery-actions">
+            <button type="button" className="wps-recovery-action" disabled={busy}
+              onClick={() => void refreshWpsDiscovery()}>重新核对（只读）</button>
+          </div>
+        </article>
+      )}
+
+      {/*
+       * 查不到 ≠ 没有。服务不可达 / 身份被拒 / 响应不合规时给出这一张，
+       * 文案明确"暂时读不到"，绝不写成"没有未完成任务"。
+       */}
+      {wpsDiscoveryFailure && !wpsRecovery && !wpsRecoveryChoices && (
+        <article className="wps-write-recovery" role="status">
+          <div className="wps-write-recovery-head">
+            <strong>上次写入的恢复核对</strong>
+            <span className="wps-write-recovery-badge wps-write-recovery-insufficient">暂时读不到</span>
+          </div>
+          <p className="wps-write-recovery-detail">{wpsDiscoveryFailure}</p>
+          <div className="wps-write-recovery-actions">
+            <button type="button" className="wps-recovery-action" disabled={busy}
+              onClick={() => void refreshWpsDiscovery()}>重新核对（只读）</button>
+          </div>
+        </article>
+      )}
+    </>
+  );
+
   return (
     <section className="wps-chat-shell chat-shell">
       {targetGuard.notice && !onOpenScope && <AuthorizedTargetConfirmation notice={targetGuard.notice}
@@ -7897,7 +8976,7 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
                 <div className="more-menu-backdrop" aria-hidden="true" onClick={() => setMoreMenuOpen(false)} />
                 <div className="view-menu" role="menu" aria-label="更多">
                   <button type="button" role="menuitem" aria-label="历史对话" onClick={() => { setMoreMenuOpen(false); setHistoryOpen(true); }}>
-                    <strong>历史对话</strong><span>查看当前 WPS 会话记录</span>
+                    <strong>历史对话</strong><span>{HISTORY_MENU_DESCRIPTION}</span>
                   </button>
                   <button type="button" role="menuitem" onClick={() => { setMoreMenuOpen(false); setRuleManagerOpen(true); }}>
                     <strong>EB 函数说明</strong><span>查看内置 =EB() 函数用法</span>
@@ -8131,6 +9210,12 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
         </aside>
       )}
 
+      {pendingDeleteConversationId && chatHistory.conversations
+        .filter((conversation) => conversation.id === pendingDeleteConversationId)
+        .map((conversation) => <HistoryDeleteDialog key={conversation.id}
+          title={conversation.title} onCancel={() => setPendingDeleteConversationId(null)}
+          onConfirm={confirmDeleteConversation} disabled={busy} />)}
+
       <div className={`message-stream-shell${newConversationNotice ? " conversation-starting" : ""}`}>
       {newConversationNotice && (
         <div className="new-conversation-toast" role="status">
@@ -8160,11 +9245,17 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
           </article>
         )}
 
-        {messages.map((message) => (
+        {messages.map((message, messageIndex) => (
+          answeringClarification && clarification?.messageId === message.id
+            && message.clarification?.status === "pending" && !clarification.localMapping ? null :
           <Fragment key={message.id}>
             <article className={`message-row ${message.role}`} data-message-id={message.id}>
               <div className="message-content">
-              {message.role === "assistant" && (
+              {message.role === "assistant" && !(
+                !message.text && isCompactMessageProcess(message.activityLog)
+                && messages[messageIndex + 1]?.role === "assistant"
+                && messages[messageIndex + 1]?.text?.trim()
+              ) && (
                 <div className="message-author">
                   Excel Bro
                   {message.resultContext ? <em>本地工具</em>
@@ -8261,37 +9352,14 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
                           onCancel={cancelClarification}
                         />
                       ) : (<>
-                      <div className="clarification-options">
-                        {message.clarification.options.map((option, index) => (
-                          <button type="button" key={index} disabled={busy} onClick={() => void resolveClarification(index)}>
-                            <strong>{option.label}</strong>
-                            <span>{option.description}</span>
-                          </button>
-                        ))}
-                      </div>
-                      {message.clarification.fields?.length ? (
-                        <ClarificationFields fields={message.clarification.fields}
-                          values={clarificationFieldDrafts} busy={busy}
-                          onChange={setClarificationFieldDrafts}
-                          onSubmit={(answer) => void resolveClarificationWithText(answer)} />
-                      ) : <>
-                      <span className="clarification-custom-hint">其他想法也可以直接说明</span>
-                      <div className="clarification-custom-input">
-                        <textarea
-                          aria-label="其他想法"
-                          value={clarificationDraft}
-                          placeholder="补充你希望我怎么处理…"
-                          onChange={(event) => setClarificationDraft(event.target.value)}
-                          onKeyDown={(event) => {
-                            if (event.key === "Enter" && !event.shiftKey) {
-                              event.preventDefault();
-                              void resolveClarificationWithText();
-                            }
-                          }}
-                        />
-                        <button type="button" disabled={!clarificationDraft.trim() || busy} onClick={() => void resolveClarificationWithText()}>发送</button>
-                      </div>
-                      </>}
+                      {/*
+                        选项与自由输入都搬到输入框内部了（`ClarificationComposer`）：
+                        那是"正在回答"的地方，紧贴输入框；消息里只留问题本身当上下文。
+                        这里给一句话指路，不画第二份按钮 —— 同一个动作只该有一个入口。
+                      */}
+                      <p className="clarification-answer-hint">
+                        在输入框上方选择或补充，按右下角「发送回答」提交。
+                      </p>
                       <div className="clarification-actions">
                         <button type="button" disabled={busy} onClick={cancelClarification}>取消本次澄清</button>
                       </div>
@@ -8396,22 +9464,22 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
                         !(planningPauseReload?.turnId === message.planningPause!.turnId &&
                           planningPauseReload.checking === false && planningPauseReload.canRecheck === false) &&
                         !(active && view?.canContinue && view.action === "continue_checkpoint") ? (
+                      /*
+                       * 「核对任务状态」已经搬到输入框右下角那颗主按钮上（同一个动作
+                       * 不再有两个入口）。卡面只留原因与指路 —— 输入框有字时那颗按钮
+                       * 发的是新需求，所以这里必须写清"清空输入框后"。
+                       */
                       <div className="wps-planning-pause-actions">
-                        <button type="button" disabled={busy} onClick={() => {
-                          void inspectPlanningMessage(message);
-                        }}>核对任务状态</button>
-                        <small>{reloadBlocked ?? "先核对原任务；只查询，不自动继续、不写入。"}</small>
+                        <small>
+                          {reloadBlocked ?? "「核对任务状态」在输入框右下角（输入框为空时显示）：只查询，不自动继续、不写入。"}
+                        </small>
                       </div>
                     ) : active && view && view.canContinue && view.action === "continue_checkpoint" ? (
                       <div className="wps-planning-pause-actions">
-                        <button
-                          type="button"
-                          disabled={busy}
-                          onClick={() => void resumePlanningFromPause(planningPause!)}
-                        >
-                          {view.actionLabel || "继续分析"}
-                        </button>
-                        <small>{view.detail}</small>
+                        <small>
+                          {view.detail}
+                          {" "}「{view.actionLabel || "继续分析"}」在输入框右下角（输入框为空时显示）。
+                        </small>
                       </div>
                     ) : (
                       <small className="wps-planning-pause-note">
@@ -8463,6 +9531,32 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
                   )}
                   </ExecutionResultDetails>
                   <small>{SESSION_RECOVERY_NOTICE_PREFIX}；关闭后不能从此卡片撤销。</small>
+                  {/*
+                    终态摘要：这条执行的恢复记录已经结束（撤销确认 / 放弃 / 收尾），
+                    固定区域**不再**显示那张恢复卡 —— 结论、进度与边界说明留在这里，
+                    可展开但不占输入区版面。记录与账本、恢复材料一条都没删。
+                  */}
+                  {wpsRecovery && wpsRecoveryTerminal !== null &&
+                    wpsRecovery.operationId === message.verification.executionId && (
+                    <details
+                      className="wps-recovery-record is-terminal"
+                      aria-label="已结束的恢复记录"
+                      data-recovery-terminal={wpsRecoveryTerminal}
+                    >
+                      <summary>
+                        <strong>{executionRecoveryBadge(wpsRecovery.verdict)}</strong>{" "}
+                        <span>{executionRecoveryTerminalSummary(wpsRecovery.verdict)}</span>
+                      </summary>
+                      <p>{WPS_RECOVERY_DETAIL(wpsRecovery.verdict)}</p>
+                      <p>
+                        {executionRecoveryProgress(wpsRecovery.verdict, {
+                          nextActionIndex: wpsRecovery.state?.nextActionIndex ?? 0,
+                          totalActions: wpsRecovery.state?.totalActions ?? message.verification.actionCount
+                        })}
+                      </p>
+                      <p>{executionRecoveryNote(wpsRecovery.verdict)}</p>
+                    </details>
+                  )}
                   {/*
                     撤销入口就挂在这张卡里，归属靠 `executionId`。
                     只有"当前会话里的活跃恢复点正是这一次、且允许撤销"才给可点按钮；
@@ -8548,7 +9642,37 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
                   onStop={activeActivityMessageId === message.id && cardPauseButton.canPause
                     ? () => pauseCurrentTurn("card")
                     : undefined}
+                  awaitingAnswer={message.clarification?.status === "pending"}
                 />
+              )}
+              {/*
+                结果摘要**在过程框之外**（与 Excel 同一组件、同一份判据）：
+                过程框收起后只剩一行"已完成 · 12s"，而"改了哪里 / 验证结果 /
+                下一步点哪"必须一直看得见。
+              */}
+              {(message.activityLog || message.verification || message.changeReviewExecutionId) && (
+                <ProcessResultSummary input={{
+                  live: activeActivityMessageId === message.id,
+                  phase: processOutcomePhaseFrom({
+                    undone: message.verification?.status === "undone",
+                    reviewPhase: message.id === lastExecutionMessageId ? resultReviewState.phase : null
+                  }),
+                  reviews: message.changeReviewExecutionId
+                    ? changeReviewsRef.current.get(message.changeReviewExecutionId) ?? null
+                    : null,
+                  /*
+                   * WPS 的回执是**档位**不是计数（回读通过 / 计算值未获证实 /
+                   * 部分写入），没有"通过了几项"可数。硬凑一个分母就是在编数字，
+                   * 所以这里传它自己已有的那句结论（`WPS_EXECUTION_OUTCOME_LABEL`）。
+                   */
+                  verification: null,
+                  verificationNote: message.verification &&
+                    message.verification.status !== "undone"
+                    ? WPS_EXECUTION_OUTCOME_LABEL[
+                        normalizeWpsExecutionOutcome(message.verification.outcome)
+                      ]
+                    : null
+                }} />
               )}
               {/*
                 删表结果卡只画在**发起这次删除的那条消息**下面。
@@ -8594,52 +9718,32 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
           那里会标明它属于哪一次执行。
         */}
 
-        {wpsRecovery && (
-          <article className="wps-write-recovery" role="status">
-            <div className="wps-write-recovery-head">
-              <strong>上次写入的恢复核对</strong>
-              <span className={`wps-write-recovery-badge wps-write-recovery-${wpsRecovery.verdict.kind}`}>
-                {wpsRecovery.verdict.kind === "completed" && wpsRecovery.verdict.recorded
-                  ? "已记录完成" : WPS_RECONCILE_LABEL[wpsRecovery.verdict.kind]}
-              </span>
-            </div>
-            {wpsRecovery.identity.kind !== "match" && (
-              <p className="wps-write-recovery-detail">{wpsRecovery.identity.detail}</p>
-            )}
-            <p className="wps-write-recovery-detail">
-              {wpsRecovery.checking
-                ? "正在查询服务端写入现场…"
-                : WPS_RECOVERY_DETAIL(wpsRecovery.verdict)}
+        {/*
+          终态（撤销确认 / 放弃 / 收尾）但**找不到归属消息**（跨重启 / 换会话）：
+          结论不能因为"历史里没有那张写入结果卡"就被丢掉。这里在消息流里渲染
+          一条**只读**终态摘要，不占固定区域、没有按钮、不形成待办 chip。
+          有归属消息时这条不画（摘要已经挂在结果卡内，见上方 map 里的
+          `wps-recovery-record is-terminal`），同一 executionId 只在消息流出现一次。
+        */}
+        {wpsRecovery && wpsRecoveryTerminal !== null && wpsRecoveryHomeMessageId === null && (
+          <details
+            className="wps-recovery-record is-terminal"
+            aria-label="已结束的恢复记录"
+            data-recovery-terminal={wpsRecoveryTerminal}
+          >
+            <summary>
+              <strong>{executionRecoveryBadge(wpsRecovery.verdict)}</strong>{" "}
+              <span>{executionRecoveryTerminalSummary(wpsRecovery.verdict)}</span>
+            </summary>
+            <p>{WPS_RECOVERY_DETAIL(wpsRecovery.verdict)}</p>
+            <p>
+              {executionRecoveryProgress(wpsRecovery.verdict, {
+                nextActionIndex: wpsRecovery.state?.nextActionIndex ?? 0,
+                totalActions: wpsRecovery.state?.totalActions ?? 0
+              })}
             </p>
-            <p className="wps-write-recovery-detail">
-              恢复只使用当前已授权工作表；续跑通过复核后执行剩余动作，再审阅结果。
-            </p>
-            {/*
-             * 按钮**只**来自判定给的 `wpsReconcileActions`：判定说证据不足/现场冲突
-             * 就一个写入或补记按钮都不画，"继续"只在真的能安全续跑时出现。
-             */}
-            {wpsRecovery.verdict.kind === "replan" && <label>
-              <input type="checkbox" checked={recoveryScopeConfirmed}
-                onChange={(event) => setRecoveryScopeConfirmed(event.target.checked)} />
-              使用当前已选工作表重新读取和规划；校验通过后执行，再审阅结果。
-            </label>}
-            <div className="wps-write-recovery-actions">
-              {wpsReconcileActions(wpsRecovery.verdict).map((action) => (
-                <button
-                  key={action}
-                  className="wps-recovery-action"
-                  type="button"
-                  disabled={busy || wpsRecovery.checking || wpsRecovery.acting || (action === "replan" && !recoveryScopeConfirmed)}
-                  onClick={() => void runWpsRecoveryAction(action)}
-                >
-                  {WPS_RECOVERY_ACTION_LABEL[action]}
-                </button>
-              ))}
-              {(wpsRecovery.verdict.kind === "blocked" || wpsRecovery.verdict.kind === "insufficient") &&
-                <button type="button" disabled={busy || wpsRecovery.checking || wpsRecovery.acting}
-                  onClick={() => void refreshWpsRecovery()}>重新核对（只读）</button>}
-            </div>
-          </article>
+            <p>{executionRecoveryNote(wpsRecovery.verdict)}</p>
+          </details>
         )}
 
         {(progress || writeProgress) && !activeActivityMessageId && progressCard}
@@ -8682,16 +9786,25 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
       {scopeOverlay ? <div className="scope-layer">{scopeOverlay}</div> : null}
 
       <footer className="composer">
-        <ResultReviewBar state={resultReviewState} title={resultTitle}
-          onCompare={() => void resultReview.compare(resultReviewState.key ?? '')}
-          onConfirm={() => void resultReview.confirm(resultReviewState.key ?? '')}
-          onDiscard={() => void resultReview.discard(resultReviewState.key ?? '')}
-          onRetryMarker={() => void resultReview.retryMarkerCleanup(resultReviewState.key ?? '')} />
+        {/* 只是状态的审阅栏（未执行 / 正在执行 / 需要核对）单独排在容器上方。 */}
+        {resultReviewVisible(resultReviewState) && !resultReviewNeedsDecision(resultReviewState)
+          ? wpsReviewBarNode
+          : null}
         {targetGuard.notice && onOpenScope && !scopePickerOpen && <TargetScopeNotice notice={targetGuard.notice}
           error={targetGuard.error} busy={targetGuard.confirming} onOpenScope={onOpenScope}
           onRecheck={() => void targetGuard.recheck()}
         />}
         {scopeDock}
+        {/*
+          固定区域 = **一个容器**：审阅与恢复同一时刻只展开一块，另一块退成可点的
+          chip（显式切换，不是隐藏）。澄清回答区不参与折叠 —— 它贴着输入框。
+        */}
+        <ComposerActionDock
+          selection={currentAction}
+          onSwitch={setDockPinned}
+          views={{ review: wpsReviewBarNode, recovery: wpsRecoveryViewNode }}
+        />
+
         {/*
           与 Excel 端同构：把手放在 `.composer-input-region` 的上内边距里（在输入框
           之外），这样它既不会盖住文本区抢走光标，又能整宽拖动。
@@ -8702,31 +9815,76 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
           <div className="composer-resize-handle" {...composerResizeHandleProps}>
             <i />
           </div>
-          <TaskExecutionControls reviewing={resultReviewState.phase === "reviewing"} state={composerPauseButton}
-            pausing={pauseRequestState?.phase === "requesting"}
-            disabled={busy && composerPauseButton.kind === "continue"}
-            onPause={() => pauseCurrentTurn("composer")}
-            onResume={() => void resumeComposerTask()} />
+          <TaskExecutionNotice
+            action={composerPrimary}
+            reviewing={resultReviewState.phase === "reviewing"}
+          />
           <form
-            className="composer-box"
+            className={`composer-box${answeringClarification ? " is-answering" : ""}`}
             onSubmit={(event) => {
               event.preventDefault();
               void submitComposer();
             }}
           >
+        {clarification && !clarification.localMapping && (
+          <div className={answeringClarification ? "clarification-answer-region" : "clarification-answer-region is-bypassed"}>
+            {answeringClarification ? (
+              <ClarificationComposer
+                question={
+                  messages.find((message) => message.id === clarification.messageId)
+                    ?.clarification?.question ?? ""
+                }
+                options={clarification.options.map((option, index) => ({
+                  id: String(index), label: option.label, description: option.description,
+                  resolution: option.resolution
+                }))}
+                selected={clarificationSelectedIndex === null ? [] : [String(clarificationSelectedIndex)]}
+                multiple={false}
+                fields={clarificationFields}
+                fieldValues={clarificationFieldDrafts}
+                freeText={prompt}
+                busy={busy}
+                onToggle={(optionId) => { setPrompt(""); toggleClarificationChoice(Number(optionId)); }}
+                onFieldChange={setClarificationFieldDrafts}
+              />
+            ) : (
+              <p className="clarification-answer-hint">
+                这道题还没回答；你正在输入的内容会作为**新需求**发送。
+              </p>
+            )}
+            {/*
+              显式逃生口：不回答、只想换个需求时用。**不按文字猜**是这里的纪律 ——
+              猜错的代价是用户的话被塞成旧问题的答案。
+            */}
+
+          </div>
+        )}
             <textarea
               ref={composerInputRef}
               aria-label="给 Excel Bro 发消息"
+              data-clarification-other={answeringClarification ? "true" : undefined}
               value={prompt}
               disabled={busy}
-              placeholder="描述你想查询、分析或修改的内容…"
-              onChange={(event) => setPrompt(event.target.value)}
-              onPaste={(event) => { if (!busy) handleImagePaste(event); }}
+              placeholder={answeringClarification ? "其他" : "描述你想查询、分析或修改的内容…"}
+              onChange={(event) => { if (answeringClarification && event.target.value.trim()) setClarificationChoice(null); setPrompt(event.target.value); }}
+              onPaste={(event) => { if (!busy && !answeringClarification) handleImagePaste(event); }}
               onKeyDown={(event) => {
-                if (event.key === "Enter" && !event.shiftKey) {
-                  event.preventDefault();
-                  void submitComposer();
-                }
+                /*
+                 * 输入法组合中的 Enter 是"选定候选词"，不是"发送"。三道判据缺一不可：
+                 * `isComposing`（Chromium/Edge 可靠）、React 侧的同一标记、
+                 * 以及部分输入法在组词结束那一拍只留的 `keyCode === 229`。
+                 */
+                if (event.nativeEvent.isComposing ||
+                  (event.nativeEvent as unknown as { isComposing?: boolean }).isComposing ||
+                  event.nativeEvent.keyCode === 229) return;
+                if (event.key !== "Enter" || event.shiftKey) return;
+                /*
+                 * 回车只表达"把这段话发出去"：分派跟着右下角那颗按钮的判据走。
+                 * 暂停/继续/核对形态下回车什么也不做 —— 绝不顺手暂停或继续。
+                 */
+                if (composerPrimary.invoke !== "send" && composerPrimary.invoke !== "answer") return;
+                event.preventDefault();
+                void invokeComposerPrimary(composerPrimary.invoke);
               }}
             />
             {pendingImages.length > 0 && <div className="composer-attachments">
@@ -8748,7 +9906,7 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
                   event.target.value = "";
                   if (!busy) void addImageFiles(files);
                 }} />
-              <div className="composer-tools-left">
+              <div className="composer-tools-left" hidden={answeringClarification}>
                 <button type="button" className="attach-image-button" aria-label="添加图片"
                   title="添加图片，也可以粘贴或拖入截图" disabled={busy || preparingImages}
                   onClick={() => imageInputRef.current?.click()}>
@@ -8759,12 +9917,18 @@ const confirmPendingPlan = async (direct = false, afterExecutionReview = false):
                   </svg>
                 </button>
               </div>
-              <span className="composer-shortcut-hint">Enter 发送 · Shift + Enter 换行 · 可粘贴截图</span>
-              <button className="send-button composer-send-button" type="submit"
-                aria-label="发送" title="发送这条需求"
-                disabled={busy || preparingImages ||
-                  (!pendingImages.length && !prompt.trim()) ||
-                  (pendingImages.length > 0 && !selectedModel?.supportsVision) || selectedSheetIndexes.length === 0}>↑</button>
+              <span hidden={answeringClarification} className="composer-shortcut-hint">{composerHint}</span>
+              {answeringClarification && (<button type="button" className="clarification-bypass-toggle" disabled={busy}
+              onClick={() => { cancelClarification(); setPrompt(""); setClarificationFieldDrafts({}); }}>
+              取消本次任务
+            </button>)}
+              <ComposerPrimaryButton
+                className="send-button composer-send-button"
+                action={composerPrimary}
+                onInvoke={(invoke) => void invokeComposerPrimary(invoke)}
+                disabled={composerPrimaryBlocked !== null}
+                disabledHint={composerPrimaryBlocked ?? undefined}
+              />
             </div>
             {/*
               暂停请求的阶段**如实**显示，挂在工具条**外面**（工具条是三列网格，

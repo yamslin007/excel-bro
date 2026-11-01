@@ -1,0 +1,187 @@
+/* 两端共用的输入框内问答面板；长问题与选项内部滚动，底部发送区保持可见。 */
+.clarification-composer {
+  display: grid;
+  gap: 7px;
+  padding: 8px 0 2px;
+  border-top: 1px dashed var(--color-border);
+}
+
+.clarification-composer-question {
+  margin: 0;
+  color: var(--color-text-primary);
+  font-size: var(--font-size-caption);
+  line-height: 1.45;
+  /* 长问题折行而不是把选项挤出去。 */
+  overflow-wrap: anywhere;
+}
+
+/*
+ * 选项条：横向排布的"胶囊"，可以换行。
+ *
+ * 之所以不用纵向大卡：这一条的职责是"快速选一个"，纵向大卡会把输入框顶走，
+ * 正是本轮要消除的那种堆叠。
+ */
+.clarification-composer .clarification-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.clarification-composer .clarification-options > button {
+  display: grid;
+  gap: 1px;
+  max-width: 100%;
+  padding: 5px 9px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text-primary);
+  font: inherit;
+  font-size: var(--font-size-caption);
+  line-height: 1.35;
+  text-align: left;
+  cursor: pointer;
+}
+
+/* 选中态靠边框与字重，不靠填充色块：输入区已经够花了。 */
+.clarification-composer .clarification-options > button[data-selected="true"] {
+  border-color: var(--color-brand-border, var(--color-border));
+  box-shadow: inset 0 0 0 1px var(--color-brand-border, var(--color-border));
+}
+
+.clarification-composer .clarification-options > button[data-selected="true"] strong {
+  color: var(--color-brand-text);
+  font-weight: 600;
+}
+
+.clarification-composer .clarification-options > button span {
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-caption);
+}
+
+.clarification-composer .clarification-options > button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+/*
+ * 「将发送：…」这一行。
+ *
+ * 它不是装饰：点选只选中、按发送才提交之后，用户需要一个地方确认
+ * "我现在按下发送，发出去的到底是什么"。必填没填完时这句话变成"还差哪几项"。
+ */
+.clarification-composer-preview {
+  margin: 0;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-caption);
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.clarification-composer-preview[data-ready="true"] {
+  color: var(--color-brand-text);
+}
+
+/* 多字段：与选项同一层，宽度撑满，避免长文本被挤成窄条。 */
+.clarification-composer .clarification-fields {
+  display: grid;
+  gap: 6px;
+}
+
+.clarification-composer .clarification-fields label {
+  display: grid;
+  gap: 3px;
+  font-size: var(--font-size-caption);
+}
+
+.clarification-composer .clarification-fields textarea {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 5px 7px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text-primary);
+  font: inherit;
+  font-size: var(--font-size-caption);
+  resize: none;
+  overflow-y: auto;
+  max-height: 88px;
+}
+
+/* 使用 composer-box 限定位置，避免重新出现输入框外的固定问答大卡。 */
+.composer-box.is-answering { gap: 6px; }
+.composer-box .clarification-answer-region {
+  min-width: 0;
+  min-height: 0;
+  max-height: min(300px, 34vh);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+.composer-box .clarification-composer { border: 0; padding: 4px 6px; gap: 10px; }
+.composer-box .clarification-composer-heading {
+  display: grid; gap: 6px; padding: 2px 0 10px;
+  border-bottom: 1px solid var(--color-border, #e5e5e3);
+}
+.composer-box .clarification-composer-mode { color: var(--color-brand-text, #2f6b47); font-size: 12px; font-weight: 600; }
+.composer-box .clarification-composer-question { font-size: 14px; font-weight: 600; line-height: 1.5; }
+.composer-box .clarification-options { display: grid; grid-template-columns: minmax(0, 1fr); gap: 7px; }
+.composer-box .clarification-options > button {
+  position: relative; width: 100%; min-height: 48px; padding: 10px 12px;
+  border-radius: 12px; background: var(--color-bg-secondary, #fafaf9);
+  overflow-wrap: anywhere;
+}
+.composer-box .clarification-options > button:focus-visible { outline: 2px solid var(--color-brand-text, #2f6b47); outline-offset: -2px; }
+.composer-box .clarification-bypass-toggle {
+  display: inline-block; margin: 5px 6px; padding: 3px 0; border: 0;
+  background: transparent; color: var(--color-text-secondary, #787975);
+  font: inherit; font-size: 12px; text-decoration: underline; cursor: pointer;
+}
+.composer-box .clarification-bypass-toggle:disabled { opacity: .5; cursor: default; }
+.composer-box.is-answering > textarea {
+  /* 覆盖拖动/自动增高 hook 的内联高度上限，回答框不挤走工具栏。 */
+  min-height: 44px; max-height: 72px !important; overflow-y: auto !important;
+  border-top: 1px solid var(--color-border, #e5e5e3); padding-top: 8px;
+}
+.composer-box .clarification-fields textarea { max-height: 88px; overflow-y: auto; }
+
+/* 回答模式替换普通输入：整块框选，不显示单选圆钮。 */
+.composer-box.is-answering .clarification-options > button { padding: 10px 12px; }
+.composer-box.is-answering .clarification-options > button::before { content: none; }
+.composer-box.is-answering .clarification-options > button[data-selected="true"] {
+  background: var(--color-brand-light, #edf5ef);
+  border-color: var(--color-brand-text, #2f6b47);
+}
+.composer-box.is-answering > textarea[data-clarification-other] {
+  border: 1px solid var(--color-border, #dededb); border-radius: 10px;
+  min-height: 44px; height: 48px !important; padding: 10px 12px;
+}
+.composer-box.is-answering .composer-tools-left[hidden] { display: none; }
+.composer-box.is-answering .composer-toolbar { grid-template-columns: 1fr auto; }
+
+/* 问题与标签同一行；取消与提交固定在同一操作行。 */
+.composer-box .clarification-composer-heading {
+  display: flex; align-items: baseline; gap: 8px;
+}
+.composer-box .clarification-composer-mode { flex: 0 0 auto; white-space: nowrap; }
+.composer-box .clarification-composer-question { min-width: 0; margin: 0; }
+.composer-box.is-answering .composer-shortcut-hint[hidden] { display: none; }
+.composer-box.is-answering .composer-toolbar {
+  display: flex; justify-content: flex-end; align-items: center; gap: 8px;
+}
+.composer-box.is-answering .composer-toolbar .clarification-bypass-toggle {
+  margin: 0; padding: 0 14px; min-height: 32px; border: 1px solid var(--color-border, #dededb);
+  border-radius: 10px; background: transparent; color: var(--color-text-primary);
+  font-size: 13px; text-decoration: none; white-space: nowrap;
+}
+
+/* 标题固定，仅选项/字段区域滚动；其他输入与操作行留在外部。 */
+.composer-box .clarification-answer-region { overflow: hidden; scrollbar-gutter: auto; }
+.composer-box .clarification-composer {
+  display: flex; flex-direction: column; max-height: min(300px, 34vh); box-sizing: border-box;
+}
+.composer-box .clarification-composer-heading { flex: 0 0 auto; }
+.composer-box .clarification-choices-scroll {
+  min-height: 0; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable;
+}

@@ -4,6 +4,7 @@ import {
   TASK_WRITE_STATE_LABEL,
   isTaskResumeRecord,
   newTaskId,
+  planSettlesExecution,
   sanitizeTaskResumeRecord,
   taskResumeDecision,
   withTaskResumeConfirmation,
@@ -315,5 +316,75 @@ describe("任务身份与状态推进", () => {
     });
     expect(twice.confirmations).toHaveLength(1);
     expect(sanitizeTaskResumeRecord(twice)).not.toBeNull();
+  });
+});
+
+describe("恢复收尾只能清掉自己那份待执行计划", () => {
+  /*
+   * 真机 2026-10-28：同会话中断→核对→续跑→确认之后，`pendingPlan` 没被收尾，
+   * 新任务一直被"请先确认或取消当前写入计划"挡住。修好之后必须同时钉住反面：
+   * **不许**因为"当前正好有一份 pendingPlan"就把它清掉 —— 那可能是另一个任务的
+   * 新计划，清掉它等于让新任务趁虚而入。
+   */
+  const planA = {id: "plan-a"};
+  const planB = {id: "plan-b"};
+  const binding = {plan: planA, messageId: "msg-a", operationId: "wps-execution-a"};
+
+  it("同一个计划对象 + 同一个执行身份 + 同一条消息：收尾", () => {
+    expect(planSettlesExecution({
+      binding,
+      pendingPlan: planA,
+      pendingPlanMessageId: "msg-a",
+      operationId: "wps-execution-a"
+    })).toBe(true);
+  });
+
+  it("计划已换成另一份：什么都不做（按引用比，不看字段像不像）", () => {
+    // 结构完全一样的新对象也必须被拒：重新规划一定产生新对象。
+    expect(planSettlesExecution({
+      binding,
+      pendingPlan: {...planA},
+      pendingPlanMessageId: "msg-a",
+      operationId: "wps-execution-a"
+    })).toBe(false);
+    expect(planSettlesExecution({
+      binding,
+      pendingPlan: planB,
+      pendingPlanMessageId: "msg-b",
+      operationId: "wps-execution-a"
+    })).toBe(false);
+  });
+
+  it("执行身份对不上：不收尾", () => {
+    expect(planSettlesExecution({
+      binding,
+      pendingPlan: planA,
+      pendingPlanMessageId: "msg-a",
+      operationId: "wps-execution-b"
+    })).toBe(false);
+  });
+
+  it("计划消息换了：归属说不清，不收尾", () => {
+    expect(planSettlesExecution({
+      binding,
+      pendingPlan: planA,
+      pendingPlanMessageId: "msg-other",
+      operationId: "wps-execution-a"
+    })).toBe(false);
+  });
+
+  it("没有绑定、或当前根本没有待执行计划：不收尾", () => {
+    expect(planSettlesExecution({
+      binding: null,
+      pendingPlan: planA,
+      pendingPlanMessageId: "msg-a",
+      operationId: "wps-execution-a"
+    })).toBe(false);
+    expect(planSettlesExecution({
+      binding,
+      pendingPlan: null,
+      pendingPlanMessageId: null,
+      operationId: "wps-execution-a"
+    })).toBe(false);
   });
 });

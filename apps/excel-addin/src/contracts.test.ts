@@ -436,3 +436,57 @@ describe("assertIntentCheckResponse", () => {
     expect(() => assertIntentCheckResponse(response)).not.toThrow();
   });
 });
+
+/*
+ * 多字段澄清（只有 fields、没有 options）的契约断言。
+ *
+ * 这四条原来挂在已删除的 `ClarificationFields.test.tsx` 上 —— 那个组件被
+ * `ClarificationComposer` 完全替代之后，验的其实是**协议**：模型可以只发一张
+ * 表单（选项一个都没有），但空表单 / 重复 id / 空白标签必须被拒。
+ * 组件可以删，协议边界不能跟着删。
+ */
+describe("structured clarification fields", () => {
+  const formOnly = {
+    kind: "clarification",
+    provider: "model",
+    clarification: {
+      id: "q1",
+      summary: "补充统计口径",
+      question: "请填写两个信息",
+      reason: "口径尚未明确",
+      scopeLabel: "当前已选表",
+      options: [],
+      fields: [
+        { id: "scope", label: "时间范围" },
+        { id: "unit", label: "统计单位", placeholder: "说明单位" }
+      ]
+    }
+  };
+
+  it("fields-only 的响应在意图判断与规划两条契约里都合法", () => {
+    expect(() => assertIntentCheckResponse(formOnly)).not.toThrow();
+    expect(() => assertAssistantResponse(formOnly)).not.toThrow();
+  });
+
+  it.each([
+    { label: "空表单", fields: [] },
+    { label: "重复 id", fields: [{ id: "same", label: "a" }, { id: "same", label: "b" }] },
+    { label: "空白标签", fields: [{ id: "x", label: " " }] }
+  ])("没有可用选项时拒绝$label", ({ fields }) => {
+    expect(() =>
+      assertAssistantResponse({ ...formOnly, clarification: { ...formOnly.clarification, fields } })
+    ).toThrow();
+  });
+});
+
+// 新问题最多三个选项，不能在渲染层静默截断第四个答案。
+it("clarification accepts three options and rejects four without truncation", () => {
+  const payload = { kind: "clarification", provider: "model", clarification: {
+    id: "max-options", summary: "确认规则", question: "使用哪种规则？", reason: "需要规则", scopeLabel: "当前任务",
+    options: Array.from({ length: 3 }, (_, i) => ({ id: String(i), label: `规则${i}`, description: "说明", resolution: `选择规则${i}`, resolutionMode: "append" }))
+  }};
+  expect(() => assertIntentCheckResponse(payload)).not.toThrow();
+  payload.clarification.options.push({ ...payload.clarification.options[0], id: "fourth" });
+  expect(() => assertIntentCheckResponse(payload)).toThrow();
+  expect(payload.clarification.options).toHaveLength(4);
+});

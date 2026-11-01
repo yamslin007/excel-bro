@@ -43,7 +43,7 @@ describe("输入框上拉：Excel 与 WPS 同一份实现", () => {
       // 所以这里只找类名本身，不要求 `className="..."` 的形式。
       const region = source.indexOf("composer-input-region");
       const handle = source.indexOf('className="composer-resize-handle"');
-      const box = source.indexOf('className="composer-box"');
+      const box = source.indexOf('composer-box${', handle);
       expect(region).toBeGreaterThan(-1);
       expect(handle).toBeGreaterThan(region);
       expect(box).toBeGreaterThan(handle);

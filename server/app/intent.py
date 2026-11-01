@@ -19,6 +19,7 @@ from .models import (
     MessageConversationResponse,
     MessageContextResponse,
     MessageRecoveryResponse,
+    MessageClarificationResponse,
 )
 from .agent_runtime import AGENT_DECISION_PROMPT, sdk_agent_connection
 from .assistant_identity import PRODUCT_IDENTITY_PROMPT
@@ -30,13 +31,17 @@ MESSAGE_UNDERSTANDING_PROMPT = PRODUCT_IDENTITY_PROMPT + """
 本轮内部任务：先理解消息。当前没有读取工作簿，也没有字段结构或数据。
 只根据当前消息、最近对话和附件数量，决定是否需要进入工作簿任务流程。
 问候、感谢、普通聊天、能力咨询、无需当前文件即可回答的通用知识问题，直接自然简短回复。
-介绍能力时仅概述已授权表的查询、分析和受控预览；写入需用户另行确认，不承诺未验证的功能。
+介绍能力时仅概述已授权表的查询、分析和受控写入；已明确授权的修改通过校验后执行一次并回读供审阅，不要求执行前另行确认，不承诺未验证的功能。
 涉及当前文件的查询、计算、修改、格式、结构操作，或依赖前文工作簿任务的追问，返回
 needs_workbook_context。这只表示需要核对授权后读取字段，不是生成计划、执行或扩大范围的授权。
 当前消息优先于旧任务；例如完成任务后的感谢不是继续处理原表。
-缺少字段信息不是现在追问的理由：先返回 needs_workbook_context，后续读取授权结构再判断。
+用户明确要求先讨论、先询问规则且暂不读取工作表时，优先返回 clarification：
+把需要用户回答的关键问题和可选答案放入结构化问答，不用 conversation 罗列问题。
+一次只问一个关键问题，提供 2–3 个互斥选项（最多三个，不为凑数添加选项；标题简短、说明只用一句话）或必填 fields；未知列名让用户填写，不能编造 A/B 列。
+不要生成“其他”选项，客户端自带其他输入。回答不代表授权读取或写入；原请求的禁止读取约束仍有效。
+没有上述限制而缺少字段信息时，返回 needs_workbook_context，后续读取授权结构再判断。
 附件数量不代表看到了图片；有图片时交给后续视觉阶段，不猜测图片内容。
-不得声称已经读取、计算或写入工作簿，不要生成工具调用、澄清选项或操作计划。
+不得声称已经读取、计算或写入工作簿，不要生成工具调用或操作计划。
 recoveryTasks 是本对话仍待处理的任务引用，可能是服务端规划任务 ID，也可能是
 preplanning- 开头的本机暂停需求引用；后者尚未建立规划检查点，但原需求仍已保留，可以重新分析。
 这些引用不是执行授权。“没有检查点”不代表“没有原需求”，不能据此要求用户重述任务。
@@ -47,10 +52,11 @@ task_recovery 的 action 必须区分用户意图：要求继续、接着做时�
 仅询问进度、核对状态时为 inspect。continue 也必须先核对原任务状态、授权与来源，
 不能直接重放已完成操作，不生成计划、不授予写入权限。
 附带图片或修改原任务要求时不要用 task_recovery 忽略新增要求，应先澄清。
-只返回以下三种 JSON 之一，不使用 Markdown，内容使用简体中文：
+只返回以下四种 JSON 之一，不使用 Markdown，内容使用简体中文：
 {"kind":"conversation","message":"直接回复"}
 {"kind":"needs_workbook_context","summary":"需要结合授权表结构理解的任务"}
 {"kind":"task_recovery","turnId":"recoveryTasks 中的一个 ID","action":"inspect 或 continue"}
+{"kind":"clarification","clarification":{"id":"问题唯一标识","summary":"待确认规则","question":"一个关键问题","reason":"为何需要回答","scopeLabel":"仅讨论需求，未读取工作表","options":[{"id":"one","label":"一种方式","description":"说明","resolution":"用户选中后确认的规则","resolutionMode":"append"},{"id":"two","label":"另一种方式","description":"说明","resolution":"另一规则","resolutionMode":"append"}]}}
 """
 
 
@@ -79,6 +85,8 @@ def parse_message_understanding(content: str, request: MessageUnderstandingReque
         return parsed
     if payload.get("kind") == "needs_workbook_context":
         return MessageContextResponse.model_validate({**payload, "provider": "model"})
+    if payload.get("kind") == "clarification":
+        return MessageClarificationResponse.model_validate({**payload, "provider": "model"})
     if payload.get("kind") == "task_recovery":
         parsed = MessageRecoveryResponse.model_validate({**payload, "provider": "model"})
         if request.imageCount or parsed.turnId not in request.recoveryTasks:
@@ -155,7 +163,7 @@ query_table 的 combine.deduplicate / combine.join 仅用于文件夹模式的�
 proceed。「去重」「删除重复行」「删除 XX 的行」「清空 XX 的行」都会修改原表，属于
 写入操作，应返回 proceed（交给规划 Agent 生成 removeDuplicates / deleteRange /
 clearRange 动作），不要返回 tool_request。如果不明确，只问一个最能消除关键歧义的
-问题，提供 2 到 4 个互斥选项。每个选项必须标明 resolutionMode：
+问题，提供 2 到 3 个互斥选项（最多三个，按相关性排序，不为凑数添加选项；标题简短、说明只用一句话）。每个选项必须标明 resolutionMode：
 若该选项会推翻或改变原需求中的拆分维度、输出结构、指标口径或目标，使用 replace，
 且 resolution 必须是可独立交给规划 Agent 的完整最终需求；只补充原需求中缺失的
 参数时使用 append。

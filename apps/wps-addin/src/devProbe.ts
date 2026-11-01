@@ -28,3 +28,19 @@ export function reportDevProbeDetail(
     body: JSON.stringify({ stage, ...details })
   }).catch(() => undefined);
 }
+
+/**
+ * 上报**恢复核对诊断**（仅 DEV，且由调用方用 `VITE_ENABLE_RECOVERY_DIAG` 显式开关）。
+ *
+ * 与 `reportDevProbeDetail` 共用同一条 `/__wps_probe` 出口（dev server 控制台打印
+ * `[wps-bridge] …`），因为真机上 WPS 窗格开不了 devtools，这是唯一能"把现场的
+ * 原因码取出来"的通道。body 里只有原因码与计数 —— 该收什么由调用方保证。
+ */
+export function reportDevProbeRecovery(details: Record<string, string | number | boolean>): void {
+  if (!import.meta.env.DEV) return;
+  void fetch("/__wps_probe", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ stage: "recovery", ...details })
+  }).catch(() => undefined);
+}

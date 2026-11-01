@@ -1,16 +1,19 @@
 import type { WpsExecutionState } from "../../excel-addin/src/contracts";
+import {
+  EXECUTION_RECOVERY_ACTION_LABEL,
+  EXECUTION_RECOVERY_STATE_LABEL,
+  executionRecoveryActions,
+  executionRecoveryDetail,
+  type ExecutionRecoveryAction,
+  type ExecutionRecoveryVerdict
+} from "@excel-bro/core/executionRecoveryView";
 
 /** Read-only recovery verdict. Resume requires independently checked local material;
  * an in-flight action must first be reconciled, never guessed or replayed.
  * Historical records without compatible source evidence remain replan-only.
+ *
+ * 形状由共享层 `ExecutionRecoveryVerdict` 定义（Excel 读同一份），这里不再自己声明一遍。
  */
-export type WpsReconcileVerdict =
-  | { kind: "completed"; recorded?: true }
-  | { kind: "reconcile"; actionIndex: number; outcome: "applied" | "not_applied" }
-  | { kind: "replan"; remaining: number; reason?: string }
-  | { kind: "resume"; remaining: number }
-  | { kind: "blocked"; detail: string }
-  | { kind: "insufficient"; detail: string };
 
 /** 身份核对失败的几种具体原因。 */
 export type WpsIdentityVerdict =
@@ -57,6 +60,33 @@ export function wpsReconcileVerdict(input: {
       detail: "当前工作簿与这次写入记录的身份不一致；请打开原工作簿后再核对，不猜是不是同一个文件。"
     };
   }
+  /*
+   * 终态优先（2026-10-31）：撤销/放弃之后账本 `status` 与游标都不变（`record_office_disposition`
+   * 只写两列时刻），宿主缓存里 `record.state="restored"` 又随重开消失 —— 不在这里先判，
+   * 跨重启的续跑判据会把一次已经回退掉的执行重新开放续跑/撤销。
+   *
+   * 与 Excel 侧 `officeExecutionTerminalReason` 同一条纪律：`undone` 是终态（不给任何按钮），
+   * `abandoned` 是"放弃变更"（回退过了，需要人工核对，给 blocked 不给写入）。
+   */
+  if (input.state.disposition?.undoneAt) {
+    return {
+      kind: "undone",
+      // 账本已留处置痕（常为另一台机器撤的）：本机没回退，现场未知，不用默认"已回到执行前"。
+      detail: "这次执行已经撤销过（账本已留处置痕），不会再执行或补记任何动作。"
+    };
+  }
+  if (input.state.disposition?.abandonedAt) {
+    return {
+      kind: "blocked",
+      detail: "这次执行已按「放弃变更」处置过，原表已按恢复点还原；不能再继续剩余动作或补记完成。",
+      /*
+       * `abandoned: true` = 用户已经做过决定，结论不会再变（终态）。仍是 `blocked`
+       * （不给写入/补记），但与"现场冲突 / 执行权被占 / 来源变化"这类**还要人核对**
+       * 的阻断分开 —— 只有它可以退出固定区域，换成消息里一条可展开的终态摘要。
+       */
+      abandoned: true
+    };
+  }
   if (input.state.status === "completed") {
     return { kind: "completed", recorded: true };
   }
@@ -88,10 +118,20 @@ export function wpsReconcileVerdict(input: {
       };
     }
     if (input.localInspection === "completed") {
-      return { kind: "reconcile", actionIndex: inFlight, outcome: "applied" };
+      return {
+        kind: "reconcile",
+        actionIndex: inFlight,
+        outcome: "applied",
+        remaining: Math.max(0, input.state.totalActions - inFlight - 1)
+      };
     }
     if (input.localInspection === "not_started") {
-      return { kind: "reconcile", actionIndex: inFlight, outcome: "not_applied" };
+      return {
+        kind: "reconcile",
+        actionIndex: inFlight,
+        outcome: "not_applied",
+        remaining: Math.max(0, input.state.totalActions - inFlight - 1)
+      };
     }
     return {
       kind: "insufficient",
@@ -113,62 +153,24 @@ export function wpsReconcileVerdict(input: {
   return input.resumeAvailable ? {kind: "resume", remaining} : {kind: "replan", remaining, ...(input.resumeUnavailableReason ? {reason: input.resumeUnavailableReason} : {})};
 }
 
+/**
+ * 结论与措辞的**唯一出处**在共享层 `@excel-bro/core/executionRecoveryView`：
+ * Excel 端 2026-10-29 起读同一份。这里只做两件事 —— 用宿主自己的名字转发，
+ * 以及把结论收窄成"一定读过现场"（WPS 的判定不会停在 `pending`）。
+ *
+ * 下面这些别名不是"行为相似的副本"：改文案只改共享层一处，两端同时生效。
+ */
+export type WpsReconcileVerdict = ExecutionRecoveryVerdict<"applied" | "not_applied">;
+
 /** 核对结论的用户可见文案（标题级）。 */
-export const WPS_RECONCILE_LABEL: Record<WpsReconcileVerdict["kind"], string> = {
-  completed: "已完成，仅缺回执",
-  reconcile: "待核对在途动作",
-  replan: "需重新规划",
-  resume: "可继续剩余动作",
-  blocked: "需要人工核对",
-  insufficient: "证据不足"
-};
+export const WPS_RECONCILE_LABEL = EXECUTION_RECOVERY_STATE_LABEL;
 
 /** 结论的正文说明。冲突与证据不足直接复用判定给出的 `detail`，不另写一套措辞。 */
-export function WPS_RECOVERY_DETAIL(verdict: WpsReconcileVerdict): string {
-  switch (verdict.kind) {
-    case "completed":
-      return verdict.recorded ? "账本已保存历史完成结果，无需重复写入；不代表当前单元格仍未被修改。" : "动作与当前现场已核对，缺的只是最终回执；补记只改账本状态，不会重写原表。";
-    case "reconcile":
-      return verdict.outcome === "applied"
-        ? `第 ${verdict.actionIndex + 1} 个动作的现场与写后一致，可补记为已写入，不重复写。`
-        : `第 ${verdict.actionIndex + 1} 个动作的现场仍是写前状态，可补记为未写入。`;
-    case "resume":
-      return `原计划与当前授权、来源和目标已核对，可继续剩余 ${verdict.remaining} 个动作；已完成动作不会重写，完成后审阅结果。`;
-    case "replan":
-      return (
-        `还有 ${verdict.remaining} 个动作没写。本机材料缺失、过期或不符合精确续跑条件。` +
-        (verdict.reason ? `具体原因：${verdict.reason} ` : "") +
-        "可在当前授权范围内重新读取并规划；通过校验后先执行，再审阅。"
-      );
-    default:
-      return verdict.detail;
-  }
-}
+export const WPS_RECOVERY_DETAIL = executionRecoveryDetail;
 
 /** 各结论允许出现的操作。返回空数组 = 不给任何写入/补记按钮。 */
-export type WpsReconcileAction = "backfill" | "reconcile" | "replan" | "resume" | "dismiss";
+export type WpsReconcileAction = ExecutionRecoveryAction;
 
-export const WPS_RECOVERY_ACTION_LABEL: Record<WpsReconcileAction, string> = {
-  resume: "继续剩余动作",
-  backfill: "补记完成（不重写原表）",
-  reconcile: "核对在途动作",
-  replan: "重新读取并规划",
-  dismiss: "清除这条恢复提示"
-};
+export const WPS_RECOVERY_ACTION_LABEL = EXECUTION_RECOVERY_ACTION_LABEL;
 
-export function wpsReconcileActions(verdict: WpsReconcileVerdict): WpsReconcileAction[] {
-  switch (verdict.kind) {
-    case "completed":
-      return verdict.recorded ? ["dismiss"] : ["backfill", "dismiss"];
-    case "reconcile":
-      return ["reconcile", "dismiss"];
-    case "resume":
-      return ["resume", "dismiss"];
-    case "replan":
-      return ["replan", "dismiss"];
-    default:
-      // `blocked` / `insufficient`：证据不够或现场冲突，一律不给写入或补记按钮，
-      // 只留"已人工核对，清除提示"。
-      return ["dismiss"];
-  }
-}
+export const wpsReconcileActions = executionRecoveryActions;

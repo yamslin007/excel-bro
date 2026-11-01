@@ -6,11 +6,122 @@ from pathlib import Path
 import sqlite3
 import subprocess
 import sys
+import time
 
 import pytest
 
 import server.app.task_ledger as task_ledger_module
 from server.app.task_ledger import ExpiredOperationError, FolderOperationLedger
+
+
+@pytest.mark.parametrize("stored_version", [9, 10])
+def test_existing_ledger_without_recovery_deadline_migrates_without_rewriting_execution(tmp_path, stored_version):
+    database = tmp_path / "state.sqlite3"
+    first = FolderOperationLedger(lambda: database)
+    original, _ = first.register_office_execution("old-execution", "unchanged-fingerprint",
+        plan={"actions": []}, authorization={"authorizedSheetNames": ["Target"]},
+        workbook_identity="url:existing.xlsx", task_id="existing-task")
+    # Reproduce the shipped v9 database, including its existing execution row.
+    # A version label alone must not conceal the missing column either.
+    with sqlite3.connect(database) as connection:
+        connection.execute("ALTER TABLE office_executions DROP COLUMN recovery_package_expires_at")
+        connection.execute(f"PRAGMA user_version = {stored_version}")
+    restarted = FolderOperationLedger(lambda: database)
+    assert restarted.reserve_recovery_package_expiry("old-execution", "2035-01-01T00:00:00Z") == "2035-01-01T00:00:00Z"
+    assert restarted.reserve_recovery_package_expiry("old-execution", "2036-01-01T00:00:00Z") == "2035-01-01T00:00:00Z"
+    assert restarted.office_execution("old-execution") == original
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] >= 10
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def test_migration_keeps_action_progress_and_checkpoint(tmp_path) -> None:
+    """补列不许碰到执行本身：进度、检查点、计划、授权、修订号都得原样。
+
+    真实故障里这条列是**出厂旧库缺的**，不是"某次迁移写坏了"。补列是纯 schema 动作，
+    一旦它在 `INSERT ... SELECT` 式的重建里丢过一列，用户看到的会是"任务还在、进度归零"，
+    那比 PUT 500 更难察觉。
+    """
+
+    database = tmp_path / "state.sqlite3"
+    first = FolderOperationLedger(lambda: database)
+    record, _ = first.register_office_execution(
+        "in-progress",
+        "unchanged-fingerprint",
+        plan={"actions": [{"type": "writeValues", "sheet": "Target", "range": "A1"}]},
+        authorization={"authorizedSheetNames": ["Target"]},
+        workbook_identity="wps-path:c:\\data\\in-progress.xlsx",
+        identity_prefix="wps-path:",
+        task_id="task-in-progress",
+    )
+    begun = first.begin_office_action(
+        "in-progress",
+        expected_revision=record.revision,
+        owner_token=record.owner_token,
+        action_index=0,
+        before_snapshot={"cells": [["old"]]},
+    )
+    done = first.complete_office_action(
+        "in-progress",
+        expected_revision=begun.revision,
+        owner_token=record.owner_token,
+        action_index=0,
+        checkpoint={"cells": [["new"]]},
+    )
+    assert done.next_action_index == 1
+    assert done.checkpoint == {"cells": [["new"]]}
+
+    # 还原成出厂 v9 形态：版本号旧，而且列**真的**不存在（只改版本号骗不过检查）。
+    with sqlite3.connect(database) as connection:
+        connection.execute("ALTER TABLE office_executions DROP COLUMN recovery_package_expires_at")
+        connection.execute("PRAGMA user_version = 9")
+
+    restarted = FolderOperationLedger(lambda: database)
+    migrated = restarted.office_execution("in-progress")
+    assert migrated == done
+    assert migrated is not None
+    assert migrated.next_action_index == 1
+    assert migrated.checkpoint == {"cells": [["new"]]}
+    assert migrated.before_snapshot is None
+    # 迁移只补列，不伪造期限：旧库从来没登记过，所以这里仍是"未登记"。
+    assert restarted.recovery_package_expiry("in-progress") is None
+    # 补列之后"首次写赢"照旧：第一次写入生效，第二次不许推后。
+    assert restarted.reserve_recovery_package_expiry(
+        "in-progress", "2036-01-01T00:00:00Z"
+    ) == "2036-01-01T00:00:00Z"
+    assert restarted.reserve_recovery_package_expiry(
+        "in-progress", "2037-01-01T00:00:00Z"
+    ) == "2036-01-01T00:00:00Z"
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def test_migration_keeps_an_existing_deadline_when_only_the_version_lags(tmp_path) -> None:
+    """版本号落后但列已经在：只能升级版本号，不许重建表、也不许清掉已登记的期限。"""
+
+    database = tmp_path / "state.sqlite3"
+    ledger = FolderOperationLedger(lambda: database)
+    ledger.register_office_execution(
+        "version-leg",
+        "fingerprint",
+        plan={"actions": []},
+        authorization={"authorizedSheetNames": ["Target"]},
+        workbook_identity="url:version-leg.xlsx",
+    )
+    assert ledger.reserve_recovery_package_expiry(
+        "version-leg", "2035-01-01T00:00:00Z"
+    ) == "2035-01-01T00:00:00Z"
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA user_version = 9")
+
+    restarted = FolderOperationLedger(lambda: database)
+    assert restarted.recovery_package_expiry("version-leg") == "2035-01-01T00:00:00Z"
+    # 已经登记过的期限不会被重启后的任何一次 PUT 推开。
+    assert restarted.reserve_recovery_package_expiry(
+        "version-leg", "2036-01-01T00:00:00Z"
+    ) == "2035-01-01T00:00:00Z"
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] >= 10
 
 
 def test_register_is_atomic_and_reuses_existing_identity(tmp_path) -> None:
@@ -92,6 +203,11 @@ def test_read_is_not_serialized_behind_concurrent_write_lock(tmp_path) -> None:
         elapsed = time.monotonic() - started
         assert record is not None and record.status == "running"
         assert elapsed < 0.5, f"只读被写锁串行化：{elapsed:.3f}s"
+        # 新加的"首次期限"读口读的是同一张表的新列，同样不许绕道去抢写锁 ——
+        # 否则"补了一列"就把这条既有保证重新打穿了。
+        expiry_started = time.monotonic()
+        assert reader.recovery_package_expiry("op-1") is None
+        assert time.monotonic() - expiry_started < 0.5, "recovery_package_expiry 抢了写锁"
     finally:
         connection.rollback()
         connection.close()
@@ -802,3 +918,67 @@ def test_wps_execution_refuses_unprefixed_or_office_identity(tmp_path) -> None:
             workbook_identity="url:c:/work/report.xlsx",
             identity_prefix="url:",
         )
+
+
+@pytest.mark.parametrize("stored_version", [9, 10, 11])
+def test_existing_ledger_without_discovery_column_migrates_without_touching_the_execution(
+    tmp_path, stored_version
+):
+    """发现处置列与恢复期限列同样受"版本号是意图、列是事实"约束。
+
+    旧库缺 `discovery_dismissed_at` 时，发现查询会直接撞 `no such column`；而版本号
+    已经被写成 11 的库若只看版本号就早退，补列会永久跳过。这里把三种出厂形态都还原
+    一遍：迁移只加列，**执行本身（进度、在途动作、检查点、修订号、执行权令牌）原样**。
+    """
+
+    database = tmp_path / "state.sqlite3"
+    first = FolderOperationLedger(lambda: database)
+    record, _ = first.register_office_execution(
+        "discovery-legacy",
+        "unchanged-fingerprint",
+        plan={"actions": [
+            {"actionIndex": 0, "type": "writeValues", "sheet": "Target", "range": "A1:A1",
+             "rowCount": 1, "columnCount": 1, "cellCount": 1,
+             "previewFingerprint": "v2:before-0", "expectedFingerprint": "v2:after-0"},
+        ]},
+        authorization={"authorizedSheetNames": ["Target"]},
+        workbook_identity="wps-path:c://data//legacy.xlsx",
+        identity_prefix="wps-path:",
+        task_id="task-legacy",
+    )
+    begun = first.begin_office_action(
+        "discovery-legacy",
+        expected_revision=record.revision,
+        owner_token=record.owner_token,
+        action_index=0,
+        before_snapshot={"sheetName": "Target", "range": "A1:A1", "type": "writeValues",
+                         "beforeFingerprint": "v2:before-0"},
+    )
+    suspended = first.suspend_office_execution(
+        "discovery-legacy",
+        expected_revision=begun.revision,
+        owner_token=record.owner_token,
+        error={"code": "WPS_WRITE_INTERRUPTED", "message": "interrupted"},
+    )
+    assert suspended.status == "needs_reconciliation"
+
+    with sqlite3.connect(database) as connection:
+        connection.execute("ALTER TABLE office_executions DROP COLUMN discovery_dismissed_at")
+        connection.execute(f"PRAGMA user_version = {stored_version}")
+
+    restarted = FolderOperationLedger(lambda: database)
+    pending, truncated = restarted.pending_office_executions(
+        "wps-path:c://data//legacy.xlsx", limit=5
+    )
+    assert truncated is False
+    assert [item.operation_id for item in pending] == ["discovery-legacy"]
+    assert restarted.office_execution("discovery-legacy") == suspended
+    assert restarted.dismiss_office_execution_discovery("discovery-legacy") is True
+    # 处置只写发现元数据：执行本身一个字段都没变。
+    assert restarted.office_execution("discovery-legacy") == suspended
+    assert restarted.pending_office_executions(
+        "wps-path:c://data//legacy.xlsx", limit=5
+    )[0] == []
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] >= 11
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"

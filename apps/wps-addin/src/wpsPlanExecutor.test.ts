@@ -224,6 +224,22 @@ describe("WPS guarded plan executor", () => {
     expect(target.storedRecords()).toEqual([]);
   });
 
+  it("空的 formulaR1C1 等于没有 R1C1：与 Excel、服务端同一口径，照常写 A1 公式", async () => {
+    /*
+     * 同一份计划只差 `formulaR1C1` 这一个字段的值：非空 ⇒ 拒绝（上面那条），
+     * `""` / `null` / 省略 ⇒ 三种都必须照常写 A1 公式。以前这里是
+     * `!== undefined`，`""` 会被当成 R1C1 整份拒掉，而 Excel 与服务端都按真值判。
+     */
+    for (const formulaR1C1 of ["", null, undefined] as const) {
+      const target = host([["旧值"]]);
+      const prepared = prepareWpsPlan(target.application, [1], plan([
+        { type: "writeFormulas", sheet: "明细", range: "A1", formulas: [["=1+1"]], ...(formulaR1C1 === undefined ? {} : { formulaR1C1 }) }
+      ]));
+      await executeWpsPlan(target.application, prepared);
+      expect(target.values()).toEqual([["=1+1"]]);
+    }
+  });
+
   it("rejects a changed target after preview, before creating a recovery record or writing", async () => {
     const target = host([["旧值"]]);
     const prepared = prepareWpsPlan(target.application, [1], plan([

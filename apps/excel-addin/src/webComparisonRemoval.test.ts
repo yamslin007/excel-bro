@@ -19,7 +19,11 @@ describe("网页前后对比已退役，原生审阅与证据保留", () => {
     expect(source.includes("activeReviewExecutionId")).toBe(false);
     expect(source.includes("openChangeReview")).toBe(false);
     expect(readFileSync("../wps-addin/src/main.tsx", "utf8")).not.toContain("review.css");
-    for (const entry of ["stageWpsNativeComparison", "verifyWpsNativeComparison", "discardWpsNativeComparison", "compareCommittedWpsResultToCopy"]) {
+    // `stageWpsNativeComparison` 的直接调用随 U7 删除「先复制再写入」死代码一并消失
+    //（旧 `stagePendingPlan` 是它在本组件里的唯一调用点）。副本现在按执行前快照重建，
+    // 活入口是 `stageWpsBeforeComparison` —— 判据钉**活的**那一份，不再靠死代码里的
+    // 名字过闸（那种断言在删除死代码当天才会变红，等于没有证据）。
+    for (const entry of ["stageWpsBeforeComparison", "verifyWpsNativeComparison", "discardWpsNativeComparison", "compareCommittedWpsResultToCopy"]) {
       expect(source).toContain(entry);
     }
   });

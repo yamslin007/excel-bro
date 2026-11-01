@@ -25,6 +25,8 @@ def isolated_a1_ledger(request, monkeypatch, tmp_path):
     if Path(str(request.node.fspath)).name in {
         "test_host_write_observation.py", "test_host_write_audit.py",
         "test_source_changed_stop.py", "test_a1e3_native_regressions.py",
+        "test_execution_disposition.py",
+        "test_recovery_package_retirement.py",
     }:
         from server.app import main
         from server.app.task_ledger import FolderOperationLedger

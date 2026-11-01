@@ -30,8 +30,27 @@ import {
   buildColumnMappingActions,
   NeedsClarificationError,
   UnmappedCategoryError,
-  type ColumnMappingInput
+  type ColumnMappingAction,
+  type ColumnMappingInput,
+  type ColumnMappingPlanAction
 } from "./columnMapping";
+
+/**
+ * 取第一段写值动作的值矩阵。
+ *
+ * `ColumnMappingPlanAction` 是 `writeValues | clearRange` 的联合，而 `clearRange`
+ * 只清内容、不带 `values`。所以"断言矩阵"必须按 `type` 先收窄 —— 直接 `actions[0].values`
+ * 在类型层就不成立。清空动作有没有写对，由断言**整条动作**（`type`/`range`/`applyTo`）
+ * 的用例负责，不靠从它身上读一个不存在的字段。
+ */
+function writeMatrix(actions: readonly ColumnMappingPlanAction[]): string[][] {
+  const action = actions.find(
+    (candidate): candidate is ColumnMappingAction =>
+      candidate.type === "writeValues"
+  );
+  if (!action) throw new Error("预期至少有一个 writeValues 动作，实际一个都没有");
+  return action.values;
+}
 
 /** 只关心"不许出现什么"，输入刻意保持与业务无关的通用标签。 */
 function run(
@@ -61,7 +80,7 @@ function run(
 describe("空白与未知类别必须分开处理", () => {
   it("真空白走 blankLabel，不抛错", () => {
     const actions = run([[null]], { 甲: "一" }, "空");
-    expect(actions[0].values).toEqual([["空"]]);
+    expect(writeMatrix(actions)).toEqual([["空"]]);
   });
 
   it("无值但有映射表仍未覆盖的值：拒绝，而不是兜成 blankLabel", () => {
@@ -88,17 +107,17 @@ describe("显式映射项与空白策略的边界", () => {
   it("映射表里写了非空标签的显式项，就按它输出，不因它像空白而降级", () => {
     // "无问题" 是**非空**来源值；实现不得因为它的语义像"没有内容"而改走空白。
     const actions = run([["无问题"]], { 无问题: "/" }, "未填");
-    expect(actions[0].values).toEqual([["/"]]);
+    expect(writeMatrix(actions)).toEqual([["/"]]);
   });
 
   it("真空白在有显式项存在时仍走 blankLabel，不借用显式项的目标", () => {
     const actions = run([[null], ["无问题"]], { 无问题: "/" }, "未填");
-    expect(actions[0].values).toEqual([["未填"], ["/"]]);
+    expect(writeMatrix(actions)).toEqual([["未填"], ["/"]]);
   });
 
   it("显式空串映射项只覆盖空串，不覆盖 null 与纯空白字符串", () => {
     const actions = run([[""], [null], ["  "]], { "": "空串" }, "真空格");
-    expect(actions[0].values).toEqual([["空串"], ["真空格"], ["真空格"]]);
+    expect(writeMatrix(actions)).toEqual([["空串"], ["真空格"], ["真空格"]]);
   });
 
   it("映射表外的显式项不会被兜底：多个未知值一次列全", () => {
@@ -116,7 +135,7 @@ describe("显式映射项与空白策略的边界", () => {
 describe("标签值本身是空白符号时不被误解为空值", () => {
   it("目标标签为符号（如 / 或 —）时原样写入", () => {
     const actions = run([["甲"], ["乙"]], { 甲: "/", 乙: "—" }, "空");
-    expect(actions[0].values).toEqual([["/"], ["—"]]);
+    expect(writeMatrix(actions)).toEqual([["/"], ["—"]]);
   });
 });
 
@@ -219,7 +238,7 @@ describe("多值拆分后的两类归因必须分开", () => {
         ]
       }
     );
-    expect(actions[0].values).toEqual([["合"]]);
+    expect(writeMatrix(actions)).toEqual([["合"]]);
   });
 
   it("拆分后按规则给出的等级取最高级", () => {
@@ -235,7 +254,7 @@ describe("多值拆分后的两类归因必须分开", () => {
         ]
       }
     );
-    expect(actions[0].values).toEqual([["壹"], ["壹"]]);
+    expect(writeMatrix(actions)).toEqual([["壹"], ["壹"]]);
   });
 
   it("多候选并存时按出现位置切分，不按声明序", () => {
@@ -245,7 +264,7 @@ describe("多值拆分后的两类归因必须分开", () => {
       "空",
       { delimiters: ["|", "-"], valueRank: [{ value: "甲", rank: 1 }] }
     );
-    expect(actions[0].values).toEqual([["壹"]]);
+    expect(writeMatrix(actions)).toEqual([["壹"]]);
   });
 });
 

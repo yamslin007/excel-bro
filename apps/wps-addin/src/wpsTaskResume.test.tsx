@@ -25,7 +25,8 @@ import { getWpsApplication } from "./wpsHost";
 
 vi.mock("../../excel-addin/src/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../excel-addin/src/api")>();
-  return { ...actual, understandMessage: vi.fn(async () => ({ kind: "needs_workbook_context", summary: "需要字段结构", provider: "model" })), listModels: vi.fn(), getModelSettings: vi.fn(), validatePlan: vi.fn() };
+  const discovery = await import("./wpsPendingDiscovery.testHost");
+  return { ...actual, ...discovery.pendingDiscoveryApiStubs(), understandMessage: vi.fn(async () => ({ kind: "needs_workbook_context", summary: "需要字段结构", provider: "model" })), listModels: vi.fn(), getModelSettings: vi.fn(), validatePlan: vi.fn() };
 });
 vi.mock("./wpsReadonlyAgent", () => ({ runWpsReadonlyTurn: vi.fn() }));
 vi.mock("./wpsHost", async (importOriginal) => {
@@ -95,6 +96,23 @@ async function click(target: HTMLElement | null) {
   await act_(() => {
     target.dispatchEvent(new MouseEvent("click", { bubbles: true }));
   });
+}
+
+
+/**
+ * 选中第 index 个快捷答案并**提交**。
+ *
+ * 新交互下点选项只选中（想改口径还有机会），提交是右下角那颗「发送回答」。
+ * 旧用例写的是"点一下就等于作答"，语义等价于这里的两次点击。
+ */
+async function selectOption(container: HTMLElement, index: number) {
+  const options = Array.from(container.querySelectorAll<HTMLButtonElement>(".clarification-options button"));
+  const option = options[index];
+  if (!option) throw new Error(`没有第 ${index} 个快捷答案`);
+  await click(option);
+  const submitButton = container.querySelector<HTMLButtonElement>('button[aria-label="发送回答"]');
+  if (!submitButton) throw new Error("没有找到「发送回答」按钮");
+  await click(submitButton);
 }
 
 async function type(target: HTMLTextAreaElement | null, value: string) {
@@ -219,7 +237,7 @@ async function pendingClarification() {
   const composer = container.querySelector<HTMLTextAreaElement>(".composer textarea");
   await type(composer, "帮我处理表格");
   await submit(composer);
-  await until(() => Boolean(container.querySelector(".clarification-card")), "应显示澄清卡");
+  await until(() => Boolean(container.querySelector(".clarification-card, .composer-box .clarification-composer")), "应显示澄清卡");
   await until(() => runTurnMock.mock.calls.length === 1, "应完成这一轮");
   return container;
 }
@@ -234,7 +252,7 @@ async function reopen() {
     "重开应加载模型"
   );
   await until(
-    () => Boolean(reopened.container.querySelector(".clarification-card")),
+    () => Boolean(reopened.container.querySelector(".clarification-card, .composer-box .clarification-composer")),
     "重开后应恢复出那张卡"
   );
   return reopened.container;
@@ -629,7 +647,7 @@ describe("待答澄清：面板重载后任务仍然可继续", () => {
     getWpsApplicationMock.mockReturnValue(hostStub({ sheetNames: ["订单"] }).application);
 
     const { container } = await mount(panel());
-    await until(() => Boolean(container.querySelector(".clarification-card")), "应恢复出卡片");
+    await until(() => Boolean(container.querySelector(".clarification-card, .composer-box .clarification-composer")), "应恢复出卡片");
     expect(container.querySelector(".clarification-recovery")).toBeNull();
     expect(textOf(container)).toContain("没有可用的恢复记录");
   });
@@ -643,7 +661,7 @@ describe("已提交答案：断线后不丢答案、不重复询问", () => {
 
     // 让续答那一轮断线（连接类错误）。
     runTurnMock.mockRejectedValueOnce(new Error("Failed to fetch"));
-    await click(clarificationOptions(container)[0]);
+    await selectOption(container, 0);
     await until(
       () => container.querySelector(".clarification-card.unconfirmed") !== null,
       "断线后应转为可恢复的中断卡"
@@ -698,8 +716,8 @@ describe("重新授权不是澄清答案", () => {
     Object.defineProperty(app, "ActiveWorkbook", { get: () => ({
       ...book, Worksheets: { ...book.Worksheets, Item: (index: number) => ({ ...(book.Worksheets.Item(index) as object) }) }
     }) });
-    await type(container.querySelector<HTMLTextAreaElement>('.clarification-custom-input textarea'), "逐行映射，空白不写入");
-    await click(container.querySelector<HTMLButtonElement>('.clarification-custom-input button'));
+    await type(container.querySelector<HTMLTextAreaElement>('.composer textarea'), "逐行映射，空白不写入");
+    await click(container.querySelector<HTMLButtonElement>('button[aria-label="发送回答"]'));
     await until(() => Boolean(container.querySelector('.clarification-recovery')), "等待重新授权");
     expect(runTurnMock).toHaveBeenCalledTimes(1);
     expect(storedTaskResumes().at(-1)?.confirmations).toEqual([
@@ -722,12 +740,12 @@ describe("重新授权不是澄清答案", () => {
     clarificationCard();
     const container = await pendingClarification();
     clarificationCard(); // 下一轮是新问题，具有不同的 questionId。
-    await click(clarificationOptions(container)[0]);
+    await selectOption(container, 0);
     await until(() => runTurnMock.mock.calls.length === 2 && clarificationOptions(container).length > 0, "第二张澄清卡");
     expect(storedTaskResumes().at(-1)?.originalPrompt).toBe("帮我处理表格");
     expect(storedTaskResumes().at(-1)?.confirmations).toHaveLength(1);
-    await type(container.querySelector<HTMLTextAreaElement>('.clarification-card.pending textarea'), "空白保留原值");
-    await click(container.querySelector<HTMLButtonElement>('.clarification-card.pending .clarification-custom-input button'));
+    await type(container.querySelector<HTMLTextAreaElement>('.composer textarea'), "空白保留原值");
+    await click(container.querySelector<HTMLButtonElement>('button[aria-label="发送回答"]'));
     await until(() => runTurnMock.mock.calls.length === 3, "第三轮");
     expect(storedTaskResumes().at(-1)?.confirmations).toHaveLength(2);
     const reopened = await reopen();

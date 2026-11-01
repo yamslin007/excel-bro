@@ -5190,6 +5190,15 @@ textarea:focus-visible {
   color: var(--color-text-secondary);
 }
 
+/*
+ * 收起之后结论已经在标题行里（"已完成 · 10.8s"），badge 再写一遍就是同一行两个
+ * "已完成"。这里只隐藏**视觉**，节点留着 —— 它是这一段状态的稳定标记，
+ * 无障碍查询与既有断言都读它。
+ */
+.task-progress-timeline[data-folded="true"] .task-progress-overall {
+  display: none;
+}
+
 .task-progress-actions {
   display: inline-flex;
   flex: 0 0 auto;
@@ -5216,6 +5225,53 @@ textarea:focus-visible {
   margin-top: 9px;
   padding-top: 9px;
   border-top: 1px solid var(--color-border);
+}
+
+/*
+ * 详细动作区的**限高与内部滚动**（2026-11-01）。
+ *
+ * 为什么限高：过程框原来没有上限，一条 20 步的任务能把输入框整块挤出窗格。
+ * 上限走两级：业务上限由组件按状态写进 `--process-panel-max-height`
+ * （进行中未展开 160px / 展开 420px / 结束展开 560px），再与 `46vh` 取小
+ * 以适配矮窗格。**判据在共享层 `processPanel.ts`，这里只执行。**
+ *
+ * 为什么 `overscroll-behavior: contain`：滚到过程框底部之后继续滚，焦点会
+ * "漏"给外层消息流，用户会以为消息流在跳。contain 把它关在框内。
+ *
+ * 底部收起入口是它的**兄弟**（`.task-progress-bottom-actions`）：
+ * 内容滚到哪，那颗按钮都留在原地。
+ */
+.task-progress-content-body {
+  max-height: min(var(--process-panel-max-height, 560px), 46vh);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  /* 可键盘滚动（组件上带 tabIndex/role=group），聚焦时要有看得见的框。 */
+  border-radius: var(--radius-sm);
+}
+
+.task-progress-content-body:focus-visible {
+  outline: 2px solid var(--color-brand-border, var(--color-border));
+  outline-offset: 2px;
+}
+
+/*
+ * 当前步骤突出、已完成步骤弱化。
+ *
+ * 之前一屏十几行的字重与颜色完全一致，哪一步真的在跑只能靠读时间戳猜。
+ * 判据由组件算（最后一个未结束的步骤 = 当前步骤），这里只管视觉层级。
+ */
+.task-progress-timeline ol.activity-steps > li[data-current="true"] .activity-step-label {
+  font-weight: 600;
+}
+
+.task-progress-timeline ol.activity-steps > li[data-current="true"] .activity-step-check {
+  box-shadow: 0 0 0 3px var(--color-brand-bg);
+}
+
+.task-progress-timeline ol.activity-steps > li[data-status="completed"]:not([data-current="true"]) .activity-step-label {
+  color: var(--color-text-secondary);
+  font-weight: 400;
 }
 
 .task-progress-bottom-actions {
@@ -6679,6 +6735,250 @@ textarea:focus-visible {
   flex: 0 0 auto;
   flex-wrap: wrap;
   gap: 8px;
+}
+
+/*
+ * Office 写入恢复卡：与 WPS 的 `.wps-write-recovery` **同一套信息层级** ——
+ * 标题 + 结论 badge + 一句正文 + 动作区 + 执行记录（折叠）。
+ *
+ * **位置**：住在输入区上方（`.composer` 的子节点），不在 `.message-stream` 里。
+ * 真机上核对成功会追加一行日志、把消息区滚到底；卡片当时还挂在旧消息下面，
+ * 于是"已核对"看得见、"继续剩余动作"被顶出视口。搬出来之后就与滚动无关了。
+ *
+ * **结构**：标题 / 可滚动正文 / 动作区三层，动作区是正文的**兄弟**。
+ * 正文再长也只让 `.office-recovery-panel-body` 自己滚，按钮永远留在原地 ——
+ * 同一条纪律见数据范围面板（动作条必须是滚动容器的兄弟）。
+ * `max-height` 是给窄窗格留的余地：卡片再长也不许把输入框挤出屏幕。
+ */
+.office-recovery-panel {
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: min(46vh, 320px);
+  margin: 0 0 8px;
+  padding: 12px 14px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  corner-shape: squircle;
+  background: var(--color-surface-hover);
+  box-shadow: 0 4px 14px rgba(31, 41, 55, 0.06);
+}
+
+.office-recovery-panel-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: grid;
+  gap: 4px;
+}
+
+.office-recovery-panel-actions {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.office-recovery-panel-actions button {
+  white-space: nowrap;
+}
+
+/*
+ * 「下一步在输入框右下角」这句：它不是按钮，是**指路**。
+ * 刻意做成正文样式（不是 primary-button），否则又变回"卡面上还有一颗主按钮"。
+ */
+.office-recovery-primary-hint {
+  flex: 1 1 100%;
+  margin: 0;
+  color: var(--text-secondary, #52675b);
+  font-size: var(--font-size-caption, 12px);
+  line-height: 1.5;
+}
+
+.office-resume-head {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.office-resume-head strong {
+  font-weight: 750;
+}
+
+.office-resume-badge {
+  padding: 2px 9px;
+  border-radius: var(--radius-xs);
+  corner-shape: squircle;
+  font-size: var(--font-size-caption);
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.office-resume-completed { background: var(--color-brand-soft); color: var(--color-brand); }
+.office-resume-reconcile { background: #e8f0fa; color: #2c5c9e; }
+.office-resume-resume { background: var(--color-brand-soft); color: var(--color-brand); }
+.office-resume-replan { background: #e8eef8; color: #3a4a6b; }
+.office-resume-blocked { background: #fbf0df; color: #925f2d; }
+.office-resume-insufficient { background: #f3eeee; color: #8a3b31; }
+
+.office-resume-detail {
+  margin: 0;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-caption);
+  line-height: 1.5;
+}
+
+/* 执行记录：进度与回执是**详情**，不是结论；收起时不占正文位置。 */
+.office-resume-record {
+  margin-top: 2px;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-caption);
+}
+
+.office-resume-record summary {
+  cursor: pointer;
+  font-weight: 650;
+}
+
+.office-resume-record p {
+  margin: 4px 0 0;
+  line-height: 1.5;
+}
+
+/*
+ * 历史消息里的**只读**执行记录（原恢复卡的位置）。
+ *
+ * 它不是入口：没有按钮、没有结论 badge、不是 `role="status"` —— 状态已经在输入区
+ * 上方那张卡上说过一次，这里再说一遍就是两处互相打架。留在这里的只有"这一步发生
+ * 过"的进度事实，以及（仅当它就是当前入口时）一句指路。
+ */
+.office-recovery-record {
+  display: grid;
+  gap: 2px;
+  width: 100%;
+  margin-top: 10px;
+  padding: 8px 12px;
+  border-left: 3px solid var(--color-border);
+  border-radius: var(--radius-xs);
+  background: color-mix(in srgb, var(--color-surface-hover) 70%, transparent);
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-caption);
+  line-height: 1.5;
+}
+
+.office-recovery-record strong {
+  color: var(--color-text-primary);
+  font-weight: 700;
+}
+
+.office-recovery-record p {
+  margin: 0;
+}
+
+/*
+ * **终态**（撤销确认 / 放弃 / 收尾）：这张记录已经没有任何动作，固定区域把它收走，
+ * 消息里只留一条**可展开**的摘要。
+ *
+ * 折叠时一行 = 结论 badge + 一句"结束了、去哪看记录"；展开后才是正文、进度与边界说明。
+ * 与上面那条只读记录同一块版式（还在同一条消息里），但多一个可点的 summary ——
+ * 它不写任何单元格，也不提供任何写入入口，所以放在历史消息里不违反"要用户点的那一下
+ * 不许画在历史消息下面"：这里没有"那一下"，只有"再看一眼"。
+ */
+.office-recovery-record.is-terminal {
+  display: block;
+  cursor: pointer;
+}
+
+.office-recovery-record.is-terminal > summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  list-style: none;
+}
+
+.office-recovery-record.is-terminal > summary::-webkit-details-marker {
+  display: none;
+}
+
+.office-recovery-record.is-terminal > summary::after {
+  content: "展开";
+  margin-left: auto;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-caption);
+}
+
+.office-recovery-record.is-terminal[open] > summary::after {
+  content: "收起";
+}
+
+.office-recovery-record.is-terminal > p {
+  margin-top: 4px;
+}
+
+/*
+ * 「发现未完成的写入」—— 多候选时的选择入口。
+ *
+ * 住在输入区上方（与历史存储提示同一层），**不是**消息：它描述的是"这个工作簿现在有
+ * 什么待处理"，不是某一轮对话的产物；刷新后由发现重新给出，不该被当成历史留下来。
+ */
+.office-recovery-choices {
+  display: grid;
+  gap: 6px;
+  width: 100%;
+  margin: 0 0 8px;
+  padding: 12px 14px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  corner-shape: squircle;
+  background: var(--color-surface-hover);
+}
+
+.office-recovery-choices strong {
+  color: var(--color-text-primary);
+  font-size: var(--font-size-caption);
+}
+
+.office-recovery-choices p {
+  margin: 0;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-caption);
+  line-height: 1.5;
+}
+
+.office-recovery-choices ul {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.office-recovery-choices li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+
+.office-recovery-choices li span {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-caption);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (max-width: 520px) {
+  .office-recovery-choices li {
+    align-items: stretch;
+    flex-direction: column;
+  }
 }
 
 .planning-fallback-field {
@@ -10024,6 +10324,8 @@ button.selected > .sheet-checkbox {
   gap: 10px;
 }
 
+/* 表单里只有输入框：提交按钮与「补充后将重新生成预览」那句话都已删除，
+   提交统一由输入框右下角那颗主按钮负责（这里再出现 button 规则 = 第二个入口）。 */
 .clarification-fields { display: grid; gap: 12px; margin-top: 14px; }
 .clarification-fields label { display: grid; gap: 6px; font-weight: 600; }
 .clarification-fields textarea {
@@ -10032,8 +10334,6 @@ button.selected > .sheet-checkbox {
   corner-shape: squircle;
   color: inherit; background: transparent; font: inherit; resize: vertical;
 }
-.clarification-fields small { opacity: .75; }
-.clarification-fields button { justify-self: start; padding: 10px 14px; }
 .excel-native-review {
   padding: 12px;
   border: 1px solid var(--border-color, #dce4df);
@@ -10684,7 +10984,15 @@ button.selected > .sheet-checkbox {
 }
 
 /* 历史段上的"查看后续进展"定位入口：轻量、不抢主按钮位置。 */
-.task-progress-jump {
+.task-progress-jump,
+/*
+ * 过程框内的两个轻量动作（"有新进展/回到底部"与"多显示几行"）。
+ *
+ * 与 `.task-progress-jump` **共用样式但不共用类名**：那个类名被既有用例用来
+ * 数"这一段有几个定位入口"（`querySelectorAll(".task-progress-jump")`），
+ * 混进来会让一个不相干的按钮改变那个计数。
+ */
+.task-progress-inline-action {
   border: 0;
   background: transparent;
   box-shadow: none;
@@ -10695,6 +11003,7 @@ button.selected > .sheet-checkbox {
   cursor: pointer;
 }
 
-.task-progress-jump:hover {
+.task-progress-jump:hover,
+.task-progress-inline-action:hover {
   text-decoration: underline;
 }

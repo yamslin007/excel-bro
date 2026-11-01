@@ -328,8 +328,23 @@ export type ExcelAction =
       sheet: string;
       range: string;
       formulas: string[][];
-      // 锚点无关的 R1C1 形式；存在时按区域形状铺满，相对引用逐格自动平移
-      formulaR1C1?: string;
+      /**
+       * 锚点无关的 R1C1 形式；存在时按区域形状铺满，相对引用逐格自动平移。
+       *
+       * 口径（2026-10-30 核对真实传输与消费后统一；三件事分开说）：
+       * - **字段名一致**：两端都叫 `formulaR1C1`；
+       * - **类型一致**：可省略、可为 `null`（服务端 `str | None = None`），
+       *   但**不能**是别的类型 —— 本文件只声明 `string`/`null`；
+       * - **运行时约束**：服务端 `max_length=512`（513 字符 ⇒ 422 `string_too_long`），
+       *   本文件没有长度预检；**空串等同"没有 R1C1"**，两端与两个宿主都按真值判
+       *   （服务端 `if action.formulaR1C1`、Excel `if (action.formulaR1C1)`、
+       *   WPS 同一写法），所以 `""`/`null`/省略 三者行为相同。
+       *
+       * 真实客户端（`App.tsx`）只会"非空才带上"，不会发 `null`；`null` 之所以在
+       * 类型里，是因为服务端本来就接受它 —— 类型与线上一旦不一致，读代码的人只会
+       * 得出错误结论。
+       */
+      formulaR1C1?: string | null;
     }
   | {
       type: "sortRange";
@@ -664,6 +679,22 @@ export interface AnalysisPlan {
    * 缺失 = 依赖不确定 = 不登记断点恢复（fail-closed，退回既有的保守口径）。
    */
   sourceDependencySheets?: string[];
+  /**
+   * **公式来源证据**：登记这份执行时，公式依赖的那几张表（
+   * `formulaSourceEvidenceRequirement` 算出的集合）的值指纹。
+   *
+   * 口径只有一条，两端一致：**指纹覆盖的正是公式文本读的那几张表**，不是本次
+   * 授权范围的整张快照。授权范围宽于依赖时，拿整张快照比对会在无关表被改时误拒；
+   * 更糟的是它证明不了公式的输入没变（"只检查一个与公式依赖无关的快照"）。
+   *
+   * 写入时机：**登记断点恢复那一刻**（`register_office_execution` 之前由宿主现场读值），
+   * 不是计划生成那一刻 —— 续跑要对照的是"开始写之前现场是什么"，中间夹着的预览期
+   * 改动本来就该由首次执行按新值算。
+   *
+   * 缺失 = 没有登记来源证据 = 公式计划**不能**精确续跑（fail-closed）；不拿
+   * "续跑时现读一次"补一个基线（那正是被反复禁止的写法）。
+   */
+  sourceDependencyFingerprint?: string | null;
   assumptions: string[];
   warnings: string[];
   actions: ExcelAction[];
@@ -729,6 +760,7 @@ export interface MessageUnderstandingRequest {
 }
 
 export type MessageUnderstandingResponse =
+  | { kind: "clarification"; clarification: IntentClarification; provider: "model" }
   | { kind: "conversation"; message: string; provider: "model" }
   | { kind: "needs_workbook_context"; summary: string; provider: "model" }
   | { kind: "task_recovery"; turnId: string; action?: "inspect" | "continue"; provider: "model" };
@@ -736,6 +768,13 @@ export type MessageUnderstandingResponse =
 export function assertMessageUnderstandingResponse(value: unknown): asserts value is MessageUnderstandingResponse {
   if (!value || typeof value !== "object") throw new Error("消息理解响应格式无效");
   const item = value as Record<string, unknown>;
+  if (item.kind === "clarification") {
+    if (item.provider !== "model" || Object.keys(item).some((key) => !["kind", "provider", "clarification"].includes(key))) {
+      throw new Error("消息理解澄清格式无效");
+    }
+    assertIntentCheckResponse(item);
+    return;
+  }
   const key = item.kind === "conversation" ? "message" : item.kind === "needs_workbook_context" ? "summary" : item.kind === "task_recovery" ? "turnId" : null;
   if (!key || item.provider !== "model" || typeof item[key] !== "string" || !(item[key] as string).trim()
       || (item[key] as string).length > (key === "message" ? 1500 : key === "turnId" ? 200 : 500)
@@ -1265,7 +1304,7 @@ export function assertIntentCheckResponse(
     !clarification ||
     typeof clarification.question !== "string" ||
     !Array.isArray(clarification.options) ||
-    clarification.options.length > 4 ||
+    clarification.options.length > capabilities.clarification.maxOptions ||
     (clarification.options.length < 2 && !clarification.fields?.length) ||
     (clarification.fields !== undefined && (
       !Array.isArray(clarification.fields) || clarification.fields.length > 4 ||
@@ -1911,6 +1950,41 @@ export interface ExecutionUndoSnapshot {
  * 服务端持久化的 Office.js 写入现场。只有受控区域动作且工作簿具有稳定 URL
  * 身份时才会创建；ownerToken 只在登记/领取写入权后返回。
  */
+/**
+ * 「补记完成」写进 `result` 的最小事实。
+ *
+ * 服务端 `complete` 只要求一个 dict（不重算计划结果），所以补记时**不伪造**
+ * 一份 `PlanExecutionResult`：这里只记"这次没有执行任何动作、只是把已完成的账补上"。
+ * 补记路径不调用 `executePlan`，一个单元格都不写。
+ */
+export interface OfficeExecutionBackfillResult {
+  backfilled: true;
+  actionCount: number;
+}
+
+/**
+ * 区分"真的执行过"与"只补记"。
+ *
+ * 补记结果没有 `undoSnapshot` / `verification`：拿它去读撤销快照会把"没执行"说成
+ * "执行了但没有可撤销数据"。判据用 `backfilled` 标记，不按字段有没有来猜。
+ */
+export function isPlanExecutionResult(
+  value: PlanExecutionResult | OfficeExecutionBackfillResult | null | undefined
+): value is PlanExecutionResult {
+  return Boolean(value) && !("backfilled" in (value as OfficeExecutionBackfillResult));
+}
+
+/**
+ * 这次执行被用户终态处置的**首次时刻**（服务端只读投影，`null` = 这条留痕不存在）。
+ *
+ * 两个取值不互冒充：`undoneAt` = 确认之后撤销本次执行，`abandonedAt` = 审阅阶段
+ * 放弃变更。重开窗格靠它判断"撤销入口是不是已经被用掉了"。
+ */
+export interface OfficeExecutionDispositionState {
+  undoneAt?: number | null;
+  abandonedAt?: number | null;
+}
+
 export interface OfficeExecutionState {
   operationId: string;
   status: "running" | "needs_reconciliation" | "completed" | "failed";
@@ -1923,11 +1997,12 @@ export interface OfficeExecutionState {
   inFlightActionIndex?: number | null;
   beforeSnapshot?: UndoRangeSnapshot | null;
   checkpoint?: ExecutionUndoSnapshot | null;
-  result?: PlanExecutionResult | null;
+  result?: PlanExecutionResult | OfficeExecutionBackfillResult | null;
   error?: { code?: string; message?: string } | null;
   canResume: boolean;
   requiresReconciliation: boolean;
   ownerToken?: string | null;
+  disposition?: OfficeExecutionDispositionState | null;
 }
 
 export function assertOfficeExecutionState(
@@ -2008,7 +2083,8 @@ export interface WpsResumeSource {
   valueFingerprint: string;
 }
 export interface WpsResumeContext {
-  version: 1;
+  /** 1: nonempty source evidence; 2: trusted literal-only plan with no source dependency. */
+  version: 1 | 2;
   hostVersion: string;
   sources: WpsResumeSource[];
 }
@@ -2081,9 +2157,11 @@ export function assertWpsRecoveryDescriptor(value: unknown): asserts value is Wp
     throw new Error("WPS 恢复描述无效");
   const context = (value as WpsRecoveryDescriptor).resumeContext;
   if (context != null) {
-    if (context.version !== 1 || typeof context.hostVersion !== "string" || !context.hostVersion ||
+    if (![1,2].includes(context.version) || typeof context.hostVersion !== "string" || !context.hostVersion ||
         context.hostVersion.length > 80 || Object.keys(context).some(key => !["version", "hostVersion", "sources"].includes(key)) ||
-        !Array.isArray(context.sources) || !context.sources.length || context.sources.length > 500)
+        !Array.isArray(context.sources) || context.sources.length > 500 ||
+        (context.version === 1 ? !context.sources.length : context.sources.length !== 0) ||
+        (context.version === 2 && (value as WpsRecoveryDescriptor).actions.some(action=>action.type!=="writeValues")))
       throw new Error("WPS 续跑来源证据无效");
     for (const source of context.sources) {
       if (!source || Object.keys(source).some(key => !["sheetName", "range", "rowCount", "columnCount", "previewFingerprint", "valueFingerprint"].includes(key)) ||
@@ -2166,6 +2244,13 @@ export interface WpsExecutionState {
   ownerActive: boolean;
   requiresReconciliation: boolean;
   ownerToken?: string | null;
+  /**
+   * 处置留痕只读投影（2026-10-31）：与 `OfficeExecutionState.disposition` 同口径。
+   * 撤销/放弃之后账本 `status` 与游标都不变，跨重启续跑判据必须靠它识别终态
+   * （否则 `undoWpsExecution` 只在宿主缓存里把 `record.state` 改成 `restored`，
+   * 重开后缓存没了，续跑会被重新开放）。
+   */
+  disposition?: OfficeExecutionDispositionState | null;
 }
 
 export function assertWpsExecutionState(
@@ -2224,6 +2309,105 @@ export function assertWpsExecutionState(
     }
   }
 }
+
+/**
+ * **未完成任务恢复包**的类型权威在 `packages/core/src/executionRecoveryPackage.ts`。
+ *
+ * 协议层只转发，不另写一份结构：恢复包同时被宿主端（构建/水合）、共享层（白名单
+ * 校验）与服务端（Pydantic 镜像）读取，多一份定义就多一处漂移。校验函数也用
+ * core 那一份（`assertExecutionRecoveryPackage`），这里只补"传输信封"的形状。
+ */
+export type {
+  ExecutionRecoveryActionType,
+  ExecutionRecoveryPackage,
+  ExecutionRecoveryPackageAction,
+  ExecutionRecoverySource,
+  ExecutionRecoverySourceEvidence
+} from "@excel-bro/core/executionRecoveryPackage";
+
+/**
+ * 恢复包的本机读取结果（与 `server/app/models.py: ExecutionRecoveryPackageMaterial` 同形）。
+ *
+ * `packageJson` 是**原样文本**：客户端保存时写下哪一串字节，读回就必须是哪一串。
+ * `expiresAt` 由服务端按保留期算出（默认 7 天），客户端不得自行延长。
+ */
+export interface ExecutionRecoveryPackageMaterial {
+  packageJson: string;
+  digest: string;
+  size: number;
+  createdAt: string;
+  expiresAt: string;
+  savedAt: string;
+}
+
+export function assertExecutionRecoveryMaterial(
+  value: unknown
+): asserts value is ExecutionRecoveryPackageMaterial {
+  if (!value || typeof value !== "object") throw new Error("服务返回的恢复包材料无效");
+  const material = value as Record<string, unknown>;
+  if (typeof material.packageJson !== "string" || !material.packageJson ||
+      typeof material.digest !== "string" || !/^[0-9a-f]{64}$/.test(material.digest) ||
+      !Number.isInteger(material.size) || (material.size as number) < 1 ||
+      typeof material.createdAt !== "string" || !Number.isFinite(Date.parse(material.createdAt)) ||
+      typeof material.expiresAt !== "string" || !Number.isFinite(Date.parse(material.expiresAt)) ||
+      typeof material.savedAt !== "string" || !Number.isFinite(Date.parse(material.savedAt)))
+    throw new Error("服务返回的恢复包材料缺少必要字段");
+}
+
+/**
+ * **未完成执行发现**的类型与准入闸权威在 `packages/core/src/pendingExecutionDiscovery.ts`。
+ *
+ * 协议层只转发，不另写一份结构：发现结果同时被两端客户端、共享判据与服务端
+ * （`server/app/models.py: PendingExecutionsResponse`）读写，多一份定义就多一处漂移。
+ * 本轮新增的两个端点：
+ *
+ * - `GET /api/{wps|office}/executions/pending?workbookIdentity=…`（只读，按完整身份精确查找）
+ * - `POST /api/wps/executions/{id}/dismiss-discovery`（只写发现处置元数据）
+ *
+ * 边界：发现入口**不等于**写入资格 —— 响应里没有执行权令牌、单元格内容、恢复包正文或
+ * 完整值计划；认领与续跑仍走既有状态查询与材料水合。
+ */
+export type {
+  PendingExecutionNamespace,
+  PendingExecutionStatus,
+  PendingExecutionCandidate,
+  PendingExecutionDiscoveryResponse,
+  PendingExecutionSelection
+} from "@excel-bro/core/pendingExecutionDiscovery";
+
+export {
+  PENDING_DISCOVERY_SCHEMA_VERSION,
+  PENDING_DISCOVERY_LIMIT,
+  assertPendingExecutionDiscovery,
+  pendingExecutionSelection
+} from "@excel-bro/core/pendingExecutionDiscovery";
+
+/**
+ * **用户处置留痕**（放弃变更 / 撤销本次执行）的类型权威在
+ * `packages/core/src/executionDisposition.ts`。
+ *
+ * 与"未完成执行发现"同一口径：协议层只转发，不另写一份结构。同一份取值被两端客户端、
+ * 共享判据与服务端（`server/app/models.py` 的 `OfficeExecutionDispositionRequest` /
+ * `WpsExecutionDispositionRequest`，两处都是 `Literal["abandoned", "undone"]`）读写，
+ * 多一份定义就多一处漂移。
+ *
+ * 端点与语义：
+ *
+ * - `POST /api/{office|wps}/executions/{id}/disposition`，体 `{ disposition }`，成功 `204`；
+ * - 记录不存在 / 身份前缀不属于本宿主 ⇒ `404 EXECUTION_DISPOSITION_NOT_FOUND`，**不补建账本**；
+ * - 只写一列时间戳：不推进 `revision`、不改 `status`、不动动作游标、不删恢复材料；
+ * - **首次写赢** ⇒ 重复上报幂等（重试只重发这一条 POST，绝不回到宿主再撤一次）。
+ */
+export type {
+  ExecutionDisposition,
+  ExecutionDispositionOutcome
+} from "@excel-bro/core/executionDisposition";
+
+export {
+  EXECUTION_DISPOSITION_LABEL,
+  normalizeExecutionDisposition,
+  recordExecutionDisposition
+} from "@excel-bro/core/executionDisposition";
 
 /**
  * 与 `server/app/models.py: ColumnMappingPair` 同形。
@@ -2369,6 +2553,7 @@ export type AssistantResponse =
     }
   | {
       kind: "plan";
+      /** Trusted single/batch literal compiler metadata; raw model JSON cannot attest it. */
       planOrigin?: "literal_range_edit" | null;
       plan: AnalysisPlan;
       provider: "model" | "local";

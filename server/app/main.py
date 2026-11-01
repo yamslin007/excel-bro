@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import sqlite3
 import uuid
 import time
@@ -15,13 +16,13 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from .capabilities import capabilities, capability_float, capability_int
+from .capabilities import capabilities, capability_float, capability_int, capability_int_list
 from .capabilities import model_timeout_seconds
 from .intent import check_intent, check_message_understanding
 from .request_cancellation import until_disconnected
@@ -92,6 +93,8 @@ from .models import (
     OfficeActionCompleteRequest,
     OfficeActionReconcileRequest,
     OfficeActionStartRequest,
+    OfficeExecutionDispositionRequest,
+    OfficeExecutionDispositionState,
     OfficeExecutionFinishRequest,
     OfficeExecutionRegisterRequest,
     OfficeExecutionResumeRequest,
@@ -100,6 +103,7 @@ from .models import (
     WpsActionCompleteRequest,
     WpsActionReconcileRequest,
     WpsActionStartRequest,
+    WpsExecutionDispositionRequest,
     WpsExecutionFinishRequest,
     WpsExecutionRegisterRequest,
     WpsExecutionResumeRequest,
@@ -107,6 +111,12 @@ from .models import (
     WpsExecutionSuspendRequest,
     WpsRecoveryActionDescriptor,
     WpsRecoveryDescriptor,
+    PendingExecutionCandidate,
+    PendingExecutionsResponse,
+    ExecutionRecoveryPackage,
+    ExecutionRecoveryPackageMaterial,
+    ExecutionRecoveryPackageWriteRequest,
+    recovery_package_plan_fingerprint,
     PlanRequest,
     PlanningContinuation,
     PlanningContinueRequest,
@@ -194,6 +204,16 @@ from .local_results import local_results
 from .python_code_artifacts import python_code_artifacts
 from . import dev_result_ref_fault, dev_source_changed_fault, planning_context
 from .ledger_privacy import ledger_recovery_descriptor
+from . import execution_recovery
+from .execution_recovery import (
+    RecoveryPackageConflict,
+    RecoveryPackageCorrupt,
+    RecoveryPackageError,
+    RecoveryPackageExpired,
+    RecoveryPackageMissing,
+    RecoveryPackagePersistenceError,
+    RecoveryPackageQuota,
+)
 
 load_dotenv("server/.env")
 logger = logging.getLogger(__name__)
@@ -221,19 +241,34 @@ app = FastAPI(
     lifespan=_app_lifespan,
 )
 
-ALLOWED_ORIGINS = [
-    "https://localhost:3000",
-    "https://127.0.0.1:3000",
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    "http://localhost:3889",
-    "http://127.0.0.1:3889",
-    # 兼容修复前由 apps/wps-addin/package.json 启动的 3890 开发页。
-    # 新的 WPS 调试入口统一使用 3889；这里保留精确回环来源，避免已打开
-    # 的任务窗格在热更新后仍因 CORS 预检失败而只能显示 Failed to fetch。
-    "http://localhost:3890",
-    "http://127.0.0.1:3890",
+_EXCEL_DEV_PORT = capability_int("devServers", "excelPort")
+WPS_DEV_PORT_CANDIDATES = capability_int_list("devServers", "wpsPortCandidates")
+if _EXCEL_DEV_PORT in WPS_DEV_PORT_CANDIDATES:
+    # 同一个回环端口被两端同时声明 ⇒ 先起的一方占住端口，另一方只能启动失败或漂移。
+    # 这是配置错误，不是运行期可以"看着办"的情况：直接拒绝启动。
+    raise RuntimeError(
+        "开发端口冲突：devServers.wpsPortCandidates 不能包含 devServers.excelPort"
+    )
+
+# Excel 任务窗格是 https://localhost:3000（Vite 严格端口），WPS 开发页是
+# http://127.0.0.1:<候选端口>。两组都必须是**精确**回环来源：既不做通配，
+# 也不因"同机"就放行别的端口 —— 来源是"谁在调用"的身份，不是可达性开关。
+EXCEL_ORIGINS = [
+    f"https://localhost:{_EXCEL_DEV_PORT}",
+    f"https://127.0.0.1:{_EXCEL_DEV_PORT}",
+    f"http://localhost:{_EXCEL_DEV_PORT}",
+    f"http://127.0.0.1:{_EXCEL_DEV_PORT}",
 ]
+# WPS 端口的**唯一**来源是 config/capabilities.json 的 devServers.wpsPortCandidates：
+# 启动器（scripts/start_wps_dev.mjs）从同一份配置里按声明顺序挑一个真正能绑定的端口，
+# 所以"登记地址 / Vite 实际监听 / 后端允许来源"三者天然同源。改端口只改配置一处。
+WPS_DEV_ORIGINS = [
+    f"http://{host}:{port}"
+    for port in WPS_DEV_PORT_CANDIDATES
+    for host in ("localhost", "127.0.0.1")
+]
+
+ALLOWED_ORIGINS = [*EXCEL_ORIGINS, *WPS_DEV_ORIGINS]
 
 app.add_middleware(
     CORSMiddleware,
@@ -259,7 +294,7 @@ def _review_layout_origin(request: Request) -> str:
     origin = request.headers.get("origin", "")
     if (not request.client or request.client.host not in {"127.0.0.1", "::1"}
         or request.url.hostname not in {"127.0.0.1", "localhost", "::1"}
-        or origin not in ALLOWED_ORIGINS[:4]
+        or origin not in EXCEL_ORIGINS
         or request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json"):
         raise HTTPException(403, detail={"code": "LAYOUT_FORBIDDEN", "message": "仅允许本机 Excel 任务窗格请求窗口排列。", "retryable": False})
     return origin
@@ -1741,6 +1776,17 @@ def _validate_office_recovery_plan(request: OfficeExecutionRegisterRequest) -> N
                 f"计划声明的实际来源依赖「{dependency_sheet}」不在本次授权范围内。",
                 retryable=False,
             )
+    # 公式来源证据必须带口径：指纹是"某几张表在某个时刻的值"，没有表集合就只是
+    # 一串哈希。反过来（有依赖表没指纹）在这里不拒 —— 那可能是"公式不读任何来源"
+    # （`=1+1`）或是端上本来就没登记，两种情况都由端上判据说得更准；
+    # 服务端不复述公式文本扫描（那是 core 的判据，写第二份必然漂移）。
+    if request.plan.sourceDependencyFingerprint and not dependency:
+        raise service_error(
+            422,
+            "OFFICE_RECOVERY_SOURCE_EVIDENCE_INCOMPLETE",
+            "计划带了公式来源指纹但没有记录它覆盖哪些来源表，无法核对来源；不登记断点恢复。",
+            retryable=False,
+        )
     for index, action in enumerate(request.plan.actions):
         if action.type not in _OFFICE_RECOVERABLE_ACTION_TYPES:
             raise service_error(
@@ -1795,6 +1841,12 @@ def _office_state_payload(
         canResume=record.status in {"running", "failed", "needs_reconciliation"},
         requiresReconciliation=record.in_flight_action_index is not None,
         ownerToken=record.owner_token if include_owner else None,
+        # 处置留痕只读投影（2026-10-31）：重开窗格要靠它判断"这次执行的撤销入口是不是
+        # 已经被用掉了"。以前接口不回这两列，界面只能凭"账本还没完成"重建入口 ——
+        # 用户撤销过之后又收到一次同样的按钮，点了也只会被写后指纹挡下。
+        disposition=OfficeExecutionDispositionState(
+            undoneAt=record.undone_at, abandonedAt=record.abandoned_at
+        ),
     )
 
 
@@ -1955,6 +2007,11 @@ def _wps_state_payload(
         requiresReconciliation=record.in_flight_action_index is not None,
         ownerActive=owner_active,
         ownerToken=record.owner_token if include_owner else None,
+        # 处置留痕只读投影（2026-10-31）：与 `_office_state_payload` 同一条纪律 —— 撤销/放弃
+        # 之后账本 status 与游标都不变，跨重启续跑判据必须靠这两列识别"这次执行已经终态"。
+        disposition=OfficeExecutionDispositionState(
+            undoneAt=record.undone_at, abandonedAt=record.abandoned_at
+        ),
     )
 
 
@@ -1978,6 +2035,112 @@ def _wps_record(operation_id: str) -> OfficeExecutionRecord:
         # Never stringify validation errors containing a legacy plan/matrix.
         raise ValueError("旧执行记录不符合无矩阵恢复协议，不能下发或接管；请重新核对并预览。") from None
     return record
+
+
+_WPS_IDENTITY_PATTERN = re.compile(r"^wps-path:[a-z]:[\\/][^\r\n]+\.xlsx$", re.IGNORECASE)
+_OFFICE_IDENTITY_PATTERN = re.compile(r"^url:[^\s]+$")
+
+
+def _pending_identity(namespace: str, value: str) -> str:
+    """校验**发现**用的工作簿身份；不合法就是 422，绝不猜。
+
+    身份是"重新发现未完成执行"的唯一钥匙，所以它的形状必须与登记时同一套口径：
+    WPS = `wps-path:` + 已保存 `.xlsx` 的盘符路径；Excel = `url:` + document url。
+    未保存簿（没有身份）、只有文件名、`.xls`、UNC 或别的命名空间一律拒绝 —— 退回
+    "看着像就认"会让同名异路径的两个簿互相看见对方未写完的写入。
+    """
+
+    identity = (value or "").strip()
+    maximum = capability_int("taskRecovery", "pendingDiscoveryMaxIdentityChars")
+    pattern = _WPS_IDENTITY_PATTERN if namespace == "wps" else _OFFICE_IDENTITY_PATTERN
+    if not identity or len(identity) > maximum or not pattern.match(identity):
+        raise service_error(
+            422,
+            "PENDING_DISCOVERY_IDENTITY_INVALID",
+            "工作簿身份不是已保存文件的稳定身份，不能用于发现未完成执行；"
+            "请先保存工作簿（WPS 需为 .xlsx）再重新核对。",
+            retryable=False,
+        )
+    return identity
+
+
+def _pending_total_actions(namespace: str, record: OfficeExecutionRecord) -> int | None:
+    """账本登记的动作总数；登记形状不可用时返回 `None`（该记录**不**进入发现）。
+
+    WPS 的记录必须能按无矩阵协议读出来 —— 旧版整份计划的记录既不能安全接管，也不该
+    出现在"可以继续"的名单里（状态端点同样会拒绝它）。Excel 的计划是完整
+    `AnalysisPlan`，这里只取动作**数量**，不把任何动作内容带到响应里。
+    """
+
+    try:
+        if namespace == "wps":
+            return len(WpsRecoveryDescriptor.model_validate(record.plan).actions)
+        actions = record.plan.get("actions")
+        return len(actions) if isinstance(actions, list) and actions else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _pending_execution_candidates(
+    namespace: str, records: list[OfficeExecutionRecord]
+) -> list[PendingExecutionCandidate]:
+    """把账本记录投影成**最小**发现元数据：定位、时间、进度。
+
+    账本里还有 `owner_token`、计划/描述、检查点；这些**一个都不出现**在这里。发现只
+    恢复"入口"，执行权必须通过认领接口取得。
+    """
+
+    now = time.time()
+    lease = capability_int("taskRecovery", "wpsOwnerLeaseSeconds")
+    candidates: list[PendingExecutionCandidate] = []
+    for record in records:
+        total = _pending_total_actions(namespace, record)
+        if total is None or total < 1:
+            continue
+        if record.next_action_index > total:
+            # 游标超出登记的动作数：形状自相矛盾，不猜到底是几步。
+            continue
+        owner_active = record.status == "running" and record.updated_at + lease > now
+        candidates.append(
+            PendingExecutionCandidate(
+                operationId=record.operation_id,
+                taskId=record.task_id or "",
+                status=record.status,
+                createdAt=max(1, int(round(record.created_at * 1000))),
+                updatedAt=max(1, int(round(record.updated_at * 1000))),
+                nextActionIndex=record.next_action_index,
+                totalActions=total,
+                inFlightActionIndex=record.in_flight_action_index,
+                ownerActive=owner_active,
+                requiresReconciliation=record.in_flight_action_index is not None,
+                canResume=not owner_active
+                and record.status in {"running", "failed", "needs_reconciliation"},
+            )
+        )
+    return candidates
+
+
+async def _pending_executions(
+    namespace: str, workbook_identity: str, limit: int | None
+) -> PendingExecutionsResponse:
+    identity = _pending_identity(namespace, workbook_identity)
+    maximum = capability_int("taskRecovery", "pendingDiscoveryMaxCandidates")
+    effective = maximum if limit is None else max(1, min(limit, maximum))
+    try:
+        records, truncated = await run_in_threadpool(
+            _folder_operation_ledger.pending_office_executions, identity, limit=effective
+        )
+    except Exception as error:
+        # 账本读不出来**不等于**没有未完成执行：调用方必须能把这两件事分开说。
+        raise _task_state_error(error) from error
+    return PendingExecutionsResponse(
+        schemaVersion=1,
+        namespace=namespace,
+        workbookIdentity=identity,
+        limit=effective,
+        truncated=truncated,
+        candidates=_pending_execution_candidates(namespace, records),
+    )
 
 
 def _wps_evidence(operation_id: str, action_index: int, evidence: Any, *, after: bool = False) -> dict[str, Any]:
@@ -2986,6 +3149,25 @@ async def register_office_execution(
 
 
 @app.get(
+    "/api/office/executions/pending",
+    response_model=PendingExecutionsResponse,
+)
+async def office_pending_executions(
+    workbookIdentity: str = "", limit: int | None = None
+) -> PendingExecutionsResponse:
+    """Excel 端的未完成执行发现（与 WPS 同一份判据、同一张表）。
+
+    客户端是否已接线是另一件事（本轮只接线 WPS，计划表如实记录）；能力本身两端同批就位，
+    否则"丢了浏览器索引就再也找不到"这个缺口在 Excel 侧依然存在。
+
+    **须声明在 `/api/office/executions/{operation_id}` 之前**：静态路径先匹配，否则
+    `pending` 会被当成一个 operationId 去查、返回 404。
+    """
+
+    return await _pending_executions("office", workbookIdentity, limit)
+
+
+@app.get(
     "/api/office/executions/{operation_id}",
     response_model=OfficeExecutionStateResponse,
 )
@@ -3387,6 +3569,31 @@ async def register_wps_execution(
 
 
 @app.get(
+    "/api/wps/executions/pending",
+    response_model=PendingExecutionsResponse,
+)
+async def wps_pending_executions(
+    workbookIdentity: str = "", limit: int | None = None
+) -> PendingExecutionsResponse:
+    """按**当前工作簿稳定身份**发现未完成执行（只读）。
+
+    这是"完整退出宿主后仍能找回恢复入口"的后端入口：浏览器 `localStorage` 的索引
+    降级为缓存，丢了也能从这里重新找到这次执行。
+
+    三条不许放宽的边界：
+
+    - **精确身份**：完整字符串相等；同名异路径、只有文件名、未保存簿一律 422；
+    - **只读**：不认领、不补记、不推进 revision、不写单元格（连 `updated_at` 都不改）；
+    - **只给入口**：响应里没有执行权令牌、单元格内容、恢复包正文或完整计划。
+
+    后续仍走 `GET /api/wps/executions/{id}` + 材料水合 + 身份/授权/来源/现场复核，
+    本端点**不**复制任何恢复判据。
+    """
+
+    return await _pending_executions("wps", workbookIdentity, limit)
+
+
+@app.get(
     "/api/wps/executions/{operation_id}",
     response_model=WpsExecutionStateResponse,
 )
@@ -3475,6 +3682,96 @@ async def suspend_wps_execution(
     return _wps_state_payload(record)
 
 
+async def _record_execution_disposition(
+    operation_id: str, request: Any, identity_prefix: str
+) -> Response:
+    """记下"用户放弃/撤销了这次执行"（幂等，只写一列时间戳）。
+
+    语义必须精确，别的一概不做：**不**推进 `revision`、**不**改 `status`、**不**动动作
+    游标或在途动作、**不**删恢复材料 —— 那会毁掉下一次真正续跑的依据。它回答的问题是
+    "用户做过什么"，不是"任务走到哪了"。
+
+    记录不存在 / 身份前缀不属于本宿主 ⇒ 404（`EXECUTION_DISPOSITION_NOT_FOUND`）：
+    绝不为了"留个痕"补建一条账本，也绝不让 Excel 的路径替 WPS 的记录作证。
+    """
+
+    record = await run_in_threadpool(
+        _folder_operation_ledger.office_execution, operation_id
+    )
+    if record is None or not record.workbook_identity.startswith(identity_prefix):
+        raise service_error(
+            404,
+            "EXECUTION_DISPOSITION_NOT_FOUND",
+            "未找到这次执行记录；处置留痕不会创建或改写任何账本。",
+            retryable=False,
+        )
+    await run_in_threadpool(
+        _folder_operation_ledger.record_office_disposition,
+        operation_id,
+        request.disposition,
+    )
+    return Response(status_code=204)
+
+
+@app.post(
+    "/api/office/executions/{operation_id}/disposition",
+    status_code=204,
+)
+async def record_office_execution_disposition(
+    operation_id: str, request: OfficeExecutionDispositionRequest
+) -> Response:
+    return await _record_execution_disposition(operation_id, request, "url:")
+
+
+@app.post(
+    "/api/wps/executions/{operation_id}/disposition",
+    status_code=204,
+)
+async def record_wps_execution_disposition(
+    operation_id: str, request: WpsExecutionDispositionRequest
+) -> Response:
+    return await _record_execution_disposition(operation_id, request, "wps-path:")
+
+
+@app.post(
+    "/api/wps/executions/{operation_id}/dismiss-discovery",
+    status_code=204,
+)
+async def dismiss_wps_execution_discovery(operation_id: str) -> Response:
+    """清除「这条恢复提示」（只写发现处置元数据，幂等）。
+
+    语义必须精确，别的一概不做：
+
+    - **不**把执行标成完成、**不**删恢复材料、**不**改动作游标或在途动作、**不**推进
+      `revision` —— 那会毁掉下一次真正续跑的依据；
+    - 只记下处置时间，于是后端发现不会在重开后把同一条提示无限复活；
+    - 该执行日后真有新变化（`updated_at` 前进），这条提示会重新出现 —— 那是新事实，
+      不该被一次旧处置长期遮住。
+
+    记录不存在就是 404：绝不为了"让提示消失"补建一条账本。
+    """
+
+    try:
+        record = await run_in_threadpool(
+            _folder_operation_ledger.office_execution, operation_id
+        )
+        if record is None or not record.workbook_identity.startswith("wps-path:"):
+            raise service_error(
+                404,
+                "WPS_EXECUTION_NOT_FOUND",
+                "未找到这次 WPS 执行记录；清除提示不会创建或改写任何账本。",
+                retryable=False,
+            )
+        await run_in_threadpool(
+            _folder_operation_ledger.dismiss_office_execution_discovery, operation_id
+        )
+    except Exception as error:
+        if isinstance(error, HTTPException):
+            raise
+        raise _wps_conflict(error) from error
+    return Response(status_code=204)
+
+
 @app.post(
     "/api/wps/executions/{operation_id}/resume",
     response_model=WpsExecutionStateResponse,
@@ -3544,6 +3841,197 @@ async def finish_wps_execution(
     except Exception as error:
         raise _wps_conflict(error) from error
     return _wps_state_payload(record)
+
+
+def _recovery_package_error(error: Exception) -> HTTPException:
+    """恢复包的状态错误必须**可区分**：缺失 / 过期 / 损坏 / 冲突 / 配额各有代号。
+
+    合并成一个"不可用"会让界面无从说明"是该早点回来、该重新规划，还是本机空间不够"。
+    消息只描述状态，绝不拼接正文（含单元格原值）。
+    """
+
+    if isinstance(error, RecoveryPackageMissing):
+        return service_error(404, "RECOVERY_PACKAGE_MISSING", str(error), retryable=False)
+    if isinstance(error, RecoveryPackageExpired):
+        return service_error(410, "RECOVERY_PACKAGE_EXPIRED", str(error), retryable=False)
+    if isinstance(error, RecoveryPackageCorrupt):
+        return service_error(409, "RECOVERY_PACKAGE_CORRUPT", str(error), retryable=False)
+    if isinstance(error, RecoveryPackageConflict):
+        return service_error(409, "RECOVERY_PACKAGE_CONFLICT", str(error), retryable=False)
+    if isinstance(error, RecoveryPackageQuota):
+        return service_error(507, "RECOVERY_PACKAGE_QUOTA", str(error), retryable=False)
+    if isinstance(error, RecoveryPackagePersistenceError):
+        return service_error(507, "RECOVERY_PACKAGE_PERSISTENCE", str(error), retryable=False)
+    if isinstance(error, RecoveryPackageError):
+        return service_error(422, "RECOVERY_PACKAGE_INVALID", str(error), retryable=False)
+    return _task_state_error(error)
+
+
+def _assert_recovery_package_matches(record: OfficeExecutionRecord, package: ExecutionRecoveryPackage) -> None:
+    """恢复包必须与**账本登记的同一次执行**对得上，否则拒绝保存。
+
+    没有这道闸，任何本机进程都能把一份"看着像"的材料挂到别的执行身份上，恢复时
+    就成了拿 A 任务的写前值去核 B 任务的原表。
+    """
+
+    descriptor = WpsRecoveryDescriptor.model_validate(record.plan)
+    if record.task_id is None or package.taskId != record.task_id:
+        raise RecoveryPackageError("恢复包与账本登记的任务身份不一致")
+    if package.workbookIdentity != record.workbook_identity:
+        raise RecoveryPackageError("恢复包与账本登记的工作簿身份不一致")
+    registered = sorted(record.authorization.get("authorizedSheetNames") or [])
+    if sorted(package.authorizedSheetNames) != registered:
+        raise RecoveryPackageError("恢复包与账本登记的授权范围不一致")
+    expected = recovery_package_plan_fingerprint(
+        [action.model_dump(include={"actionIndex", "type", "sheet", "range", "rowCount",
+                                    "columnCount", "cellCount", "previewFingerprint",
+                                    "expectedFingerprint"}) for action in descriptor.actions]
+    )
+    if package.planFingerprint != expected or len(package.actions) != len(descriptor.actions):
+        raise RecoveryPackageError("恢复包与账本登记的计划不是同一版")
+
+
+@app.put(
+    "/api/execution-recovery/{operation_id}",
+    response_model=ExecutionRecoveryPackageMaterial,
+)
+async def save_execution_recovery_package(
+    operation_id: str, request: ExecutionRecoveryPackageWriteRequest
+) -> ExecutionRecoveryPackageMaterial:
+    """写前落盘：把不可变的原始恢复材料保存到本机数据目录。
+
+    正文原样保存、原样读回，摘要由服务端按收到的字节算（不依赖浏览器的 WebCrypto）。
+    这里不碰账本进度 —— 进度仍由 `office_executions` 的 CAS 语义管理。
+    """
+
+    body = request.packageJson.encode("utf-8")
+    if len(body) != request.size:
+        raise service_error(422, "RECOVERY_PACKAGE_INVALID", "恢复包字节数与请求不一致。", retryable=False)
+    if len(body) > capability_int("taskRecovery", "recoveryPackageMaxBytes"):
+        raise service_error(507, "RECOVERY_PACKAGE_QUOTA", "恢复包超过单任务容量上限。", retryable=False)
+    try:
+        record = await run_in_threadpool(_wps_record, operation_id)
+    except Exception as error:
+        raise _wps_conflict(error) from error
+    try:
+        package = ExecutionRecoveryPackage.model_validate_json(request.packageJson)
+    except Exception:
+        # Pydantic 的错误文本会回显被校验的输入片段（含单元格原值），一律换成固定文案。
+        raise service_error(422, "RECOVERY_PACKAGE_INVALID", "恢复包正文未通过校验。", retryable=False) from None
+    try:
+        _assert_recovery_package_matches(record, package)
+    except RecoveryPackageError as error:
+        raise service_error(422, "RECOVERY_PACKAGE_INVALID", str(error), retryable=False) from None
+    # 首次到期时间由账本记住：重复 PUT、读回水合、保留期清理都不许把它往后推。
+    # 没有登记过就用"此刻 + 保留期"登记一次，之后只读。
+    try:
+        reserved = await run_in_threadpool(
+            _folder_operation_ledger.reserve_recovery_package_expiry,
+            operation_id,
+            execution_recovery.default_expiry(),
+        )
+    except Exception as error:
+        # Ledger failures must become a structured response with CORS headers.
+        # An uncaught 500 is otherwise hidden by the browser as "Failed to fetch".
+        raise _recovery_package_error(error) from error
+    if reserved is None:
+        raise service_error(409, "WPS_RECOVERY_CONFLICT", "未找到这次 WPS 执行记录", retryable=False)
+    try:
+        material = await run_in_threadpool(
+            execution_recovery.save, operation_id, request.packageJson, reserved
+        )
+    except Exception as error:
+        raise _recovery_package_error(error) from error
+    return ExecutionRecoveryPackageMaterial(**material)
+
+
+@app.get(
+    "/api/execution-recovery/{operation_id}",
+    response_model=ExecutionRecoveryPackageMaterial,
+)
+async def load_execution_recovery_package(operation_id: str) -> ExecutionRecoveryPackageMaterial:
+    """读回恢复包。只读：不延长有效期、不新建材料、不推进账本。"""
+
+    try:
+        record = await run_in_threadpool(_wps_record, operation_id)
+    except Exception as error:
+        raise _wps_conflict(error) from error
+    try:
+        material = await run_in_threadpool(execution_recovery.load, operation_id)
+    except Exception as error:
+        raise _recovery_package_error(error) from error
+    try:
+        _assert_recovery_package_matches(record, ExecutionRecoveryPackage.model_validate_json(material["packageJson"]))
+    except Exception:
+        raise service_error(409, "RECOVERY_PACKAGE_CORRUPT", "本机恢复材料与账本登记不一致。",
+                            retryable=False) from None
+    return ExecutionRecoveryPackageMaterial(**material)
+
+
+@app.delete("/api/execution-recovery/{operation_id}", status_code=204)
+async def delete_execution_recovery_package(operation_id: str) -> Response:
+    """终态回收：任务真的结束（原表已回到执行前）后删掉本机恢复材料。
+
+    **不是**执行成功后的清理：那时审阅、核对、放弃都还要用这份材料，提前删掉等于把
+    "完整退出宿主仍可继续"刚刚修好的能力再砸掉一次。不存在即幂等成功。
+
+    删之前先把"是哪一份"记进账本（U5，2026-10-30）：材料一删就没得算了，之后任何
+    "当时那份材料是不是这一份"的回答都只能是推断。**顺序不能反** —— 先留痕、再删除；
+    拿不到留痕就不删（返回 503，材料留着随保留期到期），绝不出现"材料没了还没证据"。
+    这与 `disposition` 的口径正好相反：那边必须等宿主恢复**成功之后**才写（没恢复就不许
+    说撤销了），这边必须在删除**之前**写（删完就无从取证）。两条别互相照抄。
+
+    两个**不同**的事实，别混成一句"删掉了"：
+
+    - `retired_at`（+ 指纹、字节数）：删前记下"要删的是这一份"，**只是记录**；
+    - `removed_at`：`remove()` 报告**真的删掉了**之后才写，**才是删除确认**。
+      所以"落账成功、删除失败"在账本里读得出来（前者有值、后者为空），
+      而只有两者都有才能宣称"那一份确实被删掉了"。
+    """
+
+    try:
+        record = await run_in_threadpool(_wps_record, operation_id)
+    except Exception as error:
+        raise _wps_conflict(error) from error
+    material = await run_in_threadpool(execution_recovery.raw_digest, operation_id)
+    if material is not None:
+        digest, size = material
+        try:
+            await run_in_threadpool(
+                _folder_operation_ledger.record_recovery_package_retirement,
+                operation_id,
+                digest,
+                size,
+            )
+        except Exception as error:
+            logger.exception("恢复材料回收留痕不可用")
+            raise service_error(
+                503,
+                "RECOVERY_PACKAGE_RETIREMENT_UNRECORDED",
+                "无法留下这次材料回收的留痕，已停止删除；材料仍在，会随保留期到期清理。",
+                retryable=True,
+            ) from error
+    try:
+        removed = await run_in_threadpool(execution_recovery.remove, operation_id)
+    except Exception as error:
+        # 落账已经发生、删除失败：账本留下的是"记了要删的是哪一份"，`removed_at` 仍为空。
+        # 这正是"两个事实"的意义 —— 不能因为 `retired_at` 有值就说删掉了。
+        raise _recovery_package_error(error) from error
+    if removed:
+        try:
+            await run_in_threadpool(
+                _folder_operation_ledger.mark_recovery_package_removed, operation_id
+            )
+        except Exception as error:
+            # 文件已经删了、回不来；不假装 204，也不假装"没删"：如实说"删了但没记下确认"。
+            logger.exception("恢复材料删除确认不可用")
+            raise service_error(
+                503,
+                "RECOVERY_PACKAGE_REMOVAL_UNRECORDED",
+                "材料已删除，但未能记下删除确认；账本里这一行的删除确认时间为空，请按未确认处理。",
+                retryable=True,
+            ) from error
+    return Response(status_code=204)
 
 
 @app.post("/api/folders/select", response_model=FolderCatalog | None)

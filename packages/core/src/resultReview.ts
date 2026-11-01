@@ -32,6 +32,10 @@ export class ReviewNotCurrentError extends Error {
     this.name = 'ReviewNotCurrentError';
   }
 }
+/** Host adapter proved no action started; never infer this from a missing receipt. */
+export class ReviewNotStartedError extends Error {
+  constructor(message: string) { super(message); this.name = 'ReviewNotStartedError'; }
+}
 export interface ResultReviewOperations<Before, Receipt extends ResultReviewReceipt, Marker, Copy> {
   /** Includes plan revision, authorization and the original workbook identity. */
   isCurrent(): boolean;
@@ -92,7 +96,7 @@ export class ResultReview<Before, Receipt extends ResultReviewReceipt, Marker, C
       this.update({ phase: 'reviewing' });
       return true;
     } catch (reason) {
-      this.update({ phase: executionStarted ? 'failed' : 'not_started', notice: this.reason(reason) });
+      this.update({ phase: executionStarted && !(reason instanceof ReviewNotStartedError) ? 'failed' : 'not_started', notice: this.reason(reason) });
       return false;
     } finally { this.update({ pending: false }); }
   }

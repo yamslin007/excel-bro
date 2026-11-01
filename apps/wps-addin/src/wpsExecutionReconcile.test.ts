@@ -82,6 +82,40 @@ describe("wpsReconcileVerdict 收紧后的判定", () => {
     expect(wpsReconcileActions(verdict)).toEqual(["dismiss"]);
   });
 
+  it("撤销过（disposition.undoneAt）→ 终态 undone，不给任何按钮", () => {
+    const verdict = wpsReconcileVerdict({
+      state: state({ disposition: { undoneAt: 1_790_000_700_000, abandonedAt: null } }),
+      identityMatch: true,
+      localInspection: "conflict"
+    });
+    expect(verdict.kind).toBe("undone");
+    expect(wpsReconcileActions(verdict)).toEqual([]);
+  });
+
+  it("放弃过（disposition.abandonedAt）→ blocked，不冒充已撤销", () => {
+    const verdict = wpsReconcileVerdict({
+      state: state({ disposition: { undoneAt: null, abandonedAt: 1_790_000_700_000 } }),
+      identityMatch: true,
+      localInspection: "conflict"
+    });
+    expect(verdict.kind).toBe("blocked");
+    expect(verdict).toMatchObject({ detail: expect.stringContaining("放弃变更") });
+    expect(wpsReconcileActions(verdict)).toEqual(["dismiss"]);
+  });
+
+  it("disposition 终态优先于 status/现场：即使 status 仍 needs_reconciliation 也判 undone", () => {
+    const verdict = wpsReconcileVerdict({
+      state: state({
+        status: "needs_reconciliation",
+        inFlightActionIndex: 1,
+        disposition: { undoneAt: 1_790_000_700_000, abandonedAt: null }
+      }),
+      identityMatch: true,
+      localInspection: "not_started"
+    });
+    expect(verdict.kind).toBe("undone");
+  });
+
   /*
    * 这一条是上一轮判定的**反向锚点**：那时 running 且无在途动作就返回
    * `continue`，不检查 canResume、身份、剩余动作，也不看现场。现在必须归成
@@ -165,7 +199,8 @@ describe("wpsReconcileVerdict 收紧后的判定", () => {
       identityMatch: true,
       localInspection: "completed"
     });
-    expect(verdict).toEqual({ kind: "reconcile", actionIndex: 0, outcome: "applied" });
+    // remaining = 在途这一格之后还有几个动作没跑：结论要能同时说"第 1 步已写入"和"第 2 步未执行"。
+    expect(verdict).toEqual({ kind: "reconcile", actionIndex: 0, outcome: "applied", remaining: 1 });
     expect(wpsReconcileActions(verdict)).toEqual(["reconcile", "dismiss"]);
   });
 
@@ -180,7 +215,7 @@ describe("wpsReconcileVerdict 收紧后的判定", () => {
       identityMatch: true,
       localInspection: "not_started"
     });
-    expect(verdict).toEqual({ kind: "reconcile", actionIndex: 1, outcome: "not_applied" });
+    expect(verdict).toEqual({ kind: "reconcile", actionIndex: 1, outcome: "not_applied", remaining: 0 });
   });
 
   it("有在途动作但本机现场冲突 → blocked，不允许覆盖", () => {

@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import capabilities from "../../../../config/capabilities.json";
 import type { ExecutionUndoSnapshot } from "../contracts";
 import { isRunningInExcel, undoExecution } from "../excel";
@@ -60,29 +60,86 @@ export function useUndoSnapshot({
   beforeOperation
 }: UseUndoSnapshotOptions) {
   const [undoStack, setUndoStack] = useState<ExecutionUndoSnapshot[]>([]);
+  /*
+   * 栈的**同步**副本。
+   *
+   * 存在理由（2026-10-31）：恢复卡的「撤销本次执行」是"先挂快照、紧接着就撤"——
+   * `ensureUndoSnapshot(...)` 之后**同一个 tick** 调 `undoExecutionTo(...)`。React 的
+   * 状态更新要等下一次渲染，闭包里那份 `undoStack` 在那一刻还是旧的，于是刚挂进去的
+   * 那一条找不到，撤销静默不执行（按钮点了没反应，连失败文案都没有）。
+   * 所有入栈/出栈都先写 ref 再写 state，同一次点击里就能看到自己刚放进去的东西。
+   */
+  const stackRef = useRef<ExecutionUndoSnapshot[]>([]);
+  const commitStack = useCallback(
+    (update: (stack: ExecutionUndoSnapshot[]) => ExecutionUndoSnapshot[]) => {
+      const next = update(stackRef.current);
+      stackRef.current = next;
+      setUndoStack(next);
+      return next;
+    },
+    []
+  );
   const lastUndoSnapshot =
     undoStack.length > 0 ? undoStack[undoStack.length - 1] : null;
 
   const pushUndoSnapshot = useCallback(
     (snapshot: ExecutionUndoSnapshot | null) => {
       if (!snapshot) return;
-      setUndoStack((stack) => trimStack([...stack, snapshot]));
+      /*
+       * 同一执行**只保留最新的一份**（新的替换旧的）。
+       *
+       * 存在理由（2026-10-31）：一次执行可能先后产生两份快照 —— 断点恢复时从账本材料
+       * 重建的"已完成前缀"那一份，和续跑完成后整份执行那一份。两份都留在栈里，LIFO
+       * 会把同一批区域恢复两遍：先按整份还原，再按前缀那份核对"写后指纹"必然对不上，
+       * 于是**放弃变更/撤销被误判成冲突**（真机上表现为"恢复未成功，当前结果仍保留"）。
+       * 覆盖语义才是对的：同一执行的撤销点只有一个，越晚的越完整。
+       */
+      commitStack((stack) =>
+        trimStack([
+          ...stack.filter((entry) => !snapshot.executionId || entry.executionId !== snapshot.executionId),
+          snapshot
+        ])
+      );
     },
-    []
+    [commitStack]
   );
 
   const clearUndoSnapshot = useCallback(() => {
-    setUndoStack([]);
-  }, []);
+    commitStack(() => []);
+  }, [commitStack]);
+
+  /**
+   * 把一份**从账本材料重建**的快照放进栈里，同一执行只放一次。
+   *
+   * 与 `pushUndoSnapshot` 的差别只有一条：这里按 `executionId` 去重。重开窗格后，
+   * 账本状态可能被读不止一次（发现、核对、续跑各一次），每次都盲 push 就会在栈里
+   * 攒出同一执行的多个副本 —— 撤销时会把同一块区域恢复两遍，栈长也被污染。
+   * 快照内容一律按账本原样，这里不改写任何区域。
+   */
+  const ensureUndoSnapshot = useCallback(
+    (snapshot: ExecutionUndoSnapshot | null | undefined) => {
+      if (!snapshot) return;
+      commitStack((stack) => {
+        const id = snapshot.executionId;
+        const exists = id
+          ? stack.some((entry) => entry.executionId === id)
+          : stack.some((entry) => entry.planId === snapshot.planId);
+        return exists ? stack : trimStack([...stack, snapshot]);
+      });
+    },
+    [commitStack]
+  );
 
   /** 撤销到指定 executionId；旧消息没有 executionId 时兼容 planId。 */
   const undoExecutionTo = useCallback(
     async (executionIdOrPlanId?: string) => {
       if (isBusy || !isRunningInExcel()) return false;
+      // 读 ref 而不是闭包里的 state：同一 tick 里刚 `ensureUndoSnapshot` 的那一条也要算数。
+      const stack = stackRef.current;
       const index =
         executionIdOrPlanId === undefined
-          ? undoStack.length - 1
-          : undoStack.findIndex(
+          ? stack.length - 1
+          : stack.findIndex(
               (entry) =>
                 entry.executionId === executionIdOrPlanId ||
                 entry.planId === executionIdOrPlanId
@@ -90,7 +147,7 @@ export function useUndoSnapshot({
       if (index < 0) return false;
       if (beforeOperation && !(await beforeOperation())) return false;
       // 逆序撤销：先撤最近的，再往前退，保证每一步的上下文都是它执行完的状态。
-      const targets = undoStack.slice(index).reverse();
+      const targets = stack.slice(index).reverse();
 
       onStatusChange("executing");
       let undone = 0;
@@ -115,13 +172,13 @@ export function useUndoSnapshot({
       } finally {
         // 已成功撤销的条目移出栈；失败的那条保留，供用户重试。
         if (undone > 0) {
-          setUndoStack((stack) => stack.slice(0, stack.length - undone));
+          commitStack((current) => current.slice(0, current.length - undone));
         }
         onStatusChange("idle");
       }
       return restored;
     },
-    [undoStack, isBusy, onStatusChange, onMessage, onAfterUndo, onRestored, beforeOperation]
+    [isBusy, onStatusChange, onMessage, onAfterUndo, onRestored, beforeOperation, commitStack]
   );
 
   const undoLastExecution = useCallback(
@@ -133,6 +190,7 @@ export function useUndoSnapshot({
     undoStack,
     lastUndoSnapshot,
     pushUndoSnapshot,
+    ensureUndoSnapshot,
     clearUndoSnapshot,
     undoLastExecution,
     undoExecutionTo

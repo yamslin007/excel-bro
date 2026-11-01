@@ -226,6 +226,40 @@ def test_write_actions_receive_deterministic_acceptance_criteria() -> None:
     assert range_check.expected == [["姓名", "得分"], ["阿里", 44]]
 
 
+def test_write_formulas_receives_formulas_equal_acceptance() -> None:
+    """U1a：writeFormulas 动作必须自动补 formulasEqual 验收条件。
+
+    公式身份 = 公式文本（不是计算值），所以自动补的验收条件必须是
+    `formulasEqual`（比对公式文本），而不是 `rangeEquals`（比对显示值）。
+    少了这条，恢复执行后 `verificationGaps` 判不出已核实，整份计划会被记成
+    `executed_unverified`，恢复收尾（确认/放弃）被卡在审阅之前。
+    """
+    plan = AnalysisPlan.model_validate(
+        {
+            "id": "formula-verified",
+            "title": "写公式",
+            "summary": "写入公式并验证",
+            "actions": [
+                {
+                    "type": "writeFormulas",
+                    "sheet": "结果",
+                    "range": "B2:C2",
+                    "formulas": [["=数据!A1*2", "=数据!A1*3"]],
+                }
+            ],
+        }
+    )
+
+    assert [criterion.type for criterion in plan.acceptanceCriteria] == [
+        "worksheetExists",
+        "formulasEqual",
+    ]
+    formula_check = plan.acceptanceCriteria[1]
+    assert formula_check.type == "formulasEqual"
+    assert formula_check.range == "B2:C2"
+    assert formula_check.expected == [["=数据!A1*2", "=数据!A1*3"]]
+
+
 def test_plan_infers_sort_filter_and_table_acceptance() -> None:
     plan = AnalysisPlan.model_validate(
         {

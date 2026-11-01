@@ -470,3 +470,195 @@ Codex MSIX 将默认账本读取重定向到自己的 LocalCache 旧主文件，
 WPS S3 确认 c4244afe… 与放弃 d1545de6… 两轮均 completed，动作推进 1/1；每轮 hostWriteCalls=3 wps_api_calls、mutatingCalls=1、readback=verified。服务端均返回 complete/nonzero、无缺失/越界观测；记录内未见确认/重开导致重复计划内容写入。放弃/审阅辅助写不属于该计数。Excel S3 此轮未匹配到记录，不借用 WPS 计数。
 
 最终证据：outputs/ledger-diagnosis-20261027/REPORT.md、handle-snapshot-111950/verification.json、s3-live-host-writes.json。旧505页/损坏结论及相应阻塞项已被本条取代；旧错误样本保留且标记 superseded。A1-GATE 仍未通过，A2 未启动；原生矩阵与完整重载等缺口不因本条被标完。
+
+
+### 2026-10-28：WPS「中断 → 核对补记 → 只续第三步 → 确认变更」原生路径只读核验
+
+用户报告：原执行 `wps-execution-1fd938fd-b20f-4042-9f3b-66b10f5bffdc`（`WPS恢复验收.xlsx`，
+目标表 `B2/B3/B4`）经**重新发现 → 第二步补记 → 第三步续跑**后结果为 `111/222/333`，并已点击
+「确认变更」。本轮**只读**核对该执行的账本、动作观测与宿主写入计数，**未**操作工作簿、账本、
+WAL、恢复材料，未重启前后端。取证方式：复制默认账本三文件到临时目录后只读查询，原文件
+sha256 前后一致（`state.sqlite3 eeb62c2c…66a8`、`-wal f793330f…6283`）。
+
+**账本终态**：`status=completed`、`next_action_index=3`、`in_flight_action_index=NULL`、
+`revision=11`、`updated_at=2026-10-28 15:49:06`、`result={actionCount:3, backfilled:false}`。
+授权集合 `["目标表","来源表"]`（与收窄后的两张一致）。`checkpoint_json` = `目标表!B4`
+`before=v2:19:6b546b99` → `after=v2:18:fbf8e469`。
+
+**指纹重算（独立于数值口述）**：按 `matrixFingerprintV2`（FNV-1a）对本机实值重算，六个指纹
+全部命中——写前 `B2=-101`、`B3=-202`、`B4=-303`，写后 `111` / `222` / `333`。也就是说登记的
+计划与回读的检查点都指这三格，**不是**拿最终数值反推的。
+
+**三条断言的证据与缺口**：
+
+| 断言 | 支持证据 | 明确缺失 |
+| --- | --- | --- |
+| 第二步核对只补记 | ①补记路径 `reconcileWpsActionReceipt` 只有一个 POST，全链路无宿主写入调用点（`api.ts:1319`）；②`office_host_writes` 中 `actionIndex=1` **只有 1 行**，`recorded_at=10-27 22:44:39`（原 `failed_after_write` 那一刻），15:49 无任何新行；③终态 `next=2`、`in_flight=NULL` 与"补记 applied"一致 | 补记时写入的 B3 检查点已被第三步覆盖（`checkpoint_json` 单槽），账本不再保留 `v2:18:39ce3816` 那一条；补记发生的**具体时刻**没有记录（`updated_at` 只留最后一次） |
+| 续跑只执行第三步 | ①`office_host_writes` 仅 `actionIndex=2` 在 **10-28 15:49:06** 新增 1 行：`hostWriteCalls=1`、`mutatingCalls=1`、`outcome=written`、`readback=verified`；②`actionIndex=0/1` 在该时刻之后无新行；③B4 检查点 before/after 指纹可重算命中 | 计数是**端上自报**（不是宿主生成的审计日志），端上少报一次写入账本看不出来；`payload_json` 无逐格写入内容，只能证明"一次变更调用 + 回读指纹相符" |
+| 确认变更没有再次执行写入 | ①观测表最后一行是 15:49:06，此后全表无新行；②`updated_at=15:49:06`、`revision=11` 未再推进 ⇒ 确认没走 `finish`/`reconcile`/`claim` 任何会 bump 的路径；③同一 `workbook_identity` 下**没有新建执行**（最后一条 `created_at=10-27 22:44:38`）；④确认路径 = `validateResult`（只读 `inspectWpsUndoRecord`）+ 清审阅标记，不重放 `writeValues`（`WpsAgentPanel.tsx:6617`） | 「用户点了确认变更」本身**无服务端记录**（纯前端/宿主动作），只有用户口述；清审阅标记属于宿主格式写入，**不在**该计数表内（与 2026-10-27 S3 条同一口径）；无 WPS 侧独立日志或录屏 |
+
+**revision 算术（推断，不是证据）**：按最小必要链（register 1 → begin0 2 → complete0 3 →
+begin1 4 → suspend1 5 → claim 6 → reconcile1 7 → begin2 8 → complete2 9 → finish 10）应得 10，
+实际 11，多 1 步。与终态相容的单步推进只有"再一次 `claim_office_resume`"（换 `owner_token`，
+不触碰宿主）；`begin` 必跟 `complete`/`suspend`（+2）、`reconcile` 的前置 `next=in_flight=actionIndex`
+已不成立、`finish` 只允许 `running→completed`。**账本没有逐次修订历史**，所以这条只说明"账本
+与该推断相容"，**不能**当成"没有第二次写入"的独立证据。
+
+**顺带发现（只读观察，未处理）**：
+- 工作簿磁盘态 `B2/B3/B4` 仍是 `111/222/-303`（文件最后保存 10-27 22:46，宿主 `~$` 锁文件在），
+  `333` 只在宿主内存里 ⇒「完成」不等于「已保存」；用户未保存前，磁盘不能作为任何判据。
+- 该执行的持久恢复材料 `execution-recovery/wps-execution-1fd938fd…/material.dat`（1726 B，
+  sha256 `a00cee38…122d0`）仍在盘上，到期 `2026-11-03`。完成路径没有删除它，本轮也未删。
+
+证据归档：`outputs/a1e3-native/s2-resume-20261028/`（`README.md`、`execution.json`、
+`host-writes.json`、`verification.json`）。**A1-GATE 未通过，A2 未启动**：本条只闭环
+"WPS 第二步中断后只续第三步且补记不重写"这一项，Excel 同类路径与"确认后重开"仍未验。
+
+### 2026-10-28：WPS「续跑后放弃变更」原生验收 + 两个收尾缺陷修复
+
+同一轮的第二个真机场景：**同会话内** 第二步中断 → 核对在途动作 → 继续第三步 → **放弃变更**。
+详细记录见 `ABANDON_AFTER_RESUME_ACCEPTANCE_2026-10-28.md` §10–§14，
+证据目录 `outputs/a1e3-native/abandon-20261028/`。
+
+**取证方式已改进**：本轮不再"复制账本三文件"，改用 `sqlite3` **一致只读快照**
+（`file:…?mode=ro` + `backup(out, pages=512)`）—— WAL 模式下分次复制主库/WAL/SHM
+会得到不一致视图。快照 `integrity_check=ok`、`user_version=11`，源文件 sha256 前后一致。
+
+**两次尝试必须分开**：`wps-execution-9e152fde…`（`WPS放弃验收-20261028.xlsx`，本轮放弃）
+与 `wps-execution-1fa82782…`（`…- 副本.xlsx`，误点「确认变更」，**只能算确认路径**）。
+识别按**完整工作簿路径 + task_id + 执行记录**，不按"最新一条"。
+
+**关键事实**：计划是**三个独立 `writeValues`**（`目标表!B2/B3/B4`，常量 111/222/333，
+`resumeContext.sources=[]`），**不是来源复制** —— 素材里的 `copyRange` 只是任务文本。
+中断点由 `office_host_writes` 钉住：`idx1 = failed_after_write / WPS_ACTION_FAILED @18:05:48.681`；
+续跑只新增 `idx2 = written / verified @18:05:56.658`，`idx0/idx1` 在 18:05:56 无新行。
+
+**放弃的可得证据与缺口**：材料目录已被收走、账本 `updated_at` 停在 `18:05:56.645`/`revision=11`、
+磁盘两个 `.xlsx` 字节相同且 mtime 仍是 `16:24:44`（整轮从未落盘）⇒ 单元格最终值只能依赖用户截图。
+**放弃无服务端记录**，删除前的材料内容也没有留存 —— 这两项一律写"缺失"，不用终态反推。
+**本轮不是跨进程恢复测试**：中断后没有完整退出 WPS。
+
+**同日修掉的两个真机收尾缺陷**（详见同文档 §11）：
+1. `runWpsRecoveryAction` 的三条终态分支没有收尾 `pendingPlan` ⇒ 恢复完成后新任务被
+   「请先确认或取消当前写入计划」永久挡住（用户靠「＋ → 放弃计划并新建」绕行）。
+   修法：执行开始时记归属绑定，三条终态统一 `settleRecoveredPlan`，归属判据收敛到
+   `@excel-bro/core` 的 `planSettlesExecution`（执行身份 + 计划按引用 + 消息 id，fail-closed）。
+2. 撤销说明「本次曾在 … 改动 2 / 3 个单元格」把**中断那一刻**的阶段统计说成整次执行，
+   且分子里混进了"回读失败被当成改成空"的假改动。修法：`changeReviewUndoFacts` 拆成
+   已回读确认 / 未通过回读核对 / 未执行三类，文案标注「这次执行中断时」。
+
+**回归（先红后绿，皆有反向变异）**：3 条面板级面板 + 5 条 core 归属判据 + 3 条撤销说明；
+删掉收尾调用 ⇒ 新任务用例真机同款报错；去掉引用比较 ⇒ 归属用例红；让 `readback_failed`
+累加改动数 ⇒ 撤销说明用例红。
+
+**A1-GATE 仍未通过，A2 未启动**：Excel 一端的 #9/#10/#12 全是 `⏳`；
+真实撤销、跨进程版"续跑后放弃"、"确认后重开"的单元格值（只有截图）都还空着。
+
+### 2026-10-28 收尾轮：确认 / 放弃之后能不能继续对话（同会话）
+
+前一条修完 `pendingPlan` 不收尾之后，要验的只有一句话：**收尾之后再发消息，闸门放不放行**。
+做法是在同一窗格、同一对话里直接发一条只读查询。
+
+两次真机各一对任务（写入 + 紧随其后的只读查询），账本逐条可核实
+（证据目录 `outputs/a1e3-native/abandon-20261028-followup/`，快照同样走 `backup` 一致视图）：
+
+| | 确认轮 | 放弃轮 |
+| --- | --- | --- |
+| 执行 | `wps-execution-7afd3dc6…f9c1e050`（19:38:53） | `wps-execution-5a2d84be…f7e1e1`（19:42:36） |
+| 宿主写入 | idx0/1/2 **同一毫秒** `written/verified`，`revision=8` | idx1 `failed_after_write` @19:42:36.585 → idx2 `written/verified` @19:42:46.350，`revision=11` |
+| 恢复材料 | 仍在（1658 B） | 已回收（唯一删除点在撤销成功分支） |
+| 随后查询 | `turn-4ec317…` `completed` / `answer`；`complete=false`、`sourceSheets=[目标表,来源表]` | `turn-68fd1b…` `completed` / `answer`；`complete=true`、`sourceSheets=[目标表]` |
+| 用户看到 | `111/222/333` | `-101/-202/-303`，撤销摘要标注"执行中断时" |
+
+**记账口径（本轮最重要的结论）**：
+
+- **放弃之后可以继续对话 = 真机通过**（中断 + 续跑 + 放弃，随后查询正常出结果）；
+- **确认之后可以继续对话 = 真机通过，但只覆盖"普通确认执行"**：`7afd3dc6` 在账本里
+  **没有中断记录**（三步同一毫秒、`revision=8`、无 `failed_after_write`），
+  按 `1fd938fd` / `9e152fde` / `1fa82782` / `5a2d84be` 四条已确认的形状反推，它是一次跑完的普通执行。
+  `settleRecoveredPlan` 只在三条**恢复终态分支**上调用，普通执行走不到 ⇒ 这一轮不能用来证明该修复。
+- **"续跑后确认 + 随后对话"仍缺**：前半有 `1fd938fd`（15:49 续跑 + 确认 + 保存重开），
+  后半只有 `WpsAgentPanel.test.tsx` 的自动化用例。不把两半拼成一句"通过"。
+
+**"没被挡下"的取证方式**：闸门在端上，账本没有字段。可核实的是三条同时成立 ——
+①两条 read 的 `planning_tasks` 都 `status=completed`、`resultKind=answer` 且有 `resultRef`；
+②`planning_task_events` 里各只有一次 `query_table`，没有混进写入类动作；
+③此后该工作簿没有再产生新的 `office_executions`。若闸门当时仍拦着，①不会成立。
+
+**保留**：`1fd938fd`（`…0f5bffdc`）"确认后保存重开"的通过记录未被本轮覆盖：
+`status=completed`、`revision=11`、`updated_at=15:49:06.522`、材料 1726 B 仍在。
+
+**同日记录的未修复项**：确认后那次查询的结果卡带出
+「结果不完整（扫描已达上限），仅展示已取回部分。」，而放弃后那次没有；两次的差别只有
+`complete` 与 `sourceSheets`。已定位到 `dataTools.ts` 的 `complete = warnings.length === 0`
+与「未找到字段」告警、以及 `LocalResultCard.tsx:67` 只写了"扫描已达上限"这一种原因，
+但 `query_table` 的实际参数不落账，**根因未证实**。作为独立待查项写入
+`A1_GATE_REMAINING_2026-10-28.md` §4，不因另一轮未复现而关闭。
+
+**A1-GATE 仍未通过，A2 未启动**。剩余项按三分类（尚未实现 / 自动化已验但真机未验 / 证据待补）
+列在 `A1_GATE_REMAINING_2026-10-28.md`；最值得做的下一项是
+**WPS 跨进程「中断 → 完整退出 → 重开 → 续跑 → 放弃」**（一次操作补 #11 与 #12 两格）。
+
+### 2026-10-28 夜间：WPS 跨进程（**正常退出重开**）「中断 → 重开 → 续跑 → 放弃」
+
+上一小节末尾把"跨进程版"列为下一项，本节即其结果。**注意边界**：这是用户**手动完整退出 WPS**
+后再打开的跨进程恢复，**不是**杀进程 / 崩溃恢复 —— 两者代码路径相同但触发器不同，验收分档不能合并。
+
+**精确身份**（不按"最新记录"挑）
+
+| 项 | 值 |
+|---|---|
+| 执行 ID | `wps-execution-3f00ea0d-6a93-4b44-87d8-0779df926ef1` |
+| 任务 ID | `task-da15be01-9682-49a9-8327-a51f32b40493` |
+| turn ID | `turn-6352251f00b04fae9b5e33ddce294b44`（23:25:42 → 23:25:49） |
+| 工作簿身份 | `wps-path:e:/codex/excel-bro/outputs/wps-abandon-20261028/wps放弃验收-20261028.xlsx` |
+
+**用户实际做了什么**：第二步中断 → 保存成 `111 / 222 / -303` → **完整退出 WPS** → 重开同一文件 →
+首次显示「证据不足」→ 点「重新核对（只读）」后恢复正常 → 核对第二步 → 续跑至 `111 / 222 / 333` →
+放弃变更 → 恢复 `-101 / -202 / -303` → 保存重开，三个负数保持，未再出现恢复卡。
+
+**账本侧（一致快照，`mode=ro` + `backup API`）**
+
+| 断言 | 结果 | 依据 |
+|---|---|---|
+| 只一条执行、属于本任务与本簿 | ✅ | `task_id` + 完整路径 identity |
+| 第二步 `failed_after_write` | ✅ | idx0 / idx1 同落 `23:25:50.403`，`WPS_ACTION_FAILED`、`readback=not_applicable` |
+| 第三步与第一步相隔 816 秒（**不证明进程更换**，只排除同一次连跑） | ✅ | idx2 `written/verified @23:39:26.371` vs idx0 `23:25:50.403` |
+| 前两步没有重复写入的**回执**（账本层，非宿主审计） | ✅ | `office_host_writes` 共 3 行，0/1/2 各 1 行；`backfilled=false` |
+| 终态 `completed` / `next=3` / 无在途 / 未 dismiss | ✅ | `execution.json` |
+| 恢复材料已清退 | ✅ | 目标目录不存在，`execution-recovery` 根 mtime `23:45:58` |
+
+**磁盘侧（本轮第一次拿到"保存后"的值）**
+
+- `WPS放弃验收-20261028.xlsx`：11022 B / `db31f17b83ee84b5…da1748` / mtime `23:56:41.911`
+- 目标表 `B2:B4 = -101 / -202 / -303`；来源表 `B2:B4 = 111 / 222 / 333`；未授权表 `B2 = 987654`
+- 与原始副本（8121 B / `6442c0ce…` / `16:24:44.718`）逐格比对 **0 处差异**（值 / 数字格式 / 字体），
+  **条件格式规则 0 条**、填充色一致 ⇒ 写回负值与**审阅标记清理**都落到了磁盘。
+
+**四档证据分开记（不许越级）**
+
+1. 账本证据 —— 动作序号、状态、耗时间隔、材料是否在；
+2. 磁盘取值 —— 保存后的真实单元格值 / 条件格式 / 填充；
+3. 截图 —— 界面**当时那样显示**，不证次数与时序（8 张，来自 `%TEMP%\QQ_*.png`；文件 mtime 是落盘时间，
+   复制/移动会改它，**不等于拍摄时刻**，只能当"不晚于"的近似）；
+4. 用户操作反馈 —— "完整退出 / 重开 / 点了重新核对"属口述，账本无痕。
+
+**账本不能证明的 6 条**：不记进程；「证据不足」无服务端记录、端上 `localInspection` 取值不落盘；
+「重新核对（只读）」是纯读、无痕；`hostWriteCalls` 是端上自报而非宿主审计；`before_snapshot` 已清空；
+材料删除前的内容未留存。
+
+**记入待查项（未修复）**：首次重开显示「证据不足」，点「重新核对（只读）」后即恢复。
+该文案唯一对应 `wpsExecutionReconcile.ts:75`（`localInspection` 为 `null`/`unknown`），据此可排除另外 6 支；
+但 `unknown` 本身有 6 条候选原因（授权抛错 / 描述不符 / 表未授权 / 形状不符 / `Value2`·`Formula` 为
+undefined / 格式快照不全，另有面板 `try` 吞错），**每条都无证据**。因此只记现象，
+**不归因于加载时机、授权或材料丢失**。要闭这条需要 DEV 原因码 + 两种复现条件（首次重开必现、
+二次必不复现）先坐实；拿到原因码之前不动 `wpsExecutionReconcile.ts` / `wpsRecoveryInspection.ts` /
+`WpsAgentPanel.tsx` 三处。
+
+**证据目录**：`outputs/a1e3-native/cross-process-abandon-20261028/`
+（`README.md`、`verification.json` 11 条断言、`execution.json`、`host-writes.json`、`family.json`、
+`turns.json`、`recovery-materials.json`、`workbooks.json`、`disk-values.json`、`screenshots.json`、
+`snapshot-meta.json`、`screenshots/` 8 张）；
+文档侧见 `ABANDON_AFTER_RESUME_ACCEPTANCE_2026-10-28.md` §16 与 `A1_GATE_REMAINING_2026-10-28.md` §6。
+
+**A1-GATE 不因本轮单项成功而整体通过，A2 未启动。**

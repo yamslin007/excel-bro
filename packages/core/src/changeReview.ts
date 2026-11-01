@@ -293,3 +293,63 @@ export function changeReviewSummary(review: RangeChangeReview): ChangeReviewSumm
 export function onlyChangedRows(review: RangeChangeReview): ChangeReviewRow[] {
   return review.rows.filter((row) => row.changed || row.kind === "not_executed");
 }
+
+/**
+ * 撤销说明用的事实口径。
+ *
+ * 为什么要单独一份、而不是把 `changedCount` 加起来直接报一个分数：
+ *
+ * 1. **分数会把两个不同分母的东西拼在一起。** 一次被中断的执行里，
+ *    `readback_failed` 的动作「写后快照」根本不存在，双栏只能拿空矩阵当写后，
+ *    于是"写前非空 → 写后空"被算成一次**改动**。把这种格子和真正回读确认的改动
+ *    加在同一个分子里，报出来的数不是"改了几格"，是"几格看起来不一样"。
+ * 2. **统计只属于产生恢复点的那一次执行。** 续跑不会重新生成审阅（`resumeWpsExecution`
+ *    刻意不传 `onChangeReview`），所以这里的计数**停在中断那一刻**；而撤销覆盖的是
+ *    整个恢复点。两者不是一回事，文案必须说得出来，不能让人以为"撤销只撤了 2 格"。
+ *
+ * 因此分成三类：`verified`（`applied`，写后回读通过且判为有改动）、
+ * `unverified`（写了但没通过回读核对）、`unattempted`（`not_executed`，压根没写）。
+ * 三者之和只对"动作覆盖的总格数"有意义，**不是**改动总数。
+ */
+export type ChangeReviewUndoFacts = {
+  /** 涉及的定位（`表!区域`），逗号分隔；只含定位，不含任何单元格内容。 */
+  where: string;
+  /** 这些动作覆盖的单元格总数。 */
+  totalCells: number;
+  /** 回读通过且确实有改动的单元格数。 */
+  verifiedCells: number;
+  /** 写了但没通过回读核对的单元格数（`readback_failed` / `readback_mismatch`）。 */
+  unverifiedCells: number;
+  /** 压根没执行到的单元格数。 */
+  unattemptedCells: number;
+  /** 有任何一个动作没走完 —— 用于把"中断时"的阶段标注说出来。 */
+  interrupted: boolean;
+};
+
+export function changeReviewUndoFacts(
+  summaries: readonly ChangeReviewSummary[]
+): ChangeReviewUndoFacts {
+  let totalCells = 0;
+  let verifiedCells = 0;
+  let unverifiedCells = 0;
+  let unattemptedCells = 0;
+  for (const item of summaries) {
+    totalCells += item.totalCount;
+    if (item.status === "applied") {
+      verifiedCells += item.changedCount;
+    } else if (item.status === "not_executed") {
+      unattemptedCells += item.totalCount;
+    } else {
+      // `ready`（只有预期没写）、`executed_unverified`、`readback_*` 都不许算进"改动"。
+      unverifiedCells += item.totalCount;
+    }
+  }
+  return {
+    where: summaries.map((item) => `${item.sheet}!${item.range}`).join("、"),
+    totalCells,
+    verifiedCells,
+    unverifiedCells,
+    unattemptedCells,
+    interrupted: summaries.some((item) => item.status !== "applied")
+  };
+}

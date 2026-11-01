@@ -5,8 +5,9 @@
 	"type": "module",
 	"addonType": "et",
 	"scripts": {
-		"dev": "vite --port 3889",
-		"debug": "wpsjs debug -p 3889",
+		"dev": "vite",
+		"pretest": "node ../../scripts/check_wps_dev_ports.mjs",
+		"debug": "node ../../scripts/start_wps_dev.mjs",
 		"build": "tsc --noEmit && vite build",
 		"test": "vitest run",
 		"publish": "wpsjs publish"

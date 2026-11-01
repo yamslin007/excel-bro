@@ -101,7 +101,11 @@ async function pickFolder(view: ReturnType<typeof render>, next: FolderCatalog) 
 }
 function send(view: ReturnType<typeof render>, prompt: string) {
   fireEvent.change(view.container.querySelector(".composer textarea")!, { target: { value: prompt } });
-  fireEvent.click(view.getByRole("button", { name: /^发送$/ }));
+  /*
+   * 有待回答的问题时，右下角那颗按钮的可访问名是「发送回答」——这时这句话就是
+   * 对那道题的回答（旧问题只在它自己还 pending 时才接受答案，身份绑定管住这一点）。
+   */
+  fireEvent.click(view.getByRole("button", { name: /^(发送|发送回答)$/ }));
 }
 
 describe("actual Excel folder scope safety", () => {

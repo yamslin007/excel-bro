@@ -54,6 +54,28 @@ def capability_optional_int(section: str, key: str) -> int | None:
     return value
 
 
+def capability_int_list(section: str, key: str) -> list[int]:
+    """读取"按顺序择一"的正整数数组（当前用于开发端口候选）。
+
+    三条都必须守住：非空（空数组等于"没有可用配置"）、无重复（重复会让
+    "按声明顺序择一"失去判别意义）、在可绑定端口范围内（0 让内核分配、
+    bool 冒充 1 都是无效的端口声明）。坏配置一律报错，不静默跳过。
+    """
+    value = capabilities()[section][key]
+    if not isinstance(value, list) or not value:
+        raise RuntimeError(f"能力配置 {section}.{key} 必须是非空正整数数组")
+    seen: list[int] = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, int) or not 1024 <= item <= 65535:
+            raise RuntimeError(
+                f"能力配置 {section}.{key} 的每一项必须是 1024-65535 的整数"
+            )
+        if item in seen:
+            raise RuntimeError(f"能力配置 {section}.{key} 不允许出现重复端口")
+        seen.append(item)
+    return seen
+
+
 def capability_text(section: str, key: str) -> str:
     value = capabilities()[section][key]
     if not isinstance(value, str) or not value:

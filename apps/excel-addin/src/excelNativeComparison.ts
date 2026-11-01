@@ -196,6 +196,31 @@ async function capture(context: Excel.RequestContext, name: string, allowEmpty =
   })) as SheetSnapshot;
 }
 
+/**
+ * **执行边界**：与"能不能用副本比对"无关的硬边界。
+ *
+ * 存在理由（2026-10-30 真机）：计划到达后要不要**自动执行一次**，曾经由
+ * `resultReviewPlanIssue` 决定 —— 于是任何一个"副本比对做不了"的形状（多张写入
+ * 目标表、跨表公式、重叠区域…）都会掉进"给用户画一个「执行到 Excel」按钮"的分支。
+ * 用户的授权明明已经给了，却还要再点一下，而且那一下是**绕过审阅**的执行。
+ *
+ * 副本比对是**审阅的辅助**，不是执行的许可：比对做不了就如实降级成"本次没有副本
+ * 可对比"，而不是把自动执行收回去。真正让计划不许执行的只有授权边界：
+ * 写入目标与声明来源必须落在本次已确认的范围里（执行器与来源复核在写前还会再核一次，
+ * 这里只是不把明显越界的计划送进执行）。
+ */
+export function planExecutionBoundaryIssue(plan: AnalysisPlan, authorization: readonly string[]): string | null {
+  if (!plan.actions.length) return null;
+  if (plan.actions.some(action => !authorization.includes(action.sheet))) {
+    return '计划写入目标超出本次授权，未执行。';
+  }
+  if (plan.sourceFingerprintSheets?.some(name => !authorization.includes(name)) ||
+      plan.sourceDependencySheets?.some(name => !authorization.includes(name))) {
+    return '计划来源超出本次授权，未执行。';
+  }
+  return null;
+}
+
 /** A read-only pre-write image for optional comparison after execution. */
 export function resultReviewPlanIssue(plan: AnalysisPlan, authorization: readonly string[]): string | null {
   const targets = [...new Set(plan.actions.map(action => action.sheet))];

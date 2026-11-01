@@ -92,7 +92,7 @@ describe("composer shortcut hint", () => {
     const component = css("./App.tsx");
 
     expect(component).toMatch(
-      /<span\r?\n\s+className="composer-shortcut-hint"/
+      /<span\r?\n\s+hidden={answeringClarification}\r?\n\s+className="composer-shortcut-hint"/
     );
     expect(component).toContain(
       "Enter 发送 · Shift + Enter 换行 · 可粘贴截图"

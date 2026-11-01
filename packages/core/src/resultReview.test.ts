@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { ResultReview, type ResultReviewOperations, type ResultReviewReceipt } from './resultReview';
+import { ResultReview, ReviewNotStartedError, type ResultReviewOperations, type ResultReviewReceipt } from './resultReview';
 
 function setup() {
   const receipt = { executionId: 'execution-1', verified: true, undoable: true };
@@ -17,6 +17,16 @@ function setup() {
   };
   return { review: new ResultReview<string, ResultReviewReceipt, string, string>(), operations, clearMarker, receipt };
 }
+it('accepts a positive host no-start proof, while an ordinary execution error remains uncertain',async()=>{
+  for(const proved of [false,true]) {
+    const {review,operations}=setup();
+    vi.mocked(operations.execute).mockRejectedValueOnce(proved ? new ReviewNotStartedError('package unavailable') : new Error('receipt unavailable'));
+    expect(await review.start('request-1',operations)).toBe(false);
+    expect(review.getSnapshot().phase).toBe(proved ? 'not_started' : 'failed');
+    expect(await review.start('request-1',operations)).toBe(false);
+    expect(operations.execute).toHaveBeenCalledTimes(1);
+  }
+});
 describe('标记清理失败是可重试状态，不是业务失败', () => {
   it('确认时清理失败：保持审阅中、标记待清；重试只清标记，不第二次写入', async () => {
     const { review, operations, clearMarker } = setup();

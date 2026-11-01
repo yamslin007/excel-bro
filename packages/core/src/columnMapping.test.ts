@@ -73,6 +73,25 @@ interface SharedCase {
 
 const sharedCases = cases.cases as unknown as SharedCase[];
 
+/**
+ * 断言这批动作是「一段写值」，并把类型收窄到写值分支。
+ *
+ * `ColumnMappingPlanAction` 是 `writeValues | clearRange` 联合，`clearRange` 没有
+ * `values` —— 要断言矩阵就必须先收窄，否则类型层直接拒绝（这是对的：清空动作本来
+ * 就没有值矩阵）。收窄失败时给出的信息带用例名，比一条泛泛的类型错误更好查。
+ */
+function expectSingleWriteAction(
+  actions: readonly ColumnMappingPlanAction[],
+  label: string
+): Extract<ColumnMappingPlanAction, { type: "writeValues" }> {
+  expect(actions).toHaveLength(1);
+  const action = actions[0];
+  if (action.type !== "writeValues") {
+    throw new Error(`用例「${label}」期望 writeValues，实际得到 ${action.type}`);
+  }
+  return action;
+}
+
 describe("列映射共享夹具", () => {
   it("夹具本身非空，且每条用例只声明一种期望", () => {
     expect(sharedCases.length).toBeGreaterThan(0);
@@ -94,12 +113,13 @@ describe("列映射共享夹具", () => {
   for (const item of sharedCases) {
     it(item.name, () => {
       if (item.expected !== undefined) {
-        const actions = buildColumnMappingActions(item.input);
-        expect(actions).toHaveLength(1);
-        expect(actions[0].type).toBe("writeValues");
-        expect(actions[0].sheet).toBe(item.input.targetSheet);
-        expect(actions[0].range).toBe(item.input.targetRange);
-        expect(actions[0].values).toEqual(item.expected);
+        const action = expectSingleWriteAction(
+          buildColumnMappingActions(item.input),
+          item.name
+        );
+        expect(action.sheet).toBe(item.input.targetSheet);
+        expect(action.range).toBe(item.input.targetRange);
+        expect(action.values).toEqual(item.expected);
         return;
       }
 
@@ -107,7 +127,13 @@ describe("列映射共享夹具", () => {
         const actions = buildColumnMappingActions(item.input);
         expect(actions).toHaveLength(item.expectedActions.length);
         item.expectedActions.forEach((expectedAction, index) => {
-          const actual = actions[index] as Record<string, unknown>;
+          /*
+           * 这里要按**夹具声明的字段**逐项比，所以需要按键取值。用一次展开拷贝拿到
+           * 动作自身的字段快照，而不是把联合类型硬转成别的形状 —— 展开只复制真实
+           * 存在的字段，种类本身（`writeValues` / `clearRange`）不受影响。
+           * 夹具里出现动作没有的字段时，下面的断言会当场拿到 `undefined` 并变红。
+           */
+          const actual: Record<string, unknown> = { ...actions[index] };
           expect(actual.sheet).toBe(item.input.targetSheet);
           for (const [key, value] of Object.entries(expectedAction)) {
             expect(actual[key], `第 ${index + 1} 个动作的 ${key}`).toEqual(value);

@@ -7,6 +7,15 @@ import type { ModelCatalog } from "./contracts";
 import capabilities from "../../../config/capabilities.json";
 import { modelUsageNotice } from "@excel-bro/core/modelUsageNotice";
 import {
+  assertExecutionRecoveryPackage,
+  parseExecutionRecoveryPackage
+} from "@excel-bro/core/executionRecoveryPackage";
+import {
+  assertPendingExecutionDiscovery,
+  type PendingExecutionDiscoveryResponse
+} from "@excel-bro/core/pendingExecutionDiscovery";
+import type { ExecutionDisposition } from "./contracts";
+import {
   assertTestModelConnectionResponse,
   assertIntentCheckResponse,
   assertMessageUnderstandingResponse,
@@ -21,6 +30,8 @@ import {
   assertWpsExecutionResult,
   assertWpsRecoveryDescriptor,
   assertWpsEvidence,
+  assertExecutionRecoveryMaterial,
+  type ExecutionRecoveryPackageMaterial,
   parseTaskProgressEvent,
   parseTurnStepEvent,
   type AssistantResponse,
@@ -52,6 +63,7 @@ import {
   type IntentCheckResponse,
   type ModelSettings,
   type OfficeExecutionState,
+  type OfficeExecutionBackfillResult,
   type WpsExecutionState,
   type WpsRecoveryDescriptor,
   type PlanExecutionResult,
@@ -1055,7 +1067,11 @@ export async function finishOfficeExecution(
   input: {
     expectedRevision: number;
     ownerToken: string;
-    result: PlanExecutionResult;
+    /**
+     * 正常收尾是 `PlanExecutionResult`；**补记完成**（全部动作早已记为完成、
+     * 只缺最终回执）是 `OfficeExecutionBackfillResult` —— 那一趟不执行任何动作。
+     */
+    result: PlanExecutionResult | OfficeExecutionBackfillResult;
   }
 ): Promise<OfficeExecutionState> {
   const response = await fetch(
@@ -1112,6 +1128,143 @@ export async function getWpsExecutionStatus(
     `${API_BASE_URL}/api/wps/executions/${encodeURIComponent(operationId)}`
   );
   return wpsExecutionResponse(response, "无法读取 WPS 写入现场");
+}
+
+/**
+ * 按**当前工作簿稳定身份**发现未完成执行（只读）。
+ *
+ * 为什么需要它：浏览器里的 `pending-wps-execution` 只是**缓存**。完整退出 WPS 后它没了，
+ * 账本里的进度与原表现场却都还在 —— 旧实现于是再也找不到这次执行。这里向后端要一份
+ * "定位 + 时间 + 进度"的最小元数据，真正的写入资格仍要通过状态查询与认领取得。
+ *
+ * 身份不合法时服务端返回 422（不猜）；服务不可达时**抛错**，调用方必须把"查不到"
+ * 与"没有未完成任务"分开说 —— 这两件事的后果完全不同。
+ */
+export async function listPendingExecutions(
+  namespace: "wps" | "office",
+  workbookIdentity: string
+): Promise<PendingExecutionDiscoveryResponse> {
+  const response = await fetch(
+    `${API_BASE_URL}/api/${namespace}/executions/pending?${new URLSearchParams({ workbookIdentity }).toString()}`
+  );
+  if (!response.ok) throw await requestError(response, "无法发现未完成执行");
+  const payload: unknown = await response.json();
+  assertPendingExecutionDiscovery(payload);
+  return payload;
+}
+
+export function listPendingWpsExecutions(
+  workbookIdentity: string
+): Promise<PendingExecutionDiscoveryResponse> {
+  return listPendingExecutions("wps", workbookIdentity);
+}
+
+export function listPendingOfficeExecutions(
+  workbookIdentity: string
+): Promise<PendingExecutionDiscoveryResponse> {
+  return listPendingExecutions("office", workbookIdentity);
+}
+
+/**
+ * 清除一条恢复提示：**只写发现处置元数据**（幂等）。
+ *
+ * 不会把执行标成完成、不会删恢复材料、不会改动作进度 —— 那些都是"为了让提示消失而
+ * 伪造事实"。处置只保证重开后同一条提示不再自动复活；执行日后真有新变化会重新出现。
+ */
+export async function dismissWpsExecutionDiscovery(operationId: string): Promise<void> {
+  const response = await fetch(
+    `${API_BASE_URL}/api/wps/executions/${encodeURIComponent(operationId)}/dismiss-discovery`,
+    { method: "POST" }
+  );
+  if (!response.ok && response.status !== 404) {
+    throw await requestError(response, "无法记录这次恢复提示的处置");
+  }
+}
+
+/**
+ * 记下"用户放弃/撤销了这次执行"（服务端留痕，幂等）。
+ *
+ * 只写一列时间戳：**不会**把执行标成完成、**不会**改动作游标、**不会**删恢复材料。
+ * 名字与结论由 `@excel-bro/core/executionDisposition` 统一判（两种取值不许互相冒充）。
+ * 记录不存在（404）按"没有可留痕的执行"放过 —— 不许为了留个痕去补建账本。
+ */
+export async function recordExecutionDisposition(
+  namespace: "wps" | "office",
+  operationId: string,
+  disposition: ExecutionDisposition
+): Promise<void> {
+  const response = await fetch(
+    `${API_BASE_URL}/api/${namespace}/executions/${encodeURIComponent(operationId)}/disposition`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ disposition })
+    }
+  );
+  if (!response.ok && response.status !== 404) {
+    throw await requestError(response, "无法记录这次执行的处置");
+  }
+}
+
+/**
+ * 写前落盘：把**不可变的原始恢复材料**存到本机后端应用数据目录。
+ *
+ * 这里不传摘要：摘要由服务端按收到的字节算。浏览器侧 `crypto.subtle` 只在安全上下文
+ * 可用（WPS 内嵌浏览器不保证），拿它算摘要会把"能不能恢复"绑在一个可能不存在的
+ * API 上。客户端要的是**读回逐字相同**，不是自己算哈希。
+ */
+export async function saveExecutionRecoveryPackage(
+  operationId: string,
+  packageJson: string
+): Promise<ExecutionRecoveryPackageMaterial> {
+  assertExecutionRecoveryPackage(parseExecutionRecoveryPackage(packageJson));
+  const response = await fetch(
+    `${API_BASE_URL}/api/execution-recovery/${encodeURIComponent(operationId)}`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ packageJson, size: utf8Length(packageJson) })
+    }
+  );
+  if (!response.ok) throw await requestError(response, "无法保存本机恢复包");
+  const payload: unknown = await response.json();
+  assertExecutionRecoveryMaterial(payload);
+  return payload;
+}
+
+/**
+ * 读回恢复包。缺失返回 `null`；过期 / 损坏 / 与账本不符**抛错**（各自有 code），
+ * 因为"没有材料"和"材料不能用"必须让用户看到不同的原因。
+ */
+export async function loadExecutionRecoveryPackage(
+  operationId: string
+): Promise<ExecutionRecoveryPackageMaterial | null> {
+  const response = await fetch(
+    `${API_BASE_URL}/api/execution-recovery/${encodeURIComponent(operationId)}`
+  );
+  if (response.status === 404) return null;
+  if (!response.ok) throw await requestError(response, "无法读取本机恢复包");
+  const payload: unknown = await response.json();
+  assertExecutionRecoveryMaterial(payload);
+  return payload;
+}
+
+function utf8Length(value: string): number {
+  return typeof TextEncoder === "function" ? new TextEncoder().encode(value).length : value.length;
+}
+
+/**
+ * 终态回收：任务真的结束（原表已回到执行前）后删掉本机恢复材料。
+ *
+ * 幂等（不存在也算成功）。**不要**在执行成功时调用 —— 审阅、核对、放弃都还要用这份
+ * 材料，提前删掉就把"完整退出宿主仍可继续"重新打断一次。
+ */
+export async function deleteExecutionRecoveryPackage(operationId: string): Promise<void> {
+  const response = await fetch(
+    `${API_BASE_URL}/api/execution-recovery/${encodeURIComponent(operationId)}`,
+    { method: "DELETE" }
+  );
+  if (!response.ok && response.status !== 404) throw await requestError(response, "无法回收本机恢复包");
 }
 
 export async function startWpsAction(

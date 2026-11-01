@@ -45,7 +45,19 @@ vi.mock("./wpsPlanningStream", async (importOriginal) => {
 
 vi.mock("../../excel-addin/src/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../excel-addin/src/api")>();
-  return { ...actual, pausePlanningTask: vi.fn(actual.pausePlanningTask), checkIntent: vi.fn(), understandMessage: vi.fn(async () => ({ kind: "needs_workbook_context", summary: "需要字段结构", provider: "model" })), listModels: vi.fn(), getModelSettings: vi.fn() };
+  const discovery = await import("./wpsPendingDiscovery.testHost");
+  /*
+   * 发现入口的替身见上。几条"读表回执 / 暂停 / 校验"用例故意要跑**真实实现**（它们自己
+   * `vi.stubGlobal("fetch", …)` 驱动真实字节），所以这里不能把它们换成空的 `vi.fn()`。
+   * 用 `guardNetworkSeam`：本用例装了 fetch 替身才真的调用，否则按"连不上"失败 ——
+   * 之前那种"看用户那台 8765 有没有在跑"的偶然前提就此消失。
+   */
+  const gate = await import("@excel-bro/core/testNetworkGate");
+  return { ...actual, ...discovery.pendingDiscoveryApiStubs(),
+    pollSdkBridgeTool: vi.fn(gate.guardNetworkSeam(actual.pollSdkBridgeTool)),
+    pausePlanningTask: vi.fn(gate.guardNetworkSeam(actual.pausePlanningTask)),
+    validatePlan: vi.fn(gate.guardNetworkSeam(actual.validatePlan)),
+    checkIntent: vi.fn(), understandMessage: vi.fn(async () => ({ kind: "needs_workbook_context", summary: "需要字段结构", provider: "model" })), listModels: vi.fn(), getModelSettings: vi.fn() };
 });
 
 vi.mock("./wpsHost", async (importOriginal) => {
@@ -203,9 +215,22 @@ async function submit(element: HTMLTextAreaElement | null): Promise<void> {
 }
 
 function findButton(container: HTMLElement, label: string): HTMLButtonElement | null {
+  /*
+   * 按**可访问名**找：主操作按钮（输入框右下角那一颗）只画字形，动作名在
+   * `aria-label` 上。按钮位置变了，查找方式跟着变；断言本身一个字没动。
+   */
   return Array.from(container.querySelectorAll("button")).find(
-    (button) => (button.textContent ?? "").trim() === label
+    (button) =>
+      (button.textContent ?? "").trim() === label || button.getAttribute("aria-label") === label
   ) ?? null;
+}
+
+/**
+ * 「继续」入口：规划暂停卡上叫「继续分析」，普通暂停走输入框那颗叫「继续任务」。
+ * 这些用例验的是续跑生命周期，不是按钮叫什么，所以两种都接受；入口仍然只有一个。
+ */
+function findResume(container: HTMLElement): HTMLButtonElement | null {
+  return findButton(container, "继续分析") ?? findButton(container, "继续任务");
 }
 
 /**
@@ -386,7 +411,7 @@ async function reachPauseCard(pause: ReturnType<typeof pauseResult>, numberedSte
 }
 
 async function clickContinue(container: HTMLElement): Promise<void> {
-  const button = findButton(container, "继续分析");
+  const button = findResume(container);
   if (!button) throw new Error("没有继续按钮");
   await act(async () => {
     button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
@@ -428,7 +453,7 @@ describe("CAP-02 续跑结果闭环：三分支接回正常处理链", () => {
       expect(pause).toBeTruthy();
       await act(async () => pause!.click());
       await until(() => !container.querySelector('[aria-label="暂停任务"]'), "请求未返回也应停止等待");
-      expect(container.querySelector('[aria-label="继续任务"]')).toBeTruthy();
+      expect(container.querySelector('[aria-label="继续任务"], [aria-label="继续分析"]')).toBeTruthy();
       const frozen = segmentSnapshots(container);
       await act(async () => releases[attempt - 1]({ kind: "proceed", provider: "model", turnId: `late-${attempt}`,
         summary: "迟到结果", confirmedPrompt: "分析当前表" }));
@@ -436,7 +461,7 @@ describe("CAP-02 续跑结果闭环：三分支接回正常处理链", () => {
       expect(statusMock).not.toHaveBeenCalled();
       expect(resumeMock).not.toHaveBeenCalled();
       expect(writes).toEqual([]);
-      if (attempt === 1) await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="继续任务"]')!.click());
+      if (attempt === 1) await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="继续任务"], [aria-label="继续分析"]')!.click());
     }
   });
 
@@ -458,6 +483,11 @@ describe("CAP-02 续跑结果闭环：三分支接回正常处理链", () => {
     await until(() => Boolean(container.textContent?.includes("仅取回已有结果")), "取回结果");
     expect(vi.mocked(getWpsPlanningTaskEvents).mock.calls[0][1]).toBe(7);
     expect(lastSegment(container)?.textContent).not.toContain("旧查询不应重复出现");
+    /*
+     * 这一段正常结束 ⇒ 过程框收起成一行，步骤行不在 DOM 里。
+     * 要考"每一步的状态"，先展开；收起是呈现，不是内容消失。
+     */
+    await act(async () => lastSegment(container)!.querySelector<HTMLButtonElement>(".task-progress-toggle")!.click());
     expect(lastSegment(container)?.querySelector('.activity-steps > li')?.getAttribute('data-status')).toBe('completed');
     expect(lastSegment(container)?.textContent).not.toContain("此步骤未收到结束确认");
     expect(lastSegment(container)?.getAttribute('data-status')).toBe('completed');
@@ -619,6 +649,12 @@ describe("CAP-02 续跑结果闭环：三分支接回正常处理链", () => {
     expect(container.querySelector('[aria-label="任务执行过程"]')).toBeNull();
     await act(async () => finish());
     await until(() => (container.textContent ?? "").includes("接续完成"), "完成");
+    /*
+     * 正常结束 ⇒ 过程框收起成一行；要看"第八步真的追加了"，得先展开。
+     * 收起是呈现，步骤没有被删。
+     */
+    expect(lastSegment(container)?.getAttribute("data-expanded")).toBe("false");
+    await act(async () => lastSegment(container)!.querySelector<HTMLButtonElement>(".task-progress-toggle")!.click());
     const done = segmentSnapshots(container);
     expect(done).toHaveLength(paused.length + 1);
     expect(done[0].steps).toEqual(paused[0].steps);
@@ -698,7 +734,7 @@ describe("CAP-02 续跑结果闭环：三分支接回正常处理链", () => {
     await type(input, "生成统计预览"); await submit(input);
     await until(() => Boolean(container.querySelector('[aria-label="暂停任务"]')), "理解中可以暂停");
     await act(async () => container.querySelector<HTMLButtonElement>('[aria-label="暂停任务"]')!.click());
-    await until(() => Boolean(findButton(container, "继续分析")), "暂停后可以继续");
+    await until(() => Boolean(findResume(container)), "暂停后可以继续");
     const paused = segmentSnapshots(container);
     expect(paused).toHaveLength(1);
     // 暂停那一刻：未收到结束确认，展示为中断而非业务警告。
@@ -763,6 +799,9 @@ describe("CAP-02 续跑结果闭环：三分支接回正常处理链", () => {
       .toEqual(pausedSegments.map((segment) => segment.steps));
     // 判别点 2：补发出来的两步落在**最新那一段**里（续跑段不重排编号）。
     const resumed = lastSegment(container)!;
+    // 同上：这一段已经正常结束并收起，展开后才能数到补发出来的步骤。
+    expect(resumed.getAttribute("data-expanded")).toBe("false");
+    await act(async () => resumed.querySelector<HTMLButtonElement>(".task-progress-toggle")!.click());
     const rows = resumed.querySelectorAll(".activity-steps > li");
     expect(rows).toHaveLength(3);
     expect(rows[0].textContent).toContain("接回原任务进度");
@@ -805,7 +844,7 @@ describe("CAP-02 续跑结果闭环：三分支接回正常处理链", () => {
     expect(container.querySelector<HTMLTextAreaElement>("textarea")?.value).toBe("");
     expect(resumeMock).not.toHaveBeenCalled();
     expect(runTurnMock).toHaveBeenCalledOnce();
-    expect(findButton(container, "继续分析")).toBeNull();
+    expect(findResume(container)).toBeNull();
     if (kind === "running" || kind === "unavailable") expect(findButton(container, "核对任务状态")).not.toBeNull();
     if (kind === "completed") {
       expect(container.textContent).toContain("结果已保留");
@@ -855,16 +894,36 @@ describe("CAP-02 续跑结果闭环：三分支接回正常处理链", () => {
       expect(rows.indexOf(currentRow!)).toBeGreaterThan(rows.indexOf(userRow[userRow.length - 1]));
       expect(segmentSnapshots(container).slice(0, frozenSteps.length).map(segment => segment.steps)).toEqual(frozenSteps);
       await act(async () => { pauseButton()!.click(); });
-      await until(() => Boolean(findButton(container, "继续分析")) && liveSegmentCount(container) === 0, "本轮已收尾");
+      await until(() => liveSegmentCount(container) === 0, "本轮已收尾");
+      /*
+       * 暂停请求在飞时，右下角只能是**禁用的「正在暂停」**：这时候还能点"继续"，
+       * 等于在暂停还没落地时又把它拉起来。以前那颗按钮长在卡面上、不受输入框状态
+       * 约束，所以能点；现在它和主按钮是同一颗，就必须守这条。
+       */
+      const inFlight = container.querySelector<HTMLButtonElement>(".composer .composer-primary");
+      expect(inFlight).not.toBeNull();
+      // 暂停回执在飞 ⇒ 只能是禁用的「正在暂停」；回执已到 ⇒ 才是可点的「继续」。
+      // 两种都只有**一颗**，不存在"卡面一颗、输入框一颗"。
+      if (inFlight!.getAttribute("aria-label") === "正在暂停") {
+        expect(inFlight!.disabled).toBe(true);
+      } else {
+        expect(inFlight!.getAttribute("aria-label")).toBe("继续分析");
+        expect(inFlight!.disabled).toBe(false);
+      }
+      expect(container.querySelectorAll(".composer .composer-primary")).toHaveLength(1);
       expect(resumeMock.mock.calls[round - 1][0].signal?.aborted).toBe(true);
       frozenSteps = segmentSnapshots(container).map(segment => segment.steps);
       const resumes = resumeMock.mock.calls.length;
       const sends = runTurnMock.mock.calls.length;
-      expect(container.querySelector<HTMLButtonElement>('button[aria-label="发送"]')?.disabled).toBe(true);
+      // 已暂停（或暂停请求在飞）时根本没有「发送」这颗按钮：空表单提交既不会发出去，
+      // 也不会开新一轮；主按钮永远是 type=button，表单 submit 不能顺带触发它。
+      expect(container.querySelector<HTMLButtonElement>('button[aria-label="发送"]')).toBeNull();
+      expect(container.querySelector<HTMLButtonElement>(".composer-primary")?.getAttribute("type")).toBe("button");
       await act(async () => { container.querySelector("form.composer-box")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })); });
       expect(resumeMock).toHaveBeenCalledTimes(resumes);
       expect(runTurnMock).toHaveBeenCalledTimes(sends);
-      expect(container.querySelector('.task-execution-controls')?.closest('form')).toBeNull();
+      // 输入区上方只剩一句状态说明，没有第二颗按钮（动作只在右下角）。
+      expect(container.querySelector('.task-execution-notice button')).toBeNull();
     };
     const pausedSegments = segmentSnapshots(container);
     resumeMock.mockImplementation(({ signal, onProgress }) => new Promise((_resolve, reject) => {
@@ -874,7 +933,12 @@ describe("CAP-02 续跑结果闭环：三分支接回正常处理链", () => {
     await clickContinue(container);
     await until(() => resumeMock.mock.calls.length === 1, "继续开始");
     await pauseRound(1);
-    await until(() => Boolean(findButton(container, "继续分析")), "再次核对检查点");
+    /*
+     * 暂停回执迟到：在飞期间不许继续（上面已断言），回执回来之后才出现继续入口。
+     * 这条迟到回执也不能污染下一轮 —— 后面的轮次继续验这件事。
+     */
+    await act(async () => { resolvePause({ turnId: "turn-pause-1", pauseRequested: true }); });
+    await until(() => Boolean(findResume(container)), "再次核对检查点");
     /*
      * 再走两轮"继续 → 暂停"，凑成**三停三续**。
      *
@@ -885,11 +949,11 @@ describe("CAP-02 续跑结果闭环：三分支接回正常处理链", () => {
       await clickContinue(container);
       await until(() => resumeMock.mock.calls.length === round, `第 ${round} 次继续开始`);
       if (round === 2) {
-        await act(async () => { resolvePause({ turnId: "turn-pause-1", pauseRequested: true }); });
+        // 迟到的那份暂停回执只落在第 1 轮，不该在输入区留下任何提示。
         expect(container.querySelector(".composer-pause-note")).toBeNull();
       }
       await pauseRound(round);
-      await until(() => Boolean(findButton(container, "继续分析")), `第 ${round} 次暂停后可再次继续`);
+      await until(() => Boolean(findResume(container)), `第 ${round} 次暂停后可再次继续`);
     }
     resumeMock.mockResolvedValue({ status: {} as never, outcome: { kind: "answer", provider: "model", message: "三次暂停后完成" } as never });
     await clickContinue(container);
@@ -1074,7 +1138,7 @@ describe("CAP-02 续跑结果闭环：三分支接回正常处理链", () => {
     statusMock.mockResolvedValue({ turnId: "turn-manual-pause", status: "interrupted", revision: 5, lastSequence: 10,
       canContinue: true, pauseType: "interrupted", reason: "检查点可用" });
     const { container } = await mount(panel());
-    await until(() => Boolean(findButton(container, "继续分析")), "重载后核对可继续现场");
+    await until(() => Boolean(findResume(container)), "重载后核对可继续现场");
     expect(resumeMock).not.toHaveBeenCalled();
     resumeMock.mockResolvedValue({ status: {} as never, outcome: { kind: "answer", provider: "model", message: "重载后原断点完成" } as never });
     await clickContinue(container);
@@ -1123,7 +1187,7 @@ describe("CAP-02 续跑结果闭环：三分支接回正常处理链", () => {
     await type(input, "继续这个统计任务"); await submit(input);
     await until(() => runTurnMock.mock.calls.length === 1 && Boolean(container.querySelector('[aria-label="暂停任务"]')), "应有暂停入口");
     await act(async () => { container.querySelector<HTMLButtonElement>('[aria-label="暂停任务"]')!.click(); });
-    await until(() => Boolean(findButton(container, "继续分析")), "暂停后自动核对检查点");
+    await until(() => Boolean(findResume(container)), "暂停后自动核对检查点");
     expect(statusMock).toHaveBeenCalledOnce();
     expect(resumeMock).not.toHaveBeenCalled();
     expect(input?.value).toBe("");
@@ -1131,11 +1195,11 @@ describe("CAP-02 续跑结果闭环：三分支接回正常处理链", () => {
     expect(resumeMock).not.toHaveBeenCalled();
     expect(runTurnMock).toHaveBeenCalledOnce();
     expect(container.querySelectorAll(".message-row.user")).toHaveLength(1);
-    await until(() => Boolean(container.querySelector<HTMLButtonElement>('[aria-label="继续任务"]')) &&
-      !container.querySelector<HTMLButtonElement>('[aria-label="继续任务"]')!.disabled, "等待显式继续入口");
-    const play = container.querySelector<HTMLButtonElement>('[aria-label="继续任务"]')!;
+    await until(() => Boolean(container.querySelector<HTMLButtonElement>('[aria-label="继续任务"], [aria-label="继续分析"]')) &&
+      !container.querySelector<HTMLButtonElement>('[aria-label="继续任务"], [aria-label="继续分析"]')!.disabled, "等待显式继续入口");
+    const play = container.querySelector<HTMLButtonElement>('[aria-label="继续任务"], [aria-label="继续分析"]')!;
     expect(play.textContent).toBe("▶");
-    expect(play.closest("form")).toBeNull();
+    expect(play.getAttribute("type")).toBe("button");
     await act(async () => { play.click(); });
     await until(() => (container.textContent ?? "").includes("从原断点完成"), "点击 ▶ 后续跑完成");
     expect(resumeMock).toHaveBeenCalledOnce();
@@ -1152,9 +1216,16 @@ describe("CAP-02 续跑结果闭环：三分支接回正常处理链", () => {
     await type(input, "尚未发送的新问题");
     await act(async () => { resolveStatus({ turnId: "turn-manual-pause", status: "interrupted", revision: 6,
       lastSequence: 9, canContinue: true, pauseType: "interrupted", reason: "检查点可用" } as never); });
-    await until(() => Boolean(findButton(container, "继续分析")), "核对完成");
+    /*
+     * 有未发送草稿时，右下角那颗主按钮是「发送」—— 续跑入口让位，草稿一个字都不许被
+     * 覆盖或丢弃（这正是这条用例要证的事）。清空草稿后，核对出来的续跑入口必须回来，
+     * 说明"让位"只是优先级，不是把结论丢了。
+     */
+    await until(() => Boolean(findButton(container, "发送")), "有草稿时主按钮是发送");
     expect(input?.value).toBe("尚未发送的新问题");
-    expect(findButton(container, "继续分析")).not.toBeNull();
+    expect(findResume(container)).toBeNull();
+    await type(input, "");
+    await until(() => Boolean(findResume(container)), "清空草稿后应出现继续入口");
     expect(resumeMock).not.toHaveBeenCalled();
     expect(runTurnMock).toHaveBeenCalledOnce();
     expect(writes).toEqual([]);
@@ -1421,14 +1492,14 @@ describe("CAP-02 续跑幂等身份（第 2 条）", () => {
       } as never;
     });
 
-    const button = findButton(container, "继续分析")!;
+    const button = findResume(container)!;
     await act(async () => {
       button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
     await until(() => resumeMock.mock.calls.length === 1, "接续开始");
     expect(container.querySelector(".pause-details summary")?.textContent ?? container.textContent).toContain("正在继续");
-    expect(findButton(container, "继续分析")).toBeNull();
+    expect(findResume(container)).toBeNull();
     expect(resumeMock).toHaveBeenCalledTimes(1);
     await act(async () => { release?.(); });
     await settle();
@@ -1460,7 +1531,7 @@ describe("CAP-02 续跑幂等身份（第 2 条）", () => {
         stepId: "step-8", status: "completed", title: "步骤8", timestamp: "2026-10-21T00:00:00Z"
       }] } as never);
 
-    const button = findButton(container, "继续分析");
+    const button = findResume(container);
     if (!button) throw new Error("没有继续按钮");
     const pausedSegments = segmentSnapshots(container);
     await act(async () => {

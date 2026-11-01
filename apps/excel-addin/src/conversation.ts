@@ -1,3 +1,4 @@
+import { removeHistoryConversation } from "@excel-bro/core/conversationHistory";
 // 对话 / 历史相关的纯函数与常量（从 App.tsx 抽出，避免单文件过大的维护负担）。
 import type {
   ChatConversation,
@@ -279,31 +280,7 @@ export function deleteConversationFromHistory(
   current: ChatHistoryState,
   conversationId: string
 ): ChatHistoryState {
-  const remaining = current.conversations.filter(
-    (conversation) => conversation.id !== conversationId
-  );
-  if (remaining.length === current.conversations.length) {
-    return current;
-  }
-  const remainingLegacyIds = remainingLegacyCredentialConversationIds(
-    current
-  ).filter((id) => id !== conversationId);
-  if (remaining.length === 0) {
-    const replacement = createConversation();
-    return {
-      activeConversationId: replacement.id,
-      conversations: [replacement],
-      legacyCredentialConversationIds: remainingLegacyIds
-    };
-  }
-  return {
-    activeConversationId:
-      current.activeConversationId === conversationId
-        ? remaining[0].id
-        : current.activeConversationId,
-    conversations: remaining,
-    legacyCredentialConversationIds: remainingLegacyIds
-  };
+  return removeHistoryConversation(current, conversationId, createConversation);
 }
 
 /**

@@ -11,12 +11,27 @@ import type {
 import type { CrossTableMatchProposal } from "../crossTableFormula";
 import type { ActivityLog } from "../hooks/useActivityProgress";
 import type { ReplySegment } from "@excel-bro/core/replySegments";
+import type {
+  ExecutionRecoveryAction,
+  ExecutionRecoveryVerdict
+} from "@excel-bro/core/executionRecoveryView";
 import type { SourceMode } from "./workbook";
+
+/**
+ * Excel 端的恢复结论：`reconcile` 的现场结论在**发现阶段**还没读过
+ * （发现只 GET 状态 + 本机判定，不读单元格），所以是 `pending`；
+ * 点「核对在途动作」之后服务端回执才把结论换成 applied / not_applied。
+ */
+export type OfficeRecoveryVerdict = ExecutionRecoveryVerdict<
+  "applied" | "not_applied" | "pending"
+>;
 
 export type Status = "idle" | "scanning" | "planning" | "tooling" | "executing";
 export type MessageRole = "assistant" | "user" | "system";
 
 export interface MessageClarification extends IntentClarification {
+  /** 不读取宿主的需求讨论；回答只能回到消息理解，不授予执行资格。 */
+  messageOnly?: boolean;
   /** 本地源值澄清的标记。原始值与规则草稿只在任务窗格内存中。 */
   localMapping?: true;
   turnId?: string;
@@ -118,11 +133,27 @@ export interface ChatMessage {
   officeResume?: {
     operationId: string;
     expectedRevision: number;
-    status: "pending" | "resuming" | "completed" | "failed";
-    requiresReconciliation: boolean;
+    /**
+     * 恢复**结论**。与 WPS 读同一份呈现契约
+     * （`@excel-bro/core/executionRecoveryView`）：六种 kind、标题、正文、按钮集合
+     * 都从共享层来，这里不再用 `blocked | pending` 两态和一句 `reason` 自己拼。
+     *
+     * `reconcile`（第二步可能已写入、只等补记回执）与 `resume`（第三步还没执行）
+     * 是**两个互斥结论**，各自对应一个按钮；不许再合成"核对并继续"。
+     */
+    verdict: OfficeRecoveryVerdict;
+    /**
+     * 正在跑的恢复动作（不是判定）。`null` = 空闲。
+     *
+     * 与 `verdict` 分开，是因为"正在补记"不能把结论改写成另一种结论：
+     * 卡片的说法仍按结论给，只是按钮暂时不可点。
+     */
+    acting?: ExecutionRecoveryAction | null;
+    /** 结论正文之外还需要补一句时的附加说明（例如身份不符的具体原因）。 */
+    detail?: string;
+    /** 服务端已推进到的下一步序号与动作总数：执行记录（详情）里要显示，不放进正文。 */
     nextActionIndex: number;
     totalActions: number;
-    reason: string;
   };
   /** 规划达到本轮安全时长边界后保存的现场；刷新后仍可由用户明确继续。 */
   planningResume?: {

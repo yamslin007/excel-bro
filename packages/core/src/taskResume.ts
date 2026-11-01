@@ -402,3 +402,34 @@ export function withTaskResumeConfirmation(
   const merged = sanitizeConfirmations(base);
   return { ...record, confirmations: merged, updatedAt: new Date().toISOString() };
 }
+
+/**
+ * 恢复动作收尾时，"当前这份待执行计划是不是**这次执行**的"。
+ *
+ * 为什么必须问这一句：恢复动作（续跑 / 补记 / 核对最后一步）是在异步回调里完成的，
+ * 等它回来时界面上的 `pendingPlan` 可能已经换成了另一份计划 —— 用户重新规划、
+ * 丢掉了旧预览，或者干脆在另一个任务里生成了新计划。这时按"当前 pendingPlan"
+ * 直接清空，清掉的是**别人的**计划：新任务于是可以趁虚而入，而它本来该被挡住。
+ *
+ * 三条同时成立才算自己的：
+ * - 记下的执行身份就是这次执行；
+ * - 计划**按引用相同**（重新规划一定换一个新对象，引用比较比字段比较更难被骗过）；
+ * - 计划消息 id 也相同（同一份计划换了承载消息，归属同样说不清）。
+ *
+ * 任一侧缺证据就返回 `false` —— fail-closed。宁可让用户手动处理，也不清别人的计划。
+ */
+export function planSettlesExecution(input: {
+  /** 执行开始时记下的绑定；`null` = 这次执行没有可收尾的计划。 */
+  binding: {plan: unknown; messageId: string | null; operationId: string} | null;
+  /** 当前渲染期的待执行计划与它的消息 id。 */
+  pendingPlan: unknown;
+  pendingPlanMessageId: string | null;
+  operationId: string;
+}): boolean {
+  const {binding} = input;
+  if (!binding) return false;
+  if (binding.operationId !== input.operationId) return false;
+  if (input.pendingPlan === null || input.pendingPlan === undefined) return false;
+  if (input.pendingPlan !== binding.plan) return false;
+  return input.pendingPlanMessageId === binding.messageId;
+}

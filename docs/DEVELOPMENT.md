@@ -1,3 +1,252 @@
+## 2026-11-01：全部积累改动提交前检查
+
+执行了 test:addin / test:wps / test:core、两端 build、服务端全量 pytest 和 compileall。核心 1101 passed；双端构建通过。首次 Excel 全量 1676 passed / 2 failed / 9 skipped，WPS 1239 passed / 22 failed / 8 skipped：失败为问卷替换后的旧 DOM/文案定位断言，按新位置修正，保留身份、授权、图片隐私与零写入断言。Excel 两个失败文件复跑 31 passed；WPS 四个失败文件先 45 passed / 1 failed，最后图片用例改等待实际问题而非已移除摘要后文件通过。面板凭据用例改用明确的短假凭据，相关三项复跑通过。没有把定向复跑记成整套重新全绿。
+
+服务端首次全量 1949 passed / 28 skipped / 2 failed，失败在 Python 事件投递（Docker 引擎未运行）。用户启动 Docker 后，该文件 6 passed。日志 outputs/git-all-*.log、git-fix-*.log、git-docker-retest.log、git-credentials-final.log 留在本机，不提交。暂存内容排除临时目录、代理本机资料、独立 SDK 仓库、真实工作簿和账本。推送前精简：17 份根目录历史报告、5 个一次性取证脚本及根目录手动 SSE 测试入口仅留本机，不纳入提交。正式测试、可复用回归脚本与设计/验收文档保留。
+
+## 2026-11-01：三个选项与固定问题标题
+
+共用配置 clarification.maxOptions=3；生成提示要求最多三项、短标题和一句说明。TS 与 Python 新增三项接受/四项拒绝且不修改原数组的断言。共享组件增加 clarification-choices-scroll，问题标题留在滚动区域外，其他输入及操作行仍固定。Excel/WPS 共用此组件与协议。定向 TS 32 passed，服务端消息理解 30 passed；双端三档浏览器布局通过（包括滚动前后标题位置不变）。日志 outputs/clarification-three-*.log。已存在的四项问题不被截断或重写；用新问题验收新生成规则。
+
+## 2026-11-01：澄清问卷标题与操作行收紧
+
+“需要确认”与问题同排；去掉未选择时的通用提示和回答模式底部提示，字段缺项校验仍保留。取消任务从滚动区移到提交回答旁，使用按钮样式。共享样式双端应用。浏览器布局脚本验证三档宽度下标题同排、取消/提交同排且可见。Excel 消息路由 61 passed、共享组件 7 passed；WPS 面板 232 passed / 5 skipped；双端 build 通过。组件旧 radiogroup 断言改为框选按钮组的“单选/可多选”标签断言，与实际 aria-pressed 按钮一致。日志 outputs/clarification-actions-*.log；原生宿主仍待用户查看。
+
+## 2026-11-01：澄清问卷替换输入框验证
+
+Excel 定向组件、消息路由与 contracts：99 passed；WPS 面板：232 passed / 5 skipped；服务端消息理解与身份：45 passed。新增两端真实面板测试覆盖框选/其他互斥、点选不提交、消息澄清回答不授权读取和执行。两端 build（含 tsc）通过。日志 outputs/clarification-replace-*.log。
+
+node scripts/check_clarification_inbox_layout.mjs 使用真实共享组件、主按钮与双端样式，在 320×640、400×720、500×760 验证问卷在 composer-box 内、自滚、无圆形单选标记、“其他”输入框、无横向溢出及提交按钮可见。截图 outputs/probe/clarification-inbox.png。这是浏览器夹具，原生 Excel/WPS 窗格尚待验；未操作真实工作簿。后端新增消息理解 clarification 协议，真机须加载更新后的前后端，不只刷新旧服务的前端。
+
+## 2026-10-31：历史对话对齐回归
+
+双端复用 HistoryDeleteDialog 与 core/conversationHistory；WPS 现有 30×120 移入 capabilities.conversation.wps，不能直接改用 Excel 20×60。定向测试覆盖取消/指定删除、其他保护标记、30×120 往返、重开普通续聊及零宿主写入；既有失败提示与历史计划失效测试继续保留。完整命令、真实结果和无敏感聊天真机步骤见 [验收记录](CHAT_HISTORY_ALIGNMENT_2026-10-31.md)。实际加载 URL 必须在退出前后记录，不将测试端口当作真实地址，不清缓存/删键。无需重启后端，A2 未启动。
+
+## 2026-10-31：重开后撤销未完成执行（Excel）怎么跑、怎么验
+
+跑：`cd apps/excel-addin && npx vitest run src/excelWriteEndToEnd.test.tsx -t "重开后"`（五条：
+材料恢复入口 / 目标被改过 / 授权收窄 / 已处置 / 材料缺失）；`npx vitest run src/hooks/useUndoSnapshot.test.ts`
+（去重、覆盖、`ensure` 之后同 tick 撤销、失败保留重试）；`npm run test:core` 里的
+`executionUndoRebuild.test.ts`；服务端 `pytest server/tests/test_execution_disposition.py -q`。
+
+变异：`node scripts/mutate_office_undo_rebuild.mjs`（先打印基线 sha256 与"工作区是否干净"），
+一次一个：`U1`（材料挂不进栈）/`U2`（把 needs_reconciliation 当 completed）/`U3`（服务端不投影
+disposition）/`U4`（同一执行两份快照都留在栈里）。每个都按四判据判定（退出码、预期用例红了、
+失败原文带自家证据、还原后逐字节一致）并**还原后复跑绿**；脚本装信号钩子，结束必须四个目标全部
+`clean`。pytest 的 `--basetemp` 固定在 OS 临时目录（仓库内的临时目录会被环境里的安全删除钩子牵连）。
+
+判据边界（改之前先读）：`packages/core/src/executionUndoRebuild.ts` 是"重开后能不能撤销"的**唯一**
+出处，入参刻意不含来源证据；撤销的目标必须由 `recoverableActionRange` 解析（与执行同一个函数）。
+入口位置纪律不变：可点的那一下只能在输入区上方的 `OfficeRecoveryPanel`，消息里只留只读记录 ——
+恢复卡接管同一条执行时，消息里那条同名按钮要让位。留痕只在 `onRestored` 之后写，`undone` 与
+`abandoned` 不互冒充。
+
+WPS 侧未改：撤销记录在宿主 `PluginStorage` + 本机恢复包（TTL），判据在 `wpsPlanExecutor` /
+`wpsExecutionReconcile` 一线，未接 `rebuildExecutionUndo`；不要为了"看起来一致"去重写已验证链路。
+
+## 2026-10-31：公式恢复登记与探针取消回归
+
+运行 `node`/vitest 对应的 `excelFormulaSourceEvidence.test.ts` 与 `excelWriteEndToEnd.test.tsx`：覆盖模型有/无工具读取的公式三动作中断、本机读取失败、越权、异步范围变化、混合计划保持原证据、写前取消显示“未执行”。运行 `python scripts/mutate_formula_probe_registration.py` 逐个验证 F1（移除本机来源读取）与 F2（丢失未执行分类）；脚本自动还原原始字节并复跑，不能与其他测试或源文件编辑同时运行。日志位于 `outputs/formula-probe-fix-20261030/`。
+
+## 2026-10-27：未完成执行的发现入口 + 测试网络闸门
+
+**发现（产品侧）**：浏览器 `pending-wps-execution.v1` 从"唯一入口"降级为**缓存**，权威发现改为
+`GET /api/{wps|office}/executions/pending?workbookIdentity=…`（按当前工作簿稳定身份精确查找）。
+面板在三种时机重跑：挂载、工作簿身份变化（间隔 + 焦点 + 可见性）、授权范围刷新；迟到响应由
+代数闸作废。多候选只给选择入口，服务不可达显示"暂时读不到"。发现全程只读。
+
+**怎么加新用例**：如果你写的测试会挂载面板/执行器，而 `api.ts` 里还有函数没替身，现在会**直接
+失败**——两端 `setupFiles` 装了 `packages/core/src/testNetworkGate.ts`：
+
+- 未替身的 `fetch` / `XMLHttpRequest` / `WebSocket` / `sendBeacon` 立刻抛错，`afterEach` 也会因为
+  留下未处理请求让用例失败（吞掉错误同样算失败）；
+- 发现入口的替身：`vi.mock("…/api")` 里加 `...pendingDiscoveryApiStubs()`（来自
+  `apps/wps-addin/src/wpsPendingDiscovery.testHost.ts`），需要"真的发现出东西"时用
+  `pendingDiscoveryBackend().publish({...})`，不要另写假响应；
+- 故意要跑真实实现、由用例自己 `vi.stubGlobal("fetch")` 驱动的接缝（桥轮询、暂停、计划校验）用
+  `guardNetworkSeam(real)` 包一层：只有本用例装了 fetch 替身才真的调用；
+- **不要**为了让测试变绿去关掉用户那台 8765，也不要加"允许某个地址"的白名单。
+
+**反向变异**：`node scripts/mutate_wps_recovery_discovery.mjs D1 check`（D1–D6，每条只打一个
+判别点），四判据是"退出码非 0 / 预期用例红了 / 失败原文带它自己那处证据 / 还原后逐字节一致"。
+脚本自己打印并比对 `WpsAgentPanel.tsx` 的 sha256。**变异体不许留在工作区**。
+
+**用户处置留痕（放弃 / 撤销）**：改账本这两列或那个端点之后，跑
+`python scripts/mutate_execution_disposition.py D1 check`（D2/D3 同）——
+D1 拆"首次写赢"、D2 让处置顺手 `revision + 1`、D3 把两个取值映射到同一列。
+**改了端上接线（不是账本）就换另一个脚本**：`node scripts/mutate_excel_disposition_wiring.mjs E1 check`
+—— E1 把 Excel `onRestored` 的判定写死成 `abandoned`、E2 把 `onRestored` 挪到
+`await undoExecution(...)` 之前（恢复失败也留痕）、W3 把 WPS 的 `origin` 判定写死成 `abandoned`；
+`check` 模式额外有 ④b「还原后复跑那条用例必须绿」。
+服务端用例在 `server/tests/test_execution_disposition.py`（含旧库迁移与"两端同取值"两条），
+两端接线分别在 `apps/excel-addin/src/excelWriteEndToEnd.test.tsx` 与
+`apps/wps-addin/src/WpsAgentPanel.test.tsx`（各有"上报失败不重试、不二次撤销"与
+"恢复失败不留痕"两条）。**加新端点后记得给所有 `vi.mock("…/api")` 的替身补一条**：
+那些替身用 `importOriginal` 展开真实模块，漏一条就会让"网络闸门"把用例判红（这不是产品缺陷）。
+留痕的判据位置只有一处：`onRestored` / `undoExecution` 的**成功分支**（恢复失败一律不写）。
+Excel「确认后撤销」的完整调用链见
+[处置留痕文档](EXECUTION_DISPOSITION_2026-10-29.md) §2.4.1。
+
+**删除前的恢复材料留痕（U5）**：动 `DELETE /api/execution-recovery/{id}` 的顺序、或动
+`recovery_package_*` 四列之后，跑
+`python scripts/mutate_recovery_package_retirement.py R1 check`（R2–R5 同）——
+R1 拆"删前取指纹"、R2 拆"落账失败就不删"、R3 把四列从 `_REQUIRED_OFFICE_COLUMNS` 里拿掉、
+**R4 让删除失败也写"删除确认"**、**R5 让删除确认不首次写赢**。
+用例在 `server/tests/test_recovery_package_retirement.py`（12 条）。**顺序不许反过来**：
+先落账、再删、删成功才记确认；这与处置留痕（U4，恢复成功之后才写）正好相反。
+**两个事实不许混**：`retired_at` 只证明"记下了删前摘要"，`removed_at` 才证明"文件确已删除"，
+读账本时不能只凭前者宣称删除成功。边界见 [材料回收留痕](RECOVERY_PACKAGE_RETIREMENT_2026-10-30.md)。
+
+**最短原生验收步骤**（本轮未执行，需要真实宿主）：加载新版 → 打开那个仍是 111/222/-303 的文件 →
+面板应直接出现"待核对在途动作"（不点任何东西、不重发需求）→ 点"核对在途动作"（只补记，不重写）
+→ 出现"继续剩余动作" → 点击后只写第三步 → 审阅里确认/放弃。不要求重发任务，不要重建账本或 WAL。
+
+专项：`packages/core/src/pendingExecutionDiscovery.test.ts`、
+`server/tests/test_pending_execution_discovery.py`、`WpsAgentPanel.test.tsx` 的 CAP-03 新增十条。
+细节见 [架构说明](ARCHITECTURE.md) 与 [恢复包第五轮](SDK_WPS_RECOVERY_PACKAGE_2026-10-27.md) §28。
+
+## 2026-10-28：发现/选定不该被"缓存旧键"改判（WPS 恢复阻断）
+
+真机阻断：用户选了执行 ID 尾号 `…0f5bffdc`（在途、待核对），界面却显示另一条 `failed` 执行的
+「需重新规划：还有 1 个动作没写」。机制在 `discoverWpsRecovery` 两处：①缓存优先里 `identity === null`
+也采纳索引（同名异路径旧键串台）；②`replan` 被当成「能做事」，挡住后端发现。修法（`WpsAgentPanel.tsx`）：
+
+- 身份 `null` 时**不采纳**浏览器索引（不猜是哪个簿、不据此清卡）；缓存路径要求
+  `identity !== null && pending.workbookIdentity === identity`；
+- 「能做事」收窄为**只有** `reconcile` / `resume`；`replan` / `completed` 都不算，继续走后端发现；
+- 恢复卡新增 `source: "selected" | "auto"`：用户点选过的卡在自动发现里不改判、不退回候选列表；
+- `selectWpsRecoveryCandidate` 作废判据由「发现代数」改为「工作簿身份是否变化」—— 点选不该被并发
+  的另一次发现判作废；
+- 材料缺失措辞：`ensureWpsRecoveryMaterial` 返回 `none`（宿主缓存与持久包**都**没有）时说
+  「本机没有这次执行的恢复材料」，不再落到「找不到原执行的本机恢复记录」（那会把"缓存没了但持久
+  包在"误读成"材料丢了"）。
+
+回归：`WpsAgentPanel.test.tsx` 新增 4 条（旧索引挡路 / 身份不可读不猜 / 点选不改判 / 材料缺失措辞），
+并修正既有「missing」分支断言。反向验证：临时把后端发现调用换成 `no_identity`，旧索引回归立即转红。
+**注意**：持久材料与后端发现经隔离实例证明本就正常，本轮只改前端，未改服务端。
+
+## 2026-10-28：授权范围变化后，同一条已选执行必须重新核验（WPS 恢复）
+
+**上一节那条保护写过头了**。`source: "selected"` 的本意是「别让另一次发现把用户点选的这条改判成
+别的执行」，实现却写成「这条以后一律不重算」：用户在恢复卡上看到「需重新规划：工作簿、宿主版本或
+授权已变化」，回到数据范围面板取消误选的那张表（三张 → 原两张）后，`useEffect` 里的
+`authorizationKey` / `scopeMode` 依赖**确实**变了、发现也确实重跑了，但 `discoverWpsRecovery` 在
+`current?.source === "selected"` 处直接 `return`，于是一条已经可以续跑的执行继续挂着旧阻断，
+用户只能靠重新规划（等于丢掉这次执行）脱身。
+
+**修法（`apps/wps-addin/src/WpsAgentPanel.tsx`）**：抽 `reverifySelectedWpsRecovery(isCurrent)`，
+把 selected 分支从「什么都不做」改成「按当前现场重算这一条」：
+
+- 只重算**这一条**：`operationId` / `taskId` 原样沿用，`getWpsExecutionStatus(operationId)` 直接问
+  后端，不再走候选列表（`loadPendingWpsExecution` 那一步跳过），所以不会把用户的点选换成别的执行；
+- 判据不复制：仍然调 `wpsRecoveryVerdictFor(latest)`（≈`wpsIdentityVerdict` +
+  `inspectWpsRecoveryState` + `recoveryMaterialReason` + `wpsResumeUnavailableReason`），
+  「能不能续跑」只有这一份判据，不在面板里另写一套宽松规则；
+- 只读：这一步只发 `GET /api/wps/executions/{id}`，不认领、不补记、不执行、不写宿主存储；
+- 安全边界不变：①`isCurrent()` 代数闸（`discoveryGenerationRef`）在**两次** `await` 之后各查一次，
+  迟到响应一律丢弃；②`recoveryActionLock.current` 为真时既不进也不写（核对/续跑动作在飞时让给它）；
+  ③`setWpsRecovery` 里再比一次 `operationId` + `taskId`，两次 await 之间被换成别的执行就不覆盖；
+  ④身份读不出来（`identity === null`）时保持原状、不猜、不清卡，仍走上一节的缓存规则。
+
+现在的 `discoverWpsRecovery` 分三种情况，别再把它们合成一个 `return`：
+
+| 现场 | 行为 |
+| --- | --- |
+| selected 且身份一致（或原执行没登记身份） | `reverifySelectedWpsRecovery`：同一条重新算 |
+| selected 但身份已变（换了工作簿） | 保持原卡不动，交给换簿逻辑，不在这里重算 |
+| 没有 selected（`auto` / 空） | 走后端发现 + 多候选列表（上一节流程） |
+
+**第二处（`apps/wps-addin/src/wpsPlanExecutor.ts` 的 `assertWpsResumeSources`）**：判据本身一直是
+fail-closed 的，但三种不匹配共用一句「工作簿、宿主版本或授权已变化，不能续跑」，用户没法知道该去
+改哪一样，只能笼统怀疑「材料是不是丢了」。现在按检查顺序各自点名，**顺序与严格性一字不改**：
+
+1. 身份（`wps-path:<fullName 小写>`）→「当前工作簿与原执行登记的身份不一致；请打开原工作簿后再续跑，不猜是不是同一个文件。」
+2. 授权集合（排序后逐字比 `authorizedSheetNames`）→「当前授权 3 张表，原执行登记 2 张表，两者不是同一组；授权范围与原执行不同，不能沿用原执行的写入边界续跑。」
+3. 宿主版本 →「宿主版本已变化（登记 12.0，当前 12.1），不能续跑。」
+
+三条文案都**只报数量与版本号，不打印路径/表名**（面板可能被投影）。
+
+**回归（先红后绿）**：
+
+- `WpsAgentPanel.test.tsx` 新增 5 条：把 `assertWpsResumeSources` 的合并文案临时还原、或把
+  `selected` 分支临时改回 `return`，这 5 条与 `wpsExecutionResume.test.ts` 的 3 条按预期变红，
+  还原后全绿；`selectInFlightUnderScope` 用三表夹具 + 一条写前失败候选（`wps-resume-0002`）证明
+  「刷新不采纳旧索引/别的候选」；
+- 反向变异固化成脚本：`node scripts/mutate_wps_recovery_reverify.mjs R1 check`（selected 分支
+  改回 `return`）与 `R2 check`（迟到写回的三道闸一次拆全），四判据依次是退出码、预期用例名、
+  **失败原文带它自己那处证据**、还原后逐字节 sha256（基线 `97c0ba01…2dc0cd`）。
+  另：`scripts/mutate_wps_recovery_discovery.mjs` 的 `D2` SEED 因上一节删掉"身份为 null 也采纳
+  索引"而失效，已重新定点，D1–D6 六条重跑全成立；
+- 覆盖 a–e：①三张表阻断 → 收回两张后同一条改判（`当前授权 3 张表，原执行登记 2 张表`）→
+  再收窄到 `[2]` 时「继续剩余动作」立刻消失（旧结论不许残留）；②刷新只问 `resumeOperationId`；
+  ③连续切授权时手动控制两次响应到达顺序，迟到的旧响应不覆盖新现场，换簿后恢复卡不画回来；
+  ④刷新全程零写入（claim/reconcile/start/complete/finish/suspend 均未调用、`f.writes` 为空、
+  `PluginStorage` 序列化前后一致、`jobs.snapshot` 不变）。
+
+**Excel 侧差距（如实记录）**：服务端 `GET /api/office/executions/pending` 与
+`apps/excel-addin/src/api.ts` 的 `listPendingOfficeExecutions` 都在，但 Excel 窗格**没有接线**——
+没有恢复卡、没有 `source: "selected" | "auto"`、也没有 `assertWpsResumeSources` 的对应实现，
+所以这个缺陷在 Excel 侧**尚不存在**（而不是「已修」）。接恢复卡时要连同本节三条一起搬过去。
+
+**本轮未验证**：真实 WPS 窗格里点过没有、两张表下恢复卡会不会真的亮出「继续剩余动作」——都只有
+自动化证据（真实组件 + 真实服务端 + 替身宿主）。真机最小步骤见下。
+
+## 2026-10-27：多动作字面常量入口
+
+新增 `plan_literal_edits` 工具，edits 每项为 sheet/range/value（标量），按序编译为
+独立 writeValues；`agentPlanTools.maxLiteralActions=50`，全部动作合计仍受 maxLiteralCells=1000
+限制。字面来源标记共用原单区域协议。WPS 恢复来源证据 version=2 只允许空来源及纯
+writeValues，version=1 仍必须有来源。后端与前端必须同时更新后重新发起任务。
+
+专项：服务端 test_sdk_agent_route.py / test_execution_recovery_package.py；共享层
+literalPlanOrigin.test.ts / executionRecoveryPackage.test.ts；两端真实组件的三步常量确认/放弃；
+WPS wpsExecutionResume.test.ts 的 lost host cache 常量链。实际命令、失败记录及最短原生操作
+见 [本轮交付](SDK_ORDERED_LITERAL_WRITES_2026-10-27.md)。测试通过不代替真实 WPS 完整退出。
+
+## 2026-10-27：完整退出宿主后的本机恢复包（WPS）
+
+真实缺陷：第二步写入回读后、完成回执前中断，完整退出 WPS 重开，账本能核对第二步却提示
+「找不到原执行的本机恢复记录」。根因是 `prepareWpsResume` 只读宿主 `PluginStorage`；恢复材料
+因此改存本机后端应用数据目录，`PluginStorage`/`localStorage` 只作缓存与发现索引。
+
+改动的文件（照这个顺序读）：
+
+1. `packages/core/src/executionRecoveryPackage.ts` —— 协议与判定（白名单、版本、身份、指纹、形状）；
+2. `server/app/execution_recovery.py` —— 原子文件存储（缺失/过期/损坏/冲突/配额各有状态）；
+3. `server/app/main.py` —— `PUT/GET/DELETE /api/execution-recovery/{operation_id}`（先核账本身份再动手）；
+4. `apps/wps-addin/src/wpsRecoveryPackage.ts` —— 构建、写前落盘、跨进程水合、终态回收；
+5. `apps/wps-addin/src/wpsPlanExecutor.ts` —— 写前落盘硬闸（失败即零宿主写入）。
+
+跑测试：
+
+```bash
+# 共享层（含双端共读样例 config/execution_recovery_package_cases.json）
+cd packages/core && npx vitest run src/executionRecoveryPackage.test.ts
+# 服务端（basetemp 必须在 OS 临时目录，否则 safe-delete 闸门会让整批测试成片失败）
+.venv/Scripts/python.exe -m pytest server/tests/test_execution_recovery_package.py -q \
+  -p no:cacheprovider --basetemp="C:/Users/<you>/AppData/Local/Temp/eb-pytest-recovery"
+# WPS 端：跨进程恢复 + 写前落盘失败 + 版本不兼容
+cd apps/wps-addin && npx vitest run src/wpsExecutionResume.test.ts
+# 面板：完整退出后仍能续写第三步（确认 / 放弃两条）
+npx vitest run src/WpsAgentPanel.test.tsx -t "完整退出 WPS"
+```
+
+测试替身怎么放才不算作弊：`apps/wps-addin/src/wpsRecoveryStore.testHost.ts` 是**本机后端**的替身
+（WPS 重启它不该消失），只替换 `save/load/delete` 三个网络函数，`persistWpsRecoveryPackage` /
+`ensureWpsRecoveryMaterial` 仍是生产实现，材料以**文本**跨边界。**不要**用宿主临时文件
+（`Env.GetTempPath` + `FileSystem`）去凑这条链路 —— 那不是本产品的存储方案，写出来的"证据"是假的。
+
+反向变异（两条机制各一个判别点，四判据：退出码 / 红的那几条 / 失败原文带自家证据 / 还原后 sha256）：
+
+```bash
+node scripts/mutate_wps_recovery_material.mjs            # 基线哈希
+node scripts/mutate_wps_recovery_material.mjs M1         # 退回"只信宿主缓存" ⇒ 跨进程恢复必须红
+node scripts/mutate_wps_recovery_material.mjs M1 restore
+node scripts/mutate_wps_recovery_material.mjs M2         # 拆掉写前落盘 ⇒ "中断后确实有材料"必须红
+```
+
+设计与双端状态见 [本机恢复包](SDK_WPS_RECOVERY_PACKAGE_2026-10-27.md)。**原生未做**，A1-GATE 未通过。
+
 ## 2026-10-26：S1 原生验收实例与任务关联
 
 验收脚本改用专用 `scripts.a1e3_native_server:create_app --factory` 包装真实应用，记录
@@ -156,7 +405,9 @@ Python 同次分析的 analysis_completed 与 pythonResult 在同一个 python.a
 
 ## 2026-10-23：发送与任务控制分离
 
-发送按钮固定为 ↑，空输入/空表单提交不恢复任务。Excel/WPS 共用 TaskExecutionControls，放在输入框上方、表单之外；■ 暂停，暂停请求处理中显示禁用的 …，暂停后 ▶ 由用户另一次点击才恢复。按钮始终 type=button，暂停/继续使用不同 React key，不复用为提交按钮；忽略双击的第二次点击。输入文字的发送与既有语义续跑仍走原意图路径。
+发送按钮固定为 ↑，空输入/空表单提交不恢复任务。Excel/WPS 共用 `ComposerPrimaryButton`，固定在输入框**右下角**，形态由共享判据 `composerPrimaryAction` 一次算出（发送 / 发送回答 / 暂停 / 继续 / 核对在途动作 / 继续剩余动作），输入框上方只留**无按钮**的状态行 `TaskExecutionNotice`。■ 暂停，暂停请求处理中显示禁用的 …，暂停后 ▶ 要由用户另一次点击才恢复；核对与「继续剩余动作」是两件事，核对只补记回执、不自动续跑。按钮始终 type=button，形态变化用不同 React key，不复用为提交按钮；忽略双击的第二次点击。输入文字时主按钮**永远是发送**（不吞字），发送与既有语义续跑仍走原意图路径。固定区域（审阅栏 / 恢复卡）由 `ComposerActionDock` 承载，一次只展开一块，其余压成可切的 chip。
+**（已被 2026-11-01 B 批取代）** 那颗按钮现在在输入框**右下角**（`ComposerPrimaryButton`），输入区上方只剩无按钮的状态行
+（`TaskExecutionNotice`）；`type=button` / 换 `key` / 忽略 `detail>1` / 空提交不恢复任务四条约定原样保留。
 
 本次覆盖旧约定“空输入点发送即可继续”。暂停后的自动核对仍只查询状态；这次调整不新增写入能力、不改变授权和预览确认边界。组件原生 click 用例验证同步渲染时不会连带 form submit 或 resume；双端面板验证空提交无动作、明确 ▶ 才恢复。真实宿主验收尚未执行。
 
@@ -1181,6 +1432,18 @@ Excel/WPS 的模型、新对话、工具、备份入口只显示图标，保留 
 ### 窄窗格与进度交接回归（2026-10-04）
 
 `styles.test.ts` 检查宽度约束与 App 的实际请求准备交接位置；`useActivityProgress.test.ts` 覆盖本地准备 → 服务端理解/生成 → 等待确认，以及缺少结束事件时不得保留运行状态或假报成功。
+恢复入口的**位置**（"要用户点的那一下"在不在视口里）单独验：
+`node scripts/check_recovery_entry_viewport.mjs` —— 用**真实 `<App/>` 构建 + 真实 `styles.css`**
+在 320x640 / 400x720 / 500x760 三档量入口按钮矩形，并额外跑一档"320x640 + 很长的阻断原因"
+验证面板限高与正文自滚；脚本末尾把同一张卡塞回第一条消息再滚到底，必须量出"看不见"
+（灵敏度对照）。走**原始 CDP**（`--remote-debugging-port` + WebSocket +
+`Emulation.setDeviceMetricsOverride`）：本机不一定有 Playwright，且 Chrome 是 GUI 子系统
+程序，Windows 上 `--dump-dom` 的 stdout 拿不到。`--shots` 出图到 `outputs/probe/`，
+`PROBE_BROWSER=<路径>` 换浏览器。**这是 Chrome 的布局引擎，不是宿主窗格**。
+
+反向变异：`node scripts/mutate_office_recovery_placement.mjs`（P1 入口搬回消息流 /
+P2 记录里补按钮 / P3 选择器取第一条），`check P1` 判是否已干净变异，还原后要比 sha256。
+
 浏览器尺寸测量单独运行 `node scripts/check_taskpane_layout.mjs [Playwright包路径]`，加 `--wps` 渲染真实 WPS 面板与宿主覆盖样式；需已有 Playwright 和 Microsoft Edge，不自动下载安装。真实组件用隔离上下文与模拟模型/健康响应，源表、模型服务和用户浏览器存储不参与；时间线与本地澄清夹具挂在消息容器中。`--without-containment` 只在测试内存中移除新宽度约束，用于证明布局断言能复现裁切，不修改生产文件。
 
 通过浏览器尺寸检查后，仍须在 Excel/WPS 任务窗格拉窄、加宽并检查模型菜单、表单填写、键盘与真实步骤事件。jsdom/CSS 文本断言不能代替布局证据，Edge 无头渲染不能代替宿主验收。
@@ -1398,11 +1661,45 @@ apps/wps-addin 是独立的 WPS 表格加载项工作区，不使用 Office 清�
 初始化。W0 核心加载已在目标个人版通过；W1 提供明确授权的分块读取；W2 接入对话 Agent；
 W3 已提供受控写入、回读校验和本机恢复点。
 
-依次运行 npm run test:wps、npm run build:wps 和 npm run dev:wps。dev:wps 调用
-固定版本的 wpsjs，将类型为 et、名称为 excel-bro-wps 的开发加载项登记到官方
-publish 调试配置，并在 http://127.0.0.1:3889 提供资源。WPS 子项目的 `dev`
-脚本不单独声明端口，统一服从 `vite.config.ts` 的 3889 严格端口配置，避免任务窗格
-意外从 3890 加载后被后台 CORS 预检拒绝。已有 WPS 进程可能不会
+依次运行 npm run test:wps、npm run build:wps 和 npm run dev:wps。**WPS 开发前端只有这一个入口**：
+`npm run dev:wps` → `apps/wps-addin` 的 `debug` 脚本 → `scripts/start_wps_dev.mjs`。它不再调用
+`wpsjs debug`，原因是 wpsjs 2.2.3 的端口链路不可控：`util.js` 的 `portfinder` 从 basePort
+往上找"能 bind 的端口"，把 Windows **TCP 排除/保留端口**的 `EACCES` 也算作"不可用"而静默跳过
+（本机 3887–3986 被保留，实测 3889 → 3987）；`debug_publish.js` 再把这个结果写进 WPS 的
+`publish.xml`，并把 `package.json` 的 `scripts.dev` 改写成 `vite --port <扫出来的端口>`
+（CLI `--port` 会覆盖 `vite.config.ts`，`strictPort` 只保证"不换端口"，不保证"是哪个端口"）。
+三处端口虽然当时一致，但端口是"扫"出来的：一旦落在后端 `ALLOWED_ORIGINS` 之外，任务窗格的
+`POST` 被 403 `FORBIDDEN_ORIGIN` 打回、`GET` 也读不到响应，界面只剩 `Failed to fetch`。
+
+启动器按顺序做四件事，每件都有可见输出：
+
+1. 从 `config/capabilities.json` 的 `devServers.wpsPortCandidates`（默认 `3889、3890、3987、3988`）
+   **按声明顺序**实测 `127.0.0.1` 能否 bind，取第一个可用端口；全部不可用时打印排查命令
+   （`netsh int ipv4 show excludedportrange protocol=tcp`、`netstat -ano | findstr :<端口>`）并以
+   退出码 2 失败。**不会**换到列表外的端口，也不删保留端口、不改用管理员运行。
+2. 用该端口更新 `%APPDATA%\kingsoft\wps\jsaddons\publish.xml` 里本加载项那一条（其余插件条目
+   逐字保留），写后读回校验；地址不一致就中止，不落盘。
+3. 以 `EB_WPS_DEV_PORT=<端口>` 起 Vite（直接 spawn vite 入口，避免 `npm run` 的 cmd 外壳留下
+   占端口的孤儿进程）。`vite.config.ts` 只认这个变量并保持 `strictPort: true`：端口在检查后被抢占
+   就报错退出，不漂移；`EB_WPS_DEV_PORT` 不在候选内会直接拒绝（后端不认识它）。
+4. 打印三项自检：登记地址 vs 监听地址 vs 后端来源。后端两项实测是 `GET /health` 是否回
+   `access-control-allow-origin`、以及来源守卫探测（`POST` 到不存在的路由：被允许 → 404，
+   被拒 → 403），二者都不写账本。后端不认识该来源时提示**手动**重启 `npm run dev:server`
+   ——启动器不会停掉正在运行的后端。
+
+`devServers.excelPort`（3000）是 Excel 开发页端口，WPS 候选里出现它会在配置校验阶段直接报错：
+修 WPS 不允许占掉 Excel 的启动能力。改端口只改 `config/capabilities.json` 一处——后端
+`ALLOWED_ORIGINS` 由同一份配置派生（Excel 的四个来源在前，各候选的 `127.0.0.1`/`localhost`
+精确来源在后），`_review_layout_origin` 仍只认 Excel 那四个；**改完必须重启后端**，否则白名单还是旧的。
+登记变更后需保存文档并完全重启 WPS（功能区/登记只在重启后生效）；只刷新任务窗格不会重读登记。
+
+`npm run test:wps` 会先执行 `pretest` 的 `scripts/check_wps_dev_ports.mjs`：覆盖端口被系统保留
+（EACCES）与被真实 socket 占用、候选内不漂移（挑不到就报错）、登记地址等于监听地址、登记改写
+保留其他插件且在结构不确定时 fail-closed、`package.json` 不再被当成运行时配置、后端不再自带
+第二份端口清单。来源一侧由 `server/tests/test_dev_origins.py` 钉住：候选内每个来源都能读
+`/health` 与只读发现端点，候选外来源的 `POST` 仍 403，Excel 布局守卫仍拒绝 WPS 来源。
+
+已有 WPS 进程可能不会
 热加载新登记；保存打开的文档并完全重启 WPS 后，再验收功能区与任务窗格。不要为了
 测试强制结束含未保存文档的进程。
 功能区入口应位于独立的“Excel Bro”选项卡，而不是“开始”内的附加分组；
@@ -1420,8 +1717,9 @@ W1 的自动化与真实宿主验收记录见
 [WPS W1 授权读取验证](./WPS_W1_VALIDATION_2026-09-22.md)。读取限制统一配置在
 config/capabilities.json 的 wpsRead，调整前应记录目标版本的大表耗时。
 
-W2 开发页从 http://127.0.0.1:3889 访问本地服务；服务端只对白名单中的 3889
-localhost/127.0.0.1 来源开放 CORS。只读 Agent 的真实验收见
+W2 开发页从 `devServers.wpsPortCandidates` 里由 `npm run dev:wps` 当时选中的回环端口访问本地
+服务（启动器自检会把它打出来）；服务端只对白名单中的这些精确来源开放 CORS，白名单与启动器读
+同一份 `config/capabilities.json`。只读 Agent 的真实验收见
 [WPS W2 验证记录](./WPS_W2_VALIDATION_2026-09-22.md)。WPS 代码可以复用
 dataTools.ts 的纯计算入口，但不得调用 executeQueryTableTool 或 Excel.run。
 
@@ -2869,3 +3167,38 @@ SDK 固定值回归需模拟真实前端桥绑定/受控读取，不能直接返
 
 
 2026-10-26 S2 收尾：stop 的创建时间按 UTC ticks 比较，兼容 JSON 小数尾零正规化与 DateTime 解析；仍校验路径、完整命令和专用启动模块。脚本回归见 test_a1e3_native_stop.py；原生记录见 SDK_A1_S2_NATIVE_RECOVERY_2026-10-26.md。
+
+### 2026-10-27：账本 schema 升级与"旧库缺列"恢复
+
+**症状**：恢复包 `PUT /api/execution-recovery/{id}` 返回 500，浏览器显示 `Failed to fetch`，
+服务端原文 `sqlite3.OperationalError: no such column: recovery_package_expires_at`；随后 suspend
+200、`GET` 404。客户端表现是"这次执行的恢复材料存不下来"，重开只能看到"需要重新规划"。
+
+**根因**：`_schema_is_current` 只比 `PRAGMA user_version`。版本号被写到 10 而列没建时（旧库/
+迁移中途失败），检查此后永久跳过补列。异常又穿出路由、响应缺 CORS 头，被浏览器折成网络错误。
+
+**升级（用户侧最短操作）**：只重启服务进程，不重建账本、不删 WAL、不重发任务。
+
+```
+# 停掉当前 dev:server，然后在同一工作区：
+npm run dev:server
+```
+
+新进程第一次实例化账本时补列并把 `user_version` 写到 10；已存在的任务、`next_action_index`、
+`checkpoint`、`before_snapshot` 与已登记的首次期限全部保留。**不要**用"删库重建"或"清空恢复
+索引"来绕过 —— 那会把"这次执行做到哪一步"一起丢掉。
+
+**排查顺序**（下次再遇到同一族问题时）：先看服务端日志有没有 `OperationalError`，再看
+`/api/diagnostics` 的 schema；浏览器只报 `Failed to fetch` 时不要从网络层查起。
+
+**相关纪律**：加列必须同时改 `_schema_is_current` 的判据（读 `PRAGMA table_info`），
+迁移用守卫式 `ALTER TABLE`；schema 已是最新时不许重跑 bootstrap（会抢写锁，见
+`ARCHITECTURE.md`「版本号是意图，列是事实」）。回归见
+`test_task_ledger.py::test_migration_keeps_action_progress_and_checkpoint`、
+`test_migration_keeps_an_existing_deadline_when_only_the_version_lags` 与既有
+`test_read_is_not_serialized_behind_concurrent_write_lock`；客户端反向对照见
+`WpsAgentPanel.test.tsx` 的四条（变异脚本 `scripts/mutate_wps_recovery_clear_gate.mjs` M6–M10）。
+
+本轮没有重启用户运行中的服务、没有调用其 API、没有改用户的库文件，也没有打开真实 Excel/WPS。
+**A1-GATE 仍未通过，A2 未启动。** 证据见 `docs/SDK_WPS_RECOVERY_PACKAGE_2026-10-27.md` §21–§27
+与 `outputs/recovery-package-20261027/r4-*.log`。

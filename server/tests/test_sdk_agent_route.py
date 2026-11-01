@@ -204,3 +204,74 @@ def test_model_json_cannot_attest_literal_origin():
     assert result.planOrigin == "literal_range_edit"
     parsed = _parse_content(result.model_dump_json())
     assert parsed.planOrigin is None
+
+
+def literal_edits():
+    return [{"sheet": "Sheet1", "range": f"B{index + 2}", "value": value}
+            for index, value in enumerate([111, 222, 333])]
+
+
+@pytest.mark.parametrize("host,version", [("excel-office", "16.0"), ("wps-et", "12.0"), (None, None)])
+def test_ordered_literal_edits_preserve_three_actions_and_trusted_origin(host, version):
+    from server.app.excel_agent import _parse_content
+    request = plan_request(hostId=host, hostVersion=version, selfReportedActions=["writeValues"])
+    assert "plan_literal_edits" in [item["function"]["name"] for item in plan_compiler_definitions(request)]
+    result = compile_plan_tool(request, "plan_literal_edits", {"edits": literal_edits()})
+    assert [(a.type, a.sheet, a.range, a.values) for a in result.plan.actions] == [
+        ("writeValues", "Sheet1", f"B{index + 2}", [[value]])
+        for index, value in enumerate([111, 222, 333])]
+    assert result.planOrigin == "literal_range_edit"
+    assert [(c.range, c.expected) for c in result.plan.acceptanceCriteria if c.type == "rangeEquals"] == [
+        (f"B{index + 2}", [[value]]) for index, value in enumerate([111, 222, 333])]
+    assert _parse_content(result.model_dump_json()).planOrigin is None
+
+
+@pytest.mark.parametrize("edit,code", [
+    ({"sheet": "missing"}, "sheet_not_authorized"),
+    ({"range": "XFE1"}, "invalid_range"),
+    ({"value": "=SUM(A1:A2)"}, "formula_as_value"),
+    ({"value": [[111]]}, "validation error"),
+    ({"operation": "clearRange"}, "Extra inputs"),
+])
+def test_literal_edits_reject_whole_batch_on_invalid_member(edit, code):
+    edits = literal_edits()
+    edits[1].update(edit)
+    with pytest.raises(ValueError, match=code):
+        compile_plan_tool(plan_request(), "plan_literal_edits", {"edits": edits})
+
+
+def test_literal_edits_enforce_total_cell_and_action_limits_and_host_capabilities(monkeypatch):
+    from server.app import plan_tools
+    real_limit = plan_tools.capability_int
+    monkeypatch.setattr(plan_tools, "capability_int", lambda section, key:
+                        2 if key == "maxLiteralActions" else real_limit(section, key))
+    with pytest.raises(ValueError, match="too_many_literal_edits"):
+        compile_plan_tool(plan_request(), "plan_literal_edits", {"edits": literal_edits()})
+    monkeypatch.setattr(plan_tools, "capability_int", real_limit)
+    with pytest.raises(ValueError, match="range_too_large"):
+        compile_plan_tool(plan_request(), "plan_literal_edits", {"edits": [
+            {"sheet": "Sheet1", "range": "A1:A600", "value": 1},
+            {"sheet": "Sheet1", "range": "B1:B600", "value": 2}]})
+    with pytest.raises(ValueError):
+        compile_plan_tool(plan_request(), "plan_literal_edits", {"edits": []})
+    with pytest.raises(ValueError):
+        compile_plan_tool(plan_request(), "plan_literal_edits", {"edits": [{"sheet": "Sheet1", "range": "A1"}]})
+    restricted = plan_request(hostId="wps-et", hostVersion="12.0", selfReportedActions=["clearRange:contents"])
+    assert "plan_literal_edits" not in [item["function"]["name"] for item in plan_compiler_definitions(restricted)]
+    with pytest.raises(ValueError, match="能力范围"):
+        compile_plan_tool(restricted, "plan_literal_edits", {"edits": literal_edits()})
+
+
+def test_sdk_submits_ordered_literals_through_production_tool_handler(monkeypatch, tmp_path):
+    class LiteralSdk(_FakeSdk):
+        async def query(self, *, prompt, options):
+            self.calls.append((prompt, options))
+            receipt = await options.mcp_servers["excel_bro"]["plan_literal_edits"].handler({"edits": literal_edits()})
+            assert not receipt.get("is_error")
+            yield _FakeResult()
+    fake = LiteralSdk()
+    _install_fake(monkeypatch, tmp_path, fake)
+    monkeypatch.setattr(planner, "selected_model_config", lambda _: _connection())
+    response = asyncio.run(planner.create_plan(plan_request("按顺序分别将 B2/B3/B4 写成111/222/333，不合并动作")))
+    assert response.planOrigin == "literal_range_edit"
+    assert [a.range for a in response.plan.actions] == ["B2", "B3", "B4"]

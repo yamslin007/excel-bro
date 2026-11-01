@@ -1,3 +1,163 @@
+## 2026-11-01：澄清问卷置换普通输入框
+
+当前待答问题仅在 composer-box 呈现，消息流不再重复显示同一提问卡或作者空行；回答/取消后恢复历史记录。本地映射专用卡不受影响。
+
+两端 pending 澄清时，composer-box 变为问卷：整框选择（无单选圆圈）、直接可编辑的“其他”占位输入框、提交回答和取消任务；普通附件入口隐藏。框选与“其他”互斥，点选不提交，Enter/IME 沿用既有保护。问题标题固定，选项/字段区域限高自滚；字段表单沿用必填校验，不伪造问题总数。新澄清选项上限由 config/capabilities.json 的 clarification.maxOptions=3 控制，生成提示要求 2–3 项，TS/Python 协议同步拒绝超限，不在前端截断答案；“其他”始终保留。既有历史问题不改写。
+
+MessageUnderstandingResponse 新增 clarification 分支（contracts.ts / models.py 同步）：模型可在不获取工作簿结构的消息理解阶段提出结构化问题。原先该阶段禁止澄清选项，导致仅输出文字问句。两端 messageOnly 问题在回答时直接回到消息理解，携带原要求与回答；若后续要求工作簿上下文或恢复任务则停留于文字告知，不能把回答当作读取/写入授权。原工作簿任务的澄清、身份和执行闸不变。
+
+## 2026-11-01（B 批）：主按钮搬进右下角 / 澄清融入对话 / 当前事项选择器
+
+四项新判据进共享层，两端读同一份；仍然只改**呈现与入口**：
+
+- `composerPrimaryAction` 增 `answer` 档：有 pending 问题时"发送"发出去的是**回答**（`invoke: "answer"`），
+  没内容时禁用并说明要先选/先写；任务仍在跑时不抢暂停。
+- `clarificationComposer`：绑定身份 = `conversationId + messageId + clarificationId`；提交内容三选一
+  （字段 > 选项 > 自由输入），必填缺项给 `missing` 名单；`clarificationAllowsMultiple` 在协议没标记时恒 false（不猜）。
+- `currentActionCard`：固定区域"现在最该处理哪件"的唯一判据 —— `review > recovery > clarification > runtime`，
+  其余待办进 `others`（**用于如实说明"另有 N 项"，不用于隐藏**）。
+
+端上：发送/暂停/继续统一到输入框**右下角**一颗按钮（`ComposerPrimaryButton`，`key={kind}` 换节点 +
+`detail>1` 防双击变续跑），输入区上方只留一行**没有按钮**的状态说明（`TaskExecutionNotice`）；
+澄清的选项/多字段/预览紧贴输入框（`ClarificationComposer`），点选只选中、发送才提交，自由输入就是输入框本身；
+回车只表达"发出去"，输入法组合中的 Enter（`isComposing` / `keyCode 229`）不发送、也不顺手暂停或继续。
+WPS 的"不可中断"不再读 `writeProgress` 这行文案，改读执行器阶段 `hostStage`。
+
+## 2026-11-01：对话交互改造（限高过程框 / 结果摘要出框 / 主操作判据统一）
+
+只改**呈现与入口**，授权、来源校验、目标现场复核、执行白名单、恢复判据一行未动；无协议改动，
+无新增暂停协议。四份新判据都放在共享层，两端读同一份：
+
+- `scrollFollow`：把"贴底跟随 / 上翻保持"抽成**位置判据**（不看有没有新内容），消息流与过程框内部
+  共用；`useMessageAutoFollow` 改为转发，不再自己写阈值。
+- `processPanel`：进行中限高 **160px**、用户要求看更多 420px、结束态 320/560px；**只有 `completed`
+  自动收起**（失败/中断/取消/等待回答保持展开），且用户表过态就压过一切自动收起。
+- `processOutcome`：**改了哪里 / 验证结果 / 下一步** 全部从结构化回执派生 —— 变更对照里
+  `readback_failed`/`not_executed` 不算改动，没有验收回执就不输出"验证结果"那一行，
+  撤销/放弃是终态（不复述旧验证结论）。`processOutcomePhaseFrom` 把两端枚举折成同一套语义阶段。
+- `composerPrimaryAction`：输入区那颗主操作的六态（发送 / 打断并补充 / 暂停 / 正在暂停 / 继续 / 核对）
+  一次算清，含 `disabled`/`busy`/`reason`/`invoke`。`pausing` 的 `invoke` 必须是 `null`（连点不发
+  第二个请求）；写入回读期间不许画可点的 ■；`needsReconcile` 不许落成 `continue`。
+
+端上：过程框收起成一行"结论 · 耗时"且**不再调用 `scrollIntoView`**（改为在不处于跟随底部时按高度差
+补偿外层滚动）；结果摘要渲染在过程框**之外**（`ProcessResultSummary`），收起也看得见；
+主操作由 `ComposerPrimaryButton` 渲染（在 `composer-toolbar` 内、`type="button"`、`key={kind}` 换节点、
+忽略 `detail > 1` 的第二下），输入区上方只剩**没有按钮**的 `TaskExecutionNotice`。
+原 `TaskExecutionControls`（唯一职责就是"输入区上方那颗 ■/▶"）已删除，它带的两条真断言
+（换节点、双击第二下）**迁入** `ComposerPrimaryButton.test.tsx`，不是随组件一起丢掉。
+
+当时尚未完成、现已由 2026-11-01（B 批，见文首）完成的：澄清快捷选项搬进输入框（点选只填、发送才提交）、
+主按钮搬进 `composer-toolbar`、输入区上方"最多一张卡"的显式优先级选择器。
+细节与真机清单见 [对话交互改造](CONVERSATION_UX_REFACTOR_2026-11-01.md)。
+
+## 2026-10-31：双端历史对话最小对齐
+
+Excel/WPS 原本均有多对话、本机持久化与切换。共用删除确认组件和保留安全元数据的删除纯函数；WPS 删除不再遗漏其他会话的凭据保护标记。配置保留 Excel 20×60 与 WPS 显式 30×120，WPS 继续使用原 excel-bro.wps.chat.v1，不做降额迁移。历史不恢复执行资格、不触发自动执行或撤销，不删除任务/账本/恢复材料，不改变 SDK 转录及 U3/U2 边界。组件重挂载不证明 WPS 完整退出持久性；见 [差异与验收](CHAT_HISTORY_ALIGNMENT_2026-10-31.md)。
+
+## 2026-10-31：重开之后撤销「未完成执行」已经写入的内容（Excel）
+
+真机现场：三步公式计划在第二步回读后中断 → 核对在途动作 → 把 `来源!B5` 由 5 改成 500 → 续跑被正确
+拒绝（"来源已变化，不能沿用旧结果续跑。"）→ 重开 Excel，恢复卡仍在、两个公式仍在表里，却**没有**
+「撤销本次执行」。核实后的根因不是材料丢失：写前快照一直由 `complete_office_action(checkpoint=…)`
+落库、也随状态返回；是撤销栈**只在 `completed` 分支**重建，未完成/被阻断的分支一条都没挂。
+
+因此本轮把**两种资格**写进共享判据：续跑（`pendingExecutionResume`）依赖"身份 + 状态 + 授权 +
+在途材料 + 来源证据仍一致"；撤销（新 `executionUndoRebuild`）只依赖"已验证的写前恢复点 + 目标现场
+仍是这次执行留下的样子"，**入参里没有来源证据** —— 来源被用户改了只该挡住续跑，不该把撤销一并收走。
+判定顺序是"身份 → 处置 → 状态 → 材料 → 授权"，每个原因码只在一处返回点产生。
+
+端上：`ensureUndoSnapshot` 按 `executionId` 从账本材料把撤销能力挂回栈（同一执行只挂一次）；
+`pushUndoSnapshot` 改为**同一 executionId 覆盖**（断点重建的前缀份与续跑完成份同时留在栈里会让
+LIFO 恢复两遍、把「放弃变更」误判成"恢复未成功"）；栈改为 ref+state 同步，`ensure` 之后同一 tick
+就能撤到刚挂进去的那条。恢复卡是**唯一**可点入口（在输入区上方），消息里那条同名按钮在恢复卡
+接管同一执行时让位。撤销走既有链路（目标守卫 → `undoExecution` 的 `assertUndoPostState` → 成功后才
+`onRestored` 留痕 `undone`），目标被人改过 ⇒ 任何写入之前就拒绝，材料缺失/进度与材料不符/授权收窄/
+身份不符 ⇒ 只给原因，绝不用当前单元格反推写前值。服务端状态响应新增只读 `disposition`
+（`undoneAt` / `abandonedAt`），重开的窗格据此判"入口已被用掉"，也不再把它摆成可继续。
+
+WPS 本轮只核实、不改：它的写前材料活在宿主 `PluginStorage` 与本机恢复包（有 TTL），判据在宿主适配层
+（`prepareWpsResume` / `inspectWpsUndoRecord` / `wpsRecoveryVerdictFor`），**没有**复用
+`rebuildExecutionUndo`；"重开后撤销未完成执行"在 WPS 上没有证据，不宣称两端一致。
+证据边界：真实 App 组件 + 真实服务端契约 + 替身宿主；真机未验收。见
+[重开后撤销未完成执行](OFFICE_UNDO_AFTER_RESTART_2026-10-31.md)。
+
+## 2026-10-31：纯公式首次执行的来源证据
+
+Excel `prepareFormulaSourceEvidence` 仅处理全部为 `writeFormulas` 的首次执行计划，使用共享 `formulaSourceEvidenceRequirement` 解析依赖并检查授权，再实际读取来源表摘要，成功后才通过 `attestSourceDependency` 登记来源。读取前后绑定工作簿、授权、会话和来源模式。模型提供的来源名单不能替代实际读取；混合/固定值计划保留规划期证据，续跑仍使用原登记基线。
+
+WPS 继续使用既有 `captureWpsFormulaSourceCoverage`、恢复包与逐动作来源复核，不改宿主行为。共享探针区分身份、资格、动作数量、重复单格和矩阵形状错误；Excel 将写前取消映射为 `ReviewNotStartedError`，不冒充部分写入。产品身份与意图提示统一遵守“授权校验后执行一次，回读后审阅”，不增加执行前确认。
+
+## 2026-10-27：未完成执行的**发现入口**（索引降级为缓存 + 后端只读发现）
+
+真机现场：三步常量写入在第二步回执前中断，保存并**完整退出 WPS** 后重开同一文件，账本仍是
+`needs_reconciliation / nextActionIndex=1 / inFlightActionIndex=1`、原表仍是 111/222/-303、授权
+仍是两张表 —— **进度与现场都在，恢复入口没了**。根因的形状是"唯一入口是缓存"：浏览器
+`pending-wps-execution.v1` 是 `localStorage` 里的单条索引，完整退出即消失，而账本记录、恢复
+材料、原表现场都不参与发现。
+
+现在的分工：
+
+- **浏览器索引 = 缓存**（同一件事的快捷方式，不再是权威）；权威发现走
+  `GET /api/{wps|office}/executions/pending?workbookIdentity=…`，按**当前宿主 + 当前工作簿稳定
+  身份**精确查找（WPS `wps-path:<小写磁盘完整路径>.xlsx`，Excel `url:<归一化 url>`；两个命名空间
+  互不冒充）。禁止用文件名、活动表名、表结构、相同单元格值、"最近一条"推断归属；未保存 /
+  身份不可读 / 身份不合法时一个请求都不发。
+- **发现只恢复入口，不恢复写入资格**。认领、材料水合、身份/授权/来源/目标现场复核仍走既有
+  那一条路径（`wpsRecoveryVerdictFor` 仍是唯一判定点）；本轮没有第二份恢复判据。
+- **响应只带最小元数据**（执行身份、时间、进度三元组、三个布尔）。`ownerToken`、单元格值、
+  计划正文、恢复包正文一律不出现；准入闸按白名单拒绝多余字段，`contracts.ts` 与
+  `server/app/models.py` 同一份协议，限额读 `config/capabilities.json`，截断必须显式。
+- **多候选不自动选**：排序把"有在途动作"放最前、写前失败放最后，但一条都不自动采用；已完成
+  不进候选；另一条任务不被顺手清掉。
+- **"清除恢复提示"只写处置时间戳**（`discovery_dismissed_at`）+ 清本地缓存：不改状态、不推进
+  `revision`、不动游标、不删材料；账本之后真有新变动才会再次出现。
+- **发现全过程只读**：不 claim、不补记、不 start/finish、不写单元格；重开先出现"待核对在途
+  动作"，用户显式核对后才可能"可继续剩余动作"。
+- **不止挂载查一次**：工作簿身份观察（间隔 + 焦点 + 可见性）+ 代数闸（迟到响应不得覆盖新现场）
+  是同一件事的三个必要条件。
+
+共享判据在 `packages/core/src/pendingExecutionDiscovery.ts`，宿主身份读取留 WPS 适配层
+（`apps/wps-addin/src/wpsRecoveryDiscovery.ts`）。Excel 侧同一入口已接线并通过同一组协议用例；
+两端的面板回归分别记在各自测试文件里。**本轮是自动化证据**（真实面板 + 真实服务端 + 替身宿主），
+真实宿主完整退出后的自动发现仍未实机复核；A1-GATE 保持未通过，A2 未启动。详见
+[恢复包第五轮](SDK_WPS_RECOVERY_PACKAGE_2026-10-27.md) §28。
+
+## 2026-10-28：发现/选定不被"缓存旧键"改判
+
+真机继续暴露一个前端阻断：用户选中的是**在途待核对**那条（`…0f5bffdc`，`next=1/inFlight=1`，
+持久材料齐全且与账本逐字段一致），界面却显示另一条 `failed` 执行的「需重新规划：还有 1 个动作没写」。
+根因在 `discoverWpsRecovery` 两处：①缓存优先里 `identity === null` 也采纳浏览器索引，让同名异路径
+（`downloads\wps恢复验收.xlsx` 与 `.codex\…\wps恢复验收.xlsx`）的旧键串台；②`replan` 被当成
+「能做事」（旧判据只排除 `completed`），一条无材料的旧键就此挡住后端发现，真正的在途执行永远不出现。
+
+四条纪律（`WpsAgentPanel.tsx`）：
+
+- **身份读不到就不采纳索引**：`identity === null` 时既不猜是哪个簿、也不据此清卡；缓存路径要求
+  `identity !== null && pending.workbookIdentity === identity`；
+- **「能做事」只算 `reconcile` / `resume`**：`replan`（这条没法续跑）与 `completed`（已终态）都不
+  代表"这个工作簿没有在途执行"，不得据此提前 return；
+- **用户点选不改判**：恢复卡带 `source: "selected" | "auto"`，`selected` 的卡在后续自动发现里
+  不改判、不退回候选列表，只有"换了工作簿"才作废；
+- **点选不作废于发现代数**：`selectWpsRecoveryCandidate` 的作废判据是"工作簿身份是否变化"，不是
+  "发现代数是否 +1"——否则并发的另一次发现会把用户点击判作废（点了没反应、退回候选列表）。
+
+材料措辞：`ensureWpsRecoveryMaterial` 返回 `none`（宿主缓存与持久包**都**没有）时说「本机没有这次
+执行的恢复材料」，不再落到「找不到原执行的本机恢复记录」——后者语义是"宿主缓存里没这条记录"，会
+把"缓存没了但持久包在"误读成"材料丢了"。持久材料与后端发现经隔离实例证明本就正常，本轮未改服务端。
+
+## 2026-10-27：有序字面常量计划与恢复
+
+可信 `plan_literal_edits` 接受明确的标量 edits，逐项沿用单区域编译、授权与能力校验，
+按输入顺序保留独立 writeValues。总动作/总格数读 agentPlanTools 配置。与单区域常量
+共用 literal_range_edit 响应标记及绑定完整 id/actions 的内存封印，原始模型 JSON 不能自证。
+SDK 工具循环直接接入该编译器；计算结果仍必须走受控结果引用与来源复核。
+
+WPS 恢复来源证据 v1 要求非空来源；v2 明确表示可信纯常量、无数据来源依赖，仅支持
+writeValues。初次 v2 只能由有效内存封印产生。包与账本保留该版本，不保存模型会话。
+恢复核对原执行身份、授权、宿主版本、计划/值指纹和全部目标现场后，才能为重建的字面值
+计划重新建立内存封印；普通 JSON 往返不会恢复它。Excel 沿用既有 before-image 恢复。
+详见 [实现与验收](SDK_ORDERED_LITERAL_WRITES_2026-10-27.md)。原生完整退出验收仍未完成。
+
 ## 2026-10-26：S1 原生验收实例与任务关联
 
 验收脚本改用专用 `scripts.a1e3_native_server:create_app --factory` 包装真实应用，记录
@@ -138,7 +298,9 @@ Python 同次分析的 analysis_completed 与 pythonResult 在同一个 python.a
 
 ## 2026-10-23：发送与任务控制分离
 
-发送按钮固定为 ↑，空输入/空表单提交不恢复任务。Excel/WPS 共用 TaskExecutionControls，放在输入框上方、表单之外；■ 暂停，暂停请求处理中显示禁用的 …，暂停后 ▶ 由用户另一次点击才恢复。按钮始终 type=button，暂停/继续使用不同 React key，不复用为提交按钮；忽略双击的第二次点击。输入文字的发送与既有语义续跑仍走原意图路径。
+发送按钮固定为 ↑，空输入/空表单提交不恢复任务。Excel/WPS 共用 `ComposerPrimaryButton`，固定在输入框**右下角**，形态由共享判据 `composerPrimaryAction` 一次算出（发送 / 发送回答 / 暂停 / 继续 / 核对在途动作 / 继续剩余动作），输入框上方只留**无按钮**的状态行 `TaskExecutionNotice`。■ 暂停，暂停请求处理中显示禁用的 …，暂停后 ▶ 要由用户另一次点击才恢复；核对与「继续剩余动作」是两件事，核对只补记回执、不自动续跑。按钮始终 type=button，形态变化用不同 React key，不复用为提交按钮；忽略双击的第二次点击。输入文字时主按钮**永远是发送**（不吞字），发送与既有语义续跑仍走原意图路径。固定区域（审阅栏 / 恢复卡）由 `ComposerActionDock` 承载，一次只展开一块，其余压成可切的 chip。
+**（已被 2026-11-01 B 批取代）** 那颗按钮现在在输入框**右下角**（`ComposerPrimaryButton`），输入区上方只剩无按钮的状态行
+（`TaskExecutionNotice`）；`type=button` / 换 `key` / 忽略 `detail>1` / 空提交不恢复任务四条约定原样保留。
 
 本次覆盖旧约定“空输入点发送即可继续”。暂停后的自动核对仍只查询状态；这次调整不新增写入能力、不改变授权和预览确认边界。组件原生 click 用例验证同步渲染时不会连带 form submit 或 resume；双端面板验证空提交无动作、明确 ▶ 才恢复。真实宿主验收尚未执行。
 
@@ -849,8 +1011,9 @@ if config.adapter == "claude_agent_sdk":
 两种模型后端共用 `submit_clarification` 终结工具，返回 `kind: clarification`，
 复用 `IntentClarificationResponse`，不把追问混入普通 `answer`，也不解析助手文字猜测问题。
 `IntentClarification` 新增可选 `fields`（最多 4 个、唯一 id、label、placeholder）；
-至少有一个填写字段或至少两个选项。旧选项卡兼容不变。Excel/WPS 共用无 hooks 的
-`ClarificationFields`，各字段独立受控输入，全部非空后才可提交；用户答案按标签组合，
+至少有一个填写字段或至少两个选项。旧选项卡兼容不变。Excel/WPS 共用
+`ClarificationComposer`（字段输入已并入其中，旧的 `ClarificationFields` 组件已删除），
+各字段独立受控输入，全部非空后才可提交；用户答案按标签组合，
 连同原需求经原有授权/表头复核再规划，不直接执行。取消后不生成预览，不读额外数据。
 本地未覆盖源值仍走仅面板内存的 `LocalMappingResolution`，不借这条新出口上传源值。
 
@@ -1046,6 +1209,15 @@ WPS 的本地读取、计算及写入回调会整理为 Excel 共用的 `TaskPro
 过程消息保存在对话历史中；刷新时尚无终态的步骤显示为中断，不冒充继续运行或成功。
 消息流仅在用户靠近底部时自动跟随更新；上翻阅读时显示“查看最新进度”，不强制拉回底部。
 Excel/WPS 共用的消息自动跟随状态绑定当前对话 ID：新建或切换对话时清除上一段对话的未读进度提示并恢复跟随；内容已位于底部或不足一屏时，不显示该提示。三点提示按钮的样式保持不变。
+**"要用户点的那一下"不许住在滚动容器里**（2026-10-29）。消息流会自动跟随新增步骤，
+所以任何"当前有效操作入口"只要画在某条历史消息下面，就会被随后的日志顶出视口 ——
+真机上表现为"点了核对、看到已核对，下一步按钮却不见了"。Excel 的未完成执行恢复卡因此
+分成两份：**可点击的那一份**（`.office-recovery-panel`）住在输入区上方（与发现选择入口
+同一层，是 `.composer` 的子节点），**只读的执行记录**（`.office-recovery-record`）留在
+历史消息里。哪一条算"当前入口"由共享选择器 `selectExecutionRecoveryEntry` 唯一给出
+（取最后一条带卡的记录），因此"全页只有一个可点入口"是可断言的，而不是靠人眼看。
+修法刻意不动自动跟随：给滚动打补丁（再滚一次/定时器纠正/强制 `scrollIntoView`）会打断
+用户上翻历史，属于用症状掩盖问题。WPS 的恢复卡画在消息流末尾，天然不受影响，故不重写。
 共享滚动 Hook 的实现放在 `useMessageAutoFollowRuntime.tsx`，由原 `.ts` 入口转发；Vite 为实现生成 Fast Refresh 签名，Hook 顺序变化时不得复用不兼容的组件状态，旧窗格缓存的入口地址仍可加载。
 这只对齐了当前 WPS 本地可见过程；服务端规划流的逐事件补发仍须单独接线与验收。
 
@@ -1788,7 +1960,13 @@ PlanResponse.provider 仍只允许 model 或 local。
 ### Origin 校验
 
 - FastAPI 只监听 `127.0.0.1`。
-- CORS 只允许本地任务窗格来源。
+- CORS 只允许本地任务窗格来源，且是**精确**来源：Excel 的四个 `localhost:3000` 变体在前
+  （`_review_layout_origin` 依赖这组顺序，只认它），WPS 开发来源由
+  `config/capabilities.json` 的 `devServers.wpsPortCandidates` 派生（每个候选的
+  `127.0.0.1` 与 `localhost` 变体）。没有通配、没有"同机即放行"。
+- WPS 开发页端口只有一个来源（同一份 `devServers` 配置），启动器
+  （`scripts/start_wps_dev.mjs`）只在该候选列表内按声明顺序挑端口，因此
+  "publish.xml 登记地址 / Vite 实际监听 / 后端允许来源"天然同源；改端口改配置一处。
 - 当前工作簿模式通过 Office.js，不暴露任意文件访问。
 
 ## 扩展性
@@ -2541,3 +2719,101 @@ Excel resumeInterruptedOfficeExecutionOwned 与 WPS wpsExecutionResume 的恢复
 授权、工作簿/目标检查、白名单校验、恢复准备及回读不豁免。仍先执行一次再审阅，确认不重执行。WPS 在创建审阅快照前复核计划来源，执行器内仍保留写前检查。共享审阅控制器将 execute 调用前的拒绝归为 not_started（未执行）；已进入执行的异常保持 failed，不能因此把在途写入误报为零写入。
 
 证据和原生复验见 [S3 字面值写入修复](SDK_S3_LITERAL_WRITE_FIX_2026-10-27.md)。
+
+## 2026-10-27：完整退出宿主后的本机恢复包
+
+真实 WPS 现场：第二步写入并回读后、完成回执前中断，完整退出 WPS 重开，账本能核对第二步，
+却提示「找不到原执行的本机恢复记录」，第三步续不了。原因是 `prepareWpsResume` 只读宿主
+`PluginStorage`，完整退出后那里是空的，也没有第二个材料来源。
+
+材料因此改存**本机后端应用数据目录**：`application_data_root()/execution-recovery/<operationId>/material.dat`
+（首行元数据 + 原样字节正文；原子写：临时文件 → `fsync` → 只重试替换）。宿主的 `PluginStorage`
+与 `localStorage` 降级为缓存与发现索引，不再是跨进程恢复的唯一来源。
+
+三条分工不许互换：恢复包只存**不可变原始材料**（原计划顺序、每步目标值与写前值/公式、
+计划版本、身份、授权范围、来源证据），账本 `office_executions` 只存**可变进度**（游标、在途、
+租约、`revision`），现场核对仍由宿主三态读取完成。水合只把材料写回宿主缓存，既有
+`prepareWpsResume` / `inspectWpsRecoveryState` / `undoWpsExecution` 原样工作 —— 不另开一套
+"从包里读"的并行判据。
+
+两个窗口期分开：只有宿主缓存时按 `wpsResumeMaxAgeSeconds`（1800s）；有持久材料时按服务端
+算定的 `expiresAt`（`unfinishedRecoveryPackageRetentionDays=7`）。首次落盘时算定，重复保存同正文、
+查询、打开窗格都不延长。配额不足先清已过期的，仍不足明确拒绝，不淘汰尚未结束任务的包。
+
+写前落盘是硬闸：首次宿主写入前必须落盘并读回逐字节一致，失败即中止且零宿主写入
+（归一为 `state="restored"`，保留原始错误原因）。执行成功**不**删材料 —— 审阅、确认、放弃都还要用；
+只在终态（撤销成功、原表回到执行前）经 `DELETE /api/execution-recovery/{id}` 回收。
+
+证据、双端状态与反向变异见 [本机恢复包](SDK_WPS_RECOVERY_PACKAGE_2026-10-27.md)。
+
+### 有效期的唯一判据，与"首次期限不可续期"
+
+同一份恢复材料**只能有一个期限来源**。判据收在 `apps/wps-addin/src/wpsPlanExecutor.ts` 的
+`wpsResumeWindow(record, now)` 一处：有 `resumeExpiresAt`（持久包，服务端首次保存时算定）就只认它；
+该字段存在但**不可解析即拒绝**恢复，不悄悄退回另一种期限；没有它（旧宿主缓存）才用
+`wpsResumeMaxAgeSeconds`。到期边界三处同口径 —— 本机判据、核心协议判据
+（`executionRecoveryPackageVerdict`）与服务端 `load` 一律 `now >= expiresAt`，恰好到期那一刻算过期。
+以前"前段按持久期限、后段又无条件按 30 分钟"是两套判据并存，7 天有效期在 31 分钟处就断。
+
+`now` 有效**不等于**免检：身份、授权、来源证据、目标现场、计划指纹、在途动作、执行权 `revision`
+一项不减。
+
+服务端同理只有一次机会定期限：`execution_recovery.save()` 对同正文幂等返回、对**已过期**的同正文
+抛 `RecoveryPackageExpired`、对损坏抛 `RecoveryPackageCorrupt`（不当成"没有旧文件"去覆盖）；
+首次期限登记在账本列 `office_executions.recovery_package_expires_at`（只写一次、只存时间戳），
+`PUT /api/execution-recovery/{id}` 先读它再保存 —— 材料被过期清理删掉之后重新 PUT 也拿不到新期限。
+账本只多一个时间戳，单元格正文仍只在恢复包里，账本去值口径不变。
+
+### 版本号是意图，列是事实
+
+加列不是"改 `_SCHEMA_VERSION` 就完事"。迁移的唯一入口 `_run_schema_bootstrap` 第一句就是
+"schema 已是最新就返回"，所以**判据必须读事实、不能只读版本号**：
+
+```python
+row = connection.execute("PRAGMA user_version").fetchone()
+columns = {str(column[1]) for column in connection.execute("PRAGMA table_info(office_executions)")}
+return bool(row) and int(row[0]) >= _SCHEMA_VERSION and "recovery_package_expires_at" in columns
+```
+
+只看 `user_version` 的后果已经真实发生过：版本号被写成 10、列却没建（旧库、或迁移中途失败），
+检查此后**永久**跳过补列，每一次 `PUT /api/execution-recovery/{id}` 都在
+`reserve_recovery_package_expiry` 上撞 `no such column`。异常穿出路由、响应没有 CORS 头，
+浏览器把它折成 `Failed to fetch` —— 用户看到"网络不通"，实际是数据库少一列。
+
+迁移侧对应地用守卫式补列（不重建表、不 `INSERT ... SELECT`）：
+
+```python
+if "recovery_package_expires_at" not in office_columns:
+    connection.execute("ALTER TABLE office_executions ADD COLUMN recovery_package_expires_at TEXT")
+```
+
+两边合起来才闭合：检查认列，补列看列。反过来，"版本号旧但列已在"也只能升级版本号，
+**不许**因版本号落后就重建表 —— 那会丢 `next_action_index`、`checkpoint`、`before_snapshot`
+和已登记的首次期限。
+
+启动路径还受一条既有约束：**schema 已是最新时不许重跑 bootstrap**。`PRAGMA journal_mode = WAL`
+与 `ALTER TABLE` 都要写锁，每次实例化都重跑会让另一个进程的写事务把启动卡到 busy timeout
+（表现为 `database is locked`）。只读口（`get()`、`recovery_package_expiry()`）在别人握着
+`BEGIN IMMEDIATE` 时也必须立即返回。
+
+面板侧同一条纪律：**显示结论与点击前复核必须同源**。`wpsRecoveryVerdictFor` 是唯一计算点
+（身份 + 现场 + 本机材料），挂载、刷新、点击前复核三处共用；分开写就会出现"界面说需要重新规划、
+点下去按另一套判据说可以继续"的死按钮。
+
+### 期限必须是一个**可比较的时刻**
+
+恢复包的到期时间在磁盘上是一段文本，服务端要拿它和"现在"比较。这段文本必须自带时区：
+`datetime.fromisoformat("2035-01-01T00:00:00")` 不会报错，它给出的是 **naive** 时间，
+随后与 `datetime.now(timezone.utc)` 比较直接抛
+`TypeError: can't compare offset-naive and offset-aware datetimes`（2026-10-27 现场：只把这一个
+字段改成无时区，读回、同正文重存、保留期清理三个入口全炸，接口层退化成 503）。
+
+因此 `server/app/execution_recovery.py` 只有**一个**解析口 `_instant()`，读回、保存（含账本传入的
+首次期限）、清理三处共用：非 `str`、空、解析失败、`tzinfo`/`utcoffset()` 缺失，一律返回"无法确定"，
+按损坏处理 —— **不按本机时区猜，也不自动补 UTC**（猜错方向会让材料提前失效或永不失效）。
+内部时刻同理：`load(now=)`、`prune_expired(now=)`、`default_expiry(moment)` 传 naive 一律显式拒绝，
+避免"只修文件读取、漏掉另一个比较入口"。
+
+清理还要**逐条隔离**：一条材料读不出期限时，整批清理不能中断，也不能把它当成"已过期"删掉
+（那就没有排查依据了），更不能替它重算一个期限。计数因此分三个：`removed`（确认过期并删除）、
+`failed`（清理动作失败）、`unconfirmed`（材料在，但期限无法确定）—— 三者不许互相顶替。

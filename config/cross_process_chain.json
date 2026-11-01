@@ -6,9 +6,9 @@
   "memberSheet": "会员表",
   "orderSheet": "订单表",
   "targetSheet": "汇总表",
-  "resultRef": "res_19df37aacb6e89c2a7d885c7e047d888",
+  "resultRef": "res_6bf21305b159cdbef9beec7c8f0ac434",
   "result": {
-    "resultRef": "res_19df37aacb6e89c2a7d885c7e047d888",
+    "resultRef": "res_6bf21305b159cdbef9beec7c8f0ac434",
     "title": "Python 分析结果",
     "headers": [
       "列1",
@@ -62,7 +62,7 @@
     "scannedRows": 7
   },
   "plan": {
-    "id": "result-write-84f98ad897",
+    "id": "result-write-01aeba7ff5",
     "title": "写入 汇总表!A1:C8",
     "summary": "把本地结果「Python 分析结果」写入「汇总表」A1:C8（8 行 × 3 列）。",
     "sourceFingerprint": null,
@@ -177,6 +177,6 @@
         ]
       }
     ],
-    "localResultRef": "res_19df37aacb6e89c2a7d885c7e047d888"
+    "localResultRef": "res_6bf21305b159cdbef9beec7c8f0ac434"
   }
 }

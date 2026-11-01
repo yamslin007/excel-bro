@@ -1,10 +1,28 @@
 // @vitest-environment jsdom
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ActivityLog } from "../hooks/useActivityProgress";
 import { TaskProgressTimeline } from "./TaskProgressTimeline";
 
 afterEach(() => cleanup());
+
+it("普通聊天展开后只显示完成说明，不重复阶段和过时的准备文案", () => {
+  const log: ActivityLog = {
+    operationId: "chat", outcome: "completed", totalMs: 2100,
+    steps: [{ id: "message-intent", label: "理解消息", phase: "intent", status: "completed",
+      elapsedMs: 2100, note: "已理解并直接回复；未读取工作表",
+      detail: "先判断是否需要工作簿上下文；尚未读取字段或数据。" }]
+  };
+  const view = render(<TaskProgressTimeline log={log} />);
+  fireEvent.click(screen.getByRole("button", { name: "展开" }));
+  expect(screen.getByText("已理解并直接回复；未读取工作表")).toBeTruthy();
+  expect(screen.queryByText("理解消息")).toBeNull();
+  expect(screen.queryByText(log.steps[0].detail!)).toBeNull();
+  expect(view.container.querySelector(".activity-step-badges")).toBeNull();
+  view.rerender(<TaskProgressTimeline log={{ ...log, outcome: "failed" }} />);
+  expect(screen.getByText(log.steps[0].detail!)).toBeTruthy();
+});
 
 function sampleLog(): ActivityLog {
   return {
@@ -57,10 +75,18 @@ describe("TaskProgressTimeline", () => {
   });
 
   it("shows pause and progress-wait time separately from foreground time", () => {
-    render(<TaskProgressTimeline log={{ ...sampleLog(), totalMs: 10000, pausedMs: 2000,
-      waitingMs: 3000, outcome: "completed" }} />);
-    expect(screen.getByText("执行过程 · 1 步 · 5.0s")).toBeTruthy();
+    const log = { ...sampleLog(), totalMs: 10000, pausedMs: 2000, waitingMs: 3000, outcome: "completed" as const };
+    render(<TaskProgressTimeline log={log} />);
+    /*
+     * 正常结束后过程框收起成一行：**阶段结论 + 前台耗时**（5.0s = 10s − 2s 暂停 − 3s 等待）。
+     * 计时分账没有变，只是标题从"执行过程 · N 步 · …"换成结论。
+     */
+    expect(screen.getByText("已完成 · 5.0s")).toBeTruthy();
+    // 分账明细留在折叠区**外**：收起不该把"暂停/等待各多久"一起藏起来。
     expect(screen.getByText("暂停 2.0s · 等待进度 3.0s")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "展开" }));
+    expect(screen.getByText("执行过程 · 1 步 · 5.0s")).toBeTruthy();
   });
 
   it("keeps early continuation compact inside the original timeline", () => {
@@ -233,4 +259,111 @@ it("only describes a write preview with completed preflight evidence", () => {
     { id: "preflight-plan", label: "计划校验", elapsedMs: 10, status: "completed" }
   ] }} />);
   expect(screen.getByText("预览已生成 · 待确认写入")).toBeTruthy();
+});
+
+describe("限高与内部滚动（A 批）", () => {
+  function scrollableBody(container: HTMLElement): HTMLElement {
+    const body = container.querySelector<HTMLElement>(".task-progress-content-body");
+    expect(body).not.toBeNull();
+    return body!;
+  }
+
+  it("进行中默认 160px，靠内部滚动而不是把输入框挤出窗格", () => {
+    const { container } = render(<TaskProgressTimeline log={sampleLog()} live />);
+    const body = scrollableBody(container);
+    expect(body.style.getPropertyValue("--process-panel-max-height")).toBe("160px");
+    // 限高必须真的由 CSS 执行，不能只写在变量里没人读。
+    expect(readFileSync("src/styles.css", "utf8")).toContain(
+      "max-height: min(var(--process-panel-max-height, 560px), 46vh)"
+    );
+    expect(body.getAttribute("role")).toBe("group");
+    // 可键盘滚动：没有 tabIndex 的滚动容器键盘用户根本进不去。
+    expect(body.getAttribute("tabindex")).toBe("0");
+  });
+
+  it("用户要求看更多时才放宽到 420px，并能还原", () => {
+    const originalDescriptor = Object.getOwnPropertyDescriptor(
+      HTMLElement.prototype,
+      "scrollHeight"
+    );
+    Object.defineProperty(HTMLElement.prototype, "scrollHeight", {
+      configurable: true,
+      get() {
+        return this.classList.contains("task-progress-content-body") ? 900 : 0;
+      }
+    });
+    try {
+      const { container } = render(<TaskProgressTimeline log={sampleLog()} live />);
+      const body = scrollableBody(container);
+      fireEvent.click(screen.getByRole("button", { name: "多显示几行" }));
+      expect(body.style.getPropertyValue("--process-panel-max-height")).toBe("420px");
+      fireEvent.click(screen.getByRole("button", { name: "还原高度" }));
+      expect(body.style.getPropertyValue("--process-panel-max-height")).toBe("160px");
+    } finally {
+      if (originalDescriptor) {
+        Object.defineProperty(HTMLElement.prototype, "scrollHeight", originalDescriptor);
+      } else {
+        Reflect.deleteProperty(HTMLElement.prototype, "scrollHeight");
+      }
+    }
+  });
+
+  it("正常结束后收起成一行阶段结论 + 耗时，且不把阅读位置顶走", () => {
+    const scrollIntoView = vi.fn();
+    (Element.prototype as unknown as { scrollIntoView: () => void }).scrollIntoView = scrollIntoView;
+    try {
+      const originalDescriptor = Object.getOwnPropertyDescriptor(
+        HTMLElement.prototype,
+        "scrollHeight"
+      );
+      Object.defineProperty(HTMLElement.prototype, "scrollHeight", {
+        configurable: true,
+        get() {
+          return this.classList.contains("task-progress-content-body") ? 600 : 0;
+        }
+      });
+      try {
+        render(<TaskProgressTimeline log={{ ...sampleLog(), outcome: "completed" }} live />);
+        fireEvent.click(screen.getByRole("button", { name: "收起" }));
+        expect(screen.getByText("已完成 · 10.8s")).toBeTruthy();
+        // 关键：收起**不许**替用户决定"现在该看哪"。
+        expect(scrollIntoView).not.toHaveBeenCalled();
+      } finally {
+        if (originalDescriptor) {
+          Object.defineProperty(HTMLElement.prototype, "scrollHeight", originalDescriptor);
+        } else {
+          Reflect.deleteProperty(HTMLElement.prototype, "scrollHeight");
+        }
+      }
+    } finally {
+      Reflect.deleteProperty(Element.prototype, "scrollIntoView");
+    }
+  });
+
+  it("用户上翻内部日志后给出回到最新步骤的入口，贴底时不出现", () => {
+    const { container } = render(<TaskProgressTimeline log={sampleLog()} live />);
+    const body = scrollableBody(container);
+    Object.defineProperties(body, {
+      scrollHeight: { configurable: true, value: 900 },
+      clientHeight: { configurable: true, value: 160 }
+    });
+    body.scrollTop = 700;
+    expect(screen.queryByRole("button", { name: /最新步骤/ })).toBeNull();
+
+    body.scrollTop = 100;
+    fireEvent.scroll(body);
+    const jump = screen.getByRole("button", { name: /最新步骤/ });
+    // 还在跑 ⇒ 说"有新进展"；停下之后同一个位置说"回到底部"。
+    expect(jump.textContent).toBe("有新进展");
+
+    fireEvent.click(jump);
+    expect(body.scrollTop).toBe(900);
+    expect(screen.queryByRole("button", { name: /最新步骤/ })).toBeNull();
+  });
+
+  it("等待回答时状态栏说的是「等待你的回答」，而不是通用的等待下一步", () => {
+    render(<TaskProgressTimeline log={{ ...sampleLog(), outcome: "awaiting_input" }} awaitingAnswer />);
+    expect(screen.getByText("等待你的回答")).toBeTruthy();
+    expect(screen.queryByText("等待下一步操作")).toBeNull();
+  });
 });

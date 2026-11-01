@@ -27,7 +27,31 @@ import {
   BlankSplitLimitError,
   buildColumnMappingActions
 } from "./columnMapping";
-import type { ColumnMappingInput } from "./columnMapping";
+import type {
+  ColumnMappingAction,
+  ColumnMappingInput,
+  ColumnMappingPlanAction
+} from "./columnMapping";
+
+/**
+ * 取第一个「写值」动作的值矩阵。
+ *
+ * `ColumnMappingPlanAction` 是 `writeValues | clearRange` 的**联合**：`clearRange`
+ * 只清内容、结构里根本没有 `values`。所以"断言矩阵"这件事必须先按 `type` 收窄 ——
+ * 直接写 `actions[0].values` 会在类型层报错，而那正是它该报的：清空动作本来就没有值矩阵，
+ * 硬取就是拿一个不存在的字段做断言。
+ *
+ * 找不到写值动作时抛错而不是返回 `undefined`：调用方都在断言"这一格应该是某个值"，
+ * 拿不到动作就说明前置条件（`actions` 里至少有一段写值）已经不成立，测试应当当场炸掉。
+ */
+function writeMatrix(actions: readonly ColumnMappingPlanAction[]): string[][] {
+  const action = actions.find(
+    (candidate): candidate is ColumnMappingAction =>
+      candidate.type === "writeValues"
+  );
+  if (!action) throw new Error("预期至少有一个 writeValues 动作，实际一个都没有");
+  return action.values;
+}
 
 function build(
   sourceValues: (string | number | boolean | null)[][],
@@ -61,7 +85,7 @@ describe("旧协议兼容", () => {
   it("旧规则在客户端仍能算出与以前逐格一致的值", () => {
     const actions = build([["甲"], [null], ["乙"]], { blankLabel: "未分类" });
     expect(actions).toHaveLength(1);
-    expect(actions[0].values).toEqual([["一"], ["未分类"], ["二"]]);
+    expect(writeMatrix(actions)).toEqual([["一"], ["未分类"], ["二"]]);
   });
 });
 
@@ -71,7 +95,7 @@ describe("没读到空白就不该拦", () => {
     // 直接以「空白标签为空」拒绝，逼得调用方在读到值之前先去问用户。
     const actions = build([["甲"], ["乙"], ["甲"]]);
     expect(actions).toHaveLength(1);
-    expect(actions[0].values).toEqual([["一"], ["二"], ["一"]]);
+    expect(writeMatrix(actions)).toEqual([["一"], ["二"], ["一"]]);
   });
 
   it("显式空串映射项覆盖到的格子不算需要再决定的空白", () => {
@@ -79,7 +103,7 @@ describe("没读到空白就不该拦", () => {
     const actions = build([[""], ["甲"]], {
       mapping: { "": "空串", 甲: "一" }
     });
-    expect(actions[0].values).toEqual([["空串"], ["一"]]);
+    expect(writeMatrix(actions)).toEqual([["空串"], ["一"]]);
   });
 });
 
@@ -134,7 +158,7 @@ describe("四种意图互不冒充", () => {
       blankPolicy: { kind: "value", value: "未分类" }
     });
     expect(actions).toHaveLength(1);
-    expect(actions[0].values).toEqual([["一"], ["未分类"], ["二"]]);
+    expect(writeMatrix(actions)).toEqual([["一"], ["未分类"], ["二"]]);
   });
 
   it("value 可以是空串：那是显式写空字符串，与 clear、keep 都不同", () => {
@@ -142,7 +166,7 @@ describe("四种意图互不冒充", () => {
       blankPolicy: { kind: "value", value: "" }
     });
     expect(actions).toHaveLength(1);
-    expect(actions[0].values).toEqual([["一"], [""], ["二"]]);
+    expect(writeMatrix(actions)).toEqual([["一"], [""], ["二"]]);
   });
 
   it("连续多个空白也要合成一段，不逐格拆", () => {

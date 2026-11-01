@@ -1,0 +1,1249 @@
+{
+  "note": "共享恢复包协议样例。TS 侧 packages/core/src/executionRecoveryPackage.test.ts 与 Python 侧 server/tests/test_execution_recovery_package.py 读同一份。",
+  "sourceEvidenceCases": [
+    {"version": 1, "empty": false, "valid": true},
+    {"version": 1, "empty": true, "valid": false},
+    {"version": 2, "empty": true, "valid": true},
+    {"version": 2, "empty": false, "valid": false},
+    {"version": 3, "empty": true, "valid": false}
+  ],
+  "note_formulaActionCases": "公式动作的准入样例：两端读同一份。判定点是「目标矩阵必须按类型二选一」——公式动作只认 formulas（逐格 = 开头），值动作只认 values，任何一侧携带另一侧矩阵都拒绝，因为计算值不能顶替公式。",
+  "formulaActionCases": [
+    {
+      "name": "公式动作带公式文本可登记",
+      "valid": true,
+      "action": {
+        "actionIndex": 0,
+        "type": "writeFormulas",
+        "sheet": "目标",
+        "range": "B2:B2",
+        "rowCount": 1,
+        "columnCount": 1,
+        "cellCount": 1,
+        "previewFingerprint": "v2:1:aaaaaaaa",
+        "expectedFingerprint": "v2:1:bbbbbbbb",
+        "formulas": [["=Source!A1*2"]],
+        "beforeValues": [[10]],
+        "beforeFormulas": [["=Source!A1"]]
+      }
+    },
+    {
+      "name": "相对引用的多格公式矩阵可登记",
+      "valid": true,
+      "action": {
+        "actionIndex": 0,
+        "type": "writeFormulas",
+        "sheet": "目标",
+        "range": "C1:C2",
+        "rowCount": 2,
+        "columnCount": 1,
+        "cellCount": 2,
+        "previewFingerprint": "v2:2:aaaaaaaa",
+        "expectedFingerprint": "v2:2:bbbbbbbb",
+        "formulas": [["=A1*2"], ["=A2*2"]],
+        "beforeValues": [[1], [2]],
+        "beforeFormulas": [["=A1"], ["=A2"]]
+      }
+    },
+    {
+      "name": "公式动作缺 formulas 被拒",
+      "valid": false,
+      "action": {
+        "actionIndex": 0,
+        "type": "writeFormulas",
+        "sheet": "目标",
+        "range": "B2:B2",
+        "rowCount": 1,
+        "columnCount": 1,
+        "cellCount": 1,
+        "previewFingerprint": "v2:1:aaaaaaaa",
+        "expectedFingerprint": "v2:1:bbbbbbbb",
+        "beforeValues": [[10]],
+        "beforeFormulas": [["=Source!A1"]]
+      }
+    },
+    {
+      "name": "公式动作携带计算值矩阵被拒",
+      "valid": false,
+      "action": {
+        "actionIndex": 0,
+        "type": "writeFormulas",
+        "sheet": "目标",
+        "range": "B2:B2",
+        "rowCount": 1,
+        "columnCount": 1,
+        "cellCount": 1,
+        "previewFingerprint": "v2:1:aaaaaaaa",
+        "expectedFingerprint": "v2:1:bbbbbbbb",
+        "values": [[20]],
+        "formulas": [["=Source!A1*2"]],
+        "beforeValues": [[10]],
+        "beforeFormulas": [["=Source!A1"]]
+      }
+    },
+    {
+      "name": "公式文本退化成常量被拒",
+      "valid": false,
+      "action": {
+        "actionIndex": 0,
+        "type": "writeFormulas",
+        "sheet": "目标",
+        "range": "B2:B2",
+        "rowCount": 1,
+        "columnCount": 1,
+        "cellCount": 1,
+        "previewFingerprint": "v2:1:aaaaaaaa",
+        "expectedFingerprint": "v2:1:bbbbbbbb",
+        "formulas": [["20"]],
+        "beforeValues": [[10]],
+        "beforeFormulas": [["=Source!A1"]]
+      }
+    },
+    {
+      "name": "值动作携带公式矩阵被拒",
+      "valid": false,
+      "action": {
+        "actionIndex": 0,
+        "type": "writeValues",
+        "sheet": "目标",
+        "range": "B2:B2",
+        "rowCount": 1,
+        "columnCount": 1,
+        "cellCount": 1,
+        "previewFingerprint": "v2:1:aaaaaaaa",
+        "expectedFingerprint": "v2:1:bbbbbbbb",
+        "values": [[20]],
+        "formulas": [["=Source!A1*2"]],
+        "beforeValues": [[10]],
+        "beforeFormulas": [["=Source!A1"]]
+      }
+    }
+  ],
+  "valid": [
+    {
+      "schemaVersion": 1,
+      "host": "wps",
+      "operationId": "wps-execution-0001",
+      "taskId": "task-1",
+      "workbookIdentity": "wps-path:c://data//test.xlsx",
+      "authorizedSheetNames": [
+        "来源",
+        "目标"
+      ],
+      "planId": "plan-resume",
+      "planTitle": "更新",
+      "planFingerprint": "plan:v1:2:1a143c14",
+      "hostVersion": "12.0",
+      "createdAt": "2026-10-20T00:00:00.000Z",
+      "actions": [
+        {
+          "actionIndex": 0,
+          "type": "writeValues",
+          "sheet": "目标",
+          "range": "A1:A1",
+          "rowCount": 1,
+          "columnCount": 1,
+          "cellCount": 1,
+          "previewFingerprint": "v2:1:aaaaaaaa",
+          "expectedFingerprint": "v2:1:bbbbbbbb",
+          "values": [
+            [
+              1
+            ]
+          ],
+          "beforeValues": [
+            [
+              "old1"
+            ]
+          ],
+          "beforeFormulas": [
+            [
+              "old1"
+            ]
+          ]
+        },
+        {
+          "actionIndex": 1,
+          "type": "writeValues",
+          "sheet": "目标",
+          "range": "A2:A2",
+          "rowCount": 1,
+          "columnCount": 1,
+          "cellCount": 1,
+          "previewFingerprint": "v2:1:cccccccc",
+          "expectedFingerprint": "v2:1:dddddddd",
+          "values": [
+            [
+              2
+            ]
+          ],
+          "beforeValues": [
+            [
+              "old2"
+            ]
+          ],
+          "beforeFormulas": [
+            [
+              "old2"
+            ]
+          ]
+        }
+      ],
+      "sourceEvidence": {
+        "version": 1,
+        "hostVersion": "12.0",
+        "sources": [
+          {
+            "sheetName": "来源",
+            "range": "A1:A1",
+            "rowCount": 1,
+            "columnCount": 1,
+            "previewFingerprint": "v2:1:eeeeeeee",
+            "valueFingerprint": "v2:1:ffffffff"
+          }
+        ]
+      }
+    }
+  ],
+  "invalid": [
+    {
+      "name": "unknown top-level field",
+      "value": {
+        "schemaVersion": 1,
+        "host": "wps",
+        "operationId": "wps-execution-0001",
+        "taskId": "task-1",
+        "workbookIdentity": "wps-path:c://data//test.xlsx",
+        "authorizedSheetNames": [
+          "来源",
+          "目标"
+        ],
+        "planId": "plan-resume",
+        "planTitle": "更新",
+        "planFingerprint": "plan:v1:2:1a143c14",
+        "hostVersion": "12.0",
+        "createdAt": "2026-10-20T00:00:00.000Z",
+        "actions": [
+          {
+            "actionIndex": 0,
+            "type": "writeValues",
+            "sheet": "目标",
+            "range": "A1:A1",
+            "rowCount": 1,
+            "columnCount": 1,
+            "cellCount": 1,
+            "previewFingerprint": "v2:1:aaaaaaaa",
+            "expectedFingerprint": "v2:1:bbbbbbbb",
+            "values": [
+              [
+                1
+              ]
+            ],
+            "beforeValues": [
+              [
+                "old1"
+              ]
+            ],
+            "beforeFormulas": [
+              [
+                "old1"
+              ]
+            ]
+          },
+          {
+            "actionIndex": 1,
+            "type": "writeValues",
+            "sheet": "目标",
+            "range": "A2:A2",
+            "rowCount": 1,
+            "columnCount": 1,
+            "cellCount": 1,
+            "previewFingerprint": "v2:1:cccccccc",
+            "expectedFingerprint": "v2:1:dddddddd",
+            "values": [
+              [
+                2
+              ]
+            ],
+            "beforeValues": [
+              [
+                "old2"
+              ]
+            ],
+            "beforeFormulas": [
+              [
+                "old2"
+              ]
+            ]
+          }
+        ],
+        "sourceEvidence": {
+          "version": 1,
+          "hostVersion": "12.0",
+          "sources": [
+            {
+              "sheetName": "来源",
+              "range": "A1:A1",
+              "rowCount": 1,
+              "columnCount": 1,
+              "previewFingerprint": "v2:1:eeeeeeee",
+              "valueFingerprint": "v2:1:ffffffff"
+            }
+          ]
+        },
+        "plan": {
+          "actions": []
+        }
+      }
+    },
+    {
+      "name": "unsupported schema version",
+      "value": {
+        "schemaVersion": 2,
+        "host": "wps",
+        "operationId": "wps-execution-0001",
+        "taskId": "task-1",
+        "workbookIdentity": "wps-path:c://data//test.xlsx",
+        "authorizedSheetNames": [
+          "来源",
+          "目标"
+        ],
+        "planId": "plan-resume",
+        "planTitle": "更新",
+        "planFingerprint": "plan:v1:2:1a143c14",
+        "hostVersion": "12.0",
+        "createdAt": "2026-10-20T00:00:00.000Z",
+        "actions": [
+          {
+            "actionIndex": 0,
+            "type": "writeValues",
+            "sheet": "目标",
+            "range": "A1:A1",
+            "rowCount": 1,
+            "columnCount": 1,
+            "cellCount": 1,
+            "previewFingerprint": "v2:1:aaaaaaaa",
+            "expectedFingerprint": "v2:1:bbbbbbbb",
+            "values": [
+              [
+                1
+              ]
+            ],
+            "beforeValues": [
+              [
+                "old1"
+              ]
+            ],
+            "beforeFormulas": [
+              [
+                "old1"
+              ]
+            ]
+          },
+          {
+            "actionIndex": 1,
+            "type": "writeValues",
+            "sheet": "目标",
+            "range": "A2:A2",
+            "rowCount": 1,
+            "columnCount": 1,
+            "cellCount": 1,
+            "previewFingerprint": "v2:1:cccccccc",
+            "expectedFingerprint": "v2:1:dddddddd",
+            "values": [
+              [
+                2
+              ]
+            ],
+            "beforeValues": [
+              [
+                "old2"
+              ]
+            ],
+            "beforeFormulas": [
+              [
+                "old2"
+              ]
+            ]
+          }
+        ],
+        "sourceEvidence": {
+          "version": 1,
+          "hostVersion": "12.0",
+          "sources": [
+            {
+              "sheetName": "来源",
+              "range": "A1:A1",
+              "rowCount": 1,
+              "columnCount": 1,
+              "previewFingerprint": "v2:1:eeeeeeee",
+              "valueFingerprint": "v2:1:ffffffff"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "non-wps host",
+      "value": {
+        "schemaVersion": 1,
+        "host": "office",
+        "operationId": "wps-execution-0001",
+        "taskId": "task-1",
+        "workbookIdentity": "wps-path:c://data//test.xlsx",
+        "authorizedSheetNames": [
+          "来源",
+          "目标"
+        ],
+        "planId": "plan-resume",
+        "planTitle": "更新",
+        "planFingerprint": "plan:v1:2:1a143c14",
+        "hostVersion": "12.0",
+        "createdAt": "2026-10-20T00:00:00.000Z",
+        "actions": [
+          {
+            "actionIndex": 0,
+            "type": "writeValues",
+            "sheet": "目标",
+            "range": "A1:A1",
+            "rowCount": 1,
+            "columnCount": 1,
+            "cellCount": 1,
+            "previewFingerprint": "v2:1:aaaaaaaa",
+            "expectedFingerprint": "v2:1:bbbbbbbb",
+            "values": [
+              [
+                1
+              ]
+            ],
+            "beforeValues": [
+              [
+                "old1"
+              ]
+            ],
+            "beforeFormulas": [
+              [
+                "old1"
+              ]
+            ]
+          },
+          {
+            "actionIndex": 1,
+            "type": "writeValues",
+            "sheet": "目标",
+            "range": "A2:A2",
+            "rowCount": 1,
+            "columnCount": 1,
+            "cellCount": 1,
+            "previewFingerprint": "v2:1:cccccccc",
+            "expectedFingerprint": "v2:1:dddddddd",
+            "values": [
+              [
+                2
+              ]
+            ],
+            "beforeValues": [
+              [
+                "old2"
+              ]
+            ],
+            "beforeFormulas": [
+              [
+                "old2"
+              ]
+            ]
+          }
+        ],
+        "sourceEvidence": {
+          "version": 1,
+          "hostVersion": "12.0",
+          "sources": [
+            {
+              "sheetName": "来源",
+              "range": "A1:A1",
+              "rowCount": 1,
+              "columnCount": 1,
+              "previewFingerprint": "v2:1:eeeeeeee",
+              "valueFingerprint": "v2:1:ffffffff"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "matrix shape mismatch",
+      "value": {
+        "schemaVersion": 1,
+        "host": "wps",
+        "operationId": "wps-execution-0001",
+        "taskId": "task-1",
+        "workbookIdentity": "wps-path:c://data//test.xlsx",
+        "authorizedSheetNames": [
+          "来源",
+          "目标"
+        ],
+        "planId": "plan-resume",
+        "planTitle": "更新",
+        "planFingerprint": "plan:v1:2:1a143c14",
+        "hostVersion": "12.0",
+        "createdAt": "2026-10-20T00:00:00.000Z",
+        "actions": [
+          {
+            "actionIndex": 0,
+            "type": "writeValues",
+            "sheet": "目标",
+            "range": "A1:A1",
+            "rowCount": 1,
+            "columnCount": 1,
+            "cellCount": 1,
+            "previewFingerprint": "v2:1:aaaaaaaa",
+            "expectedFingerprint": "v2:1:bbbbbbbb",
+            "values": [
+              [
+                1,
+                2
+              ]
+            ],
+            "beforeValues": [
+              [
+                "old1"
+              ]
+            ],
+            "beforeFormulas": [
+              [
+                "old1"
+              ]
+            ]
+          },
+          {
+            "actionIndex": 1,
+            "type": "writeValues",
+            "sheet": "目标",
+            "range": "A2:A2",
+            "rowCount": 1,
+            "columnCount": 1,
+            "cellCount": 1,
+            "previewFingerprint": "v2:1:cccccccc",
+            "expectedFingerprint": "v2:1:dddddddd",
+            "values": [
+              [
+                2
+              ]
+            ],
+            "beforeValues": [
+              [
+                "old2"
+              ]
+            ],
+            "beforeFormulas": [
+              [
+                "old2"
+              ]
+            ]
+          }
+        ],
+        "sourceEvidence": {
+          "version": 1,
+          "hostVersion": "12.0",
+          "sources": [
+            {
+              "sheetName": "来源",
+              "range": "A1:A1",
+              "rowCount": 1,
+              "columnCount": 1,
+              "previewFingerprint": "v2:1:eeeeeeee",
+              "valueFingerprint": "v2:1:ffffffff"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "plan fingerprint no longer matches actions",
+      "value": {
+        "schemaVersion": 1,
+        "host": "wps",
+        "operationId": "wps-execution-0001",
+        "taskId": "task-1",
+        "workbookIdentity": "wps-path:c://data//test.xlsx",
+        "authorizedSheetNames": [
+          "来源",
+          "目标"
+        ],
+        "planId": "plan-resume",
+        "planTitle": "更新",
+        "planFingerprint": "plan:v1:2:1a143c14",
+        "hostVersion": "12.0",
+        "createdAt": "2026-10-20T00:00:00.000Z",
+        "actions": [
+          {
+            "actionIndex": 0,
+            "type": "writeValues",
+            "sheet": "目标",
+            "range": "A1:A1",
+            "rowCount": 1,
+            "columnCount": 1,
+            "cellCount": 1,
+            "previewFingerprint": "v2:1:aaaaaaaa",
+            "expectedFingerprint": "v2:1:bbbbbbbb",
+            "values": [
+              [
+                1
+              ]
+            ],
+            "beforeValues": [
+              [
+                "old1"
+              ]
+            ],
+            "beforeFormulas": [
+              [
+                "old1"
+              ]
+            ]
+          },
+          {
+            "actionIndex": 1,
+            "type": "writeValues",
+            "sheet": "目标",
+            "range": "A2:A2",
+            "rowCount": 1,
+            "columnCount": 1,
+            "cellCount": 1,
+            "previewFingerprint": "v2:1:99999999",
+            "expectedFingerprint": "v2:1:dddddddd",
+            "values": [
+              [
+                99
+              ]
+            ],
+            "beforeValues": [
+              [
+                "old2"
+              ]
+            ],
+            "beforeFormulas": [
+              [
+                "old2"
+              ]
+            ]
+          }
+        ],
+        "sourceEvidence": {
+          "version": 1,
+          "hostVersion": "12.0",
+          "sources": [
+            {
+              "sheetName": "来源",
+              "range": "A1:A1",
+              "rowCount": 1,
+              "columnCount": 1,
+              "previewFingerprint": "v2:1:eeeeeeee",
+              "valueFingerprint": "v2:1:ffffffff"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "action sheet outside authorization",
+      "value": {
+        "schemaVersion": 1,
+        "host": "wps",
+        "operationId": "wps-execution-0001",
+        "taskId": "task-1",
+        "workbookIdentity": "wps-path:c://data//test.xlsx",
+        "authorizedSheetNames": [
+          "来源",
+          "目标"
+        ],
+        "planId": "plan-resume",
+        "planTitle": "更新",
+        "planFingerprint": "plan:v1:2:1a143c14",
+        "hostVersion": "12.0",
+        "createdAt": "2026-10-20T00:00:00.000Z",
+        "actions": [
+          {
+            "actionIndex": 0,
+            "type": "writeValues",
+            "sheet": "别的表",
+            "range": "A1:A1",
+            "rowCount": 1,
+            "columnCount": 1,
+            "cellCount": 1,
+            "previewFingerprint": "v2:1:aaaaaaaa",
+            "expectedFingerprint": "v2:1:bbbbbbbb",
+            "values": [
+              [
+                1
+              ]
+            ],
+            "beforeValues": [
+              [
+                "old1"
+              ]
+            ],
+            "beforeFormulas": [
+              [
+                "old1"
+              ]
+            ]
+          },
+          {
+            "actionIndex": 1,
+            "type": "writeValues",
+            "sheet": "目标",
+            "range": "A2:A2",
+            "rowCount": 1,
+            "columnCount": 1,
+            "cellCount": 1,
+            "previewFingerprint": "v2:1:cccccccc",
+            "expectedFingerprint": "v2:1:dddddddd",
+            "values": [
+              [
+                2
+              ]
+            ],
+            "beforeValues": [
+              [
+                "old2"
+              ]
+            ],
+            "beforeFormulas": [
+              [
+                "old2"
+              ]
+            ]
+          }
+        ],
+        "sourceEvidence": {
+          "version": 1,
+          "hostVersion": "12.0",
+          "sources": [
+            {
+              "sheetName": "来源",
+              "range": "A1:A1",
+              "rowCount": 1,
+              "columnCount": 1,
+              "previewFingerprint": "v2:1:eeeeeeee",
+              "valueFingerprint": "v2:1:ffffffff"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "unknown key inside action",
+      "value": {
+        "schemaVersion": 1,
+        "host": "wps",
+        "operationId": "wps-execution-0001",
+        "taskId": "task-1",
+        "workbookIdentity": "wps-path:c://data//test.xlsx",
+        "authorizedSheetNames": [
+          "来源",
+          "目标"
+        ],
+        "planId": "plan-resume",
+        "planTitle": "更新",
+        "planFingerprint": "plan:v1:2:1a143c14",
+        "hostVersion": "12.0",
+        "createdAt": "2026-10-20T00:00:00.000Z",
+        "actions": [
+          {
+            "actionIndex": 0,
+            "type": "writeValues",
+            "sheet": "目标",
+            "range": "A1:A1",
+            "rowCount": 1,
+            "columnCount": 1,
+            "cellCount": 1,
+            "previewFingerprint": "v2:1:aaaaaaaa",
+            "expectedFingerprint": "v2:1:bbbbbbbb",
+            "values": [
+              [
+                1
+              ]
+            ],
+            "beforeValues": [
+              [
+                "old1"
+              ]
+            ],
+            "beforeFormulas": [
+              [
+                "old1"
+              ]
+            ],
+            "formulas": [
+              [
+                1
+              ]
+            ]
+          },
+          {
+            "actionIndex": 1,
+            "type": "writeValues",
+            "sheet": "目标",
+            "range": "A2:A2",
+            "rowCount": 1,
+            "columnCount": 1,
+            "cellCount": 1,
+            "previewFingerprint": "v2:1:cccccccc",
+            "expectedFingerprint": "v2:1:dddddddd",
+            "values": [
+              [
+                2
+              ]
+            ],
+            "beforeValues": [
+              [
+                "old2"
+              ]
+            ],
+            "beforeFormulas": [
+              [
+                "old2"
+              ]
+            ]
+          }
+        ],
+        "sourceEvidence": {
+          "version": 1,
+          "hostVersion": "12.0",
+          "sources": [
+            {
+              "sheetName": "来源",
+              "range": "A1:A1",
+              "rowCount": 1,
+              "columnCount": 1,
+              "previewFingerprint": "v2:1:eeeeeeee",
+              "valueFingerprint": "v2:1:ffffffff"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "source overlaps target",
+      "value": {
+        "schemaVersion": 1,
+        "host": "wps",
+        "operationId": "wps-execution-0001",
+        "taskId": "task-1",
+        "workbookIdentity": "wps-path:c://data//test.xlsx",
+        "authorizedSheetNames": [
+          "来源",
+          "目标"
+        ],
+        "planId": "plan-resume",
+        "planTitle": "更新",
+        "planFingerprint": "plan:v1:2:1a718002",
+        "hostVersion": "12.0",
+        "createdAt": "2026-10-20T00:00:00.000Z",
+        "actions": [
+          {
+            "actionIndex": 0,
+            "type": "writeValues",
+            "sheet": "来源",
+            "range": "A1:A1",
+            "rowCount": 1,
+            "columnCount": 1,
+            "cellCount": 1,
+            "previewFingerprint": "v2:1:aaaaaaaa",
+            "expectedFingerprint": "v2:1:bbbbbbbb",
+            "values": [
+              [
+                1
+              ]
+            ],
+            "beforeValues": [
+              [
+                "old1"
+              ]
+            ],
+            "beforeFormulas": [
+              [
+                "old1"
+              ]
+            ]
+          },
+          {
+            "actionIndex": 1,
+            "type": "writeValues",
+            "sheet": "目标",
+            "range": "A2:A2",
+            "rowCount": 1,
+            "columnCount": 1,
+            "cellCount": 1,
+            "previewFingerprint": "v2:1:cccccccc",
+            "expectedFingerprint": "v2:1:dddddddd",
+            "values": [
+              [
+                2
+              ]
+            ],
+            "beforeValues": [
+              [
+                "old2"
+              ]
+            ],
+            "beforeFormulas": [
+              [
+                "old2"
+              ]
+            ]
+          }
+        ],
+        "sourceEvidence": {
+          "version": 1,
+          "hostVersion": "12.0",
+          "sources": [
+            {
+              "sheetName": "来源",
+              "range": "A1:A1",
+              "rowCount": 1,
+              "columnCount": 1,
+              "previewFingerprint": "v2:1:eeeeeeee",
+              "valueFingerprint": "v2:1:ffffffff"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "unsupported action type",
+      "value": {
+        "schemaVersion": 1,
+        "host": "wps",
+        "operationId": "wps-execution-0001",
+        "taskId": "task-1",
+        "workbookIdentity": "wps-path:c://data//test.xlsx",
+        "authorizedSheetNames": [
+          "来源",
+          "目标"
+        ],
+        "planId": "plan-resume",
+        "planTitle": "更新",
+        "planFingerprint": "plan:v1:2:efc3c52c",
+        "hostVersion": "12.0",
+        "createdAt": "2026-10-20T00:00:00.000Z",
+        "actions": [
+          {
+            "actionIndex": 0,
+            "type": "setFont",
+            "sheet": "目标",
+            "range": "A1:A1",
+            "rowCount": 1,
+            "columnCount": 1,
+            "cellCount": 1,
+            "previewFingerprint": "v2:1:aaaaaaaa",
+            "expectedFingerprint": "v2:1:bbbbbbbb",
+            "values": [
+              [
+                1
+              ]
+            ],
+            "beforeValues": [
+              [
+                "old1"
+              ]
+            ],
+            "beforeFormulas": [
+              [
+                "old1"
+              ]
+            ]
+          },
+          {
+            "actionIndex": 1,
+            "type": "writeValues",
+            "sheet": "目标",
+            "range": "A2:A2",
+            "rowCount": 1,
+            "columnCount": 1,
+            "cellCount": 1,
+            "previewFingerprint": "v2:1:cccccccc",
+            "expectedFingerprint": "v2:1:dddddddd",
+            "values": [
+              [
+                2
+              ]
+            ],
+            "beforeValues": [
+              [
+                "old2"
+              ]
+            ],
+            "beforeFormulas": [
+              [
+                "old2"
+              ]
+            ]
+          }
+        ],
+        "sourceEvidence": {
+          "version": 1,
+          "hostVersion": "12.0",
+          "sources": [
+            {
+              "sheetName": "来源",
+              "range": "A1:A1",
+              "rowCount": 1,
+              "columnCount": 1,
+              "previewFingerprint": "v2:1:eeeeeeee",
+              "valueFingerprint": "v2:1:ffffffff"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "fingerprint namespace drift",
+      "value": {
+        "schemaVersion": 1,
+        "host": "wps",
+        "operationId": "wps-execution-0001",
+        "taskId": "task-1",
+        "workbookIdentity": "wps-path:c://data//test.xlsx",
+        "authorizedSheetNames": [
+          "来源",
+          "目标"
+        ],
+        "planId": "plan-resume",
+        "planTitle": "更新",
+        "planFingerprint": "plan:v1:2:1a143c14",
+        "hostVersion": "12.0",
+        "createdAt": "2026-10-20T00:00:00.000Z",
+        "actions": [
+          {
+            "actionIndex": 0,
+            "type": "writeValues",
+            "sheet": "目标",
+            "range": "A1:A1",
+            "rowCount": 1,
+            "columnCount": 1,
+            "cellCount": 1,
+            "previewFingerprint": "sha256:abc",
+            "expectedFingerprint": "v2:1:bbbbbbbb",
+            "values": [
+              [
+                1
+              ]
+            ],
+            "beforeValues": [
+              [
+                "old1"
+              ]
+            ],
+            "beforeFormulas": [
+              [
+                "old1"
+              ]
+            ]
+          },
+          {
+            "actionIndex": 1,
+            "type": "writeValues",
+            "sheet": "目标",
+            "range": "A2:A2",
+            "rowCount": 1,
+            "columnCount": 1,
+            "cellCount": 1,
+            "previewFingerprint": "v2:1:cccccccc",
+            "expectedFingerprint": "v2:1:dddddddd",
+            "values": [
+              [
+                2
+              ]
+            ],
+            "beforeValues": [
+              [
+                "old2"
+              ]
+            ],
+            "beforeFormulas": [
+              [
+                "old2"
+              ]
+            ]
+          }
+        ],
+        "sourceEvidence": {
+          "version": 1,
+          "hostVersion": "12.0",
+          "sources": [
+            {
+              "sheetName": "来源",
+              "range": "A1:A1",
+              "rowCount": 1,
+              "columnCount": 1,
+              "previewFingerprint": "v2:1:eeeeeeee",
+              "valueFingerprint": "v2:1:ffffffff"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "missing source evidence",
+      "value": {
+        "schemaVersion": 1,
+        "host": "wps",
+        "operationId": "wps-execution-0001",
+        "taskId": "task-1",
+        "workbookIdentity": "wps-path:c://data//test.xlsx",
+        "authorizedSheetNames": [
+          "来源",
+          "目标"
+        ],
+        "planId": "plan-resume",
+        "planTitle": "更新",
+        "planFingerprint": "plan:v1:2:1a143c14",
+        "hostVersion": "12.0",
+        "createdAt": "2026-10-20T00:00:00.000Z",
+        "actions": [
+          {
+            "actionIndex": 0,
+            "type": "writeValues",
+            "sheet": "目标",
+            "range": "A1:A1",
+            "rowCount": 1,
+            "columnCount": 1,
+            "cellCount": 1,
+            "previewFingerprint": "v2:1:aaaaaaaa",
+            "expectedFingerprint": "v2:1:bbbbbbbb",
+            "values": [
+              [
+                1
+              ]
+            ],
+            "beforeValues": [
+              [
+                "old1"
+              ]
+            ],
+            "beforeFormulas": [
+              [
+                "old1"
+              ]
+            ]
+          },
+          {
+            "actionIndex": 1,
+            "type": "writeValues",
+            "sheet": "目标",
+            "range": "A2:A2",
+            "rowCount": 1,
+            "columnCount": 1,
+            "cellCount": 1,
+            "previewFingerprint": "v2:1:cccccccc",
+            "expectedFingerprint": "v2:1:dddddddd",
+            "values": [
+              [
+                2
+              ]
+            ],
+            "beforeValues": [
+              [
+                "old2"
+              ]
+            ],
+            "beforeFormulas": [
+              [
+                "old2"
+              ]
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "identity not a wps path",
+      "value": {
+        "schemaVersion": 1,
+        "host": "wps",
+        "operationId": "wps-execution-0001",
+        "taskId": "task-1",
+        "workbookIdentity": "test.xlsx",
+        "authorizedSheetNames": [
+          "来源",
+          "目标"
+        ],
+        "planId": "plan-resume",
+        "planTitle": "更新",
+        "planFingerprint": "plan:v1:2:1a143c14",
+        "hostVersion": "12.0",
+        "createdAt": "2026-10-20T00:00:00.000Z",
+        "actions": [
+          {
+            "actionIndex": 0,
+            "type": "writeValues",
+            "sheet": "目标",
+            "range": "A1:A1",
+            "rowCount": 1,
+            "columnCount": 1,
+            "cellCount": 1,
+            "previewFingerprint": "v2:1:aaaaaaaa",
+            "expectedFingerprint": "v2:1:bbbbbbbb",
+            "values": [
+              [
+                1
+              ]
+            ],
+            "beforeValues": [
+              [
+                "old1"
+              ]
+            ],
+            "beforeFormulas": [
+              [
+                "old1"
+              ]
+            ]
+          },
+          {
+            "actionIndex": 1,
+            "type": "writeValues",
+            "sheet": "目标",
+            "range": "A2:A2",
+            "rowCount": 1,
+            "columnCount": 1,
+            "cellCount": 1,
+            "previewFingerprint": "v2:1:cccccccc",
+            "expectedFingerprint": "v2:1:dddddddd",
+            "values": [
+              [
+                2
+              ]
+            ],
+            "beforeValues": [
+              [
+                "old2"
+              ]
+            ],
+            "beforeFormulas": [
+              [
+                "old2"
+              ]
+            ]
+          }
+        ],
+        "sourceEvidence": {
+          "version": 1,
+          "hostVersion": "12.0",
+          "sources": [
+            {
+              "sheetName": "来源",
+              "range": "A1:A1",
+              "rowCount": 1,
+              "columnCount": 1,
+              "previewFingerprint": "v2:1:eeeeeeee",
+              "valueFingerprint": "v2:1:ffffffff"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

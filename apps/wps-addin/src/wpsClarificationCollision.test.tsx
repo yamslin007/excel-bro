@@ -34,7 +34,8 @@ vi.mock("../../excel-addin/src/hooks/useAuthorizedTarget", () => ({
 
 vi.mock("../../excel-addin/src/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../excel-addin/src/api")>();
-  return { ...actual, understandMessage: vi.fn(async () => ({ kind: "needs_workbook_context", summary: "需要字段结构", provider: "model" })), listModels: vi.fn(), getModelSettings: vi.fn(), validatePlan: vi.fn() };
+  const discovery = await import("./wpsPendingDiscovery.testHost");
+  return { ...actual, ...discovery.pendingDiscoveryApiStubs(), understandMessage: vi.fn(async () => ({ kind: "needs_workbook_context", summary: "需要字段结构", provider: "model" })), listModels: vi.fn(), getModelSettings: vi.fn(), validatePlan: vi.fn() };
 });
 vi.mock("./wpsReadonlyAgent", () => ({ runWpsReadonlyTurn: vi.fn() }));
 vi.mock("./wpsHost", async (importOriginal) => {
@@ -104,6 +105,23 @@ async function click(target: HTMLElement | null) {
   await act_(() => {
     target.dispatchEvent(new MouseEvent("click", { bubbles: true }));
   });
+}
+
+
+/**
+ * 选中第 index 个快捷答案并**提交**。
+ *
+ * 新交互下点选项只选中（想改口径还有机会），提交是右下角那颗「发送回答」。
+ * 旧用例写的是"点一下就等于作答"，语义等价于这里的两次点击。
+ */
+async function selectOption(container: HTMLElement, index: number) {
+  const options = Array.from(container.querySelectorAll<HTMLButtonElement>(".clarification-options button"));
+  const option = options[index];
+  if (!option) throw new Error(`没有第 ${index} 个快捷答案`);
+  await click(option);
+  const submitButton = container.querySelector<HTMLButtonElement>('button[aria-label="发送回答"]');
+  if (!submitButton) throw new Error("没有找到「发送回答」按钮");
+  await click(submitButton);
 }
 
 async function type(target: HTMLTextAreaElement | null, value: string) {
@@ -318,7 +336,7 @@ async function pendingClarification() {
   const composer = container.querySelector<HTMLTextAreaElement>(".composer textarea");
   await type(composer, "帮我处理表格");
   await submit(composer);
-  await until(() => Boolean(container.querySelector(".clarification-card")), "应显示澄清卡");
+  await until(() => Boolean(container.querySelector(".clarification-card, .composer-box .clarification-composer")), "应显示澄清卡");
   await until(() => runTurnMock.mock.calls.length === 1, "应完成这一轮");
   return container;
 }
@@ -364,7 +382,7 @@ describe("授权身份的碰撞边界与重生路径", () => {
       (host.application as { ActiveWorkbook: { FullName: string } }).ActiveWorkbook.FullName
     ).toBe("E:\\乙公司\\销售.xlsx");
 
-    await click(clarificationOptions(container)[0]);
+    await selectOption(container, 0);
     /**
      * 指纹与表头判据**都**看不出差别（名字一样、表头一样），
      * 只有内存里的对象身份能 —— 这正是此前记录为"能力限制"的那一类，现已关闭。
@@ -391,7 +409,7 @@ describe("授权身份的碰撞边界与重生路径", () => {
     // 删掉索引 1 的「订单」，再在同一个位置新建一张同样叫「订单」、表头一致的表。
     host.rebuildSameSheet(0);
 
-    await click(clarificationOptions(container)[0]);
+    await selectOption(container, 0);
     await until(
       () => container.querySelector(".clarification-card.unconfirmed") !== null,
       "同索引同名同表头的重建表必须挡住作答"
@@ -417,7 +435,7 @@ describe("授权身份的碰撞边界与重生路径", () => {
     const container = await pendingClarification();
     host.openSameNameElsewhere("C:\\数据");
 
-    await click(clarificationOptions(container)[0]);
+    await selectOption(container, 0);
     await until(
       () => container.querySelector(".clarification-card.unconfirmed") !== null,
       "证明不了身份时必须挡住作答"
@@ -443,7 +461,7 @@ describe("授权身份的碰撞边界与重生路径", () => {
     host.rename(1, "订单");
     host.reorder(["订单", "订单（旧）"]);
 
-    await click(clarificationOptions(container)[0]);
+    await selectOption(container, 0);
     await until(
       () => container.querySelector(".clarification-card.invalidated") !== null,
       "名字集合变化后待答澄清必须失效"
@@ -459,7 +477,7 @@ describe("授权身份的碰撞边界与重生路径", () => {
     const container = await pendingClarification();
     host.rename(0, "订单★");
 
-    await click(clarificationOptions(container)[0]);
+    await selectOption(container, 0);
     await until(
       () => container.querySelector(".clarification-card.invalidated") !== null,
       "改名后必须失效"
@@ -480,7 +498,7 @@ describe("授权身份的碰撞边界与重生路径", () => {
     getWpsApplicationMock.mockReturnValue(host.application);
 
     const container = await pendingClarification();
-    expect(container.querySelector(".clarification-card")).not.toBeNull();
+    expect(container.querySelector(".clarification-card, .composer-box .clarification-composer")).not.toBeNull();
     expect(container.querySelector(".clarification-options")).not.toBeNull();
 
     // 重开任务窗格：卸载后原样挂载（宿主存储保留）。
@@ -491,7 +509,7 @@ describe("授权身份的碰撞边界与重生路径", () => {
     const reopened = await mount(panel());
     await until(() => reopened.container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "重开应加载模型");
     await until(
-      () => Boolean(reopened.container.querySelector(".clarification-card")),
+      () => Boolean(reopened.container.querySelector(".clarification-card, .composer-box .clarification-composer")),
       "重开后应恢复出那张卡（历史仍可见）"
     );
     // 身份只能在内存里确认，重开后即无从确认 —— 必须收敛成"无法确认"，
@@ -540,7 +558,7 @@ describe("授权身份的碰撞边界与重生路径", () => {
       } as never);
 
     const container = await pendingClarification();
-    await click(clarificationOptions(container)[0]);
+    await selectOption(container, 0);
     // 对象引用未变 ⇒ 能证明是同一本，正常继续（不能因为"没有路径"就一律误杀）。
     await until(() => runTurnMock.mock.calls.length === 2, "未保存工作簿同会话内应可继续");
     expect(textOf(container)).not.toContain("数据范围已经变化");

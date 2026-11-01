@@ -50,14 +50,31 @@ vi.mock("./wpsPlanningStream", async (importOriginal) => {
     getWpsPlanningTaskStatus: vi.fn(),
     // 续跑的网络缝。单独桩出来是为了让"续跑期间的读表指针"能由用例决定，
     // 断言的仍然是面板有没有把指针交给桥。
-    continueWpsPlanning: vi.fn()
+    continueWpsPlanning: vi.fn(),
+    /*
+     * 只读补发历史进度的**另一个**网络缝（`GET /api/turn/{id}/events`）。
+     * 以前没桩，于是"重开窗格核对暂停任务"这类用例会真的去读用户那台 8765 的轮次事件：
+     * 读不读得到取决于对方在不在跑。这里固定成"读不到"（生产里走的就是
+     * `catch ⇒ timeout`：读不到不等于任务结束），需要事件的用例自己给实现。
+     */
+    getWpsPlanningTaskEvents: vi.fn(async () => { throw new TypeError("Failed to fetch"); })
   };
 });
 
 vi.mock("../../excel-addin/src/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../excel-addin/src/api")>();
+  const discovery = await import("./wpsPendingDiscovery.testHost");
+  /*
+   * 「继续分析的读表桥」用例自己 `vi.stubGlobal("fetch", …)` 驱动真实轮询，所以桥与
+   * 暂停/校验这几条接缝用 `guardNetworkSeam`：装了 fetch 替身才真的调用，否则按
+   * "连不上"失败。漏出去的请求另有 `testSetup.ts` 的闸门当场判失败。
+   */
+  const gate = await import("@excel-bro/core/testNetworkGate");
   return {
-    ...actual,
+    ...actual, ...discovery.pendingDiscoveryApiStubs(),
+    pollSdkBridgeTool: vi.fn(gate.guardNetworkSeam(actual.pollSdkBridgeTool)),
+    pausePlanningTask: vi.fn(gate.guardNetworkSeam(actual.pausePlanningTask)),
+    validatePlan: vi.fn(gate.guardNetworkSeam(actual.validatePlan)),
     understandMessage: vi.fn(async () => ({ kind: "needs_workbook_context", summary: "需要字段结构", provider: "model" })),
     listModels: vi.fn(),
     getModelSettings: vi.fn()
@@ -192,8 +209,13 @@ function textOf(container: HTMLElement): string {
 }
 
 function findButton(container: HTMLElement, label: string): HTMLButtonElement | null {
+  /*
+   * 按**可访问名**找：主操作按钮（输入框右下角那一颗）只画字形，动作名在
+   * `aria-label` 上。按钮位置变了，查找方式跟着变；断言本身一个字没动。
+   */
   return Array.from(container.querySelectorAll("button")).find(
-    (button) => (button.textContent ?? "").trim() === label
+    (button) =>
+      (button.textContent ?? "").trim() === label || button.getAttribute("aria-label") === label
   ) ?? null;
 }
 
@@ -390,7 +412,7 @@ describe("CAP-02 规划暂停卡", () => {
     } else {
       expect(container.querySelector(".analysis-pause-inline")).not.toBeNull();
       expect(container.textContent).not.toContain("尚未生成规划检查点");
-      await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="继续任务"]')!.click());
+      await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="继续任务"], [aria-label="继续分析"]')!.click());
     }
     await until(() => textOf(container).includes("原需求重新分析已接通"), "继续必须实际重入原需求");
     expect(understandMessage).toHaveBeenCalledTimes(semanticCallsBeforeRestart + (via === "text" ? 1 : 0) + (stage === "message" ? 1 : 0));
@@ -411,6 +433,12 @@ describe("CAP-02 规划暂停卡", () => {
     expect(cards[0].getAttribute("data-status")).toBe("awaiting_input");
     expect(cards[0].textContent).toContain("查看后续进展");
     expect(cards[0].textContent).not.toContain("原需求重新分析已接通");
+    /*
+     * 新段正常结束 ⇒ 过程框收起成一行。展开之后才能数到它带来的步骤 ——
+     * 收起只是呈现，内容没有被删。
+     */
+    expect(cards[1].getAttribute("data-expanded")).toBe("false");
+    await act(async () => cards[1].querySelector<HTMLButtonElement>(".task-progress-toggle")!.click());
     expect(cards[1].querySelectorAll(".activity-steps > li").length).toBeGreaterThan(0);
     expect(container.querySelectorAll(".task-progress-jump")).toHaveLength(1);
     expect(container.querySelectorAll(".activity-card.is-live").length).toBeLessThanOrEqual(1);
@@ -463,6 +491,17 @@ describe("CAP-02 规划暂停卡", () => {
     expect(statusMock).toHaveBeenCalledTimes(queries);
     expect(runTurnMock).toHaveBeenCalledTimes(1);
     expect(continueMock).not.toHaveBeenCalled();
+    /*
+     * 有字时主按钮是「发送」（这是这条交互的硬规则：绝不吞掉用户正在写的话）。
+     * 核对/续跑的入口仍在，但要求输入框为空 —— 清空之后它必须回来。
+     */
+    expect(findButton(container, "发送")).not.toBeNull();
+    await act(async () => {
+      const input = container.querySelector<HTMLTextAreaElement>(".composer textarea")!;
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!;
+      setter.call(input, "");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
     expect(findButton(container, "继续分析")).not.toBeNull();
   });
 
@@ -498,13 +537,22 @@ describe("CAP-02 规划暂停卡", () => {
     expect(status).not.toBeNull();
     expect(status!.textContent).toContain("本轮处理时间已达上限");
 
-    // 操作区里只有 <button>，没有把状态文字塞进去。
+    /*
+     * 操作**已搬到输入框右下角**（同一个动作不再有两个入口）：
+     * 卡面动作区只剩一句指路，一颗按钮都没有；状态节点里也不出现动作名。
+     * 原来这条断言验的是"状态与操作分属不同节点"，这一点没变 —— 只是操作节点
+     * 现在在 `.composer` 里，且它是**唯一**的那颗。
+     */
     const actions = card!.querySelector(".wps-planning-pause-actions");
     expect(actions).not.toBeNull();
-    const buttons = actions!.querySelectorAll("button");
-    expect(buttons).toHaveLength(1);
-    expect(buttons[0].textContent).toBe("继续分析");
-    // 判据：按钮自己的文本就是动作，不含状态描述。
+    expect(actions!.querySelectorAll("button")).toHaveLength(0);
+    expect(actions!.textContent).toContain("输入框右下角");
+    const primary = container.querySelector<HTMLButtonElement>(".composer .composer-primary");
+    expect(primary).not.toBeNull();
+    expect(primary!.getAttribute("aria-label")).toBe("继续分析");
+    expect(primary!.getAttribute("type")).toBe("button");
+    expect(container.querySelectorAll('.composer .composer-primary')).toHaveLength(1);
+    // 判据：状态节点里不含动作名，动作名只出现在那颗按钮上。
     expect(status!.textContent).not.toContain("继续分析");
   });
 
@@ -879,7 +927,7 @@ describe("继续分析的读表桥", () => {
     const { container } = await mount(panel());
     await until(() => Boolean(findButton(container, "继续分析")), "应出现继续按钮");
     if (via === "button") {
-      await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="继续任务"]')!.click());
+      await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="继续任务"], [aria-label="继续分析"]')!.click());
     } else {
       vi.mocked(understandMessage).mockResolvedValueOnce({ kind: "task_recovery", turnId: "turn-pause-1", action: "continue", provider: "model" });
       await type(container.querySelector(".composer textarea"), "继续");
@@ -921,14 +969,14 @@ describe("继续分析的读表桥", () => {
       continuation: { available: true, code: null, message: "", stage: "after_tool", sourceVerificationRequired: true } });
     const { container } = await mount(panel());
     await until(() => Boolean(findButton(container, "继续分析")), "应出现继续入口");
-    await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="继续任务"]')!.click());
+    await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="继续任务"], [aria-label="继续分析"]')!.click());
     await until(() => (container.textContent ?? "").includes("原任务使用的数据已经变化"), "应拒绝旧现场");
     expect(continueMock).not.toHaveBeenCalled();
-    expect(container.querySelector('button[aria-label="继续任务"]')).toBeNull();
+    expect(container.querySelector('button[aria-label="继续任务"], [aria-label="继续分析"]')).toBeNull();
     expect(findButton(container, "继续分析")).toBeNull();
     mounted.forEach((entry) => entry.unmount()); mounted = [];
     const reopened = await mount(panel());
-    expect(reopened.container.querySelector('button[aria-label="继续任务"]')).toBeNull();
+    expect(reopened.container.querySelector('button[aria-label="继续任务"], [aria-label="继续分析"]')).toBeNull();
     expect(continueMock).not.toHaveBeenCalled();
   });
 
@@ -961,8 +1009,8 @@ describe("继续分析的读表桥", () => {
           continuation: { available: true, code: null, message: "", stage: "after_tool" } }));
 
     const { container } = await mount(panel());
-    await until(() => Boolean(container.querySelector('button[aria-label="继续任务"]')), "最新暂停任务应有继续入口");
-    await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="继续任务"]')!.click());
+    await until(() => Boolean(container.querySelector('button[aria-label="继续任务"], [aria-label="继续分析"]')), "最新暂停任务应有继续入口");
+    await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="继续任务"], [aria-label="继续分析"]')!.click());
     await until(() => textOf(container).includes("原任务使用的数据已经变化"), "应拒绝旧现场");
 
     const persisted = JSON.parse(localStorage.getItem("excel-bro.wps.chat.v1") ?? "null");
@@ -972,13 +1020,18 @@ describe("继续分析的读表桥", () => {
     const survivor = after.find((item) => item.planningPause?.turnId === "turn-pause-2")!.planningPause!;
     expect(invalidated.resolved).toBe(true);
     expect(invalidated.terminalReason).toContain("来源数据已变化");
-    // 独立任务没有被一起作废：它仍是"未解决、可继续"，▶ 也仍然指向它。
+    // 独立任务没有被一起作废：它仍是"未解决、可继续"，入口也仍然指向它。
     expect(survivor.resolved).toBeUndefined();
     expect(survivor.canContinue).toBe(true);
-    expect(container.querySelector('button[aria-label="继续任务"]')).not.toBeNull();
+    /*
+     * 它的入口此刻是「核对任务状态」而不是「继续分析」：另一条刚被拒，这条还没核对过，
+     * 主按钮按**未核对**处理（核对完才会变成继续）。入口仍然唯一、仍然指向它 ——
+     * 这条断言要证的是"另一条的失败没有把它一起作废"，不是按钮叫什么。
+     */
+    expect(container.querySelector('button[aria-label="核对任务状态"]')).not.toBeNull();
 
     const before = statusMock.mock.calls.length;
-    await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="继续任务"]')!.click());
+    await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="核对任务状态"]')!.click());
     await until(() => statusMock.mock.calls.slice(before).some(([turnId]) => turnId === "turn-pause-2"),
       "▶ 必须指向那条独立任务");
     expect(continueMock.mock.calls.some(([request]) => (request as { turnId?: string }).turnId === "turn-pause-1")).toBe(false);

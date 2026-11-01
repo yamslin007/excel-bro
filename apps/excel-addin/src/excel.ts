@@ -1,6 +1,12 @@
 import { isTrustedLiteralPlan } from "@excel-bro/core/literalPlanOrigin";
+import {
+  formulaSheetReferences,
+  formulaSourceEvidenceRequirement,
+  verifyFormulaResumeSources
+} from "@excel-bro/core/formulaWriteback";
 import { copyRangePlan } from "@excel-bro/core/copyRangePlan";
 import {
+  BAKED_WRITE_ACTION_TYPES,
   judgePlanSourceGate,
   PLAN_SOURCE_MISSING_MESSAGE,
   planHasBakedValues,
@@ -25,6 +31,7 @@ import type {
   UndoCellFormat,
   UndoCreatedWorksheetState,
   UndoRangeFormat,
+  UndoRangeSnapshot,
   UndoRestoreScope,
   UndoWorksheetSnapshot,
   VerificationCheck,
@@ -482,14 +489,11 @@ export function missingSchemaRequirements(
  * 烘焙动作：动作体里携带「从源数据算出来的」矩阵。源数据一变，这些矩阵就是
  * 过期结果，照原样执行会把旧数字写进表里。
  *
- * writeFormulas 不在此列 —— 公式引用的是单元格，Excel 自己会重算。
- * filterRange.values / setDataValidation.values 是用户点名的取值而非算出的
- * 结果，同样不算烘焙。
+ * 清单本体只有一份，在 core（`BAKED_WRITE_ACTION_TYPES`，与 WPS 共用同一份判据）；
+ * 这里只做 `Set` 包装，不再复述类型名 —— 本文件曾另存一份清单，两份漂移时
+ * `planLiveness` 会说"live"而 `planHasBakedValues` 说"有烘焙"，直接踩空。
  */
-const BAKED_ACTION_TYPES = new Set<ExcelAction["type"]>([
-  "writeValues",
-  "writeTable"
-]);
+const BAKED_ACTION_TYPES = new Set<string>(BAKED_WRITE_ACTION_TYPES);
 
 export type PlanLiveness = "live" | "mixed";
 
@@ -2771,6 +2775,37 @@ export function preflightPlanActions(
       }
     }
 
+    if (action.type === "writeFormulas") {
+      /*
+       * **公式的跨表依赖藏在文本里**：`=Other!A1` 会读一张没被勾选的工作表，而动作
+       * 自身只声明了写入目标 —— 只看 `action.sheet` 的授权闸完全看不到它。
+       *
+       * 引用解析（含 `'My Sheet'!A1`、双引号字面量里的 `!`、外部引用、`INDIRECT` / `OFFSET`）
+       * 在共享层 `@excel-bro/core/formulaWriteback`，与 WPS 端读同一份；这里只补宿主侧
+       * "哪张表存在、哪张表被授权"。
+       *
+       * 只拒**已存在且未授权**的工作表，与上面读/写闸同一口径：
+       *  - 计划自己新建的表此刻还不存在，不能当成未授权；
+       *  - 外部工作簿引用（`[Book.xlsx]Sheet1`）不是本工作簿的表，由 `assertSafeFormula`
+       *    的 `allowedExternalFiles` 单独把关，不在这里重复一套。
+       */
+      const references = formulaSheetReferences(action.formulas);
+      if (references.dynamic) {
+        issues.push({
+          index,
+          message: "公式含动态引用（INDIRECT / OFFSET），无法核对依赖的工作表"
+        });
+        return;
+      }
+      const unauthorized = references.sheets.filter(isUnauthorizedExistingSheet);
+      if (unauthorized.length > 0) {
+        issues.push({
+          index,
+          message: `公式引用了未授权的工作表「${unauthorized.join("、")}」`
+        });
+        return;
+      }
+    }
     if (action.type === "writeValues" || action.type === "writeFormulas") {
       // R1C1 模式按区域形状自动铺满，不要求 formulas 矩阵与区域同形
       if (action.type === "writeFormulas" && action.formulaR1C1) {
@@ -3883,7 +3918,14 @@ function scopeOf(saved: { scope?: UndoRestoreScope }): UndoRestoreScope {
   return saved.scope ?? LEGACY_FULL_SCOPE;
 }
 
-function recoverableActionRange(action: ExcelAction): string | null {
+/**
+ * 一个动作的**可恢复目标**（单个 A1 矩形）；结构类动作与多矩形清除返回 `null`。
+ *
+ * 导出给「重开后重建撤销」用（`App` 把计划动作翻成目标清单喂给共享判据）：
+ * 它必须与本文件里恢复/撤销真正用的地址**同一个函数**，否则"撤销的目标"和
+ * "执行的目标"就是两份互相独立的口径。
+ */
+export function recoverableActionRange(action: ExcelAction): string | null {
   switch (action.type) {
     case "writeValues":
     case "writeFormulas":
@@ -5267,6 +5309,12 @@ const OFFICE_RECOVERY_ACTION_TYPES = new Set<ExcelAction["type"]>([
 export interface OfficeRecoverySupport {
   supported: boolean;
   reason?: string;
+  /**
+   * 公式计划登记前必须钉住的来源表（= 公式文本真正读的那几张表）。
+   * 登记方按它现场取一次值指纹写进 `plan.sourceDependencyFingerprint`；
+   * 续跑时按同一个集合重新读、重新比。空/缺省 = 这份计划没有需要证据的公式。
+   */
+  sourceEvidenceSheets?: string[];
 }
 
 export function officeRecoverySupport(plan: AnalysisPlan): OfficeRecoverySupport {
@@ -5322,6 +5370,49 @@ export function officeRecoverySupport(plan: AnalysisPlan): OfficeRecoverySupport
         reason: `第 ${index + 1} 步没有可核对的字体变更`
       };
     }
+  }
+  /*
+   * **公式依赖面**：`writeFormulas` 写的是公式文本，宿主执行时自己求值，所以它不会
+   * 落进上面的"修改来源表"判断（公式依赖并不等于 `sourceDependencySheets` 里那些
+   * 读过的表）。于是恢复要回答的是另一个问题：公式读的那几张表，我们有没有证据？
+   *
+   * 三种情况一律不登记精确恢复：
+   * - 依赖面本身就不可分离（同表引用／动态／外部工作簿／名称／引用表=写入目标）——
+   *   `formulaSourceEvidenceRequirement` 给理由，这里只转发，不另写一套判断；
+   * - 依赖表不在本机可信记账里（`sourceDependencySheets`）：没有"这台机器真读过"的
+   *   凭据，也就没了"当时是什么值"的基线；
+   * - 记账为缺失（`undefined`）而不是空数组：空 = 没读过任何表，缺失 = 不知道读过谁。
+   *
+   * 通过时把**这个集合**交给登记方去钉指纹（口径写在 `sourceDependencyFingerprint`）。
+   */
+  const formulaRequirement = formulaSourceEvidenceRequirement(plan);
+  if (!formulaRequirement.ok) {
+    return {
+      supported: false,
+      reason: `公式精确恢复：${formulaRequirement.reason}`
+    };
+  }
+  if (formulaRequirement.sheets.length > 0) {
+    if (!declaredDependency) {
+      return {
+        supported: false,
+        reason:
+          "公式引用的来源表没有「本机实际读过哪些表」的可信记账，无法登记来源证据，不能精确恢复"
+      };
+    }
+    const recorded = new Set(
+      declaredDependency.map((name) => name.toLocaleLowerCase())
+    );
+    const uncovered = formulaRequirement.sheets.filter(
+      (name) => !recorded.has(name.toLocaleLowerCase())
+    );
+    if (uncovered.length > 0) {
+      return {
+        supported: false,
+        reason: `公式引用了「${uncovered.join("、")}」，但这几张表没有本机读取记录，无法为它们登记来源证据`
+      };
+    }
+    return { supported: true, sourceEvidenceSheets: [...formulaRequirement.sheets] };
   }
   return plan.actions.length > 0
     ? { supported: true }
@@ -5790,6 +5881,100 @@ function changedScopeFields(
     .join("、");
 }
 
+/** 单个区域「执行后现场」的核对结论（只读）。 */
+type UndoPostStateIssue =
+  | { kind: "no_evidence"; detail: string }
+  | { kind: "sheet_missing"; detail: string }
+  | { kind: "changed"; detail: string };
+
+/**
+ * 只读核对**一个**区域现在还是不是"这次执行写入后的样子"。
+ *
+ * 抽出来的理由：撤销前的核对（`assertUndoPostState`）与续跑前/重开后的现场核对
+ * （`observeOfficeExecutionPostState`）问的是**同一个问题**，只是处置不同 ——
+ * 前者必须抛错停下，后者要把"逐动作的观测"交给共享判据（`verifyResumeScene`）去
+ * 汇总结论。两份各写一遍"哪一代摘要优先"迟早会漂移，而漂移的后果是"同一个现场，
+ * 撤销说变了、续跑说没变"。
+ *
+ * 判据优先级（由强到弱，逐级退回是为兼容旧恢复点，**不是**为放行）：
+ *  1. 第三代 `scopeDigest` —— 覆盖范围恰好等于实际恢复范围，逐格/逐行；
+ *  2. 第二代 `extendedFormatDigest` —— 固定的全属性集合；
+ *  3. 第一代 `postFingerprint` —— 最旧的记录，只看值/公式/数字格式/填充色/加粗/字色。
+ */
+async function undoRangePostStateIssue(
+  context: Excel.RequestContext,
+  saved: UndoRangeSnapshot
+): Promise<UndoPostStateIssue | null> {
+  if (!saved.postFingerprint) {
+    return { kind: "no_evidence", detail: "撤销数据缺少目标范围的执行后校验，已停止自动覆盖。" };
+  }
+  const sheet = context.workbook.worksheets.getItemOrNullObject(saved.sheet);
+  sheet.load("isNullObject");
+  await context.sync();
+  if (sheet.isNullObject) {
+    return { kind: "sheet_missing", detail: `工作表「${saved.sheet}」已不存在，已停止撤销。` };
+  }
+  const range = sheet.getRange(saved.range);
+  const scope = scopeOf(saved);
+  const observed = await readUndoGuardState(context, range, scope, saved.formatFields);
+  if (saved.scopeDigest) {
+    if (observed.scopeDigest !== saved.scopeDigest) {
+      return {
+        kind: "changed",
+        detail:
+          `「${saved.sheet}」${saved.range} 在本次撤销将要写回的字段（${changedScopeFields(
+            saved.scopeFieldDigests,
+            observed.scopeFieldDigests,
+            saved.cellFormatFieldDigests,
+            observed.cellFormatFieldDigests
+          )}）上又发生了变化，已停止撤销以免覆盖后续编辑。`
+      };
+    }
+    return null;
+  }
+  const stale = saved.extendedFormatDigest
+    ? observed.extendedFormatDigest !== saved.extendedFormatDigest
+    : observed.postFingerprint !== saved.postFingerprint;
+  if (!stale) return null;
+  return {
+    kind: "changed",
+    detail: `「${saved.sheet}」${saved.range} 在执行后又发生了变化，已停止撤销以免覆盖后续编辑。`
+  };
+}
+
+/**
+ * 只读：这次执行**写入过的每个目标**现在还是不是执行后的样子。
+ *
+ * 这是「续跑前现场核对」的取数口（判据在 core 的 `verifyResumeScene`）。为什么不能省：
+ * 撤销成功之后如果处置留痕那次上报失败，账本里就只剩「已完成 2 / 共 3 步」，
+ * 而表已经被撤销清空了 —— 照账本续跑会在一次已经回退掉的执行后面补写第 3 步。
+ *
+ * 读不到就报 `unreadable`，**不**当作"没变"：读不到不等于没变。
+ */
+export async function observeOfficeExecutionPostState(
+  snapshot: Pick<ExecutionUndoSnapshot, "ranges" | "postStateCoverage">
+): Promise<Array<{ actionIndex: number; state: "matched" | "changed" | "unreadable" }>> {
+  return Excel.run(async (context) => {
+    const observations: Array<{
+      actionIndex: number;
+      state: "matched" | "changed" | "unreadable";
+    }> = [];
+    for (const saved of snapshot.ranges) {
+      let state: "matched" | "changed" | "unreadable";
+      try {
+        const issue = await undoRangePostStateIssue(context, saved);
+        state = !issue ? "matched" : issue.kind === "changed" || issue.kind === "sheet_missing"
+          ? "changed"
+          : "unreadable";
+      } catch {
+        state = "unreadable";
+      }
+      observations.push({ actionIndex: saved.actionIndex, state });
+    }
+    return observations;
+  });
+}
+
 export async function assertUndoPostState(
   context: Excel.RequestContext,
   snapshot: ExecutionUndoSnapshot
@@ -5808,44 +5993,8 @@ export async function assertUndoPostState(
     throw new Error("当前已不是生成这份撤销数据的工作簿，已停止撤销。");
   }
   for (const saved of snapshot.ranges) {
-    if (!saved.postFingerprint) {
-      throw new Error("撤销数据缺少目标范围的执行后校验，已停止自动覆盖。");
-    }
-    const sheet = context.workbook.worksheets.getItemOrNullObject(saved.sheet);
-    sheet.load("isNullObject");
-    await context.sync();
-    if (sheet.isNullObject) {
-      throw new Error(`工作表「${saved.sheet}」已不存在，已停止撤销。`);
-    }
-    const range = sheet.getRange(saved.range);
-    const scope = scopeOf(saved);
-    const observed = await readUndoGuardState(context, range, scope, saved.formatFields);
-    // 判据优先级（由强到弱）：
-    //  1. 第三代 `scopeDigest` —— 覆盖范围**恰好等于实际恢复范围**，逐格/逐行；
-    //  2. 第二代 `extendedFormatDigest` —— 旧记录，固定的全属性集合（载荷是第三代的超集）；
-    //  3. 第一代 `postFingerprint` —— 最旧的记录，只看值/公式/数字格式/填充色/加粗/字色。
-    // 逐级退回是为了"升级不把旧恢复点判成执行后又被改过"，而不是为了放行。
-    if (saved.scopeDigest) {
-      if (observed.scopeDigest !== saved.scopeDigest) {
-        throw new Error(
-          `「${saved.sheet}」${saved.range} 在本次撤销将要写回的字段（${changedScopeFields(
-            saved.scopeFieldDigests,
-            observed.scopeFieldDigests,
-            saved.cellFormatFieldDigests,
-            observed.cellFormatFieldDigests
-          )}）上又发生了变化，已停止撤销以免覆盖后续编辑。`
-        );
-      }
-    } else {
-      const stale = saved.extendedFormatDigest
-        ? observed.extendedFormatDigest !== saved.extendedFormatDigest
-        : observed.postFingerprint !== saved.postFingerprint;
-      if (stale) {
-        throw new Error(
-          `「${saved.sheet}」${saved.range} 在执行后又发生了变化，已停止撤销以免覆盖后续编辑。`
-        );
-      }
-    }
+    const issue = await undoRangePostStateIssue(context, saved);
+    if (issue) throw new Error(issue.detail);
   }
 
   const createdStates = new Map(
@@ -6365,9 +6514,22 @@ export async function executePlan(
     } else if (planLiveness(plan) === "live") {
       // 写入全在执行时求值：源数据变了正是它该重算的场景，只要表和字段还在
       // 就放行。
+      //
+      // 这里**不写 `anchor!`**：入口条件是 `anchor || planHasBakedValues(plan)`，
+      // "live 且没有锚点"仍然可能出现（例如计划自己声明了覆盖表之外的写法）。
+      // 非空断言会把一次可读的拒绝变成 TypeError（`Cannot read properties of null`）。
+      // 烘焙清单已经统一到 core 一份，"两份漂移导致的 live 空锚点"不再是通路；
+      // 但判据本身与清单无关，留作 fail-closed。
+      const liveSourceSheets = anchor ? [...anchor.sheets] : [];
+      if (liveSourceSheets.length === 0) {
+        throw new PlanExecutionError(
+          "这份计划写入的内容要在执行时求值，但没有记录它依赖哪些工作表，无法核对来源；未执行。",
+          incompleteActionResults(plan, new Map())
+        );
+      }
       const missing = missingSchemaRequirements(
         plan,
-        await captureWorkbookStructure([...anchor!.sheets])
+        await captureWorkbookStructure(liveSourceSheets)
       );
       if (missing.length > 0) {
         throw new PlanExecutionError(
@@ -6408,6 +6570,31 @@ export async function executePlan(
           incompleteActionResults(plan, new Map())
         );
       }
+    }
+  }
+  /*
+   * **续跑前的公式来源校验**（产品规则 2026-10-30）：公式精确恢复要求登记的来源证据
+   * 仍然一致。放在计划级来源闸**之后**，两级判据各说各的事实：
+   *
+   * - 前面那级回答"表还在不在、结构对不对"（`missingSchemaRequirements`）；
+   * - 这一级回答"那几张表里的**值**是不是还是登记时那一版"。
+   *
+   * 顺序不能颠倒：表都删了却说"来源值变了"是误导。也不能合并：一句"来源有问题"
+   * 会让用户不知道是去恢复表，还是去重新读数据。
+   *
+   * 只在续跑时判（`startActionIndex > 0`）：首次执行写下去的公式由宿主按那一刻的源值
+   * 求值，中间没有"前后两段用不同源值算"的问题 —— 那正是"不放宽正常重算"的意思。
+   * 判据本体在 core（`verifyFormulaResumeSources`），WPS 读同一份。
+   */
+  if (startActionIndex > 0) {
+    const resumeSourceVerdict = await verifyFormulaResumeSources(plan, (sheets) =>
+      captureWorkbookSourceFingerprint([...sheets])
+    );
+    if (resumeSourceVerdict.verdict === "refused") {
+      throw new PlanExecutionError(
+        resumeSourceVerdict.reason,
+        incompleteActionResults(plan, new Map())
+      );
     }
   }
   return Excel.run(async (context) => {

@@ -26,6 +26,18 @@ class RangeEdit(BaseModel):
     value: str | int | float | bool | None = None
 
 
+class LiteralEdit(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    sheet: str = Field(min_length=1, max_length=100)
+    range: str = Field(min_length=1, max_length=100)
+    value: str | int | float | bool | None
+
+
+class LiteralEdits(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    edits: list[LiteralEdit] = Field(min_length=1, max_length=50)
+
+
 PLAN_COMPILERS = {
     "plan_delete_other_worksheets": (
         DeleteOtherSheets,
@@ -36,6 +48,12 @@ PLAN_COMPILERS = {
         RangeEdit,
         "按明确表名、A1 区域和字面常量/公式生成写值、写公式或清空内容计划。"
         "不读取数据、不计算结果、不执行；统计结果应使用 submit_result_plan。",
+    ),
+    "plan_literal_edits": (
+        LiteralEdits,
+        "按用户明确指定的字面常量列表生成有序的多动作写值计划，每项为一个独立 writeValues 动作，"
+        "保留输入顺序，不合并相邻区域。不同步骤可使用不同常量。"
+        "不读取数据、不计算、不执行；不得用它抄写查询/Python计算结果，计算结果必须用 submit_result_plan。",
     ),
 }
 
@@ -52,7 +70,12 @@ def plan_compiler_definitions(request: PlanRequest) -> list[dict[str, Any]]:
                 {"writeValues", "writeFormulas", "clearRange:contents"}
             ):
                 continue
+            if name == "plan_literal_edits" and "writeValues" not in allowed:
+                continue
         schema = model.model_json_schema()
+        if name == "plan_literal_edits":
+            schema["properties"]["edits"]["maxItems"] = min(
+                50, capability_int("agentPlanTools", "maxLiteralActions"))
         if name == "plan_range_edit" and allowed is not None:
             schema["properties"]["operation"]["enum"] = [
                 op for op in schema["properties"]["operation"]["enum"]
@@ -76,8 +99,39 @@ def _sheet(request: PlanRequest, name: str):
     return candidates[0]
 
 
+def _compile_range_edit(request: PlanRequest, args: RangeEdit) -> dict[str, Any]:
+    sheet = _sheet(request, args.sheet)
+    address = args.range.upper().replace("$", "")
+    shape = _range_dimensions(address)
+    if shape is None or min(shape) <= 0:
+        raise ValueError("invalid_range：请提供单个有效 A1 矩形区域。")
+    left, top, right, bottom = range_boundaries(address)
+    if not (1 <= left <= right <= 16384 and 1 <= top <= bottom <= 1048576):
+        raise ValueError("invalid_range：区域超出工作表行列边界。")
+    if shape[0] * shape[1] > capability_int("agentPlanTools", "maxLiteralCells"):
+        raise ValueError("range_too_large：区域超过本地字面写入工具限额。")
+    action: dict[str, Any] = {"type": args.operation, "sheet": sheet.name, "range": address}
+    if args.operation == "clearRange":
+        if "value" in args.model_fields_set:
+            raise ValueError("invalid_arguments：清空操作不能同时写入值。")
+        action["applyTo"] = "contents"
+    else:
+        if "value" not in args.model_fields_set:
+            raise ValueError("missing_value：写入值必须明确指定；需要用户决定时请澄清。")
+        if args.operation == "writeFormulas" and (
+            not isinstance(args.value, str) or not args.value.startswith("=")
+        ):
+            raise ValueError("invalid_formula：公式必须为以等号开头的字符串。")
+        if args.operation == "writeValues" and isinstance(args.value, str) and args.value.lstrip().startswith(("=", "+", "-", "@")):
+            raise ValueError("formula_as_value：疑似公式不能通过常量写入工具执行。")
+        key = "values" if args.operation == "writeValues" else "formulas"
+        action[key] = [[args.value] * shape[1] for _ in range(shape[0])]
+    return action
+
+
 def compile_plan_tool(request: PlanRequest, name: str, arguments: dict[str, Any]) -> PlanResponse:
     from .excel_agent import _enforce_action_capabilities
+    literal_origin = False
     if name == "plan_delete_other_worksheets":
         args = DeleteOtherSheets.model_validate(arguments)
         keep = {_sheet(request, name).name for name in args.keepSheets}
@@ -93,34 +147,19 @@ def compile_plan_tool(request: PlanRequest, name: str, arguments: dict[str, Any]
         title = "保留指定工作表并删除已授权的其他表"
     elif name == "plan_range_edit":
         args = RangeEdit.model_validate(arguments)
-        sheet = _sheet(request, args.sheet)
-        address = args.range.upper().replace("$", "")
-        shape = _range_dimensions(address)
-        if shape is None or min(shape) <= 0:
-            raise ValueError("invalid_range：请提供单个有效 A1 矩形区域。")
-        left, top, right, bottom = range_boundaries(address)
-        if not (1 <= left <= right <= 16384 and 1 <= top <= bottom <= 1048576):
-            raise ValueError("invalid_range：区域超出工作表行列边界。")
-        if shape[0] * shape[1] > capability_int("agentPlanTools", "maxLiteralCells"):
-            raise ValueError("range_too_large：区域超过本地字面写入工具限额。")
-        action: dict[str, Any] = {"type": args.operation, "sheet": sheet.name, "range": address}
-        if args.operation == "clearRange":
-            if "value" in args.model_fields_set:
-                raise ValueError("invalid_arguments：清空操作不能同时写入值。")
-            action["applyTo"] = "contents"
-        else:
-            if "value" not in args.model_fields_set:
-                raise ValueError("missing_value：写入值必须明确指定；需要用户决定时请澄清。")
-            if args.operation == "writeFormulas" and (
-                not isinstance(args.value, str) or not args.value.startswith("=")
-            ):
-                raise ValueError("invalid_formula：公式必须为以等号开头的字符串。")
-            if args.operation == "writeValues" and isinstance(args.value, str) and args.value.lstrip().startswith(("=", "+", "-", "@")):
-                raise ValueError("formula_as_value：疑似公式不能通过常量写入工具执行。")
-            key = "values" if args.operation == "writeValues" else "formulas"
-            action[key] = [[args.value] * shape[1] for _ in range(shape[0])]
-        actions = [action]
+        actions = [_compile_range_edit(request, args)]
+        literal_origin = args.operation == "writeValues"
         title = "按指定区域生成编辑计划"
+    elif name == "plan_literal_edits":
+        batch = LiteralEdits.model_validate(arguments)
+        if len(batch.edits) > capability_int("agentPlanTools", "maxLiteralActions"):
+            raise ValueError("too_many_literal_edits：字面写入动作数超过限额。")
+        actions = [_compile_range_edit(request, RangeEdit.model_validate({
+            **edit.model_dump(), "operation": "writeValues"})) for edit in batch.edits]
+        if sum(len(action["values"]) * len(action["values"][0]) for action in actions) > capability_int("agentPlanTools", "maxLiteralCells"):
+            raise ValueError("range_too_large：全部字面写入区域的单元格总数超过限额。")
+        literal_origin = True
+        title = "按顺序写入指定常量"
     else:
         raise ValueError("unknown_plan_compiler")
     plan = AnalysisPlan.model_validate({
@@ -130,5 +169,5 @@ def compile_plan_tool(request: PlanRequest, name: str, arguments: dict[str, Any]
     _enforce_action_capabilities(request, plan)
     return PlanResponse(
         provider="model", plan=plan,
-        planOrigin="literal_range_edit" if name == "plan_range_edit" and args.operation == "writeValues" else None,
+        planOrigin="literal_range_edit" if literal_origin else None,
     )

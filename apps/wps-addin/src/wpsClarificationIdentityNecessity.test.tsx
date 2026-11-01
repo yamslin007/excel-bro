@@ -35,7 +35,8 @@ vi.mock("../../excel-addin/src/hooks/useAuthorizedTarget", () => ({
 
 vi.mock("../../excel-addin/src/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../excel-addin/src/api")>();
-  return { ...actual, understandMessage: vi.fn(async () => ({ kind: "needs_workbook_context", summary: "需要字段结构", provider: "model" })), listModels: vi.fn(), getModelSettings: vi.fn(), validatePlan: vi.fn() };
+  const discovery = await import("./wpsPendingDiscovery.testHost");
+  return { ...actual, ...discovery.pendingDiscoveryApiStubs(), understandMessage: vi.fn(async () => ({ kind: "needs_workbook_context", summary: "需要字段结构", provider: "model" })), listModels: vi.fn(), getModelSettings: vi.fn(), validatePlan: vi.fn() };
 });
 vi.mock("./wpsReadonlyAgent", () => ({ runWpsReadonlyTurn: vi.fn() }));
 vi.mock("./wpsHost", async (importOriginal) => {
@@ -103,6 +104,23 @@ async function click(target: HTMLElement | null) {
   await act_(() => {
     target.dispatchEvent(new MouseEvent("click", { bubbles: true }));
   });
+}
+
+
+/**
+ * 选中第 index 个快捷答案并**提交**。
+ *
+ * 新交互下点选项只选中（想改口径还有机会），提交是右下角那颗「发送回答」。
+ * 旧用例写的是"点一下就等于作答"，语义等价于这里的两次点击。
+ */
+async function selectOption(container: HTMLElement, index: number) {
+  const options = Array.from(container.querySelectorAll<HTMLButtonElement>(".clarification-options button"));
+  const option = options[index];
+  if (!option) throw new Error(`没有第 ${index} 个快捷答案`);
+  await click(option);
+  const submitButton = container.querySelector<HTMLButtonElement>('button[aria-label="发送回答"]');
+  if (!submitButton) throw new Error("没有找到「发送回答」按钮");
+  await click(submitButton);
 }
 
 async function type(target: HTMLTextAreaElement | null, value: string) {
@@ -279,7 +297,7 @@ async function pendingClarification() {
   const composer = container.querySelector<HTMLTextAreaElement>(".composer textarea");
   await type(composer, "帮我处理表格");
   await submit(composer);
-  await until(() => Boolean(container.querySelector(".clarification-card")), "应显示澄清卡");
+  await until(() => Boolean(container.querySelector(".clarification-card, .composer-box .clarification-composer")), "应显示澄清卡");
   await until(() => runTurnMock.mock.calls.length === 1, "应完成这一轮");
   return container;
 }
@@ -318,7 +336,7 @@ describe("身份判据的必要性（表头/尺寸/数据值全部相同的替�
     // 只有名称变：表头仍是 ["类别","归属"]，仍是 3 行 × 2 列，数据行一字未动。
     host.rename(0, "订单（新）");
 
-    await click(clarificationOptions(container)[0]);
+    await selectOption(container, 0);
     await until(
       () => container.querySelector(".clarification-card.invalidated") !== null,
       "改名后待答澄清必须失效（表头判据在这里天然触发不了）"
@@ -338,7 +356,7 @@ describe("身份判据的必要性（表头/尺寸/数据值全部相同的替�
     const container = await pendingClarification();
     host.reorder(["明细", "订单"]);
 
-    await click(clarificationOptions(container)[0]);
+    await selectOption(container, 0);
     await until(
       () => container.querySelector(".clarification-card.invalidated") !== null,
       "重排后待答澄清必须失效"
@@ -357,7 +375,7 @@ describe("身份判据的必要性（表头/尺寸/数据值全部相同的替�
     host.sheets[0].Name = "订单（副本归入）";
     host.sheets[1].Name = "订单";
 
-    await click(clarificationOptions(container)[0]);
+    await selectOption(container, 0);
     await until(
       () => container.querySelector(".clarification-card.invalidated") !== null,
       "同索引换表后待答澄清必须失效"
@@ -373,7 +391,7 @@ describe("身份判据的必要性（表头/尺寸/数据值全部相同的替�
     const container = await pendingClarification();
     host.setWorkbookName("另一本.xlsx");
 
-    await click(clarificationOptions(container)[0]);
+    await selectOption(container, 0);
     await until(
       () => container.querySelector(".clarification-card.invalidated") !== null,
       "换工作簿后待答澄清必须失效"
@@ -412,7 +430,7 @@ describe("身份判据的必要性（表头/尺寸/数据值全部相同的替�
     getWpsApplicationMock.mockReturnValue(host.application);
 
     const container = await pendingClarification();
-    await click(clarificationOptions(container)[0]);
+    await selectOption(container, 0);
     await until(() => runTurnMock.mock.calls.length === 2, "身份未变时应继续原任务");
     expect(container.querySelector(".clarification-card.resolved")).not.toBeNull();
     expect(textOf(container)).not.toContain("数据范围已经变化");
@@ -427,7 +445,7 @@ describe("身份判据的必要性（表头/尺寸/数据值全部相同的替�
     // 身份一个字没动，只有第 1 行的列名被改写。
     host.setHeader([["类型", "归属"]]);
 
-    await click(clarificationOptions(container)[0]);
+    await selectOption(container, 0);
     await until(
       () => container.querySelector(".clarification-card.invalidated") !== null,
       "表头改写后待答澄清必须失效（这条只有表头判据能拦）"

@@ -1,10 +1,37 @@
+import { HistoryDeleteDialog, HISTORY_MENU_DESCRIPTION } from "./components/HistoryDeleteDialog";
 import { stampLiteralPlanOrigin } from "@excel-bro/core/literalPlanOrigin";
+import {
+  EXECUTION_RECOVERY_ENTRY_HINT,
+  executionRecoveryActions,
+  executionRecoveryResumeVerdict,
+  executionRecoveryTerminalReason,
+  selectExecutionRecoveryEntry,
+  type ExecutionRecoveryAction,
+  type ExecutionRecoverySourceVerdict
+} from "@excel-bro/core/executionRecoveryView";
+import { verifyResumeScene, type ResumeSceneOutcome } from "@excel-bro/core/executionResumeScene";
+import {
+  FORMULA_SOURCE_UNVERIFIABLE_MESSAGE,
+  verifyFormulaResumeSources
+} from "@excel-bro/core/formulaWriteback";
+import {
+  recordExecutionDisposition,
+  type ExecutionDisposition
+} from "@excel-bro/core/executionDisposition";
+import {
+  UNDO_RECOVERY_LABEL,
+  rebuildExecutionUndo,
+  undoRecoveryDetail,
+  type UndoRebuildOutcome
+} from "@excel-bro/core/executionUndoRebuild";
 import { RecoveryProbeControl } from "@excel-bro/core/RecoveryProbeControl";
 import { ResultRefFaultControl } from "@excel-bro/core/ResultRefFaultControl";
 import { resultRefFaultTarget, resultRefFaultVisible } from "@excel-bro/core/resultRefFault";
-import { bindRecoveryProbe, interruptRecoveryProbe } from "@excel-bro/core/recoveryProbe";
+import { bindRecoveryProbe, interruptRecoveryProbe, settleRecoveryProbe, RecoveryProbeCancelledError } from "@excel-bro/core/recoveryProbe";
+import { prepareFormulaSourceEvidence } from './excelFormulaSourceEvidence';
 import { prepareExcelValueCopies } from './excelValueCopyPlan';
-import { TaskExecutionControls } from "./components/TaskExecutionControls";
+import { TaskExecutionNotice } from "./components/TaskExecutionNotice";
+import { ComposerPrimaryButton } from "./components/ComposerPrimaryButton";
 import { acceptsPlanningReplay, planningReceivedSequence, waitForPlanning } from "@excel-bro/core/planningReplay";
 import {
   PAUSE_UNAVAILABLE_REASON,
@@ -12,7 +39,6 @@ import {
   controllerOwnerOf,
   executionPauseState,
   newExecutionId,
-  pauseButtonState,
   planExecutionTeardown,
   recordPauseDiagnostic,
   tagControllerOwner,
@@ -44,8 +70,8 @@ import {
   useState,
   useSyncExternalStore,
 } from "react";
-import { ResultReview } from '@excel-bro/core/resultReview';
-import { ResultReviewBar } from './components/ResultReviewBar';
+import { ResultReview, ReviewNotStartedError } from '@excel-bro/core/resultReview';
+import { ResultReviewBar, resultReviewNeedsDecision, resultReviewVisible } from './components/ResultReviewBar';
 import { excelRecoveryBeforeResult, captureExcelBeforeResult, showExcelBeforeResult, closeExcelNativeComparison, type ExcelBeforeResult } from './excelNativeComparison';
 import { markExcelResult, clearExcelResultMarks, recoverExcelResultMarks, type ExcelResultMarks } from './resultReviewMarkers';
 import type { PlanExecutionResult, ExecutionUndoSnapshot } from './contracts';
@@ -69,6 +95,7 @@ import {
   getFolderExecutionStatus,
   isLocalServiceConnectionError,
   reconcileOfficeActionReceipt,
+  recordExecutionDisposition as sendExecutionDisposition,
   registerOfficeExecution,
   reportOfficeHostWrites,
   refreshFolder,
@@ -81,7 +108,17 @@ import {
   cancelResultRefFault,
   getResultRefFaultStatus,
 } from "./api";
-import { ClarificationFields } from "./components/ClarificationFields";
+import { ClarificationComposer } from "./components/ClarificationComposer";
+import {
+  clarificationAllowsMultiple,
+  clarificationSubmission,
+  clarificationSubmissionAllowed,
+  draftBelongsTo,
+  emptyClarificationDraft,
+  toggleClarificationOption,
+  type ClarificationDraft,
+  type ClarificationOptionLike
+} from "@excel-bro/core/clarificationComposer";
 import { brandLogoUrl } from "./brandLogo";
 import { createAgentTaskContext, confirmAgentTaskDecision, type AgentTaskContext } from "@excel-bro/core/agentTaskContext";
 import { renderConfirmedPrompt } from "@excel-bro/core/clarificationAnswers";
@@ -97,6 +134,7 @@ import { admissionComplete, admissionItem } from "@excel-bro/core/scopeAdmission
 import { checkAuthorizedTarget, TargetConfirmationRequiredError, type AuthorizedTarget } from "@excel-bro/core/authorizedTarget";
 import { folderRootIdentity, intentScopeFingerprint as sharedIntentScopeFingerprint } from "@excel-bro/core/scopeFingerprint";
 import { retireTargetMessage } from "./authorizedTargetArtifacts";
+import { isPlanExecutionResult } from "./contracts";
 import type {
   AnalysisPlan,
   AssistantResponse,
@@ -123,6 +161,7 @@ import type {
   ChatHistoryState,
   ChatMessage,
   FunctionPreview,
+  OfficeRecoveryVerdict,
   Status
 } from "./types/chat";
 import type { SourceMode, WorkbookScopeMode } from "./types/workbook";
@@ -163,7 +202,9 @@ import {
   previewFormulaFirstCell,
   PlanExecutionError,
   officeRecoverySupport,
+  observeOfficeExecutionPostState,
   reconcileOfficeRangeAction,
+  recoverableActionRange,
   StaleSourceError,
   snapshotDataEpochs,
   toolSchemaFingerprintForSnapshot,
@@ -240,11 +281,27 @@ import { RuleManager } from "./RuleManager";
 import { SlashCommandAutocomplete, type SlashCommand } from "./SlashCommandAutocomplete";
 import ThemePanel from "./components/ThemePanel";
 import TaskProgressTimeline from "./components/TaskProgressTimeline";
+import {
+  composerPrimaryAction,
+  type PrimaryActionInvoke
+} from "@excel-bro/core/composerPrimaryAction";
+import { ProcessResultSummary } from "./components/ProcessResultSummary";
+import { ComposerActionDock, type CurrentActionView } from "./components/ComposerActionDock";
+import { processOutcomePhaseFrom } from "@excel-bro/core/processOutcome";
+import { isCompactMessageProcess } from "@excel-bro/core/processPanel";
+import { selectCurrentAction } from "@excel-bro/core/currentActionCard";
 import ChangeReviewSummaryCard from "./components/ChangeReviewSummaryCard";
+import OfficeRecoveryChoicesCard from "./components/OfficeRecoveryChoicesCard";
+/*
+ * 恢复卡的**可点击那一份**住在输入区上方（`OfficeRecoveryPanel`），消息里只留
+ * 只读的 `OfficeRecoveryRecord`。两张共用同一份结论，入口由共享选择器挑出唯一一条。
+ * 主按钮（核对 / 继续剩余动作）由 `excelRecoveryActions` 判"本端能不能落地"。
+ */
+import { OfficeRecoveryPanel, OfficeRecoveryRecord, excelRecoveryActions } from "./components/OfficeRecoveryPanel";
 import { ExcelNativeReviewActions } from "./components/ExcelNativeReviewActions";
 import { SaveToolDialog } from "./components/SaveToolDialog";
 import { useExcelNativeComparison, excelReviewBlocksNewCopy } from "./hooks/useExcelNativeComparison";
-import { assertExcelNativeComparisonUnchanged, compareExcelNativeCommittedResult, resultReviewPlanIssue, type ExcelNativeComparison } from "./excelNativeComparison";
+import { assertExcelNativeComparisonUnchanged, compareExcelNativeCommittedResult, planExecutionBoundaryIssue, resultReviewPlanIssue, type ExcelNativeComparison } from "./excelNativeComparison";
 import {
   attestResultSourceDependency,
   attestSourceDependency,
@@ -318,6 +375,24 @@ import {
   savePendingOfficeExecution,
   type PendingOfficeExecution
 } from "./officeOperationRecovery";
+/*
+ * CAP-03（Excel 侧）：完整退出/换机器后**重新发现**未完成执行。
+ *
+ * 判据是两端共用的那一份（`@excel-bro/core/pendingExecutionDiscovery` 选择 + 排序 +
+ * 文案），本机只负责"读身份 / 发请求"；"发现到了能不能续跑"由
+ * `@excel-bro/core/pendingExecutionResume` 判（身份 + 授权集合 + 在途材料）。
+ * 两条判据都**不写任何东西**。
+ */
+import {
+  PENDING_DISCOVERY_CHOOSE_DETAIL,
+  PENDING_DISCOVERY_TRUNCATED_DETAIL,
+  PENDING_DISCOVERY_UNAVAILABLE_DETAIL,
+  pendingExecutionCandidateLabel,
+  type PendingExecutionCandidate
+} from "@excel-bro/core/pendingExecutionDiscovery";
+import { pendingResumeReadiness, pendingResumeTargetSheets } from "@excel-bro/core/pendingExecutionResume";
+import { currentOfficeRecoveryIdentity, discoverOfficePendingExecutions } from "./officeRecoveryDiscovery";
+import type { OfficeExecutionState } from "./contracts";
 
 export type { ActivityLog, ActivityProgress } from "./hooks/useActivityProgress";
 
@@ -586,8 +661,7 @@ async function loadDictionaryForFormula(
   }
 }
 
-// ── 结论复用缓存 ──────────────────────────────────────────────────────
-// 同一只读需求（结构化意图相同）且数据未变（dataEpoch 未变）时，直接复用上次
+// ── 结论复用缓存 ──────────────────────────────────────────────────────// 同一只读需求（结构化意图相同）且数据未变（dataEpoch 未变）时，直接复用上次
 // 结论，跳过 checkIntent / 本地全表扫描 / 模型生成。缓存只放内存、不进
 // localStorage，跨会话不自动复用（关闭期间文件可能被外部改动，监听器无从得知）。
 const RESULT_CACHE_LIMIT = 24;
@@ -803,6 +877,21 @@ function emptyBridgeLiveContext(): SdkBridgeLiveContext {
     authorizedSheetNames: [],
     activeWorksheet: ""
   };
+}
+
+/**
+ * 结果审阅条上那句「本次没有副本可对比」的原因。
+ *
+ * 只有**当前审阅确实属于这条计划**时才给（key 对得上）；对不上就返回 undefined，
+ * 让条子按原样显示 —— 猜一个"大概不能对比"会把恢复路径的审阅也说成降级。
+ */
+function reviewCompareUnavailable(
+  candidate: { id: string; plan: AnalysisPlan; authorization: string[] } | null,
+  reviewKey: string | null | undefined
+): string | undefined {
+  if (!candidate || reviewKey !== candidate.id) return undefined;
+  const issue = resultReviewPlanIssue(candidate.plan, candidate.authorization);
+  return issue ? `本次未生成执行前副本：${issue}结果以原表回读为准。` : undefined;
 }
 
 export default function App() {
@@ -1365,6 +1454,76 @@ export default function App() {
     handleScroll: handleMessageStreamScroll,
     scrollToLatest
   } = useMessageAutoFollow(activityScrollSignal, chatHistory.activeConversationId);
+  /*
+   * **唯一**的恢复入口：当前对话里最后一条带恢复卡的记录。
+   *
+   * 判据在共享层（`selectExecutionRecoveryEntry`），这里只把本端字段喂进去。
+   * 之所以要"唯一"：可点击的卡片搬到输入区上方之后，消息里**一个按钮都不留**；
+   * 万一将来有人又在消息里画一张，这个选择器不会跟着变成两个入口 —— 它只挑一条，
+   * 而消息里的那一份是只读记录（没有按钮可点）。
+   */
+  const officeRecoveryEntry = selectExecutionRecoveryEntry(
+    messages,
+    (message) => message.officeResume ?? null
+  );
+  /**
+   * 这条恢复记录**是不是已经结束**（撤销确认 / 放弃 / 收尾）。
+   *
+   * 判据在共享层（`executionRecoveryTerminalReason`，WPS 读同一份），这里只转发：
+   * 终态不再占用输入区上方那块固定区域（也不出现在"还有 N 项"里），改在**所属任务
+   * 的那条消息**里留一条可展开的终态摘要 —— 记录不删、账本不动、恢复材料不回收。
+   *
+   * 边界（不许扩大）：待核对、可继续、需重新规划、普通 blocked（现场冲突 / 执行权
+   * 被占 / 来源变化）、证据不足**都不是**终态，照旧留在固定区域。
+   */
+  const officeRecoveryTerminal = officeRecoveryEntry
+    ? executionRecoveryTerminalReason(officeRecoveryEntry.card.verdict)
+    : null;
+  /**
+   * 「结果摘要」要按阶段说"下一步点哪"。
+   *
+   * `resultReviewState` 描述的是**当前**那次审阅，也就是最近一条带执行的回复；
+   * 历史消息不该拿它去说自己"正在待审阅"。所以只把这条状态喂给最后一条带
+   * 执行的消息，其余消息按撤销/恢复结论自行判定（见 `processOutcomePhaseFrom`）。
+   * 这不是猜测：候选只有一个，审阅栏也只有一个。
+   */
+  const lastExecutionMessageId = [...messages].reverse().find((message) =>
+    Boolean(message.executedExecutionId || message.verification))?.id ?? null;
+  /*
+   * 「重开后还能不能**撤销**这次已写入的内容」——与「能不能继续执行」是两种资格。
+   *
+   * 真机（2026-10-31）：第二步中断 → 核对 → 改来源 → 续跑被拒（对的）→ 重开。
+   * 恢复卡还在，可账本里明明存着每个已完成动作的写前快照与写后指纹，界面却一个撤销
+   * 入口都没有 —— 因为撤销栈只在 `completed` 时会用 `result.undoSnapshot` 重建。
+   *
+   * 这里只保存**最近一次读到的账本状态**（面板据此在渲染时现算结论），判定本身在共享层
+   * （`@excel-bro/core/executionUndoRebuild`）：身份 → 处置 → 状态 → 材料 → 授权，
+   * 一个原因码一处返回点。**它不看来源**：来源变了只该挡住续跑，不该把撤销收走。
+   *
+   * 为什么不在挂载/卡片变化时再发一次状态查询：账本读一次就够（发现、核对、续跑用的是
+   * 同一次读数），多一次查询会让"重开只查一次"这条既有判据变成假绿。
+   */
+  const officeLedgerStates = useRef<Map<string, OfficeExecutionState>>(new Map());
+  /**
+   * 「来源还能不能沿用」的**正面**结论缓存（复核过且一致 / 这份计划不读来源）。
+   *
+   * 只缓存正面结论，而且按**场景键**（执行身份 + 版本 + 进度 + 计划 + 登记指纹）绑定：
+   * - 不缓存负面结论 ⇒ 用户把来源改回去之后，下一次复核按**当时的现场**重新算，
+   *   不会永久锁死在"来源已变化"（2026-10-31 要求的"不永久缓存上一次错误"）。
+   * - 场景一变（换簿 / 换执行 / 服务端推进 / 计划变了）缓存立刻失效。
+   * - **点击续跑时永远 fresh 重读**（`officeRecoveryEvidenceFor(state, {fresh:true})`），
+   *   缓存只用于"别在每次焦点变化时把整张来源表再读一遍"。
+   */
+  const officeSourceVerdictRef = useRef<{ key: string; verdict: ExecutionRecoverySourceVerdict } | null>(null);
+  const [officeUndoDone, setOfficeUndoDone] = useState<{ operationId: string; detail: string } | null>(null);
+  /*
+   * 「这次执行已经撤销」的**同步**终态镜像。
+   *
+   * `officeUndoDone`（state）只负责让界面重画，晚一拍；而"重开/迟到响应把终态覆盖回
+   * 可继续"正是晚一拍造成的。撤销成功那一刻先把终态写进这个 ref（同一 tick 生效），
+   * 后面任何按钮处理器、异步回调、重算结论都从这里读 —— 旧回调永远过不了这一关。
+   */
+  const officeUndoTerminalRef = useRef<{ operationId: string; detail: string } | null>(null);
   const focusDialogRef = useRef<Office.Dialog | null>(null);
   const planEditorDialogRef = useRef<Office.Dialog | null>(null);
   const queryAbortRef = useRef<AbortController | null>(null);
@@ -1411,6 +1570,52 @@ export default function App() {
   const folderRecoveryAttachStartedRef = useRef(false);
   const officeRecoveryAttachStartedRef = useRef(false);
   const officeRecoveryActionLock = useRef(false);
+  /**
+   * 已经摆到界面上的那一条（发现/点选得到）。自动发现只能"补"，不能改判或退回候选列表：
+   * 用户点过的选择就是用户的决定。但"不许换掉这一条"不等于"不许对同一条重算" ——
+   * 身份或授权变化后必须对**同一个 operationId** 重新读状态（`reverifySelectedOfficeRecovery`）。
+   */
+  const officeSelectedRecoveryRef = useRef<{ operationId: string; source: "selected" | "auto" } | null>(null);
+  /** 代数闸：身份/范围变化即作废旧代数，迟到的发现或状态响应不许落到界面上。 */
+  const officeDiscoveryGenerationRef = useRef(0);
+  /** 多条候选时的选择入口（只给入口，不替用户挑）。 */
+  const [officeRecoveryChoices, setOfficeRecoveryChoices] = useState<{
+    candidates: PendingExecutionCandidate[];
+    truncated: boolean;
+  } | null>(null);
+  /** 发现本身的失败（服务不可达、身份被拒、响应不合规）。与"没有未完成任务"分开表达。 */
+  const [officeDiscoveryFailure, setOfficeDiscoveryFailure] = useState<string | null>(null);
+  /** 当前工作簿的**已保存**身份；变化即触发重新发现（挂载、另存为、切簿）。 */
+  const [officeRecoveryIdentityKey, setOfficeRecoveryIdentityKey] = useState<string | null>(
+    () => currentOfficeRecoveryIdentity()
+  );
+  /**
+   * 用户在**本次会话**里确认过的授权范围（`null` = 还没确认过）。
+   *
+   * 为什么不能直接用"宿主的当前勾选"：Excel 窗格重新挂载时会把已提交范围播种成
+   * **当前活动表**（`applyWorkbookSnapshotSelection` 的首读播种），那不是用户的手势。
+   * 拿它去比对，真机上就会变成"什么都没动，却说你把汇总表取消了"。所以只在用户
+   * 真的按过确认之后才拿它做续跑判定；没确认过就不比对（`null`）。
+   */
+  const officeScopeConfirmedRef = useRef<string[] | null>(null);
+  /**
+   * 用户每确认一次范围就 +1。
+   *
+   * 它只负责**触发**重核：授权值住在 `officeScopeConfirmedRef` 里，而 ref 变化不会
+   * 引起重绘。不能改用"effect 监听 `committedSheetNames`"——用户把范围收成与首读
+   * 播种相同的一份时内容没变，effect 不重跑；更糟的是守卫那条路在 `await` 里提交，
+   * 渲染可能早于"这次确认是用户手势"的标记落下来，于是重核读到 `null`、判成可继续。
+   */
+  const [officeScopeConfirmedRevision, setOfficeScopeConfirmedRevision] = useState(0);
+  /**
+   * 挂载效应是否已经接手了本机索引（`pending-office-execution`）。
+   *
+   * 两条路都必须能跑，但**同一条记录只查一次**：索引在时由挂载效应负责（它还管
+   * "已完成回执找回"和"离线"这些细节），后端发现只做"索引给不出答案时"的兜底。
+   * 否则同一个 operationId 会被读两次，真机上表现为启动多一次请求、测试里表现为
+   * "状态查询次数"这条判据变红。
+   */
+  const officeIndexAttachRef = useRef(false);
   /**
    * `plan.id` → 产出这份计划的规划任务。
    *
@@ -1569,10 +1774,27 @@ export default function App() {
   }, [petVisible]);
 
   // 撤销栈管理（自定义 Hook）
+  /*
+   * 「这次恢复是用户**放弃**的，还是**撤销**的」——只由触发它的那条路径记下，不猜阶段。
+   *
+   * 为什么用 ref 而不是读 `resultReviewState.phase`：恢复是异步的，等它回来时状态可能已经
+   * 被别的分支（`settleExternally`、失败分支）改过；把"谁触发的"记在**发起那一刻**，
+   * 才是同一件事的同一个身份。`restore:` 是 `resultReview.discard()` 唯一的恢复入口，
+   * 其余入口（结果卡「撤销本次执行」、备份抽屉入口）都走 `undoExecutionTo`。
+   */
+  const revertedByDiscard = useRef<string | null>(null);
+  /**
+   * 这一次恢复是**恢复卡**发起的（"撤销这次已写入的内容"），还是结果卡发起的。
+   *
+   * 只影响一句文案（见 `onRestored` 里的 `ambiguous`）：结果卡撤销时"无法确认归属"
+   * 是诚实的不确定；恢复卡撤销时执行身份就是卡片自己，不该再报不确定。
+   */
+  const officeUndoOriginRef = useRef<"recovery" | null>(null);
   const {
     undoStack,
     lastUndoSnapshot,
     pushUndoSnapshot,
+    ensureUndoSnapshot,
     clearUndoSnapshot,
     undoLastExecution,
     undoExecutionTo
@@ -1589,6 +1811,22 @@ export default function App() {
     onAfterUndo: () => { void scan(); },
     onRestored: (snapshot) => {
       /*
+       * 留痕：用户确实把这次执行**撤回**了（单元格已回到执行前）。
+       *
+       * 这是唯一同时握着"执行身份"和"已恢复"两个事实的地方，两条入口（放弃变更 /
+       * 撤销本次执行）都汇到这里；区别只由 `revertedByDiscard` 给出。
+       * 上报是 best-effort：`recordExecutionDisposition` 永不抛错，失败只是少一条
+       * 服务端记录，**不许**把用户已经完成的恢复改判成失败、也不许弹错误。
+       */
+      const disposition: ExecutionDisposition =
+        revertedByDiscard.current === snapshot.executionId ? "abandoned" : "undone";
+      revertedByDiscard.current = null;
+      void recordExecutionDisposition(
+        (id, kind) => sendExecutionDisposition("office", id, kind),
+        snapshot.executionId,
+        disposition
+      );
+      /*
        * 从**结果卡**撤销之后，固定操作条必须同步收尾：否则它会继续显示
        * "请查看主表中的执行结果"并提供「确认变更」，而那份结果已经被还原。
        * `settleExternally` 只同步状态、不再次恢复；在 `discard()` 自己的
@@ -1597,7 +1835,13 @@ export default function App() {
       if (snapshot.executionId) void resultReview.settleExternally(snapshot.executionId);
       setMessages((current) => {
         const marking = markWorkbookExecutionUndone(current, snapshot);
-        if (marking.ambiguous) {
+        /*
+         * `ambiguous` 的原文案说的是"无法确认它对应哪一条历史记录"。从恢复卡撤销时
+         * 这句话不成立：入口本来就不在结果卡上（这次执行没收尾，压根没有结果卡），
+         * 执行身份、账本里的写前快照、用户点的那颗按钮三者是同一个 operationId。
+         * 所以只在**不是**恢复卡发起的时候保留那句诚实的不确定说明。
+         */
+        if (marking.ambiguous && officeUndoOriginRef.current !== "recovery") {
           appendMessage({
             role: "system",
             text: "本次执行已恢复，但无法确认它对应哪一条历史记录，未自动标记「已撤销」。"
@@ -1656,9 +1900,20 @@ export default function App() {
         if (!(await targetGuard.check()) || !isCurrent()) throw new Error('当前计划或授权已变化，未执行。');
         unmarkPlanVerified(candidate.plan.id);
         executionPlan = await prepareExcelValueCopies(candidate.plan, candidate.authorization, candidate.identity, isCurrent);
-        const issue = resultReviewPlanIssue(executionPlan, candidate.authorization);
-        if (issue) throw new Error(issue);
+        /*
+         * 两道判据分开：**授权边界**不成立就不执行；**副本比对**不可用只降级。
+         *
+         * 旧代码把后者写成 `throw`，于是"三张写入目标表 / 跨表公式 / 重叠区域"这些
+         * 本来可以正常写入的计划根本跑不起来，只能在卡片上等用户点「执行到 Excel」。
+         * 现在副本做不了就如实说一句，执行一次与审阅照旧 —— 用户不需要再点任何东西。
+         */
+        const boundary = planExecutionBoundaryIssue(executionPlan, candidate.authorization);
+        if (boundary) throw new Error(boundary);
         if (!isCurrent()) throw new Error('当前计划或授权已变化，未执行。');
+        const comparisonIssue = resultReviewPlanIssue(executionPlan, candidate.authorization);
+        if (comparisonIssue) {
+          return { comparisonUnavailable: `本次未生成执行前副本：${comparisonIssue}结果以原表回读为准。` };
+        }
         return captureExcelBeforeResult(executionPlan, candidate.authorization);
       },
       execute: async () => {
@@ -1681,7 +1936,18 @@ export default function App() {
         return outcome === 'closed' || outcome === 'already_closed' ? null : '执行前对比副本仍保留，请手动核对；原表不会被关闭。';
       },
       restore: async receipt => {
-        if (!(await resultUndo.current(receipt.executionId))) throw new Error('恢复未成功，当前结果仍保留。');
+        /*
+         * 记下"这次恢复是**放弃变更**发起的"（`resultReview.discard()` 唯一的恢复入口），
+         * 供 `onRestored` 判成 `abandoned` 而不是 `undone`。恢复失败就撤掉这个标记，
+         * 免得同一执行的另一次真正撤销被贴错标签。
+         */
+        revertedByDiscard.current = receipt.executionId;
+        try {
+          if (!(await resultUndo.current(receipt.executionId))) throw new Error('恢复未成功，当前结果仍保留。');
+        } catch (error) {
+          revertedByDiscard.current = null;
+          throw error;
+        }
       },
       validateResult: async receipt => {
         if (!receipt.undo) throw new Error('恢复记录不可用，未确认变更。');
@@ -2189,6 +2455,7 @@ export default function App() {
     officeRecoveryAttachStartedRef.current = true;
     const pending = loadPendingOfficeExecution();
     if (!pending) return;
+    officeIndexAttachRef.current = true;
 
     const attach = async () => {
       let persisted;
@@ -2210,7 +2477,8 @@ export default function App() {
       }
 
       if (persisted.status === "completed") {
-        if (persisted.result?.undoSnapshot) {
+        // 补记收尾的结果没有撤销快照：只有真的执行过的那一份才有。
+        if (isPlanExecutionResult(persisted.result) && persisted.result.undoSnapshot) {
           pushUndoSnapshot(persisted.result.undoSnapshot);
         }
         appendOfficeExecutionNotice(
@@ -2221,28 +2489,110 @@ export default function App() {
         return;
       }
 
-      const currentIdentity = currentOfficeWorkbookIdentity();
-      const identityMatches = currentIdentity === persisted.workbookIdentity;
-      const reason = !currentIdentity
-        ? "当前工作簿尚未保存，无法确认它就是原工作簿。请先保存并重新打开原文件。"
-        : !identityMatches
-          ? "当前不是产生该断点的工作簿。请打开原工作簿后再继续。"
-          : persisted.requiresReconciliation
-            ? "上次停止时有一个动作可能已经写入。继续前会先读取目标范围并核对，不会盲目重放。"
-            : "已完成动作会跳过，将从服务端保存的下一步继续。";
-      appendOfficeExecutionNotice(pending, reason, {
-        operationId: pending.operationId,
-        expectedRevision: persisted.revision,
-        status: identityMatches ? "pending" : "failed",
-        requiresReconciliation: persisted.requiresReconciliation,
-        nextActionIndex: persisted.nextActionIndex,
-        totalActions: persisted.plan.actions.length,
-        reason
-      });
+      /*
+       * 结论不再在这里另算一份：身份、授权集合、在途材料统一由共享判据
+       * （`officeResumeReadinessFor` → `pendingResumeReadiness`）给出，措辞由共享
+       * 呈现契约给出。以前这段自己拼了一句 `reason`，卡面又拼一句，同一件事说两遍。
+       * 这里同样先取一次证据（只读），让"来源/现场"的结论也有出处。
+       */
+      const evidence = await officeRecoveryEvidenceFor(persisted);
+      const notice = officeRecoveryNoticeFor(persisted, evidence);
+      appendOfficeExecutionNotice(pending, notice.text, notice.card);
+      officeSelectedRecoveryRef.current = { operationId: pending.operationId, source: "auto" };
     };
 
     void attach();
   }, []);
+
+  /**
+   * 记下最近一次读到的账本状态（**不额外查询**）。
+   *
+   * 只在 `officeRecoveryCardFor` 里被调用：那张卡是"一次权威读数变成界面事实"的唯一
+   * 出口（挂载发现、核对、续跑、补记、只读重核都经过它）。撤销资格于是永远按**同一个
+   * 读数**重算，既不会多一次 GET，也不会出现"卡上是新状态、撤销按旧状态算"。
+   */
+  function rememberOfficeState(state: OfficeExecutionState | null | undefined): void {
+    if (!state || typeof state.operationId !== "string") return;
+    officeLedgerStates.current.set(state.operationId, state);
+    /*
+     * 材料够时把这次执行的撤销能力**挂回栈里**（同一执行只挂一次）。
+     *
+     * 这里只判结构与身份（`structuralOnly`）：用户在重开后还没重新勾选授权时，
+     * 不该因此丢掉"材料存在"这个事实；此刻能不能点，由渲染时那份完整判定
+     * （含当前授权）决定，点击时 `targetGuard` 与写后指纹还会再各核一次。
+     */
+    const material = officeUndoRebuildFor(state, true);
+    if (material.available && state.checkpoint) {
+      ensureUndoSnapshot({
+        ...state.checkpoint,
+        planId: state.plan.id,
+        executionId: state.operationId,
+        workbookIdentity: state.workbookIdentity
+      });
+    }
+    /*
+     * 不自增"版本号"来触发重渲染：`officeRecoveryCardFor` 的每个调用点都伴随一次
+     * 状态更新（`setMessages` / `setChatHistory`），而其中几处是在 state updater 里
+     * 调过来的 —— updater 必须是纯的（StrictMode 会重放两次），在里面 setState
+     * 就是往渲染期塞副作用。ref 已经变了，紧随其后的那次渲染读到的就是新读数。
+     */
+  }
+
+  /**
+   * 身份观察：界面没有"文档已切换"事件，也不能只靠 React 初次挂载查一次。
+   *
+  /**
+   * 身份观察：界面没有"文档已切换"事件，也不能只靠 React 初次挂载查一次。
+   *
+   * 三个来源合起来覆盖真机上的三种时机：窗口重新获得焦点、窗格从隐藏变可见、
+   * 以及身份在挂载之后才可读（未保存 → 用户另存为）。只有**值真的变了**才更新
+   * 状态 ⇒ 不会因为定时器反复触发发现与网络请求。
+   */
+  useEffect(() => {
+    const read = () => {
+      const next = currentOfficeRecoveryIdentity();
+      setOfficeRecoveryIdentityKey((previous) => (previous === next ? previous : next));
+    };
+    const timer = window.setInterval(
+      read,
+      capabilities.taskRecovery.workbookIdentityWatchIntervalMs
+    );
+    window.addEventListener("focus", read);
+    document.addEventListener("visibilitychange", read);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("focus", read);
+      document.removeEventListener("visibilitychange", read);
+    };
+  }, []);
+
+  /**
+   * 授权集合的**内容**键（不只是数量）：同名同数量的另一个集合不算没变。
+   *
+   * 与工作簿模式、用户确认版本一起进依赖：用户把范围从三张收回两张、切到工作目录
+   * 再切回来、或者确认了一份与首读播种相同的范围，都必须对**同一条**已选执行重算
+   * 结论（只读）。
+   */
+  const officeRecoveryScopeKey = JSON.stringify([
+    sourceMode,
+    workbookScopeMode,
+    [...committedSheetNames],
+    workbook ? [...selectedNamesFor(workbook)] : null,
+    officeScopeConfirmedRevision
+  ]);
+
+  useEffect(() => {
+    if (sourceMode !== "workbook") return;
+    const generation = (officeDiscoveryGenerationRef.current += 1);
+    const isCurrent = () => generation === officeDiscoveryGenerationRef.current;
+    void discoverOfficeRecovery(officeRecoveryIdentityKey, isCurrent);
+    return () => {
+      // 依赖变化（身份/范围）即作废旧代数，迟到的响应不会再落到界面上。
+      if (officeDiscoveryGenerationRef.current === generation) officeDiscoveryGenerationRef.current += 1;
+    };
+    // Scope/identity changes only repeat GET + local judgment, never claim/reconcile/write.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [officeRecoveryIdentityKey, officeRecoveryScopeKey, sourceMode]);
 
   function appendMessage(
     message: Omit<ChatMessage, "id" | "createdAt">
@@ -2269,7 +2619,18 @@ export default function App() {
   function enqueueProducedPlan(id: string, plan: AnalysisPlan, staleSourceConfirm = false) {
     if (staleSourceConfirm || resultMessages.current.has(id) || sourceMode !== "workbook" || !workbook) return;
     const identity = currentOfficeWorkbookIdentity();
-    if (!identity || (!isWorksheetDeletion(plan) && resultReviewPlanIssue(plan, selectedNamesFor(workbook)) !== null)) return;
+    if (!identity) return;
+    /*
+     * 这里判的是**授权边界**，不是"能不能用副本比对"。
+     *
+     * 2026-10-30 真机：用户已经确认授权，三步公式计划的界面却摆着「执行到 Excel」——
+     * 因为旧代码拿 `resultReviewPlanIssue` 当执行许可，而三张写入目标表 / 跨表公式
+     * 都落在"副本比对做不了"的拒绝面上，于是计划不被自动执行，只剩一个要人点的按钮。
+     * 副本比对只影响"能不能看前后对比"；做不了就降级，不收回自动执行。
+     * 越界的计划仍然一个单元格都不写：卡片直接给出原因，不画按钮。
+     */
+    if (!isWorksheetDeletion(plan) &&
+        planExecutionBoundaryIssue(plan, [...selectedNamesFor(workbook)]) !== null) return;
     resultMessages.current.add(id);
     const candidate = { id, plan, identity, authorization: [...selectedNamesFor(workbook)],
       conversationId: chatHistory.activeConversationId };
@@ -2535,26 +2896,137 @@ export default function App() {
     }));
   }
 
-  async function resumeInterruptedOfficeExecution(message: ChatMessage): Promise<void> {
+  /**
+   * 恢复卡上的动作分发。
+   *
+   * 按钮集合**只**来自共享层的 `executionRecoveryActions`：结论说"待核对在途动作"就
+   * 只给「核对在途动作」，说"可继续剩余动作"就只给「继续剩余动作」。这两件事以前被
+   * 合成一个「核对并继续」——点一下先补记再续跑，用户既看不出第二步的回执有没有补上，
+   * 也不知道第三步是不是又被写了一遍。
+   */
+  async function runOfficeRecoveryAction(
+    message: ChatMessage,
+    action: ExecutionRecoveryAction
+  ): Promise<void> {
+    const resume = message.officeResume;
+    if (!resume) return;
+    // 显示的 badge 不是权限：按**卡片当前结论**再核一次，结论里没有这个动作就不动手。
+    if (!executionRecoveryActions(resume.verdict).includes(action)) return;
     if (officeRecoveryActionLock.current) return;
     officeRecoveryActionLock.current = true;
     try {
-      await resumeInterruptedOfficeExecutionOwned(message);
+      if (action === "reconcile") await reconcileOfficeInFlightAction(message);
+      else if (action === "resume") await resumeOfficeRemainingActions(message);
+      else if (action === "backfill") await backfillOfficeCompletion(message);
     } finally {
       officeRecoveryActionLock.current = false;
     }
   }
 
-  async function resumeInterruptedOfficeExecutionOwned(message: ChatMessage): Promise<void> {
-    if (!(await targetGuard.check())) return;
+  /**
+   * 卡片构造的唯一入口：结论来自适配层，进度放详情，不塞正文。
+   *
+   * `evidence` 是**必填**的：结论要用到"来源复核结论"和"写后现场"，而这两样只有
+   * 读过的调用方才有。设成可选就会有人省掉它，卡片又回到"没读来源却说已核对"。
+   */
+  function officeRecoveryCardFor(
+    state: OfficeExecutionState,
+    evidence: OfficeRecoveryEvidence,
+    acting: ExecutionRecoveryAction | null = null
+  ): NonNullable<ChatMessage["officeResume"]> {
+    // 顺带记下这次读数：撤销资格（`officeRecoveryUndoFor`）按同一份账本状态现算。
+    rememberOfficeState(state);
+    return {
+      operationId: state.operationId,
+      expectedRevision: state.revision,
+      verdict: officeRecoveryVerdictFor(state, evidence),
+      acting,
+      nextActionIndex: state.nextActionIndex,
+      totalActions: state.plan.actions.length
+    };
+  }
+
+  /**
+   * 一张恢复卡的**唯一**构造入口：正文只说"这是什么"，能不能继续、为什么，
+   * 交给卡片（结论 + 一句正文）。以前两处各拼一句 `reason`，卡面再说一遍。
+   */
+  function officeRecoveryNoticeFor(
+    state: OfficeExecutionState,
+    evidence: OfficeRecoveryEvidence
+  ): { text: string; card: NonNullable<ChatMessage["officeResume"]> } {
+    const card = officeRecoveryCardFor(state, evidence);
+    const blocked =
+      card.verdict.kind === "blocked" ||
+      card.verdict.kind === "insufficient" ||
+      card.verdict.kind === "undone";
+    const text = blocked
+      ? "发现一条未完成的 Office 写入，但现在不能继续；原因见下方恢复卡。"
+      : `发现一条未完成的 Office 写入（第 ${Math.min(
+          state.nextActionIndex + 1,
+          state.plan.actions.length
+        )} / ${state.plan.actions.length} 步）。`;
+    return { text, card };
+  }
+
+  /**
+   * 恢复前的身份闸。三个动作共用同一句判据 —— 各写一份就会一边拦一边放。
+   */
+  function assertOfficeRecoveryIdentity(state: OfficeExecutionState): void {
+    const currentIdentity = currentOfficeWorkbookIdentity();
+    if (!currentIdentity) throw new Error("当前工作簿尚未保存，无法确认身份，已停止。");
+    if (currentIdentity !== state.workbookIdentity) {
+      throw new Error("当前不是产生该断点的工作簿，已停止。");
+    }
+  }
+
+  /**
+   * 恢复失败时的收尾：有执行权就交还（挂起）。失败也不改判 ——
+   * 下一次先查权威状态，不拿旧 revision 推断。
+   */
+  async function suspendOfficeExecutionQuietly(
+    state: OfficeExecutionState | null,
+    code: string,
+    detail: string
+  ): Promise<void> {
+    if (!state?.ownerToken || state.status !== "running") return;
+    try {
+      await suspendOfficeExecution(state.operationId, {
+        expectedRevision: state.revision,
+        ownerToken: state.ownerToken,
+        code,
+        message: detail
+      });
+    } catch {
+      // 若回执响应丢失，旧 revision 可能已推进；保留 operationId，下一次先查权威状态。
+    }
+  }
+
+  /** 本机没有挂接记录时的一句话（三个恢复动作共用）。 */
+  const OFFICE_RECOVERY_MISSING_INDEX =
+    "本机没有找到这项 Office 任务的挂接记录，不能安全继续。请重开窗格让它重新发现。";
+
+  /**
+   * 「核对在途动作」：**只补记回执，一个单元格都不写**。
+   *
+   * 读现场（`reconcileOfficeRangeAction` 只比对目标范围与写前快照）→ 提交回执
+   * （`reconcileOfficeActionReceipt`）→ 按新结论重画卡片。全程**不调用** `executePlan`：
+   * 剩余动作要等用户在下一张卡上单独点「继续剩余动作」。
+   */
+  async function reconcileOfficeInFlightAction(message: ChatMessage): Promise<void> {
     const resume = message.officeResume;
+    if (!resume) return;
+    if (!(await targetGuard.check())) return;
     const pending = loadPendingOfficeExecution();
-    if (!resume || !pending || pending.operationId !== resume.operationId) {
+    if (!pending || pending.operationId !== resume.operationId) {
       updateFolderResumeMessage(message.id, (current) => ({
         ...current,
-        text: "本机没有找到这项 Office 任务的挂接记录，不能安全续跑。",
+        text: OFFICE_RECOVERY_MISSING_INDEX,
         officeResume: current.officeResume
-          ? { ...current.officeResume, status: "failed" }
+          ? {
+              ...current.officeResume,
+              acting: null,
+              verdict: { kind: "blocked", detail: OFFICE_RECOVERY_MISSING_INDEX }
+            }
           : undefined
       }));
       return;
@@ -2562,62 +3034,218 @@ export default function App() {
     updateFolderResumeMessage(message.id, (current) => ({
       ...current,
       officeResume: current.officeResume
-        ? { ...current.officeResume, status: "resuming" }
+        ? { ...current.officeResume, acting: "reconcile" }
         : undefined
     }));
-    beginActivity(
-      "正在核对 Office 写入断点",
-      "先确认工作簿身份和在途动作，再从下一步继续。",
-      {
-        operationId: resume.operationId,
-        phase: "preflight",
-        stepId: "execution.office.resume"
+    beginActivity("正在核对在途动作", "只读取目标范围与写前快照，不写任何单元格。", {
+      operationId: resume.operationId,
+      phase: "preflight",
+      stepId: "execution.office.reconcile"
+    });
+    setStatus("executing");
+    let state: OfficeExecutionState | null = null;
+    try {
+      state = await getOfficeExecutionStatus(resume.operationId);
+      assertOfficeRecoveryIdentity(state);
+      /*
+       * 终态闸：这次执行可能已经在本机或别处被撤销。**先看处置，再谈别的** ——
+       * 已经撤销的执行不该再被"补记成已写入"，那会把一次回退掉的执行记成完成。
+       */
+      const terminal = officeExecutionTerminalReason(state);
+      if (terminal) {
+        updateFolderResumeMessage(message.id, (current) => ({
+          ...current,
+          text: terminal,
+          officeResume: current.officeResume
+            ? officeRecoveryCardFor(state!, OFFICE_RECOVERY_NO_EVIDENCE)
+            : undefined
+        }));
+        finishActivity("warning", "这次执行已撤销，未做任何写入");
+        return;
       }
-    );
+      const verdict = officeRecoveryVerdictFor(state, OFFICE_RECOVERY_NO_EVIDENCE);
+      if (verdict.kind !== "reconcile") {
+        /*
+         * 现场在别处已经推进（另一台机器补记过，或剩余动作已被执行）：
+         * **不改判、不追写**，只把卡片换成最新结论。
+         */
+        const evidence = await officeRecoveryEvidenceFor(state);
+        updateFolderResumeMessage(message.id, (current) => ({
+          ...current,
+          text: "这条恢复提示的结论已经变化，卡片已按最新状态更新；本次没有写入任何单元格。",
+          officeResume: current.officeResume ? officeRecoveryCardFor(state!, evidence) : undefined
+        }));
+        finishActivity("warning", "结论已变化，未做任何写入");
+        return;
+      }
+      if (!state.beforeSnapshot) {
+        throw new Error("在途动作缺少写前快照，只能人工核对，不能自动补记。");
+      }
+      const actionIndex = verdict.actionIndex;
+      const check = await reconcileOfficeRangeAction({
+        plan: state.plan,
+        operationId: state.operationId,
+        workbookIdentity: state.workbookIdentity,
+        actionIndex,
+        before: state.beforeSnapshot,
+        previous: state.checkpoint
+      });
+      if (check.outcome === "unknown") {
+        throw new Error(
+          "目标范围既不匹配执行前状态，也不匹配预期写入结果；可能存在部分写入或后续人工修改，已保持挂起。"
+        );
+      }
+      let next = await reconcileOfficeActionReceipt(state.operationId, {
+        expectedRevision: state.revision,
+        actionIndex,
+        outcome: check.outcome,
+        ...(check.checkpoint ? { checkpoint: check.checkpoint } : {})
+      });
+      /*
+       * 最后一个动作的完成回执丢了：用刚拿到的执行权把账收掉。
+       * 这一趟也**不执行任何动作** —— 服务端只会在"全部动作已完成"时才允许收尾。
+       */
+      if (check.outcome === "applied" && next.nextActionIndex === next.plan.actions.length) {
+        if (next.ownerToken) {
+          next = await finishOfficeExecution(next.operationId, {
+            expectedRevision: next.revision,
+            ownerToken: next.ownerToken,
+            result: { backfilled: true, actionCount: next.plan.actions.length }
+          });
+        }
+        clearPendingOfficeExecution(next.operationId);
+        updateFolderResumeMessage(message.id, (current) => ({
+          ...current,
+          text: `已核对第 ${actionIndex + 1} 个动作并补记完成；原表未重复写入。`,
+          officeResume: undefined
+        }));
+        finishActivity("completed", "已补记完成，原表未重复写入");
+        return;
+      }
+      /*
+       * 还有动作没跑：**不在这里代跑**。先把执行权交还（挂起），再按新结论重画卡片，
+       * 剩下的动作由下一次「继续剩余动作」执行。
+       */
+      if (next.ownerToken) {
+        next = await suspendOfficeExecution(next.operationId, {
+          expectedRevision: next.revision,
+          ownerToken: next.ownerToken,
+          code: "OFFICE_RECOVERY_RECHECK_REQUIRED",
+          message: "核对完成，剩余动作等待来源与本机材料复核。"
+        });
+      }
+      const fresh = await getOfficeExecutionStatus(next.operationId);
+      state = fresh;
+      /*
+       * 核对本身已经读过一次现场，顺手把"来源还能不能沿用"一起复核掉（只读）：
+       * 这样下一步给的结论是**有依据**的，而不是让用户先看到"可继续"、
+       * 点下去再被来源判据打回（2026-10-31 真机就是这样两句话并存）。
+       */
+      const freshEvidence = await officeRecoveryEvidenceFor(fresh);
+      updateFolderResumeMessage(message.id, (current) => ({
+        ...current,
+        text:
+          check.outcome === "applied"
+            ? `已把第 ${actionIndex + 1} 个动作补记为已写入（现场与写后一致），未重复写入。`
+            : `已把第 ${actionIndex + 1} 个动作补记为未写入（现场仍是写前）。`,
+        officeResume: current.officeResume
+          ? officeRecoveryCardFor(fresh, freshEvidence)
+          : undefined
+      }));
+      finishActivity("completed", "已核对在途动作，未写单元格");
+    } catch (reason) {
+      const detail = reason instanceof Error ? reason.message : String(reason);
+      await suspendOfficeExecutionQuietly(state, "OFFICE_RECONCILE_INTERRUPTED", detail);
+      updateFolderResumeMessage(message.id, (current) => ({
+        ...current,
+        text: detail,
+        officeResume: current.officeResume
+          ? { ...current.officeResume, acting: null, verdict: { kind: "blocked", detail } }
+          : undefined
+      }));
+      finishActivity("warning", "核对未完成，现场已保持挂起");
+    } finally {
+      setStatus("idle");
+    }
+  }
+
+  /**
+   * 「继续剩余动作」：**只执行没跑过的动作**。
+   *
+   * 进来先按最新读数复核结论：如果服务端此刻在途动作还没落地，结论会变成
+   * `reconcile`，这里就**不续跑**，只把卡片换成"待核对"——绝不用续跑顺手补记。
+   */
+  async function resumeOfficeRemainingActions(message: ChatMessage): Promise<void> {
+    const resume = message.officeResume;
+    if (!resume) return;
+    if (!(await targetGuard.check())) return;
+    const pending = loadPendingOfficeExecution();
+    if (!pending || pending.operationId !== resume.operationId) {
+      updateFolderResumeMessage(message.id, (current) => ({
+        ...current,
+        text: OFFICE_RECOVERY_MISSING_INDEX,
+        officeResume: current.officeResume
+          ? {
+              ...current.officeResume,
+              acting: null,
+              verdict: { kind: "blocked", detail: OFFICE_RECOVERY_MISSING_INDEX }
+            }
+          : undefined
+      }));
+      return;
+    }
+    updateFolderResumeMessage(message.id, (current) => ({
+      ...current,
+      officeResume: current.officeResume ? { ...current.officeResume, acting: "resume" } : undefined
+    }));
+    beginActivity("正在复核 Office 写入断点", "先确认工作簿身份和在途动作，再从下一步继续。", {
+      operationId: resume.operationId,
+      phase: "preflight",
+      stepId: "execution.office.resume"
+    });
     setStatus("executing");
     const hostWriteAudits: HostWriteAudit[] = [];
     let state: Awaited<ReturnType<typeof getOfficeExecutionStatus>> | null = null;
     try {
       state = await getOfficeExecutionStatus(resume.operationId);
-      const currentIdentity = currentOfficeWorkbookIdentity();
-      if (!currentIdentity || currentIdentity !== state.workbookIdentity) {
-        throw new Error(
-          currentIdentity
-            ? "当前不是产生该断点的工作簿，已停止续跑。"
-            : "当前工作簿尚未保存，无法确认身份，已停止续跑。"
-        );
+      assertOfficeRecoveryIdentity(state);
+      /*
+       * 点击时的**最新**处置闸。按钮可能来自很早的一张卡（甚至一次已被撤销的执行），
+       * 所以这里不看"当初那张卡的结论"，而是按刚读到的账本 + 本机终态重新判一次。
+       * 已经撤销 ⇒ 一格都不写，也不重置账本游标（不重跑旧执行）。
+       */
+      const terminal = officeExecutionTerminalReason(state);
+      if (terminal) {
+        updateFolderResumeMessage(message.id, (current) => ({
+          ...current,
+          text: terminal,
+          officeResume: current.officeResume
+            ? officeRecoveryCardFor(state!, OFFICE_RECOVERY_NO_EVIDENCE)
+            : undefined
+        }));
+        finishActivity("warning", "这次执行已撤销，未继续写入");
+        return;
       }
-      if (state.inFlightActionIndex !== null && state.inFlightActionIndex !== undefined) {
-        if (!state.beforeSnapshot) {
-          throw new Error("在途动作缺少写前快照，只能人工核对，不能自动续跑。");
-        }
-        const reconciliation = await reconcileOfficeRangeAction({
-          plan: state.plan,
-          operationId: state.operationId,
-          workbookIdentity: state.workbookIdentity,
-          actionIndex: state.inFlightActionIndex,
-          before: state.beforeSnapshot,
-          previous: state.checkpoint
-        });
-        if (reconciliation.outcome === "unknown") {
-          throw new Error(
-            "目标范围既不匹配执行前状态，也不匹配预期写入结果；可能存在部分写入或后续人工修改，已保持挂起。"
-          );
-        }
-        state = await reconcileOfficeActionReceipt(state.operationId, {
-          expectedRevision: state.revision,
-          actionIndex: state.inFlightActionIndex,
-          outcome: reconciliation.outcome,
-          ...(reconciliation.checkpoint
-            ? { checkpoint: reconciliation.checkpoint }
-            : {})
-        });
-      } else {
-        state = await claimOfficeExecutionResume(
-          state.operationId,
-          state.revision
-        );
+      /*
+       * `fresh: true` —— 点击续跑永远现读来源与现场，**不用缓存**：
+       * 缓存只服务"别在每次焦点变化时重读整张来源表"，不能替执行前判据做决定。
+       * `executePlan` 内部还会再核一次来源（同一个 `verifyFormulaResumeSources`）。
+       */
+      const evidence = await officeRecoveryEvidenceFor(state, { fresh: true });
+      const verdict = officeRecoveryVerdictFor(state, evidence);
+      if (verdict.kind !== "resume" || !executionRecoveryActions(verdict).includes("resume")) {
+        // 结论变了（现在有在途动作要先核对，或已经全部完成）：不续跑，只换卡面。
+        updateFolderResumeMessage(message.id, (current) => ({
+          ...current,
+          text: "这条恢复提示的结论已经变化，卡片已按最新状态更新；本次没有写入任何单元格。",
+          officeResume: current.officeResume
+            ? officeRecoveryCardFor(state!, evidence)
+            : undefined
+        }));
+        finishActivity("warning", "结论已变化，未继续写入");
+        return;
       }
+      state = await claimOfficeExecutionResume(state.operationId, state.revision);
       if (!state.ownerToken) {
         throw new Error("服务端没有授予本次 Office 续跑写入权。");
       }
@@ -2711,33 +3339,12 @@ export default function App() {
       );
     } catch (reason) {
       const detail = reason instanceof Error ? reason.message : String(reason);
-      if (state?.ownerToken && state.status === "running") {
-        try {
-          state = await suspendOfficeExecution(state.operationId, {
-            expectedRevision: state.revision,
-            ownerToken: state.ownerToken,
-            code: "OFFICE_RESUME_INTERRUPTED",
-            message: detail
-          });
-        } catch {
-          // 若回执响应丢失，旧 revision 可能已推进；保留 operationId，下一次先查权威状态。
-        }
-      }
+      await suspendOfficeExecutionQuietly(state, "OFFICE_RESUME_INTERRUPTED", detail);
       updateFolderResumeMessage(message.id, (current) => ({
         ...current,
         text: detail,
         officeResume: current.officeResume
-          ? {
-              ...current.officeResume,
-              expectedRevision: state?.revision ?? current.officeResume.expectedRevision,
-              requiresReconciliation:
-                state?.inFlightActionIndex !== null &&
-                state?.inFlightActionIndex !== undefined,
-              nextActionIndex:
-                state?.nextActionIndex ?? current.officeResume.nextActionIndex,
-              reason: detail,
-              status: "failed"
-            }
+          ? { ...current.officeResume, acting: null, verdict: { kind: "blocked", detail } }
           : undefined
       }));
       finishActivity("warning", "Office 任务仍需核对");
@@ -2751,6 +3358,808 @@ export default function App() {
       setActivePlanId(null);
       setStatus("idle");
     }
+  }
+
+  /**
+   * 「补记完成（不重写原表）」：全部动作早已被服务端记为完成，只剩最终回执。
+   *
+   * 这一趟**不调用 `executePlan`**：连"从第 N 步开始执行"都不走 —— 那会重新进宿主
+   * 写路径。服务端的 `complete` 只在 `next_action_index = 动作总数` 且没有在途动作时
+   * 才接受，所以这里唯一的写入是账本。
+   */
+  async function backfillOfficeCompletion(message: ChatMessage): Promise<void> {
+    const resume = message.officeResume;
+    if (!resume) return;
+    if (!(await targetGuard.check())) return;
+    const pending = loadPendingOfficeExecution();
+    if (!pending || pending.operationId !== resume.operationId) {
+      updateFolderResumeMessage(message.id, (current) => ({
+        ...current,
+        text: OFFICE_RECOVERY_MISSING_INDEX,
+        officeResume: current.officeResume
+          ? {
+              ...current.officeResume,
+              acting: null,
+              verdict: { kind: "blocked", detail: OFFICE_RECOVERY_MISSING_INDEX }
+            }
+          : undefined
+      }));
+      return;
+    }
+    updateFolderResumeMessage(message.id, (current) => ({
+      ...current,
+      officeResume: current.officeResume ? { ...current.officeResume, acting: "backfill" } : undefined
+    }));
+    beginActivity("正在补记完成回执", "只提交账本状态，不执行任何动作、不写单元格。", {
+      operationId: resume.operationId,
+      phase: "preflight",
+      stepId: "execution.office.backfill"
+    });
+    setStatus("executing");
+    let state: OfficeExecutionState | null = null;
+    try {
+      state = await getOfficeExecutionStatus(resume.operationId);
+      assertOfficeRecoveryIdentity(state);
+      // 终态闸：已经撤销的执行**不许**被补记成完成（那会把回退掉的执行记成干完了）。
+      const terminal = officeExecutionTerminalReason(state);
+      if (terminal) {
+        updateFolderResumeMessage(message.id, (current) => ({
+          ...current,
+          text: terminal,
+          officeResume: current.officeResume
+            ? officeRecoveryCardFor(state!, OFFICE_RECOVERY_NO_EVIDENCE)
+            : undefined
+        }));
+        finishActivity("warning", "这次执行已撤销，未补记");
+        return;
+      }
+      const verdict = officeRecoveryVerdictFor(state, OFFICE_RECOVERY_NO_EVIDENCE);
+      if (verdict.kind !== "completed") {
+        const evidence = await officeRecoveryEvidenceFor(state);
+        updateFolderResumeMessage(message.id, (current) => ({
+          ...current,
+          text: "这条恢复提示的结论已经变化，卡片已按最新状态更新；本次没有写入任何单元格。",
+          officeResume: current.officeResume
+            ? officeRecoveryCardFor(state!, evidence)
+            : undefined
+        }));
+        finishActivity("warning", "结论已变化，未补记");
+        return;
+      }
+      const claimed = await claimOfficeExecutionResume(state.operationId, state.revision);
+      if (!claimed.ownerToken) {
+        throw new Error("服务端没有授予补记这次执行的权限，账本未改动。");
+      }
+      const actionCount = claimed.plan.actions.length;
+      // 领取后现场仍需是"全部动作已完成、没有在途动作"：否则这一趟就不是补记。
+      if (claimed.inFlightActionIndex != null || claimed.nextActionIndex !== actionCount) {
+        await suspendOfficeExecutionQuietly(claimed, "OFFICE_BACKFILL_CONFLICT", "领取后现场变化。");
+        throw new Error("领取执行权后现场发生变化，未补记完成。");
+      }
+      const finished = await finishOfficeExecution(claimed.operationId, {
+        expectedRevision: claimed.revision,
+        ownerToken: claimed.ownerToken,
+        result: { backfilled: true, actionCount }
+      });
+      state = finished;
+      clearPendingOfficeExecution(finished.operationId);
+      updateFolderResumeMessage(message.id, (current) => ({
+        ...current,
+        text: `已补记这次写入的完成回执（${actionCount} 个动作）。补记只改账本状态，原表未再做任何写入。`,
+        officeResume: undefined
+      }));
+      finishActivity("completed", "已补记完成，原表未再做写入");
+    } catch (reason) {
+      const detail = reason instanceof Error ? reason.message : String(reason);
+      await suspendOfficeExecutionQuietly(state, "OFFICE_BACKFILL_INTERRUPTED", detail);
+      updateFolderResumeMessage(message.id, (current) => ({
+        ...current,
+        text: detail,
+        officeResume: current.officeResume
+          ? { ...current.officeResume, acting: null, verdict: { kind: "blocked", detail } }
+          : undefined
+      }));
+      finishActivity("warning", "补记未完成，账本未改动");
+    } finally {
+      setStatus("idle");
+    }
+  }
+  /**
+   * 续跑判定用的"此刻的授权表名"。
+   *
+   * 口径与规划续跑那一处**逐字一致**（先已提交的范围，没有再退回当前选择）：
+   * 两处各写一份就会出现"续分析认为授权是两张、续跑认为是三张"这种只在真机上
+   * 才发现的错位。读不到（工作目录模式 / 工作簿还没读完）返回 `null`，由共享判据
+   * 说"还没读到"，**不**用登记时的授权顶替。
+   */
+  /**
+   * 记下一次**用户确认**过的授权范围 —— 唯一写入点，且只在确认真的成功之后调用。
+   *
+   * `null` 表示"这次口径下没有可比对的显式名单"（跟随当前表 / 工作目录）：此时续跑
+   * 判定**不**比对授权，而不是把它当成"一张表都没授权"。
+   */
+  function recordConfirmedScope(names: readonly string[] | null): void {
+    officeScopeConfirmedRef.current = names ? [...names] : null;
+    setOfficeScopeConfirmedRevision((value) => value + 1);
+  }
+
+  function resumeAuthorizedNames(): string[] | null {
+    if (sourceMode !== "workbook" || !workbook) return null;
+    return officeScopeConfirmedRef.current;
+  }
+
+  /**
+   * 这一条未完成执行现在能不能摆成"可续跑"的卡。
+   *
+   * 判据在共享层（`pendingResumeReadiness`）：身份 → 状态 → 授权集合 → 在途材料，
+   * 一处返回点一个原因码。这里只负责把宿主的当前读数（身份、授权、工作表目录）
+   * 填进去，**不**添加任何"宽松版本"。
+   */
+  function officeResumeReadinessFor(state: OfficeExecutionState) {
+    return pendingResumeReadiness({
+      currentIdentity: currentOfficeRecoveryIdentity(),
+      recordedIdentity: state.workbookIdentity,
+      status: state.status,
+      canResume: state.canResume,
+      inFlightActionIndex: state.inFlightActionIndex ?? null,
+      hasBeforeSnapshot: Boolean(state.beforeSnapshot),
+      recordedAuthorizedSheets: state.authorizedSheetNames,
+      currentAuthorizedSheets: resumeAuthorizedNames(),
+      planTargetSheets: pendingResumeTargetSheets(state.plan),
+      workbookSheetNames: workbook ? workbook.worksheets.map((sheet) => sheet.name) : null
+    });
+  }
+
+  /**
+   * 「来源还能不能沿用」的结论（判据本体是 core 的 `verifyFormulaResumeSources`，
+   * 与 `executePlan` 续跑前用的是**同一个函数**，不另写一份）。
+   *
+   * 为什么必须在**出结论的地方**问一次：2026-10-31 真机上，来源改动让续跑被正确拒绝；
+   * 重开窗格后卡片却说"来源和目标已核对，可继续剩余动作" —— 因为发现阶段只读账本，
+   * 一次都没读过来源表。判据一直在，只是从来没人在显示这一侧问过它。
+   */
+  async function officeSourceVerdictFor(
+    state: OfficeExecutionState,
+    options: { fresh?: boolean } = {}
+  ): Promise<ExecutionRecoverySourceVerdict> {
+    const key = [
+      state.operationId,
+      state.workbookIdentity,
+      state.revision,
+      state.nextActionIndex,
+      state.inFlightActionIndex ?? "-",
+      state.plan.id,
+      state.plan.sourceDependencyFingerprint ?? "-"
+    ].join("|");
+    const cached = officeSourceVerdictRef.current;
+    if (!options.fresh && cached?.key === key) return cached.verdict;
+    let verdict: ExecutionRecoverySourceVerdict;
+    try {
+      const outcome = await verifyFormulaResumeSources(state.plan, (sheets) =>
+        captureWorkbookSourceFingerprint([...sheets])
+      );
+      verdict =
+        outcome.verdict === "ok"
+          ? { state: "matched" }
+          : outcome.verdict === "not-applicable"
+            ? { state: "not-required" }
+            : { state: "refused", reason: outcome.reason };
+    } catch (reason) {
+      verdict = {
+        state: "refused",
+        reason: reason instanceof Error ? reason.message : FORMULA_SOURCE_UNVERIFIABLE_MESSAGE
+      };
+    }
+    // 只缓存正面结论：负面结论每次重算，来源改回登记值之后卡面自己会回来。
+    officeSourceVerdictRef.current =
+      verdict.state === "refused" ? null : { key, verdict };
+    return verdict;
+  }
+
+  /**
+   * 「这次执行写入过的目标现在还是不是它留下的样子」（判据本体是 core 的
+   * `verifyResumeScene`）。
+   *
+   * 它挡的是**账本与表已经不一致**的那一类现场：撤销成功但处置留痕上报失败时，
+   * 账本只剩"已完成 2 / 共 3 步"，表却已经被撤销清空 —— 照账本续跑会在一次已经
+   * 回退掉的执行后面补写第 3 步，并把它记成完成。
+   *
+   * 账本**没有**写前快照时不在这里加新闸：那种执行连撤销入口都没有，续跑资格仍按
+   * 既有判据（`pendingResumeReadiness`）判，本轮不改变它的行为。
+   */
+  async function officeSceneVerdictFor(state: OfficeExecutionState): Promise<ResumeSceneOutcome> {
+    const checkpoint = state.checkpoint ?? null;
+    if (!checkpoint) return { ok: true, checked: 0 };
+    const completedActionCount = state.nextActionIndex;
+    const coveredActionIndexes = checkpoint.ranges
+      .filter((range) => typeof range.postFingerprint === "string" && range.postFingerprint.trim())
+      .map((range) => range.actionIndex);
+    let observations: Awaited<ReturnType<typeof observeOfficeExecutionPostState>> = [];
+    try {
+      observations = await observeOfficeExecutionPostState(checkpoint);
+    } catch {
+      // 读不到就按"没读到"处理（不是"没变"）。
+      observations = [];
+    }
+    return verifyResumeScene({ completedActionCount, coveredActionIndexes, observations });
+  }
+
+  /** 结论需要的两份现场证据（都没有副作用：只读账本读数 + 只读单元格）。 */
+  type OfficeRecoveryEvidence = {
+    source: ExecutionRecoverySourceVerdict;
+    scene: ResumeSceneOutcome;
+  };
+
+  const OFFICE_RECOVERY_NO_EVIDENCE: OfficeRecoveryEvidence = {
+    source: { state: "unverified" },
+    scene: { ok: true, checked: 0 }
+  };
+
+  /** 这一条执行是不是已经是终态（本机确认撤销 / 账本留了处置痕）。 */
+  function officeExecutionTerminalReason(state: OfficeExecutionState): string | null {
+    if (
+      officeUndoTerminalRef.current?.operationId === state.operationId ||
+      officeUndoDone?.operationId === state.operationId
+    ) {
+      return "这次执行已经撤销，不会再执行或补记任何动作；如需重新计算，请另起一次任务。";
+    }
+    if (state.disposition?.undoneAt) {
+      return "这次执行已经撤销过（账本已留处置痕），不会再执行或补记任何动作。";
+    }
+    if (state.disposition?.abandonedAt) {
+      return "这次执行已按「放弃变更」处置过，不会再执行或补记任何动作。";
+    }
+    return null;
+  }
+
+  /**
+   * 为一次账本读数取**证据**：先现场、再来源。
+   *
+   * 只有"还有动作没跑"这一支需要证据 —— 待核对（在途动作）、已完成、已处置的结论
+   * 都不依赖来源与写后现场，为它们去读整张来源表纯属浪费。
+   * 现场先判：如果写入过的目标已经不在了，就先说这件事（用户要做的是撤销），
+   * 不必再读一遍来源。
+   */
+  async function officeRecoveryEvidenceFor(
+    state: OfficeExecutionState,
+    options: { fresh?: boolean } = {}
+  ): Promise<OfficeRecoveryEvidence> {
+    if (officeExecutionTerminalReason(state)) return OFFICE_RECOVERY_NO_EVIDENCE;
+    if (state.status === "completed") return OFFICE_RECOVERY_NO_EVIDENCE;
+    if ((state.inFlightActionIndex ?? null) != null || state.requiresReconciliation) {
+      return OFFICE_RECOVERY_NO_EVIDENCE;
+    }
+    const remaining = Math.max(0, state.plan.actions.length - state.nextActionIndex);
+    if (remaining === 0) return OFFICE_RECOVERY_NO_EVIDENCE;
+    const scene = await officeSceneVerdictFor(state);
+    if (!scene.ok) return { source: { state: "unverified" }, scene };
+    return { scene, source: await officeSourceVerdictFor(state, options) };
+  }
+
+  /**
+   * 把宿主读数翻成**用户可见的恢复结论**（和 WPS 读同一份呈现契约）。
+   *
+   * 判定输入：共享层 `pendingResumeReadiness`（身份 → 状态 → 授权 → 在途材料）、
+   * 现场判据（`verifyResumeScene`）、来源判据（`verifyFormulaResumeSources`）。
+   * 这里只做宿主才有的翻译：
+   *
+   * 1. **在途动作 ⇒ `reconcile`，"还有动作没跑" ⇒ 续跑结论**：两个互斥结论，
+   *    各自一个按钮。发现阶段不读单元格，所以在途动作的现场结论是 `pending`，
+   *    点「核对在途动作」之后才变成 applied / not_applied。
+   * 2. 服务端说"需要核对"却没给在途动作号 ⇒ `insufficient`：状态自相矛盾，
+   *    不许自己挑一个动作去补记。
+   * 3. **终态优先**：已撤销（本机或账本）⇒ `undone`，一个写入/补记/再撤按钮都不给。
+   *    以前这里只看账本 `disposition`，本机撤销成功不参与 ⇒ 同一张卡既说"已撤销"
+   *    又说"可继续剩余动作"，按钮还能点。
+   */
+  function officeRecoveryVerdictFor(
+    state: OfficeExecutionState,
+    evidence: OfficeRecoveryEvidence
+  ): OfficeRecoveryVerdict {
+    /*
+     * 已经处置过（撤销/放弃）的执行不再给"继续 / 补记"。
+     *
+     * 为什么必须在这里挡（而不是只在撤销按钮上挡）：写前快照被恢复之后，账本里的
+     * "已完成 N 步"已经**不再描述现在的表**。此时允许续跑，会只写剩下那一步、
+     * 然后把它标成"全部完成"；允许补记，会把一次已经回退掉的执行记成完成。
+     *
+     * `undone` 是终态（撤销已经完成，没有第二个动作可做）；`abandoned` 仍用
+     * `blocked` —— 它说的是"回退过了，需要人工核对"，不是"我们撤销的"。
+     */
+    if (
+      officeUndoTerminalRef.current?.operationId === state.operationId ||
+      officeUndoDone?.operationId === state.operationId
+    ) {
+      return { kind: "undone" };
+    }
+    if (state.disposition?.undoneAt) {
+      return {
+        kind: "undone",
+        /*
+         * 账本说已经撤销过（通常是**另一台机器**撤的）：本机没动手，表格现场未知，
+         * 不能用默认的"本次写入已回到执行前"。保留账本处置痕的原文措辞。
+         */
+        detail: "这次执行已经撤销过（账本已留处置痕），不会再执行或补记任何动作。"
+      };
+    }
+    if (state.disposition?.abandonedAt) {
+      return {
+        kind: "blocked",
+        detail: "这次执行已按「放弃变更」处置过，原表已按恢复点还原；不能再继续剩余动作或补记完成。",
+        /*
+         * `abandoned: true` = 用户已经做过决定，结论不会再变（终态）。
+         * 它仍是 `blocked`（不给写入/补记按钮），但与"现场冲突、执行权被占、
+         * 来源变化"这些**还要人核对**的阻断分开：只有这一种可以退出固定区域，
+         * 换成消息里一条可展开的终态摘要（2026-11-01）。
+         */
+        abandoned: true
+      };
+    }
+    const readiness = officeResumeReadinessFor(state);
+    if (!readiness.ready) {
+      // 已完成不是"阻断"：账本本来就有结果，只是这里没有可给的写入按钮。
+      return readiness.reason === "completed"
+        ? { kind: "completed", recorded: true }
+        : { kind: "blocked", detail: readiness.detail };
+    }
+    const total = state.plan.actions.length;
+    const inFlight = state.inFlightActionIndex ?? null;
+    if (inFlight != null) {
+      return {
+        kind: "reconcile",
+        actionIndex: inFlight,
+        outcome: "pending",
+        remaining: Math.max(0, total - inFlight - 1)
+      };
+    }
+    if (state.requiresReconciliation) {
+      return {
+        kind: "insufficient",
+        detail: "服务端标记需要核对，但没有给出在途动作位置，无法安全补记。"
+      };
+    }
+    /*
+     * 现场先于来源：写入过的目标如果已经不在了（例如撤销成功但处置留痕没上报成功），
+     * 先说的是"账本与表已经不一致"，而不是把它当成"可继续"。
+     *
+     * `sceneChanged: true` 是给**撤销行**的信号：目标不在写后状态，既不能续跑，也不能
+     * 再"撤销回退"（已经回退过），所以撤销入口要一起收走，不能卡面说阻断、撤销还亮着。
+     */
+    if (!evidence.scene.ok) {
+      return evidence.scene.reason === "changed"
+        ? { kind: "blocked", detail: evidence.scene.detail, sceneChanged: true }
+        : { kind: "blocked", detail: evidence.scene.detail };
+    }
+    const remaining = Math.max(0, total - state.nextActionIndex);
+    return executionRecoveryResumeVerdict(remaining, evidence.source);
+  }
+
+  /**
+   * 把账本状态翻成「重开后能不能撤销已写入的内容」的输入（判定在共享层）。
+   *
+   * 这里只做**宿主侧读数**：当前工作簿身份、当前已确认授权、计划动作的可恢复目标。
+   * 刻意**不**喂来源证据 —— 撤销不依赖来源是否还一致（那是续跑的事）。
+   */
+  function officeUndoRebuildFor(state: OfficeExecutionState, structuralOnly = false) {
+    return rebuildExecutionUndo<ExecutionUndoSnapshot>({
+      operationId: state.operationId,
+      status: state.status,
+      planId: state.plan.id,
+      workbookIdentity: state.workbookIdentity,
+      nextActionIndex: state.nextActionIndex,
+      inFlightActionIndex: state.inFlightActionIndex ?? null,
+      requiresReconciliation: state.requiresReconciliation,
+      checkpoint: state.checkpoint ?? null,
+      recordedAuthorization: state.authorizedSheetNames,
+      currentAuthorization: structuralOnly ? null : resumeAuthorizedNames(),
+      currentIdentity: currentOfficeRecoveryIdentity(),
+      targets: state.plan.actions.map((action, index) => {
+        const range = recoverableActionRange(action);
+        return range ? { actionIndex: index, sheet: action.sheet, range } : null;
+      }),
+      disposition: state.disposition ?? null
+    });
+  }
+
+  /**
+   * 恢复卡上的撤销行（**唯一**入口；历史消息里那份仍然只读）。
+   *
+   * 三种状态各自说清一件事：可撤销（写前快照已登记）／阻断（为什么不能，且不假装
+   * 已撤销）／已撤销（本次写入回到了执行前，来源保持用户现在的修改）。
+   */
+  function officeRecoveryUndoFor(
+    entry: NonNullable<typeof officeRecoveryEntry>
+  ): {
+    state: "available" | "blocked" | "done";
+    detail: string;
+    label?: string;
+    onUndo?: () => void;
+  } | undefined {
+    if (officeUndoDone?.operationId === entry.operationId) {
+      return { state: "done", detail: officeUndoDone.detail };
+    }
+    /*
+     * 现场已不在写后状态（`sceneChanged`）：这次执行写入过的目标已经被人撤销/改掉，
+     * 既不能续跑，也不能再"撤销回退"（已经回退过）。卡面结论（verdict）已经说阻断，
+     * 撤销行也要跟着收走 —— 否则"卡面说阻断、撤销按钮却还亮着"，点下去只会
+     * `assertUndoPostState` fail-closed，按钮本身就是误导。
+     */
+    if (entry.card.verdict.kind === "blocked" && entry.card.verdict.sceneChanged) {
+      return { state: "blocked", detail: entry.card.verdict.detail };
+    }
+    const state = officeLedgerStates.current.get(entry.operationId);
+    // 还没读到这次执行的账本状态 ⇒ 不宣称任何结论（不画"也许能撤销"）。
+    if (!state) return undefined;
+    const outcome = officeUndoRebuildFor(state);
+    if (!outcome.available) {
+      // 「一个动作都没写成」不是异常：没有可撤销的东西就不该多一块说明。
+      return outcome.reason === "nothing_written" ? undefined : { state: "blocked", detail: outcome.detail };
+    }
+    const stackIndex = undoStack.findIndex((snapshot) => snapshot.executionId === entry.operationId);
+    const alsoUndone = stackIndex >= 0 ? undoStack.length - 1 - stackIndex : 0;
+    const detail = undoRecoveryDetail(
+      outcome.writtenActionCount,
+      outcome.rangeCount,
+      state.plan.sourceDependencySheets ?? []
+    ) + (alsoUndone > 0
+      ? `这次撤销会连带你之后执行的 ${alsoUndone} 次写入一起回退（它们可能改过同一区域）。`
+      : "");
+    return {
+      state: "available",
+      detail,
+      label: alsoUndone > 0 ? `${UNDO_RECOVERY_LABEL}（含之后 ${alsoUndone} 次）` : UNDO_RECOVERY_LABEL,
+      onUndo: () => void undoOfficeRecoveredExecution(entry.operationId)
+    };
+  }
+
+  /**
+   * 撤销这次未完成执行**已经写入**的内容。
+   *
+   * 走的是既有链路：`undoExecutionTo` → 目标守卫 → `undoExecution`（`assertUndoPostState`
+   * 先核身份与每个区域的执行后指纹，不通过就整次只读失败）→ 成功后才 `onRestored`
+   * 留痕（`undone`）。所以：目标被人改过 ⇒ 拒绝且零写入；留痕只在真的恢复之后写。
+   */
+  async function undoOfficeRecoveredExecution(operationId: string): Promise<void> {
+    /*
+     * 终态闸（第一处）：已经撤销过就**一次也不再撤**。
+     *
+     * 这条不只是"按钮不该还在"的兜底 —— 它同时是"绝不二次宿主撤销"的唯一判据点：
+     * 旧回调、迟到的渲染、或者用户连点两下，都从这里被挡住。本机终态与账本处置痕
+     * 分开看，任一成立都不动手。
+     */
+    if (officeUndoTerminalRef.current?.operationId === operationId) return;
+    let state = officeLedgerStates.current.get(operationId) ?? null;
+    if (!state) return;
+    /*
+     * 点下去之前按**最新**账本读数复核：处置痕可能是别的窗格或另一台机器写的。
+     * 读不到就沿用本机那份读数（撤销本身还有宿主的写后指纹闸兜底），
+     * 读到了就以它为准 —— 绝不用一个可能过期的读数去动宿主。
+     */
+    try {
+      const latest = await getOfficeExecutionStatus(operationId);
+      rememberOfficeState(latest);
+      state = latest;
+    } catch {
+      // 读不到：不改判，继续按本机读数走既有的撤销链路。
+    }
+    if (officeExecutionTerminalReason(state)) {
+      /*
+       * 账本已留处置痕 / 本机已确认撤销：**不动宿主**，只让卡面收敛到终态。
+       * ref 已经能表达结论，但界面要重画一次（渲染读的是消息里那份卡），
+       * 所以这里把这张卡就地改成终态，而不是等下一次发现。
+       */
+      updateOfficeRecoveryMessage(
+        operationId,
+        "这次执行已经撤销过；本次没有再次写入或回退任何单元格。",
+        officeRecoveryCardFor(state, OFFICE_RECOVERY_NO_EVIDENCE)
+      );
+      return;
+    }
+    const outcome = officeUndoRebuildFor(state);
+    if (!outcome.available || !state.checkpoint) return;
+    /*
+     * 点下去之前再挂一次（幂等）：挂载那一刻身份可能还读不到、没挂进栈，
+     * 现在条件成立了才点得到 —— 不因为一次读数的时机让按钮变成死键。
+     */
+    ensureUndoSnapshot({
+      ...state.checkpoint,
+      planId: state.plan.id,
+      executionId: state.operationId,
+      workbookIdentity: state.workbookIdentity
+    });
+    officeUndoOriginRef.current = "recovery";
+    let restored = false;
+    try {
+      restored = (await undoExecutionTo(operationId)) === true;
+    } finally {
+      officeUndoOriginRef.current = null;
+    }
+    // 撤销失败 ⇒ 什么都不标：卡面仍是"可撤销"，账本也不留"已撤销"的痕（失败就是没撤销）。
+    if (!restored) return;
+    /*
+     * 宿主恢复成功的那一刻就**立刻**是终态：ref 同步生效（同一 tick 里后面要构造的卡
+     * 就能读到），state 负责让界面重画。两件事分开写 —— 只有 state 会晚一拍，
+     * 而"重开/迟到响应把终态覆盖回可继续"正是晚一拍造成的。
+     */
+    const done = {
+      operationId,
+      detail:
+        `已撤销本次执行：这次写入的 ${outcome.writtenActionCount} 个动作（${outcome.rangeCount} 个区域）已回到执行前；` +
+        "来源保持你现在的修改，没有重新执行计划。"
+    };
+    officeUndoTerminalRef.current = done;
+    setOfficeUndoDone(done);
+    /*
+     * 把这张卡本身改成终态。**不能只靠撤销行**：卡面的结论（verdict）来自消息里
+     * 存的那一份，不重写它就会同时出现"已撤销本次执行"（撤销行）与
+     * "可继续剩余动作"（结论 + 按钮）—— 2026-10-31 真机就是这样。
+     */
+    updateOfficeRecoveryMessage(
+      operationId,
+      "这次执行已撤销：本次写入已回到执行前，来源保持你现在的修改。",
+      officeRecoveryCardFor(state, OFFICE_RECOVERY_NO_EVIDENCE)
+    );
+  }
+
+
+  /** 就地把某条执行对应的恢复卡改成新的读数（找不到那张卡就什么都不做）。 */
+  function updateOfficeRecoveryMessage(
+    operationId: string,
+    text: string,
+    resume: NonNullable<ChatMessage["officeResume"]>
+  ): void {
+    const updatedAt = new Date().toISOString();
+    setChatHistory((current) => ({
+      ...current,
+      conversations: current.conversations.map((conversation) => {
+        if (!conversation.messages.some((message) => message.officeExecutionId === operationId)) {
+          return conversation;
+        }
+        return {
+          ...conversation,
+          messages: conversation.messages.map((message) =>
+            message.officeExecutionId === operationId ? { ...message, text, officeResume: resume, createdAt: updatedAt } : message
+          ),
+          updatedAt
+        };
+      })
+    }));
+  }
+
+  /**
+   * 把一条未完成执行摆到界面（**只读**：GET 状态 + 本机判定）。
+   *
+   * 不 claim、不 reconcile、不推进 revision、不执行动作、不写单元格。发现只恢复"入口"，
+   * 写入资格仍要在用户点续跑时按既有路径重新取得。
+   *
+   * `isCurrent` 是代数闸：身份/授权变化后迟到的响应不许落盘到界面 —— 那会把上一个
+   * 工作簿（或上一次授权）的结论画到当前现场上。
+   *
+   * 阻断时不写本机索引：索引会让下一次挂载直接挂接这条执行，而**当前这条本来就不能跑**。
+   */
+  const adoptOfficeRecoveryCandidate = async (
+    candidate: { operationId: string },
+    isCurrent: () => boolean,
+    source: "selected" | "auto"
+  ): Promise<
+    | { kind: "adopted"; ready: boolean }
+    | { kind: "settled" }
+    | { kind: "unavailable" }
+    | { kind: "abandoned" }
+  > => {
+    // 先清候选列表：无论结果如何，用户都已经（或自动）做出了选择，不该停在两份入口上。
+    if (source === "selected") setOfficeRecoveryChoices(null);
+    let state: OfficeExecutionState | null = null;
+    try {
+      state = await getOfficeExecutionStatus(candidate.operationId);
+    } catch {
+      state = null;
+    }
+    if (!isCurrent()) return { kind: "abandoned" };
+    if (!state) {
+      // 发现说"有"、状态却读不出：不许退化成"没有未完成任务"。
+      setOfficeDiscoveryFailure(PENDING_DISCOVERY_UNAVAILABLE_DETAIL);
+      return { kind: "unavailable" };
+    }
+    if (state.status === "completed") {
+      /*
+       * 已完成的记录**不是**"待续写"：挂载那条路已经负责"找回完成回执"（并回收本机
+       * 索引）。发现这条路不许把它改写成一张"这一条现在不能继续"的卡 —— 那是同一件事
+       * 的两种说法，而后者会让用户以为还有活没干完。
+       */
+      clearPendingOfficeExecution(state.operationId);
+      return { kind: "settled" };
+    }
+    const readiness = officeResumeReadinessFor(state);
+    if (!isCurrent()) return { kind: "abandoned" };
+    /*
+     * 先取证据再摆卡：发现阶段读一次来源与写后现场（只读），卡片结论才有依据 ——
+     * 而不是先画一张"来源已核对、可继续"，等用户点下去再被来源判据打回。
+     * 身份/授权在等证据期间变了，`isCurrent` 会把这个结果作废。
+     */
+    const evidence = await officeRecoveryEvidenceFor(state);
+    if (!isCurrent()) return { kind: "abandoned" };
+    const noticeId = messageId();
+    const pendingIndex: PendingOfficeExecution = {
+      schemaVersion: 1,
+      operationId: state.operationId,
+      conversationId: chatHistory.activeConversationId,
+      activityMessageId: noticeId,
+      workbookIdentity: state.workbookIdentity,
+      createdAt: new Date().toISOString()
+    };
+    if (readiness.ready) savePendingOfficeExecution(pendingIndex);
+    const notice = officeRecoveryNoticeFor(state, evidence);
+    appendOfficeExecutionNotice(
+      {
+        conversationId: pendingIndex.conversationId,
+        operationId: state.operationId,
+        activityMessageId: noticeId
+      },
+      notice.text,
+      notice.card
+    );
+    /*
+     * 只有"能跑"的卡（或用户亲手点的那条）才算"这件事已经有主"。
+     * 自动发现出来的阻断卡不算：它必须让后端发现继续往下走，否则一条读不到现场的
+     * 旧索引会把真正待核对的执行挡在门外。
+     */
+    if (readiness.ready || source === "selected") {
+      officeSelectedRecoveryRef.current = { operationId: state.operationId, source };
+    }
+    setOfficeDiscoveryFailure(null);
+    return { kind: "adopted", ready: readiness.ready };
+  };
+
+  /**
+   * 对**用户已选定的那一条**重新核验（只读）。
+   *
+   * 保护的本意是"不许被别的候选改判"，不是"不许对同一条重算结论"：授权收窄、
+   * 工作簿另存为、服务端进度推进之后，卡面必须按最新读数更新，否则用户已经改正了
+   * 授权，界面还在说上一次的理由。
+   *
+   * 三条边界：**同一条**（operationId 取自当前选择，不换成缓存或发现的别的候选）；
+   * **只读**（只 GET 状态 + 本机判定）；**不改判据**（同一个 `officeResumeReadinessFor`）。
+   */
+  const reverifySelectedOfficeRecovery = async (isCurrent: () => boolean): Promise<void> => {
+    const current = officeSelectedRecoveryRef.current;
+    if (!current) return;
+    if (officeRecoveryActionLock.current) return;
+    const operationId = current.operationId;
+    let latest: OfficeExecutionState | null = null;
+    try {
+      latest = await getOfficeExecutionStatus(operationId);
+    } catch {
+      latest = null;
+    }
+    if (!isCurrent()) return;
+    if (!latest) {
+      // 读不到时**保留卡片**：清卡等于把用户的入口弄丢。
+      setOfficeDiscoveryFailure(PENDING_DISCOVERY_UNAVAILABLE_DETAIL);
+      return;
+    }
+    const readiness = officeResumeReadinessFor(latest);
+    if (!isCurrent() || officeRecoveryActionLock.current) return;
+    if (officeSelectedRecoveryRef.current?.operationId !== operationId) return;
+    /*
+     * 只读重核**必须 fresh 重读证据**：这里正是"来源被改回去 / 授权被改正"之后
+     * 用户点「重新核对」的那一下。用缓存就会把上一次的结论（比如"来源已变化"）
+     * 原样端回来，永远不会恢复。场景键虽然能挡掉一部分，但 fresh 才是"按现在的现场
+     * 重新判断"的明确语义。
+     */
+    const evidence = await officeRecoveryEvidenceFor(latest, { fresh: true });
+    if (!isCurrent() || officeRecoveryActionLock.current) return;
+    if (officeSelectedRecoveryRef.current?.operationId !== operationId) return;
+    if (readiness.ready) {
+      savePendingOfficeExecution({
+        schemaVersion: 1,
+        operationId: latest.operationId,
+        conversationId: chatHistory.activeConversationId,
+        activityMessageId: messageId(),
+        workbookIdentity: latest.workbookIdentity,
+        createdAt: new Date().toISOString()
+      });
+    }
+    const notice = officeRecoveryNoticeFor(latest, evidence);
+    updateOfficeRecoveryMessage(operationId, notice.text, notice.card);
+    setOfficeDiscoveryFailure(null);
+  };
+
+  /**
+   * CAP-03（Excel）：重新发现未完成执行。
+   *
+   * 顺序**缓存优先、后端兜底**：本地索引还在且身份对得上就先查它（快捷方式，不是权威）；
+   * 索引不在 / 读不到 / 不能续跑，就按当前工作簿身份走 `GET /api/office/executions/pending`。
+   * 多条候选只给选择入口，一条也不自动选；服务不可达说"暂时读不到"。
+   *
+   * 全程只读：不 claim、不补记、不推进 revision、不写单元格。
+   */
+  const discoverOfficeRecovery = async (identity: string | null, isCurrent: () => boolean): Promise<void> => {
+    if (sourceMode !== "workbook" || officeRecoveryActionLock.current) return;
+    const selected = officeSelectedRecoveryRef.current;
+    /*
+     * 用户已经点过一条：那张卡就是用户的决定，自动发现不许改判或退回候选列表。
+     * 但身份/授权变化后必须对**同一条**重算结论（`reverifySelectedOfficeRecovery`）。
+     * 身份读不出来时既不拦也不重算 —— 读不到 ≠ 换簿，也没有可比的现场。
+     */
+    if (selected && identity !== null) {
+      await reverifySelectedOfficeRecovery(isCurrent);
+      return;
+    }
+    if (selected) return;
+    /*
+     * 索引在时由挂载效应独占这条记录（同一个 GET 不查第二次）；这里只在"挂载效应
+     * 没有接手"的情况下才读索引 —— 那是"索引存在但这一轮没跑挂载效应"的兜底。
+     */
+    const pending = officeIndexAttachRef.current ? null : loadPendingOfficeExecution();
+    let actionable = false;
+    if (pending && identity !== null && pending.workbookIdentity === identity) {
+      const adopted = await adoptOfficeRecoveryCandidate({ operationId: pending.operationId }, isCurrent, "auto");
+      if (adopted.kind === "abandoned") return;
+      if (adopted.kind === "settled") return;
+      actionable = adopted.kind === "adopted" && adopted.ready;
+      if (actionable) return;
+    }
+    if (identity === null) {
+      // 身份不可读（未保存 / 宿主还没就绪）：不用文件名猜，也不采纳浏览器索引。
+      if (!pending) {
+        setOfficeRecoveryChoices(null);
+        setOfficeDiscoveryFailure(null);
+      }
+      return;
+    }
+    const outcome = await discoverOfficePendingExecutions({ identity: () => identity });
+    if (!isCurrent()) return;
+    if (outcome.kind === "no_identity") return;
+    if (outcome.kind === "unavailable") {
+      // 已经摆着一条卡时，只把"暂时读不到"挂出去；清卡等于把入口弄丢。
+      setOfficeDiscoveryFailure(outcome.reason ? `${outcome.detail}（${outcome.reason}）` : outcome.detail);
+      return;
+    }
+    const selection = outcome.selection;
+    if (selection.kind === "mismatch") {
+      setOfficeDiscoveryFailure(selection.detail);
+      return;
+    }
+    if (selection.kind === "none") {
+      // "这个工作簿没有未完成执行"不等于"把已有结论清掉"：只在确实没有卡片时收尾。
+      if (!pending) {
+        setOfficeRecoveryChoices(null);
+        setOfficeDiscoveryFailure(null);
+      }
+      return;
+    }
+    if (selection.kind === "choose") {
+      setOfficeRecoveryChoices({ candidates: selection.candidates, truncated: selection.truncated });
+      setOfficeDiscoveryFailure(null);
+      return;
+    }
+    if (officeSelectedRecoveryRef.current?.operationId === selection.candidate.operationId) return;
+    await adoptOfficeRecoveryCandidate(selection.candidate, isCurrent, "auto");
+  };
+
+  /** 用户显式点选一条候选：只有这一步会把"发现结果"变成"这张卡"。 */
+  const selectOfficeRecoveryCandidate = async (candidate: PendingExecutionCandidate): Promise<void> => {
+    const generation = officeDiscoveryGenerationRef.current;
+    await adoptOfficeRecoveryCandidate(
+      candidate,
+      () => generation === officeDiscoveryGenerationRef.current,
+      "selected"
+    );
+  };
+
+  /**
+   * 卡片上的「重新核对（只读）」。
+   *
+   * 与自动刷新走**同一个** `reverifySelectedOfficeRecovery`：同一份判据、同一条执行，
+   * 不因为"用户点了一下"就换一套更宽松的校验。只递增代数，让还在飞的那次发现作废。
+   */
+  async function reverifyOfficeRecoveryMessage(message: ChatMessage): Promise<void> {
+    const resume = message.officeResume;
+    if (!resume) return;
+    const generation = (officeDiscoveryGenerationRef.current += 1);
+    officeSelectedRecoveryRef.current = { operationId: resume.operationId, source: "auto" };
+    await reverifySelectedOfficeRecovery(() => generation === officeDiscoveryGenerationRef.current);
   }
 
   async function resumeInterruptedFolderOperation(message: ChatMessage): Promise<void> {
@@ -4396,6 +5805,12 @@ export default function App() {
         }
         if (!isCurrent()) return false;
         commitAuthorizedScope([], "manual");
+        /*
+         * 清空也是一次**用户确认**：从这里起续跑判定拿"零张表"去比，卡面必须立刻变红。
+         * 漏掉这一句时，撤权之后卡片仍写着"可继续"，只有点下去才失败 —— 用户已经收回了
+         * 授权，界面还在替他说"没问题"。
+         */
+        recordConfirmedScope(sourceMode === "folder" ? null : []);
         return true;
       }
       const checked = await scopeAdmission.verify();
@@ -4464,6 +5879,7 @@ export default function App() {
                 setWorkbook(snapshot);
                 targetGuard.bind(after);
                 adoptCurrentWorkbookScope(snapshot, selectedNames);
+                recordConfirmedScope(selectedNames);
                 appendMessage({
                   role: "system",
                   text: "所选文件就是当前工作簿，已改为直接在 Excel 中处理。"
@@ -4491,6 +5907,7 @@ export default function App() {
         // 文件夹的已提交范围住在 `confirmedFolderScopeRef`（上面刚写），
         // 工作簿口径的已提交名单同步到同一批表；守卫此刻不启用（来源是文件夹）。
         commitAuthorizedScope(snapshot.worksheets.map((sheet) => sheet.name));
+        recordConfirmedScope(snapshot.worksheets.map((sheet) => sheet.name));
         return true;
       } catch (reason) {
         const message = reason instanceof Error ? reason.message : "读取所选工作表失败";
@@ -4519,6 +5936,9 @@ export default function App() {
         // the automatic/manual mode explicitly chosen for this confirmation.
         if (!isCurrent()) return false;
         setWorkbookScopeMode(workbookScopeMode);
+        // 守卫那条路是通过 `adopt` 把范围写进已提交的：这里记"用户确认过的那一份"，
+        // 供续跑判定比对（跟随当前表 => 没有显式名单，不比对）。
+        recordConfirmedScope(workbookScopeMode === "auto" ? null : selectedSheetNames);
       } catch {
         setScopeConfirmationError("暂时无法读取目标身份，请刷新后重试；未变更授权。");
         return false;
@@ -4531,6 +5951,7 @@ export default function App() {
     } else {
       // 没有守卫的那条路（未在 Excel 中运行）：确认动作自己提交。
       commitAuthorizedScope(selectedSheetNames, workbookScopeMode);
+      recordConfirmedScope(workbookScopeMode === "auto" ? null : selectedSheetNames);
     }
     return true;
     } finally {
@@ -5931,6 +7352,16 @@ export default function App() {
   ) {
     const clarification = message.clarification;
     if (!clarification || clarification.status !== "pending" || busy || preparingImages) return;
+    if (clarification.messageOnly) {
+      if (!resolution.trim()) return;
+      setMessages((items) => items.map((item) => item.id === message.id && item.clarification
+        ? { ...item, clarification: { ...item.clarification, status: "resolved", resolvedLabel: label } } : item));
+      appendMessage({ role: "user", text: label });
+      setPrompt("");
+      await sendMessage({ overrideText: `${clarification.originalPrompt}\n已回答问题：${clarification.question}\n回答：${resolution}`,
+        overrideImages: [], targetConfirmedRetry: true, messageOnlyContinuation: true });
+      return;
+    }
     if (sourceMode === "folder" && !folderCatalog) {
       setContextOpen(true);
       appendMessage({ role: "system", text: "请先在上方「数据范围」中选择文件夹和工作表。" });
@@ -6665,6 +8096,7 @@ export default function App() {
   }
 
   async function sendMessage(options?: {
+    messageOnlyContinuation?: boolean;
     forceRecompute?: boolean;
     overrideText?: string;
     overrideImages?: PendingImage[];
@@ -6749,7 +8181,7 @@ export default function App() {
         (message) =>
           message.clarification?.status === "pending" && !message.clarification.localMapping
       );
-    const answeringClarification = Boolean(enteredText) && Boolean(pendingClarification);
+    const answeringClarification = !options?.messageOnlyContinuation && Boolean(enteredText) && Boolean(pendingClarification);
     if (!answeringClarification && options?.targetConfirmedRetry !== true && !options?.restartingAnalysis) {
       appendMessage({
         role: "user",
@@ -6806,6 +8238,20 @@ export default function App() {
       }, messageController.signal), messageController.signal);
       if (messageController.signal.aborted) throw new DOMException("Aborted", "AbortError");
       markServerOnline();
+      if (understanding.kind === "clarification") {
+        appendMessage({ role: "assistant", provider: "model", clarification: {
+          ...understanding.clarification, messageOnly: true, originalPrompt: intentText,
+          scopeFingerprint: "", round: 0, status: "pending"
+        } });
+        setPrompt("");
+        finishActivity("completed", "等待回答；未读取工作表", "awaiting_input");
+        return;
+      }
+      if (options?.messageOnlyContinuation && understanding.kind !== "conversation") {
+        appendMessage({ role: "assistant", text: "回答已记录，尚未读取或修改工作表。若要开始处理，请另行发送明确需求。" });
+        finishActivity("completed", "已记录回答；未读取工作表", "completed");
+        return;
+      }
       if (understanding.kind === "conversation") {
         // 普通发送/转向在受理时就把用户气泡送进对话了（见上面「受理即送达」），
         // 这里只补**回答澄清卡**那一种：它的气泡不由那条链路产生。
@@ -7246,7 +8692,58 @@ export default function App() {
    */
   const composerCanContinue = Boolean(composerPausedMessage);
   /*
-   * 输入框右侧按钮的判据来自**共享层**（`pauseButtonState`，WPS 端读同一份）。
+   * 当前**待回答**的澄清问题（如果有）。
+   *
+   * 只认"最后一条还在 pending 的问题"，且排除 `localMapping` —— 那是本地结构化补全，
+   * 有它自己的编辑器与源值边界，不该被搬进输入框。
+   *
+   * 为什么按"最后一条"而不是"任意一条"：同一时刻只可能有一道题在等回答；
+   * 挑最后一条既符合"最新任务优先"，也让返回键/取消后自然换到上一道（如果还有）。
+   */
+  const activeClarificationMessage = [...messages].reverse().find((message) =>
+    message.clarification?.status === "pending" && !message.clarification.localMapping
+  ) ?? null;
+  const clarificationBinding = activeClarificationMessage?.clarification
+    ? {
+        conversationId: chatHistory.activeConversationId,
+        messageId: activeClarificationMessage.id,
+        clarificationId: activeClarificationMessage.clarification.id
+      }
+    : null;
+  /*
+   * 本地草稿只保存"用户点了哪些选项 / 填了哪些字段"。
+   * 自由输入直接用输入框本身 —— 再开一个输入框等于让用户面对两个光标。
+   */
+  const [clarificationDraft, setClarificationDraft] = useState<ClarificationDraft | null>(null);
+  const activeClarificationDraft = draftBelongsTo(clarificationDraft, clarificationBinding)
+    ? clarificationDraft
+    : null;
+  /**
+   * 固定区域里用户**显式**切到了哪一件事（`ComposerActionDock` 的切换入口）。
+   *
+   * 默认 `null` = 按生命周期优先级排。它压过默认顺序，但只能切到仍然存在的那件事
+   * —— 判据（`selectCurrentAction`）会自己退回默认，不留空卡。
+   */
+  const [dockPinned, setDockPinned] = useState<CurrentActionView | null>(null);
+  const answeringClarification = Boolean(clarificationBinding);
+  const clarificationMultiple = clarificationAllowsMultiple(
+    activeClarificationMessage?.clarification as { multiSelect?: unknown } | undefined
+  );
+  /**
+   * 这道题"现在发送会提交什么"—— 也是"能不能发送"的**唯一**判据。
+   *
+   * 与 `ClarificationComposer` 里的预览行读的是同一个函数：一个地方算"还差几项"，
+   * 另一个地方算"按钮亮不亮"，两处必须给出同一个结论。
+   */
+  const activeClarificationSubmission = clarificationSubmission({
+    options: (activeClarificationMessage?.clarification?.options ?? []) as ClarificationOptionLike[],
+    selected: activeClarificationDraft?.selected ?? [],
+    freeText: prompt,
+    fields: activeClarificationMessage?.clarification?.fields,
+    fieldValues: activeClarificationDraft?.fields ?? {}
+  });
+  /*
+   * 输入框右侧按钮的判据来自**共享层**（`composerPrimaryAction`，WPS 端读同一份）。
    *
    * 三件事显式分开，不再由 `busy` 一个变量推：
    *  - `taskRunning`：真的在途（模型请求 / 取数 / 生成对比 / 确认收尾）；
@@ -7256,17 +8753,102 @@ export default function App() {
    * 旧写法 `busy ? ■ : ↑` 的后果实测过：只是"结果在等你看"（`phase === 'reviewing'`）
    * 也会画出一个 ■，点下去 `stopTurn` 找不到任何可中止对象 —— 点了没反应。
    */
-  const composerPauseButton = pauseButtonState({
-    hasInput: false,
+  /**
+   * 恢复卡上那颗「核对 / 继续剩余动作」搬到哪里去了 —— 只算一次。
+   *
+   * 三件事都在这里定：
+   *  - 只在**没有别的活**的时候才由主按钮承接（`running` 时不抢暂停）；
+   *  - 只认共享结论 ∩ 本端能落地（`excelRecoveryActions`）—— 画一个点了没反应的
+   *    按钮比不画更糟；
+   *  - `reconcile` 与 `resume` **互斥**，且核对在续跑之前：核对成功后**不会**自动续跑，
+   *    界面会变成「继续剩余动作」，等用户再点一下。
+   */
+  const recoveryPrimaryAction: "reconcile" | "resume" | null = (() => {
+    if (!officeRecoveryEntry || running) return null;
+    /*
+     * 终态（撤销 / 放弃 / 收尾）已经退出固定区域 —— 主按钮自然也不该再承接它。
+     * 这一句是**防御性的第二道**：`excelRecoveryActions` 对终态本来就返回不出
+     * reconcile/resume，加在这里是为了将来有人放宽按钮集合时，主按钮不会悄悄复活。
+     */
+    if (officeRecoveryTerminal) return null;
+    const available = excelRecoveryActions(officeRecoveryEntry.card);
+    if (available.includes("reconcile")) return "reconcile";
+    if (available.includes("resume")) return "resume";
+    return null;
+  })();
+
+  const composerPrimary = composerPrimaryAction({
+    // 有图也算"有内容"：带图发送是常规操作，不能让按钮还停在 ▶。
+    hasInput: Boolean(prompt.trim() || pendingImages.length > 0),
     paused: composerCanContinue,
     taskRunning: running,
     controllerAlive: Boolean(
       (turnAbortRef.current && !turnAbortRef.current.signal.aborted) ||
       (queryAbortRef.current && !queryAbortRef.current.signal.aborted)
-    )
+    ),
+    /*
+     * 写入与回读期间**不给可点的 ■**：动作已经提交给宿主，按下去不会让它立刻停，
+     * 画一颗能点的按钮就是在承诺一件做不到的事。
+     */
+    uninterruptible: resultReviewState.phase === "executing",
+    pausing: pauseRequestState?.phase === "requesting",
+    /*
+     * 恢复卡的「核对 / 继续剩余动作」现在由这颗按钮承接（2026-11-01 决定）。
+     *
+     * 为什么可以接了：卡面不再画同名按钮 —— 同一个动作在 40px 内出现两次，
+     * 用户只能靠试。判据本身一行没改：核对与继续仍是**两个结论**，
+     * 核对只补记回执（零写入），续跑只跑剩下的动作，中间必须由用户再点一下。
+     *
+     * 有字时不会走到这两档（判据把 `hasInput` 排在前面）：用户正在写的那句话
+     * 不许因为点了按钮就被静默丢掉。此时的提示见 `composerHint`。
+     */
+    needsReconcile: recoveryPrimaryAction === "reconcile",
+    recoveryResume: recoveryPrimaryAction === "resume",
+    /*
+     * 正在回答一道澄清题：此时"发送"发出去的是**回答**，不是新需求。
+     * 判据本身在共享层，这里只把事实告诉它（有选项/有字才可点）。
+     */
+    answeringClarification,
+    /*
+     * "能不能提交"不在这里另算一遍：直接问共享判据。
+     * 自己写 `some(v => v.trim())` 会把"多字段只填了一半"当成可以发送，
+     * 而共享层的必填校验认为不行 —— 两端各写一遍就一定会有一端猜错。
+     */
+    hasAnswerContent: activeClarificationSubmission.ok
   });
-  /** 过程卡上的「停止」：同一条判据，但**不受输入影响**（打了字也要能停）。 */
-  const cardPauseButton = executionPauseState({
+  /**
+   * 固定区域里"现在最该处理哪一件"—— 判据在共享层（`selectCurrentAction`）。
+   *
+   * 四个事实都是**已经算好的**，这里不再推一遍：
+   *  - `review`：结果在等确认/放弃；
+   *  - `recovery`：有恢复卡（待核对/待续跑），终态由结论自己退出；
+   *  - `clarification`：有 pending 问题且未取消；
+   *  - `running`：任务在跑（运行控制只在输入框，不占固定区域）。
+   */
+  const currentAction = selectCurrentAction(
+    {
+      /*
+       * `review` = 审阅栏**在等你决定**（确认 / 放弃 / 重试清理标记），
+       * 与组件读同一份判据。只写 `phase === "reviewing"` 会漏掉"确认后标记没清"，
+       * 而把"未执行 / 正在执行 / 需要核对"这些纯状态也算进来，就会让一条状态行
+       * 把真正要点的恢复卡挤成 chip。
+       */
+      review: resultReviewNeedsDecision(resultReviewState),
+      /*
+       * 终态（撤销 / 放弃 / 收尾）**不占固定区域**：它已经没有下一步可做，
+       * 留在主视图或 chip 行里就成了"还有一件待办"的假象（2026-11-01）。
+       * 记录本身不删——所属任务的消息里有一条可展开的终态摘要。
+       */
+      recovery:
+        (officeRecoveryEntry !== null && officeRecoveryTerminal === null) ||
+        officeRecoveryChoices !== null ||
+        officeDiscoveryFailure !== null,
+      clarification: answeringClarification,
+      running
+    },
+    dockPinned
+  );
+  /** 过程卡上的「停止」：同一条判据，但**不受输入影响**（打了字也要能停）。 */  const cardPauseButton = executionPauseState({
     taskRunning: running,
     controllerAlive: Boolean(
       (turnAbortRef.current && !turnAbortRef.current.signal.aborted) ||
@@ -7274,9 +8856,189 @@ export default function App() {
     )
   });
 
+  /** 空闲状态的默认提示（也是 `styles.test.ts` 认得的那个常量串）。 */
+  const DEFAULT_COMPOSER_HINT = "Enter 发送 · Shift + Enter 换行 · 可粘贴截图";
+  /**
+   * 输入框下方那行提示的**唯一**来源。
+   *
+   * 它只描述"回车会发生什么"，而回车的行为完全由 `composerPrimary.invoke` 决定 ——
+   * 所以这里也按同一个判据分支，不许自己再推一遍状态。改造前运行中写的是
+   * 「点击**上方** ■ 暂停」，按钮搬到右下角之后那句话会把手指指向错的方向。
+   */
+  const composerHint =
+    answeringClarification
+      ? "选择一项或填写其他，发送后继续"
+      : composerPrimary.kind === "pausing"
+        ? "正在停止当前处理…"
+        : composerPrimary.kind === "pause" && composerPrimary.disabled
+          ? (composerPrimary.reason ?? "正在处理，请稍候")
+            : composerPrimary.kind === "send-supplement"
+              ? "运行中：Enter 打断并转向 · 右下角 ■ 暂停"
+              : /*
+                 * 冲突如实说：有内容时主按钮一定是"发送"，核对/续跑被排在后面。
+                 * 不许写"点发送顺便核对一下" —— 那会把用户正在写的话丢掉。
+                 *
+                 * 判据读**主按钮自己的输出**（`kind === "send"`），不在这里再写一遍
+                 * `prompt.trim()`：`hasInput` 把待发图片也算内容，重写一遍就会漏掉
+                 * "只贴了图片、没打字"的情形 —— 入口被顶掉却没有任何说明。
+                 */
+                composerPrimary.kind === "send" && recoveryPrimaryAction
+                ? `输入框有内容：${
+                    /* 暂停之后发出去是**重新判断**这条要求，不是重放已暂停的计划 —— 说法必须跟着路由走。 */
+                    composerCanContinue ? "发送会重新判断这条要求（不重放已暂停的计划）" : "发送会作为新需求"
+                  }；要${
+                    recoveryPrimaryAction === "reconcile" ? "核对在途动作" : "继续剩余动作"
+                  }请先清空输入框${pendingImages.length > 0 ? "并移除待发图片" : ""}`
+                : resultReviewState.phase === "reviewing" && !resultReviewState.pending
+                  ? "等待审阅结果：可确认变更、放弃变更或打开双视图"
+                  : busy
+                    ? "正在处理，请稍候"
+                    : DEFAULT_COMPOSER_HINT;
+
+  /**
+   * 宿主侧**额外**的禁用条件（判据本身不认为它该禁用）。
+   *
+   * 每条都带原因：只是变灰的话，用户看到的是一颗"坏了"的按钮。
+   * 最后一条保留了改造前的既有守卫 —— 结果在等审阅（`busy` 为真、且有独立的历史
+   * 暂停任务）时不给"继续"，否则会在审阅没收尾的时候从旧检查点续跑。
+   */
+  const composerPrimaryBlocked =
+    !workbook
+      ? "工作簿读取完成后才能发送"
+      : preparingImages
+        ? "图片还在处理，稍候再发送"
+        : pendingImages.length > 0 && !supportsVision
+          ? "当前模型不支持图片：先切换到支持视觉的模型再发送"
+          : busy && composerPrimary.kind === "continue" && recoveryPrimaryAction !== "resume"
+            ? "等待审阅结果：可确认变更、放弃变更或打开双视图"
+            : /*
+               * 核对/续跑在飞（`busy` 且卡片正标着"正在核对…/正在继续…"）：
+               * 禁用并说明，而不是让用户连点出第二个请求。
+               */
+              busy && (composerPrimary.kind === "reconcile" || composerPrimary.kind === "continue")
+              ? "正在处理这次恢复，稍候…"
+              : null;
+
   async function submitComposer() {
+    /*
+     * 有待回答的澄清问题时，右下角那颗按钮发出去的是**回答**，不是新需求。
+     * 取消本次任务后恢复普通输入，不按文字猜测用户是否换题。
+     */
+    if (answeringClarification) return submitClarificationAnswer();
     if (busy || preparingImages || (!prompt.trim() && pendingImages.length === 0)) return;
     return sendMessage();
+  }
+
+  /**
+   * 主按钮按下去之后**唯一**的分派点（按钮点击与回车都走这里）。
+   *
+   * 为什么要有这一层：改造前"点按钮"和"按回车"各写一套 if，运行中按回车是转向、
+   * 点按钮有时是暂停 —— 同一个位置两种行为，用户只能靠试。现在两处都只做一件事：
+   * 把共享层算出来的 `invoke` 交进来。
+   */
+  async function invokeComposerPrimary(invoke: NonNullable<PrimaryActionInvoke>) {
+    if (invoke === "answer") return submitClarificationAnswer();
+    if (invoke === "pause") return stopTurn();
+    if (invoke === "resume") {
+      /*
+       * 同一个 `resume` 有两种真实含义，靠**同一份**事实分开：
+       *  - 恢复卡说"可继续剩余动作" ⇒ 交给 `runOfficeRecoveryAction(..., "resume")`，
+       *    它只跑没跑过的动作，并且有身份闸、终态守卫和防重入；
+       *  - 否则是规划任务从检查点继续分析。
+       * 两个处理器都是原有的，这里只做分派，不改任何安全语义。
+       */
+      if (recoveryPrimaryAction === "resume" && officeRecoveryEntry) {
+        return void runOfficeRecoveryAction(officeRecoveryEntry.row, "resume");
+      }
+      return resumeComposerTask();
+    }
+    if (invoke === "reconcile") {
+      /*
+       * 核对走**同一份**实现（`runOfficeRecoveryAction` 自己会再按卡片结论核一遍，
+       * 并且有 `officeRecoveryActionLock` 防重入），不在这里另开一条只读路径。
+       * 卡片不在/结论已经变了就什么都不做 —— 按钮的解释权在卡片，不在这一层。
+       */
+      const entry = officeRecoveryEntry;
+      if (!entry || entry.card.verdict.kind !== "reconcile" || busy) return;
+      await runOfficeRecoveryAction(entry.row, "reconcile");
+      return;
+    }
+    /*
+     * `send` 有两种语义，由**同一份**事实区分：运行中且有字 = 打断并补充
+     * （`steerTurn`，与既有"转向"链路一致）；其余 = 正常发送（内部会按
+     * `answeringClarification` 再分派到澄清回答）。
+     */
+    if (running && prompt.trim() && !answeringClarification) {
+      steerTurn(prompt);
+      return;
+    }
+    await submitComposer();
+  }
+
+  /**
+   * 提交对**当前这道**澄清题的答案。
+   *
+   * 三道闸依次过：绑定/状态（`clarificationSubmissionAllowed`）→ 内容是否够提交
+   * （`clarificationSubmission`）→ 既有 `resolveClarification` 自己的
+   * `status !== "pending"` 与目标守卫。任何一道不给过，就一个字节都不发，
+   * 并把原因说清楚；提交成功后立刻清空草稿与输入框（受理即送达）。
+   */
+  async function submitClarificationAnswer() {
+    const message = activeClarificationMessage;
+    const clarification = message?.clarification;
+    if (!message || !clarification || !clarificationBinding) return;
+    const gate = clarificationSubmissionAllowed({
+      draft: activeClarificationDraft ?? emptyClarificationDraft(clarificationBinding),
+      binding: clarificationBinding,
+      status: clarification.status,
+      busy
+    });
+    if (!gate.ok) {
+      appendMessage({ role: "system", text: gate.reason });
+      return;
+    }
+    /* 与按钮"亮不亮"读同一份判据：不许一处说能发、另一处说还差几项。 */
+    const submission = activeClarificationSubmission;
+    if (!submission.ok) {
+      appendMessage({ role: "system", text: submission.reason });
+      return;
+    }
+    setClarificationDraft(null);
+    setPrompt("");
+    if (submission.kind === "option") {
+      const resolution = submission.options.map((option) => option.resolution).join("\n");
+      const mode = submission.options.length === 1
+        ? submission.options[0].resolutionMode
+        : "append";
+      await resolveClarification(message, resolution, submission.answer, false, mode);
+      return;
+    }
+    await resolveClarification(message, submission.answer, submission.answer);
+  }
+
+  /** 选中/取消一个快捷选项。只改本地草稿 —— 提交发生在「发送」那一刻。 */
+  function toggleClarificationChoice(optionId: string) {
+    if (!clarificationBinding) return;
+    setClarificationDraft((current) => {
+      const base = draftBelongsTo(current, clarificationBinding)
+        ? current!
+        : emptyClarificationDraft(clarificationBinding);
+      return {
+        ...base,
+        selected: toggleClarificationOption(base.selected, optionId, clarificationMultiple)
+      };
+    });
+  }
+
+  /** 多字段草稿：同样只存在本地，等「发送」才提交。 */
+  function updateClarificationFieldValues(values: Record<string, string>) {
+    if (!clarificationBinding) return;
+    setClarificationDraft((current) => {
+      const base = draftBelongsTo(current, clarificationBinding)
+        ? current!
+        : emptyClarificationDraft(clarificationBinding);
+      return { ...base, fields: values };
+    });
   }
 
   async function resumeComposerTask() {
@@ -7554,7 +9316,45 @@ export default function App() {
     const authorizedSheetNames = forceLocal
       ? [workbook!.activeWorksheet]
       : selectedNamesFor(workbook!);
-    const recoverySupport = officeRecoverySupport(plan);
+    const evidenceIdentity = currentOfficeWorkbookIdentity();
+    const evidenceBinding = deletionState();
+    let planToRun: AnalysisPlan = plan;
+    let formulaEvidenceError: string | null = null;
+    try {
+      planToRun = await prepareFormulaSourceEvidence(plan, authorizedSheetNames,
+        captureWorkbookSourceFingerprint,
+        () => currentOfficeWorkbookIdentity() === evidenceIdentity && deletionState() === evidenceBinding);
+    } catch (error) {
+      formulaEvidenceError = error instanceof Error ? error.message : '读不到公式依赖的来源值，无法登记来源证据。';
+    }
+    let recoverySupport = formulaEvidenceError
+      ? { supported: false as const, reason: formulaEvidenceError }
+      : officeRecoverySupport(planToRun);
+    /*
+     * **公式来源证据**：登记那一刻把公式依赖的那几张表的值指纹钉在计划上。
+     *
+     * 时机是刻意选的 —— 续跑要对照的是"开始写之前现场是什么"，不是"预览生成时是什么"。
+     * 预览到执行之间用户改了源值，首次执行本来就该按新值算（公式是活值），那是正常
+     * 重算，不该拦；但**开始写之后**再改动，就会让同一份计划里前半段和后半段的公式按
+     * 两个不同的源值算，那才是必须停下来的场景。
+     *
+     * 读不到就不登记精确恢复：拿"没取到证据"当"没有变化"是这类缺陷的统一形状。
+     */
+    if (planToRun === plan && recoverySupport.supported && recoverySupport.sourceEvidenceSheets?.length) {
+      try {
+        planToRun = {
+          ...plan,
+          sourceDependencyFingerprint: await captureWorkbookSourceFingerprint([
+            ...recoverySupport.sourceEvidenceSheets
+          ])
+        };
+      } catch {
+        recoverySupport = {
+          supported: false,
+          reason: "读不到公式依赖的来源值，无法登记来源证据"
+        };
+      }
+    }
     const workbookIdentity = currentOfficeWorkbookIdentity();
     let officeState: Awaited<ReturnType<typeof registerOfficeExecution>> | null = null;
     let recoveryLimitation: string | null = null;
@@ -7598,7 +9398,7 @@ export default function App() {
         } else {
           officeState = await registerOfficeExecution({
             operationId,
-            plan,
+            plan: planToRun,
             authorizedSheetNames,
             allowedExternalFiles: [...(allowedExternalFiles ?? [])],
             workbookIdentity,
@@ -7627,12 +9427,13 @@ export default function App() {
       } else {
         recoveryLimitation = `${recoverySupport.reason ?? "该计划包含复杂对象操作"}；本次不承诺跨重启自动续跑。`;
       }
-      bindRecoveryProbe((import.meta.env.DEV || import.meta.env.VITE_ENABLE_RECOVERY_PROBE === "true"), currentOfficeWorkbookIdentity(), operationId, plan.actions, Boolean(officeState?.ownerToken));
+      bindRecoveryProbe((import.meta.env.DEV || import.meta.env.VITE_ENABLE_RECOVERY_PROBE === "true"), currentOfficeWorkbookIdentity(), operationId, plan.actions, Boolean(officeState?.ownerToken), recoverySupport.reason ?? recoveryLimitation ?? undefined);
+      if (formulaEvidenceError) throw new ReviewNotStartedError(formulaEvidenceError);
       /*
        * 「实际写入了几次」的事实源：执行器在**真的调用宿主写 API 的地方**累加，
        * 这里只收着，等账本动作都提交完再 best-effort 补报（失败不挡写入）。
        */
-      const result = await executePlan(plan, {
+      const result = await executePlan(planToRun, {
         /*
        * 直接执行**也**挂 `beforeFirstWrite`：这就是"只跳过副本比对"的落点。
        * 少了这一行，两条路径的差别就不止"有没有副本"，还会多出"有没有执行前复核"。
@@ -7767,6 +9568,13 @@ export default function App() {
           // 动作完成回执可能已提交但响应丢失；保留 operationId，重载后查询权威状态。
         }
       }
+      if (reason instanceof RecoveryProbeCancelledError || reason instanceof ReviewNotStartedError) {
+        workbookActivityStatus = "failed";
+        workbookActivitySummary = reason.message;
+        appendMessage({ role: "system", text: reason.message });
+        if (onResultReview) throw new ReviewNotStartedError(reason.message);
+        return false;
+      }
       if (reason instanceof StaleSourceError) {
         workbookActivityStatus = "warning";
         workbookActivitySummary = reason.message;
@@ -7775,9 +9583,25 @@ export default function App() {
           return false;
         }
         if (directRecheck) {
-          // 直接执行同样**不豁免**来源复核：数据变了要么重新生成计划，要么走上面的二次确认，
-          // 但绝不因为"没生成副本"就当这份计划可以直接写。
-          appendMessage({ role: "system", text: `${reason.message}本次直接执行已停止；请重新生成计划，或确认数据已变后再次执行。原表未写入。` });
+          /*
+           * 直接执行同样**不豁免**来源复核：数据变了要么重新生成计划，要么由用户
+           * 明确说一句"我知道是旧结果，仍然要执行"。
+           *
+           * 这里以前只写一句"本次直接执行已停止；请重新生成计划，或确认数据已变后
+           * 再次执行"，却**不给**那个确认入口 —— 于是那句承诺没有对应按钮，
+           * 用户只能重发需求。既然没有副本（`nativeReview` 与 `directRecheck` 互斥），
+           * 二次确认就是唯一诚实的出口：给卡，不给自动写入。
+           */
+          appendMessage({
+            role: "system",
+            text: reason.message,
+            plan,
+            staleSourceConfirm: {
+              plan,
+              bakedActionCount: reason.bakedActionCount,
+              status: "pending"
+            }
+          });
           return false;
         }
         // 数据变了但计划本身仍可执行：给出二次确认，而不是像字段缺失那样堵死。
@@ -7822,20 +9646,13 @@ export default function App() {
           executedPlanId: reason.undoSnapshot ? plan.id : undefined,
           executedExecutionId: reason.undoSnapshot?.executionId,
           officeExecutionId: officeState ? operationId : undefined,
-          officeResume:
-            officeState &&
+          // 卡片的结论与 WPS 读同一份契约：有在途动作就是"待核对"，只剩后续动作才是"可继续"。
+          // 出错分支是同步构造，拿不到来源证据 ⇒ 用 `OFFICE_RECOVERY_NO_EVIDENCE`：
+          // 有在途动作走 `reconcile`；无在途但有剩余动作时不再无依据地给"可继续"，
+          // 而是"待复核"（用户点「重新核对」后按真实来源出结论）。
+          officeResume: officeState &&
             (officeState.requiresReconciliation || officeState.nextActionIndex > 0)
-              ? {
-                  operationId,
-                  expectedRevision: officeState.revision,
-                  status: "pending",
-                  requiresReconciliation: officeState.requiresReconciliation,
-                  nextActionIndex: officeState.nextActionIndex,
-                  totalActions: plan.actions.length,
-                  reason:
-                    officeState.error?.message ??
-                    "执行现场已保存；继续前会先核对真实单元格状态。"
-                }
+              ? officeRecoveryCardFor(officeState, OFFICE_RECOVERY_NO_EVIDENCE)
               : undefined
         });
         return false;
@@ -7855,21 +9672,12 @@ export default function App() {
         officeResume:
           officeState &&
           (officeState.requiresReconciliation || officeState.nextActionIndex > 0)
-            ? {
-                operationId,
-                expectedRevision: officeState.revision,
-                status: "pending",
-                requiresReconciliation: officeState.requiresReconciliation,
-                nextActionIndex: officeState.nextActionIndex,
-                totalActions: plan.actions.length,
-                reason:
-                  officeState.error?.message ??
-                  "写入回执尚未完整确认，继续前会先核对真实单元格状态。"
-              }
+            ? officeRecoveryCardFor(officeState, OFFICE_RECOVERY_NO_EVIDENCE)
             : undefined
       });
       return false;
     } finally {
+      settleRecoveryProbe((import.meta.env.DEV || import.meta.env.VITE_ENABLE_RECOVERY_PROBE === "true"), operationId);
       setActivePlanId(null);
       setStatus("idle");
       finishActivity(workbookActivityStatus, workbookActivitySummary);
@@ -8819,16 +10627,43 @@ export default function App() {
       setShowSlashAutocomplete(false);
       return;
     }
-    if (event.key === "Enter" && !event.shiftKey) {
-      event.preventDefault();
-      // 运行中回车 = 转向（带这句话打断重跑）；空闲回车 = 正常发送。
-      if (busy) {
-        if (!prompt.trim()) return;
-        steerTurn(prompt);
-        return;
-      }
-      void submitComposer();
+    /*
+     * 输入法组合中的 Enter **不是**「发送」，是「选定候选词」。
+     *
+     * 中文输入法（微软拼音 / 搜狗 / QQ）在组合期按 Enter 会上屏，同时照样把
+     * keydown 冒泡到 textarea。以前这里只判 `key === "Enter" && !shiftKey`，
+     * 于是打一句「汇总一下」还没选词，整句就被当成需求发出去了 —— 而运行时那一发
+     * 还会命中「打断并转向」，把在跑的任务顶掉。
+     *
+     * 三道判据一起用，少一道都会漏：
+     *  - `nativeEvent.isComposing`：Chromium/Edge 组合期可靠；
+     *  - `event.isComposing`：React 合成事件的同名标记（部分宿主只给这一侧）；
+     *  - `keyCode === 229`：Office.js WebView / 老版输入法在组词结束那一拍只留这个。
+     * 组合结束的那次 keydown 有的输入法 `isComposing` 已经是 false（上屏与确认是同一拍），
+     * 这时 `229` 仍在，所以它不能省。
+     */
+    if (
+      event.nativeEvent.isComposing ||
+      (event.nativeEvent as unknown as { isComposing?: boolean }).isComposing ||
+      event.nativeEvent.keyCode === 229
+    ) {
+      return;
     }
+    if (event.key !== "Enter" || event.shiftKey) return;
+    /*
+     * 回车**只表达一件事**：把这段话发出去。
+     *
+     * 它不再是"运行中 = 打断转向"的独立分支 —— 那样会在按钮已经变成 ■ 的时候
+     * 仍然按 Enter 去转向，用户以为自己在按"暂停"。现在分派完全跟着右下角那颗
+     * 按钮的判据走（`composerPrimary.invoke`）：
+     *  - `send`（含"打断并补充"）⇒ 发出去；
+     *  - `answer` ⇒ 提交这道澄清题的回答；
+     *  - `pause` / `resume` / `reconcile` / `null` ⇒ 回车什么也不做，也不阻止默认行为
+     *    （换行照旧），绝不顺手暂停或继续。
+     */
+    if (composerPrimary.invoke !== "send" && composerPrimary.invoke !== "answer") return;
+    event.preventDefault();
+    void invokeComposerPrimary(composerPrimary.invoke);
   }
 
   // 「操作目标确认之后」的回调重入：这句话已经送过一次（气泡已落盘、输入框已清空），
@@ -8836,6 +10671,22 @@ export default function App() {
   retrySendRef.current = (text, messageUnderstanding) => {
     void sendMessage({ overrideText: text, messageUnderstanding, targetConfirmedRetry: true });
   };
+
+  /**
+   * 审阅栏这个节点只构造一次，两处都用它：
+   *  - **有决定要你做**（`reviewing` / 收尾未清）时不进固定区域容器，它是主视图；
+   *  - 只是**状态**（未执行 / 正在执行 / 需要核对）时单独渲染在容器上方，
+   *    不参与"谁是主视图"的竞争 —— 否则一条状态行会把真正要点的恢复卡挤成 chip，
+   *    出现"卡片说去恢复、恢复卡却不在"的自相矛盾（回归⑥ 抓到的正是这个）。
+   */
+  const reviewBarNode = (
+    <ResultReviewBar state={resultReviewState} title={resumedReviewTitle || resultCandidate?.plan.title || ''}
+      compareUnavailable={reviewCompareUnavailable(resultCandidate, resultReviewState.key)}
+      onCompare={() => void resultReview.compare(resultReviewState.key ?? '')}
+      onConfirm={() => void resultReview.confirm(resultReviewState.key ?? '')}
+      onDiscard={() => void resultReview.discard(resultReviewState.key ?? '')}
+      onRetryMarker={() => void resultReview.retryMarkerCleanup(resultReviewState.key ?? '')} />
+  );
 
   return (
     <main className="chat-shell">
@@ -9064,7 +10915,7 @@ export default function App() {
                     disabled={busy}
                   >
                     <strong>历史对话</strong>
-                    <span>查看并恢复以前的对话</span>
+                    <span>{HISTORY_MENU_DESCRIPTION}</span>
                   </button>
                   <button
                     type="button"
@@ -10251,56 +12102,11 @@ export default function App() {
         </aside>
       )}
 
-      {pendingDeleteConvId &&
-        chatHistory.conversations
-          .filter(
-            (conversation) =>
-              conversation.id === pendingDeleteConvId
-          )
-          .map((conversation) => (
-            <div
-              className="tool-dialog-backdrop"
-              role="presentation"
-              key={conversation.id}
-            >
-              <section
-                className="tool-dialog history-delete-dialog"
-                role="dialog"
-                aria-modal="true"
-                aria-label="删除历史对话"
-              >
-                <div className="tool-dialog-title">
-                  <div>
-                    <strong>删除历史对话？</strong>
-                    <span>此操作无法撤销</span>
-                  </div>
-                  <button
-                    onClick={cancelDeleteConversation}
-                    aria-label="关闭"
-                  >
-                    ×
-                  </button>
-                </div>
-                <p>
-                  确定删除「{conversation.title}」吗？删除后不会影响已保存的工具。
-                </p>
-                <div className="tool-dialog-actions">
-                  <button
-                    className="secondary-button"
-                    onClick={cancelDeleteConversation}
-                  >
-                    取消
-                  </button>
-                  <button
-                    className="danger-button"
-                    onClick={confirmDeleteConversation}
-                  >
-                    确认删除
-                  </button>
-                </div>
-              </section>
-            </div>
-          ))}
+      {pendingDeleteConvId && chatHistory.conversations
+        .filter((conversation) => conversation.id === pendingDeleteConvId)
+        .map((conversation) => <HistoryDeleteDialog key={conversation.id}
+          title={conversation.title} onCancel={cancelDeleteConversation}
+          onConfirm={confirmDeleteConversation} disabled={busy} />)}
 
       {saveCandidate && (
         <SaveToolDialog
@@ -10332,7 +12138,9 @@ export default function App() {
         aria-live="polite"
         onScroll={handleMessageStreamScroll}
       >
-        {messages.map((message) => (
+        {messages.map((message, messageIndex) => (
+          answeringClarification && activeClarificationMessage?.id === message.id
+            && message.clarification?.status === "pending" && !message.clarification.localMapping ? null :
           <article
             className={`message-row ${message.role}${
               message.staleSourceConfirm ? " stale-source-message" : ""
@@ -10341,7 +12149,11 @@ export default function App() {
             data-message-id={message.id}
           >
             <div className="message-content">
-              {message.role === "assistant" && (
+              {message.role === "assistant" && !(
+                !message.text && isCompactMessageProcess(message.activityLog)
+                && messages[messageIndex + 1]?.role === "assistant"
+                && messages[messageIndex + 1]?.text?.trim()
+              ) && (
                 <span className="message-author">
                   Excel Bro
                   {message.provider && (
@@ -10444,37 +12256,17 @@ export default function App() {
                 </section>
               )}
               {message.officeResume && (
-                <section
-                  className="folder-resume-card office-resume-card"
-                  aria-label="继续已保存的 Office 写入任务"
-                >
-                  <div className="folder-resume-copy">
-                    <strong>
-                      {message.officeResume.requiresReconciliation
-                        ? "需要先核对一个在途写入"
-                        : "可从 Office 动作断点继续"}
-                    </strong>
-                    <span>{message.officeResume.reason}</span>
-                    <span>
-                      已确认到第 {message.officeResume.nextActionIndex} / {message.officeResume.totalActions} 步；
-                      只支持已保存工作簿中的受控区域写入。
-                    </span>
-                  </div>
-                  <div className="folder-resume-actions">
-                    <button
-                      type="button"
-                      className="primary-button"
-                      disabled={busy || message.officeResume.status === "resuming"}
-                      onClick={() => void resumeInterruptedOfficeExecution(message)}
-                    >
-                      {message.officeResume.status === "resuming"
-                        ? "正在核对..."
-                        : message.officeResume.requiresReconciliation
-                          ? "核对并继续"
-                          : "继续剩余步骤"}
-                    </button>
-                  </div>
-                </section>
+                /*
+                 * 历史消息里只留**只读**执行记录：结论 badge、正文与按钮都在输入区
+                 * 上方那张卡上（`OfficeRecoveryPanel`）。这里曾经是完整卡片 ——
+                 * 核对成功后追加的日志会把消息区滚到底，把还停在旧消息位置的
+                 * 「继续剩余动作」顶出视口，用户于是"看不到下一步"。
+                 * 同一条执行不摆两个可点击入口：这份没有按钮。
+                 */
+                <OfficeRecoveryRecord
+                  card={message.officeResume}
+                  active={officeRecoveryEntry?.row.id === message.id}
+                />
               )}
               {!message.activityLog && prePlanningPause.entries.filter((entry) => entry.messageId === message.id &&
                 entry.conversationId === chatHistory.activeConversationId).map((entry) =>
@@ -10644,6 +12436,7 @@ export default function App() {
                       live: true,
                       continuesTask: message.replySegment?.continuesTask
                     }}
+                    awaitingAnswer={message.clarification?.status === "pending"}
                   />
                 )}
               {message.activityLog &&
@@ -10672,8 +12465,36 @@ export default function App() {
                           ? () => void restartEarlyAnalysis(`preplanning-${message.id}`) : undefined
                     }
                     continueBusy={busy}
-                    continuationError={prePlanningPause.entries.find((entry) => entry.messageId === message.id)?.error} />
+                    continuationError={prePlanningPause.entries.find((entry) => entry.messageId === message.id)?.error}
+                    awaitingAnswer={message.clarification?.status === "pending"} />
                 )}
+              {/*
+                结果摘要**在过程框之外**：过程框收起后只剩一行"已完成 · 12s"，
+                而"改了哪里 / 验证结果 / 下一步点哪"必须一直看得见。
+                三句都由共享层从结构化回执派生，这里不写任何一条文案判断。
+              */}
+              {(message.activityLog || message.verification || message.executedPlanId ||
+                message.executedExecutionId || message.officeResume) && (
+                <ProcessResultSummary input={{
+                  live: Boolean(message.activityPending && activity?.persistenceKey === message.id),
+                  phase: processOutcomePhaseFrom({
+                    undone: message.executionUndone,
+                    reviewPhase: message.id === lastExecutionMessageId ? resultReviewState.phase : null,
+                    recoveryKind: message.officeResume?.verdict.kind ?? null
+                  }),
+                  reviews: message.executedExecutionId
+                    ? changeReviewsRef.current.get(message.executedExecutionId) ?? null
+                    : null,
+                  verification: message.verification
+                    ? {
+                        status: message.verification.status,
+                        total: message.verification.checks.length,
+                        passed: message.verification.checks.filter((check) => check.passed).length,
+                        unverified: message.verification.unverifiedActions.length
+                      }
+                    : null
+                }} />
+              )}
               {message.clarification && (
                 <section
                   className={`clarification-card ${message.clarification.status}`}
@@ -10727,85 +12548,20 @@ export default function App() {
                         />
                       ) : <p>本地规则草稿已失效，请重新发送需求。</p>
                     ) : <>
-                      <div className="clarification-options">
-                        {message.clarification.options.map(
-                          (option: IntentOption) => (
-                            <button
-                              key={option.id}
-                              disabled={busy}
-                              onClick={() => {
-                                if (option.action === "editScope") {
-                                  editClarificationScope(message);
-                                  return;
-                                }
-                                void resolveClarification(
-                                  message,
-                                   option.resolution,
-                                   option.label,
-                                   true,
-                                   option.resolutionMode
-                                 );
-                              }}
-                            >
-                              <strong>{option.label}</strong>
-                              <span>{option.description}</span>
-                            </button>
-                          )
-                        )}
-                      </div>
-                      {message.clarification.fields?.length ? (
-                        <ClarificationFields fields={message.clarification.fields}
-                          values={clarificationFieldDrafts[message.id] ?? {}} busy={busy}
-                          onChange={(values) => setClarificationFieldDrafts((current) => ({ ...current, [message.id]: values }))}
-                          onSubmit={(answer) => void resolveClarification(message, answer, answer)} />
-                      ) : <>
-                      <span className="clarification-custom-hint">
-                        都不符合？请直接写下你的想法。
-                      </span>
-                      <div className="clarification-custom-input">
-                        <textarea
-                          value={
-                            clarificationDrafts[
-                              message.clarification.id
-                            ] ?? ""
-                          }
-                          disabled={busy}
-                          rows={2}
-                          placeholder="例如：按所有已选工作表汇总后，再比较每个分类的整体占比"
-                          onChange={(event) =>
-                            setClarificationDrafts((current) => ({
-                              ...current,
-                              [message.clarification!.id]:
-                                event.target.value
-                            }))
-                          }
-                        />
-                        <button
-                          disabled={
-                            busy ||
-                            !(
-                              clarificationDrafts[
-                                message.clarification.id
-                              ] ?? ""
-                            ).trim()
-                          }
-                          onClick={() => {
-                            const customAnswer = (
-                              clarificationDrafts[
-                                message.clarification!.id
-                              ] ?? ""
-                            ).trim();
-                            void resolveClarification(
-                              message,
-                              customAnswer,
-                              customAnswer
-                            );
-                          }}
-                        >
-                          提交补充
-                        </button>
-                      </div>
-                      </>}
+                      {/*
+                        快捷回答已经搬到**输入框内部**（`ClarificationComposer`）。
+                        消息里只留问题本身与不可省的次要动作 —— 同一组选项在两处出现，
+                        用户不知道该点哪一个；而且消息里的那份会随滚动跑出视口。
+                        绑定的也是那一个（同一 conversationId + 消息 + 问题 id），
+                        这里不再提供第二套提交路径。
+                      */}
+                      <p className="clarification-answer-hint">
+                        {activeClarificationMessage?.id === message.id
+                          ? answeringClarification
+                            ? "在下方问卷中框选，或填写“其他”，按提交回答继续。"
+                            : "当前问题尚未就绪，请重新选择待回答的问题。"
+                          : "这条问题已经不在等待回答（不是当前待回答的问题）。"}
+                      </p>
                       <div className="clarification-actions">
                         <button
                           disabled={busy}
@@ -10919,6 +12675,28 @@ export default function App() {
                 )}
               {message.executedPlanId &&
                 (() => {
+                  /*
+                   * 这条执行已经由**恢复卡**接管（入口在输入框上方）：消息里那份不再
+                   * 画第二颗同样的按钮。
+                   *
+                   * 为什么必须让掉：本轮之前未完成执行的撤销栈根本不重建，于是这里只
+                   * 显示"当前没有可用的撤销记录"；重建之后同一条执行会同时长出两颗
+                   * "↶ 撤销本次执行"（一颗在历史消息里、一颗在恢复卡里）。而"要用户点的
+                   * 那一下"按布局纪律只能有一个，且必须在输入框上方 —— 所以让给恢复卡，
+                   * 消息里只留指路。结论仍由**同一份**判据给出（没有可撤销内容时恢复卡
+                   * 不画撤销行，这里也就不必让）。
+                   */
+                  if (
+                    message.officeResume &&
+                    officeRecoveryEntry?.operationId === message.officeResume.operationId &&
+                    officeRecoveryUndoFor(officeRecoveryEntry) !== undefined
+                  ) {
+                    return (
+                      <div className="execution-recovery-footer">
+                        <span>{EXECUTION_RECOVERY_ENTRY_HINT}</span>
+                      </div>
+                    );
+                  }
                   const workbookIndex = undoStack.findIndex((entry) =>
                     message.executedExecutionId
                       ? entry.executionId === message.executedExecutionId
@@ -11427,15 +13205,26 @@ export default function App() {
                           : "验证后保存"}
                       </button>
                     )}
-                    {!message.staleSourceConfirm && !isWorksheetDeletion(message.plan) && nativeComparison.review?.messageId !== message.id && (sourceMode !== "workbook" || !message.plan.actions.some(action => action.type === "copyRange")) && (sourceMode !== "workbook" || !workbook || resultReviewPlanIssue(message.plan, selectedNamesFor(workbook)) !== null) && (
+                    {/*
+                      工作簿模式下**不再**有手动执行入口：计划到达即自动执行一次。
+                      旧实现把「执行到 Excel」画在"副本比对做不了"的分支上，于是用户
+                      明明已经授权，却还要再点一下，而那一下是绕过审阅的执行
+                      （2026-10-30 真机：三张写入目标表的三步公式计划就是这条分支）。
+                      目录模式仍走它自己的批量执行入口。
+                    */}
+                    {sourceMode !== "workbook" && !message.staleSourceConfirm && !isWorksheetDeletion(message.plan) && nativeComparison.review?.messageId !== message.id && (
                       <button className="primary-button" disabled={busy} onClick={() => void runPlan(message.plan!)}>
                         {status === "executing" && activePlanId === message.plan.id ? "正在执行..." : "执行到 Excel"}
                       </button>
                     )}
                   </div>
-                  {sourceMode === "workbook" && workbook && !message.staleSourceConfirm && message.plan.actions.some(action => action.type === "copyRange") &&
-                    resultReviewPlanIssue(message.plan, selectedNamesFor(workbook)) !== null && (
-                      <p role="status">{resultReviewPlanIssue(message.plan, selectedNamesFor(workbook))}</p>
+                  {/*
+                    越界的计划**不执行**，原因直接写在卡片上 —— 不画一个点了只会报错的
+                    按钮，也不给它点下去就"绕过授权/审阅"的机会。
+                  */}
+                  {sourceMode === "workbook" && workbook && !message.staleSourceConfirm && !isWorksheetDeletion(message.plan) &&
+                    planExecutionBoundaryIssue(message.plan, selectedNamesFor(workbook)) !== null && (
+                      <p role="status">{planExecutionBoundaryIssue(message.plan, selectedNamesFor(workbook))}</p>
                     )}
                   {!resultMessages.current.has(message.id) && !message.staleSourceConfirm && (nativeComparison.review?.messageId === message.id ||
                     (sourceMode === "workbook" && workbook && !isWorksheetDeletion(message.plan) && resultReviewPlanIssue(message.plan, selectedNamesFor(workbook)) === null)) && (
@@ -11641,11 +13430,6 @@ export default function App() {
       )}
 
       <footer className="composer">
-        <ResultReviewBar state={resultReviewState} title={resumedReviewTitle || resultCandidate?.plan.title || ''}
-          onCompare={() => void resultReview.compare(resultReviewState.key ?? '')}
-          onConfirm={() => void resultReview.confirm(resultReviewState.key ?? '')}
-          onDiscard={() => void resultReview.discard(resultReviewState.key ?? '')}
-          onRetryMarker={() => void resultReview.retryMarkerCleanup(resultReviewState.key ?? '')} />
         {targetGuard.notice && !contextOpen && <TargetScopeNotice notice={targetGuard.notice} error={targetGuard.error}
           busy={targetGuard.confirming || scopeCheckingCommit} onOpenScope={() => void openScopePicker()}
           onRecheck={() => void targetGuard.recheck()}
@@ -12203,6 +13987,65 @@ export default function App() {
         */}
         <HistoryStorageNotice status={historyStorageStatus} />
 
+        {/*
+          只是**状态**的审阅栏（未执行 / 正在执行 / 需要核对）单独排在这里：
+          它没有决定可做，不该参与"谁是主视图"的竞争，但也不能因此消失。
+        */}
+        {resultReviewVisible(resultReviewState) && !resultReviewNeedsDecision(resultReviewState)
+          ? reviewBarNode
+          : null}
+
+        {/*
+          固定区域 = **一个容器**（`ComposerActionDock`），只展开一块卡。
+
+          改造前这里是三块各自决定出不出现：审阅栏（在 footer 顶部）、发现/恢复卡、
+          当前事项说明。三块可以同时在场，视觉分量还都差不多。现在由容器统一排版：
+          审阅与恢复**同一时刻只展开一块**，另一块退成一枚可点的 chip（显式切换，
+          不是隐藏）；澄清回答区不参与折叠 —— 它贴着输入框，折起来会让输入框在说
+          另一件事（详见组件的注释）。
+
+          这一层是 `.composer`（`<footer>`）的子节点，**不在** `.message-stream`
+          这个滚动容器里：核对成功后追加的日志再怎么把消息区滚到底，也不会把它挤出
+          视口。它绑定的执行由共享选择器（`officeRecoveryEntry`）唯一给出，
+          换簿/换会话后自然跟着变。
+        */}
+        <ComposerActionDock
+          selection={currentAction}
+          onSwitch={setDockPinned}
+          views={{
+            review: reviewBarNode,
+            recovery: (
+              <>
+                {/*
+                  发现入口：只在"发现到了但还没决定"或"发现本身失败"时出现。
+                  它不替用户选中任何一条，也不写入；点「核对这一次」之后才会多出一张恢复卡。
+                */}
+                <OfficeRecoveryChoicesCard
+                  choices={officeRecoveryChoices}
+                  failure={officeDiscoveryFailure}
+                  busy={busy}
+                  onSelect={(candidate) => void selectOfficeRecoveryCandidate(candidate)}
+                />
+                {officeRecoveryEntry && officeRecoveryTerminal === null && (
+                  <OfficeRecoveryPanel
+                    card={officeRecoveryEntry.card}
+                    busy={busy}
+                    undo={officeRecoveryUndoFor(officeRecoveryEntry)}
+                    onAction={(action) => void runOfficeRecoveryAction(officeRecoveryEntry.row, action)}
+                    onReverify={() => void reverifyOfficeRecoveryMessage(officeRecoveryEntry.row)}
+                  />
+                )}
+              </>
+            )
+          }}
+        />
+
+
+        {/*
+          固定区域里"现在最该处理哪件、还有几件在排队"由 `ComposerActionDock`
+          统一排版：它一次只展开一块卡，并给出显式切换入口（不再另起一行说明）。
+        */}
+
         <div
           className={`composer-input-region ${
             draggingImage ? "dragging-image" : ""
@@ -12222,14 +14065,41 @@ export default function App() {
           <div className="composer-resize-handle" {...composerResizeHandleProps}>
             <i />
           </div>
-          <TaskExecutionControls reviewing={resultReviewState.phase === "reviewing"} state={composerPauseButton}
-            pausing={pauseRequestState?.phase === "requesting"}
-            disabled={busy && composerPauseButton.kind === "continue"}
-            onPause={() => stopTurn()}
-            onResume={() => void resumeComposerTask()} />
-          <div className="composer-box">
+          <TaskExecutionNotice
+            action={composerPrimary}
+            reviewing={resultReviewState.phase === "reviewing"}
+          />
+          <div className={`composer-box${answeringClarification ? " is-answering" : ""}`}>
+        {clarificationBinding && activeClarificationMessage?.clarification && (
+          <div className={answeringClarification ? "clarification-answer-region" : "clarification-answer-region is-bypassed"}>
+            {answeringClarification ? (
+              <ClarificationComposer
+                question={activeClarificationMessage.clarification.question}
+                options={activeClarificationMessage.clarification.options}
+                selected={activeClarificationDraft?.selected ?? []}
+                multiple={clarificationMultiple}
+                fields={activeClarificationMessage.clarification.fields}
+                fieldValues={activeClarificationDraft?.fields ?? {}}
+                freeText={prompt}
+                busy={busy}
+                onToggle={(id) => { setPrompt(""); toggleClarificationChoice(id); }}
+                onFieldChange={updateClarificationFieldValues}
+              />
+            ) : (
+              <p className="clarification-answer-hint">
+                这道题还没回答；你正在输入的内容会作为**新需求**发送。
+              </p>
+            )}
+            {/*
+              显式逃生口：不回答、只想换个需求时用。**不按文字猜**是这里的纪律 ——
+              猜错的代价是用户的话被塞成旧问题的答案。
+            */}
+
+          </div>
+        )}
+
             <SlashCommandAutocomplete
-              visible={showSlashAutocomplete}
+              visible={!answeringClarification && showSlashAutocomplete}
               commands={slashMode === "model" ? slashModelCommands : slashCommands}
               onSelect={handleSlashCommandSelect}
               filter={slashFilter}
@@ -12238,13 +14108,19 @@ export default function App() {
             <textarea
               ref={composerInputRef}
               aria-label="给 Excel Bro 发消息"
+              data-clarification-other={answeringClarification ? "true" : undefined}
               value={prompt}
-              onChange={handleComposerChange}
+              onChange={(event) => {
+                if (answeringClarification && event.target.value.trim()) {
+                  setClarificationDraft((draft) => draft ? { ...draft, selected: [] } : draft);
+                }
+                handleComposerChange(event);
+              }}
               onKeyDown={handleComposerKeyDown}
-              onPaste={handleImagePaste}
+              onPaste={(event) => { if (!answeringClarification) handleImagePaste(event); }}
               onBlur={() => setShowSlashAutocomplete(false)}
               placeholder={
-                workbook
+                answeringClarification ? "其他" : workbook
                   ? "描述你想查询、分析或修改的内容…"
                   : "可以先输入需求，工作簿读取完成后即可发送..."
               }
@@ -12293,7 +14169,7 @@ export default function App() {
                   void addImageFiles(files);
                 }}
               />
-              <div className="composer-tools-left">
+              <div className="composer-tools-left" hidden={answeringClarification}>
                 <button
                   className="attach-image-button"
                   disabled={busy || preparingImages}
@@ -12317,32 +14193,26 @@ export default function App() {
                 </button>
               </div>
               <span
+                hidden={answeringClarification}
                 className="composer-shortcut-hint"
-                title={
-                  composerPauseButton.canPause
-                    ? "运行中：输入新内容按 Enter 可打断并转向，点击上方 ■ 暂停"
-                    : busy
-                      ? (resultReviewState.phase === "reviewing" && !resultReviewState.pending
-                        ? "等待审阅结果：可确认变更、放弃变更或打开双视图"
-                        : "正在处理，请稍候")
-                      : "Enter 发送 · Shift + Enter 换行 · 可粘贴截图"
-                }
+                title={composerHint}
               >
-                {composerPauseButton.canPause
-                  ? "运行中：输入新内容按 Enter 可打断并转向，点击上方 ■ 暂停"
-                  : busy
-                    ? (resultReviewState.phase === "reviewing" && !resultReviewState.pending
-                        ? "等待审阅结果：可确认变更、放弃变更或打开双视图"
-                        : "正在处理，请稍候")
-                    : "Enter 发送 · Shift + Enter 换行 · 可粘贴截图"}
+                {composerHint}
               </span>
-              <button className={`send-button ${prompt.trim() && running ? "is-steer" : ""}`}
-                type="button"
-                disabled={!workbook || preparingImages || (!prompt.trim() && pendingImages.length === 0) ||
-                  (pendingImages.length > 0 && !supportsVision) || (running && !prompt.trim())}
-                onClick={() => (running && prompt.trim() ? steerTurn(prompt) : void submitComposer())}
-                aria-label={running && prompt.trim() ? "打断并补充" : "发送"}
-                title={running && prompt.trim() ? "打断当前处理，带上这句话重新开始" : "发送这条需求"}>↑</button>
+              {answeringClarification && (<button
+              type="button"
+              className="clarification-bypass-toggle"
+              disabled={busy}
+              onClick={() => { if (activeClarificationMessage) cancelClarification(activeClarificationMessage); setPrompt(""); setClarificationDraft(null); }}
+            >
+              取消本次任务
+            </button>)}
+              <ComposerPrimaryButton
+                action={composerPrimary}
+                onInvoke={(invoke) => void invokeComposerPrimary(invoke)}
+                disabled={composerPrimaryBlocked !== null}
+                disabledHint={composerPrimaryBlocked ?? undefined}
+              />
             </div>
             {/*
               暂停请求的阶段**如实**显示，挂在工具条**外面**：工具条是三列网格，
@@ -12356,7 +14226,20 @@ export default function App() {
             )}
           </div>
         </div>
-        {(import.meta.env.DEV || import.meta.env.VITE_ENABLE_RECOVERY_PROBE === "true") && <RecoveryProbeControl identity={resultWorkbookIdentity} disabled={busy} />}
+        {(import.meta.env.DEV || import.meta.env.VITE_ENABLE_RECOVERY_PROBE === "true") &&
+          <RecoveryProbeControl
+            identity={resultWorkbookIdentity}
+            disabled={busy}
+            /*
+             * 只清本机的**挂接记录**（`excel-bro.pending-office-execution.v1`）：
+             * 换机器、清缓存、换端口之后就是这个样子。账本、授权、单元格一个字不动 ——
+             * 所以这一步不会让"发现"变成"没有未完成任务"，只会逼它走后端。
+             */
+            onClearIndex={() => {
+              const pending = loadPendingOfficeExecution();
+              if (pending) clearPendingOfficeExecution(pending.operationId);
+            }}
+          />}
         {/*
           A1-E1 验收入口：让本工作簿的下一次规划任务的第一个 Python 结果引用在
           "已登记、尚未首次写入"处失效。可见性由共享判据决定；未开启开发模式时

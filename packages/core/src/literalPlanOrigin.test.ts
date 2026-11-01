@@ -25,8 +25,19 @@ describe("trusted literal compiler provenance", () => {
   it("does not attest result references, mixed actions or computed matrices", () => {
     for (const plan of [
       {...literal(),localResultRef:"res_old"},
-      {...literal(),actions:[...literal().actions,...literal().actions]},
+      {...literal(),actions:[...literal().actions,{type:"clearRange",sheet:"目标",range:"A2"}]},
       {...literal(),actions:[{...literal().actions[0],values:[[222],[500]]}]}
     ]) expect(isTrustedLiteralPlan(stampLiteralPlanOrigin(plan,"literal_range_edit"))).toBe(false);
+  });
+  it("attests ordered literal edits without merging and binds every action", () => {
+    const actions = [111,222,333].map((value,index) => ({type:"writeValues",sheet:"目标",range:`B${index+2}`,values:[[value]]}));
+    const plan = stampLiteralPlanOrigin({id:"three-literals",actions},"literal_range_edit");
+    expect(isTrustedLiteralPlan(plan)).toBe(true);
+    expect(judgePlanSourceGate({plan,anchor:null,authorizedSheets:["目标"],liveFingerprint:null})).toEqual({verdict:"ok",basis:"literal"});
+    expect(plan.actions.map(action=>action.range)).toEqual(["B2","B3","B4"]);
+    expect(isTrustedLiteralPlan({...plan,actions:[...actions].reverse()})).toBe(false);
+    expect(isTrustedLiteralPlan(JSON.parse(JSON.stringify(plan)))).toBe(false);
+    actions[2].values[0][0]=999;
+    expect(isTrustedLiteralPlan(plan)).toBe(false);
   });
 });

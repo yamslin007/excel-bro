@@ -17,7 +17,10 @@ def test_all_stages_share_product_identity_separate_from_internal_task(prompt):
     assert prompt.startswith(PRODUCT_IDENTITY_PROMPT)
     assert "不要自称消息理解器" in prompt
     assert "Claude Agent SDK 是调用适配方式" in prompt
-    assert "经用户另行确认才执行" in prompt
+    assert "经用户另行确认才执行" not in prompt
+    assert "写入需用户另行确认" not in prompt
+    assert "不得要求执行前另行确认" in prompt
+    assert "不重复执行" in prompt
 
 
 @pytest.mark.parametrize("model", [None, True, "", "  ", "unsafe\nmodel", "x" * 201])

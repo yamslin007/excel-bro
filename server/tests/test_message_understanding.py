@@ -68,6 +68,28 @@ def test_images_are_not_claimed_seen(monkeypatch):
     assert result.kind == "needs_workbook_context"
 
 
+def test_message_only_structured_clarification_has_no_workbook_payload(monkeypatch):
+    payload = {"kind": "clarification", "clarification": {
+        "id": "rules", "question": "怎样分级？", "summary": "规则待定",
+        "reason": "缺少规则", "scopeLabel": "当前要求",
+        "options": [
+            {"id": "range", "label": "按区间", "description": "使用区间", "resolution": "按区间"},
+            {"id": "map", "label": "逐项对应", "description": "使用对应表", "resolution": "逐项对应"},
+        ],
+    }}
+    client = Client([response(payload)])
+    install_text_transport(monkeypatch, client)
+    result = asyncio.run(intent.check_message_understanding(
+        request(prompt="先问我规则，不要读取工作表"), config=_connection()))
+    assert result.kind == "clarification"
+    assert result.clarification.id == "rules"
+    outbound = json.loads(client.calls[0]["messages"][1]["content"])
+    assert set(outbound) == {"prompt", "imageCount", "conversation"}
+    payload["clarification"]["options"] = []
+    with pytest.raises((ValueError, ValidationError)):
+        intent.parse_message_understanding(json.dumps(payload), request())
+
+
 @pytest.mark.parametrize("payload", [
     {"kind": "proceed", "confirmedPrompt": "读取整表"},
     {"kind": "conversation", "message": "你好", "plan": {}},
@@ -192,3 +214,14 @@ def test_endpoint_has_no_scope_or_turn_registry_requirement(monkeypatch):
     assert client.post("/api/intent/message", json={"prompt": "谢谢帮助"}).json()["kind"] == "conversation"
     assert "scope" not in received[0]
     assert client.post("/api/intent/message", json={"prompt": "谢谢帮助", "scope": {}}).status_code == 422
+
+
+def test_clarification_three_options_limit():
+    from server.app.models import IntentClarification
+    payload = dict(id="rules", summary="规则", question="哪种规则？", reason="待定", scopeLabel="当前任务",
+                   options=[dict(id=str(i), label=f"规则{i}", description="说明", resolution=f"采用规则{i}") for i in range(3)])
+    assert len(IntentClarification.model_validate(payload).options) == 3
+    payload["options"].append(dict(id="fourth", label="规则4", description="说明", resolution="规则4"))
+    with pytest.raises(ValidationError):
+        IntentClarification.model_validate(payload)
+    assert len(payload["options"]) == 4
