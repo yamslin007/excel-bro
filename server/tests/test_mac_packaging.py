@@ -117,7 +117,7 @@ def test_runtime_uses_shared_application_support_resolver_on_macos() -> None:
 def test_workflow_builds_arm64_mac_installer() -> None:
     workflow = _read(WORKFLOW_PATH)
 
-    assert "macos-14" in workflow
+    assert "macos-15" in workflow
     assert "arm64" in workflow
     assert "workflow_dispatch" in workflow
     assert "bash packaging/build_mac.sh" in workflow

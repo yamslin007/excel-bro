@@ -2233,7 +2233,7 @@ Office 加载项清单的 `<Version>` 必须至少为 `1.0.0.0`，并包含顶�
 
 mac 包只能在 macOS 上构建，仓库通过 `.github/workflows/build-mac.yml` 在
 GitHub Actions 上完成：`workflow_dispatch` 手动触发或推送 `v*` 标签，matrix
-当前产出 arm64（macos-14）`.pkg`，未产出 Intel 包。本地有 Mac 时也可
+当前产出 arm64（macos-15）`.pkg`，未产出 Intel 包。macos-14 runner 已退役，首次构建在调度阶段被取消，已更新 runner。本地有 Mac 时也可
 直接执行：
 
 ```bash
