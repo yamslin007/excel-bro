@@ -1,0 +1,124 @@
+.conversation-navigation {
+  position: absolute;
+  right: 14px;
+  top: 8px;
+  bottom: 8px;
+  width: 10px;
+  z-index: 9;
+  transition: width 350ms cubic-bezier(.22, 1, .36, 1),
+    background-color 280ms ease, box-shadow 280ms ease;
+}
+
+.conversation-navigation-ticks {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow-y: auto;
+  scrollbar-width: none;
+}
+.conversation-navigation-ticks::-webkit-scrollbar { display: none; }
+.conversation-navigation-ticks > button {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  flex: 0 0 28px;
+  width: 100%;
+  min-width: 0;
+  padding: 0 4px;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--color-text-secondary, #68756e);
+  cursor: pointer;
+}
+.conversation-navigation-ticks > button > .conversation-navigation-tick {
+  flex: 0 0 12px;
+  height: 2px;
+  background: currentColor;
+  opacity: .45;
+}
+.conversation-navigation-ticks > button[aria-current],
+.conversation-navigation-ticks > button:hover,
+.conversation-navigation-ticks > button:focus-visible {
+  color: var(--color-brand-text, #286b46);
+}
+.conversation-navigation-ticks > button[aria-current] > .conversation-navigation-tick,
+.conversation-navigation-ticks > button:hover > .conversation-navigation-tick,
+.conversation-navigation-ticks > button:focus-visible > .conversation-navigation-tick {
+  flex-basis: 16px;
+  opacity: 1;
+}
+.conversation-navigation-ticks > button:focus-visible { outline: 2px solid currentColor; outline-offset: -2px; }
+
+.conversation-navigation { box-sizing: border-box; }
+.conversation-navigation[data-expanded="false"] .conversation-navigation-ticks > button {
+  padding: 0 2px;
+  justify-content: center;
+}
+.conversation-navigation[data-expanded="false"] .conversation-navigation-tick {
+  flex-basis: 3px;
+  height: 3px;
+  border-radius: 50%;
+}
+.conversation-navigation[data-expanded="false"] button[aria-current] > .conversation-navigation-tick,
+.conversation-navigation[data-expanded="false"] button:hover > .conversation-navigation-tick,
+.conversation-navigation[data-expanded="false"] button:focus-visible > .conversation-navigation-tick {
+  flex-basis: 4px;
+  height: 4px;
+}
+.conversation-navigation[data-expanded="true"] {
+  width: min(360px, calc(100% - 14px));
+  background: var(--color-background, #fff);
+  border: 1px solid var(--color-border, #ddd);
+  border-radius: 14px;
+  box-shadow: 0 6px 24px #0002;
+  padding: 6px 0;
+}
+.conversation-navigation-ticks {
+  position: relative;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+}
+.conversation-navigation[data-expanded="true"] .conversation-navigation-ticks {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-text-secondary, #89938d) transparent;
+}
+.conversation-navigation[data-expanded="true"] .conversation-navigation-ticks::-webkit-scrollbar {
+  display: block;
+  width: 6px;
+}
+.conversation-navigation[data-expanded="true"] .conversation-navigation-ticks::-webkit-scrollbar-thumb {
+  background: var(--color-border, #aaa);
+  border-radius: 4px;
+}
+.conversation-navigation-label { display: none; }
+.conversation-navigation[data-expanded="true"] .conversation-navigation-label {
+  display: block;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+  font-size: 13px;
+}
+.conversation-navigation[data-expanded="true"] .conversation-navigation-ticks > button {
+  flex-basis: 44px;
+  max-height: none;
+  padding: 0 10px 0 16px;
+  font: inherit;
+}
+.conversation-navigation-ticks > button[aria-current] { font-weight: 700; }
+
+.conversation-navigation[data-expanded="true"] .conversation-navigation-label {
+  animation: conversation-navigation-label-in 300ms ease-out both;
+}
+@keyframes conversation-navigation-label-in {
+  from { opacity: 0; transform: translateX(6px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .conversation-navigation { transition: none; }
+  .conversation-navigation[data-expanded="true"] .conversation-navigation-label { animation: none; }
+}

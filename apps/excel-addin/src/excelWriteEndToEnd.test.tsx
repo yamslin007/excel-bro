@@ -25,10 +25,21 @@
  * `docs/SDK_WORKFLOW_DELIVERY_2026-10-09.md` §4.4（仍为未验证）。
  */
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+
+/**
+ * 恢复操作区那颗主按钮的**名字族**（2026-11-02）。
+ *
+ * 主操作按证据分档：「检查已写入结果」/「检查写入结果」/「检查当前结果」，
+ * 续跑那档带剩余步数「继续剩余 N 步」。测试若写死某一个名字，就等于默认"分档不会发生"——
+ * 而分档恰恰是"状态未知时不许宣称已写入"的落地点。所以这里按名字族找：
+ * 负向用例（`queryByRole(...).toBeNull()`）也因此仍然在测真东西，不是自动通过。
+ */
+const RECOVERY_CHECK_BUTTON = /^检查/;
+const RECOVERY_RESUME_BUTTON = /^继续剩余 \d+ 步$/;
 import { act } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
-import { prepareExcelReviewLayout, arrangeExcelReviewLayout, executeWorksheetDeletion, openWorksheetCheckpoint, restoreWorksheetCheckpoint, confirmWorksheetCheckpointBackup } from "./api";
+import { closeExcelReviewCopy, selectExcelReviewCopySheet, prepareExcelReviewLayout, arrangeExcelReviewLayout, executeWorksheetDeletion, openWorksheetCheckpoint, restoreWorksheetCheckpoint, confirmWorksheetCheckpointBackup } from "./api";
 import { inspectOfficeAuthorizedTarget } from "./officeAuthorizedTarget";
 import { checkIntent, streamAssistantResponse, understandMessage, continuePlanningTask, getPlanningTaskStatus } from "./api";
 import {
@@ -43,6 +54,7 @@ import {
   reconcileOfficeActionReceipt,
   recordExecutionDisposition,
   registerOfficeExecution,
+  sendExecutionReview,
   startOfficeAction,
   suspendOfficeExecution
 } from "./api";
@@ -186,6 +198,9 @@ vi.mock("./api", async (importOriginal) => ({
   reconcileOfficeActionReceipt: vi.fn(),
   /* 用户处置留痕（放弃/撤销）：真实网络出口，必须替身，否则测试会往用户服务端发请求。 */
   recordExecutionDisposition: vi.fn(async () => undefined),
+  /* 审阅决定落账（审阅生命周期）：也是真实网络出口（POST /api/{ns}/executions/{id}/review）。
+     不替身就会让结果审阅的确认/放弃真的发到用户服务端。 */
+  sendExecutionReview: vi.fn(async () => undefined),
   // 工具桥：走真实状态机，只把"网络"换成替身（请求体与回执仍是产品代码拼的）。
   executeWorksheetDeletion: vi.fn(),
   confirmWorksheetCheckpointBackup: vi.fn(),
@@ -195,6 +210,11 @@ vi.mock("./api", async (importOriginal) => ({
   postSdkBridgeReceipt: vi.fn(),
   // 本机窗口排列服务：替身不模拟它，明确拒绝（产品会如实降级为"手动排列"）。
   arrangeExcelReviewLayout: vi.fn(),
+  closeExcelReviewCopy: vi.fn(),
+  selectExcelReviewCopySheet: vi.fn(async () => ({status:'selected'})),
+  setExcelReviewCopyViewing: vi.fn(async (_request, viewing) => viewing
+    ? {status:'arranged',layoutVersion:3,copySide:'left',originalSide:'right',synchronousScrolling:'enabled'}
+    : {status:'suspended',copyRetained:true}),
   prepareExcelReviewLayout: vi.fn(async () => {
     throw new Error("test-host: 未提供本机窗口排列服务");
   })
@@ -468,10 +488,16 @@ const liveTargetPlan = {
 };
 
 /** 桥上的确定性读取：`scope: "active"` 只读当前工作表（= 来源依赖只含它）。 */
-function bridgeQuery(scope: "active" | "selected") {
+function bridgeQuery(scope: "active" | "selected", sheets?: string[]) {
+  /*
+   * `scope: "selected"` 不再等于"把已授权表全读一遍"：多张表时必须显式绑定
+   * （`sheets` 或 range 带表名），否则执行器直接拒绝。夹具要"真的读整片授权区"
+   * 就得把表名列出来 —— 这也正是新语义要的显式性。
+   */
   return {
     mode: "rows" as const,
     scope,
+    ...(sheets && sheets.length > 0 ? { sheets } : {}),
     fields: ["影片"],
     limit: 10
   };
@@ -489,7 +515,7 @@ interface PlanTurnOptions {
   /** 弹层里要遍历的表清单（默认 `ALL_SHEETS`）；自定义夹具时传它。 */
   authorizePool?: string[];
   /** 让本轮真的经工具桥读一次宿主，从而产生可信来源记录。 */
-  read?: { scope: "active" | "selected" };
+  read?: { scope: "active" | "selected"; sheets?: string[] };
   /**
    * 计划**返回之前**的一下改动（改源值、改公式文本…）。
    *
@@ -529,7 +555,7 @@ async function sendPlan(
         {
           operationId: BRIDGE_OP,
           tool: "query_table",
-          arguments: bridgeQuery(options.read.scope),
+          arguments: bridgeQuery(options.read.scope, options.read.sheets),
           requestFingerprint: BRIDGE_FP,
           expiresAt: 0
         }
@@ -686,10 +712,10 @@ const contentWrites = (writes: ReturnType<TestOfficeHost["writes"]>) =>
   writes.filter((write) => write.kind !== "format");
 
 async function stageReview(view: ReturnType<typeof render>) {
-  await waitFor(() => expect(view.queryByRole("button", { name: "确认变更" })).not.toBeNull());
+  await waitFor(() => expect(view.queryByRole("button", { name: "确认全部变更" })).not.toBeNull());
 }
 async function clickSave(view: ReturnType<typeof render>) {
-  const save = view.getByRole("button", { name: "确认变更" });
+  const save = view.getByRole("button", { name: "确认全部变更" });
   fireEvent.click(save);
   /*
    * 成功终态下固定条会**收起**（不再占着输入框上方），所以"确认成了"的观测点
@@ -698,7 +724,7 @@ async function clickSave(view: ReturnType<typeof render>) {
    */
   await waitFor(() => expect(text(view)).toContain("已确认变更"));
   expect(view.container.querySelector(".result-review-bar")).toBeNull();
-  expect(view.queryByRole("button", { name: "确认变更" })).toBeNull();
+  expect(view.queryByRole("button", { name: "确认全部变更" })).toBeNull();
   return save;
 }
 const text = (view: ReturnType<typeof render>) => view.container.textContent ?? "";
@@ -751,14 +777,14 @@ describe("主表执行结果审阅（真实 App/执行器，宿主与网络替�
      *   ①「核对在途动作」只补记回执（零单元格写入）；
      *   ②「继续剩余动作」只跑剩下的动作（已完成的第 2 步不重放）。
      */
-    const reconcileButton=await reopened.findByRole("button",{name:"核对在途动作"});
+    const reconcileButton=await reopened.findByRole("button",{name: RECOVERY_CHECK_BUTTON});
     await waitFor(()=>expect((reconcileButton as HTMLButtonElement).disabled).toBe(false));
-    expect(reopened.queryByRole("button",{name:"继续剩余动作"})).toBeNull();
+    expect(reopened.queryByRole("button",{name:RECOVERY_RESUME_BUTTON})).toBeNull();
     act(()=>{fireEvent.click(reconcileButton);fireEvent.click(reconcileButton);});
     await waitFor(()=>expect(reconcileOfficeActionReceipt).toHaveBeenCalledTimes(1));
     // 核对这一下：一个单元格都没写。
     expect(contentWrites(host.originalWrites())).toEqual(before);
-    const resumeButton=await reopened.findByRole("button",{name:"继续剩余动作"});
+    const resumeButton=await reopened.findByRole("button",{name:RECOVERY_RESUME_BUTTON});
     await waitFor(()=>expect((resumeButton as HTMLButtonElement).disabled).toBe(false));
     fireEvent.click(resumeButton);
     if (sourceChanged) {
@@ -782,21 +808,20 @@ describe("主表执行结果审阅（真实 App/执行器，宿主与网络替�
     expect(text(reopened)).toContain('从第 3 步继续并完成');
     const writes=contentWrites(host.originalWrites());
     fireEvent.click(reopened.getByRole('button',{name:'双视图对比'}));
-    await waitFor(()=>expect(host.createWorkbookCalls()).toHaveLength(1));
-    const seed=host.seedEntries(0)['xl/worksheets/sheet1.xml'];
-    expect(seed).toContain('-101');expect(seed).toContain('-202');expect(seed).toContain('-303');
+    await waitFor(()=>expect(text(reopened)).toContain('没有保留完整的执行前表快照'));
+    expect(host.createWorkbookCalls()).toHaveLength(0); // Never manufacture a blank "whole sheet" from partial undo data.
     expect(contentWrites(host.originalWrites())).toEqual(writes);
     if(outcome==='confirm') {
-      const confirm=reopened.getByRole('button',{name:'确认变更'});
+      const confirm=reopened.getByRole('button',{name:'确认全部变更'});
       await waitFor(()=>expect((confirm as HTMLButtonElement).disabled).toBe(false));fireEvent.click(confirm);
       await waitFor(()=>expect(text(reopened)).toContain('已确认变更'));
-      expect(reopened.queryByRole('button',{name:'确认变更'})).toBeNull();
+      expect(reopened.queryByRole('button',{name:'确认全部变更'})).toBeNull();
       // This SharePoint host cannot close a native local copy; a settled cleanup notice is legitimate.
       expect(reopened.container.querySelector('.result-review-bar')?.textContent ?? '').not.toContain('执行未完成');
       // ③确认只清标记：续跑 + 确认的整个链路没有产生第二次写入。
       expect(contentWrites(host.originalWrites())).toEqual(writes);
     } else {
-      const discard=reopened.getByRole('button',{name:'放弃变更'});
+      const discard=reopened.getByRole('button',{name:'放弃全部变更'});
       await waitFor(()=>expect((discard as HTMLButtonElement).disabled).toBe(false));fireEvent.click(discard);
       await waitFor(()=>expect(text(reopened)).toContain('已放弃并恢复'));
       expect([2,3,4].map(r=>host.cell(TARGET,`B${r}`))).toEqual([-101,-202,-303]);
@@ -821,7 +846,7 @@ describe("主表执行结果审阅（真实 App/执行器，宿主与网络替�
       await clickSave(view);
       expect(contentWrites(host.originalWrites())).toEqual(writes);
     } else {
-      fireEvent.click(view.getByRole('button',{name:'放弃变更'}));
+      fireEvent.click(view.getByRole('button',{name:'放弃全部变更'}));
       await waitFor(()=>expect(text(view)).toContain('已放弃并恢复'));
       expect([2,3,4].map(r=>host.cell(TARGET,`B${r}`))).toEqual([-101,-202,-303]);
     }
@@ -840,7 +865,7 @@ describe("主表执行结果审阅（真实 App/执行器，宿主与网络替�
     for (const name of ALL_SHEETS) expect(sheetToggle(view, name).getAttribute('aria-pressed')).toBe('true');
   });
 
-  it("续跑交付计划后自动写入并回读，确认变更只清标记且不重复执行", async () => {
+  it("续跑交付计划后自动写入并回读，确认全部变更只清标记且不重复执行", async () => {
     vi.mocked(getPlanningTaskStatus).mockResolvedValue({
       kind: "planning_pause", turnId: "resumed-write-turn", status: "interrupted", revision: 1,
       lastSequence: 0, canContinue: true, pauseType: "interrupted", reason: "规划已暂停",
@@ -858,7 +883,7 @@ describe("主表执行结果审阅（真实 App/执行器，宿主与网络替�
     expect(host.createWorkbookCalls()).toHaveLength(0);
     expect(view.queryByRole("button", { name: "确认执行" })).toBeNull();
     expect(view.queryByRole("button", { name: "生成副本并排审阅" })).toBeNull();
-    expect(view.getByRole("button", { name: "放弃变更" })).toBeTruthy();
+    expect(view.getByRole("button", { name: "放弃全部变更" })).toBeTruthy();
     expect(view.getByRole("button", { name: "双视图对比" })).toBeTruthy();
     const writes = contentWrites(host.originalWrites()).length;
     await clickSave(view);
@@ -912,17 +937,17 @@ describe("主表执行结果审阅（真实 App/执行器，宿主与网络替�
     await waitFor(() => expect(host.createWorkbookCalls()).toHaveLength(1));
     const seed = host.seedEntries(0)["xl/worksheets/sheet1.xml"];
     expect(seed).not.toContain("<f>");
-    expect(seed).not.toContain("票房");
-    expect(text(view)).toContain("公式采用当时的值，不重新计算");
+    expect(seed).toContain("票房"); // Unchanged context on the authorized target is part of the before image.
+    expect(text(view)).toContain("公式采用执行前的值，不重新计算");
     expect(contentWrites(host.originalWrites())).toHaveLength(writes);
-    expect(view.getByRole("button", { name: "确认变更" })).toBeTruthy();
-    fireEvent.click(view.getByRole("button", { name: "放弃变更" }));
+    expect(view.getByRole("button", { name: "确认全部变更" })).toBeTruthy();
+    fireEvent.click(view.getByRole("button", { name: "放弃全部变更" }));
     await waitFor(() => expect(text(view)).toContain("已放弃并恢复"));
     expect(host.cell(SHEET, "G1")).toBe("");
     expect(host.matrix(SHEET, "A1:C3")).toEqual(before);
     expect(host.createWorkbookCalls()).toHaveLength(1);
   });
-  it("含工作簿名称时确认变更仍只清标记，不重放写入", async () => {
+  it("含工作簿名称时确认全部变更仍只清标记，不重放写入", async () => {
     host = createHost({ workbookNameCount: 1 }); installOfficeTestHost(host);
     const view = await sendPlan(reviewPlan); await stageReview(view);
     const writes = contentWrites(host.originalWrites()).length;
@@ -936,7 +961,7 @@ describe("主表执行结果审阅（真实 App/执行器，宿主与网络替�
     await waitFor(() => expect(text(view)).toContain("未执行"));
     expect(text(view)).toContain("恢复快照不可读");
     expect(host.originalWrites()).toHaveLength(0);
-    expect(view.queryByRole("button", { name: "确认变更" })).toBeNull();
+    expect(view.queryByRole("button", { name: "确认全部变更" })).toBeNull();
   });
   it("未知宿主读取错误仍阻止执行，不吞掉真实错误", async () => {
     host = createHost({ corruptFormatRead: () => { throw new Error("宿主读取中断"); } });
@@ -951,6 +976,9 @@ describe("主表执行结果审阅（真实 App/执行器，宿主与网络替�
     expect(host.cell(SHEET, "G1")).toBe("合计");
     expect(contentWrites(host.originalWrites()).map(w => w.address)).toEqual(["E1:F3", "G1"]);
     expect(host.createWorkbookCalls()).toHaveLength(0);
+    expect(view.container.querySelector(".composer-box .result-review-composer")).not.toBeNull();
+    expect(view.container.querySelectorAll(".result-review-bar")).toHaveLength(1);
+    expect(view.container.querySelector(".composer-box textarea")).toBeNull();
     expect(view.container.querySelector(".composer-footer .result-review-bar") ?? view.container.querySelector(".result-review-bar")).not.toBeNull();
     expect(view.container.querySelector("button[title='保存为可重复使用的个人工具']")).toBeNull();
   });
@@ -984,9 +1012,9 @@ describe("主表执行结果审阅（真实 App/执行器，宿主与网络替�
     fireEvent.click(view.getByRole("button", { name: "双视图对比" }));
     await waitFor(() => expect(host.createWorkbookCalls()).toHaveLength(1));
     const xml = host.seedEntries(0)["xl/worksheets/sheet1.xml"];
-    expect(xml).not.toContain("票房");
+    expect(xml).toContain("票房");
     expect(xml).toContain("执行前旧值");
-    expect(xml).not.toContain("不应复制的区域外数据");
+    expect(xml).toContain("不应复制的区域外数据"); // Same authorized sheet; not an unauthorized source sheet.
     expect(xml).toContain('r="E1"');
     expect(xml).not.toContain("<f>");
     expect(xml).not.toContain("上座率");
@@ -1005,11 +1033,10 @@ describe("主表执行结果审阅（真实 App/执行器，宿主与网络替�
     const view = await sendPlan(reviewPlan);
     await stageReview(view);
     const composerButton = view.container.querySelector<HTMLButtonElement>(".composer .send-button");
-    expect(composerButton).not.toBeNull();
-    expect(composerButton!.textContent?.trim()).not.toBe("■");
-    expect(composerButton!.getAttribute("aria-label")).not.toBe("暂停任务");
+    expect(composerButton).toBeNull();
+    expect(view.container.querySelector(".composer-box .result-review-composer")).not.toBeNull();
     expect(view.container.querySelector('[aria-label="暂停任务"]')).toBeNull();
-    expect(text(view)).toContain("等待审阅结果");
+    expect(text(view)).not.toContain("等待审阅结果");
   });
 
   /*
@@ -1044,7 +1071,7 @@ describe("主表执行结果审阅（真实 App/执行器，宿主与网络替�
      */
     const bar = view.container.querySelector<HTMLElement>(".result-review-bar")!;
     expect(bar.getAttribute("aria-busy")).toBe("false");
-    expect(text(view)).toContain("请查看主表中的执行结果");
+    expect(text(view)).toContain("待审阅");
     await waitFor(() =>
       expect(view.container.querySelector<HTMLButtonElement>(".new-progress-button")?.dataset.mode).toBe("idle"));
     const hint = view.container.querySelector<HTMLButtonElement>(".new-progress-button")!;
@@ -1061,14 +1088,14 @@ describe("主表执行结果审阅（真实 App/执行器，宿主与网络替�
     vi.mocked(inspectOfficeAuthorizedTarget).mockImplementationOnce(
       () => new Promise((resolve) => { releaseGuard = () => resolve(targetFor(null) as never); })
     );
-    fireEvent.click(view.getByRole("button", { name: "放弃变更" }));
+    fireEvent.click(view.getByRole("button", { name: "放弃全部变更" }));
     await waitFor(() =>
       expect(view.container.querySelector<HTMLButtonElement>(".new-progress-button")?.dataset.mode).toBe("running"));
     expect(view.container.querySelector<HTMLButtonElement>(".new-progress-button")!
       .querySelectorAll(".progress-dots > span")).toHaveLength(3);
     // 同一时刻审阅通道确实在途：按钮被禁用、`aria-busy` 为真。
     expect(view.container.querySelector<HTMLElement>(".result-review-bar")!.getAttribute("aria-busy")).toBe("true");
-    expect((view.getByRole("button", { name: "放弃变更" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((view.getByRole("button", { name: "放弃全部变更" }) as HTMLButtonElement).disabled).toBe(true);
 
     /*
      * ③ 操作完成：回到锚。`busy` 的互斥边界没被破坏 —— 恢复成功、固定条收起，
@@ -1088,6 +1115,8 @@ describe("主表执行结果审阅（真实 App/执行器，宿主与网络替�
     expect(host.conditionalFormatCount(SHEET)).toBe(2);
     await clickSave(view);
     expect(host.conditionalFormatCount(SHEET)).toBe(0);
+    expect(view.container.querySelector(".composer-box textarea")).not.toBeNull();
+    expect(view.container.querySelector(".result-review-composer")).toBeNull();
     expect(contentWrites(host.originalWrites())).toEqual(writes);
     expect(host.cell(SHEET, "G1")).toBe("合计");
     expect(text(view)).toContain("并通过独立验证");
@@ -1096,21 +1125,23 @@ describe("主表执行结果审阅（真实 App/执行器，宿主与网络替�
   it("放弃调用真正撤销，恢复目标且保留区域外内容", async () => {
     const view = await sendPlan(reviewPlan); await stageReview(view);
     expect(host.cell(SHEET, "G1")).toBe("合计");
-    fireEvent.click(view.getByRole("button", { name: "放弃变更" }));
+    expect(host.conditionalFormatCount(SHEET)).toBeGreaterThan(0);
+    fireEvent.click(view.getByRole("button", { name: "放弃全部变更" }));
     await waitFor(() => expect(text(view)).toContain("已放弃并恢复"));
+    expect(host.conditionalFormatCount(SHEET)).toBe(0);
     expect(host.cell(SHEET, "G1")).toBe("");
     expect(host.cell(SHEET, "E1")).toBe("");
     expect(host.cell(SHEET, "B2")).toBe(1200);
     expect(host.windowNames()).toEqual(["book.xlsx"]);
   });
-  it("放弃变更 → 服务端留痕记「放弃」，不是「撤销」", async () => {
+  it("放弃全部变更 → 服务端留痕记「放弃」，不是「撤销」", async () => {
     const view = await sendPlan(reviewPlan); await stageReview(view);
-    fireEvent.click(view.getByRole("button", { name: "放弃变更" }));
+    fireEvent.click(view.getByRole("button", { name: "放弃全部变更" }));
     await waitFor(() => expect(text(view)).toContain("已放弃并恢复"));
     /*
      * 留痕是 best-effort（`void` 掉的），所以等的是"端点被调用过"，不是某条消息。
      * 它证的正是账本里补出来的那一行：用户**主动撤回**了这次执行。
-     * 这一格以前完全不存在 —— 2026-10-29 真机确认变更后，账本里连"用户点过确认"
+     * 这一格以前完全不存在 —— 2026-10-29 真机确认全部变更后，账本里连"用户点过确认"
      * 都查不到（见 `outputs/a1-acceptance-20261029-2/EVIDENCE.md` §6）。
      */
     await waitFor(() => expect(vi.mocked(recordExecutionDisposition)).toHaveBeenCalledTimes(1));
@@ -1132,7 +1163,7 @@ describe("主表执行结果审阅（真实 App/执行器，宿主与网络替�
      */
     vi.mocked(recordExecutionDisposition).mockRejectedValueOnce(new Error("网络不可用"));
     const view = await sendPlan(reviewPlan); await stageReview(view);
-    fireEvent.click(view.getByRole("button", { name: "放弃变更" }));
+    fireEvent.click(view.getByRole("button", { name: "放弃全部变更" }));
     await waitFor(() => expect(text(view)).toContain("已放弃并恢复"));
     await waitFor(() => expect(vi.mocked(recordExecutionDisposition)).toHaveBeenCalledTimes(1));
     const writes = host.originalWrites().length;
@@ -1141,9 +1172,9 @@ describe("主表执行结果审阅（真实 App/执行器，宿主与网络替�
     expect(host.cell(SHEET, "G1")).toBe("");
     expect(text(view)).not.toContain("无法记录这次执行的处置");
   });
-  it("确认变更不是处置：不写「放弃/撤销」留痕", async () => {
+  it("确认全部变更不是处置：不写「放弃/撤销」留痕", async () => {
     const view = await sendPlan(reviewPlan); await stageReview(view);
-    fireEvent.click(view.getByRole("button", { name: "确认变更" }));
+    fireEvent.click(view.getByRole("button", { name: "确认全部变更" }));
     await waitFor(() => expect(text(view)).toContain("已确认变更"));
     expect(vi.mocked(recordExecutionDisposition)).not.toHaveBeenCalled();
     expect(host.cell(SHEET, "G1")).toBe("合计");
@@ -1152,9 +1183,9 @@ describe("主表执行结果审阅（真实 App/执行器，宿主与网络替�
     const view = await sendPlan(reviewPlan); await stageReview(view);
     host.setCell(SHEET, "G1", "人工修改");
     const count = contentWrites(host.originalWrites()).length;
-    fireEvent.click(view.getByRole("button", { name: "确认变更" }));
+    fireEvent.click(view.getByRole("button", { name: "确认全部变更" }));
     await waitFor(() => expect(text(view)).toContain("又发生了变化"));
-    fireEvent.click(view.getByRole("button", { name: "放弃变更" }));
+    fireEvent.click(view.getByRole("button", { name: "放弃全部变更" }));
     await waitFor(() => expect(text(view)).toContain("未能放弃"));
     expect(host.cell(SHEET, "G1")).toBe("人工修改");
     expect(contentWrites(host.originalWrites())).toHaveLength(count);
@@ -1170,7 +1201,7 @@ describe("主表执行结果审阅（真实 App/执行器，宿主与网络替�
     const view = await sendPlan(reviewPlan); await stageReview(view);
     const count = contentWrites(host.originalWrites()).length;
     host.setDocumentUrl("https://contoso.sharepoint.com/other.xlsx");
-    fireEvent.click(view.getByRole("button", { name: "确认变更" }));
+    fireEvent.click(view.getByRole("button", { name: "确认全部变更" }));
     await waitFor(() => expect(text(view)).toContain("工作簿、授权或计划已变化"));
     expect(contentWrites(host.originalWrites())).toHaveLength(count);
   });
@@ -1180,7 +1211,7 @@ describe("主表执行结果审阅（真实 App/执行器，宿主与网络替�
     const view = await sendPlan(reviewPlan);
     await waitFor(() => expect(text(view)).toContain("本次执行需要核对"));
     expect(host.cell(SHEET, "F2")).toBe(0.99);
-    expect(view.queryByRole("button", { name: "确认变更" })).toBeNull();
+    expect(view.queryByRole("button", { name: "确认全部变更" })).toBeNull();
     expect(contentWrites(host.originalWrites()).map(w => w.address)).toEqual(["E1:F3", "G1"]);
     expect(view.container.querySelector("button[title='保存为可重复使用的个人工具']")).toBeNull();
   });
@@ -1191,8 +1222,9 @@ describe("主表执行结果审阅（真实 App/执行器，宿主与网络替�
     expect(host.cell(SHEET, "E1")).toBe("影片");
     expect(host.cell(SHEET, "G1")).toBe("");
     expect(contentWrites(host.originalWrites()).map(w => w.address)).toEqual(["E1:F3"]);
-    expect(view.queryByRole("button", { name: "确认变更" })).toBeNull();
+    expect(view.queryByRole("button", { name: "确认全部变更" })).toBeNull();
   });
+
 });
 
 /**
@@ -1313,7 +1345,7 @@ describe("Excel 写侧：三步公式计划自动执行（阻断条件回归）"
     };
   }
 
-  it.each([true, false])("三张结果表的公式计划自动执行并在第二步中断（模型读取=%s）", async (modelRead) => {
+  it.each([[true, true], [false, true], [false, false]])("三张结果表的公式计划自动执行并在第二步中断（模型读取=%s，同一执行=%s）", async (modelRead, sameExecution) => {
     installFormulaHost();
     const plan = threeFormulaPlan("plan-formula-three");
     /*
@@ -1325,8 +1357,8 @@ describe("Excel 写侧：三步公式计划自动执行（阻断条件回归）"
      * 授权 → 在途材料）。只给 `status` 与两个索引，卡片构造会在读 `plan.actions` 时抛错，
      * 表现为"恢复入口根本没出现"——那是替身缺料，不是产品少闸门。
      */
-    vi.mocked(suspendOfficeExecution).mockResolvedValue({
-      operationId: "op-formula-three",
+    vi.mocked(suspendOfficeExecution).mockImplementation(async operationId => ({
+      operationId: sameExecution ? operationId : "op-formula-three",
       status: "suspended",
       revision: 2,
       workbookIdentity: `url:${BOOK_URL}`,
@@ -1351,7 +1383,7 @@ describe("Excel 写侧：三步公式计划自动执行（阻断条件回归）"
       canResume: true,
       requiresReconciliation: true,
       ownerToken: "owner-token"
-    } as never);
+    } as never));
     const view = await sendPlan(plan, "把三条公式分别写到三张结果表", {
       authorize: FORMULA_SCOPE,
       authorizePool: FORMULA_SCOPE,
@@ -1392,7 +1424,10 @@ describe("Excel 写侧：三步公式计划自动执行（阻断条件回归）"
     // 来源表一个单元格都没动。
     expect(host.matrix(SHEET, "A1:C2")).toEqual([["影片", "票房(万)", "场次"], ["甲", 1200, 30]]);
     // 恢复入口按结论给出（有在途动作 ⇒ 待核对），可点、且只有一条。
-    expect(await view.findByRole("button", { name: "核对在途动作" })).toBeTruthy();
+    expect(await view.findByRole("button", { name: RECOVERY_CHECK_BUTTON })).toBeTruthy();
+    expect(view.container.querySelector(".recovery-composer")).not.toBeNull();
+    if (sameExecution) expect(view.container.querySelector(".result-review-bar")).toBeNull();
+    else expect(view.container.querySelector(".result-review-bar")).not.toBeNull();
   });
 
   it("探针取消显示具体同表依赖原因和未执行，不显示需要核对", async () => {
@@ -1414,13 +1449,21 @@ describe("Excel 写侧：三步公式计划自动执行（阻断条件回归）"
    *
    * 旧代码把 `resultReviewPlanIssue` 当执行许可，于是这类计划连执行都进不去；
    * 现在它照常执行一次，审阅条如实说"本次没有副本"，**不画**点下去只会报错的
-   * 「双视图对比」，而「确认变更 / 放弃变更」照旧 —— 比对是审阅的辅助，不是许可。
+   * 「双视图对比」，而「确认全部变更 / 放弃全部变更」照旧 —— 比对是审阅的辅助，不是许可。
    *
    * 这里用**值**计划而不是公式计划：公式计划的 `verified` 依赖服务端补
    * `formulasEqual`（替身服务端没有），会先卡在"结果未完整验证"上，测不到降级这段。
    */
-  it("多张写入目标表的值计划没有副本可对比：照常执行并如实降级，不冒充可对比", async () => {
+  it("多张目标表按各自执行前快照切换对比，确认不重写", async () => {
+    BOOK_URL = 'file:///c:/work/multi-review.xlsx';
+    vi.mocked(registerOfficeExecution).mockResolvedValue(officeLedgerState() as never);
+    vi.mocked(startOfficeAction).mockResolvedValue(officeLedgerState() as never);
+    vi.mocked(completeOfficeAction).mockResolvedValue(officeLedgerState() as never);
+    vi.mocked(finishOfficeExecution).mockResolvedValue(officeLedgerState({status:'finished'}) as never);
+
+    vi.mocked(closeExcelReviewCopy).mockResolvedValue({status:'closed',copyClosed:true,recoveryCopyPath:null} as never);
     installFormulaHost();
+    FORMULA_TARGETS.forEach((name,index)=>host.setCell(name,'A1',`执行前${index+1}`));
     const rows = [["甲", 1200], ["乙", 980], ["甲", 30]];
     const plan = {
       id: "plan-three-values",
@@ -1459,14 +1502,38 @@ describe("Excel 写侧：三步公式计划自动执行（阻断条件回归）"
     expect(FORMULA_TARGETS.map((name) => host.matrix(name, "A1:B1")))
       .toEqual([[["甲", 1200]], [["乙", 980]], [["甲", 30]]]);
 
-    // 审阅条照旧出现，并**明说**这次没有执行前副本。
-    const bar = await view.findByRole("region", { name: "本次结果审阅" }, { timeout: 5000 });
-    expect(bar.textContent).toContain("本次未生成执行前副本");
-    expect(bar.textContent).toContain("结果以原表回读为准");
-    // 不画假按钮：比对做不了就不给「双视图对比」，确认/放弃仍在。
-    expect(view.queryByRole("button", { name: "双视图对比" })).toBeNull();
-    expect(view.getByRole("button", { name: "确认变更" })).toBeTruthy();
-    expect(view.getByRole("button", { name: "放弃变更" })).toBeTruthy();
+    await view.findByRole("region", { name: "本次结果审阅" }, { timeout: 5000 });
+    const written=host.originalWrites().length;
+    expect(view.queryByRole('button', {name:'结果一'})).toBeNull();
+    fireEvent.click(view.getByRole('button', {name:'双视图对比'}));
+    await waitFor(()=>expect(host.createWorkbookCalls()).toHaveLength(1));
+    const picker = await view.findByRole('button', {name:'结果一'});
+    fireEvent.click(view.getByRole('button', {name:'结果二'}));
+    await waitFor(()=>expect(selectExcelReviewCopySheet).toHaveBeenCalledTimes(1));
+    expect(host.createWorkbookCalls()).toHaveLength(1);
+    expect(host.seedEntries(0)['xl/worksheets/sheet1.xml']).toContain('执行前1');
+    expect(host.seedEntries(0)['xl/worksheets/sheet2.xml']).toContain('执行前2');
+    expect(host.seedEntries(0)['xl/worksheets/sheet3.xml']).toContain('执行前3');
+    expect(host.seedEntries(0)['xl/workbook.xml']).toContain('<sheet name="结果一"');
+    expect(host.seedEntries(0)['xl/workbook.xml']).toContain('<sheet name="结果二"');
+    expect(host.seedEntries(0)['xl/workbook.xml']).toContain('<sheet name="结果三"');
+    expect(host.seedEntries(0)['xl/workbook.xml']).not.toContain('<sheet name="EB_');
+    expect(host.seedEntries(0)['xl/worksheets/sheet2.xml']).not.toContain('执行前1');
+    expect(host.seedEntries(0)['xl/worksheets/sheet2.xml']).not.toContain('980');
+    expect(host.originalWrites()).toHaveLength(written);
+    await waitFor(()=>expect((view.getByRole('button', {name:'结果二'}) as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(view.getByRole('button', {name:'退出双视图'}));
+    await view.findByRole('button', {name:'双视图对比'});
+    fireEvent.click(view.getByRole('button', {name:'双视图对比'}));
+    await waitFor(()=>expect((view.getByRole('button', {name:'退出双视图'}) as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(view.getByRole('button', {name:'结果一'}));
+    await waitFor(()=>expect((view.getByRole('button', {name:'结果一'}) as HTMLButtonElement).disabled).toBe(false));
+    expect(host.createWorkbookCalls()).toHaveLength(1);
+    expect(host.originalWrites()).toHaveLength(written);
+    fireEvent.click(view.getByRole('button',{name:'确认全部变更'}));
+    await waitFor(()=>expect(view.container.querySelector('.result-review-composer')).toBeNull());
+    expect(host.originalWrites()).toHaveLength(written);
+
   });
 });
 
@@ -1619,13 +1686,15 @@ describe("Excel 写侧：断点恢复登记的真实可达性", () => {
 
   it("工具真的读过目标表：依赖含目标 → 不登记（不靠摘掉目标造来源集合）", async () => {
     /*
-     * `scope: "selected"` 会读**全部授权表**，其中就有写入目标「汇总表」。
-     * 于是来源依赖 = [综合票房, 汇总表] 与目标重叠 —— 即便"把目标从来源里摘掉"
+     * 显式把整片授权区都列进 `sheets`，让本轮**真的**读过「汇总表」——
+     * 于是来源依赖 = [综合票房, 汇总表] 与目标重叠。即便"把目标从来源里摘掉"
      * 就能换来登记成功，也不摘：记账说的是"读过谁"，它就是读过目标表。
+     * （旧夹具靠 `scope: "selected"` 隐式读全部授权表；那条隐式路径已经取消，
+     * 多张表必须显式绑定，所以这里把表名列出来。）
      */
     const view = await sendPlan(targetPlan, "把合计写到汇总表", {
       authorize: SCOPE,
-      read: { scope: "selected" }
+      read: { scope: "selected", sheets: SCOPE }
     });
     // 已授权的新流程在计划抵达后自动执行；下面核对实际登记/写入结果。
 
@@ -1805,18 +1874,22 @@ describe("Excel 写侧：中断后先核对再续跑", () => {
       resumeState({ plan, nextActionIndex: 3, inFlightActionIndex: null, revision: 4 }) as never
     );
     const view = render(<App />);
-    const reconcileButton = await view.findByRole("button", { name: "核对在途动作" });
+    const reconcileButton = await view.findByRole("button", { name: RECOVERY_CHECK_BUTTON });
     // 待核对时**不许**同时给续跑按钮：那正是"一个按钮里先补记再续跑"的老行为。
-    expect(view.queryByRole("button", { name: "继续剩余动作" })).toBeNull();
+    expect(view.queryByRole("button", { name: RECOVERY_RESUME_BUTTON })).toBeNull();
     /*
-     * 信息层级：一句正文要同时说清"第几步可能已写入"和"还剩几步没执行"，
-     * 而不是一句 `reason` 加一句按状态分支的重复说明。
+     * 信息层级（2026-11-02）：输入框里那块操作区一句话说完"写了哪些 / 还没写哪些 /
+     * 点下去不会写表"，上头不再另摆一张说同一件事的大卡。
      */
     const card = text(view);
-    expect(card).toContain("上次写入的恢复核对");
-    expect(card).toContain("待核对在途动作");
-    expect(card).toContain("第 2 个动作");
-    expect(card).toContain("还有 1 个动作没执行");
+    expect(view.container.querySelector(".office-recovery-panel"), "接管时不许再有大卡").toBeNull();
+    expect(card).toContain("任务中断 · 第 2 步结果待核对");
+    expect(card).toContain("已写入：");
+    expect(card).toContain("是否已写入还没确认");
+    expect(card).toContain("尚未写入：");
+    expect(card).toContain("不会修改表格");
+    // 状态未知时一个字都不许往"已写入"上靠：进在途那格不进 `已写入` 清单。
+    expect(card).not.toContain("已写入：汇总表!A1:B1、汇总表!A2:B2");
     fireEvent.click(reconcileButton);
     if (outcome === "unknown") {
       await waitFor(() => expect(text(view)).toContain("目标范围既不匹配执行前状态"));
@@ -1837,7 +1910,7 @@ describe("Excel 写侧：中断后先核对再续跑", () => {
     expect(startOfficeAction).not.toHaveBeenCalled();
     expect(finishOfficeExecution).not.toHaveBeenCalled();
     // ②继续：只剩没跑过的动作，已完成的第 2 步不重放。
-    fireEvent.click(await view.findByRole("button", { name: "继续剩余动作" }));
+    fireEvent.click(await view.findByRole("button", { name: RECOVERY_RESUME_BUTTON }));
     await waitFor(() => expect(finishOfficeExecution).toHaveBeenCalledTimes(1));
     expect(contentWrites(host.originalWrites()).slice(beforeWrites).map((write) => write.address))
       .toEqual(outcome === "applied" ? ["A3:B3"] : ["A2:B2", "A3:B3"]);
@@ -1847,6 +1920,78 @@ describe("Excel 写侧：中断后先核对再续跑", () => {
       .toEqual(outcome === "applied" ? [2] : [1, 2]);
   });
 
+
+  it("连点「检查」的第二下不会派发第二个请求，也不会跨到续跑把表写了", async () => {
+    /*
+     * 现场风险：核对与续跑住在**同一个位置**（输入框里的操作区）。双击时浏览器会派发
+     * `detail=1` 与 `detail=2` 两下；若两下都派发，第二下可能落在"视图已变成
+     * 继续剩余 N 步"的那一帧上 —— 用户以为自己在检查，结果把表写了。
+     *
+     * 判据两层：点击层的 `detail > 1` 不派发 + 核对→继续**换节点**（`key=view.action`）。
+     * 这里断言端到端的可观察结果：只提交一次回执、一格都没写、没有任何执行权请求。
+     */
+    // 在途的就是第 2 步（A2:B2），现场已经是**写后**状态：回执丢了，但值在。
+    host.setCell(TARGET, "A1", '="影片"', { asFormula: true });
+    host.setCell(TARGET, "B1", "=1200", { asFormula: true });
+    host.setCell(TARGET, "A2", '="乙"', { asFormula: true });
+    host.setCell(TARGET, "B2", "=980", { asFormula: true });
+    const beforeWrites = contentWrites(host.originalWrites()).length;
+    const originalFirstRow = host.matrix(TARGET, "A1:B1");
+    const plan = { ...liveTargetPlan, sourceFingerprintSheets: SCOPE, sourceDependencySheets: [SHEET],
+      actions: [...liveTargetPlan.actions, { type: "writeFormulas" as const, sheet: TARGET, range: "A3:B3", formulas: [['="丙"', "=600"]] }] };
+    pendingIndex();
+    const prior = await reconcileOfficeRangeAction({ plan, operationId: OPERATION_ID,
+      workbookIdentity: resumeState().workbookIdentity, actionIndex: 0,
+      before: resumeState().beforeSnapshot!, previous: null });
+    let reconciled = false;
+    let reconciledCheckpoint: unknown = null;
+    const inFlightState = () => resumeState({ plan, nextActionIndex: 1, inFlightActionIndex: 1,
+      checkpoint: prior.checkpoint,
+      beforeSnapshot: { ...resumeState().beforeSnapshot, actionIndex: 1, range: "A2:B2" } });
+    const settledState = () => resumeState({ plan,
+      checkpoint: reconciledCheckpoint ?? prior.checkpoint,
+      nextActionIndex: 2, inFlightActionIndex: null, requiresReconciliation: false, revision: 3 });
+    vi.mocked(getOfficeExecutionStatus).mockImplementation(async () => (reconciled ? settledState() : inFlightState()) as never);
+    vi.mocked(reconcileOfficeActionReceipt).mockImplementation(async (_id, request) => {
+      reconciled = true;
+      // 真实服务端把核对累积的 checkpoint（含两步写后指纹）落库并返回，替身也必须传播它。
+      reconciledCheckpoint = request.checkpoint;
+      return settledState() as never;
+    });
+    vi.mocked(claimOfficeExecutionResume).mockImplementation(async () => settledState() as never);
+    vi.mocked(finishOfficeExecution).mockResolvedValue(
+      resumeState({ plan, nextActionIndex: 3, inFlightActionIndex: null, revision: 4 }) as never
+    );
+    const view = render(<App />);
+    const reconcileButton = await view.findByRole("button", { name: RECOVERY_CHECK_BUTTON });
+
+    // 双击：第一下 detail=1，第二下 detail=2（浏览器对同一次双击的真实派发形状）。
+    fireEvent.click(reconcileButton, { detail: 1 });
+    fireEvent.click(reconcileButton, { detail: 2 });
+
+    await waitFor(() => expect(reconcileOfficeActionReceipt).toHaveBeenCalledTimes(1));
+    // 给第二下"落空"之后可能出现的异步续跑留出机会，再断言它确实没发生。
+    await act(async () => { await Promise.resolve(); });
+    expect(reconcileOfficeActionReceipt).toHaveBeenCalledTimes(1);
+    expect(contentWrites(host.originalWrites()).slice(beforeWrites)).toEqual([]);
+    expect(host.matrix(TARGET, "A1:B1")).toEqual(originalFirstRow);
+    // 只补记、不写表：回执说的就是"现场与写后一致"，第 3 步 A3:B3 一格都没动。
+    expect((vi.mocked(reconcileOfficeActionReceipt).mock.calls[0][1] as { outcome: string }).outcome)
+      .toBe("applied");
+    expect(claimOfficeExecutionResume).not.toHaveBeenCalled();
+    expect(startOfficeAction).not.toHaveBeenCalled();
+    expect(finishOfficeExecution).not.toHaveBeenCalled();
+    /*
+     * 结算之后停在"继续剩余 N 步"，**没有**自动续跑：按钮出现是等来的（异步状态推进），
+     * 出现之后立刻再断一次"一格都没写"。
+     */
+    const resumeButton = await view.findByRole("button", { name: RECOVERY_RESUME_BUTTON });
+    expect(resumeButton).toBeTruthy();
+    // 只剩第 3 步可跑：文案里的步数来自账本游标，不按动作总数硬算。
+    expect(resumeButton.textContent ?? "").toContain("1 步");
+    expect(contentWrites(host.originalWrites()).slice(beforeWrites)).toEqual([]);
+    expect(claimOfficeExecutionResume).not.toHaveBeenCalled();
+  });
 
   it("在途动作先核对为「已写入」：跳过该步，只写剩余步骤，不重复写", async () => {
     // 头一步已经真的写进宿主了（回执丢失），第二部还没写。
@@ -1877,8 +2022,8 @@ describe("Excel 写侧：中断后先核对再续跑", () => {
 
     const view = render(<App />);
     // 挂接索引在挂载时先核对一次：在途动作 → 恢复卡只给「核对在途动作」。
-    const reconcileButton = await view.findByRole("button", { name: "核对在途动作" });
-    expect(view.queryByRole("button", { name: "继续剩余动作" })).toBeNull();
+    const reconcileButton = await view.findByRole("button", { name: RECOVERY_CHECK_BUTTON });
+    expect(view.queryByRole("button", { name: RECOVERY_RESUME_BUTTON })).toBeNull();
     fireEvent.click(reconcileButton);
 
     // ①核对只补记：一个单元格都没写，也没有领取任何动作的执行权。
@@ -1887,7 +2032,7 @@ describe("Excel 写侧：中断后先核对再续跑", () => {
     expect(startOfficeAction).not.toHaveBeenCalled();
 
     // ②继续：只写第二步（A2:B2），第一步的 A1:B1 不再被写一次。
-    fireEvent.click(await view.findByRole("button", { name: "继续剩余动作" }));
+    fireEvent.click(await view.findByRole("button", { name: RECOVERY_RESUME_BUTTON }));
     await waitFor(() => expect(host.cell(TARGET, "A2")).toBe("=\"乙\""));
     const writes = contentWrites(host.originalWrites()).slice(firstWrites);
     expect(writes.map((write) => write.address)).toEqual(["A2:B2"]);
@@ -1917,7 +2062,7 @@ describe("Excel 写侧：中断后先核对再续跑", () => {
     const view = render(<App />);
     const backfill = await view.findByRole("button", { name: "补记完成（不重写原表）" });
     // 只剩回执时不画「继续剩余动作」：没有动作可执行，画了就是假按钮。
-    expect(view.queryByRole("button", { name: "继续剩余动作" })).toBeNull();
+    expect(view.queryByRole("button", { name: RECOVERY_RESUME_BUTTON })).toBeNull();
     fireEvent.click(backfill);
 
     await waitFor(() => expect(finishOfficeExecution).toHaveBeenCalledTimes(1));
@@ -1966,13 +2111,13 @@ describe("Excel 写侧：中断后先核对再续跑", () => {
     );
 
     const view = render(<App />);
-    fireEvent.click(await view.findByRole("button", { name: "核对在途动作" }));
+    fireEvent.click(await view.findByRole("button", { name: RECOVERY_CHECK_BUTTON }));
     await waitFor(() => expect(reconcileOfficeActionReceipt).toHaveBeenCalledTimes(1));
     // ①核对只补记：一个单元格都没写。
     expect(contentWrites(host.originalWrites()).slice(firstWrites)).toEqual([]);
 
     // ②继续：只写第二步（A2:B2），第一步的 A1:B1 不重写。
-    fireEvent.click(await view.findByRole("button", { name: "继续剩余动作" }));
+    fireEvent.click(await view.findByRole("button", { name: RECOVERY_RESUME_BUTTON }));
     await waitFor(() => expect(host.cell(TARGET, "A2")).toBe('="乙"'));
     expect(contentWrites(host.originalWrites()).slice(firstWrites).map((w) => w.address))
       .toEqual(["A2:B2"]);
@@ -1981,13 +2126,13 @@ describe("Excel 写侧：中断后先核对再续跑", () => {
     // ③审阅收尾：续跑完成后必须能进入审阅（有确认/放弃），而不是因为
     //    "前几步判据在上一次运行里"被判成 executed_unverified 后整卡 failed。
     //    这是本用例要钉住的关键：续跑完成 ≠ 不能审阅。
-    await waitFor(() => expect(view.queryByRole("button", { name: "确认变更" })).not.toBeNull());
-    expect(view.getByRole("button", { name: "放弃变更" })).toBeTruthy();
+    await waitFor(() => expect(view.queryByRole("button", { name: "确认全部变更" })).not.toBeNull());
+    expect(view.getByRole("button", { name: "放弃全部变更" })).toBeTruthy();
 
     if (outcome === "confirm") {
       // ④确认不重放：点确认后 A1:B1 与 A2:B2 都不再被写一次。
       const writesBeforeConfirm = contentWrites(host.originalWrites()).length;
-      fireEvent.click(view.getByRole("button", { name: "确认变更" }));
+      fireEvent.click(view.getByRole("button", { name: "确认全部变更" }));
       await waitFor(() => expect(text(view)).toContain("已确认变更"));
       expect(contentWrites(host.originalWrites())).toHaveLength(writesBeforeConfirm);
       // 公式仍在（确认只清标记，不回写）。
@@ -1995,7 +2140,7 @@ describe("Excel 写侧：中断后先核对再续跑", () => {
       expect(host.cell(TARGET, "A2")).toBe('="乙"');
     } else {
       // ⑤放弃恢复：原公式与格式一起回到执行前，不留本次写入的公式。
-      fireEvent.click(view.getByRole("button", { name: "放弃变更" }));
+      fireEvent.click(view.getByRole("button", { name: "放弃全部变更" }));
       await waitFor(() => expect(text(view)).toContain("已放弃并恢复"));
       expect(host.matrix(TARGET, "A1:B1")).toEqual(beforeFirstRow);
       expect(host.matrix(TARGET, "A2:B2")).toEqual([["", ""]]);
@@ -2510,10 +2655,12 @@ function scopeModeButton(view: ReturnType<typeof render>, label: "跟随当前" 
 
 async function bootApp() {
   const view = render(<App />);
-  await waitFor(() => expect(view.container.querySelector(".composer textarea")).not.toBeNull());
-  await waitFor(() =>
-    expect(view.container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title).toContain("当前模型")
-  );
+  await waitFor(() => {
+    // 恢复待办会替换普通输入区，模型选择器此时不渲染。
+    const modelReady = view.container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型");
+    const recoveryReady = view.container.querySelector(".composer .recovery-composer");
+    expect(Boolean(modelReady || recoveryReady)).toBe(true);
+  });
   return view;
 }
 
@@ -2797,10 +2944,10 @@ it("executes a trusted literal without a source read and confirmation does not r
     actions: [{type: "writeValues", sheet: SHEET, range: "A1", values: [["完成"]]}],
     acceptanceCriteria: [{type: "rangeEquals", sheet: SHEET, range: "A1", expected: [["完成"]]}]};
   const view = await sendPlan(plan, "仅在 A1 写入完成", {planOrigin: "literal_range_edit"});
-  await waitFor(() => expect(view.queryByRole("button", {name: "确认变更"}), text(view)).not.toBeNull());
+  await waitFor(() => expect(view.queryByRole("button", {name: "确认全部变更"}), text(view)).not.toBeNull());
   expect(host.cell(SHEET, "A1")).toBe("完成");
   const writes = contentWrites(host.originalWrites()); expect(writes).toHaveLength(1);
-  fireEvent.click(await view.findByRole("button", {name: "确认变更"}));
+  fireEvent.click(await view.findByRole("button", {name: "确认全部变更"}));
   await waitFor(() => expect(text(view)).toContain("已确认变更"));
   expect(contentWrites(host.originalWrites())).toEqual(writes);
 });
@@ -2811,12 +2958,12 @@ it.each(["confirm", "discard"])("executes three trusted literal actions in order
     actions:[111,222,333].map((value,index)=>({type:"writeValues",sheet:SHEET,range:`B${index+2}`,values:[[value]]})),
     acceptanceCriteria:[111,222,333].map((value,index)=>({type:"rangeEquals",sheet:SHEET,range:`B${index+2}`,expected:[[value]]}))};
   const view = await sendPlan(plan,"B2/B3/B4依次写入111/222/333，不合并动作",{planOrigin:"literal_range_edit"});
-  await waitFor(()=>expect(view.queryByRole("button",{name:"确认变更"}),text(view)).not.toBeNull());
+  await waitFor(()=>expect(view.queryByRole("button",{name:"确认全部变更"}),text(view)).not.toBeNull());
   expect([2,3,4].map(row=>host.cell(SHEET,`B${row}`))).toEqual([111,222,333]);
   const writes = contentWrites(host.originalWrites());
   expect(writes).toHaveLength(3);
   expect(writes.map(write=>write.address)).toEqual(["B2","B3","B4"]);
-  fireEvent.click(await view.findByRole("button",{name:outcome==="confirm"?"确认变更":"放弃变更"}));
+  fireEvent.click(await view.findByRole("button",{name:outcome==="confirm"?"确认全部变更":"放弃全部变更"}));
   await waitFor(()=>expect(text(view)).toContain(outcome==="confirm"?"已确认变更":"已放弃并恢复"));
   if(outcome==="confirm") expect(contentWrites(host.originalWrites())).toEqual(writes);
   else expect([2,3,4].map(row=>host.cell(SHEET,`B${row}`))).toEqual([-101,-202,-303]);
@@ -2850,7 +2997,11 @@ describe("Excel 未完成执行的发现入口（真实 App / 宿主与网络替
     return {
       operationId: OPERATION,
       taskId: "task-discovery-0001",
+      // 发现候选现在带"性质 + 审阅状态"（2026-11-03）：替身必须与服务端同形，
+      // 否则准入闸会以"缺少性质标记"整条拒绝 —— 那会掩盖真正的发现判据。
+      kind: "resume",
       status: "running",
+      reviewState: null,
       createdAt: 1_790_000_000_000,
       updatedAt: 1_790_000_600_000,
       nextActionIndex: 0,
@@ -2919,8 +3070,98 @@ describe("Excel 未完成执行的发现入口（真实 App / 宿主与网络替
     expect(view.getAllByRole("button", { name: "核对这一次" })).toHaveLength(2);
     expect(getOfficeExecutionStatus).not.toHaveBeenCalled();
     expect(text(view)).not.toContain("继续剩余动作");
+    /*
+     * 没有可选的**那一条**时，恢复操作区不该顶掉输入框（没东西可操作），
+     * 但这条待办也不许"因为没接管输入框就消失"：它仍然在固定区域里的恢复视图里。
+     */
+    expect(view.container.querySelector("[data-recovery-composer]")).toBeNull();
+    expect(view.container.querySelector(".composer-box textarea")).not.toBeNull();
+    const dockRecovery = view.container.querySelector<HTMLElement>('[data-dock-view="recovery"]');
+    expect(dockRecovery, "恢复待办必须在固定区域里看得见").not.toBeNull();
+    expect(dockRecovery!.contains(view.container.querySelector(".office-recovery-choices"))).toBe(true);
     expect(host.writes()).toEqual([]);
     for (const spy of mutationSpies()) expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("审阅在等决定时：恢复待办退成 chip 但不消失，输入框不被顶掉，也不谎称入口在里面", async () => {
+    /*
+     * 两个待办同时在场：审阅（优先级 1）与未收尾的写入（优先级 2）。
+     * 输入区只能归一件事 —— 审阅期间用户可能正在打字决定要不要确认，所以恢复操作区
+     * **不接管**。这条钉四件事：①恢复没被藏起来（chip 在，点得开）；
+     * ②输入框还在（不是被置换掉）；③卡面不说"在输入框里"；④全程零写入。
+     */
+    discovery([candidate()]);
+    vi.mocked(getOfficeExecutionStatus).mockResolvedValue(executionState() as never);
+    const view = await bootApp();
+    await waitFor(() => expect(view.queryByRole("button", { name: RECOVERY_RESUME_BUTTON })).not.toBeNull());
+    // 基线：没人跟它抢的时候，输入区确实归恢复操作区（没有 textarea）。
+    expect(view.container.querySelector("[data-recovery-composer]")).not.toBeNull();
+    expect(view.container.querySelector(".composer-box textarea")).toBeNull();
+
+    /*
+     * 用户先做别的事：「另提需求」把输入框要回来，发一条会写单元格的任务并走到审阅。
+     * 这一下才让**两件待办同时在场**（审阅在等决定 + 上一次写入没收尾）。
+     * 必须用**同一个 App 实例**发（`sendPlan` 会另挂一份 App，等于换了个现场）。
+     */
+    await setAuthorizedScope(view, [SHEET, TARGET]);
+    fireEvent.click(view.getByRole("button", { name: "另提需求" }));
+    await waitFor(() => expect(view.container.querySelector(".composer-box textarea")).not.toBeNull());
+    vi.mocked(understandMessage).mockResolvedValue({
+      kind: "needs_workbook_context",
+      summary: "补上座率",
+      provider: "model"
+    } as never);
+    vi.mocked(checkIntent).mockResolvedValue({
+      kind: "proceed",
+      summary: "补上座率",
+      confirmedPrompt: "补上座率",
+      provider: "model"
+    } as never);
+    vi.mocked(streamAssistantResponse).mockResolvedValue({
+      kind: "plan",
+      provider: "model",
+      plan: reviewPlan
+    } as never);
+    fireEvent.change(view.container.querySelector(".composer textarea")!, {
+      target: { value: "补上座率" }
+    });
+    fireEvent.click(view.getByRole("button", { name: /^发送$/ }));
+    await stageReview(view);
+
+    const dock = view.container.querySelector<HTMLElement>(".composer-action-dock")!;
+    expect(dock.getAttribute("data-dock-primary")).toBe("review");
+    const chip = view.container.querySelector<HTMLElement>('[data-dock-switch="recovery"]');
+    expect(chip, "恢复待办不许因为输入框被审阅占着就消失").not.toBeNull();
+    expect(chip!.textContent).toContain("恢复核对");
+    // 审阅置换输入框，恢复待办仍可从 chip 查看。
+    expect(view.container.querySelector(".composer-box textarea")).toBeNull();
+    expect(view.container.querySelector(".composer-box .result-review-composer")).not.toBeNull();
+    expect(view.container.querySelector("[data-recovery-composer]")).toBeNull();
+    expect(view.container.querySelector(".recovery-pending-entry")).toBeNull();
+    // 卡面此刻没展开（展开的是审阅那一块）：恢复视图连渲染都没渲染，自然不该有指路句。
+    expect(view.container.querySelector(".office-recovery-panel")).toBeNull();
+
+    // 显式切过去：卡与入口都还在，用户随时能看清这条待办是什么。
+    const writesBefore = host.writes().length;
+    fireEvent.click(chip!);
+    await waitFor(() =>
+      expect(view.container.querySelector('[data-dock-view="recovery"]')).not.toBeNull()
+    );
+    expect(view.container.querySelector('[data-dock-view="review"]')).toBeNull();
+    expect(view.container.querySelector('[data-dock-switch="review"]')).not.toBeNull();
+    expect(view.container.querySelector(".office-recovery-panel")).not.toBeNull();
+    // 判别句只属于"输入区归别人"这一档：不写"在输入框里"（此刻那里是普通 textarea）。
+    const hint = view.container.querySelector<HTMLElement>("[data-recovery-primary-hint]")!;
+    expect(hint.textContent).toContain("等当前事项处理完后");
+    // 切过来也没有主操作可点 —— 输入区仍然归审阅，不许在这里另画一颗。
+    expect(view.container.querySelector(".composer-box [data-recovery-primary]")).toBeNull();
+
+    // 发现这条链路依然只读：一次状态查询（发现时那一次），零补记、零写入。
+    expect(
+      vi.mocked(getOfficeExecutionStatus).mock.calls.every(([operationId]) => operationId === OPERATION)
+    ).toBe(true);
+    expect(reconcileOfficeActionReceipt).not.toHaveBeenCalled();
+    expect(host.writes()).toHaveLength(writesBefore);
   });
 
   it("点选的一条身份不符时：只给阻断与只读重核，不给续跑按钮", async () => {
@@ -2944,7 +3185,7 @@ describe("Excel 未完成执行的发现入口（真实 App / 宿主与网络替
     await waitFor(() => expect(view.container.querySelector(".office-recovery-choices")).not.toBeNull());
     fireEvent.click(view.getAllByRole("button", { name: "核对这一次" })[0]);
     await waitFor(() => expect(text(view)).toContain("当前不是产生该断点的工作簿"));
-    expect(view.queryByRole("button", { name: "继续剩余动作" })).toBeNull();
+    expect(view.queryByRole("button", { name: RECOVERY_RESUME_BUTTON })).toBeNull();
     expect(view.queryByRole("button", { name: "核对并继续" })).toBeNull();
     expect(view.getByRole("button", { name: "重新核对（只读）" })).toBeTruthy();
     // 点选本身只读：一个写入类接口都不许被调用。
@@ -2958,7 +3199,7 @@ describe("Excel 未完成执行的发现入口（真实 App / 宿主与网络替
     discovery([candidate()]);
     vi.mocked(getOfficeExecutionStatus).mockResolvedValue(executionState() as never);
     const view = await bootApp();
-    await waitFor(() => expect(view.queryByRole("button", { name: "继续剩余动作" })).not.toBeNull());
+    await waitFor(() => expect(view.queryByRole("button", { name: RECOVERY_RESUME_BUTTON })).not.toBeNull());
     // 只看"读的是哪一条"，不钉次数：工作簿目录晚到会再核对一轮（只读，不写入）。
     expect(
       vi.mocked(getOfficeExecutionStatus).mock.calls.every(([operationId]) => operationId === OPERATION)
@@ -2970,7 +3211,7 @@ describe("Excel 未完成执行的发现入口（真实 App / 宿主与网络替
      */
     await setAuthorizedScope(view, [SHEET]);
     await waitFor(() => expect(text(view)).toContain("当前授权里没有工作表「汇总表」"));
-    expect(view.queryByRole("button", { name: "继续剩余动作" })).toBeNull();
+    expect(view.queryByRole("button", { name: RECOVERY_RESUME_BUTTON })).toBeNull();
     expect(view.getByRole("button", { name: "重新核对（只读）" })).toBeTruthy();
 
     // 重新核验的是**同一条**执行：每一次状态查询的 operationId 都相同，没有被换成别的候选。
@@ -3113,7 +3354,7 @@ describe("Excel 未完成执行的发现入口（真实 App / 宿主与网络替
     }) as never);
 
     const reopened = render(<App />);
-    const reconcileButton = await reopened.findByRole("button", { name: "核对在途动作" });
+    const reconcileButton = await reopened.findByRole("button", { name: RECOVERY_CHECK_BUTTON });
     await waitFor(() => expect((reconcileButton as HTMLButtonElement).disabled).toBe(false));
     /*
      * 发现只补"挂接记录"，不改授权：续跑读的就是这份索引。
@@ -3129,7 +3370,7 @@ describe("Excel 未完成执行的发现入口（真实 App / 宿主与网络替
     // 核对只补记回执：第 3 步还没跑，这一下不写任何单元格。
     expect(contentWrites(host.originalWrites()).slice(before.length)).toEqual([]);
     expect(finishOfficeExecution).not.toHaveBeenCalled();
-    fireEvent.click(await reopened.findByRole("button", { name: "继续剩余动作" }));
+    fireEvent.click(await reopened.findByRole("button", { name: RECOVERY_RESUME_BUTTON }));
     await waitFor(() => expect(finishOfficeExecution, text(reopened)).toHaveBeenCalledTimes(1));
     // 只补第 3 步：第 2 步已经在中断前写完（核对判定 applied），不许重放。
     expect(contentWrites(host.originalWrites()).slice(before.length).map((write) => write.address)).toEqual(["B4"]);
@@ -3149,7 +3390,7 @@ describe("Excel 未完成执行的发现入口（真实 App / 宿主与网络替
     vi.mocked(getOfficeExecutionStatus).mockResolvedValue(executionState() as never);
     const view = await bootApp();
     const scopeBefore = view.container.querySelector(".scope-trigger")?.textContent;
-    const button = await view.findByRole("button", { name: "继续剩余动作" });
+    const button = await view.findByRole("button", { name: RECOVERY_RESUME_BUTTON });
     expect((button as HTMLButtonElement).disabled).toBe(false);
     /*
      * 首读播种把已提交范围写成**当前活动表**（综合票房），而计划要写汇总表。
@@ -3166,7 +3407,7 @@ describe("Excel 未完成执行的发现入口（真实 App / 宿主与网络替
     discovery([candidate()]);
     vi.mocked(getOfficeExecutionStatus).mockResolvedValue(executionState() as never);
     const view = await bootApp();
-    await waitFor(() => expect(view.queryByRole("button", { name: "继续剩余动作" })).not.toBeNull());
+    await waitFor(() => expect(view.queryByRole("button", { name: RECOVERY_RESUME_BUTTON })).not.toBeNull());
 
     await openScopePicker(view);
     fireEvent.click(view.getByRole("button", { name: "清空" }));
@@ -3177,7 +3418,7 @@ describe("Excel 未完成执行的发现入口（真实 App / 宿主与网络替
     await waitFor(() => expect(view.container.querySelector(".scope-popover")).toBeNull());
 
     await waitFor(() => expect(text(view)).toContain("当前授权里没有工作表「汇总表」"));
-    expect(view.queryByRole("button", { name: "继续剩余动作" })).toBeNull();
+    expect(view.queryByRole("button", { name: RECOVERY_RESUME_BUTTON })).toBeNull();
     expect(view.getByRole("button", { name: "重新核对（只读）" })).toBeTruthy();
     // 撤销之后仍然只有只读入口：重新核对不许借机把授权恢复。
     fireEvent.click(view.getByRole("button", { name: "重新核对（只读）" }));
@@ -3193,7 +3434,7 @@ describe("Excel 未完成执行的发现入口（真实 App / 宿主与网络替
       expect(view.container.querySelector(".scope-close")?.getAttribute("data-scope-pending")).toBe("false")
     );
     await waitFor(() => expect(text(view)).toContain("当前授权里没有工作表「汇总表」"));
-    expect(view.queryByRole("button", { name: "继续剩余动作" })).toBeNull();
+    expect(view.queryByRole("button", { name: RECOVERY_RESUME_BUTTON })).toBeNull();
     expect(host.writes()).toEqual([]);
     for (const spy of mutationSpies()) expect(spy).not.toHaveBeenCalled();
   });
@@ -3210,7 +3451,7 @@ describe("Excel 未完成执行的发现入口（真实 App / 宿主与网络替
     }) as never);
     vi.mocked(getOfficeExecutionStatus).mockResolvedValue(executionState() as never);
     const view = await bootApp();
-    await waitFor(() => expect(view.queryByRole("button", { name: "继续剩余动作" })).not.toBeNull());
+    await waitFor(() => expect(view.queryByRole("button", { name: RECOVERY_RESUME_BUTTON })).not.toBeNull());
 
     await act(async () => {
       host.setDocumentUrl(otherUrl);
@@ -3218,7 +3459,7 @@ describe("Excel 未完成执行的发现入口（真实 App / 宿主与网络替
       await Promise.resolve();
     });
     await waitFor(() => expect(text(view)).toContain("当前不是产生该断点的工作簿"));
-    expect(view.queryByRole("button", { name: "继续剩余动作" })).toBeNull();
+    expect(view.queryByRole("button", { name: RECOVERY_RESUME_BUTTON })).toBeNull();
     expect(view.getByRole("button", { name: "重新核对（只读）" })).toBeTruthy();
     // 换走时**不清**本机索引：切回来还要用它把同一条接上。
     expect(loadPendingOfficeExecution()?.operationId).toBe(OPERATION);
@@ -3228,7 +3469,7 @@ describe("Excel 未完成执行的发现入口（真实 App / 宿主与网络替
       document.dispatchEvent(new Event("visibilitychange"));
       await Promise.resolve();
     });
-    await waitFor(() => expect(view.queryByRole("button", { name: "继续剩余动作" })).not.toBeNull());
+    await waitFor(() => expect(view.queryByRole("button", { name: RECOVERY_RESUME_BUTTON })).not.toBeNull());
     expect(
       vi.mocked(getOfficeExecutionStatus).mock.calls.every(([operationId]) => operationId === OPERATION)
     ).toBe(true);
@@ -3241,21 +3482,42 @@ describe("Excel 未完成执行的发现入口（真实 App / 宿主与网络替
     return view.container.querySelector<HTMLElement>(".office-recovery-panel");
   }
 
-  it("恢复入口只在输入区上方：不在消息滚动容器里，历史消息只留没有按钮的记录", async () => {
+  /**
+   * 输入框里的恢复操作区（接管态）。
+   *
+   * 2026-11-02 起它与上面那张大卡**互斥**：结论是待核对/可继续时由操作区接管，
+   * 卡被收走；结论给不出"一个主操作"（阻断/证据不足/重新规划）时操作区退出，
+   * 卡回来。所以"入口"永远只有一块，测试要按状态取对的那一块。
+   */
+  function recoveryComposerOf(view: ReturnType<typeof render>): HTMLElement | null {
+    return view.container.querySelector<HTMLElement>(".composer-box .recovery-composer");
+  }
+
+  /** 当前那一块入口（两种节点取其一，不会同时有两个）。 */
+  function recoveryEntryOf(view: ReturnType<typeof render>): HTMLElement | null {
+    return recoveryComposerOf(view) ?? recoveryPanelOf(view);
+  }
+
+  it("恢复入口在输入框里：不在消息滚动容器里，历史消息只留没有按钮的记录", async () => {
     discovery([candidate()]);
     vi.mocked(getOfficeExecutionStatus).mockResolvedValue(executionState() as never);
     const view = await bootApp();
-    await waitFor(() => expect(recoveryPanelOf(view)).not.toBeNull());
-    const panel = recoveryPanelOf(view)!;
+    await waitFor(() => expect(recoveryComposerOf(view)).not.toBeNull());
+    const panel = recoveryComposerOf(view)!;
+    /*
+     * ⓪**只有一处**：操作区接管输入框时，固定区域那张大卡不再渲染 —— 同一个结论
+     * 不画两遍（标题/正文/进度逐句重复，用户要先读两遍才知道点哪）。
+     */
+    expect(recoveryPanelOf(view), "接管之后上方不许再有那张大卡").toBeNull();
     // ①唯一性：全页只有一个可点的续跑入口，消息里那份记录一个按钮都没有。
     // 先断这一条再断位置：两者是**两个**属性（`mutate_office_recovery_placement.mjs`
     // 的 P1 把卡搬回消息里时，唯一性仍成立、只有位置那条红）。
-    expect(view.getAllByRole("button", { name: "继续剩余动作" })).toHaveLength(1);
+    expect(view.getAllByRole("button", { name: RECOVERY_RESUME_BUTTON })).toHaveLength(1);
     const record = view.container.querySelector<HTMLElement>(".office-recovery-record");
     expect(record, "历史消息里仍要留下执行记录").not.toBeNull();
     expect(record!.querySelectorAll("button")).toHaveLength(0);
     expect(record!.closest(".message-stream"), "记录留在历史里，入口不在").not.toBeNull();
-    expect(record!.textContent).toContain("操作入口在输入框上方");
+    expect(record!.textContent).toContain("操作入口在输入框里");
     /*
      * ②位置（jsdom 能钉死的那一半）：可点击的那一份**不在** `.message-stream`
      * 这个滚动容器里，而在 `.composer` 里。核对后追加的日志再怎么滚，也改不了它的位置。
@@ -3264,65 +3526,122 @@ describe("Excel 未完成执行的发现入口（真实 App / 宿主与网络替
      */
     expect(panel.closest(".message-stream")).toBeNull();
     expect(panel.closest(".composer")).not.toBeNull();
-    expect(panel.getAttribute("data-operation-id")).toBe(OPERATION);
+    expect(panel.getAttribute("data-recovery-composer")).toBe("resume");
     /*
-     * ③**唯一主入口**：那颗按钮就是输入框右下角的主按钮，不是卡面上另画的一颗。
-     * 卡面只留一句指路 + 次要动作（补记完成 / 重新核对），否则同一个动作两个入口，
-     * 而且其中一颗不受输入框状态约束。
+     * ③**唯一主入口**：那颗按钮就在这块操作区里，不是卡面上另画的一颗、也不是
+     * 右下角那颗图标按钮。全页与这块里都只有一颗。
      */
-    const primaryEntry = view.container.querySelector<HTMLElement>(".composer .composer-primary");
+    const primaryEntry = panel.querySelector<HTMLElement>("[data-recovery-primary]");
     expect(primaryEntry, "主入口必须在输入框里").not.toBeNull();
-    expect(primaryEntry!.getAttribute("aria-label")).toBe("继续剩余动作");
-    expect(view.getByRole("button", { name: "继续剩余动作" })).toBe(primaryEntry);
-    expect(panel.querySelector('[data-recovery-primary-hint="resume"]')!.textContent).toContain("输入框右下角");
-    // 卡面自己不许再有第二个「继续/核对」按钮（次要动作可以留）。
-    expect(panel.querySelectorAll("button")).toHaveLength(0);
+    expect(primaryEntry!.getAttribute("aria-label")).toMatch(RECOVERY_RESUME_BUTTON);
+    expect(view.getByRole("button", { name: RECOVERY_RESUME_BUTTON })).toBe(primaryEntry);
+    expect(panel.querySelectorAll("[data-recovery-primary]")).toHaveLength(1);
     /*
-     * ④ 有内容 ⇒ 主按钮变「发送」，但**必须说明为什么核对入口不在了**。
-     * 静默顶掉入口是本轮明确要避免的形状：用户会以为恢复卡坏了。
-     * 两个方向都断言：有字时给说明、清空后入口回来（不是恒真）。
+     * ④**置换**而不是叠加：恢复操作区占着输入框时，里面没有 textarea，也没有
+     * 右下角那颗主按钮 —— 一屏只有一个"现在该点哪"的答案。
      */
-    const composerTextarea = view.container.querySelector<HTMLTextAreaElement>(".composer textarea")!;
+    expect(view.container.querySelector(".composer-box textarea")).toBeNull();
+    expect(view.container.querySelector(".composer .composer-primary")).toBeNull();
+    /*
+     * ⑤「另提需求」把输入框**原样还回来**：普通 textarea 回来、主按钮回到「发送」、
+     * 旧任务退成一行待办入口（不是撤销、不是放弃，任务与材料都没动）。
+     */
+    fireEvent.click(view.getByRole("button", { name: "另提需求" }));
+    await waitFor(() => expect(view.container.querySelector(".composer-box textarea")).not.toBeNull());
+    expect(view.container.querySelector(".recovery-pending-entry")).not.toBeNull();
+    expect(view.queryByRole("button", { name: RECOVERY_RESUME_BUTTON })).toBeNull();
+    expect(
+      view.container.querySelector(".composer .composer-primary")!.getAttribute("aria-label")
+    ).toBe("发送");
+    /*
+     * ⑥**草稿不丢、也不被误提交**：写一句话之后从待办入口点回操作区，再按
+     * 「另提需求」回到输入框，那句话还在；全过程一次核对/续跑/发送都没发生。
+     */
+    const composerTextarea = view.container.querySelector<HTMLTextAreaElement>(
+      ".composer-box textarea"
+    )!;
     fireEvent.change(composerTextarea, { target: { value: "再补一列金额" } });
+    fireEvent.click(view.getByRole("button", { name: /恢复待办/ }));
+    await waitFor(() => expect(view.getByRole("button", { name: RECOVERY_RESUME_BUTTON })).toBeTruthy());
+    fireEvent.click(view.getByRole("button", { name: "另提需求" }));
     await waitFor(() =>
-      expect(view.container.querySelector(".composer .composer-primary")!.getAttribute("aria-label")).toBe("发送")
-    );
-    expect(text(view)).toContain("输入框有内容：发送会作为新需求");
-    expect(text(view)).toContain("请先清空输入框");
-    // 清空文字 ⇒ 入口回来（反方向断言，防止"恒为发送"也能过）。
-    fireEvent.change(composerTextarea, { target: { value: "" } });
-    await waitFor(() =>
-      expect(view.container.querySelector(".composer .composer-primary")!.getAttribute("aria-label"))
-        .toBe("继续剩余动作")
-    );
-    /*
-     * ⑤ **只贴图片、文字为空**：`hasInput` 把待发图片也算内容，所以同一个入口
-     * 同样会被 `send` 顶掉 —— 提示必须说明还得移除图片，否则用户清空文字之后
-     * 仍然点不到核对，却看不出为什么。这条以前只能靠"同源"推断（jsdom 没有图片
-     * 解码），现在靠 `prepareImageFile` 这个接缝的替身来断言。
-     */
-    const fileInput = view.container.querySelector<HTMLInputElement>('input[type="file"]')!;
-    fireEvent.change(fileInput, {
-      target: { files: [new File([new Uint8Array([1, 2, 3])], "u.png", { type: "image/png" })] }
-    });
-    await waitFor(() => expect(view.container.querySelector(".composer-attachments")).not.toBeNull());
-    await waitFor(() =>
-      expect(view.container.querySelector(".composer .composer-primary")!.getAttribute("aria-label")).toBe("发送")
-    );
-    expect(text(view)).toContain("并移除待发图片");
-    // 移除图片（文字为空）⇒ 核对入口回来。
-    fireEvent.click(view.container.querySelector<HTMLButtonElement>('[aria-label="移除图片 u.png"]')!);
-    await waitFor(() =>
-      expect(view.container.querySelector(".composer .composer-primary")!.getAttribute("aria-label"))
-        .toBe("继续剩余动作")
+      expect(
+        view.container.querySelector<HTMLTextAreaElement>(".composer-box textarea")!.value
+      ).toBe("再补一列金额")
     );
     // 进度是共享层那一句，不是另拼的。
     expect(record!.textContent).toContain("已完成 0 / 2 步 · 剩余 2 步");
     expect(host.writes()).toEqual([]);
+    expect(reconcileOfficeActionReceipt).not.toHaveBeenCalled();
     for (const spy of mutationSpies()) expect(spy).not.toHaveBeenCalled();
   });
 
-  it("换簿再切回：同一张卡在输入区上方原地改判，入口节点不换、按钮不重复", async () => {
+  it("输入法还在组合时不算空输入框：恢复待办退成入口行，不卸载正在打字的 textarea", async () => {
+    /*
+     * 现场：用户正在用拼音打一句话（组合未上屏），这时一次**晚到**的发现结果摆出了恢复待办。
+     * 组合期间浏览器可能还没把这几个字提交进 `value` —— 只看"文字/附件非空"就会判定
+     * "输入框是空的"，于是把 textarea 整块**卸载**，用户眼睁睁看着正在打的字没了。
+     * 判据因此多看一件事：`compositionstart` 到 `compositionend` 之间也算有草稿。
+     */
+    /*
+     * 这本簿用自己的身份：上一条用例如果在收尾时往浏览器索引里写了"还有一条待办"，
+     * 它带的是另一本簿的身份。发现按身份精确匹配，换一个身份就不会把它继承过来 ——
+     * 否则开场就已经是恢复态，`.composer-box` 里根本没有 textarea 可以组合输入。
+     */
+    BOOK_URL = "https://contoso.sharepoint.com/ime-compose.xlsx";
+    host.setDocumentUrl(BOOK_URL);
+    /*
+     * 把**每一次**发现都按住，直到测试自己 `release`：
+     * 身份监视的 3s 定时器、窗口 focus/visibilitychange 都可能在同一时刻再触发一轮
+     * 发现，若只按住第一轮、后面的立刻返回候选，恢复操作区就会在 `compositionStart`
+     * 之前接管输入框（textarea 被卸载）。按住全部几轮，测试对"发现到底触发几次"就不敏感。
+     */
+    let issued = 0;
+    const pending: ((value: unknown) => void)[] = [];
+    vi.mocked(listPendingOfficeExecutions).mockImplementation(() => {
+      issued += 1;
+      return new Promise((resolve) => {
+        pending.push(resolve);
+      }) as never;
+    });
+    const releaseAll = () => {
+      for (const resolve of pending.splice(0)) {
+        resolve({
+          schemaVersion: 1,
+          namespace: "office",
+          workbookIdentity: identity(),
+          limit: 20,
+          truncated: false,
+          candidates: [candidate()]
+        });
+      }
+    };
+    vi.mocked(getOfficeExecutionStatus).mockResolvedValue(executionState() as never);
+    const view = await bootApp();
+    const textarea = view.container.querySelector<HTMLTextAreaElement>(".composer-box textarea")!;
+    expect(textarea).not.toBeNull();
+
+    fireEvent.compositionStart(textarea);
+    await act(async () => {
+      releaseAll();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(view.container.querySelector(".office-recovery-panel")).not.toBeNull());
+    // 组合中：**同一颗** textarea 原地不动，恢复待办退成一行看得见、点得开的入口。
+    expect(view.container.querySelector(".composer-box textarea")).toBe(textarea);
+    expect(view.container.querySelector("[data-recovery-composer]")).toBeNull();
+    expect(view.container.querySelector(".recovery-pending-entry")).not.toBeNull();
+
+    // 组合结束、而且没上屏（用户取消了这次输入）：恢复操作区立刻回来，不用再点一次。
+    fireEvent.compositionEnd(textarea);
+    await waitFor(() =>
+      expect(view.container.querySelector("[data-recovery-composer]")).not.toBeNull()
+    );
+    expect(view.container.querySelector(".recovery-pending-entry")).toBeNull();
+    expect(host.writes()).toEqual([]);
+  });
+
+  it("换簿再切回：结论就地改判，入口始终只有一块（操作区 ⇄ 卡）、按钮不重复", async () => {
     const otherUrl = "https://contoso.sharepoint.com/sites/finance/other-workbook.xlsx";
     vi.mocked(listPendingOfficeExecutions).mockImplementation(async (workbookIdentity) => ({
       schemaVersion: 1,
@@ -3334,9 +3653,9 @@ describe("Excel 未完成执行的发现入口（真实 App / 宿主与网络替
     }) as never);
     vi.mocked(getOfficeExecutionStatus).mockResolvedValue(executionState() as never);
     const view = await bootApp();
-    await waitFor(() => expect(recoveryPanelOf(view)).not.toBeNull());
-    const panel = recoveryPanelOf(view)!;
-    expect(panel.getAttribute("data-recovery-kind")).toBe("resume");
+    await waitFor(() => expect(recoveryComposerOf(view)).not.toBeNull());
+    expect(recoveryComposerOf(view)!.getAttribute("data-recovery-composer")).toBe("resume");
+    expect(recoveryPanelOf(view), "接管时上方不许有那张大卡").toBeNull();
 
     await act(async () => {
       host.setDocumentUrl(otherUrl);
@@ -3345,13 +3664,18 @@ describe("Excel 未完成执行的发现入口（真实 App / 宿主与网络替
     });
     await waitFor(() => expect(text(view)).toContain("当前不是产生该断点的工作簿"));
     /*
-     * **同一个 DOM 节点**：卡片没有重建、没有搬到别处、也没有变出第二张。
-     * "同一执行的卡片直接更新"就是这条 —— 不是"再插一张新卡"。
+     * 结论变成"不是产生断点的工作簿"：这种结论交不出**一个**主操作，操作区退出，
+     * 卡回来（阻断原因与"重新核对（只读）"只有卡上能放）。
+     * 判据不是"节点没变"，而是**同一时刻只有一块入口** —— 操作区与大卡互斥，
+     * 任何时刻都不许两处都说这件事。
      */
-    expect(recoveryPanelOf(view)).toBe(panel);
-    expect(panel.getAttribute("data-recovery-kind")).toBe("blocked");
-    expect(view.queryByRole("button", { name: "继续剩余动作" })).toBeNull();
+    await waitFor(() => expect(recoveryPanelOf(view)).not.toBeNull());
+    const blockedPanel = recoveryPanelOf(view)!;
+    expect(recoveryComposerOf(view)).toBeNull();
+    expect(blockedPanel.getAttribute("data-recovery-kind")).toBe("blocked");
+    expect(view.queryByRole("button", { name: RECOVERY_RESUME_BUTTON })).toBeNull();
     expect(view.getByRole("button", { name: "重新核对（只读）" })).toBeTruthy();
+    expect(view.container.querySelectorAll(".office-recovery-panel")).toHaveLength(1);
     expect(view.container.querySelectorAll(".office-recovery-record button")).toHaveLength(0);
 
     await act(async () => {
@@ -3359,10 +3683,11 @@ describe("Excel 未完成执行的发现入口（真实 App / 宿主与网络替
       document.dispatchEvent(new Event("visibilitychange"));
       await Promise.resolve();
     });
-    await waitFor(() => expect(view.queryByRole("button", { name: "继续剩余动作" })).not.toBeNull());
-    expect(recoveryPanelOf(view)).toBe(panel);
-    expect(panel.getAttribute("data-recovery-kind")).toBe("resume");
-    expect(view.getAllByRole("button", { name: "继续剩余动作" })).toHaveLength(1);
+    await waitFor(() => expect(view.queryByRole("button", { name: RECOVERY_RESUME_BUTTON })).not.toBeNull());
+    // 又变回可继续：操作区重新接管，大卡再被收走 —— 仍然只有一块。
+    expect(recoveryComposerOf(view), "可继续时操作区重新接管输入框").not.toBeNull();
+    expect(recoveryPanelOf(view)).toBeNull();
+    expect(view.getAllByRole("button", { name: RECOVERY_RESUME_BUTTON })).toHaveLength(1);
     expect(host.writes()).toEqual([]);
     for (const spy of mutationSpies()) expect(spy).not.toHaveBeenCalled();
   });
@@ -3383,32 +3708,34 @@ describe("Excel 未完成执行的发现入口（真实 App / 宿主与网络替
       }) as never;
     });
     const view = await bootApp();
-    const reconcileButton = await view.findByRole("button", { name: "核对在途动作" });
-    const panel = recoveryPanelOf(view)!;
-    expect(panel.getAttribute("data-recovery-kind")).toBe("reconcile");
+    const reconcileButton = await view.findByRole("button", { name: RECOVERY_CHECK_BUTTON });
+    const panel = recoveryComposerOf(view)!;
+    expect(panel.getAttribute("data-recovery-composer")).toBe("reconcile");
+    expect(recoveryPanelOf(view)).toBeNull();
     const rowsBefore = view.container.querySelectorAll(".message-stream .message-row").length;
 
     hang = true;
     fireEvent.click(reconcileButton);
-    // 进行中：同一张卡改的是 acting，不是另插一张；主按钮仍是**同一颗**，只是禁用。
-    await waitFor(() => expect(panel.getAttribute("data-recovery-acting")).toBe("reconcile"));
-    expect(recoveryPanelOf(view)).toBe(panel);
     /*
-     * 核对在飞的"进行中"由两处同时表达：卡面 `acting`（上面那条）+ 输入框右下角
-     * 那颗主按钮变禁用。这里断言的是"同一时刻只有一个主入口、且它点不动"——
-     * 不再要求按钮文案变成「正在核对…」：那个文案原本是卡面上的第二颗按钮，
-     * 现在卡面不画按钮了，在途状态由 `acting` 与主按钮的不可点共同表达。
+     * 进行中：**同一块**操作区改的是自己的状态（`data-recovery-busy`），不另插一块；
+     * 主按钮仍是同一颗，只是禁用 + 文案改成「正在检查…」。防双击就靠这一条：
+     * 按钮在飞的时候是 disabled，第二次点击落不下去。
      */
-    const primary = view.container.querySelector<HTMLButtonElement>(".composer .composer-primary");
+    await waitFor(() =>
+      expect(recoveryComposerOf(view)!.getAttribute("data-recovery-busy")).toBe("true")
+    );
+    expect(recoveryComposerOf(view)).toBe(panel);
+    const primary = panel.querySelector<HTMLButtonElement>("[data-recovery-primary]");
     expect(primary).not.toBeNull();
     expect(primary!.disabled).toBe(true);
-    expect(view.container.querySelectorAll(".composer .composer-primary")).toHaveLength(1);
+    expect(primary!.textContent).toBe("正在检查…");
+    expect(panel.querySelectorAll("[data-recovery-primary]")).toHaveLength(1);
     // 核对真的追加了日志（消息流变长），入口却**不在**那个滚动容器里。
     await waitFor(() =>
       expect(view.container.querySelectorAll(".message-stream .message-row").length)
         .toBeGreaterThan(rowsBefore)
     );
-    expect(recoveryPanelOf(view)).toBe(panel);
+    expect(recoveryComposerOf(view)).toBe(panel);
     expect(panel.closest(".message-stream")).toBeNull();
     expect(panel.closest(".composer")).not.toBeNull();
     expect(view.container.querySelectorAll(".office-recovery-record button")).toHaveLength(0);
@@ -3421,7 +3748,7 @@ describe("Excel 未完成执行的发现入口（真实 App / 宿主与网络替
     discovery([candidate()]);
     vi.mocked(getOfficeExecutionStatus).mockResolvedValue(executionState() as never);
     const view = await bootApp();
-    const button = await view.findByRole("button", { name: "继续剩余动作" });
+    const button = await view.findByRole("button", { name: RECOVERY_RESUME_BUTTON });
     /*
      * 卡片摆好**之后**服务端才出现"在途但没快照"（另一个现场/另一次中断留下的）。
      * 续跑必须重新读状态并按同一条纪律停下 —— 卡面说"能继续"不等于能继续。
@@ -3493,7 +3820,7 @@ describe("Excel 未完成执行：重开后从账本材料撤销已写入的内�
   /** 与真机夹具同一组公式：`来源!B2*1` / `来源!B4*2` / `来源!B5*3`。 */
   const FORMULAS = [`=${SOURCE}!B2*1`, `=${SOURCE}!B4*2`, `=${SOURCE}!B5*3`];
   const UNDO_LABEL = "↶ 撤销本次执行";
-  const SOURCE_CHANGED = "来源已变化，不能沿用旧结果续跑。";
+  const SOURCE_CHANGED = "来源数据已改变，不能继续原任务。";
 
   type LedgerState = Awaited<ReturnType<typeof getOfficeExecutionStatus>>;
 
@@ -3641,7 +3968,7 @@ describe("Excel 未完成执行：重开后从账本材料撤销已写入的内�
   /** 核对在途动作（只补记回执）→ 账本进度 2/3，写前快照补齐第 2 步。 */
   async function reconcileInFlight(view: ReturnType<typeof render>) {
     const before = contentWrites(host.originalWrites()).length;
-    fireEvent.click(await view.findByRole("button", { name: "核对在途动作" }));
+    fireEvent.click(await view.findByRole("button", { name: RECOVERY_CHECK_BUTTON }));
     await waitFor(() => expect(reconcileOfficeActionReceipt).toHaveBeenCalledTimes(1));
     expect(contentWrites(host.originalWrites()).slice(before)).toEqual([]);
     return before;
@@ -3660,7 +3987,7 @@ describe("Excel 未完成执行：重开后从账本材料撤销已写入的内�
      * 可继续，也可撤销 —— 两件事同时成立。撤销那条先看**说明**：这句话只在
      * "材料够 + 身份对 + 未处置"时渲染，是判据的正文，比"按钮在不在"更能定位原因。
      */
-    expect(await view.findByRole("button", { name: "继续剩余动作" })).toBeTruthy();
+    expect(await view.findByRole("button", { name: RECOVERY_RESUME_BUTTON })).toBeTruthy();
     await waitFor(() =>
       expect(text(view)).toContain(`来源工作表「${SOURCE}」保持你现在的修改`)
     );
@@ -3671,7 +3998,7 @@ describe("Excel 未完成执行：重开后从账本材料撤销已写入的内�
      * 拒绝不是本组要修的东西，这里钉住它是为了下面那条 —— 撤销**不因此**消失。
      */
     host.setCell(SOURCE, "B5", 500);
-    fireEvent.click(view.getByRole("button", { name: "继续剩余动作" }));
+    fireEvent.click(view.getByRole("button", { name: RECOVERY_RESUME_BUTTON }));
     await waitFor(() => expect(text(view)).toContain(SOURCE_CHANGED));
     expect(contentWrites(host.originalWrites()).slice(before)).toEqual([]);
     expect(host.cell(RESULTS[2], "B2")).toBe("");
@@ -3695,6 +4022,8 @@ describe("Excel 未完成执行：重开后从账本材料撤销已写入的内�
         {
           operationId,
           taskId: "task-formula-undo",
+          kind: "resume",
+          reviewState: null,
           status: "needs_reconciliation",
           createdAt: 1_790_000_000_000,
           updatedAt: 1_790_000_600_000,
@@ -3723,7 +4052,7 @@ describe("Excel 未完成执行：重开后从账本材料撤销已写入的内�
      * "来源已核对、可继续"，也不该给「继续剩余动作」按钮 —— 发现阶段读了来源指纹，
      * 结论是"来源已变化"（阻断），而不是上一轮那种"显示可继续、点下去才被拒"。
      */
-    expect(reopened.queryByRole("button", { name: "继续剩余动作" })).toBeNull();
+    expect(reopened.queryByRole("button", { name: RECOVERY_RESUME_BUTTON })).toBeNull();
     expect(text(reopened)).not.toContain("来源和目标已核对");
     expect(text(reopened)).toContain(SOURCE_CHANGED);
     const undoButton = await reopened.findByRole("button", { name: UNDO_LABEL });
@@ -3764,9 +4093,9 @@ describe("Excel 未完成执行：重开后从账本材料撤销已写入的内�
      * （撤销行）与"可继续剩余动作"（结论 + 按钮）—— 上一轮真机正是两句话并存、
      * 按钮还能点。终态下「继续剩余动作」和「补记完成」都不得再出现。
      */
-    expect(reopened.queryByRole("button", { name: "继续剩余动作" })).toBeNull();
+    expect(reopened.queryByRole("button", { name: RECOVERY_RESUME_BUTTON })).toBeNull();
     expect(reopened.queryByRole("button", { name: "补记完成（不重写原表）" })).toBeNull();
-    expect(reopened.queryByRole("button", { name: "核对在途动作" })).toBeNull();
+    expect(reopened.queryByRole("button", { name: RECOVERY_CHECK_BUTTON })).toBeNull();
     expect(text(reopened)).toContain("已撤销本次执行");
     expect(text(reopened)).not.toContain("可继续剩余动作");
     /*
@@ -3795,8 +4124,8 @@ describe("Excel 未完成执行：重开后从账本材料撤销已写入的内�
       expect(view.container.querySelector('[data-recovery-terminal="undone"]')).not.toBeNull()
     );
     expect(view.container.querySelector(".office-recovery-panel")).toBeNull();
-    expect(view.queryByRole("button", { name: "继续剩余动作" })).toBeNull();
-    expect(view.queryByRole("button", { name: "核对在途动作" })).toBeNull();
+    expect(view.queryByRole("button", { name: RECOVERY_RESUME_BUTTON })).toBeNull();
+    expect(view.queryByRole("button", { name: RECOVERY_CHECK_BUTTON })).toBeNull();
     const summary = view.container.querySelector('[data-recovery-terminal="undone"]')!;
     expect(summary.textContent).toContain("已撤销");
     expect(summary.textContent).toContain("展开");
@@ -3814,7 +4143,7 @@ describe("Excel 未完成执行：重开后从账本材料撤销已写入的内�
         .toBe("发送")
     );
     expect(view.container.querySelector(".office-recovery-panel")).toBeNull();
-    expect(view.queryByRole("button", { name: "继续剩余动作" })).toBeNull();
+    expect(view.queryByRole("button", { name: RECOVERY_RESUME_BUTTON })).toBeNull();
     // 终态摘要没有消失，也没有被重新摆回固定区域。
     expect(view.container.querySelector('[data-recovery-terminal="undone"]')).not.toBeNull();
     expect(view.container.querySelector(".office-recovery-panel")).toBeNull();
@@ -3836,6 +4165,8 @@ describe("Excel 未完成执行：重开后从账本材料撤销已写入的内�
         {
           operationId,
           taskId: "task-formula-undo",
+          kind: "resume",
+          reviewState: null,
           status: "needs_reconciliation",
           createdAt: 1_790_000_000_000,
           updatedAt: 1_790_000_600_000,
@@ -3894,6 +4225,8 @@ describe("Excel 未完成执行：重开后从账本材料撤销已写入的内�
         {
           operationId,
           taskId: "task-formula-undo",
+          kind: "resume",
+          reviewState: null,
           status: "needs_reconciliation",
           createdAt: 1_790_000_000_000,
           updatedAt: 1_790_000_600_000,
@@ -3909,7 +4242,7 @@ describe("Excel 未完成执行：重开后从账本材料撤销已写入的内�
 
     const writesBeforeOpen = host.writes().length;
     const reopened = render(<App />);
-    await reopened.findByRole("button", { name: "继续剩余动作" });
+    await reopened.findByRole("button", { name: RECOVERY_RESUME_BUTTON });
     // 用户重开后只勾了来源表并确认：撤销要写回的两张结果表已被收窄掉。
     await setAuthorizedScope(reopened, [SOURCE], SCOPE);
     await waitFor(() => expect(text(reopened)).toContain("当前授权里没有工作表"));
@@ -3937,6 +4270,8 @@ describe("Excel 未完成执行：重开后从账本材料撤销已写入的内�
         {
           operationId,
           taskId: "task-formula-undo",
+          kind: "resume",
+          reviewState: null,
           status: "needs_reconciliation",
           createdAt: 1_790_000_000_000,
           updatedAt: 1_790_000_600_000,
@@ -3955,7 +4290,7 @@ describe("Excel 未完成执行：重开后从账本材料撤销已写入的内�
     await waitFor(() => expect(text(reopened)).toContain("这次执行已经撤销过"));
     expect(reopened.queryByRole("button", { name: UNDO_LABEL })).toBeNull();
     // 已经撤销过的执行也不该再被摆成"可继续"：两件事读的是同一条账本事实。
-    expect(reopened.queryByRole("button", { name: "继续剩余动作" })).toBeNull();
+    expect(reopened.queryByRole("button", { name: RECOVERY_RESUME_BUTTON })).toBeNull();
     expect(host.writes().length).toBe(writesBeforeOpen);
   });
 
@@ -3977,6 +4312,8 @@ describe("Excel 未完成执行：重开后从账本材料撤销已写入的内�
         {
           operationId,
           taskId: "task-formula-undo",
+          kind: "resume",
+          reviewState: null,
           status: "needs_reconciliation",
           createdAt: 1_790_000_000_000,
           updatedAt: 1_790_000_600_000,
@@ -4017,6 +4354,8 @@ describe("Excel 未完成执行：重开后从账本材料撤销已写入的内�
         {
           operationId,
           taskId: "task-formula-undo",
+          kind: "resume",
+          reviewState: null,
           status: "needs_reconciliation",
           createdAt: 1_790_000_000_000,
           updatedAt: 1_790_000_600_000,
@@ -4033,7 +4372,7 @@ describe("Excel 未完成执行：重开后从账本材料撤销已写入的内�
     const reopened = render(<App />);
     // 阻断：没有"继续"，也没有"来源已核对"，只给只读重核。
     await waitFor(() => expect(text(reopened)).toContain(SOURCE_CHANGED));
-    expect(reopened.queryByRole("button", { name: "继续剩余动作" })).toBeNull();
+    expect(reopened.queryByRole("button", { name: RECOVERY_RESUME_BUTTON })).toBeNull();
     expect(text(reopened)).not.toContain("来源和目标已核对");
     const reverify = await reopened.findByRole("button", { name: "重新核对（只读）" });
 
@@ -4041,7 +4380,7 @@ describe("Excel 未完成执行：重开后从账本材料撤销已写入的内�
     host.setCell(SOURCE, "B5", 5);
     fireEvent.click(reverify);
     await waitFor(() =>
-      expect(reopened.queryByRole("button", { name: "继续剩余动作" })).not.toBeNull()
+      expect(reopened.queryByRole("button", { name: RECOVERY_RESUME_BUTTON })).not.toBeNull()
     );
     // 复核全程零写入：来源改回去是用户自己做的，重核没有写任何单元格。
     expect(host.cell(SOURCE, "B5")).toBe(5);
@@ -4063,6 +4402,8 @@ describe("Excel 未完成执行：重开后从账本材料撤销已写入的内�
         {
           operationId,
           taskId: "task-formula-undo",
+          kind: "resume",
+          reviewState: null,
           status: "needs_reconciliation",
           createdAt: 1_790_000_000_000,
           updatedAt: 1_790_000_600_000,
@@ -4080,7 +4421,7 @@ describe("Excel 未完成执行：重开后从账本材料撤销已写入的内�
     const undoButton = await reopened.findByRole("button", { name: UNDO_LABEL });
     fireEvent.click(undoButton);
     await waitFor(() => expect(text(reopened)).toContain("已撤销本次执行"));
-    expect(reopened.queryByRole("button", { name: "继续剩余动作" })).toBeNull();
+    expect(reopened.queryByRole("button", { name: RECOVERY_RESUME_BUTTON })).toBeNull();
 
     /*
      * 终态之后又发生一次"重新发现"（例如身份观察触发、或用户又点了一次只读重核）：
@@ -4091,7 +4432,7 @@ describe("Excel 未完成执行：重开后从账本材料撤销已写入的内�
       // 触发一次身份观察驱动的只读重核：换簿后身份观察会调 reverifySelectedOfficeRecovery。
       await Promise.resolve();
     });
-    expect(reopened.queryByRole("button", { name: "继续剩余动作" })).toBeNull();
+    expect(reopened.queryByRole("button", { name: RECOVERY_RESUME_BUTTON })).toBeNull();
     expect(reopened.queryByRole("button", { name: UNDO_LABEL })).toBeNull();
     expect(text(reopened)).toContain("已撤销本次执行");
     expect(text(reopened)).not.toContain("可继续剩余动作");
@@ -4106,7 +4447,7 @@ describe("Excel 未完成执行：重开后从账本材料撤销已写入的内�
     const operationId = ledger.current().operationId;
     await reconcileInFlight(view);
     // 来源没改（B5=5），核对后卡面是「继续剩余动作」—— 这才是"撤销后会不会被重新开放"的对照起点。
-    expect(await view.findByRole("button", { name: "继续剩余动作" })).toBeTruthy();
+    expect(await view.findByRole("button", { name: RECOVERY_RESUME_BUTTON })).toBeTruthy();
 
     // 撤销的留痕上报失败（网络不可用）：best-effort，不重试、不弹错、不改判。
     vi.mocked(recordExecutionDisposition).mockRejectedValueOnce(new Error("网络不可用"));
@@ -4127,7 +4468,7 @@ describe("Excel 未完成执行：重开后从账本材料撤销已写入的内�
     expect(vi.mocked(registerOfficeExecution).mock.calls.length).toBe(registrations);
     expect(vi.mocked(claimOfficeExecutionResume).mock.calls.length).toBe(claims);
     // ③ 本会话保持已撤销：终态退出固定区域，没有继续/补记/再撤，只剩消息里的终态摘要。
-    expect(view.queryByRole("button", { name: "继续剩余动作" })).toBeNull();
+    expect(view.queryByRole("button", { name: RECOVERY_RESUME_BUTTON })).toBeNull();
     expect(view.container.querySelector('[data-recovery-terminal="undone"]')).not.toBeNull();
     expect(view.container.querySelector('[data-recovery-kind="undone"]')).toBeNull();
 
@@ -4144,6 +4485,8 @@ describe("Excel 未完成执行：重开后从账本材料撤销已写入的内�
         {
           operationId,
           taskId: "task-formula-undo",
+          kind: "resume",
+          reviewState: null,
           status: "needs_reconciliation",
           createdAt: 1_790_000_000_000,
           updatedAt: 1_790_000_600_000,
@@ -4165,7 +4508,7 @@ describe("Excel 未完成执行：重开后从账本材料撤销已写入的内�
     await waitFor(() =>
       expect(text(reopened)).toContain("已经不是这次执行写入后的样子")
     );
-    expect(reopened.queryByRole("button", { name: "继续剩余动作" })).toBeNull();
+    expect(reopened.queryByRole("button", { name: RECOVERY_RESUME_BUTTON })).toBeNull();
     expect(reopened.queryByRole("button", { name: "补记完成（不重写原表）" })).toBeNull();
     expect(reopened.queryByRole("button", { name: UNDO_LABEL })).toBeNull();
     // 重开后没有任何新写入。
@@ -4177,7 +4520,7 @@ describe("Excel 未完成执行：重开后从账本材料撤销已写入的内�
     const operationId = ledger.current().operationId;
     await reconcileInFlight(view);
     // 卡片此刻是「继续剩余动作」（来源 matched）。保存这个入口元素本身（= 旧回调的持有者）。
-    const resumeButton = await view.findByRole("button", { name: "继续剩余动作" });
+    const resumeButton = await view.findByRole("button", { name: RECOVERY_RESUME_BUTTON });
 
     /*
      * 在点击之前，账本处置被推进成「已撤销」（例如另一台机器 / 另一窗格已经撤销并留痕）。
@@ -4194,7 +4537,7 @@ describe("Excel 未完成执行：重开后从账本材料撤销已写入的内�
     expect(vi.mocked(claimOfficeExecutionResume).mock.calls.length).toBe(claims);
     expect(contentWrites(host.originalWrites()).length).toBe(writesBefore);
     // 卡面收敛到终态，继续/补记/再撤都不给（终态退出固定区域，只剩消息里的摘要）。
-    expect(view.queryByRole("button", { name: "继续剩余动作" })).toBeNull();
+    expect(view.queryByRole("button", { name: RECOVERY_RESUME_BUTTON })).toBeNull();
     expect(view.container.querySelector('[data-recovery-terminal="undone"]')).not.toBeNull();
     expect(view.container.querySelector('[data-recovery-kind="undone"]')).toBeNull();
   });
@@ -4208,13 +4551,14 @@ describe("Excel 未完成执行：重开后从账本材料撤销已写入的内�
     const { view, ledger } = await runToInterrupted();
     const operationId = ledger.current().operationId;
     await reconcileInFlight(view);
-    // 撤销前：卡面是「继续剩余动作」，固定说明仍是那句续跑引导（未结束状态照旧）。
-    expect(await view.findByRole("button", { name: "继续剩余动作" })).toBeTruthy();
+    // 撤销前：操作区是「继续剩余 N 步」，续跑引导句收在「查看详情」里（技术口径）。
+    expect(await view.findByRole("button", { name: RECOVERY_RESUME_BUTTON })).toBeTruthy();
+    fireEvent.click(view.getByRole("button", { name: "查看详情" }));
     expect(text(view)).toContain("续跑通过复核后执行剩余动作");
 
     // 撤销：账本处置推进成已撤销（等价于撤销成功后留痕），卡面收敛到 undone 终态。
     ledger.current().disposition = { undoneAt: 1_790_000_700_000, abandonedAt: null };
-    fireEvent.click(view.getByRole("button", { name: "继续剩余动作" }));
+    fireEvent.click(view.getByRole("button", { name: RECOVERY_RESUME_BUTTON }));
     await waitFor(() =>
       expect(view.container.querySelector('[data-recovery-terminal="undone"]')).not.toBeNull()
     );
@@ -4223,8 +4567,136 @@ describe("Excel 未完成执行：重开后从账本材料撤销已写入的内�
     expect(text(view)).not.toContain("续跑通过复核后执行剩余动作");
     expect(text(view)).toContain("已撤销本次执行");
     // 不给任何写入/补记/继续按钮。
-    expect(view.queryByRole("button", { name: "继续剩余动作" })).toBeNull();
+    expect(view.queryByRole("button", { name: RECOVERY_RESUME_BUTTON })).toBeNull();
     expect(view.queryByRole("button", { name: "补记完成（不重写原表）" })).toBeNull();
     expect(view.queryByRole("button", { name: UNDO_LABEL })).toBeNull();
+  });
+
+  /**
+   * 2026-11-03 的主线缺陷：写入完成、回读通过，用户还没点「确认全部变更」就刷新窗格 ——
+   * 待审阅界面消失、输入框回到普通状态，甚至写「本次没有需要你处理的后续操作」，
+   * 而原表停在一个没人收尾的写入现场上。
+   *
+   * 修法在账本里（`review_state`）与发现里（`kind: "review"`）：重开时按**显式审阅状态**
+   * 找回审阅，走 `adoptCompleted`（那条路上没有 `prepare`/`execute`，所以重开一次不会
+   * 多写一次）。这条用例钉住三件事：入口回来了、内容没被重写、确认只清标记。
+   */
+  it.each(['confirm', 'discard', 'changed'] as const)("执行完成但没处理审阅 → 重开窗格后审阅入口回来，且一个单元格都不再写（%s）", async outcome => {
+    const { view, ledger } = await runToInterrupted();
+    const operationId = ledger.current().operationId;
+    await reconcileInFlight(view);
+    const writesAfterResume = contentWrites(host.originalWrites()).length;
+    const snapshot = ledger.current();
+
+    /*
+     * 账本此刻的事实：三个动作都写完了、回读通过、`review_state = pending`
+     * （服务端把审阅初始状态与完成回执写在**同一条 UPDATE** 里）。
+     *
+     * 这里只补这份**账本事实**，不补任何单元格内容、也不触碰宿主：被测的是
+     * "重开时能不能凭账本把审阅找回来"，不是"能不能把表再写一遍"。
+     */
+    Object.assign(snapshot, {
+      status: "completed",
+      nextActionIndex: 3,
+      inFlightActionIndex: null,
+      requiresReconciliation: false,
+      canResume: false,
+      review: { state: "pending", decidedAt: 1_790_000_000_000 },
+      result: { verification: { status: "verified" }, review: [], undoSnapshot: snapshot.checkpoint }
+    });
+    const actionCalls = {
+      start: vi.mocked(startOfficeAction).mock.calls.length,
+      complete: vi.mocked(completeOfficeAction).mock.calls.length,
+      finish: vi.mocked(finishOfficeExecution).mock.calls.length
+    };
+
+    view.unmount();
+    localStorage.clear();
+    expect(loadPendingOfficeExecution()).toBeNull();
+    /*
+     * 再放一份**上一次审阅遗留的标记归属记录**：挂载时那段"认领并清理"会照着它
+     * 去删条件格式。这一步只允许清展示标记 —— 它既不是"用户确认过"，也不许顺手
+     * 把审阅状态写掉（见下面 `sendExecutionReview` 在点确认之前没被调用）。
+     */
+    localStorage.setItem("excel-bro.reviewMarks.v1", JSON.stringify({
+      v: 1,
+      identity: `url:${BOOK_URL}`,
+      formula: '=N("EB_REVIEW_0000000000000000000")=0',
+      entries: [{ sheet: RESULTS[0], range: "B2", id: "rule-legacy-review-mark" }]
+    }));
+    vi.mocked(listPendingOfficeExecutions).mockResolvedValue({
+      schemaVersion: 1,
+      namespace: "office",
+      workbookIdentity: `url:${BOOK_URL}`,
+      limit: 20,
+      truncated: false,
+      candidates: [
+        {
+          operationId,
+          taskId: "task-review-restore",
+          kind: "review",
+          status: "completed",
+          reviewState: "pending",
+          createdAt: 1_790_000_000_000,
+          updatedAt: 1_790_000_600_000,
+          nextActionIndex: 3,
+          totalActions: 3,
+          inFlightActionIndex: null,
+          ownerActive: false,
+          requiresReconciliation: false,
+          // 待审阅**没有**续跑资格：一步都不能再写。
+          canResume: false
+        }
+      ]
+    } as never);
+
+    const reopened = render(<App />);
+    // 入口回来了（不是"本次没有需要你处理的后续操作"）。
+    await stageReview(reopened);
+    expect(text(reopened)).not.toContain("没有需要你处理的后续操作");
+    // 恢复审阅**没有**执行任何动作、也没有再提交一次完成回执。
+    expect(contentWrites(host.originalWrites())).toHaveLength(writesAfterResume);
+    expect(vi.mocked(startOfficeAction).mock.calls.length).toBe(actionCalls.start);
+    expect(vi.mocked(completeOfficeAction).mock.calls.length).toBe(actionCalls.complete);
+    expect(vi.mocked(finishOfficeExecution).mock.calls.length).toBe(actionCalls.finish);
+    // 也不给续跑入口（那是"待续写"，不是"待审阅"）。
+    expect(reopened.queryByRole("button", { name: RECOVERY_RESUME_BUTTON })).toBeNull();
+    /*
+     * 启动时那次"清理遗留标记"**没有**顺手确认：审阅还在，决定还没落账。
+     * 这是"清理标记 ≠ 用户确认"的可观测证据（标记清理本身是展示层收尾）。
+     */
+    expect(vi.mocked(sendExecutionReview)).not.toHaveBeenCalled();
+
+    if (outcome !== 'confirm') {
+      if (outcome === 'changed') host.setCell(RESULTS[0], 'B2', '用户后续修改');
+      const beforeDiscard = contentWrites(host.originalWrites()).length;
+      fireEvent.click(reopened.getByRole('button', {name:'放弃全部变更'}));
+      if (outcome === 'discard') {
+        await waitFor(() => expect(sendExecutionReview).toHaveBeenCalledWith('office', operationId, 'discarded'));
+        expect(RESULTS.map(name => host.cell(name, 'B2'))).toEqual(['','','']);
+        expect(contentWrites(host.originalWrites()).length).toBeGreaterThan(beforeDiscard);
+        expect(reopened.queryByRole('button', {name:'放弃全部变更'})).toBeNull();
+      } else {
+        await waitFor(() => expect(text(reopened)).toContain('未能放弃本次变更'));
+        expect(host.cell(RESULTS[0], 'B2')).toBe('用户后续修改');
+        expect(host.cell(RESULTS[1], 'B2')).toBe(FORMULAS[1]);
+        expect(contentWrites(host.originalWrites())).toHaveLength(beforeDiscard);
+        expect(sendExecutionReview).not.toHaveBeenCalled();
+      }
+      expect(vi.mocked(startOfficeAction).mock.calls.length).toBe(actionCalls.start);
+      expect(vi.mocked(finishOfficeExecution).mock.calls.length).toBe(actionCalls.finish);
+      return;
+    }
+
+    fireEvent.click(reopened.getByRole("button", { name: "确认全部变更" }));
+    await waitFor(() =>
+      expect(vi.mocked(sendExecutionReview)).toHaveBeenCalledWith("office", operationId, "confirmed")
+    );
+    // 确认只接受已有结果：没有新写入，也没有重跑计划。
+    expect(contentWrites(host.originalWrites())).toHaveLength(writesAfterResume);
+    expect(vi.mocked(startOfficeAction).mock.calls.length).toBe(actionCalls.start);
+    expect(vi.mocked(finishOfficeExecution).mock.calls.length).toBe(actionCalls.finish);
+    // 单元格里还是第一次写进去的那条公式（没被重写成值，也没写第二遍）。
+    expect(host.matrix(RESULTS[0], "B2")).toEqual([[FORMULAS[0]]]);
   });
 });

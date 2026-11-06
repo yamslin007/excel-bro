@@ -52,20 +52,22 @@ export function isCompactMessageProcess(log?: {
 /**
  * 这一次渲染该不该展开详细动作区。
  *
- * 只有"正常结束"（`outcome === "completed"`）会自动收起 —— 失败、中断、
- * 取消、等待回答都留着，因为那些情况下用户要看的恰恰是"停在哪一步"。
- * 这条不是风格偏好：把失败原因折起来，用户看到的就只剩一行"执行失败"，
+ * 进行中、正常结束和等待回答默认收起；等待回答时问题在对话中直接展示。
+ * 失败、中断、取消保留详情，因为用户需要知道"停在哪一步"。
+ * 把失败原因折起来，用户看到的就只剩一行"执行失败"，
  * 然后必须自己想到去点展开。
  */
 export function processPanelExpanded(input: {
   live: boolean;
   outcome?: string | null;
   userChoice: ProcessPanelUserChoice;
+  awaitingAnswer?: boolean;
 }): boolean {
   if (input.userChoice === "expanded") return true;
   if (input.userChoice === "collapsed") return false;
-  if (input.live) return true;
-  return input.outcome !== "completed";
+  if (input.live) return false;
+  // Waiting for an answer shows the question in the conversation, not an expanded log.
+  return input.outcome !== "completed" && !(input.outcome === "awaiting_input" && input.awaitingAnswer);
 }
 
 /**

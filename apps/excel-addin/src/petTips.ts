@@ -6,7 +6,7 @@ export interface PetTip {
   shortcut?: string;
 }
 
-// 高频且实用的 Excel 操作技巧，供格仔在气泡里轮流展示。
+// 高频且实用的 Excel 操作技巧，供 EB 助手在气泡里轮流展示。
 // 按主题分组，新增技巧直接往数组里加即可，顺序不影响逻辑。
 export const PET_TIPS: PetTip[] = [
   // —— 录入与编辑 ——

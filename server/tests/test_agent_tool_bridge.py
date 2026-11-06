@@ -23,12 +23,14 @@ from server.app.local_results import LocalResultRegistry
 from server.app.models import (
     DataToolResult,
     PlanRequest,
+    QueryIncompleteReason,
 )
 from server.app.result_plan import (
     ResultPlanError,
     compile_result_plan,
     result_summary_for_answer,
 )
+from server.app.result_submission import local_result_card
 from server.app.task_bridge import (
     BridgeBinding,
     BridgeError,
@@ -599,25 +601,38 @@ def test_compiled_plan_omits_source_dependency_when_the_result_has_none():
 
 
 def test_result_card_never_silently_drops_warnings_or_sources():
-    """结果卡必须原样带回来源与告警，不静默丢弃任何输出。"""
+    """结果卡必须原样带回来源、告警与**不完整原因**，不静默丢弃任何输出。
+
+    `complete=False` 现在必须带原因（`incomplete`）：一个布尔配上自由文本告警时，
+    卡片只能把任何不完整都说成"扫描已达上限"。所以这份夹具用**真实可产生**的
+    「某张表缺字段」来构造不完整，并同时断言告警与原因都到了卡片上。
+    """
     registry = LocalResultRegistry()
     item = registry.register(
         "turn-bridge-0001",
         DataToolResult.model_validate({
-            "requestId": "req-4", "tool": "query_table", "title": "带未匹配明细的汇总",
+            "requestId": "req-4", "tool": "query_table", "title": "带缺字段明细的汇总",
             "headers": ["类别", "数量"], "rows": [["甲", 2]],
             "sourceSheets": ["订单", "字典"],
             "scannedRows": 8, "complete": False,
             "calculation": "左连接后汇总",
-            "warnings": ["有 2 条记录在字典中未匹配，已列入未匹配明细。"],
+            "warnings": ["「字典」未找到字段：等级"],
+            "incomplete": [
+                {"kind": "missing_field", "sheet": "字典", "fields": ["等级"]}
+            ],
         }),
         "fp-source-1",
     )
     card = result_summary_for_answer(item)
     assert card["sourceSheets"] == ["订单", "字典"]
-    assert card["warnings"] == ["有 2 条记录在字典中未匹配，已列入未匹配明细。"]
+    assert card["warnings"] == ["「字典」未找到字段：等级"]
     # 未完成的结果必须如实标出，不能显示成完整。
     assert "complete" not in card or card.get("complete") is False
+    # 而且必须能说清"为什么"，否则界面只能编一句（"扫描已达上限"）。
+    pointer = local_result_card(item)
+    assert pointer.incomplete == [
+        QueryIncompleteReason(kind="missing_field", sheet="字典", fields=["等级"])
+    ]
 
 
 def test_compiler_rejects_size_mismatch():

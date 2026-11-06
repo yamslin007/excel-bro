@@ -38,7 +38,10 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: excel-bro-mac-${{ matrix.arch }}
-          path: dist/Excel-Bro-Setup-*.pkg
+          path: |
+            dist/Excel-Bro-Setup-*.pkg
+            dist/Excel-Bro-Setup-*.pkg.sha256
+          if-no-files-found: error
 
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/')

@@ -324,12 +324,59 @@ M1 第一次写成了"给 `recoveryResume` 加 `&& !hasInput`"，那是**等价�
 - **自动化**：`wpsExecutionResume.test.ts`「撤销成功后 record 变 restored，续跑在拿到执行权前就被 state 闸拒绝、零写入」等。
 - **剩余缺口**：处置留痕与恢复包回收的**真机取值**要等新一轮执行（WPS 端上报是 best-effort）。
 
-#### F. 仍然没做的（不许写成"已通过"）
+#### F. WPS · 公式（3×`writeFormulas`）· A 分支：中断 → 完整退出重开 → 核对 → 续跑只写第三步 → 确认
 
-- **WPS · 公式 · A/B**：真机一次没走；夹具与 9 步清单已备（`docs/WPS_ACCEPTANCE_FIXTURE_2026-10-31.md`），**未执行**。
+- **实机**：用户 2026-11-01 21:46–22:10 在真实 WPS 里走完，并按六步逐条确认 —— ①三个独立公式写入
+  `结果1!B2 =来源!B2*1` / `结果2!B2 =来源!B4*2` / `结果3!B2 =来源!B5*3`；②第二步写入并回读后中断（前两格 2、8 且公式栏为公式，第三格为空）；
+  ③保存并**完整退出** WPS，重开同一文件后恢复卡仍可用；④点核对后界面变"可继续剩余动作"，第三格仍空；
+  ⑤显式点继续后 `结果3!B2=15` 且公式栏 `=来源!B5*3`，前两格仍 2、8 且公式正确；⑥点确认变更成功
+  （原文："已接受当前结果并移除本次审阅标记；保存为工具与撤销本次执行可用"）。截图：**待定位**（全盘未找到 21:40 之后新建的图片；
+  `outputs/probe/clarification-inbox.png` 是 11:49 的旧图，与本轮无关）。
+- **文件只读**（本轮复核，未改动）：`C:\Users\jia\Desktop\测试\公式来源证据验收-WPS-A.xlsx`，11032B / mtime `11-01 22:15:45` /
+  sha256 `ecf3a6ad…8a98bc8`；`结果1/2/3!B2` 公式文本分别 `=来源!B2*1` / `=来源!B4*2` / `=来源!B5*3`，缓存值 `2 / 8 / 15`；
+  `来源!A1:B5` = `(10,1)…(50,5)`。**注意**：账本 `workbook_identity` 记的是小写 `…-wps-a.xlsx`，磁盘文件名是大写 `…-WPS-A.xlsx`，
+  同一路径大小写归一，不是两个文件。
+- **账本**（一致性只读快照 `mode=ro` + `Connection.backup()`，WAL 已并入，未改原库）：本轮唯一执行
+  `wps-execution-304e6eee-5ba7-4131-b01a-7c54aaea4e32`（`wps rows today: 1`，不会混入此前登记失败轮或 10-28/10-29 旧轮）；
+  `status=completed` / `revision=11` / `next_action_index=3` / `in_flight_action_index=NULL`；`created_at=21:46:09` / `updated_at=22:10:10`；
+  `result_json={"actionCount":3,"backfilled":false}`；`checkpoint_json` 指向 `结果3!B2`、`afterFingerprint=v2:26:1562cd4c`（与材料 `actions[2].expectedFingerprint` 一致）；
+  **`undone_at` / `abandoned_at` 均 `NULL`**；`recovery_package_*` 除 `expires_at=2026-11-08` 外全为 `NULL`。
+- **写序（不是数值推断）**：`office_host_writes` 对本 op **恰好 3 行** —— `idx0` + `idx1` 同在 `21:46:09`
+  （`idx0` `written`/`readback=verified`；`idx1` **`failed_after_write`** / `WPS_ACTION_FAILED` = 第二步写进去了但回执失败），
+  `idx2` 在 **`22:10:10`**（`written`/`verified`）⇒ **续跑只执行第三步，未重写前两步**。
+  依据是 `append_office_host_writes` **只追加、不改状态、不推进 revision**，`recorded_at` 由服务端取 `time.time()`，
+  所以 24 分钟的时间差本身就是写序。**第二步回执补记**走 `reconcileWpsActionReceipt`，**不产生新的 host-writes 行** ——
+  这正是"回执补记"与"第二次宿主写入"可区分的地方。
+- **恢复材料**（只读）：`%LOCALAPPDATA%\Excel Bro\execution-recovery\wps-execution-304e6eee…\material.dat`，1914B，
+  `digest=55c63b7b…`；三动作 `expectedFingerprint` = `v2:26:6b460f4f` / `v2:26:a013f678` / `v2:26:1562cd4c`；
+  `sourceEvidence` = `来源!A1:B5`（`previewFingerprint = valueFingerprint = v2:146:43024e97`）。
+- **账本证据不足（不得补推断）**：`planning_tasks` / `planning_task_events` 里**查不到** `task-a6b33fa7-f25b-45b5-a4ba-82fe39eb6252`，
+  `folder_operation_events` 对本 op 计数为 **0** ⇒ 账本**没有**"动作登记 / 开始 / 回执 / 核对"的逐事件序列，
+  **"核对（reconcile）"这一步没有独立事件行**；阶段划分只能由 `created_at`、`office_host_writes.recorded_at` 与 `result_json` 推出。
+- **自动化**：修复轮 `wpsExecutionResume.test.ts` + `wpsNativeComparison.test.ts` 合计 110 passed；全量 core 1128 / addin 1734 / wps 1283 / server 2026。
+- **剩余缺口**：截图待定位；「确认变更」**只有用户界面证据**，账本侧可见的只是 `completed + next_action_index=3`，
+  **没有单独的确认留痕**（与 A 条 Excel 同理）；`undone_at=NULL` ⇒ "撤销入口可用"**不等于**本轮实际撤销通过，本轮**没有**撤销动作证据；
+  **B 分支仍未验**；续跑期间过程面板文案未切换（见 §8.6）。
+
+#### G. 仍然没做的（不许写成"已通过"）
+
+- **WPS · 公式 · B 分支**：A 已通过（F 条），B 真机仍未走；应按 `FORMULA_SOURCE_RESUME_ACCEPTANCE_2026-10-30.md` §3–5 的 B 段
+  改 `来源!B5` 后重开续跑，验"被拒 + 目标不变 + 撤销"。`WPS_ACCEPTANCE_FIXTURE_2026-10-31.md` 的九步清单是两表值复制终态验证，不能当公式 A/B 验收。
 - Excel/WPS 的**格式动作**、**删表原地撤销**、并排审阅布局、审阅副本生命周期、WPS「工作目录」服务端链路。
 
-⇒ 所以"**公式精确恢复真机通过**"只能限定为 **Excel**；WPS 仍是"自动化闭环 + 真机未做"。说"恢复链路真机通过"必须带上宿主＋动作类型＋分支。
+⇒ 所以"**公式精确恢复真机通过**"现在覆盖到 **Excel A/B（含重开后撤销）** 与 **WPS A**；WPS **B 仍缺**。
+说"恢复链路真机通过"必须带上宿主＋动作类型＋分支。整个 **A1-GATE 仍未通过**，不要用本节代替闸门结论。
+
+### 8.6 已登记的展示缺陷：续跑进入审阅后，过程面板仍停在"回读第 2 个动作"（**本轮只记录、未修**）
+
+- **复现**：WPS 公式 A 分支（F 条，`wps-execution-304e6eee…`）续跑第三步成功、界面已进入**结果审阅**后，
+  上方过程区仍显示 **「回读核对第 2 个动作」/「进度 2/3 步」/「正在回读核对「结果2!B2」…」**，不会切到第 3 个动作、也不会切成审阅态。
+- **影响**：状态自相矛盾 —— 结果已经要人审阅，过程却说还在回读上一格。用户按这行字会以为第三步没执行完，
+  从而怀疑"继续"没生效（本轮 ④→⑤ 之间正是这种观感）。属**文案/条目累积**问题，不影响写入正确性与账本写序。
+- **出处**（只读定位，未改）：`apps/wps-addin/src/wpsActivityLog.ts:126-150` —— `verifying` 分支把条目 id 记成
+  `verifying:${index}` 且**续跑开始时不重置**累积，label 为 `回读核对第 ${index + 1} 个动作`，facts 为 `进度 ${index + 1}/${actionCount} 步`；
+  行内文案来自 `apps/wps-addin/src/wpsPlanExecutor.ts:2578` 的 `正在回读核对「${action.sheetName}!${action.range}」…`。
+- **未做**：本轮**不改产品代码、不重跑写入**（用户明确要求只登记）。
 
 ## 9. 复现命令
 

@@ -178,7 +178,7 @@ def test_sdk_uses_same_message_only_payload(monkeypatch):
     monkeypatch.setattr(claude_sdk_agent, "_sdk", lambda: sdk)
     monkeypatch.setattr(claude_sdk_agent, "_options", lambda *_a, **_k: "restricted-options")
 
-    async def result(_sdk, prompt, options, timeout):
+    async def result(_sdk, prompt, options, timeout, *, connection=None):
         captured.append((json.loads(prompt), options))
         return json.dumps({"kind": "conversation", "message": "不客气！"})
 
@@ -193,7 +193,7 @@ def test_sdk_invalid_route_is_not_permission(monkeypatch):
     monkeypatch.setattr(claude_sdk_agent, "_sdk", lambda: object())
     monkeypatch.setattr(claude_sdk_agent, "_options", lambda *_a, **_k: "restricted-options")
 
-    async def invalid(*_args):
+    async def invalid(*_args, **_kwargs):
         return '{"kind":"proceed","confirmedPrompt":"读字段"}'
 
     monkeypatch.setattr(claude_sdk_agent, "_result", invalid)

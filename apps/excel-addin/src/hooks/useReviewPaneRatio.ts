@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import { REVIEW_PANE_LIMITS as limits, ReviewPaneSizing } from '@excel-bro/core/reviewPaneSizing';
 export { reviewPaneTargetWidth, reviewLayoutPlan } from '@excel-bro/core/reviewPaneSizing';
 import { measureLocalExcelWindow } from '../excelWindowLayout';
@@ -16,6 +16,8 @@ export type ReviewPaneScope = { workbookIdentity: string; original: { name: stri
  * 重新套用默认比例。消息更新、流式输出、回读等普通重渲染**不会**触发重排。
  */
 export function useReviewPaneRatio(scope?: ReviewPaneScope, rearm = 0) {
+  const currentScope = useRef(scope);
+  currentScope.current = scope;
   const [needsResize, setNeedsResize] = useState(false);
   const identity = scope?.workbookIdentity, sheet = scope?.original.name, nonce = scope?.copySheetName;
   useEffect(() => {
@@ -33,7 +35,7 @@ export function useReviewPaneRatio(scope?: ReviewPaneScope, rearm = 0) {
       if (document.visibilityState === 'hidden') { schedule(limits.reviewPaneMeasureIntervalMs); return; }
       busy = true;
       try {
-        const { workAreaWidthCssPx } = await measureLocalExcelWindow(identity!, sheet!, nonce!);
+        const { workAreaWidthCssPx } = await measureLocalExcelWindow(identity!, currentScope.current!.original.name, nonce!);
         if (disposed) return;
         const decision = sizing.observe(workAreaWidthCssPx, window.innerWidth);
         manual = decision.manual;
@@ -68,6 +70,6 @@ export function useReviewPaneRatio(scope?: ReviewPaneScope, rearm = 0) {
       window.removeEventListener('focus', resized);
       document.removeEventListener('visibilitychange', visible);
     };
-  }, [identity, sheet, nonce, rearm]);
+  }, [identity, nonce, rearm]);
   return needsResize;
 }

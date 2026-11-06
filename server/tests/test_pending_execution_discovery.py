@@ -174,7 +174,11 @@ def test_discovery_finds_the_in_flight_execution_without_any_local_index() -> No
     assert set(candidate) == {
         "operationId",
         "taskId",
+        # 2026-11-03：候选的**性质**（resume / review）与审阅状态随发现一起下发。
+        # 两者都只是状态标记，仍然不含执行权令牌、计划、单元格值或恢复材料。
+        "kind",
         "status",
+        "reviewState",
         "createdAt",
         "updatedAt",
         "nextActionIndex",

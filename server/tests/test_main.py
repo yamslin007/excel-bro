@@ -485,32 +485,35 @@ def test_model_catalog_lists_allowlisted_models_without_a_local_placeholder(
         "models": [
             {
                 "id": "default-model",
+                "modelId": "default-model",
                 "label": "default-model",
                 "provider": "model",
                 "available": True,
                 "supportsVision": False,
-                "agentAvailable": False,
-                "agentUnavailableReason": "此端点未配置 Anthropic 兼容协议，仅可用于独立公式；请按供应商说明配置 SDK 端点。",
+                "agentAvailable": True,
+                "agentUnavailableReason": None,
                 "formulaAvailable": True,
             },
             {
                 "id": "fast-model",
+                "modelId": "fast-model",
                 "label": "fast-model",
                 "provider": "model",
                 "available": True,
                 "supportsVision": False,
-                "agentAvailable": False,
-                "agentUnavailableReason": "此端点未配置 Anthropic 兼容协议，仅可用于独立公式；请按供应商说明配置 SDK 端点。",
+                "agentAvailable": True,
+                "agentUnavailableReason": None,
                 "formulaAvailable": True,
             },
             {
                 "id": "reasoning-model",
+                "modelId": "reasoning-model",
                 "label": "reasoning-model",
                 "provider": "model",
                 "available": True,
                 "supportsVision": False,
-                "agentAvailable": False,
-                "agentUnavailableReason": "此端点未配置 Anthropic 兼容协议，仅可用于独立公式；请按供应商说明配置 SDK 端点。",
+                "agentAvailable": True,
+                "agentUnavailableReason": None,
                 "formulaAvailable": True,
             },
         ],
@@ -2523,7 +2526,7 @@ def test_model_intent_retries_invalid_structure_and_keeps_prior_intent(
     monkeypatch.setattr(main_module, "selected_model_config", lambda _: _connection())
     monkeypatch.setattr(sdk, "_sdk", lambda: object())
     monkeypatch.setattr(sdk, "_options", lambda *_a, **_k: None)
-    async def result(_sdk, prompt, options, timeout):
+    async def result(_sdk, prompt, options, timeout, *, connection=None):
         calls.append(prompt)
         if len(calls) == 1:
             return "我需要想一下"

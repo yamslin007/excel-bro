@@ -59,13 +59,20 @@ export function nativeReviewSeed(sheetName: string, startRow: number, startColum
   }).join("")}</row>`).join("");
   return nativeReviewPackage(sheetName, `<worksheet xmlns="${NS}"><sheetData>${rows}</sheetData></worksheet>`, maxBytes);
 }
-export function nativeReviewPackage(sheetName: string, sheetXml: string, maxBytes: number, stylesXml?: string): string {
+export function nativeReviewPackage(sheetName: string, sheetXml: string, maxBytes: number, stylesXml?: string, reviewCopyId?: string): string {
+  return nativeReviewWorkbookPackage([{name: sheetName, xml: sheetXml}], maxBytes, stylesXml, reviewCopyId);
+}
+export function nativeReviewWorkbookPackage(sheets: Array<{name: string; xml: string}>, maxBytes: number, stylesXml?: string, reviewCopyId?: string, activeTab = 0): string {
+  if (!sheets.length || new Set(sheets.map(sheet => sheet.name.toLowerCase())).size !== sheets.length ||
+      sheets.some(sheet => !sheet.name || sheet.name.length > 31 || /[\\/?*\[\]:]/.test(sheet.name))) throw new Error('对比子表名称无效或重复。');
+  if (reviewCopyId !== undefined && !/^EB_[0-9a-f]{20}$/.test(reviewCopyId)) throw new Error('对比副本标识无效。');
+  const identity = reviewCopyId ? `<definedNames><definedName name="_EB_ReviewCopyId" hidden="1">&quot;${reviewCopyId}&quot;</definedName></definedNames>` : '';
   const bytes = storedZip({
-    "[Content_Types].xml": '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>'.replace('</Types>', stylesXml ? '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>' : '</Types>'),
+    "[Content_Types].xml": `<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>${sheets.map((_, i) => `<Override PartName="/xl/worksheets/sheet${i+1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`).join('')}${stylesXml ? '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>' : ''}</Types>`,
     "_rels/.rels": '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>',
-    "xl/workbook.xml": `<workbook xmlns="${NS}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">${stylesXml ? '<bookViews><workbookView/></bookViews>' : ''}<sheets><sheet name="${xml(sheetName)}" sheetId="1" r:id="rId1"/></sheets>${stylesXml ? '<calcPr calcId="0" fullCalcOnLoad="1" forceFullCalc="1"/>' : ''}</workbook>`,
-    "xl/_rels/workbook.xml.rels": `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>${stylesXml ? '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>' : ''}</Relationships>`,
-    "xl/worksheets/sheet1.xml": sheetXml,
+    "xl/workbook.xml": `<workbook xmlns="${NS}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><bookViews><workbookView activeTab="${activeTab}"/></bookViews><sheets>${sheets.map((sheet,i) => `<sheet name="${xml(sheet.name)}" sheetId="${i+1}" r:id="rId${i+1}"/>`).join('')}</sheets>${identity}${stylesXml ? '<calcPr calcId="0" fullCalcOnLoad="1" forceFullCalc="1"/>' : ''}</workbook>`,
+    "xl/_rels/workbook.xml.rels": `<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${sheets.map((_,i) => `<Relationship Id="rId${i+1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${i+1}.xml"/>`).join('')}${stylesXml ? `<Relationship Id="rId${sheets.length+1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>` : ''}</Relationships>`,
+    ...Object.fromEntries(sheets.map((sheet,i) => [`xl/worksheets/sheet${i+1}.xml`, sheet.xml])),
     ...(stylesXml ? { "xl/styles.xml": stylesXml } : {})
   });
   if (bytes.length > maxBytes) throw new Error("原生审阅副本超过本机大小限额，请缩小工作表后重试。");

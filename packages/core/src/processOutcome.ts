@@ -58,6 +58,18 @@ export interface ProcessOutcomeInput {
   reviews?: readonly ProcessOutcomeReviewLike[] | null;
   verification?: ProcessOutcomeVerificationLike | null;
   /**
+   * 输入区上方**此刻**还摆着一件恢复待办（待核对 / 待续跑），与这条消息本身无关。
+   *
+   * 存在理由（2026-11-01）：`phase` 是按"这条消息自己那次执行"折算的。跨重启、
+   * 换会话或经发现流程找回来的恢复卡，往往对不上任何一条消息的 `officeResume` ——
+   * 于是消息里写「本次没有需要你处理的后续操作」，而输入框上方正摆着「核对结果」。
+   * 同一屏里两句话互相打脸。
+   *
+   * 所以这里多给一条**全局**事实：只要它成立，`idle` 就不许输出"没有需要处理的
+   * 后续操作"，改成指路那句。这不是新判据，只是让"没有待办"这句话在还有待办时闭嘴。
+   */
+  pendingRecovery?: boolean;
+  /**
    * 已经由调用方渲染好的一句验收结论。
    *
    * 存在的理由：两端的结果回执形状不同 —— Excel 是"N 项检查里通过了多少"，
@@ -145,9 +157,15 @@ export function describeNextStep(phase: ProcessOutcomePhase): string {
     case "undone":
       return "本次执行已撤销；如需重做请重新发送需求。";
     case "needs_review":
-      return "这次执行需要先核对：点「核对在途动作」后再决定继续或撤销。";
+      /*
+       * 不写死按钮名（2026-11-02）：主操作按证据分档（「检查已写入结果」/
+       * 「检查写入结果」/「检查当前结果」），写死一个名字就会指到一颗不存在的按钮上。
+       * 所以照实说"在输入框里"，让人自己看见那颗按钮。
+       */
+      return "这次执行需要先核对：在输入框里点核对按钮（只读，不写单元格），再决定继续或撤销。";
     case "resumable":
-      return "点「继续剩余动作」执行尚未完成的动作；已完成的动作不会重跑。";
+      /* 同理：续跑那档的按钮带剩余步数（「继续剩余 N 步」），名字不固定。 */
+      return "在输入框里点继续按钮执行尚未完成的步骤；已完成的部分不会重跑。";
     case "blocked":
       return "当前不能继续；按上方提示处理后重新核对。";
     case "executing":
@@ -157,6 +175,14 @@ export function describeNextStep(phase: ProcessOutcomePhase): string {
       return "本次没有需要你处理的后续操作。";
   }
 }
+
+/**
+ * 还有恢复待办时替代 `idle` 那句的指路话（唯一出处）。
+ *
+ * 只在这条消息自己**说不出**下一步、而输入区上方确实还摆着一件事时使用：
+ * 那句话必须说"去哪处理"，而不是硬把别人的待办算到这次执行头上。
+ */
+export const PENDING_RECOVERY_NEXT_STEP = "还有一次写入没有收尾；处理入口在输入框里。";
 
 /**
  * 把两端各自的内部枚举折成**语义阶段**（`ProcessOutcomePhase`）。
@@ -225,9 +251,20 @@ export function processOutcomeSummary(
       ? null
       : describeVerification(input.verification) ??
         (input.verificationNote?.trim() ? input.verificationNote.trim() : null),
-    nextStep: describeNextStep(input.phase)
+    nextStep:
+      input.phase === "idle" && input.pendingRecovery
+        ? PENDING_RECOVERY_NEXT_STEP
+        : describeNextStep(input.phase)
   };
   // 普通聊天没有结果回执或待办，不额外输出一条空的操作提示。
-  if (input.phase === "idle" && !summary.changedWhere && !summary.verification) return null;
+  // 例外：输入区上方还摆着恢复待办时，"没有待办"这句话不成立，必须给指路那句。
+  if (
+    input.phase === "idle" &&
+    !summary.changedWhere &&
+    !summary.verification &&
+    !input.pendingRecovery
+  ) {
+    return null;
+  }
   return summary;
 }

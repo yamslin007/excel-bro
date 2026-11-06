@@ -50,7 +50,13 @@ const FP = "c".repeat(64);
 function makeSheet(
   name: string,
   values: unknown[][],
-  origin: { row?: number; column?: number } = {}
+  origin: { row?: number; column?: number } = {},
+  /**
+   * 写入探针。传了它，`Range()` 返回的对象会被包一层 Proxy：任何
+   * `range.Value2 = ...` 之类的赋值都会落进这个数组。
+   * 「只读查询零写入」由此变成可断言的事实，而不是"我读过源码"。
+   */
+  writeLog?: string[]
 ): WpsWorksheet {
   const rowCount = values.length;
   const columnCount = Math.max(0, ...values.map((row) => row.length));
@@ -71,11 +77,18 @@ function makeSheet(
       const startColumn = Number(first.Column ?? 1);
       const endRow = Number(last?.Row ?? startRow);
       const endColumn = Number(last?.Column ?? startColumn);
-      return {
+      const box = {
         Value2: values
           .slice(startRow - 1, endRow)
           .map((row) => row.slice(startColumn - 1, endColumn))
       };
+      if (!writeLog) return box;
+      return new Proxy(box, {
+        set(_target, property) {
+          writeLog.push(String(property));
+          return true;
+        }
+      });
     }
   };
 }
@@ -126,9 +139,15 @@ function cinemaApplication(
   );
 }
 
+/*
+ * 跨表查询：这张夹具**本来就**要读两张表，所以现在必须把表名写进 `sheets`。
+ * `scope: "selected"` 不再隐含"整片授权区都要读" —— 多张表必须显式绑定，
+ * 否则执行器会拒绝（`sourceSheets` 混进没被要求的表正是要根除的行为）。
+ */
 const QUERY_ARGUMENTS = {
   mode: "aggregate" as const,
   scope: "selected" as const,
+  sheets: ["Sheet1", "Sheet2"],
   groupBy: ["影片名称"],
   metrics: [{ operation: "sum" as const, field: "计数项:影厅", outputName: "影厅数" }],
   sortBy: "影厅数",
@@ -379,6 +398,291 @@ describe("端到端：轮询 → 复核 → 真读真算 → 回执", () => {
       scannedRows: 3,
       totalRows: 3
     });
+  });
+
+  /**
+   * 现场（2026-11-01，与「刷新后重复要求确认范围」**分开记录**）：
+   * 「只读取来源表 A1:B5，告诉我 B 列五个数的合计，不修改任何工作表。」
+   * 执行侧曾把首行当表头吞掉（合计成了 14），只读需求还被说成需要写入。
+   *
+   * 这里走 WPS **真实链路**：桥 → 授权复核 → 真读宿主 → 生产计算函数 →
+   * 回执。断言两件事：五个数全部参与（15），且宿主上**一次写入都没有**。
+   */
+  it("无表头数字区间：只读求和按全部行算，且宿主零写入", async () => {
+    const writes: string[] = [];
+    const application = makeApplication([
+      makeSheet(
+        "来源",
+        [
+          ["甲", 1],
+          ["乙", 2],
+          ["丙", 3],
+          ["丁", 4],
+          ["戊", 5]
+        ],
+        {},
+        writes
+      )
+    ]);
+    const captured = stubNetwork({
+      poll: {
+        calls: [
+          {
+            operationId: OP,
+            tool: "query_table",
+            arguments: {
+              mode: "aggregate",
+              scope: "selected",
+              hasHeaders: false,
+              metrics: [
+                { operation: "sum", field: "列2", outputName: "合计" }
+              ]
+            },
+            requestFingerprint: FP,
+            expiresAt: 0
+          }
+        ],
+        generation: 1
+      }
+    });
+    const binding = bindingOf(application, [1]);
+    const ports = createWpsSdkBridgeHostPorts(
+      { liveContext: () => createWpsBridgeLiveContext(application, [1]) },
+      binding,
+      { application: () => application }
+    );
+
+    await runBridgeUntilIdle(pollingState(binding), ports);
+
+    const receipt = captured.find((item) => item.url.includes("/receipt"))?.body;
+    const payload = (
+      receipt?.receipt as {
+        result?: { headers: unknown[]; rows: unknown[][]; scannedRows: number };
+      }
+    ).result;
+    expect(payload?.rows).toEqual([[15]]);
+    // 少一行就是 14 —— 而且界面上看不出少的是哪一行。
+    expect(payload?.scannedRows).toBe(5);
+    expect(writes).toEqual([]);
+  });
+
+  /**
+   * 显式区域的同一张表：`B6=100` 是"区域外诱饵"。
+   * 用户的原始限定是「只读取来源!A1:B5」，用整表查询代替就会把 100 算进来。
+   */
+  it(`显式区域：来源!A1:B5 时 B6=100 不参与，合计 15 且零写入`, async () => {
+    // 记账表按 turnId 共享；这一条要断言"记了哪几张表"，先清干净。
+    resetTrustedSourceReads();
+    const writes: string[] = [];
+    const application = makeApplication([
+      makeSheet(
+        "来源",
+        [
+          ["甲", 1],
+          ["乙", 2],
+          ["丙", 3],
+          ["丁", 4],
+          ["戊", 5],
+          [null, 100]
+        ],
+        {},
+        writes
+      )
+    ]);
+    const captured = stubNetwork({
+      poll: {
+        calls: [
+          {
+            operationId: OP,
+            tool: "query_table",
+            arguments: {
+              mode: "aggregate",
+              scope: "selected",
+              range: "来源!A1:B5",
+              hasHeaders: false,
+              metrics: [
+                { operation: "sum", field: "列2", outputName: "合计" }
+              ]
+            },
+            requestFingerprint: FP,
+            expiresAt: 0
+          }
+        ],
+        generation: 1
+      }
+    });
+    const binding = bindingOf(application, [1]);
+    const ports = createWpsSdkBridgeHostPorts(
+      { liveContext: () => createWpsBridgeLiveContext(application, [1]) },
+      binding,
+      { application: () => application }
+    );
+
+    await runBridgeUntilIdle(pollingState(binding), ports);
+
+    const receipt = captured.find((item) => item.url.includes("/receipt"))?.body;
+    const payload = (
+      receipt?.receipt as {
+        result?: { rows: unknown[][]; scannedRows: number };
+      }
+    ).result;
+    expect(payload?.rows).toEqual([[15]]);
+    expect(payload?.scannedRows).toBe(5);
+    expect(writes).toEqual([]);
+    // 账本上的"实际来源"只记真正参与计算的那张表。
+    expect(trustedToolReads(binding.taskId)?.sheets).toEqual(["来源"]);
+  });
+
+  /*
+   * 真机现场（2026-11-01）：四张表都勾了，用户只说「来源!A1:B5」，结果卡却列出
+   * 四张来源表、三张各报「缺少列2」，还说成「扫描已达上限」。
+   * 这里让**四张表都有可求和的第二列**：只要多读一张，合计就不是 15。
+   */
+  it("四张表都已授权：区域仍只读那一张，合计 15、来源仅「来源」、完整无截断", async () => {
+    resetTrustedSourceReads();
+    const application = makeApplication([
+      makeSheet("来源", [
+        ["甲", 1],
+        ["乙", 2],
+        ["丙", 3],
+        ["丁", 4],
+        ["戊", 5]
+      ]),
+      makeSheet("结果1", [["x", 100]]),
+      makeSheet("结果2", [["y", 100]]),
+      makeSheet("结果3", [["z", 100]])
+    ]);
+    const captured = stubNetwork({
+      poll: {
+        calls: [
+          {
+            operationId: OP,
+            tool: "query_table",
+            arguments: {
+              mode: "aggregate",
+              scope: "selected",
+              range: "来源!A1:B5",
+              hasHeaders: false,
+              metrics: [{ operation: "sum", field: "列2", outputName: "合计" }]
+            },
+            requestFingerprint: FP,
+            expiresAt: 0
+          }
+        ],
+        generation: 1
+      }
+    });
+    const binding = bindingOf(application, [1, 2, 3, 4]);
+    const ports = createWpsSdkBridgeHostPorts(
+      { liveContext: () => createWpsBridgeLiveContext(application, [1, 2, 3, 4]) },
+      binding,
+      { application: () => application }
+    );
+
+    await runBridgeUntilIdle(pollingState(binding), ports);
+
+    const receipt = captured.find((item) => item.url.includes("/receipt"))?.body;
+    const payload = (
+      receipt?.receipt as {
+        result?: {
+          rows: unknown[][];
+          sourceSheets: string[];
+          warnings: string[];
+          complete: boolean;
+          truncated: boolean;
+          scannedRows: number;
+        };
+      }
+    ).result;
+    // 15，而不是 15+100×3=315：区间与表绑定都生效了。
+    expect(payload?.rows).toEqual([[15]]);
+    expect(payload?.sourceSheets).toEqual(["来源"]);
+    expect(payload?.warnings).toEqual([]);
+    expect(payload?.complete).toBe(true);
+    expect(payload?.truncated).toBe(false);
+    expect(payload?.scannedRows).toBe(5);
+    expect(trustedToolReads(binding.taskId)?.sheets).toEqual(["来源"]);
+  });
+
+  it("多张表却没绑定：拒读（invalid_arguments），且不记成读过任何表", async () => {
+    resetTrustedSourceReads();
+    const application = makeApplication([
+      makeSheet("来源", [["甲", 1]]),
+      makeSheet("结果1", [["x", 100]])
+    ]);
+    const captured = stubNetwork({
+      poll: {
+        calls: [
+          {
+            operationId: OP,
+            tool: "query_table",
+            arguments: {
+              mode: "aggregate",
+              scope: "selected",
+              metrics: [{ operation: "sum", field: "列2", outputName: "合计" }]
+            },
+            requestFingerprint: FP,
+            expiresAt: 0
+          }
+        ],
+        generation: 1
+      }
+    });
+    const binding = bindingOf(application, [1, 2]);
+    const ports = createWpsSdkBridgeHostPorts(
+      { liveContext: () => createWpsBridgeLiveContext(application, [1, 2]) },
+      binding,
+      { application: () => application }
+    );
+
+    await runBridgeUntilIdle(pollingState(binding), ports);
+
+    const receipt = captured.find((item) => item.url.includes("/receipt"))?.body;
+    // 参数问题按 invalid_arguments 回给模型，让它带上表名重试；
+    // 关键是**没有**退成"两张表都查一遍"。
+    expect((receipt?.receipt as { errorCode?: string })).toEqual({
+      errorCode: "invalid_arguments"
+    });
+    expect(trustedToolReads(binding.taskId)).toBeNull();
+  });
+
+  it("显式区域指到未授权工作表：拒读，错误码 unauthorized_scope", async () => {
+    resetTrustedSourceReads();
+    const application = cinemaApplication();
+    const captured = stubNetwork({
+      poll: {
+        calls: [
+          {
+            operationId: OP,
+            tool: "query_table",
+            arguments: {
+              mode: "rows",
+              scope: "selected",
+              range: "私密!A1:A2"
+            },
+            requestFingerprint: FP,
+            expiresAt: 0
+          }
+        ],
+        generation: 1
+      }
+    });
+    const binding = bindingOf(application);
+    const ports = createWpsSdkBridgeHostPorts(
+      { liveContext: () => createWpsBridgeLiveContext(application, [1, 2]) },
+      binding,
+      { application: () => application }
+    );
+
+    await runBridgeUntilIdle(pollingState(binding), ports);
+
+    // 授权复核这一层看到的是"两张表都在范围内"，越权是在区域这一步判的：
+    // 因此这里要看的是回执的固定错误码，而不是"没有进过 execute"。
+    expect(
+      captured.find((item) => item.url.includes("/receipt"))?.body.receipt
+    ).toEqual({ errorCode: "unauthorized_scope" });
+    // 没读到就不记账。
+    expect(trustedToolReads(binding.taskId)).toBeNull();
   });
 
   it("执行前授权收窄：一个单元格都不读，回执只带固定错误码", async () => {

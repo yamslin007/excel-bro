@@ -1,4 +1,6 @@
-# A1 验收剩余项（2026-10-28 收盘版）
+# A1 验收剩余项（历史批次＋2026-11-01 校正）
+
+> 当前排期以 [主线计划 §0](SDK_MAINLINE_PLAN_2026-10-19.md#0-当前收口队列2026-11-01优先于下方历史批次状态) 为准。下方 10-28/29 收盘描述保留历史时点；公式已实现、Excel 公式 A/B 与撤销已有原生证据，**WPS 公式 A 也已于 2026-11-01 真机通过**（写序证据齐全，见 UX 台账 §8.5 F），不能再整体标未做。WPS 公式 **B 仍标未验**。
 
 > 这份文件的唯一用途：把 A1 还没闭环的东西**按"为什么没闭环"分开写**，避免三类东西混成一句
 > "待实机"。
@@ -71,7 +73,7 @@
 
 | # | 项 | 说明 | 为什么本轮没做 |
 | --- | --- | --- | --- |
-| U1 | 跨窗格/跨进程的"格式、公式、结构动作"精确续写 | 精确续写目前只支持 `writeValues`（且要 `resumeContext`、材料在有效期、来源与目标表分离、完整来源快照、目标不重叠） | 动作类型本身没进恢复协议，`copyRange`/`setFill`/`insertRows` 的恢复点结构没人写 —— 协议级改动，不是一轮能收的 |
+| U1 | 跨进程动作恢复范围 | writeFormulas 双端已实现（Excel A/B 原生已过；**WPS A 于 11-01 真机已过、B 未验**）；copyRange 的 values 展开已有只续第三格用例 | 格式与结构恢复仍需实现；各子集分开结论，见主线 §0 |
 | U2 | 缺来源快照的 SDK Python 结果计划的精确续写 | 同上，明确列为不支持 | 没有写前矩阵就无法构造撤销点；与 U1 同一根 |
 | U7 | ~~旧"先复制再写入"死代码（`WpsAgentPanel.tsx` 的 `stagePendingPlan`）~~ | **2026-10-30 已删**（46 行 + 3 处孤立 import；见 §1.3）。`stageWpsNativeComparison` / `fixedValueFallbackFromFormula` **保留** —— 它们有自己的直测，删不删是另一个决定 | 已闭环，不再排轮 |
 
@@ -87,11 +89,11 @@
 
 | # | 项 | 自动化证据 | 真机缺口 |
 | --- | --- | --- | --- |
-| C1 | **真实撤销**（U4：`abandoned` / `undone` 落账） | 两端 9 条组件用例 + 6 条 pytest + E1/E2/W3 变异 | 账本那两列至今**零真机取值** |
+| C1 | 处置留痕 | 两端已有实现与自动化 | Excel 10-31 两条 undone_at 已有取值；**WPS 仍是待验**——11-01 公式 A 轮 `undone_at=NULL`，但该轮只到「确认变更」、用户没点撤销，既不算留痕通过也不否定用户操作。不追溯旧轮 |
 | C2 | **U5 材料回收留痕**（本轮新增） | 12 条 pytest + R1–R5 变异 + 服务端全量 | 真实 WPS 里撤销一次后，`recovery_package_*` 四列有没有值 |
-| C3 | 保存落盘后的终值（E2） | 自动化有磁盘比对 | 每轮都只有截图；2026-10-29 那轮**根本没保存** |
-| C4 | Excel 真实窗格里结果卡撤销按钮的可点性 | 真实组件 + 真实样式表 + 替身宿主 | 真实 Excel 一次都没点过 |
-| C5 | S1 来源变化 → 本次规划停止 | 故障注入脚本/绑定/采集齐 | 一次都没跑过（A1-E3 的立项理由） |
+| C3 | 保存落盘后的终值 | 既有只读核验 | Excel 公式 A/B 已有保存文件证据；**WPS 公式 A 于 11-01 补上保存文件证据**（`公式来源证据验收-WPS-A.xlsx`，三格公式文本 + 缓存值 2/8/15）；WPS 值放弃回基线也已有。10-29 Excel 未保存仅是那一轮事实 |
+| C4 | Excel 结果卡/重开撤销入口 | 组件自动化及用户操作 | 10-31 已点击成功，见 UX 台账 §8.5 B/C；截图待定位，不再标从未点击 |
+| C5 | S1 来源失效停止 | 注入脚本与账本 | 10-26 双端注入原生已做，见 SDK_A1_NATIVE_TOOLING_REPAIR；不扩大为完整手动改源交错矩阵 |
 | C6 | 崩溃/被杀进程版恢复 | 正常退出版已过（`3f00ea0d`） | 杀进程版空着，不能用正常退出代替 |
 | C7 | 双窗格/换簿/同名簿/授权收窄视觉/并排布局/删表撤销/格式动作 | 各有一批面板级用例 | 见 §2.1–§2.4 逐格 |
 
@@ -103,10 +105,10 @@
 
 | # | 项 | 现状 | 为什么不能靠"实机再跑一次"解决 |
 | --- | --- | --- | --- |
-| U1 | **跨窗格/跨进程的"格式、公式、结构动作"精确续写** | WPS 精确续写当前只支持 `writeValues`（且要 `resumeContext`、材料在有效期内、来源与目标表分离、完整来源快照、目标不重叠）。**2026-10-30 已切三片**（§1.6 / `docs/U1_U2_MINIMAL_SCOPE_2026-10-30.md`）：U1a `writeFormulas`（**已实现，双端**）／U1b 格式动作（要先出格式指纹判据）／U1c `copyRange`**疑似已支持**、只缺一条用例 | 门槛只有两处：`wpsResumeContext()` 只给 `writeValues` 出材料（`wpsPlanExecutor.ts:1075-1082`），`prepareWpsResume` 也只认它（1208）—— **这两处对 `writeFormulas` 已放宽** |
+| U1 | 跨进程动作恢复范围 | writeFormulas 双端已实现（Excel A/B 原生已过；**WPS A 于 11-01 真机已过、B 未验**）；copyRange 的 values 展开已有只续第三格用例 | 格式与结构恢复仍需实现；各子集分开结论，见主线 §0 |
 | U2 | **缺少来源快照的 SDK Python 结果计划**的精确续写 | 同上，明确列为不支持。卡点：`localResultRef` 的计划**强制**要来源锚点（867-868），而它没有 `sourceDependencySheets` ⇒ 材料为 `null` | 表面是"补个 context 变体"，实际是"结果引用能不能充当来源证据"—— 动的是信任模型，要产品点头 |
 | U3 | **SDK 原生会话持久化**（`--no-session-persistence` 仍开） | 未接入；与 `resume` 互斥，隐私边界未定 | 需要一个"谁能读历史转录"的决定，不是测出来的 |
-| U4 | ~~**放弃/撤销的服务端留痕**~~ | **2026-10-29 已实现**（见 §1.1）：`abandoned_at` / `undone_at` + 两端 `disposition` 端点 + 共享判据。**实机未验**，且**不追溯**已有记录 | 原样只读记录：`None` = "没有留痕"，不是"用户没放弃过" |
+| U4 | ~~**放弃/撤销的服务端留痕**~~ | **2026-10-29 已实现**（见 §1.1）：`abandoned_at` / `undone_at` + 两端 `disposition` 端点 + 共享判据。**Excel undone_at 已有原生账本证据；WPS 新版留痕未验**，且**不追溯**已有记录 | 原样只读记录：`None` = "没有留痕"，不是"用户没放弃过" |
 | U5 | ~~**删除前的恢复材料留痕**（哈希/快照）~~ | **2026-10-30 已实现**（见 §1.2）：DELETE 端点改成「取指纹 → 落账 → 才删」，删成功后再记一次「删除确认」；`office_executions` 加 `recovery_package_digest` / `recovery_package_bytes` / `recovery_package_retired_at` / `recovery_package_removed_at`（`user_version` 12 → 13）；落账失败**不删**（503，材料留到期）。**`retired_at` 只证明"记下了删前摘要"，`removed_at` 才证明"文件确已删除"** —— 不许只凭前者宣称删除成功。**实机未验**，且**不追溯**上线前删掉的材料。详见 `docs/RECOVERY_PACKAGE_RETIREMENT_2026-10-30.md` | 原样只读记录：`NULL` = 没有留痕，不是"材料还在" |
 | U6 | **Excel 侧的撤销说明卡与恢复收尾卡** | ~~`ChangeReviewUndoNote` / `settleRecoveredPlan` 只有 WPS 面板渲染；Excel 面板没有 `pendingPlan` 闸门，也没有这张说明~~ **2026-10-30 第十七轮已闭环**（§1.5）：撤销范围说明用 `App.tsx:11721` 文案、恢复收尾用 `officeResume: undefined` 等价接线，均已有测试 | 不是"没验"，是没接线；要不要加是产品决定，本轮不擅自加 |
 | U7 | ~~旧"先复制再写入"死代码（`WpsAgentPanel.tsx` 的 `stagePendingPlan`）~~ | **2026-10-30 已删**（见 §1.3）。附带删掉 5 条**永远不会失败**的负向断言，保留有直测的助手函数 | 已闭环 |
@@ -291,9 +293,38 @@
 
 ## 4. 独立待查项：明确查询 `B2:B4`，结果卡却说「扫描不完整」
 
-**状态：未修复、根因未证实。不得因为另一轮没出现就关闭。**
+**状态：2026-11-01 已定位 + 已修（自动化通过，**真机未复测**）。**
 
-### 4.1 事实
+### 4.0 结论与修法（2026-11-01 补）
+
+真机再一次复现（`turn-b018aec5a1cc4f50ab1d8caa16fcb551`，WPS，19:04）：
+用户只说「只读取「来源」工作表的 A1:B5」，结果卡 `sourceSheets` 却是
+`["来源","结果1","结果2","结果3"]`、`complete=false`，界面照旧写「扫描已达上限」。
+这一次能确定两件事：
+
+1. **表名在"模型产出的 arguments"这一层就没了**，不是桥或执行器丢的 ——
+   证据是执行器把四张表都 `addSheet` 了：旧代码里 `scope: "selected"` 等于"全部已授权表"，
+   只有 `range` 带表名或 `scope: "active"` 才会收窄。桥只做形状闸（原样转发），
+   所以问题在上游：授权集合被当成了本次查询范围。
+2. **「扫描已达上限」是写死的一句文案**，与真实原因无关：任何 `complete=false` 都这么写。
+
+修法两处，互不替代：
+
+* 新增 `sheets`（本次要查的表）+ `packages/core/src/queryTarget.ts` 的 `resolveQueryTarget`：
+  多张可查表却没绑定时**拒绝**并列出可选表名，不再退成"全都查"；
+  `range`/`sheets`/`scope:"active"` 三种绑定的优先级也只在这里定。
+* `complete` 拆成 `complete` + `incomplete[]` + `truncated`/`truncation`：
+  原因由产生它的那段代码写（缺字段 / 没有数据行），卡片按原因渲染，截断单独一句；
+  模型回执带同一份事实。读失败与扫描超限仍然整条报错（不产出部分结果），
+  所以它们**不会**出现在卡片上 —— 这正是"不能统一说成扫描达上限"的正解。
+
+**参数不落账**这一条也补了：进度事件的桥指针现在带 `BridgeQueryBindings`
+（模式/scope/表名/区域/表头口径，不含任何值），下次真机可以直接看参数。
+
+**未做**：真机复测（本次没有打开真实工作簿）。所以本节只能记为"已修、待复测"，
+不得写成"真机通过"。
+
+### 4.1 事实（原始记录，保留）
 
 | 轮 | 结果卡 | `complete` | `sourceSheets` | 界面 |
 | --- | --- | --- | --- | --- |
@@ -521,3 +552,96 @@ Q5 的"保存后再取证"是这一轮学到的东西：不保存就永远只能
 - 不为了让某格变绿而降低判定点（尤其"中断点"与"跨进程"这两处，拿同会话冒充跨进程就等于没测）；
 - 不把 U4/U5 这类"没有记录"写成"已验证不存在"；
 - 不把 §4 的待查项因为"这轮没复现"标为已修复。
+
+## 8. WPS 公式计划「写入前恢复登记失败」（2026-11-01）
+
+**状态：已定位 + 已修（自动化通过，**真机未复测**）。**
+
+真机：三个独立 `writeFormulas` 计划已生成，写入前登记被拒，界面只有一句
+
+> 无法持久登记本次写入现场，已取消写入；原表未被修改。续跑来源越界、形状不符或不支持该动作组合。
+
+场景：来源 `A1:B5`（只读）；`结果1!B2 =来源!B2*1`、`结果2!B2 =来源!B4*2`、`结果3!B2 =来源!B5*3`；目标原为空。
+
+### 8.0 根因（只读定位，不是从文案猜的）
+
+那句话是**服务端**拼好的：`main.py::_validate_wps_recovery_descriptor` 里
+`WPS_RESUME_CONTEXT_INVALID` 的 `message`。界面只是把它接在"无法持久登记…"后面。
+
+真正命中的是**动作组合**那一条：
+
+```python
+valid = all(a.type == "writeValues" for a in request.descriptor.actions)   # 旧
+```
+
+即"带来源证据的描述里只允许值写入"。而端上从公式恢复落地那天起就把
+`writeFormulas` 算作可带来源证据的动作（`wpsPlanExecutor.isResumableValueAction`），
+两端口径漂移 ⇒ **凡是公式计划，一律登记不了**。
+
+判别证据（不是推理）：同一份载荷**只把三个动作的 `type` 换成 `writeValues`**，
+其余（来源表名、`A1:B5`、5 行 2 列、授权集合、两个指纹、`version`）一字不改，
+登记立刻 200。见 `server/tests/test_wps_formula_resume.py::test_action_type_is_the_only_input_that_decides_this_branch`。
+所以不是"来源越界"，不是"形状不符"，也不是协议字段缺失 —— 端上产出的
+`resumeContext.version === 1` + 一块来源证据，服务端本来就认（只是被那个 `all` 一并否掉）。
+
+另外两个叠加缺陷（同一处代码）：
+
+1. **四条拒绝原因合并成一个布尔**：来源越界 / 形状不符 / 动作组合 / 配额，任一条不成立都报同一句，
+   排查只能靠猜。
+2. **零写入却留下在途核对待办**：写入前预置的恢复标记是
+   `executing + execution_unknown + reconcile + unknown`（当时唯一诚实的说法），
+   中止时没有回退 ⇒ 中断卡写"写入结果无法确认，需要先核对"，审阅条写"本次执行需要核对"。
+   现场其实**一个单元格都没动**。
+
+### 8.1 修法
+
+| 位置 | 改动 |
+| --- | --- |
+| `main._WPS_RESUME_SOURCE_ACTION_TYPES` | 新增：可带来源证据的动作 = `{writeValues, writeFormulas}`。与 TS `isResumableValueAction` **同一份判据**，漂移由 `test_resume_source_action_types_match_the_ts_criterion` 钉住 |
+| `main._validate_wps_recovery_descriptor` | 拆开 `valid`：`WPS_RESUME_ACTION_UNSUPPORTED` / `WPS_RESUME_SOURCE_RANGE_INVALID` / `WPS_RESUME_SOURCE_SHAPE_MISMATCH` / `WPS_RESUME_SOURCE_OUT_OF_SCOPE`(403) / `WPS_RESUME_SOURCE_TARGET_OVERLAP` / `WPS_RESUME_SOURCE_LIMIT`。判据一个字没放宽，只是不再合并陈述 |
+| `WpsAgentPanel` 四个写前出口（身份缺失 / 登记失败 / 无写入权 / 索引存不下） | 统一走 `abandonBeforeFirstWrite`：恢复标记退回 `WPS_NOT_EXECUTED_PATCH`（= `not_written` + 保留需求后重新规划）、计划预览不再是"待执行"、原因经 `zeroWriteAbortRef` 交给审阅通道 |
+| 审阅通道 `execute` | 写前中止抛 `ReviewNotStartedError` ⇒ 结论 `not_started`（条上写**未执行**）。与既有 `noActionStarted` 那条**不合并**：那条读账本现场，登记失败时账本是空的，条件恒假 |
+
+不新增任何"执行前确认"；不跳过登记、不删来源证据、不放宽授权。
+
+### 8.2 断言（红→绿）
+
+- `server/tests/test_wps_formula_resume.py`（11 条，新建）：四表三公式同形状**必须登记**；
+  六种拒绝各报各码；v2 字面值计划的两条边界不放宽；区域解析兜底闸直接测（HTTP 层被 pattern 挡在前面）。
+- `apps/wps-addin/src/wpsFormulaResumeRegistration.test.ts`（4 条，新建）：同一份计划的前端载荷
+  （`version 1` + `来源!A1:B5` 5×2 + 三个 `writeFormulas` + 无值矩阵）**以及**
+  "登记成功 → 前两步写入并回读 → 第二步回执前中断 → 第三步一格没写"。
+- `WpsAgentPanel.test.tsx`：`登记失败（零写入）：结论是「未执行」，不留虚构的在途核对入口`、
+  `服务端拒绝原因原样到达界面`；原"登记失败零写入"负向用例保留。
+- 既有 `test_wps_resume_context_rejects_unsafe_metadata[formula]` 是**把缺陷写成了断言**（它要求
+  `writeFormulas` + 来源证据必须 422），改为 `[format]`：要守的是"格式动作没有来源值"那半边。
+
+### 8.3 未做
+
+真机复测（本轮没有打开真实工作簿），所以只能记"已修、待复测"。**→ 复测已于同日 21:46–22:10 完成，见 §9。**
+
+---
+
+## 9. 上条修复的真机复测：WPS 公式 A 分支通过（2026-11-01 21:46–22:10）
+
+**结论：WPS 公式 A 真机操作链路通过**（登记 → 前两步写入并回读 → 第二步回执前中断 → 完整退出重开 → 核对 → 续跑只写第三步 → 确认变更）。
+逐项五列台账在 `docs/CONVERSATION_UX_REFACTOR_2026-11-01.md` §8.5 F，此处只留索引与判据。
+
+| 维度 | 证据 |
+| --- | --- |
+| executionId | `wps-execution-304e6eee-5ba7-4131-b01a-7c54aaea4e32`（当天唯一一条 WPS 执行，`task-a6b33fa7…`） |
+| 用户实机 | 六步逐条确认（三格公式、第三步为空、重开恢复卡可用、核对后"可继续剩余动作"、继续后 15、确认变更成功）；**截图待定位** |
+| 保存文件（只读） | `C:\Users\jia\Desktop\测试\公式来源证据验收-WPS-A.xlsx`，11032B / mtime `22:15:45` / sha256 `ecf3a6ad…8a98bc8`；`结果1/2/3!B2` = `=来源!B2*1` / `=来源!B4*2` / `=来源!B5*3`，缓存值 `2/8/15` |
+| 账本 | `status=completed` / `revision=11` / `next_action_index=3`；`created_at=21:46:09`、`updated_at=22:10:10`；`result_json={"actionCount":3,"backfilled":false}`；`checkpoint` 指向 `结果3!B2` |
+| 写序（关键） | `office_host_writes` 恰好 3 行：`idx0`+`idx1` @`21:46:09`（`idx1`=`failed_after_write`/`WPS_ACTION_FAILED`）、`idx2` @`22:10:10` ⇒ **续跑只执行第三步**。该表只追加、`recorded_at` 由服务端取时，时间差即写序；第二步**回执补记**不产生新行，故可与"第二次宿主写入"区分 |
+| 自动化 | 修复轮 `wpsExecutionResume` + `wpsNativeComparison` 110 passed；全量 core 1128 / addin 1734 / wps 1283 / server 2026 |
+
+**不能据此宣称的东西**：
+
+- 账本里**查不到** `planning_tasks` / `planning_task_events` 的该 `task_id`，`folder_operation_events` 计数 0 ⇒ 没有"登记 / 开始 / 回执 / 核对"的逐事件序列，**"核对"这一步在账本里没有独立事件行**（证据不足，不补推断）。
+- 「确认变更」只有用户界面证据，账本只有 `completed + next_action_index=3`，**没有独立确认留痕**。
+- `undone_at=NULL`、`recovery_package_digest/bytes/retired_at/removed_at` 全 `NULL` ⇒ **"撤销入口可用"不等于本轮撤销通过**，本轮未做撤销，C1/C2 两格仍未验。
+- **WPS 公式 B 仍未验**；A1-GATE **不通过**、A2 未启动。
+
+**新登记的展示缺陷（只记录、未改代码）**：续跑进入结果审阅后，过程面板仍显示「回读核对第 2 个动作 / 进度 2/3 步 / 正在回读核对「结果2!B2」…」。
+出处 `apps/wps-addin/src/wpsActivityLog.ts:126-150`（`verifying:<index>` 条目累积、续跑开始不重置）与 `wpsPlanExecutor.ts:2578`。复现与影响见 UX 台账 §8.6。

@@ -60,6 +60,7 @@ export type WpsRange = {
 };
 
 export type WpsWorksheet = {
+  Activate?(): void;
   Name: string;
   Index?: number;
   /**
@@ -97,8 +98,8 @@ export type WpsWorksheet = {
     Count: number;
     Item(index: number): { Name?: unknown; Range?: WpsRange };
   };
-  /** 无参数复制到新的未保存工作簿；原生并排审阅仅在实机确认支持时使用。 */
-  Copy?(): void;
+  /** 无参数建立未保存副本；指定 After 则复制到该受控副本的末尾。 */
+  Copy?(before?: WpsWorksheet, after?: WpsWorksheet): void;
 };
 
 export type WpsNativeWindow = {
@@ -218,6 +219,27 @@ export function getWpsApplication(scope: Pick<Window, "Application"> = window): 
     throw new WpsHostUnavailableError();
   }
   return application;
+}
+
+/**
+ * 计算"尽可能大"的专注窗口尺寸（逻辑像素）。
+ *
+ * WPS `ShowDialog(url, caption, width, height, bModal)` 的宽高是逻辑像素，没有
+ * "最大化"标志；要让窗口尽量大，就用当前屏幕可用区域（排除任务栏等系统占用）
+ * 作为宽高传入。宿主会自行按 DPI 缩放，这里只求"接近满屏、不越界"。
+ *
+ * 回退：WebView 里读不到 `screen.availWidth/availHeight`（或值非法）时退回
+ * 1280×860（与宽视图探针的保守目标一致），而不是写死一个更小的值。
+ */
+export function maxFocusWindowSize(
+  screenLike: Pick<Screen, "availWidth" | "availHeight"> = window.screen
+): { width: number; height: number } {
+  const width = Number(screenLike.availWidth);
+  const height = Number(screenLike.availHeight);
+  if (Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0) {
+    return { width, height };
+  }
+  return { width: 1280, height: 860 };
 }
 
 function normalizeSelectionPreview(value: unknown): string | null {

@@ -39,11 +39,17 @@ export { isNearScrollBottom };
 export function useMessageAutoFollow(signal: string, conversationId: string) {
   const containerRef = useRef<HTMLElement | null>(null);
   const followingRef = useRef(true);
+  const navigationHoldRef = useRef(false);
+  const cancelNavigationRef = useRef<(() => void) | null>(null);
   const conversationRef = useRef(conversationId);
   const [awayFromBottom, setAwayFromBottom] = useState(false);
 
   const handleScroll = useCallback((event: UIEvent<HTMLElement>) => {
-    const following = followingAfterScroll(event.currentTarget);
+    if (cancelNavigationRef.current) return;
+    if (navigationHoldRef.current && isNearScrollBottom(event.currentTarget, 1)) {
+      navigationHoldRef.current = false;
+    }
+    const following = !navigationHoldRef.current && followingAfterScroll(event.currentTarget);
     followingRef.current = following;
     // 滚出去就放出来、滚回来就收回 —— **不要求**期间有新内容。
     setAwayFromBottom(!following);
@@ -52,20 +58,74 @@ export function useMessageAutoFollow(signal: string, conversationId: string) {
   const scrollToLatest = useCallback(() => {
     const container = containerRef.current;
     if (!container) return;
+    cancelNavigationRef.current?.();
     followingRef.current = true;
+    navigationHoldRef.current = false;
     container.scrollTop = container.scrollHeight;
     setAwayFromBottom(false);
   }, []);
+
+  const scrollToMessage = useCallback((id: string) => {
+    const container = containerRef.current;
+    if (!container) return;
+    const row = Array.from(container.querySelectorAll<HTMLElement>("[data-message-id]"))
+      .find((element) => element.dataset.messageId === id);
+    if (!row) return;
+    cancelNavigationRef.current?.();
+    followingRef.current = false;
+    navigationHoldRef.current = true;
+    const start = container.scrollTop;
+    const target = Math.max(0, Math.min(container.scrollHeight - container.clientHeight,
+      start + row.getBoundingClientRect().top - container.getBoundingClientRect().top - 16));
+    const behavior = container.style.scrollBehavior;
+    container.style.scrollBehavior = "auto";
+    // Respect reduced motion; older hosts without matchMedia use immediate navigation.
+    if (!window.matchMedia || window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      container.scrollTop = target;
+      container.style.scrollBehavior = behavior;
+      setAwayFromBottom(!isNearScrollBottom(container, 1));
+      return;
+    }
+    let frame = 0;
+    const began = performance.now();
+    const finish = () => {
+      cancelAnimationFrame(frame);
+      container.style.scrollBehavior = behavior;
+      cancelNavigationRef.current = null;
+      for (const name of ["wheel", "touchstart", "pointerdown", "keydown"]) container.removeEventListener(name, finish);
+      setAwayFromBottom(!isNearScrollBottom(container, 1));
+    };
+    cancelNavigationRef.current = finish;
+    for (const name of ["wheel", "touchstart", "pointerdown", "keydown"]) container.addEventListener(name, finish, { passive: true });
+    const tick = (now: number) => {
+      const t = Math.min(1, (now - began) / 320);
+      const eased = t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+      container.scrollTop = start + (target - start) * eased;
+      if (t < 1) frame = requestAnimationFrame(tick);
+      else finish();
+    };
+    setAwayFromBottom(true);
+    frame = requestAnimationFrame(tick);
+  }, []);
+
+  useLayoutEffect(() => () => { cancelNavigationRef.current?.(); }, [conversationId]);
 
   useLayoutEffect(() => {
     // Scroll intent belongs to the displayed conversation, not to the pane.
     if (conversationRef.current !== conversationId) {
       conversationRef.current = conversationId;
       followingRef.current = true;
+      navigationHoldRef.current = false;
       setAwayFromBottom(false);
     }
     const container = containerRef.current;
     if (!container) return;
+    if (cancelNavigationRef.current) return;
+    if (navigationHoldRef.current && !isNearScrollBottom(container, 1)) {
+      setAwayFromBottom(true);
+      return;
+    }
+    navigationHoldRef.current = false;
     // 意图优先、位置兜底：这一句就是"用户上翻后新内容不许抢滚动"的落点。
     if (shouldFollowAfterLayout({ following: followingRef.current, metrics: container })) {
       followingRef.current = true;
@@ -81,6 +141,7 @@ export function useMessageAutoFollow(signal: string, conversationId: string) {
     containerRef,
     awayFromBottom,
     handleScroll,
-    scrollToLatest
+    scrollToLatest,
+    scrollToMessage
   };
 }

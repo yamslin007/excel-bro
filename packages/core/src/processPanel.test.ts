@@ -26,15 +26,21 @@ describe("单步消息理解的简洁展示", () => {
 });
 
 describe("processPanelExpanded", () => {
-  it("进行中默认展开，正常结束后自动收起", () => {
-    expect(processPanelExpanded({ live: true, outcome: null, userChoice: null })).toBe(true);
+  it("进行中和正常结束都默认收起", () => {
+    expect(processPanelExpanded({ live: true, outcome: null, userChoice: null })).toBe(false);
     expect(processPanelExpanded({ live: false, outcome: "completed", userChoice: null })).toBe(false);
   });
 
-  it("失败/中断/取消/等待回答都不自动收起", () => {
+  it("等待回答让位于问题，仍允许用户主动展开", () => {
+    expect(processPanelExpanded({ live: false, outcome: "awaiting_input", awaitingAnswer: true, userChoice: null })).toBe(false);
+    expect(processPanelExpanded({ live: false, outcome: "awaiting_input", awaitingAnswer: true, userChoice: "expanded" })).toBe(true);
+    expect(processPanelExpanded({ live: false, outcome: "awaiting_input", userChoice: null })).toBe(true);
+  });
+
+  it("失败/中断/取消都不自动收起", () => {
     // 反向锚点：把这条判据写成 `!live` 就会让"执行失败"只剩一行标题，
     // 用户必须自己想到去展开才知道停在哪一步。
-    for (const outcome of ["failed", "interrupted", "cancelled", "warning", "awaiting_input"]) {
+    for (const outcome of ["failed", "interrupted", "cancelled", "warning"]) {
       expect(processPanelExpanded({ live: false, outcome, userChoice: null })).toBe(true);
     }
   });

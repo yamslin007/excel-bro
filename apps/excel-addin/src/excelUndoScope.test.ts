@@ -425,3 +425,21 @@ describe("④ 非 Normal 命名样式 + 直接格式覆盖的恢复", () => {
     expect(host.cellNumberFormat(SHEET, "A1")).toBe("0.00");
   });
 });
+
+it('宿主静默未保留恢复值时，回读拒绝宣告全部恢复成功', async () => {
+  const result = await executePlan(await anchoredPlan([{type:'writeValues',sheet:SHEET,range:'A1',values:[['新值']]}]), {authorizedSheetNames:[SHEET]});
+  const runtime = globalThis as unknown as {Excel:{run:(callback:(context:Excel.RequestContext)=>Promise<void>)=>Promise<void>}};
+  const originalRun = runtime.Excel.run;
+  runtime.Excel.run = callback => originalRun(async context => {
+    const sync = context.sync.bind(context);
+    context.sync = async <T>(passThroughValue?: T): Promise<T> => {
+      const value = await sync(passThroughValue);
+      // Simulate a host that accepts the call but fails to retain the restored value.
+      if (host.cell(SHEET,'A1') === '甲') host.setCell(SHEET,'A1','新值');
+      return value;
+    };
+    await callback(context);
+  });
+  try { await expect(undoExecution(result.undoSnapshot!)).rejects.toThrow('恢复后回读不一致'); }
+  finally { runtime.Excel.run = originalRun; }
+});

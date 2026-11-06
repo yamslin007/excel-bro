@@ -304,7 +304,15 @@ describe("WPS readonly agent", () => {
     expect(result.kind).toBe("answer");
     expect(executeQuery).toHaveBeenCalledWith(
       expect.objectContaining({ id: "q1" }),
-      [{ name: "明细", values: readResult.values }]
+      // origin 是 `values[0][0]` 的绝对位置：没有它，显式区域无法落成裁剪，
+      // 执行器会明确报错而不是悄悄改成整表读。
+      [
+        {
+          name: "明细",
+          values: readResult.values,
+          origin: { row: 1, column: 1 }
+        }
+      ]
     );
     const plannerRequest = createAssistantResponse.mock.calls[0][0];
     expect(plannerRequest.workbook.worksheets[0].dataRows).toEqual([]);

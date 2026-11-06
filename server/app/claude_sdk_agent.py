@@ -8,6 +8,7 @@ an existing EB answer, local computation rule, or validated preview plan.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -258,8 +259,36 @@ async def _close_stream(stream: Any) -> None:
 
 
 async def _result(
-    sdk: Any, prompt: Any, options: Any, timeout: float, *, stop_event: Any | None = None
+    sdk: Any, prompt: Any, options: Any, timeout: float, *, stop_event: Any | None = None,
+    connection: ModelConnection | None = None,
 ) -> str:
+    if connection is not None and connection.adapter == "openai_compatible":
+        from .openai_sdk_transport import openai_sdk_transport
+        async with openai_sdk_transport(connection) as transport:
+            local_options = copy.copy(options)
+            # Bind all internal model-class requests to the user's chosen ID.
+            # Only the temporary bridge credential reaches the SDK subprocess.
+            local_options.env = {**options.env,
+                "ANTHROPIC_BASE_URL": transport.base_url,
+                "ANTHROPIC_API_KEY": transport.token,
+                "ANTHROPIC_AUTH_TOKEN": transport.token,
+                "ANTHROPIC_MODEL": connection.model,
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": connection.model,
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": connection.model,
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": connection.model,
+                "CLAUDE_CODE_SUBAGENT_MODEL": connection.model,
+                "CLAUDE_CODE_USE_BEDROCK": "0",
+                "CLAUDE_CODE_USE_VERTEX": "0",
+                "CLAUDE_CODE_USE_FOUNDRY": "0",
+                "NO_PROXY": ",".join(filter(None, [os.getenv("NO_PROXY", os.getenv("no_proxy", "")), "127.0.0.1", "localhost"])),
+                "no_proxy": ",".join(filter(None, [os.getenv("NO_PROXY", os.getenv("no_proxy", "")), "127.0.0.1", "localhost"])),
+            }
+            try:
+                return await _result(sdk, prompt, local_options, timeout, stop_event=stop_event)
+            except LLMError:
+                if transport.error is not None:
+                    raise transport.error from None
+                raise
     # Uvicorn's Windows reload/multi-worker mode installs a Selector loop,
     # which has no subprocess transport. Fail before invoking the SDK rather
     # than misreporting NotImplementedError as a model-network failure.
@@ -331,7 +360,7 @@ async def check_sdk_connection(connection: ModelConnection) -> None:
     from .agent_runtime import sdk_agent_connection
 
     connection = sdk_agent_connection(connection)
-    if not connection.api_key:
+    if not connection.api_key and connection.adapter != "openai_compatible":
         raise ModelNotAvailableError("SDK Agent 连接测试需要 API Key；不会借用其他登录身份。")
     sdk = _sdk()
     token = uuid.uuid4().hex
@@ -354,7 +383,7 @@ async def check_sdk_connection(connection: ModelConnection) -> None:
         max_turns=capability_int("modelConnectionTest", "maxTurns"), server=server,
         allowed=["mcp__excel_bro__connection_probe"])
     await _result(sdk, f"Verify connection using token: {token}", options,
-                  capability_float("modelConnectionTest", "timeoutSeconds"))
+                  capability_float("modelConnectionTest", "timeoutSeconds"), connection=connection)
     if not received:
         raise LLMResponseError("模型返回了文本，但未完成 SDK 工具调用；连接尚不能用于表格 Agent。")
 
@@ -371,7 +400,7 @@ async def check_sdk_message_understanding(
     options = _options(sdk, connection, MESSAGE_UNDERSTANDING_PROMPT, max_turns=1)
     timeout = min(capability_float("llm", "timeoutSeconds"), 60.0)
     for attempt in range(2):
-        content = await _result(sdk, prompt, options, timeout)
+        content = await _result(sdk, prompt, options, timeout, connection=connection)
         try:
             return parse_message_understanding(content, request)
         except (ValueError, TypeError, KeyError):
@@ -433,7 +462,7 @@ async def check_sdk_intent(
     options = _options(sdk, connection, INTENT_SYSTEM_PROMPT + TASK_CONTEXT_PROMPT, max_turns=1)
     timeout = min(capability_float("llm", "timeoutSeconds"), 60.0)
     for attempt in range(2):
-        content = await _result(sdk, prompt, options, timeout)
+        content = await _result(sdk, prompt, options, timeout, connection=connection)
         try:
             parsed = _parse_model_response(content, request)
             if parsed.kind == "clarification" and request.clarificationRound >= MAX_CLARIFICATION_ROUNDS:
@@ -502,6 +531,7 @@ async def run_sdk_plan(
         local_query_tool_definitions,
         local_terminal_tool_definitions,
         prepare_python_data_tool_definition,
+        query_bindings_of,
     )
     from .python_analysis import (
         python_analysis_tool_definition, python_error_response_content,
@@ -573,7 +603,9 @@ async def run_sdk_plan(
         operation_id: str, tool: str, arguments: dict[str, Any], fingerprint: str
     ) -> None:
         # 只发一个不透明指针事件；请求参数留在易失桥里由宿主适配器拉取，
-        # 不写进会落盘的进度事件/账本。
+        # 不写进会落盘的进度事件/账本。**唯一的例外是查询的绑定事实**
+        # （模式/scope/表名/区域/表头口径，见 `BridgeQueryBindings`）：它不含值，
+        # 却是排查"查错了表"唯一能拿到的证据。
         if on_event is not None:
             await on_event({
                 "phase": "planning",
@@ -585,7 +617,11 @@ async def run_sdk_plan(
                 "status": "started",
                 "title": "正在本机执行数据查询",
                 "toolName": tool,
-                "bridgeTool": {"operationId": operation_id, "tool": tool},
+                "bridgeTool": {
+                    "operationId": operation_id,
+                    "tool": tool,
+                    "bindings": query_bindings_of(arguments),
+                },
             })
 
     async def on_bridge_complete(
@@ -877,6 +913,15 @@ async def run_sdk_plan(
             + "\n本轮只有表结构，没有源值；只能调用 excel_bro 白名单工具。"
             "需要数据计算时调用 mcp__excel_bro__query_table：本地会在真实宿主上"
             "执行确定性查询，回执只给出结果引用与结构，**不含任何数值**。"
+            "无表头区域的字段名是「列1、列2……」（整列都是数字的区域就属于这种），"
+            "这类区域**首行也是数据**，不得以「第一行是表头」为由把它排除。"
+            "用户点名只读区域（如 来源!A1:B5）时用 arguments.range 传同一个区域："
+            "**区域外的单元格不参与计算**，不要用整表结果冒充；那张表必须已授权。"
+            "**每次调用都要绑定本次要查的表**：已授权/已勾选只是允许访问的上限，"
+            "不是本次查询范围。用户说了「来源表」就只查来源表（range 带表名，或 "
+            "sheets:[\"来源\"]）；可查范围有多张表却没绑定时工具会报错并列出可选表名，"
+            "不会替你退成「全部查一遍」。真要跨表就把表名在 sheets 里列全。"
+            "真实表头恰好叫「列1/列2」时传 hasHeaders=true（显式声明优先于按列名推断）。"
             "回执里没有数据值时，不要声称你比较过数值或识别出异常。"
             "同一任务内可以多次调用工具，可按回执中的固定错误码修正参数后重试。"
             "用户明确指定字面常量时：单区域用 plan_range_edit；多条独立写入用 plan_literal_edits，"
@@ -906,7 +951,7 @@ async def run_sdk_plan(
             content = await _result(
                 sdk, _image_prompt(prompt, request.images) if request.images else prompt, options,
                 capability_float("taskRecovery", "planningHardWallTimeSeconds"),
-                stop_event=source_stop,
+                stop_event=source_stop, connection=connection,
             )
         except SourceChangedDuringPlanning:
             # 父阶段也必须如实收尾：停在这一步的是"来源变了"，不是模型失败，

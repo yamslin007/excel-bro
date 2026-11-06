@@ -1,7 +1,7 @@
 import type { AnalysisPlan, CellValue, ExcelAction } from "./contracts";
 import { isFormatAction } from "./contracts";
 import type { SheetSnapshot } from "./excelNativeComparison";
-import { nativeColumnName, nativeReviewPackage, nativeReviewXml as xml } from "./nativeReviewFile";
+import { nativeColumnName, nativeReviewPackage, nativeReviewWorkbookPackage, nativeReviewXml as xml } from "./nativeReviewFile";
 import { parseExplicitA1Rect } from "./planCore";
 import { excelFormatActionFields } from "./excelFormatCapability";
 import { directFormatFieldValue } from "./excel";
@@ -109,7 +109,23 @@ function styleTable() {
 
 // Projection only: never evaluates formulas or calls host setters. The plan has already
 // passed nativeComparisonPlanIssue. Excel recalculates this standalone workbook on open.
-export function buildManualReviewFile(sheetName: string, source: SheetSnapshot, plan: AnalysisPlan, maxCells: number, maxBytes: number): { base64: string; markedCells: number } {
+export function buildManualReviewFile(sheetName: string, source: SheetSnapshot, plan: AnalysisPlan, maxCells: number, maxBytes: number, reviewCopyId?: string): { base64: string; markedCells: number } {
+  const styles = styleTable();
+  const sheet = manualReviewSheet(source, plan, maxCells, styles);
+  return {base64: nativeReviewPackage(sheetName, sheet.xml, maxBytes, styles.xml(), reviewCopyId), markedCells: sheet.markedCells};
+}
+/** One immutable before-workbook for the whole execution; all formulas use captured values. */
+export function buildBeforeReviewWorkbook(sources: SheetSnapshot[], plan: AnalysisPlan, maxCells: number, maxBytes: number, reviewCopyId: string, selected: string) {
+  if (sources.reduce((sum, s) => sum + s.values.reduce((n, row) => n + row.length, 0), 0) > maxCells)
+    throw new Error('执行前比对工作簿超过本机范围限额。');
+  const styles = styleTable();
+  const sheets = sources.map(source => ({name: source.name,
+    xml: manualReviewSheet({...source, formulaCells: []}, {...plan, actions: []}, maxCells, styles).xml}));
+  const activeTab = sources.findIndex(s => s.name === selected);
+  if (activeTab < 0) throw new Error('对比目标不在执行前快照内。');
+  return {base64: nativeReviewWorkbookPackage(sheets, maxBytes, styles.xml(), reviewCopyId, activeTab)};
+}
+function manualReviewSheet(source: SheetSnapshot, plan: AnalysisPlan, maxCells: number, styles: ReturnType<typeof styleTable>) {
   const sourceRect = parseExplicitA1Rect(source.address)!;
   const rects = [sourceRect, ...plan.actions.map(action => parseExplicitA1Rect('range' in action ? action.range : '')!)];
   const firstRow = Math.min(...rects.map(r => r.startRow)), lastRow = Math.max(...rects.map(r => r.endRow));
@@ -183,7 +199,6 @@ export function buildManualReviewFile(sheetName: string, source: SheetSnapshot, 
       }
     }
   }
-  const styles = styleTable();
   let rows = '';
   for (let row=firstRow; row<=lastRow; row++) {
     let cells = '';
@@ -215,6 +230,9 @@ export function buildManualReviewFile(sheetName: string, source: SheetSnapshot, 
   // Office widths are points; OOXML widths are font character units (approximate).
   const columns = projectedColumnWidths.map((width,c) => width > 0 && Number.isFinite(width) ? `<col min="${source.startColumn+c}" max="${source.startColumn+c}" width="${Math.max(0,(width*96/72-5)/7).toFixed(4)}" customWidth="1"/>` : '').join('');
   const topLeft = `${nativeColumnName(firstColumn)}${firstRow}`;
-  const sheetXml = `<worksheet xmlns="${NS}"><dimension ref="${topLeft}:${nativeColumnName(lastColumn)}${lastRow}"/><sheetViews><sheetView workbookViewId="0" topLeftCell="${topLeft}"/></sheetViews><sheetFormatPr defaultRowHeight="15"/><cols>${columns}</cols><sheetData>${rows}</sheetData></worksheet>`;
-  return { base64: nativeReviewPackage(sheetName, sheetXml, maxBytes, styles.xml()), markedCells: marked.size };
+  const focus = source.focusAddress && parseExplicitA1Rect(source.focusAddress) ? source.focusAddress : topLeft;
+  const merged = (source.mergedAreas ?? []).filter(area => parseExplicitA1Rect(area));
+  const merges = merged.length ? `<mergeCells count="${merged.length}">${merged.map(area => `<mergeCell ref="${xml(area)}"/>`).join('')}</mergeCells>` : '';
+  const sheetXml = `<worksheet xmlns="${NS}"><dimension ref="${topLeft}:${nativeColumnName(lastColumn)}${lastRow}"/><sheetViews><sheetView workbookViewId="0" topLeftCell="${focus}"><selection activeCell="${focus}" sqref="${focus}"/></sheetView></sheetViews><sheetFormatPr defaultRowHeight="15"/><cols>${columns}</cols><sheetData>${rows}</sheetData>${merges}</worksheet>`;
+  return { xml: sheetXml, markedCells: marked.size };
 }

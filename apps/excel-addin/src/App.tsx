@@ -1,4 +1,8 @@
-import { HistoryDeleteDialog, HISTORY_MENU_DESCRIPTION } from "./components/HistoryDeleteDialog";
+import { ConversationMessage } from "./components/ConversationMessage";
+import { ClarificationMessageIntro } from "./components/ClarificationMessageIntro";
+import { ConversationUtilityButtons } from "./components/ConversationUtilityButtons";
+import { ComposerAppMenu } from "./components/ComposerAppMenu";
+import { HistoryDeleteDialog } from "./components/HistoryDeleteDialog";
 import { stampLiteralPlanOrigin } from "@excel-bro/core/literalPlanOrigin";
 import {
   EXECUTION_RECOVERY_ENTRY_HINT,
@@ -10,6 +14,11 @@ import {
   type ExecutionRecoverySourceVerdict
 } from "@excel-bro/core/executionRecoveryView";
 import { verifyResumeScene, type ResumeSceneOutcome } from "@excel-bro/core/executionResumeScene";
+import {
+  recoveryComposerPrimaryLabel,
+  recoveryComposerState,
+  type RecoveryComposerFacts
+} from "@excel-bro/core/recoveryComposer";
 import {
   FORMULA_SOURCE_UNVERIFIABLE_MESSAGE,
   verifyFormulaResumeSources
@@ -30,7 +39,7 @@ import { resultRefFaultTarget, resultRefFaultVisible } from "@excel-bro/core/res
 import { bindRecoveryProbe, interruptRecoveryProbe, settleRecoveryProbe, RecoveryProbeCancelledError } from "@excel-bro/core/recoveryProbe";
 import { prepareFormulaSourceEvidence } from './excelFormulaSourceEvidence';
 import { prepareExcelValueCopies } from './excelValueCopyPlan';
-import { TaskExecutionNotice } from "./components/TaskExecutionNotice";
+import { TaskExecutionNotice, taskExecutionNoticeText } from "./components/TaskExecutionNotice";
 import { ComposerPrimaryButton } from "./components/ComposerPrimaryButton";
 import { acceptsPlanningReplay, planningReceivedSequence, waitForPlanning } from "@excel-bro/core/planningReplay";
 import {
@@ -63,16 +72,26 @@ import {
 } from "./components/WorksheetCheckpointCard";
 import { ModelConnectionProtocolFields } from "./components/ModelConnectionProtocolFields";
 import {
+  Fragment,
   useEffect,
   useLayoutEffect,
   useMemo,
   useRef,
   useState,
   useSyncExternalStore,
+  type ReactNode,
 } from "react";
+import { ComposerPendingBar } from "./components/ComposerPendingBar";
+import { ExecutionFeedbackSummary } from "./components/ExecutionFeedbackSummary";
+import { groupOperationFeedback } from "@excel-bro/core/operationFeedback";
+import type { ComposerPendingItem } from "@excel-bro/core/composerPending";
+import { currentActionShortLabel } from "@excel-bro/core/currentActionCard";
+import { isHistoryStorageNoticeVisible } from "./components/HistoryStorageNotice";
 import { ResultReview, ReviewNotStartedError } from '@excel-bro/core/resultReview';
-import { ResultReviewBar, resultReviewNeedsDecision, resultReviewVisible } from './components/ResultReviewBar';
-import { excelRecoveryBeforeResult, captureExcelBeforeResult, showExcelBeforeResult, closeExcelNativeComparison, type ExcelBeforeResult } from './excelNativeComparison';
+import { ResultReviewBar, resultReviewComposerActive, resultReviewNeedsDecision, resultReviewVisible, reviewStatusBarSuppressedByRecovery } from './components/ResultReviewBar';
+import { excelBeforeComparisonSheets, captureExcelBeforeResult, showExcelBeforeResult, closeExcelNativeComparison, suspendExcelBeforeComparison, activateExcelBeforeComparison, switchExcelBeforeComparison, type ExcelBeforeResult } from './excelNativeComparison';
+import { saveReviewBefore, loadReviewBefore, deleteReviewBefore } from './utils/reviewBeforeStore';
+import { saveExcelComparisonCopies, loadExcelComparisonCopies } from './excelNativeComparison';
 import { markExcelResult, clearExcelResultMarks, recoverExcelResultMarks, type ExcelResultMarks } from './resultReviewMarkers';
 import type { PlanExecutionResult, ExecutionUndoSnapshot } from './contracts';
 import type { HostWriteAudit } from '@excel-bro/core/hostWriteAudit';
@@ -96,6 +115,7 @@ import {
   isLocalServiceConnectionError,
   reconcileOfficeActionReceipt,
   recordExecutionDisposition as sendExecutionDisposition,
+  sendExecutionReview,
   registerOfficeExecution,
   reportOfficeHostWrites,
   refreshFolder,
@@ -122,7 +142,7 @@ import {
 import { brandLogoUrl } from "./brandLogo";
 import { createAgentTaskContext, confirmAgentTaskDecision, type AgentTaskContext } from "@excel-bro/core/agentTaskContext";
 import { renderConfirmedPrompt } from "@excel-bro/core/clarificationAnswers";
-import { ModelPickerIcon } from "./components/ModelPickerIcon";
+import { ModelPickerLabel } from "./components/ModelPickerLabel";
 import { TargetScopeNotice } from "./components/TargetScopeNotice";
 import { ScopeAdmissionSummary } from "./components/ScopeAdmissionStatus";
 import { useImmediateScopeAuthorization } from "./hooks/useImmediateScopeAuthorization";
@@ -266,13 +286,19 @@ import {
 import { formulaExternalFileNames, fuzzyLookupMatch } from "./formulaSafety";
 import {
   currentModelCallCount,
-  exportDiagnosticReport,
   recordDiagnosticEvent
 } from "./diagnostics";
 import {
-  FOCUS_PAYLOAD_STORAGE_KEY,
-  type FocusPayload
-} from "./focusState";
+  FOCUS_CACHE_TTL_MS,
+  FOCUS_HEARTBEAT_INTERVAL_MS,
+  FOCUS_PROTOCOL_VERSION,
+  createFocusEnvelope,
+  createFocusSessionId,
+  focusCacheKey,
+  nextFocusSeq,
+  readFocusMessage
+} from "@excel-bro/core/focusProtocol";
+import type { FocusSnapshot } from "./focusState";
 import {
   describeIntentDecision
 } from "./intent";
@@ -288,16 +314,18 @@ import {
 import { ProcessResultSummary } from "./components/ProcessResultSummary";
 import { ComposerActionDock, type CurrentActionView } from "./components/ComposerActionDock";
 import { processOutcomePhaseFrom } from "@excel-bro/core/processOutcome";
-import { isCompactMessageProcess } from "@excel-bro/core/processPanel";
+import { reviewBlockerMessage, reviewNeedsAttention, reviewRestoreVerdict } from "@excel-bro/core/reviewLifecycle";
+import { messageRowPresentation } from "@excel-bro/core/messageRows";
 import { selectCurrentAction } from "@excel-bro/core/currentActionCard";
 import ChangeReviewSummaryCard from "./components/ChangeReviewSummaryCard";
 import OfficeRecoveryChoicesCard from "./components/OfficeRecoveryChoicesCard";
 /*
  * 恢复卡的**可点击那一份**住在输入区上方（`OfficeRecoveryPanel`），消息里只留
  * 只读的 `OfficeRecoveryRecord`。两张共用同一份结论，入口由共享选择器挑出唯一一条。
- * 主按钮（核对 / 继续剩余动作）由 `excelRecoveryActions` 判"本端能不能落地"。
+ * 核对 / 继续执行由输入框里的恢复操作区承接（`RecoveryComposer`），卡面只留指路与次要动作。
  */
-import { OfficeRecoveryPanel, OfficeRecoveryRecord, excelRecoveryActions } from "./components/OfficeRecoveryPanel";
+import { OfficeRecoveryPanel, OfficeRecoveryRecord } from "./components/OfficeRecoveryPanel";
+import { RecoveryComposer, RecoveryPendingEntry } from "./components/RecoveryComposer";
 import { ExcelNativeReviewActions } from "./components/ExcelNativeReviewActions";
 import { SaveToolDialog } from "./components/SaveToolDialog";
 import { useExcelNativeComparison, excelReviewBlocksNewCopy } from "./hooks/useExcelNativeComparison";
@@ -311,6 +339,7 @@ import { LocalMappingResolution } from "./components/LocalMappingResolution";
 import MessageCopyButton from "./components/MessageCopyButton";
 import { ExecutionResultCard } from "./components/ExecutionResultCard";
 import ScrollToLatestButton from "./components/ScrollToLatestButton";
+import ConversationNavigation from "./components/ConversationNavigation";
 import { FolderBackupManager } from "./components/FolderBackupManager";
 import { ScopeSelectionGuidance } from "./components/ScopeSelectionGuidance";
 import HistoryStorageNotice from "./components/HistoryStorageNotice";
@@ -333,6 +362,7 @@ import { loadBridgeResult, type SdkBridgeLiveContext } from "./sdkBridgeHost";
 import LocalResultCard from "./components/LocalResultCard";
 import { useMessageAutoFollow } from "./hooks/useMessageAutoFollow";
 import { useComposerResize } from "./hooks/useComposerResize";
+import { NewConversationButton } from "./components/NewConversationButton";
 import { useConversation } from "./hooks/useConversation";
 import {
   canAcknowledgeStaleSource,
@@ -361,7 +391,6 @@ import {
 } from "./hooks/useScopeSelection";
 import { useFolderUndo } from "./hooks/useFolderUndo";
 import { useUndoSnapshot } from "./hooks/useUndoSnapshot";
-import { useLongPress } from "./hooks/useLongPress";
 import { folderSheetKey, formulaTrialFailed } from "./utils";
 import {
   clearPendingFolderOperation,
@@ -781,6 +810,47 @@ function planFormatPreview(plan: AnalysisPlan) {
   return formatPlanPreview(selectFormatActions(plan.actions));
 }
 
+/**
+ * 下一条动作**写到哪儿** —— 只从 `plan.actions[nextActionIndex]` 取，不做任何推断。
+ *
+ * 用途只有一句人话：「继续后将写入「结果3!B2」」。所以它只回答位置，不回答写什么
+ * （值/公式矩阵一个字节都不带），也不参与"能不能续跑"的判定 —— 那是结论的事。
+ *
+ * 位置字段按动作类型**分别**叫 `range`（写入/格式）、`targetRange`（复制）与
+ * `startCell`（写表），三者都指向"这次会落在哪"，取第一个存在的就拿去显示。
+ * 一个都没有（例如"切换到工作表""新建工作表"）就只报工作表名；连工作表都没有
+ * （理论上不会发生）就返回 `null`，界面改说"还要执行剩余 N 步"——**绝不拼一个假区域**。
+ */
+function nextActionTargetOf(
+  state: OfficeExecutionState
+): { type: string; sheet: string; range: string | null } | null {
+  const target = actionTargetsOf(state)[state.nextActionIndex];
+  return target && target.sheet ? target : null;
+}
+
+/**
+ * 计划里**每条动作**落在哪儿（按下标一一对应，顺序即执行顺序）。
+ *
+ * 只回答位置，不回答写什么：输入框里那两句「已写入：…」「尚未写入：…」就是拿它
+ * 与账本游标拼出来的。字段口径与 `nextActionTargetOf` 完全相同（同一个函数），
+ * 所以"卡上说下一步是 结果3!B2、输入框里说尚未写入 结果3!B2"必然一致。
+ *
+ * **下标必须与 `plan.actions` 对齐**：说不出位置的动作（例如"激活工作表"）留一个
+ * `sheet: ""` 的空位，而不是把它从数组里删掉 —— 删掉会让后面每条动作的下标前移，
+ * `nextActionIndex` 就会指到隔壁那条动作上（那是会写错表的 bug，不是显示问题）。
+ * 空位在渲染时被过滤掉，界面按证据少说一句，而不是补一个假的 `Sheet1!A1`。
+ */
+function actionTargetsOf(
+  state: OfficeExecutionState
+): { type: string; sheet: string; range: string | null }[] {
+  const text = (value: unknown): string => (typeof value === "string" ? value.trim() : "");
+  return state.plan.actions.map((action) => {
+    const record = action as unknown as Record<string, unknown>;
+    const range = text(record.range) || text(record.targetRange) || text(record.startCell);
+    return { type: text(record.type), sheet: text(record.sheet), range: range || null };
+  });
+}
+
 function actionLabel(action: AnalysisPlan["actions"][number]): string {
   switch (action.type) {
     case "createWorksheet":
@@ -894,6 +964,21 @@ function reviewCompareUnavailable(
   return issue ? `本次未生成执行前副本：${issue}结果以原表回读为准。` : undefined;
 }
 
+/**
+ * 作者名后面那个来源徽标写什么；`null` = 这一行不带徽标。
+ *
+ * **只此一份**：分组判据（`messageRows.ts` 的 `badge` 入参）与真正渲染的 `<em>`
+ * 都读它。两处各写一遍的话，判据以为"徽标换了"而界面没换（或反过来），
+ * 就会出现无名抬头或重复抬头。
+ */
+function messageAuthorBadge(message: ChatMessage): string | null {
+  if (!message.provider) return null;
+  if (message.clarification) return "需求确认";
+  if (message.provider === "model") return "Agent";
+  if (message.provider === "system") return "系统";
+  return "本地工具";
+}
+
 export default function App() {
   const [workbook, setWorkbook] = useState<WorkbookSnapshot | null>(null);
   const [prompt, setPrompt] = useState("");
@@ -951,7 +1036,7 @@ export default function App() {
    *
    * 标记只存在于工作簿的条件格式里，内存里的会话对象随刷新消失；没有这一步，
    * 那些边框会一直留在表上，而加载项既不认识它们也不敢按区域批量删。
-   * 认领只依据持久记录里的"规则 id + 本次随机公式"，对不上的规则一律不碰。
+   * 优先核对规则 id + 完整随机公式；id 缺失时仅接受原区域内唯一完整公式匹配。
    */
   const recoveredMarks = useRef(false);
   useEffect(() => {
@@ -974,7 +1059,7 @@ export default function App() {
    */
   const settledLoggedRef = useRef<string | null>(null);
   useEffect(() => {
-    const { phase, key } = resultReviewState;
+    const { phase, key, executionId } = resultReviewState;
     if (!key || (phase !== 'confirmed' && phase !== 'discarded')) return;
     const stamp = `${key}:${phase}`;
     if (settledLoggedRef.current === stamp) return;
@@ -983,16 +1068,53 @@ export default function App() {
       role: 'assistant',
       text: phase === 'confirmed'
         ? '已确认变更：已接受当前结果并移除本次审阅标记；保存为工具与撤销入口可用。'
-        : '已放弃并恢复：主表已按本次恢复点还原。'
+        : '已放弃并恢复：主表已按本次恢复点还原。',
+      /*
+       * 收尾反馈归到**这次执行**的记录下面，不再在消息流末尾单独占一大块。
+       * 拿不到执行身份就不填：宁可保留成一条普通消息，也不能挂错任务。
+       */
+      feedback: executionId ? {
+        executionId,
+        kind: phase === 'confirmed' ? 'confirmed' : 'discarded',
+        text: phase === 'confirmed' ? '已确认变更' : '已放弃并恢复：工作簿已按恢复点还原。'
+      } : undefined
     });
-  }, [resultReviewState.phase, resultReviewState.key]);
+  }, [resultReviewState.phase, resultReviewState.key, resultReviewState.executionId]);
+
+  /*
+   * 展示副本没清理掉 → 也归到本次执行记录下面。按「执行身份 + 真实副本身份集合」
+   * 去重：同一次执行的同一批副本只写一条反馈，不同执行各写各的。
+   * 文案只说展示副本，不碰"工作簿已恢复"这个业务结论。
+   */
+  const copyCleanupLoggedRef = useRef<string | null>(null);
+  useEffect(() => {
+    const cleanup = resultReviewState.copyCleanup;
+    const executionId = resultReviewState.executionId;
+    if (!cleanup || cleanup.count === 0 || !executionId) {
+      copyCleanupLoggedRef.current = null;
+      return;
+    }
+    const stamp = `${executionId}:${cleanup.issues.map((issue) => issue.identity).sort().join('|')}`;
+    if (copyCleanupLoggedRef.current === stamp) return;
+    copyCleanupLoggedRef.current = stamp;
+    appendMessage({
+      role: 'system',
+      text: cleanup.headline,
+      feedback: {
+        executionId,
+        kind: 'copy_cleanup_failed',
+        text: cleanup.headline,
+        issues: cleanup.issues
+      }
+    });
+  }, [resultReviewState.copyCleanup, resultReviewState.executionId]);
   const worksheetCheckpoint = useWorksheetCheckpoint("excel");
   const [deletionCandidate, setDeletionCandidate] = useState<{ id: string; plan: AnalysisPlan; identity: string; authorization: string[]; conversationId: string } | null>(null);
   const issuedDeletions = useRef(new Set<string>());
   const [resultCandidate, setResultCandidate] = useState<{ id: string; plan: AnalysisPlan; authorization: string[]; identity: string; conversationId: string } | null>(null);
   const resultMessages = useRef(new Set<string>());
   const resultLive = useRef({ messages, workbookIdentity: '', authorization: '', conversationId: '', sourceMode: '' as string });
-  const resultUndo = useRef<(id: string) => Promise<boolean>>(async () => false);
+  const resultUndo = useRef<(id: string, snapshot: ExecutionUndoSnapshot | null) => Promise<boolean>>(async () => false);
   // 只有用户主动点「重新排列」才会自增；AI 窗格据此重建自适应状态机并重套默认比例。
   // 消息更新、流式输出、回读、保存工具都不改它 —— 用户摆好的布局不会被反复抢回。
   const reviewPaneRearm = 0;
@@ -1199,11 +1321,13 @@ export default function App() {
     composerHeight, setComposerHeight,
     comparisonPaneNeedsResize,
     togglePetVisibility
-  } = useUIState(excelReviewBlocksNewCopy(nativeComparison.review) || nativeComparison.pending,
-    excelReviewBlocksNewCopy(nativeComparison.review) ? nativeComparison.review?.session : undefined, reviewPaneRearm);
+  } = useUIState(
+    resultReviewState.comparing || (resultReviewState.phase === 'reviewing' && resultReviewState.pending) ||
+      excelReviewBlocksNewCopy(nativeComparison.review) || nativeComparison.pending,
+    resultReview.getComparisonCopy() ??
+      (excelReviewBlocksNewCopy(nativeComparison.review) ? nativeComparison.review?.session : undefined), reviewPaneRearm);
 
   const themeApi = useTheme();
-  const logoLongPress = useLongPress(() => setThemePanelOpen(true));
 
   // 执行验收与工具固化批准状态（自定义 Hook）
   const {
@@ -1452,7 +1576,8 @@ export default function App() {
     containerRef: messageStreamRef,
     awayFromBottom,
     handleScroll: handleMessageStreamScroll,
-    scrollToLatest
+    scrollToLatest,
+    scrollToMessage
   } = useMessageAutoFollow(activityScrollSignal, chatHistory.activeConversationId);
   /*
    * **唯一**的恢复入口：当前对话里最后一条带恢复卡的记录。
@@ -1525,6 +1650,17 @@ export default function App() {
    */
   const officeUndoTerminalRef = useRef<{ operationId: string; detail: string } | null>(null);
   const focusDialogRef = useRef<Office.Dialog | null>(null);
+  /**
+   * 专注窗口会话：随机会话标识 + 单调序号 + 打开时的工作簿身份。
+   * 与对话框句柄分开记，是因为"对话框关了但心跳还在跑"曾经真实发生过 ——
+   * 清理必须两边一起走（`teardownFocusSession`）。
+   */
+  const focusSessionRef = useRef<{
+    sessionId: string;
+    seq: number;
+    workbookIdentity: string | null;
+  } | null>(null);
+  const focusHeartbeatRef = useRef<number | null>(null);
   const planEditorDialogRef = useRef<Office.Dialog | null>(null);
   const queryAbortRef = useRef<AbortController | null>(null);
   // turnAbortRef：整个 turn（需求确认→本地取数→生成方案）共用的打断句柄。
@@ -1784,6 +1920,15 @@ export default function App() {
    */
   const revertedByDiscard = useRef<string | null>(null);
   /**
+   * 最近一次**审阅通道**执行留下的办公室 `operationId`（成功或写一半失败都有）。
+   *
+   * `resultReviewState.executionId` 只在执行成功时才有值；写到一半失败时它为空，
+   * 而恢复操作区恰恰按这同一个 `operationId` 出现。展示层靠它把「本次执行需要核对」
+   * 状态卡与恢复操作区对齐（见 `reviewStatusBarSuppressedByRecovery`），只用于归属，
+   * 不参与任何执行 / 撤销 / 授权判据。
+   */
+  const reviewExecutionOperationIdRef = useRef<{ key: string | null; operationId: string } | null>(null);
+  /**
    * 这一次恢复是**恢复卡**发起的（"撤销这次已写入的内容"），还是结果卡发起的。
    *
    * 只影响一句文案（见 `onRestored` 里的 `ambiguous`）：结果卡撤销时"无法确认归属"
@@ -1797,6 +1942,7 @@ export default function App() {
     ensureUndoSnapshot,
     clearUndoSnapshot,
     undoLastExecution,
+    undoReviewedExecution,
     undoExecutionTo
   } = useUndoSnapshot({
     isBusy: status !== 'idle' || nativeComparison.pending,
@@ -1808,8 +1954,8 @@ export default function App() {
         text
       });
     },
-    onAfterUndo: () => { void scan(); },
-    onRestored: (snapshot) => {
+    onAfterUndo: async () => { await scan(); },
+    onRestored: async (snapshot) => {
       /*
        * 留痕：用户确实把这次执行**撤回**了（单元格已回到执行前）。
        *
@@ -1832,7 +1978,7 @@ export default function App() {
        * `settleExternally` 只同步状态、不再次恢复；在 `discard()` 自己的
        * 恢复流程里因为 `pending` 在位会被它自己挡掉，不会重复处理副本。
        */
-      if (snapshot.executionId) void resultReview.settleExternally(snapshot.executionId);
+      if (snapshot.executionId) await resultReview.settleExternally(snapshot.executionId);
       setMessages((current) => {
         const marking = markWorkbookExecutionUndone(current, snapshot);
         /*
@@ -1851,10 +1997,7 @@ export default function App() {
       });
     }
   });
-  resultUndo.current = async executionId => {
-    if (undoStack.at(-1)?.executionId !== executionId) throw new Error('本次执行不是当前恢复栈顶，未撤销其他任务。');
-    return (await undoExecutionTo(executionId)) === true;
-  };
+  resultUndo.current = undoReviewedExecution;
   useEffect(() => {
     if (!deletionCandidate || busy || deletionCandidate.conversationId !== chatHistory.activeConversationId || issuedDeletions.current.has(deletionCandidate.id)) return;
     const candidate = deletionCandidate;
@@ -1916,24 +2059,34 @@ export default function App() {
         }
         return captureExcelBeforeResult(executionPlan, candidate.authorization);
       },
-      execute: async () => {
+      execute: async before => {
         let observed: PlanExecutionResult | null = null;
         const succeeded = await runPlan(executionPlan, undefined, false, false, undefined,
           { plan: executionPlan, authorization: candidate.authorization, workbookIdentity: candidate.identity,
             requestMessageId: candidate.id },
-          result => { observed = result; });
+          result => { observed = result; },
+          operationId => { reviewExecutionOperationIdRef.current = { key: candidate.id, operationId }; });
         const result = observed as PlanExecutionResult | null;
         if (!succeeded || !result) throw new Error('执行未完成，请查看执行记录和恢复入口；不会自动重试。');
+        if (result.undoSnapshot?.executionId && !await saveReviewBefore('office', candidate.identity, result.undoSnapshot.executionId, candidate.authorization, before))
+          appendMessage({ role: 'system', text: '执行前快照保留在当前窗格；本机持久存储不可用，刷新后可能无法重新打开完整比对。' });
         return { executionId: result.undoSnapshot?.executionId ?? '', verified: result.verification.status === 'verified',
           undoable: result.undoSnapshot?.postStateCoverage === 'complete', undo: result.undoSnapshot ?? null };
       },
       mark: () => markExcelResult(executionPlan, candidate.identity),
       clearMarker: clearExcelResultMarks,
-      showBefore: before => showExcelBeforeResult(before, candidate.identity, executionPlan, candidate.authorization),
+      comparisonSheets: excelBeforeComparisonSheets,
+      showBefore: (before, _receipt, sheet) => showExcelBeforeResult(before, candidate.identity, executionPlan, candidate.authorization, sheet),
+      comparisonHelp: copy => ({ scope: copy.comparisonScope, layout: copy.comparisonLayoutHelp }),
       comparisonNotice: copy => copy.comparisonNotice ?? null,
+      suspendComparison: suspendExcelBeforeComparison,
+      saveComparisons: (receipt, copies) => saveExcelComparisonCopies(candidate.identity, receipt.executionId, copies),
+      activateComparison: activateExcelBeforeComparison,
+      switchComparison: switchExcelBeforeComparison,
+      copyIdentity: copy => copy.copySheetName,
       closeBefore: async copy => {
         const outcome = await closeExcelNativeComparison(copy);
-        return outcome === 'closed' || outcome === 'already_closed' ? null : '执行前对比副本仍保留，请手动核对；原表不会被关闭。';
+        return outcome === 'closed' || outcome === 'already_closed' ? null : `展示副本未关闭（${outcome}${copy.closeFailure ? `：${copy.closeFailure}` : ""}），可重试清理。`;
       },
       restore: async receipt => {
         /*
@@ -1943,7 +2096,7 @@ export default function App() {
          */
         revertedByDiscard.current = receipt.executionId;
         try {
-          if (!(await resultUndo.current(receipt.executionId))) throw new Error('恢复未成功，当前结果仍保留。');
+          if (!(await resultUndo.current(receipt.executionId, receipt.undo))) throw new Error('恢复未通过完整回读；可能已有部分恢复，请保留现场核对。');
         } catch (error) {
           revertedByDiscard.current = null;
           throw error;
@@ -1952,6 +2105,15 @@ export default function App() {
       validateResult: async receipt => {
         if (!receipt.undo) throw new Error('恢复记录不可用，未确认变更。');
         await Excel.run(context => assertUndoPostState(context, receipt.undo!));
+      },
+      /*
+       * 把"这次审阅处理过了"写进执行账本。没有它，刷新窗格后待审阅整段消失 ——
+       * 而那正是这次要修的缺陷。写失败不会回滚已经成立的宿主结论：`ResultReview`
+       * 只记一条 `decisionPending` 并允许重试，重试只重发这一条决定。
+       */
+      settle: async (receipt, decision) => {
+        await sendExecutionReview("office", receipt.executionId, decision);
+        await deleteReviewBefore('office', candidate.identity, receipt.executionId).catch(() => undefined);
       },
       accepted: () => markPlanVerified(candidate.plan.id)
     });
@@ -1993,14 +2155,7 @@ export default function App() {
   const modelCatalogLoading = modelCatalogStatus === "loading";
   const modelNotConfigured =
     modelCatalogStatus === "ready" && !hasConfiguredModel;
-  const headerStatusClassName = !serverOnline
-    ? ""
-    : modelCatalogFailed
-      ? "offline"
-      : effectiveModelId && serviceHealth?.configured
-        ? "online model-online"
-        : "online";
-  const headerStatusText = !serverOnline
+  const composerStatusText = !serverOnline
     ? "Excel Bro 后台未连接"
     : modelCatalogFailed
       ? "无法读取模型配置"
@@ -2227,13 +2382,33 @@ export default function App() {
 
   useEffect(
     () => () => {
+      // 父窗格刷新/卸载：先告知子窗口（若通道还在），再关闭对话框并停止心跳，
+      // 避免未清理的计时器继续向已失效的句柄发消息。
+      sendFocusMessage("closing", { reason: "任务窗格已刷新或关闭。" });
       focusDialogRef.current?.close();
       focusDialogRef.current = null;
+      focusSessionRef.current = null;
+      stopFocusHeartbeat();
       planEditorDialogRef.current?.close();
       planEditorDialogRef.current = null;
     },
     []
   );
+
+  // 已打开的专注窗口跟随当前会话变化（任务窗格仍是任务状态的权威来源）。
+  useEffect(() => {
+    if (!focusDialogRef.current || !focusSessionRef.current) return;
+    if (!Office.context.requirements.isSetSupported("DialogApi", "1.2")) return;
+    const currentIdentity = currentOfficeWorkbookIdentity() ?? null;
+    if (focusSessionRef.current.workbookIdentity !== currentIdentity) {
+      sendFocusMessage("closing", { reason: "当前工作簿已切换。" });
+      focusDialogRef.current.close();
+      teardownFocusSession();
+      return;
+    }
+    sendFocusMessage("snapshot", { snapshot: buildFocusSnapshot(toolsOpen ? "tools" : "conversation") });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chatHistory, tools, queryTools, toolsOpen]);
 
   /*
    * 输入框的「上拉」：拖动上方把手调高度、内容变多时自动长高，长到上限之后
@@ -2942,7 +3117,13 @@ export default function App() {
       verdict: officeRecoveryVerdictFor(state, evidence),
       acting,
       nextActionIndex: state.nextActionIndex,
-      totalActions: state.plan.actions.length
+      totalActions: state.plan.actions.length,
+      nextAction: nextActionTargetOf(state),
+      /*
+       * 全部动作目标一起带上：输入框里「已写入 / 尚未写入」两句要靠它说具体。
+       * 与 `nextAction` 同一个映射函数算出来，所以两处位置口径不会分叉。
+       */
+      targets: actionTargetsOf(state)
     };
   }
 
@@ -3309,7 +3490,8 @@ export default function App() {
       const facts = {...resultLive.current};
       setResumedReviewTitle(completed.plan.title);
       await resultReview.adoptCompleted(`recovered:${completed.operationId}`,
-        undo ? excelRecoveryBeforeResult(completed.plan, undo, completed.authorizedSheetNames) : {comparisonUnavailable:'恢复记录不可用。'},
+        await loadReviewBefore<ExcelBeforeResult>('office', completed.workbookIdentity, completed.operationId, completed.authorizedSheetNames) ??
+          {comparisonUnavailable:'这次中断执行没有保留完整的执行前表快照；局部恢复点仍可用于放弃，但不能作为整表双视图。'},
         {executionId:completed.operationId,verified:result.verification.status === 'verified',
           undoable:undo?.postStateCoverage === 'complete',undo}, {
           isCurrent: () => currentOfficeWorkbookIdentity() === completed.workbookIdentity &&
@@ -3318,18 +3500,31 @@ export default function App() {
             resultLive.current.conversationId === facts.conversationId,
           mark: () => markExcelResult(completed.plan, completed.workbookIdentity),
           clearMarker: clearExcelResultMarks,
-          showBefore: before => showExcelBeforeResult(before, completed.workbookIdentity, completed.plan, completed.authorizedSheetNames),
-          comparisonNotice: copy => copy.comparisonNotice ?? '恢复对比展示原始单元格值及公式文本；不重算公式，不作为原始格式对比。',
-          closeBefore: async copy => {
+          comparisonSheets: excelBeforeComparisonSheets,
+          showBefore: (before, _receipt, sheet) => showExcelBeforeResult(before, completed.workbookIdentity, completed.plan, completed.authorizedSheetNames, sheet),
+          comparisonHelp: copy => ({ scope: copy.comparisonScope, layout: copy.comparisonLayoutHelp }),
+      comparisonNotice: copy => copy.comparisonNotice ?? null,
+          suspendComparison: suspendExcelBeforeComparison,
+          saveComparisons: (receipt, copies) => saveExcelComparisonCopies(completed.workbookIdentity, receipt.executionId, copies),
+          activateComparison: activateExcelBeforeComparison,
+          switchComparison: switchExcelBeforeComparison,
+          copyIdentity: copy => copy.copySheetName,
+      closeBefore: async copy => {
             const outcome = await closeExcelNativeComparison(copy);
-            return outcome === 'closed' || outcome === 'already_closed' ? null : '执行前副本仍保留，请手动核对。';
+            return outcome === 'closed' || outcome === 'already_closed' ? null : `展示副本未关闭（${outcome}${copy.closeFailure ? `：${copy.closeFailure}` : ""}），可重试清理。`;
           },
           restore: async receipt => {
-            if (!(await resultUndo.current(receipt.executionId))) throw new Error('恢复未成功，当前结果仍保留。');
+            revertedByDiscard.current = receipt.executionId;
+            try {
+              if (!(await resultUndo.current(receipt.executionId, receipt.undo))) throw new Error('恢复未通过完整回读；可能已有部分恢复，请保留现场核对。');
+            } catch (reason) { revertedByDiscard.current = null; throw reason; }
           },
           validateResult: async receipt => {
             if (!receipt.undo) throw new Error('恢复记录不可用。');
             await Excel.run(context => assertUndoPostState(context, receipt.undo!));
+          },
+          settle: async (receipt, decision) => {
+            await sendExecutionReview("office", receipt.executionId, decision);
           },
           accepted: () => markPlanVerified(completed.plan.id)
         });
@@ -3927,6 +4122,147 @@ export default function App() {
   }
 
   /**
+   * 找回"执行完了、用户还没处理"的那次审阅（2026-11-03）。
+   *
+   * 缺陷原状：审阅状态只在 `ResultReview` 内存里。刷新窗格后 `start()` 不会被再触发，
+   * 界面就回到普通状态 —— 而原表停在一个没人收尾的写入现场上。
+   *
+   * 这里**只核验已有结果**：读账本 → 过共享判据（`reviewRestoreVerdict`）→ 用
+   * `adoptCompleted`（这条路径上根本没有 `prepare`/`execute` 两个回调，**物理上**没有
+   * 重跑计划的能力）重建审阅。所以这段代码每刷新一次也不会多执行一次写入。
+   *
+   * 两种不给入口的情况都**不等于**"没有待办"：
+   * - 受阻断（身份/授权/结果对不上）：把具体原因说清楚，账本里的未决事实原样保留；
+   * - 老记录（`review_state IS NULL`）：只说"无法判断"，不推成待审阅，也不推成已确认。
+   */
+  const restoreOfficeResultReview = async (
+    state: OfficeExecutionState,
+    isCurrent: () => boolean
+  ): Promise<{ kind: "adopted"; ready: boolean } | { kind: "settled" } | { kind: "blocked" }> => {
+    const result = isPlanExecutionResult(state.result) ? state.result : null;
+    const undo = result?.undoSnapshot ?? null;
+    let currentSheets: string[] = [];
+    try {
+      const parsed: unknown = JSON.parse(resultLive.current.authorization);
+      if (Array.isArray(parsed)) currentSheets = parsed.map(String);
+    } catch { currentSheets = []; }
+    const verdict = reviewRestoreVerdict({
+      reviewState: state.review?.state ?? null,
+      recordedIdentity: state.workbookIdentity,
+      currentIdentity: currentOfficeWorkbookIdentity() ?? null,
+      recordedSheets: state.authorizedSheetNames,
+      /*
+       * 面板还没建立授权（刚挂载、表目录没读完）时，**不拿空集合去比**：那会把
+       * "还没来得及读"误判成"范围变了"。空集合按"未建立"处理，范围仍以账本为准 ——
+       * 恢复审阅从来不往授权里加任何表，也不会因此扩大原范围。
+       */
+      currentSheets: currentSheets.length ? currentSheets : state.authorizedSheetNames,
+      status: state.status,
+      resultPresent: Boolean(result),
+      resultVerified: result?.verification.status === "verified",
+      materialAvailable: Boolean(undo)
+    });
+    if (verdict.kind === "settled") return { kind: "settled" };
+    if (verdict.kind === "legacy_unknown") {
+      /*
+       * 老记录：账本里根本没有审阅列。既不批量推成待审阅（会凭空造出一堆"待处理"），
+       * 也不推成已确认（那是伪造用户操作）。只把不确定性说出来。
+       */
+      setOfficeDiscoveryFailure(
+        "这次执行是本能力上线前记录的，无法判断你是否已经处理过它的结果；不据此重建审阅入口，原表内容保持原样。"
+      );
+      return { kind: "blocked" };
+    }
+    if (verdict.kind === "blocked") {
+      const detail = verdict.blockers.map(reviewBlockerMessage).join(" ");
+      setOfficeDiscoveryFailure(detail);
+      appendMessage({ role: "system", text: `尚未处理的审阅无法重建：${detail}` });
+      return { kind: "blocked" };
+    }
+    /*
+     * 重建的范围就是**这次执行**：`isCurrent` 仍然要求工作簿身份与授权没有变化，
+     * 迟到的读数不许画到已经换了的现场上。
+     */
+    const recorded = state.authorizedSheetNames;
+    const savedBefore = await loadReviewBefore<ExcelBeforeResult>('office', state.workbookIdentity, state.operationId, recorded);
+    const adopted = await resultReview.adoptCompleted(
+      `restored-review:${state.operationId}`,
+      savedBefore ?? { comparisonUnavailable: "这次执行没有保留完整的执行前表快照，无法提供整表双视图；仍可审阅当前结果或使用已验证恢复点放弃。" },
+      {
+        executionId: state.operationId,
+        verified: verdict.canConfirm,
+        undoable: verdict.canDiscard,
+        undo
+      },
+      {
+        /*
+         * 当前性只看**工作簿身份**：一条恢复出来的审阅绑定的是它登记时的那一组表，
+         * 而刷新之后面板里的勾选是"当下的选择"，不是那次授权。拿选区去判当前性，
+         * 每次刷新都会因为"选区没恢复"而把审阅判成过期（2026-11-03 实测）。
+         * 授权边界仍由 `recorded`（账本登记值）决定，不会因为当前选区而扩大。
+         */
+        isCurrent: () =>
+          currentOfficeWorkbookIdentity() === state.workbookIdentity &&
+          resultLive.current.workbookIdentity === state.workbookIdentity,
+        mark: () => markExcelResult(state.plan, state.workbookIdentity),
+        clearMarker: clearExcelResultMarks,
+        comparisonSheets: excelBeforeComparisonSheets,
+        showBefore: (before, _receipt, sheet) =>
+          showExcelBeforeResult(before, state.workbookIdentity, state.plan, recorded, sheet),
+        comparisonHelp: copy => ({ scope: copy.comparisonScope, layout: copy.comparisonLayoutHelp }),
+      comparisonNotice: copy => copy.comparisonNotice ?? null,
+        suspendComparison: suspendExcelBeforeComparison,
+        loadComparisons: receipt => loadExcelComparisonCopies(state.workbookIdentity, receipt.executionId),
+        saveComparisons: (receipt, copies) => saveExcelComparisonCopies(state.workbookIdentity, receipt.executionId, copies),
+        activateComparison: activateExcelBeforeComparison,
+        switchComparison: switchExcelBeforeComparison,
+        copyIdentity: copy => copy.copySheetName,
+      closeBefore: async copy => {
+          const outcome = await closeExcelNativeComparison(copy);
+          return outcome === 'closed' || outcome === 'already_closed' ? null : `展示副本未关闭（${outcome}${copy.closeFailure ? `：${copy.closeFailure}` : ""}），可重试清理。`;
+        },
+        restore: async receipt => {
+          if (!verdict.canDiscard) throw new Error(verdict.limitations.discard ?? "这次执行缺少可用的恢复材料，不能放弃变更。");
+          revertedByDiscard.current = receipt.executionId;
+          try {
+            if (!(await resultUndo.current(receipt.executionId, receipt.undo))) throw new Error("恢复未通过完整回读；可能已有部分恢复，请保留现场核对。");
+          } catch (error) {
+            revertedByDiscard.current = null;
+            throw error;
+          }
+        },
+        validateResult: async receipt => {
+          if (!receipt.undo) throw new Error("恢复记录不可用，未确认变更。");
+          await Excel.run(context => assertUndoPostState(context, receipt.undo!));
+        },
+        /*
+         * 持久化这一次决定：确认只是"接受已有结果并清标记"，不会执行原计划；
+         * 放弃/撤销的恢复材料已经在宿主侧用掉，这里只把事实写进账本。
+         * 写失败由 `ResultReview` 记成 `decisionPending` 并允许只重试这一条。
+         */
+        settle: async (receipt, decision) => {
+          await sendExecutionReview("office", receipt.executionId, decision);
+          await deleteReviewBefore('office', state.workbookIdentity, receipt.executionId).catch(() => undefined);
+        },
+        accepted: () => markPlanVerified(state.plan.id)
+      },
+      { restored: true }
+    );
+    if (!isCurrent()) return { kind: "adopted", ready: false };
+    if (!adopted) {
+      setOfficeDiscoveryFailure(
+        "找到了这次执行未处理的审阅，但重建审阅入口没有成功；原表内容保持原样，执行记录仍在。"
+      );
+      return { kind: "blocked" };
+    }
+    if (verdict.limitations.discard) {
+      appendMessage({ role: "system", text: verdict.limitations.discard });
+    }
+    setOfficeDiscoveryFailure(null);
+    return { kind: "adopted", ready: true };
+  };
+
+  /**
    * 把一条未完成执行摆到界面（**只读**：GET 状态 + 本机判定）。
    *
    * 不 claim、不 reconcile、不推进 revision、不执行动作、不写单元格。发现只恢复"入口"，
@@ -3946,6 +4282,7 @@ export default function App() {
     | { kind: "settled" }
     | { kind: "unavailable" }
     | { kind: "abandoned" }
+    | { kind: "blocked" }
   > => {
     // 先清候选列表：无论结果如何，用户都已经（或自动）做出了选择，不该停在两份入口上。
     if (source === "selected") setOfficeRecoveryChoices(null);
@@ -3966,9 +4303,16 @@ export default function App() {
        * 已完成的记录**不是**"待续写"：挂载那条路已经负责"找回完成回执"（并回收本机
        * 索引）。发现这条路不许把它改写成一张"这一条现在不能继续"的卡 —— 那是同一件事
        * 的两种说法，而后者会让用户以为还有活没干完。
+       *
+       * 2026-11-03：但它可能是**待审阅**。判据只认账本里显式的 `review_state`
+       * （`pending` / `blocked`）—— 绝不由 `status === "completed"` 反推，否则
+       * 所有历史完成记录都会变成"等你确认"。
        */
-      clearPendingOfficeExecution(state.operationId);
-      return { kind: "settled" };
+      if (!reviewNeedsAttention(state.review?.state ?? null)) {
+        clearPendingOfficeExecution(state.operationId);
+        return { kind: "settled" };
+      }
+      return await restoreOfficeResultReview(state, isCurrent);
     }
     const readiness = officeResumeReadinessFor(state);
     if (!isCurrent()) return { kind: "abandoned" };
@@ -8142,7 +8486,7 @@ export default function App() {
         role: "system",
         text:
           "这段历史里的凭据是在旧版本写进去的，已被拦下，不会随本次提问发送。" +
-          "请点上方「新对话」开始一段干净的对话，或先删除这段历史。"
+          "请点「新对话」开始一段干净的对话，或先删除这段历史。"
       });
       setPrompt(enteredText);
       return;
@@ -8754,28 +9098,82 @@ export default function App() {
    * 也会画出一个 ■，点下去 `stopTurn` 找不到任何可中止对象 —— 点了没反应。
    */
   /**
-   * 恢复卡上那颗「核对 / 继续剩余动作」搬到哪里去了 —— 只算一次。
+   * 恢复待办**此刻住在哪**：输入框里的操作区，还是一枚一行待办入口。
    *
-   * 三件事都在这里定：
-   *  - 只在**没有别的活**的时候才由主按钮承接（`running` 时不抢暂停）；
-   *  - 只认共享结论 ∩ 本端能落地（`excelRecoveryActions`）—— 画一个点了没反应的
-   *    按钮比不画更糟；
-   *  - `reconcile` 与 `resume` **互斥**，且核对在续跑之前：核对成功后**不会**自动续跑，
-   *    界面会变成「继续剩余动作」，等用户再点一下。
+   * 判据全在共享层（`recoveryComposerState`，WPS 读同一份），这里只把三个**本端事实**
+   * 交过去：
+   *  - `choice`：用户显式选了哪一边（按「另提需求」，或从待办入口点回来）。它按
+   *    `operationId` 记账，换一次执行就自然失效 —— 新执行不该继承上一次的"他不想看"。
+   *  - `hasDraft`：输入框里有字或有图。**不抢**他正在写的东西，退成入口。
+   *  - `composerBusyElsewhere`：任务在跑 / 审阅在等你决定 / 一道澄清题在等回答。
+   *    这三种情形下输入框归别的事（判据与 `selectCurrentAction` 同向），连入口都不给。
+   *
+   * 目标（「继续后将写入「结果3!B2」」）来自卡上那条真实的下一个动作
+   * （`card.nextAction`）；拿不到就 `null`，正文改说"还要执行剩余 N 步"。
    */
-  const recoveryPrimaryAction: "reconcile" | "resume" | null = (() => {
-    if (!officeRecoveryEntry || running) return null;
-    /*
-     * 终态（撤销 / 放弃 / 收尾）已经退出固定区域 —— 主按钮自然也不该再承接它。
-     * 这一句是**防御性的第二道**：`excelRecoveryActions` 对终态本来就返回不出
-     * reconcile/resume，加在这里是为了将来有人放宽按钮集合时，主按钮不会悄悄复活。
-     */
-    if (officeRecoveryTerminal) return null;
-    const available = excelRecoveryActions(officeRecoveryEntry.card);
-    if (available.includes("reconcile")) return "reconcile";
-    if (available.includes("resume")) return "resume";
-    return null;
-  })();
+  const [recoveryComposerChoice, setRecoveryComposerChoice] = useState<{
+    operationId: string;
+    choice: "composer" | "recovery";
+  } | null>(null);
+  /**
+   * 输入法**正在组合**（`compositionstart` → `compositionend` 之间）。
+   *
+   * 为什么它也算"有草稿"：组合期间浏览器可能还没把这段字提交到 `value`，于是
+   * `prompt.trim()` 是空的、`pendingImages` 也是空的 —— 判据会认为"输入框是空的"，
+   * 恢复待办就把 textarea 整块**卸载**掉，用户眼睁睁看着正在打的字没了（输入法
+   * 的组合串挂在被卸载的元素上，收不回来）。
+   *
+   * 这不是"多保护一点"：这是唯一一条能在 `hasDraft` 之外证明"他正在写东西"的证据，
+   * 而卸载是不可逆的。所以它和文字/附件同一档：只让恢复待办退成入口，不抢输入框。
+   */
+  const [composerComposing, setComposerComposing] = useState(false);
+  /** 「查看详情」展开的是**哪一次**执行的折叠记录（换执行就不再是展开态）。 */
+  const [recoveryDetailsFor, setRecoveryDetailsFor] = useState<string | null>(null);
+  const recoveryFacts: RecoveryComposerFacts | null = officeRecoveryEntry
+    ? {
+        verdict: officeRecoveryEntry.card.verdict,
+        nextActionIndex: officeRecoveryEntry.card.nextActionIndex,
+        totalActions: officeRecoveryEntry.card.totalActions,
+        nextTarget: officeRecoveryEntry.card.nextAction ?? null,
+        actions: officeRecoveryEntry.card.targets ?? null,
+        busy,
+        choice:
+          recoveryComposerChoice?.operationId === officeRecoveryEntry.operationId
+            ? recoveryComposerChoice.choice
+            : null,
+        hasDraft: Boolean(prompt.trim() || pendingImages.length > 0 || composerComposing),
+        /*
+         * `running` 要减掉"恢复动作自己这一下"（`card.acting`）：点「检查…」时宿主会
+         * 把全局状态置成执行中，若照旧算成"输入框归别人"，操作区会被换成普通输入框 ——
+         * 用户看到的是点了没反应、框还变了样。自己的请求在飞由 `busy` 表达（按钮禁用）。
+         */
+        composerBusyElsewhere:
+          (running && (officeRecoveryEntry?.card.acting ?? null) === null) ||
+          resultReviewNeedsDecision(resultReviewState) ||
+          answeringClarification
+      }
+    : null;
+  const recoveryComposer = recoveryFacts ? recoveryComposerState(recoveryFacts) : null;
+  /** 输入框里的普通输入被**置换**成恢复操作区（不是在上方再叠一张卡）。 */
+  const recoveryComposerMode = recoveryComposer?.mode === "recovery";
+  const recoveryPendingEntry =
+    recoveryComposer?.mode === "composer" ? recoveryComposer.entry : null;
+  /** 「查看详情」展开的是**这一次**执行的记录（换执行自动收起）。 */
+  const recoveryDetailsOpen = Boolean(
+    officeRecoveryEntry && recoveryDetailsFor === officeRecoveryEntry.operationId
+  );
+
+  /**
+   * 固定区域里"恢复"这一块**现在有没有位置**。
+   *
+   * 输入区接管（`recoveryComposerMode`）之后，同一件事只画一处：卡不再渲染，
+   * 容器也不该留一个空壳 —— 空壳会让"待处理事项"那块版面凭空多出一条分隔线。
+   * 多候选与"发现失败"仍然算数：它们不是输入框能承接的东西（挑哪条执行不能替用户决定）。
+   */
+  const recoveryDockVisible =
+    officeRecoveryChoices !== null ||
+    officeDiscoveryFailure !== null ||
+    (!recoveryComposerMode && officeRecoveryEntry !== null && officeRecoveryTerminal === null);
 
   const composerPrimary = composerPrimaryAction({
     // 有图也算"有内容"：带图发送是常规操作，不能让按钮还停在 ▶。
@@ -8793,17 +9191,14 @@ export default function App() {
     uninterruptible: resultReviewState.phase === "executing",
     pausing: pauseRequestState?.phase === "requesting",
     /*
-     * 恢复卡的「核对 / 继续剩余动作」现在由这颗按钮承接（2026-11-01 决定）。
+     * `needsReconcile` / `recoveryResume` **本端不再喂**（2026-11-02）。
      *
-     * 为什么可以接了：卡面不再画同名按钮 —— 同一个动作在 40px 内出现两次，
-     * 用户只能靠试。判据本身一行没改：核对与继续仍是**两个结论**，
-     * 核对只补记回执（零写入），续跑只跑剩下的动作，中间必须由用户再点一下。
-     *
-     * 有字时不会走到这两档（判据把 `hasInput` 排在前面）：用户正在写的那句话
-     * 不许因为点了按钮就被静默丢掉。此时的提示见 `composerHint`。
+     * 核对与继续现在住在输入框内部那块恢复操作区里（`RecoveryComposer`，判据
+     * `recoveryComposerState`）：一个动作只留一颗按钮。这两档一旦还在这里接，
+     * 同一个动作就会在 40px 内长出两个入口 —— 而其中一颗不受"有草稿"约束。
+     * 共享判据本身没改：核对只补记回执（零写入），续跑只跑剩下的动作，
+     * 两者之间必须由用户再点一下。
      */
-    needsReconcile: recoveryPrimaryAction === "reconcile",
-    recoveryResume: recoveryPrimaryAction === "resume",
     /*
      * 正在回答一道澄清题：此时"发送"发出去的是**回答**，不是新需求。
      * 判据本身在共享层，这里只把事实告诉它（有选项/有字才可点）。
@@ -8840,7 +9235,17 @@ export default function App() {
        * 记录本身不删——所属任务的消息里有一条可展开的终态摘要。
        */
       recovery:
-        (officeRecoveryEntry !== null && officeRecoveryTerminal === null) ||
+        /*
+         * 输入区接管之后，固定区域**不再画同一件事**（2026-11-02）：同一个结论一块卡、
+         * 输入框里一块操作区，等于让用户先读两遍再决定点哪一下。接管期间这张卡
+         * 在"待处理事项"里也不算数 —— 否则它会变成一枚点了没内容的 chip。
+         *
+         * 只有真的**没界面可展开**时才退出计数；多候选与"发现失败"照旧占位，
+         * 它们不是输入框能承接的东西（挑哪一条执行，不能替用户决定）。
+         */
+        (!recoveryComposerMode &&
+          officeRecoveryEntry !== null &&
+          officeRecoveryTerminal === null) ||
         officeRecoveryChoices !== null ||
         officeDiscoveryFailure !== null,
       clarification: answeringClarification,
@@ -8875,21 +9280,15 @@ export default function App() {
             : composerPrimary.kind === "send-supplement"
               ? "运行中：Enter 打断并转向 · 右下角 ■ 暂停"
               : /*
-                 * 冲突如实说：有内容时主按钮一定是"发送"，核对/续跑被排在后面。
-                 * 不许写"点发送顺便核对一下" —— 那会把用户正在写的话丢掉。
+                 * 注意这里**没有**"要核对请先清空输入框"那条分支了（2026-11-02）。
                  *
-                 * 判据读**主按钮自己的输出**（`kind === "send"`），不在这里再写一遍
-                 * `prompt.trim()`：`hasInput` 把待发图片也算内容，重写一遍就会漏掉
-                 * "只贴了图片、没打字"的情形 —— 入口被顶掉却没有任何说明。
+                 * 那条提示存在的前提是"核对入口被有字顶掉了，用户看不出为什么"。
+                 * 现在有草稿时输入框整块不被接管，恢复待办退成一行入口
+                 * （`recoveryPendingEntry`）：入口本身就在旁边写着"恢复待办 · 待核对"，
+                 * 再补一句"请先清空"只会让人以为必须先把话删掉。切换是**点**出来的，
+                 * 不是靠清空输入框猜出来的。
                  */
-                composerPrimary.kind === "send" && recoveryPrimaryAction
-                ? `输入框有内容：${
-                    /* 暂停之后发出去是**重新判断**这条要求，不是重放已暂停的计划 —— 说法必须跟着路由走。 */
-                    composerCanContinue ? "发送会重新判断这条要求（不重放已暂停的计划）" : "发送会作为新需求"
-                  }；要${
-                    recoveryPrimaryAction === "reconcile" ? "核对在途动作" : "继续剩余动作"
-                  }请先清空输入框${pendingImages.length > 0 ? "并移除待发图片" : ""}`
-                : resultReviewState.phase === "reviewing" && !resultReviewState.pending
+                resultReviewState.phase === "reviewing" && !resultReviewState.pending
                   ? "等待审阅结果：可确认变更、放弃变更或打开双视图"
                   : busy
                     ? "正在处理，请稍候"
@@ -8909,15 +9308,9 @@ export default function App() {
         ? "图片还在处理，稍候再发送"
         : pendingImages.length > 0 && !supportsVision
           ? "当前模型不支持图片：先切换到支持视觉的模型再发送"
-          : busy && composerPrimary.kind === "continue" && recoveryPrimaryAction !== "resume"
+          : busy && composerPrimary.kind === "continue"
             ? "等待审阅结果：可确认变更、放弃变更或打开双视图"
-            : /*
-               * 核对/续跑在飞（`busy` 且卡片正标着"正在核对…/正在继续…"）：
-               * 禁用并说明，而不是让用户连点出第二个请求。
-               */
-              busy && (composerPrimary.kind === "reconcile" || composerPrimary.kind === "continue")
-              ? "正在处理这次恢复，稍候…"
-              : null;
+            : null;
 
   async function submitComposer() {
     /*
@@ -8939,29 +9332,21 @@ export default function App() {
   async function invokeComposerPrimary(invoke: NonNullable<PrimaryActionInvoke>) {
     if (invoke === "answer") return submitClarificationAnswer();
     if (invoke === "pause") return stopTurn();
+    /*
+     * `reconcile` 与"写入续跑"都**不再从这里进来**（2026-11-02）：它们住在输入框里
+     * 那块恢复操作区，由 `RecoveryComposer` 的 `onPrimary` 直接交给
+     * `runOfficeRecoveryAction`（同一个处理器，同样一次点击一次调用）。
+     *
+     * 这两句守着的是"万一有人又把它们接回右下角"：不落进下面的发送/转向分支。
+     * 核对绝不能变成"把这句需求发出去"，续跑也绝不能变成"继续分析"。
+     */
+    if (invoke === "reconcile") return;
     if (invoke === "resume") {
       /*
-       * 同一个 `resume` 有两种真实含义，靠**同一份**事实分开：
-       *  - 恢复卡说"可继续剩余动作" ⇒ 交给 `runOfficeRecoveryAction(..., "resume")`，
-       *    它只跑没跑过的动作，并且有身份闸、终态守卫和防重入；
-       *  - 否则是规划任务从检查点继续分析。
-       * 两个处理器都是原有的，这里只做分派，不改任何安全语义。
+       * 走到这里的 `resume` 只有一种含义：规划任务从检查点继续分析
+       * （`paused` 那一档）。写入续跑由恢复操作区自己分派，不经过这里。
        */
-      if (recoveryPrimaryAction === "resume" && officeRecoveryEntry) {
-        return void runOfficeRecoveryAction(officeRecoveryEntry.row, "resume");
-      }
       return resumeComposerTask();
-    }
-    if (invoke === "reconcile") {
-      /*
-       * 核对走**同一份**实现（`runOfficeRecoveryAction` 自己会再按卡片结论核一遍，
-       * 并且有 `officeRecoveryActionLock` 防重入），不在这里另开一条只读路径。
-       * 卡片不在/结论已经变了就什么都不做 —— 按钮的解释权在卡片，不在这一层。
-       */
-      const entry = officeRecoveryEntry;
-      if (!entry || entry.card.verdict.kind !== "reconcile" || busy) return;
-      await runOfficeRecoveryAction(entry.row, "reconcile");
-      return;
     }
     /*
      * `send` 有两种语义，由**同一份**事实区分：运行中且有字 = 打断并补充
@@ -9099,7 +9484,16 @@ export default function App() {
     nativeReview?: ExcelNativeComparison,
     /** 直接执行路径的执行前复核凭据；与 `nativeReview` 互斥。 */
     directRecheck?: DirectExecutionRecheck,
-    onResultReview?: (result: PlanExecutionResult) => void
+    onResultReview?: (result: PlanExecutionResult) => void,
+    /**
+     * 办公室写路径确定 `operationId` 时回调一次（成功与失败都会回调，只要走到这里）。
+     *
+     * 只用于**展示层**的归属判断：审阅失败后 `resultReviewState.executionId` 是空的，
+     * 但恢复操作区按同一个 `operationId` 出现 —— 界面要靠它判"这两处说的是不是同一次
+     * 执行"，否则「本次执行需要核对」状态卡会和恢复操作区叠在一起。它不参与任何
+     * 执行 / 撤销 / 授权判据。
+     */
+    onOfficeOperationId?: (operationId: string) => void
   ): Promise<boolean> {
     const deletionState = () => JSON.stringify({ identity: resultLive.current.workbookIdentity,
       authorization: resultLive.current.authorization, conversation: resultLive.current.conversationId,
@@ -9313,6 +9707,7 @@ export default function App() {
     }
 
     const operationId = `execution-${messageId()}`;
+    onOfficeOperationId?.(operationId);
     const authorizedSheetNames = forceLocal
       ? [workbook!.activeWorksheet]
       : selectedNamesFor(workbook!);
@@ -10052,12 +10447,10 @@ export default function App() {
     }).format(parsed);
   }
 
-  function buildFocusPayload(
-    initialView: FocusPayload["initialView"]
-  ): FocusPayload {
+  function buildFocusSnapshot(
+    initialView: FocusSnapshot["initialView"]
+  ): FocusSnapshot {
     return {
-      type: "focus-state",
-      workbookName: workbook?.name ?? "",
       initialView,
       activeConversationId: chatHistory.activeConversationId,
       conversations: chatHistory.conversations.map((conversation) => ({
@@ -10105,8 +10498,67 @@ export default function App() {
           steps: 1,
           stepLabels: []
         }))
-      ]
+      ],
+      workbook: {
+        name: workbook?.name ?? "",
+        identity: currentOfficeWorkbookIdentity() ?? null
+      }
     };
+  }
+
+  function stopFocusHeartbeat() {
+    if (focusHeartbeatRef.current !== null) {
+      window.clearInterval(focusHeartbeatRef.current);
+      focusHeartbeatRef.current = null;
+    }
+  }
+
+  function teardownFocusSession() {
+    stopFocusHeartbeat();
+    focusDialogRef.current = null;
+    focusSessionRef.current = null;
+    setFocusOpening(false);
+  }
+
+  function sendFocusMessage(
+    kind: "snapshot" | "heartbeat" | "closing",
+    options: { snapshot?: FocusSnapshot; reason?: string } = {}
+  ): boolean {
+    const dialog = focusDialogRef.current;
+    const session = focusSessionRef.current;
+    if (!dialog || !session) return false;
+    if (!Office.context.requirements.isSetSupported("DialogApi", "1.2")) return false;
+    const seq = nextFocusSeq(session.seq);
+    try {
+      dialog.messageChild(
+        JSON.stringify(
+          createFocusEnvelope({
+            kind,
+            sessionId: session.sessionId,
+            seq,
+            sentAt: Date.now(),
+            workbook: {
+              name: workbook?.name ?? "",
+              identity: session.workbookIdentity
+            },
+            snapshot: options.snapshot,
+            reason: options.reason
+          })
+        )
+      );
+    } catch {
+      return false;
+    }
+    session.seq = seq;
+    return true;
+  }
+
+  function startFocusHeartbeat() {
+    stopFocusHeartbeat();
+    focusHeartbeatRef.current = window.setInterval(() => {
+      if (!focusDialogRef.current || !focusSessionRef.current) return;
+      sendFocusMessage("heartbeat");
+    }, FOCUS_HEARTBEAT_INTERVAL_MS);
   }
 
   function openFocusWindow() {
@@ -10117,33 +10569,60 @@ export default function App() {
       });
       return;
     }
-    const initialView: FocusPayload["initialView"] = toolsOpen
+    const initialView: FocusSnapshot["initialView"] = toolsOpen
       ? "tools"
       : "conversation";
-    const payload = buildFocusPayload(initialView);
-    try {
-      localStorage.setItem(FOCUS_PAYLOAD_STORAGE_KEY, JSON.stringify(payload));
-    } catch {
-      // DialogApi 1.2 messaging remains the primary synchronization path.
-    }
+    const snapshot = buildFocusSnapshot(initialView);
     const canMessageChild = Office.context.requirements.isSetSupported(
       "DialogApi",
       "1.2"
     );
-    if (focusDialogRef.current) {
-      if (canMessageChild) {
-        focusDialogRef.current.messageChild(JSON.stringify(payload));
-      }
+    if (focusDialogRef.current && focusSessionRef.current) {
+      // 窗口已打开：只同步最新内容，不重复创建会话。
+      if (canMessageChild) sendFocusMessage("snapshot", { snapshot });
       return;
     }
+    const sessionId = createFocusSessionId();
+    if (!sessionId) {
+      appendMessage({
+        role: "system",
+        text: "无法创建专注窗口会话：当前运行环境不支持安全随机数。"
+      });
+      return;
+    }
+    const workbookIdentity = currentOfficeWorkbookIdentity() ?? null;
+    if (!canMessageChild) {
+      /*
+       * 双向通道不可用（DialogApi 1.2 以下）：写入**会话隔离**的打开时快照。
+       * 子窗口只有握手超时后才会读取它，并在界面明确标注"仅快照"；它带版本与
+       * 过期时间，不构成对"当前现场"的判断。
+       */
+      try {
+        localStorage.setItem(
+          focusCacheKey(sessionId),
+          JSON.stringify({
+            version: FOCUS_PROTOCOL_VERSION,
+            sessionId,
+            expiresAt: Date.now() + FOCUS_CACHE_TTL_MS,
+            snapshot
+          })
+        );
+      } catch {
+        // 本地存储被禁用时窗口会如实停在"未连接"，不伪装内容。
+      }
+    }
     setFocusOpening(true);
-    const url = new URL("focus.html", window.location.href).toString();
+    const url = new URL(
+      `focus.html?session=${sessionId}`,
+      window.location.href
+    ).toString();
     Office.context.ui.displayDialogAsync(
       url,
-      { height: 93, width: 100, displayInIframe: false },
+      // height/width 是屏幕百分比；100 会被宿主钳制到约 99.5%，即"尽可能满屏"。
+      { height: 100, width: 100, displayInIframe: false },
       (result) => {
         if (result.status !== Office.AsyncResultStatus.Succeeded) {
-          setFocusOpening(false);
+          teardownFocusSession();
           appendMessage({
             role: "system",
             text: `无法打开专注窗口：${result.error.message}`
@@ -10152,32 +10631,35 @@ export default function App() {
         }
         const dialog = result.value;
         focusDialogRef.current = dialog;
+        focusSessionRef.current = { sessionId, seq: 0, workbookIdentity };
         dialog.addEventHandler(
           Office.EventType.DialogMessageReceived,
           (event) => {
             if (!("message" in event)) return;
-            try {
-              const message = JSON.parse(event.message) as { type?: string };
-              if (message.type === "focus-ready" && canMessageChild) {
-                dialog.messageChild(JSON.stringify(payload));
-                setFocusOpening(false);
+            // 父窗格只做结构与会话校验；本机同源消息不需要序号/时效约束。
+            const parsed = readFocusMessage(event.message, {
+              sessionId,
+              now: Date.now(),
+              maxAgeMs: 0
+            });
+            if (!parsed.ok) return;
+            const message = parsed.message;
+            if (message.kind === "hello") {
+              if (canMessageChild) {
+                sendFocusMessage("snapshot", { snapshot });
+                startFocusHeartbeat();
               }
-              if (message.type === "focus-ready" && !canMessageChild) {
-                setFocusOpening(false);
-              }
-              if (message.type === "focus-close") {
-                dialog.close();
-                focusDialogRef.current = null;
-                setFocusOpening(false);
-              }
-            } catch {
-              // Ignore messages that don't belong to the focus workspace.
+              setFocusOpening(false);
+              return;
+            }
+            if (message.kind === "close") {
+              dialog.close();
+              teardownFocusSession();
             }
           }
         );
         dialog.addEventHandler(Office.EventType.DialogEventReceived, () => {
-          focusDialogRef.current = null;
-          setFocusOpening(false);
+          teardownFocusSession();
         });
       }
     );
@@ -10679,274 +11161,211 @@ export default function App() {
    *    不参与"谁是主视图"的竞争 —— 否则一条状态行会把真正要点的恢复卡挤成 chip，
    *    出现"卡片说去恢复、恢复卡却不在"的自相矛盾（回归⑥ 抓到的正是这个）。
    */
+  const reviewComposerMode = resultReviewComposerActive(resultReviewState, answeringClarification, composerComposing);
   const reviewBarNode = (
-    <ResultReviewBar state={resultReviewState} title={resumedReviewTitle || resultCandidate?.plan.title || ''}
+    <ResultReviewBar inComposer={reviewComposerMode} paneNeedsResize={comparisonPaneNeedsResize} state={resultReviewState} title={resumedReviewTitle || resultCandidate?.plan.title || ''}
       compareUnavailable={reviewCompareUnavailable(resultCandidate, resultReviewState.key)}
+      onComparisonSheet={sheet => void resultReview.compare(resultReviewState.key ?? '', sheet)}
       onCompare={() => void resultReview.compare(resultReviewState.key ?? '')}
+      onExitComparison={() => void ResultReview.prototype.exitComparison.call(resultReview, resultReviewState.key ?? '')}
       onConfirm={() => void resultReview.confirm(resultReviewState.key ?? '')}
       onDiscard={() => void resultReview.discard(resultReviewState.key ?? '')}
+      onRetryCopy={() => void resultReview.retryCopyCleanup(resultReviewState.key ?? '')}
+      onRetryDecision={() => void resultReview.retryDecision(resultReviewState.key ?? '')}
       onRetryMarker={() => void resultReview.retryMarkerCleanup(resultReviewState.key ?? '')} />
   );
 
-  return (
-    <main className="chat-shell">
-      <header
-        className={`chat-header${modelMenuOpen || moreMenuOpen ? " menu-open" : ""}`}
+  /*
+   * 消息行的分组呈现（署名 + 组间/组内间距），判据在 `packages/core/messageRows.ts`。
+   *
+   * 引擎把一段回复拆成多条消息落盘（过程卡一条、结论一条、结果卡一条），
+   * 每条都印一次"Excel Bro"就会读成三件事；本判据让一段回复只有一个抬头。
+   * 两端读同一份：WPS 侧 `WpsAgentPanel.tsx` 同步调用，不另写"行为相似"的副本。
+   */
+  /*
+   * 短操作反馈（已撤销 / 已放弃并恢复 / 副本清理失败）按 **executionId** 挂回它
+   * 自己的执行记录。判据在共享层 `groupOperationFeedback`：找不到执行身份的消息
+   * 照旧单独渲染，不同执行身份绝不因为挨得近就合并。
+   */
+  const feedbackGrouping = groupOperationFeedback(messages);
+  const messageRowChrome = messageRowPresentation(messages.map((message) => ({
+    role: message.role,
+    text: message.text,
+    segmentId: message.replySegment?.id ?? null,
+    badge: messageAuthorBadge(message),
+    processLog: message.activityLog,
+    /*
+     * 与下面渲染时的跳过条件**逐字一致**：正在作答的澄清问卷由输入框接管，
+     * 已经归属到执行记录的短反馈也不再单独占一行。判据若把这两类算作可见行，
+     * 作者名会让给一条看不见的消息。
+     */
+    skipped: Boolean(
+      (answeringClarification && activeClarificationMessage?.id === message.id
+        && message.clarification?.status === "pending" && !message.clarification.localMapping)
+      || feedbackGrouping.suppressed.has(message.id)
+    )
+  })));
+
+  const composerAppMenu = (
+    <ComposerAppMenu logoSrc={brandLogoUrl} open={moreMenuOpen}
+      onToggle={() => { setModelMenuOpen(false); setHistoryOpen(false); setToolsOpen(false); closeSettings(); setMoreMenuOpen((current) => !current); }} onClose={() => setMoreMenuOpen(false)}>
+      <button type="button" role="menuitem" className="tools-entry" aria-label="我的工具" disabled={busy}
+        onClick={() => { setMoreMenuOpen(false); openTools(); }}><strong>工具</strong><span>打开我的工具</span></button>
+      <button type="button" role="menuitemcheckbox" className="pet-toggle" aria-checked={petVisible}
+        aria-label={petVisible ? "隐藏 EB 助手" : "显示 EB 助手"}
+        onClick={() => { setMoreMenuOpen(false); togglePetVisibility(); }}>
+        <strong>宠物</strong><span>{petVisible ? "已显示 · 点击隐藏" : "已隐藏 · 点击显示"}</span>
+      </button>
+      <button type="button" role="menuitem" onClick={() => { setMoreMenuOpen(false); setThemePanelOpen(true); }}>
+        <strong>壁纸</strong><span>设置主题与背景</span>
+      </button>
+      <button
+        type="button"
+        role="menuitem"
+        onClick={() => {
+          setMoreMenuOpen(false);
+          setIsRuleManagerOpen(true);
+        }}
+        disabled={busy}
       >
-        <img className="brand-mark" src={brandLogoUrl} alt="" />
-        <div className="brand-copy">
-          <strong className="app-logo" {...logoLongPress}>
-            Excel Bro
-          </strong>
-          {headerStatusText && <span className={headerStatusClassName}>
-            <i />
-            {serverOnline && modelNotConfigured && (
-              <svg
-                className="model-status-icon"
-                viewBox="0 0 16 16"
-                aria-hidden="true"
-                focusable="false"
-              >
-                <circle cx="8" cy="8" r="6.25" />
-                <path d="M5.5 8h5" />
-              </svg>
+        <strong>EB 函数说明</strong>
+        <span>查看内置 =EB() 函数用法</span>
+      </button>
+      <button
+        type="button"
+        role="menuitem"
+        onClick={() => {
+          setMoreMenuOpen(false);
+          openFocusWindow();
+        }}
+        disabled={focusOpening}
+      >
+        <strong>{focusOpening ? "正在打开..." : "专注窗口"}</strong>
+        <span>在独立窗口中打开对话</span>
+      </button>                  <div role="separator" />
+      <button type="button" role="menuitem" onClick={() => {
+        setMoreMenuOpen(false);
+        if (resultReviewState.comparing || nativeComparison.review) {
+          appendMessage({role: 'system', text: '双视图正在管理窗格宽度，请先退出双视图后调整。'});
+          return;
+        }
+        try {
+          if (!Office.context.requirements.isSetSupported('TaskPaneApi', '1.1') ||
+              typeof Office.extensionLifeCycle?.taskpane?.setWidth !== 'function') throw new Error('unsupported');
+          const maximum = Math.floor(window.screen.availWidth * 0.7);
+          const width = Math.min(window.innerWidth + 160, maximum);
+          if (!Number.isFinite(width) || width <= window.innerWidth + 2) {
+            appendMessage({role: 'system', text: '窗格已达到当前屏幕的宽度上限。'});
+            return;
+          }
+          Office.extensionLifeCycle.taskpane.setWidth(width);
+          appendMessage({role: 'system', text: '已请求加宽对话窗格；如果宽度没有变化，请使用窗格边界拖动。'});
+        } catch {
+          appendMessage({role: 'system', text: '当前 Excel 不支持自动调整窗格宽度，请使用窗格边界拖动。'});
+        }
+      }}><strong>加宽对话窗格</strong><span>扩大对话区域</span></button>
+
+
+    </ComposerAppMenu>
+  );
+
+  /*
+   * 底部结构（**只有这两层**）：
+   *   `.composer-pending` —— 全部通知 / 状态 / 恢复摘要 / 历史反馈，一行紧凑摘要 + 可展开；
+   *   `.composer-dock`    —— 工具栏 + 输入框，**两者紧贴，中间不许再插任何东西**。
+   *
+   * 旧结构把这些提示逐条散在工具栏与 `.composer-input-region` 之间，于是每来一条
+   * "副本仍保留 / 另有 1 项"就把工具栏从输入框旁边推开一次。现在底部高度只随
+   * "有没有事项"变一次，消息区通过 grid 的 `minmax(0, 1fr)` 正常让出空间。
+   */
+  const pendingNodes: Array<{ item: ComposerPendingItem; node: ReactNode }> = [];
+  const pushPending = (item: ComposerPendingItem, node: ReactNode | null | false) => {
+    if (node === null || node === false || node === undefined) return;
+    pendingNodes.push({ item, node });
+  };
+  pushPending(
+    { id: "scope", label: "授权范围待确认", kind: "status" },
+    targetGuard.notice && !contextOpen && <TargetScopeNotice notice={targetGuard.notice} error={targetGuard.error}
+      busy={targetGuard.confirming || scopeCheckingCommit} onOpenScope={() => void openScopePicker()}
+      onRecheck={() => void targetGuard.recheck()}
+      onConfirmOriginal={() => void targetGuard.confirm("original", [])} />
+  );
+  pushPending(
+    { id: "work-directory", label: "设置工作目录", kind: "status" },
+    showWorkDirectoryGuide && <WorkDirectoryGuide busy={busy}
+      onDismiss={dismissWorkDirectoryGuide} onChoose={() => void chooseWorkDirectoryFromGuide()} />
+  );
+  pushPending(
+    { id: "service", label: "服务状态", kind: "status" },
+    Boolean(composerStatusText) && <p className="composer-service-status" role="status">{composerStatusText}</p>
+  );
+  pushPending(
+    { id: "history-storage", label: "对话历史存储", kind: "notice" },
+    isHistoryStorageNoticeVisible(historyStorageStatus) && <HistoryStorageNotice status={historyStorageStatus} />
+  );
+  const reviewStatusBarVisible = !reviewComposerMode && resultReviewVisible(resultReviewState)
+    && !resultReviewNeedsDecision(resultReviewState)
+    && !reviewStatusBarSuppressedByRecovery({
+      recoveryComposerActive: recoveryComposerMode && resultReviewState.phase === "failed" && !resultReviewState.markerPending,
+      reviewExecutionId: resultReviewState.executionId,
+      reviewKey: resultReviewState.key,
+      failedExecution: reviewExecutionOperationIdRef.current,
+      recoveryOperationId: officeRecoveryEntry?.operationId ?? null
+    });
+  pushPending(
+    { id: "review-status", label: "本次执行状态", kind: resultReviewState.phase === "reviewing" ? "decision" : "status" },
+    reviewStatusBarVisible && reviewBarNode
+  );
+  const dockVisible = currentAction.kind === "review" || currentAction.kind === "recovery"
+    || currentAction.others.length > 0;
+  pushPending(
+    {
+      id: "dock",
+      label: currentAction.kind === "review" || currentAction.kind === "recovery"
+        ? currentActionShortLabel(currentAction.kind)
+        : "其他待处理事项",
+      kind: currentAction.kind === "review" ? "decision" : "recovery"
+    },
+    dockVisible && <ComposerActionDock
+      selection={currentAction}
+      onSwitch={setDockPinned}
+      views={{
+        review: reviewComposerMode ? null : reviewBarNode,
+        recovery: recoveryDockVisible ? (
+          <>
+            <OfficeRecoveryChoicesCard choices={officeRecoveryChoices} failure={officeDiscoveryFailure}
+              busy={busy} onSelect={(candidate) => void selectOfficeRecoveryCandidate(candidate)} />
+            {officeRecoveryEntry && officeRecoveryTerminal === null && !recoveryComposerMode && (
+              <OfficeRecoveryPanel card={officeRecoveryEntry.card} busy={busy}
+                undo={officeRecoveryUndoFor(officeRecoveryEntry)}
+                primaryLabel={recoveryFacts ? recoveryComposerPrimaryLabel(recoveryFacts) : ""}
+                onAction={(action) => void runOfficeRecoveryAction(officeRecoveryEntry.row, action)}
+                onReverify={() => void reverifyOfficeRecoveryMessage(officeRecoveryEntry.row)}
+                primaryEntryVisible={recoveryComposerMode || recoveryPendingEntry !== null} />
             )}
-            {headerStatusText}
-            {serverOnline && modelNotConfigured && (
-              <button
-                type="button"
-                className="model-help-button"
-                title="查看模型配置说明"
-                aria-label="查看模型配置说明"
-                onClick={() => handleSlashCommandSelect("help")}
-              >
-                <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">
-                  <circle cx="8" cy="8" r="6.25" />
-                  <path d="M6.15 6.15c.14-1.05 1.08-1.78 2.12-1.62 1.02.16 1.72 1.02 1.67 2.02-.04.83-.54 1.42-1.36 1.86-.38.2-.47.38-.43.78" />
-                  <path d="M8 11.2h.01" />
-                </svg>
-              </button>
-            )}
-          </span>}
-        </div>
-        <div className="header-actions">
-        <div
-          className={`model-picker${showModelGuide ? " needs-model" : ""}`}
-        >
-          <button
-            type="button"
-            className="model-picker-trigger"
-            disabled={!serverOnline || busy}
-            aria-haspopup="menu"
-            aria-expanded={modelMenuOpen}
-            aria-label={hasConfiguredModel ? "选择或添加模型" : "添加模型"}
-            title={selectedModel ? `选择或添加模型 · 当前模型：${selectedModel.label}` : "选择或添加模型"}
-            onClick={() => {
-              setHistoryOpen(false);
-              setToolsOpen(false);
-              setMoreMenuOpen(false);
-              closeSettings();
-              setModelMenuOpen((current) => !current);
-            }}
-          >
-            <ModelPickerIcon />
-          </button>
-          {modelMenuOpen && (
-            <div className="model-menu" role="menu" aria-label="模型">
-              <span className="model-menu-title">选择模型</span>
-              {modelOptions.map((option) => (
-                <button
-                  type="button"
-                  role="menuitemradio"
-                  aria-checked={option.id === effectiveModelId}
-                  key={option.id}
-                  disabled={!agentModelAvailable(option)}
-                  title={!agentModelAvailable(option) ? agentModelUnavailableReason(option) : undefined}
-                  onClick={() => handleSelectModel(option.id)}
-                >
-                  <i />
-                  <span className="model-option-copy">
-                    <span>{option.label}</span>
-                    {!agentModelAvailable(option) && <small>{agentModelUnavailableReason(option)}</small>}
-                  </span>
-                  {option.id === effectiveModelId && <b>✓</b>}
-                </button>
-              ))}
-              <div className="model-menu-actions">
-                <button
-                  type="button"
-                  role="menuitem"
-                  onClick={() => void handleOpenConnectionCreator()}
-                >
-                  ＋ 添加模型连接
-                </button>
-                <button
-                  type="button"
-                  role="menuitem"
-                  onClick={() => void handleOpenSettings()}
-                >
-                  管理模型连接
-                </button>
-              </div>
-            </div>
-          )}
-          {showModelGuide && (
-            <section
-              className="first-model-guide"
-              aria-label="首次模型设置引导"
-            >
-              <div className="guide-spark" aria-hidden="true">
-                <i />
-                <i />
-                <i />
-              </div>
-              <div>
-                <strong>添加你的第一个大模型</strong>
-                <span>
-                  Excel Bro 不会预置模型或密钥，由你选择 Kimi、DeepSeek、OpenAI
-                  或其他兼容服务。
-                </span>
-              </div>
-              <div className="first-model-guide-actions">
-                <button type="button" onClick={dismissModelGuide}>
-                  稍后
-                </button>
-                <button
-                  type="button"
-                  className="primary"
-                  onClick={() => void handleOpenConnectionCreator()}
-                >
-                  现在添加
-                </button>
-              </div>
-            </section>
-          )}
-        </div>
-          <button
-            className="header-button new-chat-entry"
-            onClick={handleNewChat}
-            disabled={busy}
-            title="新对话"
-            aria-label="新对话"
-          >
-            <span aria-hidden="true">＋</span>
-          </button>
-          <button
-            className="header-button tools-entry"
-            onClick={openTools}
-            disabled={busy}
-            title="我的工具"
-            aria-label="我的工具"
-          >
-            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-              <path d="M8.5 7V5.8c0-1 .8-1.8 1.8-1.8h3.4c1 0 1.8.8 1.8 1.8V7" />
-              <rect x="3" y="7" width="18" height="12.5" rx="2.5" />
-              <path d="M3.5 11.5h17M10 11.5v2h4v-2" />
-            </svg>
-          </button>
-          <button
-            className="header-button folder-backup-entry"
-            onClick={() => {
-              closeAllDrawers();
-              closeAllMenus();
-              setFolderBackupOpen(true);
-            }}
-            disabled={busy}
-            title={
-              folderBackupTarget.kind === "unavailable"
-                ? "恢复点与备份"
-                : `恢复点与备份：${folderBackupTarget.folderPath}`
-            }
-            aria-label="备份与恢复"
-          >
-            <span aria-hidden="true">↶</span>
-            {undoStack.length + folderUndoStack.length > 0 && (
-              <b>{undoStack.length + folderUndoStack.length}</b>
-            )}
-          </button>
-          <button
-            className={`header-button pet-toggle${petVisible ? " active" : ""}`}
-            onClick={togglePetVisibility}
-            title={petVisible ? "隐藏格仔" : "显示格仔"}
-            aria-label={petVisible ? "隐藏格仔" : "显示格仔"}
-            aria-pressed={petVisible}
-          >
-            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-              <ellipse cx="6.3" cy="10" rx="1.9" ry="2.4" />
-              <ellipse cx="10.4" cy="7.1" rx="1.9" ry="2.5" />
-              <ellipse cx="14.6" cy="7.1" rx="1.9" ry="2.5" />
-              <ellipse cx="18.7" cy="10" rx="1.9" ry="2.4" />
-              <path d="M7.4 16c0-2.7 2-4.5 4.6-4.5s4.6 1.8 4.6 4.5c0 2.4-1.9 4-4.6 4s-4.6-1.6-4.6-4Z" />
-            </svg>
-          </button>
-          <div className="view-menu-wrap">
-            <button
-              className="header-button"
-              onClick={() => {
-                setModelMenuOpen(false);
-                setHistoryOpen(false);
-                setToolsOpen(false);
-                closeSettings();
-                setMoreMenuOpen((current) => !current);
-              }}
-              aria-haspopup="menu"
-              aria-expanded={moreMenuOpen}
-              title="更多"
-              aria-label="更多"
-            >
-              <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-                <circle cx="5" cy="12" r="1.6" />
-                <circle cx="12" cy="12" r="1.6" />
-                <circle cx="19" cy="12" r="1.6" />
-              </svg>
-            </button>
-            {moreMenuOpen && (
-              <>
-                <div
-                  className="more-menu-backdrop"
-                  onClick={() => setMoreMenuOpen(false)}
-                  aria-hidden="true"
-                />
-                <div className="view-menu" role="menu" aria-label="更多">
-                  <button
-                    type="button"
-                    role="menuitem"
-                    onClick={openHistory}
-                    disabled={busy}
-                  >
-                    <strong>历史对话</strong>
-                    <span>{HISTORY_MENU_DESCRIPTION}</span>
-                  </button>
-                  <button
-                    type="button"
-                    role="menuitem"
-                    onClick={() => {
-                      setMoreMenuOpen(false);
-                      setIsRuleManagerOpen(true);
-                    }}
-                    disabled={busy}
-                  >
-                    <strong>EB 函数说明</strong>
-                    <span>查看内置 =EB() 函数用法</span>
-                  </button>
-                  <button
-                    type="button"
-                    role="menuitem"
-                    onClick={() => {
-                      setMoreMenuOpen(false);
-                      openFocusWindow();
-                    }}
-                    disabled={focusOpening}
-                  >
-                    <strong>{focusOpening ? "正在打开..." : "专注窗口"}</strong>
-                    <span>在独立窗口中打开对话</span>
-                  </button>
-                </div>
-              </>
-            )}
-          </div>
-        </div>
-      </header>
+          </>
+        ) : null
+      }}
+    />
+  );
+  pushPending(
+    { id: "recovery-pending", label: "恢复待办", kind: "recovery" },
+    recoveryPendingEntry && officeRecoveryEntry && <RecoveryPendingEntry
+      entry={recoveryPendingEntry} busy={busy}
+      onReturn={() => setRecoveryComposerChoice({
+        operationId: officeRecoveryEntry.operationId, choice: "recovery"
+      })} />
+  );
+  pushPending(
+    { id: "task-status", label: "任务状态", kind: "status" },
+    !recoveryComposerMode && !reviewComposerMode && Boolean(taskExecutionNoticeText(composerPrimary, resultReviewState.phase === "reviewing")) && <TaskExecutionNotice
+      action={composerPrimary} reviewing={resultReviewState.phase === "reviewing"} />
+  );
+  const composerPendingItems = pendingNodes.map(({ item }) => item);
+
+  return (
+    <main className="chat-shell chat-shell-headerless">
+
 
       {showWidenGuide && (
         <section
@@ -11003,14 +11422,6 @@ export default function App() {
               <strong>模型设置</strong>
               <span>密钥仅保存在这台电脑的本地服务中</span>
             </div>
-            <button
-              type="button"
-              className="drawer-text-action"
-              onClick={exportDiagnosticReport}
-              title="导出不含原始数据和密钥的诊断 JSON"
-            >
-              导出诊断
-            </button>
             <button onClick={closeSettings} aria-label="关闭">
               ×
             </button>
@@ -11099,21 +11510,36 @@ export default function App() {
                     </section>
                   </>
                 ) : (
-                  <section className="settings-first-run">
-                    <div className="settings-first-run-icon">＋</div>
-                    <div>
-                      <strong>
-                        {hasManagedModels
-                          ? "你的模型连接"
-                          : "从添加第一个模型开始"}
-                      </strong>
-                      <span>
-                        {hasManagedModels
-                          ? "模型和密钥都由下方连接独立管理。"
-                          : "没有预置模型，也不需要先去后端修改配置。填写服务地址、模型 ID 和自己的 API Key 即可。"}
-                      </span>
-                    </div>
-                  </section>
+                  !connectionDraft && (
+                    <section
+                      className="settings-first-run"
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => {
+                        void handleOpenConnectionCreator();
+                      }}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" || event.key === " ") {
+                          event.preventDefault();
+                          void handleOpenConnectionCreator();
+                        }
+                      }}
+                    >
+                      <div className="settings-first-run-icon">＋</div>
+                      <div>
+                        <strong>
+                          {hasManagedModels
+                            ? "添加模型连接"
+                            : "从添加第一个模型开始"}
+                        </strong>
+                        <span>
+                          {hasManagedModels
+                            ? "模型和密钥都由下方连接独立管理。"
+                            : "没有预置模型，也不需要先去后端修改配置。填写服务地址、模型 ID 和自己的 API Key 即可。"}
+                        </span>
+                      </div>
+                    </section>
+                  )
                 )}
 
             <section className="connection-settings">
@@ -11124,7 +11550,7 @@ export default function App() {
                   </strong>
                   <span>每个连接使用独立的服务地址、模型和 API Key。</span>
                 </div>
-                {!connectionDraft && (
+                {!connectionDraft && hasEnvironmentModel && (
                   <button
                     type="button"
                     disabled={settingsSaving || !serverOnline}
@@ -11134,89 +11560,6 @@ export default function App() {
                   </button>
                 )}
               </div>
-
-              {(modelSettings?.connections.length ?? 0) === 0 &&
-              !connectionDraft ? (
-                <div className="connection-empty">
-                  还没有额外连接。可以添加 DeepSeek、OpenAI 或其他
-                  OpenAI-compatible 模型。
-                </div>
-              ) : (
-                <div className="connection-list">
-                  {(modelSettings?.connections ?? []).map((connection) => (
-                    <article
-                      className={`connection-card${
-                        effectiveModelId === connection.catalogModelId
-                          ? " current"
-                          : ""
-                      }`}
-                      key={connection.id}
-                    >
-                      <div>
-                        <div className="connection-card-title">
-                          <strong>{connection.label}</strong>
-                          {effectiveModelId === connection.catalogModelId && (
-                            <b>当前使用</b>
-                          )}
-                        </div>
-                        <span>{connection.modelId}{connectionModelSuffix(modelSettings?.connections ?? [], connection.id)}</span>
-                        <small>{connection.baseUrl}</small>
-                          <small>{connection.agentAvailable === false ? connection.agentUnavailableReason : "SDK Agent 可用性请以连接测试为准"}</small>
-                        <small>
-                          Key：
-                          {connection.apiKeyConfigured
-                            ? `已配置 ${connection.apiKeyHint ?? ""}`
-                            : "未配置"}
-                          {connection.supportsVision ? " · 支持图片" : ""}
-                          {modelSettings?.formulaModelId ===
-                          connection.catalogModelId
-                            ? " · /function 公式模型"
-                            : ""}
-                        </small>
-                      </div>
-                      {pendingDeleteConnectionId === connection.id ? (
-                        <div className="connection-card-actions confirm">
-                          <button
-                            type="button"
-                            onClick={() => setPendingDeleteConnectionId(null)}
-                          >
-                            取消
-                          </button>
-                          <button
-                            type="button"
-                            className="delete"
-                            disabled={settingsSaving || settingsTesting}
-                            onClick={() => void removeConnection(connection.id)}
-                          >
-                            确认删除
-                          </button>
-                        </div>
-                      ) : (
-                        <div className="connection-card-actions">
-                          <button
-                            type="button"
-                            disabled={settingsSaving || settingsTesting}
-                            onClick={() => editModelConnection(connection.id)}
-                          >
-                            编辑
-                          </button>
-                          <button
-                            type="button"
-                            className="delete"
-                            disabled={settingsSaving}
-                            onClick={() =>
-                              setPendingDeleteConnectionId(connection.id)
-                            }
-                          >
-                            删除
-                          </button>
-                        </div>
-                      )}
-                    </article>
-                  ))}
-                </div>
-              )}
-
               {connectionDraft && (
                 <div className="connection-editor">
                   <div>
@@ -11225,13 +11568,13 @@ export default function App() {
                     </strong>
                     <button
                       type="button"
+                      disabled={settingsSaving || settingsTesting}
                       onClick={() => {
                         setShowApiKey(false);
                         setConnectionDraft(null);
                       }}
-                      aria-label="关闭连接编辑"
                     >
-                      ×
+                      取消
                     </button>
                   </div>
                   <ModelConnectionProtocolFields draft={connectionDraft} onChange={setConnectionDraft} />
@@ -11412,6 +11755,87 @@ export default function App() {
                   )}
                 </div>
               )}
+
+              {(modelSettings?.connections.length ?? 0) === 0 &&
+              !connectionDraft ? (
+                <div className="connection-empty">
+                  还没有额外连接。可以添加 OpenAI 或 Anthropic 兼容的模型连接。
+                </div>
+              ) : (
+                <div className="connection-list">
+                  {(modelSettings?.connections ?? []).map((connection) => (
+                    <article
+                      className={`connection-card${
+                        effectiveModelId === connection.catalogModelId
+                          ? " current"
+                          : ""
+                      }`}
+                      key={connection.id}
+                    >
+                      <div>
+                        <div className="connection-card-title">
+                          <strong>{connection.label}</strong>
+                          {effectiveModelId === connection.catalogModelId && (
+                            <b>当前使用</b>
+                          )}
+                        </div>
+                        <span>{connection.modelId}{connectionModelSuffix(modelSettings?.connections ?? [], connection.id)}</span>
+                        <small>{connection.baseUrl}</small>
+                        <small>
+                          Key：
+                          {connection.apiKeyConfigured
+                            ? `已配置 ${connection.apiKeyHint ?? ""}`
+                            : "未配置"}
+                          {connection.supportsVision ? " · 支持图片" : ""}
+                          {modelSettings?.formulaModelId ===
+                          connection.catalogModelId
+                            ? " · /function 公式模型"
+                            : ""}
+                        </small>
+                      </div>
+                      {pendingDeleteConnectionId === connection.id ? (
+                        <div className="connection-card-actions confirm">
+                          <button
+                            type="button"
+                            onClick={() => setPendingDeleteConnectionId(null)}
+                          >
+                            取消
+                          </button>
+                          <button
+                            type="button"
+                            className="delete"
+                            disabled={settingsSaving || settingsTesting}
+                            onClick={() => void removeConnection(connection.id)}
+                          >
+                            确认删除
+                          </button>
+                        </div>
+                      ) : (
+                        <div className="connection-card-actions">
+                          <button
+                            type="button"
+                            disabled={settingsSaving || settingsTesting}
+                            onClick={() => editModelConnection(connection.id)}
+                          >
+                            编辑
+                          </button>
+                          <button
+                            type="button"
+                            className="delete"
+                            disabled={settingsSaving}
+                            onClick={() =>
+                              setPendingDeleteConnectionId(connection.id)
+                            }
+                          >
+                            删除
+                          </button>
+                        </div>
+                      )}
+                    </article>
+                  ))}
+                </div>
+              )}
+
             </section>
 
             <section className="connection-settings">
@@ -12126,7 +12550,7 @@ export default function App() {
         />
       )}
 
-      <div className={`message-stream-shell${newConversationNotice ? " conversation-starting" : ""}`}>
+      <div className={`message-stream-shell${messages.filter((message) => message.role === "user").length > 1 ? " has-conversation-navigation" : ""}${newConversationNotice ? " conversation-starting" : ""}`}>
       {newConversationNotice && (
         <div className="new-conversation-toast" role="status">
           {newConversationNotice.previousSaved ? "已新建对话" : "当前已是新对话"}
@@ -12139,36 +12563,20 @@ export default function App() {
         onScroll={handleMessageStreamScroll}
       >
         {messages.map((message, messageIndex) => (
-          answeringClarification && activeClarificationMessage?.id === message.id
-            && message.clarification?.status === "pending" && !message.clarification.localMapping ? null :
-          <article
-            className={`message-row ${message.role}${
-              message.staleSourceConfirm ? " stale-source-message" : ""
-            }`}
-            key={message.id}
-            data-message-id={message.id}
-          >
-            <div className="message-content">
-              {message.role === "assistant" && !(
-                !message.text && isCompactMessageProcess(message.activityLog)
-                && messages[messageIndex + 1]?.role === "assistant"
-                && messages[messageIndex + 1]?.text?.trim()
-              ) && (
-                <span className="message-author">
-                  Excel Bro
-                  {message.provider && (
-                    <em>
-                      {message.clarification
-                        ? "需求确认"
-                        : message.provider === "model"
-                          ? "Agent"
-                          : message.provider === "system"
-                            ? "系统"
-                            : "本地工具"}
-                    </em>
-                  )}
-                </span>
-              )}
+          (answeringClarification && activeClarificationMessage?.id === message.id
+            && message.clarification?.status === "pending" && !message.clarification.localMapping)
+            || feedbackGrouping.suppressed.has(message.id) ? null :
+          <ConversationMessage key={message.id} id={message.id} role={message.role}
+            actions={message.text && !message.staleSourceConfirm && !message.feedback ? <MessageCopyButton
+              copied={copiedMessageId === message.id}
+              onClick={() => void copyMessageText(message.id, message.text?.trim() ?? "")}
+            /> : null}
+            groupStart={messageRowChrome[messageIndex]?.groupStart}
+            author={messageRowChrome[messageIndex]?.author} badge={messageAuthorBadge(message)}
+            executionResult={Boolean(message.verification || message.executedPlanId || message.executedExecutionId)}
+            feedback={feedbackGrouping.byAnchor.has(message.id)
+              ? <ExecutionFeedbackSummary records={feedbackGrouping.byAnchor.get(message.id)!} /> : undefined}
+            className={message.staleSourceConfirm ? "stale-source-message" : ""}>
               {message.reused && (
                 <div className="reuse-badge">
                   <span>♻ 复用上次结果（数据未变化）</span>
@@ -12492,7 +12900,21 @@ export default function App() {
                         passed: message.verification.checks.filter((check) => check.passed).length,
                         unverified: message.verification.unverifiedActions.length
                       }
-                    : null
+                    : null,
+                  /*
+                   * 这条消息自己**说不出**下一步，而输入框里还摆着一件恢复待办
+                   * （跨重启 / 换会话 / 经发现流程找回来的卡对不上任何消息）：
+                   * 那句话必须改成指路，否则同一屏里「本次没有需要你处理的后续操作」
+                   * 会和下方那颗「核对结果」互相打脸。
+                   *
+                   * 只在这条消息**没有**自己的恢复卡时补 —— 有卡时 `recoveryKind`
+                   * 已经把阶段折算成 needs_review / resumable，那句话本来就是对的。
+                   */
+                  pendingRecovery:
+                    (Boolean(officeRecoveryEntry) && !message.officeResume) ||
+                    // 待审阅同样是"还有一件事没处理"：这条消息说不出下一步时，
+                    // 不许写"本次没有需要你处理的后续操作"（输入框里正摆着确认/放弃）。
+                    resultReviewState.phase === "reviewing"
                 }} />
               )}
               {message.clarification && (
@@ -12500,32 +12922,7 @@ export default function App() {
                   className={`clarification-card ${message.clarification.status}`}
                   aria-label="确认需求"
                 >
-                  <div className="clarification-heading">
-                    <div>
-                      <span>执行前确认</span>
-                      <strong>
-                        {message.clarification.status === "pending"
-                          ? "需要你确认需求"
-                          : message.clarification.status === "resolving"
-                            ? "正在理解你的补充"
-                          : message.clarification.status === "resolved"
-                            ? "需求已确认"
-                            : message.clarification.status === "invalidated"
-                              ? "数据范围已变化"
-                              : "需求已取消"}
-                      </strong>
-                    </div>
-                    <em>{message.clarification.scopeLabel}</em>
-                  </div>
-                  <p className="clarification-summary">
-                    {message.clarification.summary}
-                  </p>
-                  <strong className="clarification-question">
-                    {message.clarification.question}
-                  </strong>
-                  <span className="clarification-reason">
-                    {message.clarification.reason}
-                  </span>
+                  <ClarificationMessageIntro {...message.clarification} />
 
                   {message.clarification.status === "pending" ? (
                     message.clarification.localMapping ? (
@@ -13388,18 +13785,9 @@ export default function App() {
                     </div>
                   </section>
                 ))}
-              {message.text && !message.staleSourceConfirm && (
-                <div className="message-copy-row">
-                  <MessageCopyButton
-                    copied={copiedMessageId === message.id}
-                    onClick={() =>
-                      void copyMessageText(message.id, message.text?.trim() ?? "")
-                    }
-                  />
-                </div>
-              )}
-            </div>
-          </article>
+
+
+          </ConversationMessage>
         ))}
 
         <div />
@@ -13413,6 +13801,7 @@ export default function App() {
         （本轮 turn 是否在途），不是"最近有没有报过进度" —— 后者在没有进度回调的
         快速回答里会是 false，于是一个正在跑的 turn 被画成"已停下"。
       */}
+      <ConversationNavigation key={chatHistory.activeConversationId} messages={messages} streamRef={messageStreamRef} onNavigate={scrollToMessage} />
       {awayFromBottom && (
         <ScrollToLatestButton running={running} onClick={scrollToLatest} />
       )}
@@ -13423,25 +13812,14 @@ export default function App() {
           <strong>这段历史来自旧版本，曾包含凭据</strong>
           <span>
             凭据已在读取时抹掉，界面里不会再显示原文。为避免把它当作正常历史
-            续聊，发送仍会被拦下；请点上方「新对话」开始一段干净的对话，或删掉
+            续聊，发送仍会被拦下；请点「新对话」开始一段干净的对话，或删掉
             这段历史。
           </span>
         </div>
       )}
 
-      <footer className="composer">
-        {targetGuard.notice && !contextOpen && <TargetScopeNotice notice={targetGuard.notice} error={targetGuard.error}
-          busy={targetGuard.confirming || scopeCheckingCommit} onOpenScope={() => void openScopePicker()}
-          onRecheck={() => void targetGuard.recheck()}
-        />}
-        {showWorkDirectoryGuide && (
-          <WorkDirectoryGuide
-            busy={busy}
-            onDismiss={dismissWorkDirectoryGuide}
-            onChoose={() => void chooseWorkDirectoryFromGuide()}
-          />
-        )}
         {contextOpen && workbook && (
+          <div className="scope-layer">
           <section className="scope-popover" aria-label="选择数据范围">
               <div className="scope-popover-header">
               <div>
@@ -13926,9 +14304,24 @@ export default function App() {
               count={scopeAdmissionIds.length} checking={scopeAdmission.checking} />}
             {sourceMode === "folder" && scopeConfirmationError && <p role="alert" className="authorized-target-error">{scopeConfirmationError}</p>}
           </section>
+          </div>
         )}
 
-        <div className="scope-entry-row">
+      <footer className="composer">
+        {/*
+          常驻待处理事项：**整个输入容器上方**，默认一行紧凑摘要，可展开看详情。
+          通知 / 错误 / 恢复摘要 / 历史执行结果一律住在这里，不进 `.composer-dock`。
+        */}
+        <ComposerPendingBar items={composerPendingItems}>
+          {pendingNodes.map(({ item, node }) => <Fragment key={item.id}>{node}</Fragment>)}
+        </ComposerPendingBar>
+        {/* 固定底部容器：工具栏与输入框是它仅有的两个子节点，紧贴、间距统一。 */}
+        <div className="composer-dock">
+        <div className="scope-entry-row scope-entry-row-with-new-chat">
+        <NewConversationButton disabled={busy} onClick={handleNewChat} />
+          <ConversationUtilityButtons disabled={busy} backupCount={undoStack.length + folderUndoStack.length}
+            backupTitle={folderBackupTarget.kind === "unavailable" ? "恢复点与备份" : `恢复点与备份：${folderBackupTarget.folderPath}`}
+            onBackup={() => { closeAllDrawers(); closeAllMenus(); setFolderBackupOpen(true); }} onHistory={openHistory} />
         <button
           className={`scope-trigger ${contextOpen ? "open" : ""}`}
           onClick={() => {
@@ -13980,72 +14373,10 @@ export default function App() {
         </div>
 
         {/*
-          对话历史的存储状态提示。四种形态由 `HistoryStorageNotice` 按状态给文案：
-          "保存失败 + 旧记录保留" / "未保存且无旧记录" / "已保存但旧键待清理" / 无提示。
-          不贴异常原文、不含任何历史内容。与"旧记录拦续聊"是两件事，所以不复用
-          上面的 staleCredentials 气泡：那条是针对当前会话能不能续聊。
+          这里开始就是输入区：`.composer-dock` 的第二个子节点。
+          通知、状态、恢复摘要已全部移到上方的 `ComposerPendingBar`，
+          工具栏与输入框之间不再有任何可插入节点。
         */}
-        <HistoryStorageNotice status={historyStorageStatus} />
-
-        {/*
-          只是**状态**的审阅栏（未执行 / 正在执行 / 需要核对）单独排在这里：
-          它没有决定可做，不该参与"谁是主视图"的竞争，但也不能因此消失。
-        */}
-        {resultReviewVisible(resultReviewState) && !resultReviewNeedsDecision(resultReviewState)
-          ? reviewBarNode
-          : null}
-
-        {/*
-          固定区域 = **一个容器**（`ComposerActionDock`），只展开一块卡。
-
-          改造前这里是三块各自决定出不出现：审阅栏（在 footer 顶部）、发现/恢复卡、
-          当前事项说明。三块可以同时在场，视觉分量还都差不多。现在由容器统一排版：
-          审阅与恢复**同一时刻只展开一块**，另一块退成一枚可点的 chip（显式切换，
-          不是隐藏）；澄清回答区不参与折叠 —— 它贴着输入框，折起来会让输入框在说
-          另一件事（详见组件的注释）。
-
-          这一层是 `.composer`（`<footer>`）的子节点，**不在** `.message-stream`
-          这个滚动容器里：核对成功后追加的日志再怎么把消息区滚到底，也不会把它挤出
-          视口。它绑定的执行由共享选择器（`officeRecoveryEntry`）唯一给出，
-          换簿/换会话后自然跟着变。
-        */}
-        <ComposerActionDock
-          selection={currentAction}
-          onSwitch={setDockPinned}
-          views={{
-            review: reviewBarNode,
-            recovery: (
-              <>
-                {/*
-                  发现入口：只在"发现到了但还没决定"或"发现本身失败"时出现。
-                  它不替用户选中任何一条，也不写入；点「核对这一次」之后才会多出一张恢复卡。
-                */}
-                <OfficeRecoveryChoicesCard
-                  choices={officeRecoveryChoices}
-                  failure={officeDiscoveryFailure}
-                  busy={busy}
-                  onSelect={(candidate) => void selectOfficeRecoveryCandidate(candidate)}
-                />
-                {officeRecoveryEntry && officeRecoveryTerminal === null && (
-                  <OfficeRecoveryPanel
-                    card={officeRecoveryEntry.card}
-                    busy={busy}
-                    undo={officeRecoveryUndoFor(officeRecoveryEntry)}
-                    onAction={(action) => void runOfficeRecoveryAction(officeRecoveryEntry.row, action)}
-                    onReverify={() => void reverifyOfficeRecoveryMessage(officeRecoveryEntry.row)}
-                  />
-                )}
-              </>
-            )
-          }}
-        />
-
-
-        {/*
-          固定区域里"现在最该处理哪件、还有几件在排队"由 `ComposerActionDock`
-          统一排版：它一次只展开一块卡，并给出显式切换入口（不再另起一行说明）。
-        */}
-
         <div
           className={`composer-input-region ${
             draggingImage ? "dragging-image" : ""
@@ -14065,11 +14396,58 @@ export default function App() {
           <div className="composer-resize-handle" {...composerResizeHandleProps}>
             <i />
           </div>
-          <TaskExecutionNotice
-            action={composerPrimary}
-            reviewing={resultReviewState.phase === "reviewing"}
-          />
-          <div className={`composer-box${answeringClarification ? " is-answering" : ""}`}>
+          <div
+            className={`composer-box${reviewComposerMode ? " is-reviewing" : ""}${answeringClarification ? " is-answering" : ""
+              }${recoveryComposerMode ? " is-recovery" : ""}`}
+          >
+            {reviewComposerMode ? reviewBarNode : recoveryComposerMode && recoveryComposer?.mode === "recovery" ? (
+              /*
+               * **置换**：普通输入（含附件区与工具条）整块让给恢复操作区。
+               * 判据保证走到这里时输入框里没有草稿（有草稿只退成上面那枚入口），
+               * 所以被换下去的不是用户正在写的东西。
+               */
+              <RecoveryComposer
+                view={recoveryComposer.view}
+                busy={busy}
+                acting={officeRecoveryEntry?.card.acting ?? null}
+                detailsOpen={recoveryDetailsOpen}
+                /*
+                 * Excel 的 `/api/office/executions` 没有处置端点 ⇒ 传 `null`：
+                 * 画一颗点了没反应的「清除恢复提示」比不画更糟（WPS 有，那边照传）。
+                 */
+                dismiss={null}
+                /*
+                 * 大卡在接管期间被收走 ⇒ 撤销行跟过来。它是那张卡上**唯一**不能由
+                 * 操作区主按钮承接的东西（撤销回答"已经写进去的怎么退回来"，
+                 * 与"这次任务怎么收尾"是两件事），所以留在详情里，不占动作行。
+                 */
+                undo={officeRecoveryEntry ? officeRecoveryUndoFor(officeRecoveryEntry) : undefined}
+                onPrimary={() => {
+                  const entry = officeRecoveryEntry;
+                  if (!entry) return;
+                  void runOfficeRecoveryAction(
+                    entry.row,
+                    recoveryComposer.view.action === "reconcile" ? "reconcile" : "resume"
+                  );
+                }}
+                onNewRequest={() => {
+                  const entry = officeRecoveryEntry;
+                  if (!entry) return;
+                  setRecoveryComposerChoice({
+                    operationId: entry.operationId,
+                    choice: "composer"
+                  });
+                }}
+                onToggleDetails={() => {
+                  const entry = officeRecoveryEntry;
+                  if (!entry) return;
+                  setRecoveryDetailsFor((current) =>
+                    current === entry.operationId ? null : entry.operationId
+                  );
+                }}
+              />
+            ) : (
+              <>
         {clarificationBinding && activeClarificationMessage?.clarification && (
           <div className={answeringClarification ? "clarification-answer-region" : "clarification-answer-region is-bypassed"}>
             {answeringClarification ? (
@@ -14117,6 +14495,13 @@ export default function App() {
                 handleComposerChange(event);
               }}
               onKeyDown={handleComposerKeyDown}
+              /*
+               * 组合起止只用来回答一件事：**现在能不能把输入框换掉**（见
+               * `composerComposing` 的注释）。它不参与发送、不参与回车判据 ——
+               * 回车在组合期该不该发送已经由 `handleComposerKeyDown` 的三道判据决定。
+               */
+              onCompositionStart={() => setComposerComposing(true)}
+              onCompositionEnd={() => setComposerComposing(false)}
               onPaste={(event) => { if (!answeringClarification) handleImagePaste(event); }}
               onBlur={() => setShowSlashAutocomplete(false)}
               placeholder={
@@ -14170,27 +14555,8 @@ export default function App() {
                 }}
               />
               <div className="composer-tools-left" hidden={answeringClarification}>
-                <button
-                  className="attach-image-button"
-                  disabled={busy || preparingImages}
-                  onClick={() => imageInputRef.current?.click()}
-                  title={
-                    supportsVision
-                      ? "添加图片，也可以直接粘贴或拖入截图"
-                      : "添加图片；当前模型不支持视觉，发送前需切换模型"
-                  }
-                  aria-label="添加图片"
-                >
-                  <svg
-                    viewBox="0 0 24 24"
-                    aria-hidden="true"
-                    focusable="false"
-                  >
-                    <rect x="3.5" y="4.5" width="17" height="15" rx="2.5" />
-                    <circle cx="9" cy="9.5" r="1.5" />
-                    <path d="m5.5 17 4.2-4.4 3.1 3 2.2-2.2 3.5 3.6" />
-                  </svg>
-                </button>
+                {composerAppMenu}
+
               </div>
               <span
                 hidden={answeringClarification}
@@ -14207,12 +14573,103 @@ export default function App() {
             >
               取消本次任务
             </button>)}
+              <div className="composer-tools-right">
+              <div
+                  className={`model-picker${showModelGuide ? " needs-model" : ""}`}
+                  hidden={answeringClarification}
+                  onBlur={(event) => {
+                    if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setModelMenuOpen(false);
+                  }}
+                >
+                  <button
+                    type="button"
+                    className="model-picker-trigger"
+                    disabled={!serverOnline || busy}
+                    aria-haspopup="menu"
+                    aria-expanded={modelMenuOpen}
+                    aria-label={hasConfiguredModel ? "选择或添加模型" : "添加模型"}
+                    title={selectedModel ? `选择或添加模型 · 当前模型：${selectedModel.label}` : "选择或添加模型"}
+                    onClick={() => {
+                      setHistoryOpen(false);
+                      setToolsOpen(false);
+                      setMoreMenuOpen(false);
+                      closeSettings();
+                      setModelMenuOpen((current) => !current);
+                    }}
+                  >
+                    <ModelPickerLabel model={selectedModel} />
+                  </button>
+                  {modelMenuOpen && (
+                    <div className="model-menu" role="menu" aria-label="模型">
+                      <span className="model-menu-title">选择模型</span>
+                      {modelOptions.map((option) => (
+                        <button
+                          type="button"
+                          role="menuitemradio"
+                          aria-checked={option.id === effectiveModelId}
+                          key={option.id}
+                          disabled={!agentModelAvailable(option)}
+                          title={!agentModelAvailable(option) ? agentModelUnavailableReason(option) : undefined}
+                          onClick={() => handleSelectModel(option.id)}
+                        >
+                          <i />
+                          <span className="model-option-copy">
+                            <span>{option.label}</span>
+                            {!agentModelAvailable(option) && <small>{agentModelUnavailableReason(option)}</small>}
+                          </span>
+                          {option.id === effectiveModelId && <b>✓</b>}
+                        </button>
+                      ))}
+                      <div className="model-menu-actions">
+                        <button
+                          type="button"
+                          role="menuitem"
+                          onClick={() => void handleOpenSettings()}
+                        >
+                          管理模型连接
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                  {showModelGuide && !modelMenuOpen && (
+                    <section
+                      className="first-model-guide"
+                      aria-label="首次模型设置引导"
+                    >
+                      <div className="guide-spark" aria-hidden="true">
+                        <i />
+                        <i />
+                        <i />
+                      </div>
+                      <div>
+                        <strong>添加你的第一个大模型</strong>
+                        <span>
+                          Excel Bro 不会预置模型或密钥，由你选择 Kimi、DeepSeek、OpenAI
+                          或其他兼容服务。
+                        </span>
+                      </div>
+                      <div className="first-model-guide-actions">
+                        <button type="button" onClick={dismissModelGuide}>
+                          稍后
+                        </button>
+                        <button
+                          type="button"
+                          className="primary"
+                          onClick={() => void handleOpenConnectionCreator()}
+                        >
+                          现在添加
+                        </button>
+                      </div>
+                    </section>
+                  )}
+                </div>
               <ComposerPrimaryButton
                 action={composerPrimary}
                 onInvoke={(invoke) => void invokeComposerPrimary(invoke)}
                 disabled={composerPrimaryBlocked !== null}
                 disabledHint={composerPrimaryBlocked ?? undefined}
               />
+              </div>
             </div>
             {/*
               暂停请求的阶段**如实**显示，挂在工具条**外面**：工具条是三列网格，
@@ -14224,8 +14681,12 @@ export default function App() {
                 {pauseRequestState.detail}
               </span>
             )}
+              </>
+            )}
+            {(reviewComposerMode || recoveryComposerMode) && <div className="composer-utility-toolbar">{composerAppMenu}</div>}
           </div>
         </div>
+        </div>{/* /.composer-dock：工具栏与输入框到此为止，中间没有第三个子节点 */}
         {(import.meta.env.DEV || import.meta.env.VITE_ENABLE_RECOVERY_PROBE === "true") &&
           <RecoveryProbeControl
             identity={resultWorkbookIdentity}
@@ -14256,7 +14717,7 @@ export default function App() {
           cancel={cancelResultRefFault}
         />
       </footer>
-      {petVisible && <PetCompanion busy={busy} />}
+      {petVisible && <PetCompanion busy={busy} onHide={() => setPetVisible(false)} />}
       <ThemePanel
         open={themePanelOpen}
         onClose={() => setThemePanelOpen(false)}

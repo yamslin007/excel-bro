@@ -1,7 +1,7 @@
 import type { Dispatch, SetStateAction } from "react";
 import type { ModelConnectionDraft } from "../hooks/useModelManagement";
 
-/** The two host settings editors share protocol and test-purpose semantics. */
+/** Both hosts configure one connection, independent of how it will be used. */
 export function ModelConnectionProtocolFields({ draft, onChange }: {
   draft: ModelConnectionDraft;
   onChange: Dispatch<SetStateAction<ModelConnectionDraft | null>>;
@@ -11,22 +11,15 @@ export function ModelConnectionProtocolFields({ draft, onChange }: {
       <span>接口协议</span>
       <select value={draft.protocol ?? "openai_compatible"} onChange={(event) => {
         const protocol = event.target.value as "openai_compatible" | "anthropic";
-        onChange((current) => current ? { ...current, protocol, purpose: "agent" } : current);
+        onChange((current) => current ? { ...current, protocol } : current);
       }}>
         <option value="openai_compatible">OpenAI 兼容</option>
-        <option value="anthropic">Anthropic 兼容（SDK Agent）</option>
+        <option value="anthropic">Anthropic 兼容</option>
       </select>
+      <small className="model-protocol-hint">
+        按供应商提供的接口选择协议，两种协议均可用于对话和公式。
+      </small>
     </label>
-    <label>
-      <span>测试用途</span>
-      <select value={draft.purpose ?? "agent"} onChange={(event) => {
-        const purpose = event.target.value as "agent" | "formula";
-        onChange((current) => current ? { ...current, purpose } : current);
-      }}>
-        <option value="agent">表格 Agent（SDK 与工具调用）</option>
-        <option value="formula" disabled={draft.protocol === "anthropic"}>独立公式（OpenAI 接口）</option>
-      </select>
-    </label>
-    <p>表格 Agent 使用 Claude Agent SDK。自定义服务须填写供应商提供的 Anthropic 兼容地址；DeepSeek 官方 OpenAI 地址可自动适配。独立公式测试通过不代表 Agent 可用。</p>
+    <p>填写服务地址、模型 ID 和 API Key，点击「测试连接」。模型正常回复后即可保存使用。</p>
   </>;
 }

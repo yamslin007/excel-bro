@@ -164,17 +164,25 @@ export function classifyWpsWriteEvidence(input: {
   return { kind: "unknown" };
 }
 
-/**
- * 把证据翻译成任务恢复记录的四个字段。面板只用这一处映射，
- * 避免"某条分支忘了改 writeState"这种人眼容易漏的错。
- */
-export function taskResumePatchForEvidence(evidence: WpsWriteEvidence): {
+/** 任务恢复记录的四个字段（`phase` / `blocker` / `resumability` / `writeState`）。 */
+export type TaskResumeFields = {
   phase: TaskPhase;
   blocker: TaskBlocker;
   resumability: TaskResumability;
   writeState: TaskWriteState;
-} {
-  switch (evidence.kind) {
+};
+
+/**
+ * 把证据翻译成任务恢复记录的四个字段。面板只用这一处映射，
+ * 避免"某条分支忘了改 writeState"这种人眼容易漏的错。
+ */
+export function taskResumePatchForEvidence(evidence: WpsWriteEvidence): TaskResumeFields {
+  return taskResumeFieldsFor(evidence.kind);
+}
+
+/** 四个字段的**唯一**映射体。`kind` 是唯一入参：这里不回答"哪一次执行"。 */
+function taskResumeFieldsFor(kind: WpsWriteEvidence["kind"]): TaskResumeFields {
+  switch (kind) {
     case "completed":
       return {
         phase: "executing",
@@ -205,3 +213,20 @@ export function taskResumePatchForEvidence(evidence: WpsWriteEvidence): {
       };
   }
 }
+
+/**
+ * 「一个单元格都没写」的恢复记录补丁 —— **写前中止的唯一出口**。
+ *
+ * 谁读它：身份缺失 / 登记失败 / 服务端未授予写入权 / 本地恢复索引存不下 —— 这四条
+ * 都发生在**第一次进宿主写入 API 之前**。
+ *
+ * 为什么必须显式回到这里：写入前那一步会把标记预置成
+ * `executing / execution_unknown / reconcile / unknown`（"写入状态未知"是当时唯一
+ * 诚实的说法）。中止时若不回退，中断卡就会一直写"写入结果无法确认，需要先核对"，
+ * 并给一个核对入口 —— 而现场是**一个单元格都没动**。2026-11-01 真机就是这个形态：
+ * 公式计划在登记处被拒，界面却留下了一条"待核对在途动作"。
+ *
+ * 仍然走 `taskResumeFieldsFor`：不另写一份字段，避免出现第二套"未写入"词表。
+ * 这里 `not_started` 说的是"一步都没写"，不是"宿主里查到 restored 记录"。
+ */
+export const WPS_NOT_EXECUTED_PATCH: TaskResumeFields = taskResumeFieldsFor("not_started");

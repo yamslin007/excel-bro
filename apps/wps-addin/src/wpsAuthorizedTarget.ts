@@ -8,6 +8,7 @@ import { wpsConfirmationTargetKey } from "./wpsClarificationTargetConfirmation";
 import { checkAuthorizedTarget } from "@excel-bro/core/authorizedTarget";
 import { admissionItem, type ScopeAdmissionReport, type ScopeAdmissionReason } from "@excel-bro/core/scopeAdmission";
 import { wpsWriteVersionStatus } from "./wpsWriteVersionGate";
+import type { TargetStableIdGrade } from "@excel-bro/core/targetDiagnostics";
 import capabilities from "../../../config/capabilities.json";
 
 /**
@@ -43,8 +44,34 @@ export async function inspectWpsAuthorizedTarget(selected: readonly number[] | n
     selected: (selected ?? metadata.sheets.filter((sheet) => sheet.isActive).map((sheet) => sheet.index)).map(String) };
 }
 
-/** Detect unknown wrappers BEFORE starting a task; consent only permits fresh reads/planning. */
-export async function wpsAnalysisTargetEvidence(target: AuthorizedTarget) {
+/**
+ * Detect unknown wrappers BEFORE starting a task; consent only permits fresh reads/planning.
+ *
+ * 证据分两级：
+ *
+ * - `conclusive`（对象级）：同一瞬间两次读拿到**同一个宿主对象** ⇒ 会话内能证明
+ *   "还是那个对象"。它只在宿主包装对象稳定时成立，跨刷新必然失效。
+ * - `documentBound`（文档级）：**路径身份 + 每张授权表都有宿主声明的稳定 ID**
+ *   （`CodeName` / `SId`）。宿主换包装对象不影响它，所以它**在宿主真的报出稳定 ID 时**
+ *   跨刷新仍成立。**注意这不是"与 Excel 同强度"**：Excel 的文档身份无条件成立，
+ *   这里是有条件的 —— 宿主不给稳定 ID、或工作簿未保存，`documentBound` 就是 false，
+ *   照旧要用户确认一次（2026-11-01 真机复测即落在这一支）。
+ *
+ * 它**也不做刷新前的基线比较**：`documentBound` 只回答"本次读数是否具备文档级要素"，
+ * 不回答"稳定 ID 是否与刷新前那份相同"。因此它**不**能识别"删掉已授权表再新建同名表"——
+ * 那种情况只有 `conclusive`（对象引用）看得见。不要宣称它实现了"同名表替换降级确认"。
+ *
+ * 它**不**冒充对象级：`conclusive` 的含义一字未改，写入/恢复/数据读取仍只看它；
+ * 只有"要不要再做一次范围确认"这一处允许文档级证据直接放行（见
+ * `useAuthorizedTarget.checkForAnalysis`）。
+ */
+export async function wpsAnalysisTargetEvidence(target: AuthorizedTarget): Promise<
+  {
+    key: string; conclusive: boolean; documentBound?: boolean;
+    /** 只用于诊断：稳定 ID 读到几成 / 本次是否拿到路径身份。不参与判定。 */
+    diagnostic?: { stableId: TargetStableIdGrade; pathIdentity: boolean };
+  } | null
+> {
   const identity = captureWpsObjectIdentity(getWpsApplication(), target.selected.map(Number));
   if (identity.workbookName !== target.name ||
       (target.fileKey ? identity.workbookFullName !== target.fileKey : identity.workbookRef !== target.fileRef) ||
@@ -52,7 +79,14 @@ export async function wpsAnalysisTargetEvidence(target: AuthorizedTarget) {
         allowed.id === String(sheet.index) && allowed.name === sheet.name))) return null;
   const conclusive = verifyWpsObjectIdentity(getWpsApplication(), identity) === "same";
   const key = wpsConfirmationTargetKey(identity);
-  return key ? { key, conclusive } : conclusive ? { key: "session-object-reference", conclusive } : null;
+  const readable = identity.sheets.filter((sheet) => typeof sheet.id === "string" && sheet.id.length > 0).length;
+  const stableId: TargetStableIdGrade = readable === 0 || identity.sheets.length === 0 ? "none"
+    : readable === identity.sheets.length ? "all" : "partial";
+  // 文档级必须有路径身份（key 非空）且每张授权表都能报出稳定 ID；缺一即不成立。
+  const documentBound = Boolean(key) && identity.sheets.length > 0 && stableId === "all";
+  const diagnostic = { stableId, pathIdentity: Boolean(key) };
+  if (key) return { key, conclusive, documentBound, diagnostic };
+  return conclusive ? { key: "session-object-reference", conclusive, documentBound: false, diagnostic } : null;
 }
 
 /** No cells, data rows, model calls or consent mutations. Only the selected sheets are inspected. */

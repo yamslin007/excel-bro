@@ -10,6 +10,10 @@
 
 import { useEffect, useRef, useState } from "react";
 
+import {
+  describeIncompleteReasons,
+  describeTruncation
+} from "@excel-bro/core";
 import type { LocalResultCard as LocalResultPointer } from "../contracts";
 import type { SdkBridgeResultResponse } from "../contracts";
 
@@ -49,6 +53,25 @@ export function LocalResultCard({
     };
   }, [card.resultRef]);
 
+  /*
+   * 两句提示都由**事实**推出来：
+   * - 不完整：`incomplete` 里有什么就说什么（哪张表缺哪个字段 / 哪张表没有数据行）；
+   * - 截断：`truncation` 的计数，只在 limit 真的切掉了行时出现。
+   * 没有任何原因却 `complete===false` 属于数据不一致 —— 那就如实说"原因未记录"，
+   * 不替它编一个（尤其不编"扫描已达上限"）。
+   */
+  const incompleteText = (() => {
+    const described = describeIncompleteReasons(card.incomplete ?? []);
+    if (described) return `结果不完整：${described}`;
+    if (card.complete === false) {
+      return "结果不完整，但这次没有记录到具体原因。";
+    }
+    return null;
+  })();
+  const truncationText = card.truncation
+    ? `列表已截断：${describeTruncation(card.truncation)}`
+    : null;
+
   return (
     <section className="local-result-card" aria-label="本地查询结果">
       <div className="local-result-card-head">
@@ -62,10 +85,19 @@ export function LocalResultCard({
           来源：{card.sourceSheets.join("、")}
         </p>
       )}
-      {!card.complete && (
-        <p className="local-result-card-partial">
-          结果不完整（扫描已达上限），仅展示已取回部分。
-        </p>
+      {/**
+       * 提示语**按真实原因**写成，不按一个布尔猜。
+       *
+       * 原来这里只有一句「结果不完整（扫描已达上限）」：任何 `complete=false`
+       * 都这么写。2026-11-01 真机里三张表缺「列2」也被说成扫描达上限，用户自然
+       * 以为是读表读崩了。现在两条事实分开：内容不完整（有原因）与展示截断
+       * （只有 limit 生效），各自只说自己。
+       */}
+      {incompleteText && (
+        <p className="local-result-card-partial">{incompleteText}</p>
+      )}
+      {truncationText && (
+        <p className="local-result-card-truncated">{truncationText}</p>
       )}
       {state.status === "loading" && (
         <p className="local-result-card-status" role="status">

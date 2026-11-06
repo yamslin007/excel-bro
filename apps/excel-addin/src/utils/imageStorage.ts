@@ -43,8 +43,8 @@ async function withStore<T>(
   return new Promise((resolve, reject) => {
     const transaction = db.transaction(storeName, mode);
     const request = action(transaction.objectStore(storeName));
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error ?? new Error("主题数据读写失败"));
+    transaction.oncomplete = () => { db.close(); resolve(request.result); };
+    transaction.onabort = transaction.onerror = () => { db.close(); reject(transaction.error ?? new Error("主题数据读写失败")); };
   });
 }
 
@@ -76,4 +76,18 @@ export function loadThemeSettings(): Promise<ThemeSettings | null> {
   return withStore(STORE_SETTINGS, "readonly", (store) =>
     store.get("theme_config")
   ).then((value) => (value && typeof value === "object" ? (value as ThemeSettings) : null));
+}
+
+/** Commit settings and image together: failure must preserve the previous appearance. */
+export async function saveThemeSnapshot(settings: ThemeSettings, image: Blob | null): Promise<void> {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([STORE_BACKGROUNDS, STORE_SETTINGS], "readwrite");
+    transaction.oncomplete = () => { db.close(); resolve(); };
+    transaction.onabort = transaction.onerror = () => { db.close(); reject(transaction.error ?? new Error("无法保存外观，请重试。")); };
+    transaction.objectStore(STORE_SETTINGS).put(settings, "theme_config");
+    const backgrounds = transaction.objectStore(STORE_BACKGROUNDS);
+    if (image) backgrounds.put(image, "current");
+    else backgrounds.delete("current");
+  });
 }

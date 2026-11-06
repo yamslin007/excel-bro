@@ -403,10 +403,10 @@ def set_formula_model_id(model_id: str) -> dict[str, object]:
         valid_ids = {
             str(option["id"])
             for option in catalog["models"]  # type: ignore[index]
-            if option.get("formulaAvailable", False)
+            if option.get("available", False)
         }
         if normalized not in valid_ids:
-            raise ValueError("所选公式模型不存在、未配置或不支持 OpenAI 兼容公式接口")
+            raise ValueError("所选模型不存在或尚未配置")
     _write_managed_connections(
         load_managed_connections(), formula_model_id=normalized
     )
@@ -618,21 +618,26 @@ def formula_model_config() -> ModelConnection | None:
 
 
 def connection_capabilities(connection: ModelConnection) -> dict[str, object]:
+    """Legacy capability fields describe routable protocols, never a tool test.
+
+    SDK runtime availability and actual tool support are checked when used.
+    They must not disable a valid text connection (including for older clients).
+    """
     from ..agent_runtime import sdk_agent_connection
+    from .anthropic import messages_url
+    from .errors import LLMResponseError
 
     reason = None
     try:
         sdk_agent_connection(connection)
-        if not connection.api_key:
-            reason = "SDK Agent 需要配置 API Key。"
-        elif not _claude_sdk_state_ready():
-            reason = "SDK 运行目录未配置，请用项目启动脚本启动服务。"
-    except ModelNotAvailableError:
-        reason = "此端点未配置 Anthropic 兼容协议，仅可用于独立公式；请按供应商说明配置 SDK 端点。"
+        if connection.adapter == "claude_agent_sdk":
+            messages_url(connection.base_url)
+    except (ModelNotAvailableError, LLMResponseError, ValueError):
+        reason = "此连接的接口协议或服务地址不受支持，请检查模型配置。"
     return {
         "agentAvailable": reason is None,
         "agentUnavailableReason": reason,
-        "formulaAvailable": connection.adapter == "openai_compatible",
+        "formulaAvailable": reason is None,
     }
 
 
@@ -649,6 +654,7 @@ def model_catalog() -> dict[str, object]:
         options.extend(
             {
                 "id": model,
+                "modelId": model,
                 "label": model,
                 "provider": "model",
                 "available": True,
@@ -673,6 +679,7 @@ def model_catalog() -> dict[str, object]:
         suffix = f" ({model_ordinals[key]})" if model_counts[key] > 1 else ""
         options.append({
             "id": connection.catalog_id,
+            "modelId": connection.model,
             "label": f"{base_label}{suffix}",
             "provider": "model",
             "available": True,
@@ -683,6 +690,7 @@ def model_catalog() -> dict[str, object]:
     if sdk_connection is not None:
         options.append({
             "id": CLAUDE_SDK_CATALOG_ID,
+            "modelId": sdk_connection.model,
             "label": f"Claude Agent SDK · {sdk_connection.model}",
             "provider": "model",
             "available": True,

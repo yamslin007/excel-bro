@@ -13,7 +13,7 @@ import { describe, expect, it } from "vitest";
 import type { AnalysisPlan } from "../../excel-addin/src/contracts";
 import type { WpsApplication, WpsRange, WpsWorkbook, WpsWorksheet } from "./wpsHost";
 import { prepareWpsPlan } from "./wpsPlanExecutor";
-import { captureWpsBeforeResult, stageWpsBeforeComparison } from "./wpsNativeComparison";
+import { captureWpsBeforeResult, stageWpsBeforeComparison, wpsBeforeComparisonForSheet } from "./wpsNativeComparison";
 
 type Cell = { value: string | null; formula: string | null; bold: boolean };
 
@@ -35,6 +35,7 @@ function conditionsOf(rules: CondRule[]) {
 
 function makeHost(options: {
   values: string[][];
+  sheetName?: string;
   formulas?: Record<string, string>;
   bold?: boolean;
   rowHeight?: number;
@@ -152,13 +153,13 @@ function makeHost(options: {
     }
   } as unknown as WpsWorksheet);
 
-  const originalSheet = makeSheet("数据", cells);
+  const originalSheet = makeSheet(options.sheetName ?? "数据", cells);
   let copyCells: Cell[][] = [];
   let copyRowHeight = rowHeight;
   let active: WpsWorkbook;
 
   const copySheet = {
-    Name: "数据",
+    Name: options.sheetName ?? "数据",
     ProtectContents: false,
     Range: (address: string) => {
       const box = rect(address);
@@ -281,6 +282,32 @@ function plan(title: string, actions: AnalysisPlan["actions"]): AnalysisPlan {
 }
 
 describe("执行前副本按快照重建", () => {
+  it('多表同地址按动作索引取各自前态，未选表与原表不改动', () => {
+    const host = makeHost({values:[['第二表旧值']], sheetName:'结果2'});
+    const prepared = prepareWpsPlan(host.application,[1],plan('第二表',[
+      {type:'writeValues',sheet:'结果2',range:'A1',values:[['新值']]}
+    ]),[]);
+    const before = captureWpsBeforeResult(host.application,prepared);
+    const first = {...prepared.actions[0],sheetName:'结果1'};
+    const combined = {...before, prepared:{...prepared,
+      authorization:{...prepared.authorization,sheets:[...prepared.authorization.sheets,{index:2,name:'结果1'}]},
+      actions:[first,...prepared.actions],plan:{...prepared.plan,actions:[
+        {type:'writeValues' as const,sheet:'结果1',range:'A1',values:[['第一表新值']]},...prepared.plan.actions]}},
+      values:[{...before.values[0],values:[['第一表旧值']]},...before.values],formats:[undefined,...before.formats]};
+    host.originalCells()[0][0].value='第二表新值';
+    expect(()=>stageWpsBeforeComparison(host.application,combined,undefined,'未授权')).toThrow('不属于本次执行');
+    expect(()=>wpsBeforeComparisonForSheet(combined,'未授权')).toThrow('授权快照');
+    // 此最小宿主没有整表快照，整本多子表构造必须拒绝，不能用当前值冒充前态。
+    expect(()=>stageWpsBeforeComparison(host.application,combined,undefined,'结果2')).toThrow('缺少完整的执行前子表快照');
+    // 单表投影仍须按原动作索引取值，再由真实重建器写入副本。
+    const selected=wpsBeforeComparisonForSheet(combined,'结果2');
+    const copy=stageWpsBeforeComparison(host.application,selected,undefined,'结果2');
+    expect(host.copyCells()[0][0].value).toBe('第二表旧值');
+    expect(host.originalCells()[0][0].value).toBe('第二表新值');
+    expect(copy.plan.actions).toHaveLength(1);
+    expect(copy.writeSheet.name).toBe('结果2');
+  });
+
   it("值是执行前的：副本按执行前快照重建，而不是沿用执行后的当前表", () => {
     // 执行前：A1:B1 是「旧值A/B」。
     const host = makeHost({ values: [["旧值A", "旧值B"]] });

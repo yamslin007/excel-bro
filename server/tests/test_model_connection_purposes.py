@@ -40,11 +40,16 @@ def test_explicit_protocol_roundtrip_preserves_identity_credentials_and_formula_
     assert config.selected_model_config(item["catalogModelId"]).api_key == "secret-test-key"
     catalog = config.model_catalog()
     assert len(catalog["models"]) == 1
+    assert catalog["models"][0]["modelId"] == "chosen-model"
+    assert catalog["models"][0]["id"] == item["catalogModelId"]
+    response = TestClient(main_module.app).get("/api/models")
+    assert response.status_code == 200
+    assert response.json()["models"][0]["modelId"] == "chosen-model"
     assert catalog["models"][0]["agentAvailable"] is True
-    assert catalog["models"][0]["formulaAvailable"] is False
+    assert catalog["models"][0]["formulaAvailable"] is True
     assert "secret-test-key" not in json.dumps(catalog)
-    with pytest.raises(ValueError, match="公式"):
-        config.set_formula_model_id(item["catalogModelId"])
+    config.set_formula_model_id(item["catalogModelId"])
+    assert config.formula_model_config() == connection
 
 
 def test_old_json_defaults_to_openai_and_does_not_guess_gateway_endpoint():
@@ -54,8 +59,8 @@ def test_old_json_defaults_to_openai_and_does_not_guess_gateway_endpoint():
     }]}), encoding="utf-8")
     item = config.model_settings_view()["connections"][0]
     assert item["protocol"] == "openai_compatible"
-    assert item["agentAvailable"] is False and item["formulaAvailable"] is True
-    assert "Anthropic" in item["agentUnavailableReason"]
+    assert item["agentAvailable"] is True and item["formulaAvailable"] is True
+    assert item["agentUnavailableReason"] is None
     config.set_formula_model_id(item["catalogModelId"])
     assert config.load_formula_model_id() == item["catalogModelId"]
     assert config.selected_model_config(item["catalogModelId"]).base_url == "https://gateway.invalid/v1"
@@ -71,12 +76,12 @@ def test_deepseek_has_one_catalog_entry_but_old_sdk_id_still_resolves():
     assert old.api_key == "secret-test-key"
 
 
-def test_missing_runtime_directory_is_distinct_from_incompatible_protocol(monkeypatch):
+def test_missing_sdk_runtime_does_not_disable_a_text_connection(monkeypatch):
     item = save()
     monkeypatch.setattr(config, "_claude_sdk_state_ready", lambda: False)
     option = config.model_catalog()["models"][0]
-    assert option["id"] == item["catalogModelId"] and option["agentAvailable"] is False
-    assert "目录" in option["agentUnavailableReason"]
+    assert option["id"] == item["catalogModelId"] and option["agentAvailable"] is True
+    assert option["agentUnavailableReason"] is None
 
 
 def test_invalid_protocol_rejected_before_persistence():
@@ -85,35 +90,36 @@ def test_invalid_protocol_rejected_before_persistence():
     assert not config._connection_store_path().exists()
 
 
-@pytest.mark.parametrize("purpose", ["agent", "formula"])
-def test_connection_test_uses_requested_runtime_and_does_not_save(monkeypatch, purpose):
+@pytest.mark.parametrize("purpose", ["connection", "agent", "formula"])
+@pytest.mark.parametrize("protocol", ["anthropic", "openai_compatible"])
+def test_connection_test_is_unified_even_for_old_clients_and_does_not_save(monkeypatch, purpose, protocol):
     calls = []
     async def agent(connection):
-        calls.append(("agent", connection))
+        pytest.fail("unified connection test must not require the SDK runtime or tools")
     async def formula(connection):
         calls.append(("formula", connection))
     monkeypatch.setattr(sdk_agent, "check_sdk_connection", agent)
     monkeypatch.setattr(main_module, "test_model_connection", formula)
     response = TestClient(main_module.app).post("/api/settings/model/connections/test", json={
         "label": "test", "baseUrl": "https://gateway.invalid", "modelId": "chosen-model",
-        "apiKey": "secret", "protocol": "anthropic" if purpose == "agent" else "openai_compatible", "purpose": purpose,
+        "apiKey": "secret", "protocol": protocol, "purpose": purpose,
     })
-    assert response.status_code == 200 and response.json()["testedFor"] == purpose
-    assert [call[0] for call in calls] == [purpose]
+    assert response.status_code == 200 and response.json()["testedFor"] == "connection"
+    assert [call[0] for call in calls] == ["formula"]
     assert calls[0][1].model == "chosen-model" and calls[0][1].api_key == "secret"
     assert not config._connection_store_path().exists()
 
 
-def test_anthropic_cannot_claim_formula_test_success(monkeypatch):
-    async def forbidden(connection):
-        pytest.fail("must not send Anthropic credentials to chat/completions")
-    monkeypatch.setattr(main_module, "test_model_connection", forbidden)
+def test_anthropic_test_preserves_protocol(monkeypatch):
+    async def check(connection):
+        assert connection.adapter == "claude_agent_sdk"
+    monkeypatch.setattr(main_module, "test_model_connection", check)
     response = TestClient(main_module.app).post("/api/settings/model/connections/test", json={
         "label": "test", "baseUrl": "https://gateway.invalid", "modelId": "m",
         "protocol": "anthropic", "purpose": "formula",
     })
-    assert response.status_code == 400
-    assert response.json()["detail"]["code"] == "MODEL_CONNECTION_INCOMPATIBLE"
+    assert response.status_code == 200
+    assert response.json()["testedFor"] == "connection"
 
 
 @pytest.mark.parametrize("tool_call", ["valid", "wrong_token", "text_only"])
@@ -141,7 +147,7 @@ def test_sdk_probe_requires_real_tool_receipt_and_exposes_no_workbook_tools(monk
             asyncio.run(sdk_agent.check_sdk_connection(connection))
 
 
-def test_resume_candidates_exclude_formula_only_connections(monkeypatch):
+def test_resume_candidates_ignore_legacy_agent_capability_gate(monkeypatch):
     monkeypatch.setattr(main_module, "model_settings_view", lambda: {"connections": [
         {"catalogModelId": "connection:formula", "label": "formula", "modelId": "m", "agentAvailable": False},
         {"catalogModelId": "connection:agent", "label": "agent", "modelId": "m", "agentAvailable": True},
@@ -151,7 +157,7 @@ def test_resume_candidates_exclude_formula_only_connections(monkeypatch):
         pause_reason="", approved_wall_time_seconds=600, turn_id="t", revision=1,
         last_sequence=0, extension_count=0, model_switches=[])
     result = main_module._planning_pause_payload(record)
-    assert [item["catalogModelId"] for item in result["availableModelConnections"]] == ["connection:agent"]
+    assert [item["catalogModelId"] for item in result["availableModelConnections"]] == ["connection:formula", "connection:agent"]
 
 
 def test_probe_with_no_key_cannot_borrow_cached_sdk_login(monkeypatch):

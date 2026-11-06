@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from openpyxl import Workbook
 
 from server.app.folder_workbooks import (
@@ -285,3 +287,105 @@ def test_folder_and_sheet_ids_are_stable_across_rescans(tmp_path: Path) -> None:
         first_snapshot.worksheets[0].sourceSheetId
         == second_snapshot.worksheets[0].sourceSheetId
     )
+
+
+def test_folder_query_refuses_headerless_sources_instead_of_dropping_a_row(
+    tmp_path: Path,
+) -> None:
+    """文件夹模式没有「无表头」这条路，声明了就必须明确拒绝。
+
+    它的读取固定把每个文件的第一行当表头。若静默忽略 `hasHeaders=false`，
+    「五个数的合计」会算成 14，而用户看不出少的是哪一行 —— 所以宁可报错。
+    """
+    source = tmp_path / "no-header.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "数据"
+    for value in range(1, 6):
+        sheet.append([f"项{value}", value])
+    workbook.save(source)
+    workbook.close()
+    catalog = scan_folder(tmp_path)
+    create_folder_snapshot(
+        FolderSnapshotRequest(
+            sessionId=catalog.sessionId,
+            selections=[
+                FolderSelection(fileId=catalog.files[0].id, sheets=["数据"])
+            ],
+        )
+    )
+
+    with pytest.raises(ValueError, match="无表头"):
+        query_folder_data(
+            FolderQueryRequest(
+                sessionId=catalog.sessionId,
+                request=DataToolRequest.model_validate(
+                    {
+                        "id": "no-header",
+                        "tool": "query_table",
+                        "arguments": {
+                            "mode": "aggregate",
+                            "hasHeaders": False,
+                            "metrics": [
+                                {
+                                    "operation": "sum",
+                                    "field": "列2",
+                                    "outputName": "合计",
+                                }
+                            ],
+                        },
+                    }
+                ),
+            )
+        )
+
+
+def test_folder_query_refuses_range_instead_of_ignoring_it(tmp_path: Path) -> None:
+    """文件夹模式读的是整个文件，没有按区域裁剪这一步，给了 range 必须明确拒绝。
+
+    它的读取走 `iter_rows` 到 max_row/max_column。若静默忽略 `range`，
+    「A1:B5 的合计」会把区域外的 B6 也算进来，而结果里看不出多算了哪一行。
+    """
+    source = tmp_path / "with-header.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "数据"
+    sheet.append(["项目", "数量"])
+    for value in range(1, 6):
+        sheet.append([f"项{value}", value])
+    sheet.append(["区域外", 100])
+    workbook.save(source)
+    workbook.close()
+    catalog = scan_folder(tmp_path)
+    create_folder_snapshot(
+        FolderSnapshotRequest(
+            sessionId=catalog.sessionId,
+            selections=[
+                FolderSelection(fileId=catalog.files[0].id, sheets=["数据"])
+            ],
+        )
+    )
+
+    with pytest.raises(ValueError, match="range"):
+        query_folder_data(
+            FolderQueryRequest(
+                sessionId=catalog.sessionId,
+                request=DataToolRequest.model_validate(
+                    {
+                        "id": "with-range",
+                        "tool": "query_table",
+                        "arguments": {
+                            "mode": "aggregate",
+                            "range": "数据!A1:B5",
+                            "metrics": [
+                                {
+                                    "operation": "sum",
+                                    "field": "数量",
+                                    "outputName": "合计",
+                                }
+                            ],
+                        },
+                    }
+                ),
+            )
+        )

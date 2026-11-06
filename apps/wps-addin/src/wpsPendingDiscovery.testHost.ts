@@ -23,7 +23,14 @@ export type PendingDiscoveryJob = {
   operationId: string;
   taskId: string;
   workbookIdentity: string;
+  /**
+   * 候选的性质：`resume` = 还有动作没写；`review` = 写完了、审阅没有收尾。
+   * 不传时按状态推：`completed` 只能是 `review`，其余只能是 `resume` —— 这只是替身
+   * 的便利默认值，**不是**判据（真判据只认账本显式的 `review_state`）。
+   */
+  kind?: PendingExecutionCandidate["kind"];
   status: PendingExecutionCandidate["status"];
+  reviewState?: PendingExecutionCandidate["reviewState"];
   nextActionIndex: number;
   totalActions: number;
   inFlightActionIndex?: number | null;
@@ -70,11 +77,14 @@ export type PendingDiscoveryBackend = {
 function normalize(job: PendingDiscoveryJob): Stored {
   const now = Date.now();
   const createdAt = job.createdAt ?? now;
+  const kind = job.kind ?? (job.status === "completed" ? "review" : "resume");
   return {
     operationId: job.operationId,
     taskId: job.taskId,
     workbookIdentity: job.workbookIdentity,
+    kind,
     status: job.status,
+    reviewState: job.reviewState ?? (kind === "review" ? "pending" : null),
     nextActionIndex: job.nextActionIndex,
     totalActions: job.totalActions,
     inFlightActionIndex: job.inFlightActionIndex ?? null,
@@ -92,7 +102,9 @@ function project(entry: Stored): PendingExecutionCandidate {
   return {
     operationId: entry.operationId,
     taskId: entry.taskId,
+    kind: entry.kind,
     status: entry.status,
+    reviewState: entry.reviewState,
     createdAt: entry.createdAt,
     updatedAt: entry.updatedAt,
     nextActionIndex: entry.nextActionIndex,
@@ -131,7 +143,14 @@ export function createPendingDiscoveryBackend(
       }
       const visible = [...entries.values()].filter((entry) =>
         entry.workbookIdentity === workbookIdentity &&
-        (entry.status === "running" || entry.status === "needs_reconciliation" || entry.status === "failed") &&
+        /*
+         * `completed` 只在**显式**待审阅时出现（`review_state = pending/blocked`）：
+         * 这就是服务端那条判据的替身。以前这里把 `completed` 一刀切排除，于是
+         * "执行完了但没确认，刷新后待审阅消失"这件事在测试里根本没有对应场景。
+         */
+        (entry.kind === "review"
+          ? entry.status === "completed" && (entry.reviewState === "pending" || entry.reviewState === "blocked")
+          : entry.status === "running" || entry.status === "needs_reconciliation" || entry.status === "failed") &&
         // 处置只压住"这一版"：账本之后又有变动（`updatedAt` 更新）就重新出现。
         (entry.dismissedAt === null || entry.dismissedAt < entry.updatedAt)
       );

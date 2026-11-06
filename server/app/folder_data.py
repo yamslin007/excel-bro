@@ -9,7 +9,14 @@ import pandas as pd
 from openpyxl import load_workbook
 
 from .capabilities import capability_int
-from .models import CellValue, DataFilter, DataToolRequest, DataToolResult
+from .models import (
+    CellValue,
+    DataFilter,
+    DataToolRequest,
+    DataToolResult,
+    QueryIncompleteReason,
+    QueryTruncation,
+)
 
 
 @dataclass(frozen=True)
@@ -171,11 +178,37 @@ def execute_folder_query(
     if not authorized_sheets:
         raise ValueError("没有已授权的文件夹工作表")
     arguments = request.arguments
+    if arguments.hasHeaders is False:
+        # 文件夹模式的读取固定把每个文件的第一行当表头（见上面构造 DataFrame 的
+        # 那段），没有「无表头」这条路。**不静默忽略**这个声明：忽略会让无表头
+        # 数字区域少算一行，而且用户看不出少了哪一行 —— 宁可明确拒绝。
+        raise ValueError(
+            "文件夹模式不支持「源区域无表头」的查询；请先补一行表头，或改用工作簿模式。"
+        )
+    if arguments.range is not None:
+        # 同上：文件夹模式读的是整个文件（`iter_rows` 到 max_row/max_column），
+        # 没有按区域裁剪这一步。忽略 range 会把区域外的数据也算进来，
+        # 而结果里看不出多算了哪些行。
+        raise ValueError(
+            "文件夹模式不支持按区域（range）查询；请缩小文件里的数据范围，或改用工作簿模式。"
+        )
     sources = (
         authorized_sheets[:1]
         if arguments.scope == "active"
         else authorized_sheets
     )
+    if arguments.sheets:
+        # `sheets` 是"本次要查哪几张表"。给了就按名字收窄，**不静默忽略**：
+        # 名字对不上时明确报错，而不是把它当成"全部都要"照旧读一遍。
+        wanted = {name.strip() for name in arguments.sheets if name.strip()}
+        by_name = {source.display_name: source for source in sources}
+        missing = [name for name in wanted if name not in by_name]
+        if missing:
+            raise ValueError(
+                f"本次要查的工作表「{'、'.join(missing)}」不在已授权的文件夹范围内"
+                f"（可选：{'、'.join(by_name) or '无'}）"
+            )
+        sources = [source for source in sources if source.display_name in wanted]
     required = [
         *arguments.fields,
         *arguments.groupBy,
@@ -195,10 +228,15 @@ def execute_folder_query(
     required = [field for field in required if field]
     frames: list[pd.DataFrame] = []
     warnings: list[str] = []
+    # 与 warnings 同一次判断写下的结构化原因：`complete` 只由它派生。
+    incomplete: list[QueryIncompleteReason] = []
     for source in sources:
         frame = _read_authorized(source)
         if frame.empty:
             warnings.append(f"「{source.display_name}」没有数据行")
+            incomplete.append(
+                QueryIncompleteReason(kind="empty_sheet", sheet=source.display_name)
+            )
             continue
         source_required = required
         if arguments.combine and arguments.combine.mode == "join":
@@ -211,8 +249,16 @@ def execute_folder_query(
             )
         resolved, missing = _resolve_columns(frame, source_required)
         if missing:
+            unique_missing = sorted(set(missing))
             warnings.append(
-                f"「{source.display_name}」未找到字段：{'、'.join(sorted(set(missing)))}"
+                f"「{source.display_name}」未找到字段：{'、'.join(unique_missing)}"
+            )
+            incomplete.append(
+                QueryIncompleteReason(
+                    kind="missing_field",
+                    sheet=source.display_name,
+                    fields=unique_missing,
+                )
             )
             continue
         frame = frame.rename(columns={column: field for field, column in resolved.items()})
@@ -354,6 +400,15 @@ def execute_folder_query(
     output = output.head(arguments.limit)
     headers = [str(column) for column in output.columns]
     rows = [[_cell(value) for value in row] for row in output.itertuples(index=False, name=None)]
+    truncation = (
+        QueryTruncation(
+            shownRows=len(rows),
+            totalRows=len(data),
+            limit=arguments.limit,
+        )
+        if len(data) > len(rows)
+        else None
+    )
     return DataToolResult(
         requestId=request.id,
         tool="query_table",
@@ -362,7 +417,10 @@ def execute_folder_query(
         rows=rows,
         sourceSheets=[source.display_name for source in sources],
         scannedRows=scanned_rows,
-        complete=not warnings,
+        complete=not incomplete,
         calculation=calculation,
         warnings=warnings,
+        incomplete=incomplete,
+        truncated=truncation is not None,
+        truncation=truncation,
     )

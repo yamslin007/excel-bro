@@ -461,9 +461,12 @@ def test_planner_narrows_legacy_read_policy_without_uploading_snapshot_rows(
     assert request.planningReadPolicy == "ifNeeded"
 
 
-def test_sdk_connection_cannot_be_used_as_openai_compatible() -> None:
-    with pytest.raises(ModelNotAvailableError, match="尚未接入"):
-        OpenAICompatibleClient(_connection(), timeout=1)
+def test_sdk_connection_uses_anthropic_auth_in_the_shared_text_client() -> None:
+    connection = _connection()
+    client = OpenAICompatibleClient(connection, timeout=1)
+    assert client.connection is connection
+    assert client._headers()["x-api-key"] == connection.api_key
+    assert "Authorization" not in client._headers()
 
 
 def test_sdk_refuses_another_backends_checkpoint_instead_of_replanning(

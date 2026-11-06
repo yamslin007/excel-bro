@@ -123,6 +123,39 @@ def _inline_json_schema(schema: dict[str, Any]) -> dict[str, Any]:
     return resolve(schema)
 
 
+def query_bindings_of(arguments: dict[str, Any]) -> dict[str, Any]:
+    """`query_table` 调用的**绑定事实**：查了哪些表、哪个区域、什么口径。
+
+    只取结构字段，**不取任何值**（筛选值、单元格内容都不在这里）。用处是让
+    "查错了表"这类故障事后可证：2026-11-01 真机上用户只要求查「来源」表，结果却
+    扫了四张表，而账本里当时只有 `tool` 与 `operationId`，只能靠 `sourceSheets`
+    反推，无法区分"模型没传表名"和"执行器忽略了表名"。
+    """
+    if not isinstance(arguments, dict):
+        return {}
+    sheets = arguments.get("sheets")
+    range_text = arguments.get("range")
+    has_headers = arguments.get("hasHeaders")
+    return {
+        "mode": _short_text(arguments.get("mode"), 20),
+        "scope": _short_text(arguments.get("scope"), 20),
+        "sheets": (
+            [str(name)[:200] for name in sheets][:30]
+            if isinstance(sheets, list)
+            else []
+        ),
+        "range": _short_text(range_text, 40),
+        "hasHeaders": has_headers if isinstance(has_headers, bool) else None,
+    }
+
+
+def _short_text(value: Any, limit: int) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text[:limit] if text else None
+
+
 def _query_table_parameters() -> dict[str, Any]:
     """``query_table`` parameter schema, generated from the shared model.
 
@@ -151,6 +184,9 @@ def local_query_tool_definitions() -> list[dict[str, Any]]:
                 "description": (
                     "查看本任务已授权工作表的结构（表名、使用范围、行列数、表头）。"
                     "只返回授权范围内的结构信息，不含任何数据行。"
+                    "headers 就是 query_table 里的字段名。**无表头区域返回合成列名"
+                    "「列1、列2……」，此时所有行（含第一行）都是数据**，不要把它当成"
+                    "「第一行是表头」。"
                 ),
                 "parameters": {"type": "object", "properties": {}},
             },
@@ -167,6 +203,20 @@ def local_query_tool_definitions() -> list[dict[str, Any]]:
                     "结果引用和结果结构，**不含任何数值**；真实结果由本地结果卡展示。"
                     "需要多步查询时可在同一任务内多次调用，也可以根据回执修正参数后"
                     "再次调用。"
+                    "字段名就是表头文字；**无表头区域的字段名是「列1、列2……」**"
+                    "（如 A1:B5 没有任何表头、B 列是五个数字时，B 列是「列2」）："
+                    "这种区域所有行都是数据，不得把第一行当表头排除。"
+                    "**只读区域用 range 指定**（如 A1:B5、来源!A1:B5）：给了区域，"
+                    "**区域外的单元格不参与计算**；省略 range 才是整张已用区域。"
+                    "带工作表名时那张表必须已授权，否则整条请求按越权失败。"
+                    "**必须绑定本次要查的表**：授权集合只是允许访问的上限，**不是本次查询"
+                    "范围**。用户点名了工作表（如「查来源表」）时，只查那张表 —— 用 range "
+                    "带上表名（来源!A1:B5）或用 sheets 列出（sheets: [\"来源\"]）。"
+                    "可查范围有多张表却没绑定时，工具会直接报错并列出可选表名，"
+                    "**不会**退成「把已选表全查一遍」：那会让结果混进别的表，还可能带出"
+                    "一堆「某表没有这个字段」。真正需要跨表时，把要查的表名在 sheets 里列全。"
+                    "**只读需求不得转成写入方案**：读出结果不需要先写进任何单元格；"
+                    "区域读不了就如实说明，不要改用写入去实现范围限制。"
                 ),
                 "parameters": _query_table_parameters(),
             },

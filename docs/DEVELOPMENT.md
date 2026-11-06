@@ -1,3 +1,221 @@
+## 2026-11-06：macOS 双宿主安装包
+
+Mac arm64 包同时构建 Excel 与 WPS 前端，共享一个冻结运行时及后端：Excel HTTPS localhost:3000，WPS HTTP 127.0.0.1 使用 capabilities.devServers.wpsPortCandidates 首项（当前 3889），不漂移端口。安装器以桌面用户身份将 Excel manifest 写入 wef，将 WPS ET 插件登记合并到 ~/Library/Containers/com.kingsoft.wpsoffice.mac/Data/.kingsoft/wps/jsaddons/publish.xml；保留其他插件、注释与原配置备份。损坏 XML、实体声明及符号链接拒绝改写；卸载只移除本插件的 name/type 条目，保留用户模型配置。重开 Excel/WPS 后加载入口，WPS 版本须具备 JS 加载项能力。
+
+PyInstaller 显式 collect-all claude_agent_sdk，包含平台原生 CLI；Mac 构建时执行冻结程序 --self-test，检查后端导入、双端资源、CLI --version，再在临时 home 验证注册/卸载，不启动 8765 或操作工作簿。产出 .pkg 及 SHA-256；当前未做 Apple 签名/公证。Windows 的打包/注册流程不在本次变更范围，已有 Excel-only 安装器须单独升级，不能据此宣称 Windows 双宿主安装已完成。
+
+自动化已实现；Mac 双端实际入口显示、安装器权限、沙盒和 Excel/WPS API 兼容性仍待实机验收。具体构建结果见本轮交付。
+
+## 2026-11-06：本轮提交前验证
+
+本轮打包双端审阅/恢复与副本生命周期、对话与外观、统一模型连接和 SDK 协议适配的代码、测试、配置与文档；不纳入临时目录、运行数据、真实工作簿及测试产物。
+
+提交前检查：core 全量 1261 passed；WPS 全量 1334 passed、8 skipped；服务端 2113 passed、1 skipped；Excel/WPS build（含 tsc）、服务端 compileall、暂存 diff --check 均通过。WPS 旧多表前态用例改为分别核实目标越界拒绝、缺少整表前态拒绝、按动作索引单表投影与真实副本重建，不放松运行时校验。
+
+Excel 全量两次各有 1 项授权界面用例失败（首次为选择器待提交状态未在时限内解除，限制单工作进程后为文件夹选择器异步状态断言）；两次均为 1853 passed、1 failed、9 skipped。随后独立顺序复查 excelWriteEndToEnd.test.tsx 与 folderScopeSafety.test.tsx，119 passed。此处保留全量失败记录，不将定向复测等同于全量全绿。日志 outputs/git-round-*.log；本轮未做原生宿主实机验收。
+
+## 2026-11-05：撤销后的颜色标记清理
+
+Excel 补齐旧规则 id 失效时的精确归属回查和删除后回读，WPS 补齐删除后回读；两端外部撤销等待审阅收尾。清理失败保留本次规则记录，通过既有入口重试清理，不再次恢复单元格。只认本次随机公式，不删除用户原有颜色或其他规则。
+
+自动化覆盖规则 id 变化、归属歧义、静默删除失效、其他规则保留、撤销反馈等待收尾，以及真实组件放弃后规则数归零。日志 outputs/undo-marks-*.log。宿主接口由替身提供，不代表实机通过；真实双端需在独立测试工作簿检查撤销后颜色消失、业务格式保留。刷新前端窗格加载修复，无需重启后端；已记录的旧残留会走现有重载清理，不扫描或抹除无归属的黄色。
+
+## 2026-11-05：旧撤销记录不注入新对话
+
+WPS 原有兜底在找不到 verification.executionId 匹配消息时，把发现的终态恢复记录追加在当前消息流末尾，导致欢迎页/新对话也常驻旧撤销摘要。已移除该兜底，只在原任务匹配的执行消息内保留 RecoveryTerminalRecord；不清账本、历史、恢复材料，不改变恢复判据或操作。Excel 没有该兜底，无须添加新展示。待核对/阻断/未完成的恢复入口不受影响。
+
+回归覆盖有归属与无归属两类已撤销执行后发送普通聊天、已完成任务连续重开、新任务仍可审阅；保持零新增写入和恢复材料保留。日志 outputs/orphan-terminal-*.log，两端构建通过。真实宿主未操作，刷新 WPS 窗格后验收；无需重启后端。
+
+## 2026-11-05：普通聊天后的空待办计数
+
+两端 pushPending 在构造 TaskExecutionNotice 节点时就登记任务状态，但该组件在空闲、普通发送等状态返回 null，产生“待处理 1 项 · 任务状态”的空壳。共享 taskExecutionNoticeText 同时驱动父级登记与组件渲染，有实际状态文本才计数。暂停、停止中、不可中断及审阅说明仍保留；真实清理/恢复事项继续由各自入口登记。WPS 的已撤销摘要是消息历史，不属于待办，保留其记录和展开入口，没有删除账本或恢复材料。
+
+Excel 提示组件和真实 App 结构测试 13 passed；WPS 面板 254 passed、5 skipped，包含已撤销任务后普通聊天无待办栏且历史摘要保留。两端 build（含 tsc）通过，日志 outputs/empty-pending-*.log。未操作真实工作簿，原生宿主待刷新窗格验收；本轮只需刷新前端，无需重启后端。
+
+## 2026-11-05：放弃恢复与展示副本收尾分离
+
+已证实：Excel closeCompatReviewCopy 为了满足旧的活动表匹配而激活 session.original，可能把用户从最后比对的子表带走；窗口桥 close_copy 又用活动子表匹配多子表副本，原表/副本标签不同会返回 identity_lost。正常、续跑、刷新恢复三条 Excel closeBefore 原先丢弃具体关闭状态，续跑 restore 也漏了 discard 来源标记；useUndoSnapshot 的底层成功消息与 ResultReview 终态消息重复。共享 closeBefore 在保存副本登记时抛错会越过清理分类，被外层误报成放弃失败；已有结构化清理清单缺少独立重试入口。
+
+本轮关闭采用 v2 隐藏 nonce + 未保存身份 + 唯一副本 + 原簿路径哈希，不再依赖活动子表。最终仍由 Windows 适配器复核持有的 Workbook、隐藏标识、无路径、格式及窗口身份，先 SaveCopyAs 归档再 Close(false)；另存、重复/缺失身份及不可核实关闭仍保留。旧 v1 nonce 表签约束不放宽。查看、排列、切表接口继续保留各自的表级校验。前端关闭不再调用 sheet.activate，因此不制造收尾导航、也不更新授权基线。原生关闭前复用身份核实过的 suspend_pair 恢复原窗口位置并解除并排，再重新核实双方身份；失败保留副本，不伪造退出成功。恢复后的 scan 改为被等待，使数据范围栏刷新完成后才结束恢复调用。
+
+共享层按宿主副本身份对清理调用去重，不只是对提示去重；清理、登记存储错误保持 discarded/confirmed 业务终态。新增 retryCopyCleanup，仅终态、非处理中、审阅决定已落账才可调用；retryDecision 与 retryMarkerCleanup 保留。界面为三种收尾提供对应重试，清掉其他 notice 不会藏起仍存在的 copyCleanup。已恢复但登记失败时不再次恢复，未能核实完整恢复时不发布 discarded。
+
+Excel 逆序逐动作恢复后立即回读本动作涉及的公式/值、数字格式、逐格格式属性、行高和列宽；允许 null/空字符串表示同一个空格，其他内容仍严格比较。重叠动作按各步中间前态核对，避免误拿早期快照与最终状态比较。回读失败提示可能已有部分恢复，不声明全部完成；原有工作簿、授权、写后现场、指定恢复栈顶校验不放宽。Reviewed discard 不再广播底层“已撤销上一次执行”，只由审阅终态发布一条主结论；真正撤销入口继续原有消息。WPS 原本已区分 undo/discard，保留其恢复和整本副本内容保护，补齐副本身份去重、独立重试及具体关闭原因。
+
+当前工作区已有 ComposerPendingBar + composer-dock 两层结构，保留：通知在整个输入区上方，工具栏和输入框相邻，没有把清理提示插入其中；保留壁纸、模型和输入框样式。
+
+自动化证据（独立内存工作簿/宿主替身，不是实机）：共享审阅 58 passed；Excel 恢复/格式/原生副本/真实 App 端到端/工具栏布局七文件 218 passed，后续新增独立回读失败用例与重试按钮用例另有定向日志；WPS 原生副本/执行器/真实面板 348 passed、5 skipped；窗口桥 pytest 115 passed（含关闭前恢复原窗口位置、活动子表不变）。覆盖多子表、不同活动标签、退出重进、刷新接回、重复放弃、关闭失败重试不再恢复、另存/已关闭/身份丢失、真实范围变化仍拦截及确认不重写。双端 320/400/500px 浏览器布局检查通过。日志 outputs/discard-fix-*.log；追加界面测试 17 passed、恢复回读测试 14 passed；最终 build:addin/build:wps（含 tsc）均通过，compileall 通过。上述定向用例有重叠，不累加成全量测试数。
+
+Excel/WPS 原生实机均未验证。本轮未操作用户工作簿、未删除归档/账本、未启动额外 8765 服务、未提交 Git。需要重启已有后端以加载新的关闭匹配规则，并刷新两端窗格；不得为验收重放原用户任务。独立测试簿实机待验：三张结果表中切到结果3、原副本异表标签放弃，检查原表值/公式/格式与恢复点一致、副本按身份清理、当前表与范围栏一致；再验关闭失败重试与实际换簿仍受守卫保护。
+
+## 2026-11-05：双视图审阅说明折叠与异常保留
+
+本轮仅调整展示字段与说明归属：ResultReviewState.comparisonHelp.scope/layout 分别承载常规范围说明和布局帮助，notice 继续承载操作异常；不按中文内容判断隐藏。Excel 的静态值、基础格式/合并区域及不含图表/条件格式说明、WPS 的冻结值与基础格式/列宽及复杂对象来自打开时原表的限制，均进入「查看详情 → 比对范围」。自动调窄失败和 Excel 自动并排失败的手动帮助进入「布局说明」，默认折叠。主操作区保留状态、选表、退出、确认/放弃；间距由 10px 收至 6px，不预留说明占位。未增加方向标识或新按钮。
+
+WPS 缺完整前态、标记清理无法核实、身份/切表/恢复失败继续由 notice 或 compareUnavailable 显示；没有统一隐藏 notice。现有执行、授权、确认、恢复和副本清理调用顺序未改，退出继续保留副本。
+
+验证：共享审阅测试 52 passed；Excel 审阅组件及原生适配器 56 passed；WPS 原生适配器与面板 299 passed、5 skipped；build:addin/build:wps 均通过。双端样式浏览器探针覆盖 320/400/500px，三颗审阅按钮均在视口内、八张长表名 3/3/2 分页无横向溢出、长错误独立滚动、详情默认折叠。日志 outputs/review-help-*.log。首轮 WPS 测试依赖旧通用说明失败，补回详情中的通用说明后全文件复跑通过；新增 Excel 范围断言最初放到旧 staged 路径，移至真实 before-result 路径后复跑通过。
+
+两端均已实现；原生实机待验：独立测试簿中查看正常比对、自动宽度不可用和真实错误时的提示归属，展开范围/布局说明，检查窄窗格按钮。未操作用户真实工作簿，未重新执行任务或清理审阅状态；浏览器夹具不能代替原生验收。
+
+## 2026-11-05：多子表副本与切换验证
+
+新比对为一份副本包含全部目标子表。Excel 新增 select-sheet 本机桥；更新后在现有服务终端 Ctrl+C，再运行 `npm run dev:server`，刷新前端即可，不重新执行用户计划。不启动第二个隐藏服务占用 8765。
+
+专项测试覆盖：一份 XLSX 多子表、冻结前值/共享格式、一次创建、切表不排列/不暂停/不重复保存、退出复用、恢复认领、旧记录升级、确认后单次关闭、身份/授权错误拒绝、WPS 非当前子表额外修改保留。测试仅使用合成数据及宿主替身；独立 openpyxl 解析合成 XLSX 也验证通过，不能据此宣称原生切换耗时已达标。
+
+原生验收：独立测试簿执行一次三表任务，打开后仅一份三子表副本；结果1→结果3→结果1 两侧同名，窗口宽度不反复变化；退出/重开复用；确认/放弃成功后关闭，任一恢复失败继续保留。完整记录见 [双视图专项](DUAL_VIEW_RETENTION_2026-11-05.md)。
+
+## 2026-11-05：Excel 对比副本表签修复与本机服务更新
+
+用户截图的 Excel 副本表签为 EB_nonce，而 WPS 保留“结果1”。现已分离显示名与隐藏身份；兼容恢复查看旧 nonce 副本，仅更新该临时副本标签和固定隐藏名称。旧服务 OpenAPI 实测缺失 suspend/resume，导致退出失败；已核验本项目进程后按既有 SDK 启动脚本重启，健康检查通过，现有两个接口与 copyIdentityVersion 1/2。
+
+Excel 专项 270 passed（含逐表名称对应、复用不重写、请求只含元数据）；窗口桥 112 passed（含标识缺失/错误、重名/另存拒绝、旧副本迁移）；WPS 原生比对替身 45 passed。两端生产构建通过。独立 openpyxl 解析生成的合成 XLSX，核对单个“结果1”可见表签、原值与隐藏常量标识均通过。后端编译及差异检查通过。日志 `outputs/copy-label-*.log`。
+
+未实际修改用户工作簿内容，未自动确认/放弃；原生只读窗口元数据检查不替代表签迁移/并排交互的实机验收。完整实机流程仍待验，已有副本可退出再进入以触发核对升级，无需重发写入任务。材料或身份不明时继续保留待审阅并提示原因。
+
+## 2026-11-05：任务状态栏垂直居中
+
+截图中的暂停按钮偏低来自独立按钮遗留的 `margin-top: 8px`；圆点共用动画含向上位移，窄窗格还覆盖成顶对齐。共享状态栏内取消按钮外边距，统一按钮居中、字号及行高，圆点改为固定中心的透明度动画，窄窗格保留垂直居中。仅修改 styles.css 与 appearance.css，不改变任务行为。
+
+Excel/WPS 均加载这两份样式，已实现。真实 Chromium 加载各端样式，验证有效宽度 320/420/600/1000px、100%/150% 缩放共 16 组：按钮中心对齐、圆点不位移、无水平溢出；已有 TaskProgressTimeline 测试 26 项通过，两端构建通过。浏览器证据在 `outputs/probe/status-alignment/`，原生宿主视觉仍待刷新窗格后验收。
+
+## 2026-11-05：Excel 前态上下文对齐与双端副本保留
+
+实现、限额、失败语义及分端验收见 [双视图专项记录](DUAL_VIEW_RETENTION_2026-11-05.md)。须重启本机后端（新增 suspend/resume 路由）并刷新前端。旧任务缺写前整表快照时，不可重发任务来补造历史。自动化使用宿主替身；浏览器验证本机持久存储；本轮未修改用户工作簿，原生窗口行为仍须在独立测试簿验收。
+
+## 2026-11-05：重开审阅后无法放弃修复
+
+复现：Excel 执行完成、未处理审阅，销毁前端并清空缓存，再从账本找回审阅；放弃报“本次执行不是当前恢复栈顶”。审阅回执已恢复，但内存撤销栈为空。WPS 同类回归也复现：恢复包水合成功，但旧 undoRecord 为空而拒绝恢复。两端已接回真实恢复材料，保留指定执行、现场冲突与撤销顺序保护。
+
+| 端 | 实现 | 自动化验收 | 原生验收 |
+| --- | --- | --- | --- |
+| Excel | 已实现 | E2E、撤销 hook、授权范围测试 140 passed；生产构建通过 | 实机待验 |
+| WPS | 已实现 | 面板、执行器、恢复检查测试 357 passed、5 skipped；生产构建通过 | 实机待验 |
+
+覆盖重开后确认不重写、放弃恢复三格、后续人工修改零覆盖；Excel 另验其他任务栈顶与核对期间栈变化拒绝，WPS 另验水合旧记录保持栈顺序。日志 outputs/review-discard-excel.log、outputs/review-discard-wps-final.log、outputs/review-discard-build-*.log。没有修改用户工作簿、账本或恢复包。
+
+原生最短验收：独立测试簿完成多步写入后刷新窗格，找回审阅并放弃，核对所有目标恢复前值且没有新增执行；另测刷新后手改一个目标，应拒绝覆盖并保留审阅。不要重发原任务来恢复。
+
+## 2026-11-05：双视图目标定位与窗格接入修复
+
+用户报告 Excel 可以打开双视图，但内容/排列不正确。代码定位到两处断点：执行后 ResultReview 未接入旧流程已有的窗格比例管理；Excel 打开副本前未激活所选比对表，而原生排列桥按工作簿与活动工作表共同匹配原表。
+
+- Excel：核实工作簿及快照工作表 ID/名称，激活所选表并定位修改区域；副本设置同一初始活动单元格。新审阅副本接入宽度管理，打开期间禁止普通聊天偏好覆盖，退出恢复普通宽度。
+- WPS：既有目标表激活保留，将 ResultReview 的当前副本接入现有宽度/租约适配器。
+- 共享：仅通过内存 getter 提供当前比对句柄，不持久化；不再比对或进入终态即释放布局接入。宿主拒绝自动调宽时，审阅区显示手动调整提示。
+
+| 端 | 实现状态 | 验证证据 | 尚需原生验收 |
+| --- | --- | --- | --- |
+| Excel | 已实现 | 新增单元测试：活动标签错位、同名表替换拒绝、执行前值不被新结果替代、无新增写入、退出恢复宽度；原生副本/OOXML/比例/输入区专项通过；生产构建通过 | 本机 Excel 打开、多表切换、窗口排列与实际任务窗格宽度 |
+| WPS | 已实现同类宽度接入 | 副本/执行前快照/宽度/真实面板替身测试 333 passed、5 skipped；生产构建通过 | 本机 WPS 并排与退出宽度恢复 |
+
+共享 ResultReview 44 项通过。Excel 全量首次 1810 passed、9 skipped、1 超时；随后端到端文件复跑出现一次选表授权等待超时，再隔离运行 103/103 通过；最新提示用例 8/8 通过。保留全量运行的不稳定性记录，不宣称全量首次通过。日志 `outputs/dual-view-fix-excel-tests.log`、`outputs/dual-view-fix-e2e.log`。
+
+原生桌面查看工具两次启动失败（kernel exited / helper_unknown_error），本次未实机验证，也未修改真实工作簿；自动化使用有状态宿主替身。布局操作不执行 AnalysisPlan，不改变确认/放弃边界。
+
+## 2026-11-04：选表面板防遮挡
+
+Excel 与 WPS 的选表面板均挂载到聊天外壳的独立 `.scope-layer`，边界由窗格高度决定，不再依附输入框向上定位。标题与操作区固定，正文为唯一滚动区；工作表及文件列表不再套第二层纵向滚动。宽窗格并排显示跟随当前/选择多个，窄窗格自动堆叠。勾选即授权和确认关闭的语义保持不变。
+
+| 端 | 实现 | 验证 | 剩余验收 |
+| --- | --- | --- | --- |
+| Excel | 独立层、共享高度与滚动规则 | 真实 App 层级/选择测试、生产构建、浏览器布局夹具 | 原生任务窗格内长草稿、缩放、重开选表待验 |
+| WPS | 移除独立高度上限、共享高度与滚动规则 | WpsAgentPanel、选表/工作目录测试、生产构建、浏览器布局夹具 | 原生任务窗格内长草稿、缩放、重开选表待验 |
+
+`node scripts/check_scope_overlay_layout.mjs` 加载生产样式，以两端行结构构造离线布局夹具，检查 320×480、400×360、740×760、1280×900 与 72/300px 输入区的 16 种组合：标题和确认完整可见、只有正文滚动、末行与确认可达、无横向溢出。截图和测量位于 `outputs/probe/scope-overlay`。这是浏览器布局证据，不等同原生宿主验收；本次未操作真实工作簿。
+
+## 2026-11-04：双端阅读展示
+
+两端共用 ConversationMessage 与 conversation.css，助手正文、过程状态、澄清问题、结果操作以连续对话呈现；壁纸阅读底色按内容占位，空白画布透明。样式顺序为 styles → 宿主补充 → chatScrollbars → appearance → conversation。新增展示形态应进入共享层，不在两端面板另造消息外壳。刷新 Excel/WPS 窗格生效，原生宿主观感待验。[设计与验证](APPEARANCE_PREVIEW_2026-11-04.md)。
+
+## 2026-11-04：壁纸与外观验收
+
+Excel 前端全量 1807 passed / 9 skipped，WPS 1323 passed / 8 skipped；最后异步互斥补充后 useTheme 9 项复跑通过，两端再次构建。node scripts/check_appearance_layout.mjs 覆盖两端五档尺寸、样式一致、取消、IndexedDB 事务中断、保存及重载；截图 outputs/probe/appearance。刷新窗格 → EB Logo → 壁纸即可使用。原生宿主最终观感仍待验，未操作真实工作簿。[完整记录](APPEARANCE_PREVIEW_2026-11-04.md)。
+
+## 2026-11-04：通用 OpenAI 兼容接入验收
+
+后端更新后重启原启动脚本，再刷新 Excel/WPS。连接选择 OpenAI 或 Anthropic 兼容，按供应商文档填写基础地址、模型与 Key，点击统一“测试连接”；不再选择用途，文本正常回复即可使用。两种协议文本及公式调用：`test_unified_model_connection.py`；共享转换与真实本机 SDK 链路：`test_openai_sdk_transport.py`；双端前端覆盖旧 Agent 元数据为 false 时仍选择并发送原连接 ID。开发用 SDK 工具探针仍保留，不能把连接测试当作全功能证明。具体证据和宿主验收步骤见 [统一连接验收](UNIFIED_MODEL_CONNECTION_2026-11-04.md)。
+
+## 2026-11-03：模型工具栏验收
+
+两端模型入口位于 `.composer-toolbar`，顶部不再重复。验收：空目录显示「模型」；配置或切换后显示上游模型 ID 与对应厂商 Logo；选择仍保存连接目录 ID；长 ID 在窄窗格省略；菜单向上展开且不越界。旧版目录缺 `modelId` 时，托管连接按连接设置精确补齐，失败时保留完整连接标签。定向回归：`modelCatalogCompatibility.test.ts`、`components/ModelPickerLabel.test.tsx`；浏览器探针 `check_scope_entry_layout.mjs` 覆盖两端三档宽度和 DeepSeek Logo。原生 Excel/WPS 刷新、切换后视觉效果仍需实机验收。
+
+验证：Excel `styles.test.ts` / `messageFirstRouting.test.tsx` 共 91 passed，模型切换路由断言单独复跑 1 passed；WPS `WpsAgentPanel.test.tsx` 247 passed / 5 skipped；服务端模型连接与 SDK 目录相关 67 passed，compileall 通过。两端构建通过；`node scripts/check_scope_entry_layout.mjs` 检查两端 320/400/500px 布局。真实 Excel/WPS 窗格仍待验，本轮不操作工作簿。
+
+## 2026-11-03：重开窗格后待审阅还在——怎么跑、怎么验
+
+缺陷与设计见 [审阅状态持久化](REVIEW_STATE_PERSISTENCE_2026-11-03.md)。本机跑法：
+
+```
+# 需要后端与账本一起升（schema v14 会加 review_state / review_state_at 两列，不回填）
+./.venv/Scripts/python.exe -m pytest server/tests -q -p no:cacheprovider --basetemp="$(mktemp -d)"
+cd packages/core && npx vitest run
+npm run test:addin
+npm run test:wps
+npm run build:addin && npm run build:wps
+python -m compileall -q server/app
+```
+
+定向复跑（改这两端任何一处审阅路径时）：
+
+```
+npx vitest run src/excelWriteEndToEnd.test.tsx -t "重开窗格后审阅入口回来"
+cd apps/wps-addin && npx vitest run src/WpsAgentPanel.test.tsx -t "执行完成但没处理审阅"
+```
+
+真机步骤（**本轮未做，待验**）：
+
+1. 重启后端、重新加载两端加载项（账本加列在启动时迁移）。
+2. 跑一次会真正写入的小任务，等过程框结束、出现「确认全部变更 / 放弃全部变更」。
+3. **不要点任何按钮**：刷新任务窗格（Excel：重新打开加载项；WPS：关掉窗格再打开）。
+4. 期望：审阅入口回来了，提示里没有"本次没有需要你处理的后续操作"；
+   原表内容与刷新前逐格一致（没有被重写）。
+5. 点「确认全部变更」：只应出现"已确认变更"的收尾，原表内容不变；
+   再刷新一次，审阅入口**不再**出现。
+6. 反向：另跑一次，第 3 步刷新后点「放弃全部变更」，原表应回到执行前值；
+   再刷新不出现审阅入口，重复点击不重复恢复。
+
+已知不可重建：双视图（执行前快照只在上一次窗格内存里）；WPS 的颜色标记与"保存为工具"资格
+（标记公式只在上一次窗格内存里，账本也不存单元格值）。Excel 会按计划重新加条件格式标记，
+那不改单元格内容。
+
+## 对话窗格加宽入口
+
+Excel/WPS 的“更多”菜单提供“加宽对话窗格”，不访问单元格。Excel 使用 TaskPaneApi 1.1，缺少能力时提示手动拖动；WPS 仅使用当前已登记、可见且右侧停靠的任务窗格，并从当前原生宽度和 WebView 宽度换算单位。请求幅度 160 CSS px，上限分别为屏幕可用宽度或宿主窗口宽度的 70%；宿主可能不采纳请求，界面不承诺调整成功。双视图自动宽度管理期间拒绝本入口，避免覆盖布局。
+
+自动化：WPS 宽度及双视图租约定向测试 30 条通过；双端真实宿主是否接受宽度请求仍待验。当前双端构建受既有恢复发现类型错误阻断，不能记录为构建通过。
+
+## 相同公式的结果确认与中断判定
+
+真机确认提示“写前写后的公式文本相同”定位到 WPS 确认误用 inspectWpsUndoRecord。新增 inspectWpsConfirmedResult 供普通/恢复完成后的两个确认入口：要求记录 verified、全部动作 appliedRows 等于 rowCount，再只读核对当前结果。公式矩阵中每格为 written 或 indeterminate 时符合预期；混入 before/unknown 仍拒绝。inspectWpsUndoRecord 与公式续跑闸保持原判据，不能凭相同公式猜测写入历史。Excel 仍用 assertUndoPostState 核对写后状态，无需放宽恢复判据。
+
+自动化覆盖相同公式、相同与不同公式混合、目标被改回写前/第三种公式、未完成记录及缺失记录；确认不写单元格、不改变恢复记录。原生 WPS 当前审阅轮仍待用户点击验证。
+
+## 2026-11-02：确认失败保留核对原因
+
+ResultReview.confirm 按真实失败阶段判断 markerPending，只有 clearMarker 失败提示重试清理。validateResult 失败保留具体原因、不接受结果、不重复执行。WPS 普通与恢复后的确认入口均透传 inspectWpsUndoRecord.detail，不再把区域冲突、公式写前写后相同、读取失败及记录缺失合成“结果已变化或无法核对”。这不改变核对判据；当前真机究竟命中哪一个 detail 仍待获取，不能据笼统文案断言用户改过结果。
+
+## 2026-11-02：审阅工作表分页搜索
+
+Excel/WPS 共用 ReviewSheetPicker：每页最多三张表，中间纵向显示完整名称，两侧仅一组上一页/下一页。三张以内隐藏搜索与分页；超过三张显示搜索，匹配结果仍每页三张。搜索和翻页不派发 comparison，点击名称才调用既有对比接口。中文组合输入结束后筛选，清空搜索回到当前对比表所在页。列表不设第二层滚动，审阅动作行继续固定。
+
+自动化覆盖八表 3/3/2、搜索无匹配、清空定位、IME、忙碌禁用、双端切表零重写。浏览器探针 check_recovery_composer_layout.mjs 使用八张长表名检查三档宽度。真实 Excel/WPS 窗格仍需查看；未改变写入、授权或恢复逻辑。
+
+## 2026-11-01：SDK 主线证据对齐
+
+主线计划新增 §0 当前队列，A1 剩余表修正 Excel 公式 A/B、同会话/重开撤销、保存文件与 undone_at 的过时未验结论；S1 保留 10-26 双端注入原生证据，不能外推全部手动改源场景。WPS 两表值复制终态九步清单与四表公式 A/B 分开，不再互相引用为同一夹具。
+
+发现 copyRange 已有精确续跑用例，复跑 `cd apps/wps-addin; npx vitest run src/wpsExecutionResume.test.ts -t "copyRange 的精确续跑"`：1 passed / 65 未选中；这里只覆盖 values 展开、前两步写后中断、续跑仅 Target!A3，生产实现未改。未重跑全量/build，未重新操作真实工作簿或读取原账本。A1-GATE 仍未通过，A2 未启动。
+
+## 2026-11-01：对话定位条验证
+
+悬停目录调整：单条浮动预览替换为向左展开的可滚动摘要列表；行尾保留刻度，移出/Escape 收回，点击才跳转。目录 overscroll-behavior: contain，不带动消息流。共享组件与滚动 hook 10 passed；两端 build 通过；六十轮浏览器夹具在两端三档宽度验证展开边界、独立滚动、点击跳转和新内容不抢位置。日志 outputs/conversation-nav-menu-*.log，截图仍在下述目录；原生宿主待验。
+
+两端接入共享 ConversationNavigation。Excel 的 ConversationNavigation / useMessageAutoFollow / messageFirstRouting 定向共 71 passed；另 Fast Refresh 回归 2 passed。WPS WpsAgentPanel 232 passed / 5 skipped。两端 build 通过（含类型检查），仅既有大 chunk 提示。日志 outputs/conversation-nav-*.log。
+
+`node scripts/check_conversation_navigation_layout.mjs` 使用真实共享组件、滚动 hook 与双端样式，验证 320×640、400×720、500×760 的右侧留位、预览边界、输入区不遮挡、点击定位及新消息不抢滚动；截图在 outputs/probe/conversation-navigation。浏览器夹具通过不等于原生宿主验收。原生 Excel/WPS 待查看：两轮以上对话出现刻度，悬停展开目录、滚轮浏览、点击旧轮保持位置，回到底部恢复跟随，切换会话不串位置。本轮未操作工作簿，未修改后端或协议，未提交推送。
+
 ## 2026-11-01：全部积累改动提交前检查
 
 执行了 test:addin / test:wps / test:core、两端 build、服务端全量 pytest 和 compileall。核心 1101 passed；双端构建通过。首次 Excel 全量 1676 passed / 2 failed / 9 skipped，WPS 1239 passed / 22 failed / 8 skipped：失败为问卷替换后的旧 DOM/文案定位断言，按新位置修正，保留身份、授权、图片隐私与零写入断言。Excel 两个失败文件复跑 31 passed；WPS 四个失败文件先 45 passed / 1 failed，最后图片用例改等待实际问题而非已移除摘要后文件通过。面板凭据用例改用明确的短假凭据，相关三项复跑通过。没有把定向复跑记成整套重新全绿。
@@ -1246,6 +1464,15 @@ Office 不取单元格/usedRange；WPS 的 `readWpsHostProbe(...,{includeSelecti
 
 双端共用组件与 hook；用例须覆盖实际点击、有限重试、直接调用确认被拒、变化不被重试掩盖、旧写入不重放与零字段/数据读取。只需刷新前端，真实宿主尚待验收，见 [实施记录](./TARGET_CONFIRMATION_STATES_2026-10-08.md)。
 
+2026-11-01 补充（证据分级）：分析前置闸现在接受**文档级**证据 `documentBound`（路径身份 +
+宿主声明的工作表稳定 ID）。它是**有条件的**：宿主真的报出稳定 ID 时才成立，跨"重载任务窗格"
+仍有效；宿主给不出稳定 ID 或工作簿未保存时它不成立，仍确认一次（文案不得暗示用户改过勾选）。
+`conclusive`（对象级）含义不变，写入/恢复/隔离 Python 数据读取仍只认它。三键冲突、证据缺失、
+元数据范围变化一律照旧拦下；`requireExplicitConsent` **只**禁止用文档级证据替调用方跳过显式
+确认（恢复挂起任务卡），对象级证明或本会话同键同意仍然直接放行。细则见
+`docs/ARCHITECTURE.md` 同日章节（含 **2026-11-01 真机复测：这一支在真机上没有生效** 的修正）。
+**真实宿主仍未取得运行时布尔值**。
+
 ### 文件夹刷新不等于重新授权（2026-10-08）
 
 `applyFolderCatalog` 的 `preserveAuthorization` 仅用于候选刷新：同绝对根、同会话、已选目标均存在才保留原确认，不能将草稿/localStorage 勾选转为授权。重选目录与会话变化默认失效。澄清范围必须用本地目录根身份，不能仅凭目录显示名与相对文件名；根路径不得加进模型意图请求。目录转当前工作簿时用 `captureWorkbookCatalog` 检查名称，再读明确选择的表。后端快照必须读取前后核对全部选中文件指纹，并在通过后提交授权现场；执行前指纹保护不得省略。
@@ -2006,7 +2233,7 @@ Office 加载项清单的 `<Version>` 必须至少为 `1.0.0.0`，并包含顶�
 
 mac 包只能在 macOS 上构建，仓库通过 `.github/workflows/build-mac.yml` 在
 GitHub Actions 上完成：`workflow_dispatch` 手动触发或推送 `v*` 标签，matrix
-同时产出 x86_64（macos-13）和 arm64（macos-14）两个 `.pkg`。本地有 Mac 时也可
+当前产出 arm64（macos-14）`.pkg`，未产出 Intel 包。本地有 Mac 时也可
 直接执行：
 
 ```bash
@@ -2197,6 +2424,15 @@ turnId、revision、lastSequence、稳定 requestId 和原来源指纹。刷新�
 也可以直接打开 `https://localhost:3000/focus.html` 检查专注窗口的响应式布局。
 直接打开时只有本机缓存的最近展示快照；窗口通信、实时内容同步和关闭行为仍须
 从 Excel 任务窗格中的“显示方式 → 打开专注窗口”验证。
+
+WPS 的专注窗口入口在任务窗格输入框左下角 EB 菜单的「专注窗口」（`WpsAgentPanel.tsx`
+的 `openFocusWindow`），生产构建含 `focus.html`（`apps/wps-addin/vite.config.ts` 多页
+`rollupOptions.input`）。WPS 没有 Office `dialog.messageChild`，跨窗口通信走
+`apps/wps-addin/src/wpsFocusChannel.ts`：按 sessionId 优先 `BroadcastChannel`、回退同源
+`localStorage` 邮箱，仅传已校验展示快照（不传密钥/凭据/原始数据行），子窗口失联/父窗格
+刷新/切换工作簿/关闭都会显示失联并停止会话。**跨 WebView 的 `BroadcastChannel` 是否真的
+可用、`ShowDialog` 是否真的打开独立窗口与可关闭，只能实机验证**，见
+[WPS 专注窗口交付记录](./WPS_FOCUS_WINDOW_2026-11-03.md)。
 
 ### Excel 模式
 
@@ -2858,6 +3094,101 @@ SDK 流接口提示不应覆盖服务端 422/500/503。`TASK_STATE_CORRUPT` 表�
 
 **替身证据 ≠ 实机证据**：以上 6 步尚未在真实 Excel / WPS 上执行。
 
+### 刷新后不重复确认范围实机验收（2026-11-01，**未执行**）
+
+修的是「已固定勾选、未改勾选，重新加载 WPS 插件后发送任务仍要求确认数据范围」。
+自动化用**替身宿主**证明了两条分支（文档级证据成立 ⇒ 不再询问；证据不足 ⇒ 仍确认一次），
+但真实 WPS 是否真的每次返回新包装对象、`CodeName`/`SId` 是否可读，只能实机看。
+用专用测试簿（含来源 + 结果1/2/3 四张表），不操作业务工作簿。
+
+1. 「数据范围」→ 勾四张 →「确认」→ 发一句读表任务：正常执行，不弹确认。
+2. **只重载加载项**（不改勾选）→ 发同一类任务：**应不再弹「请确认本次使用的数据范围」**，
+   直接进入分析。这一步是本次修复的实机判据。
+3. 若仍弹确认：**按标题精确对号**（四种标题各自唯一对应一个 `notice.reason`，
+   `TargetScopeNotice` 是唯一出处；「请确认本次使用的数据范围」只可能是
+   `confirmation_required`）。
+   - 「请确认本次使用的数据范围」⇒ `confirmation_required`：元数据一致、三份证据键也一致，
+     但**都是弱证据** —— 即 `conclusive=false` 且 `documentBound=false`。**已经实测到过一次**
+     （见下），意味着这台宿主没给稳定 ID；
+   - 「暂时无法核实当前目标」⇒ `unavailable`：证据缺失/三键冲突/读不出来，不是"变了"；
+   - 「工作表范围发生变化」⇒ `scope_changed`：元数据比对失败；
+   - 「当前文件与已授权文件不同」⇒ `file_changed`：真的换了文件（同名不同路径也算）。
+   **不得**为了让它通过而关守卫或强制 `conclusive`。
+3b. 要拿到布尔值而不是标题猜测：DEV 构建下每条判定都会落一条诊断
+   （`wpsTargetDiagnostics.ts`）。回收方式二选一：
+   - 窗格 console（若可见）：`[wps-target] {...}`；
+   - 磁盘：`%APPDATA%/kingsoft/wps/addons/data/win-x64/cef/2/jsapi/cache/Local Storage/leveldb`
+     里的 `excel-bro.wps.target-diag.v1`（只有布尔值/原因码，不含路径、表名、证据键）。
+   要看到 `branch / conclusive / documentBound / hasConsent / explicitRequired /
+   stableId / pathIdentity / round / seq`，这几项就够判"新请求又被拦"还是"旧提示没清"：
+   同一 `round` 且 `seq` 不再增长 = 旧提示；`seq` 增长而 `round` 变大 = 新的一轮。
+4. 收窄/扩一张表 → 重载 → 发任务：**必须**要求确认（范围真的变了），且说的是范围变化，
+   不是"暂时无法核实"。
+5. 换一个工作簿（含同名不同目录）→ 重载 → 发任务：**必须**拦下。
+6. 真做一次「同名工作表替换」（删掉一张已授权表、新建同名表）→ 发任务：允许它要求确认，
+   但**不得**宣称"数据已变化"；记录实际结论。
+7. Excel 侧重复 1–2（Excel 应当一直不弹；若弹了就是另一个问题）。
+
+自动化入口：`apps/wps-addin/src/wpsAuthorizedTarget.test.ts`（文档级/对象级/缺稳定 ID/
+未保存/顺序无关）、`apps/excel-addin/src/hooks/useAuthorizedTarget.test.tsx`
+（`文档级证据成立时刷新后直接分析`、`只有对象级弱证据时刷新后仍确认一次`、
+`文档级证据也不能掩盖身份键冲突`、`requireExplicitConsent 只挡文档级捷径` 三条、
+`范围恢复原样后旧提示会被清掉`、`诊断只有布尔值与原因码`）、
+`apps/wps-addin/src/WpsAgentPanel.test.tsx`（`刷新后范围未变、宿主换了包装对象`、
+`宿主给不出工作表稳定 ID`）、`apps/wps-addin/src/wpsTargetDiagnostics.test.ts`。
+反向核对：摘掉共享闸里的 `documentBound` 放行条件，面板用例立刻变红（卡在"应按原授权
+直接进入分析"），还原后 sha256 一致。
+
+**已执行到的程度（2026-11-01，只到第 1–3 步的一半）**：用户重载窗格后发任务，第 2 步的
+预期**没有**出现 —— 弹的是「请确认本次使用的数据范围」（= `confirmation_required`）。
+按 3b 回收到了那条记录：`branch=weak_evidence`、`conclusive=false`、`documentBound=false`、
+**`stableId=none`**、`pathIdentity=true`、`hasConsent=false`、`explicitRequired=false`。
+即**这台 ET 宿主没有报出工作表稳定 ID**，路径身份正常，对象级证明也不成立。
+因此第 4–7 步（范围变化/换簿/同名表替换/Excel 对照）**未执行**。
+修复前不得再宣称"刷新后与 Excel 一致"；要让刷新后不再询问，只能放宽那条证据、
+由用户拍板（见 `docs/ARCHITECTURE.md` 同日章节末）。
+
+**最短真机步骤（2026-11-01，交互闭环后；只跑这一遍）**
+
+1. 在 WPS 里打开那份四表工作簿，重载加载项（任务窗格重开）。
+2. 发一句读表任务（例如"按来源表算三步公式"）。
+3. 预期：提示卡写「窗格已重新加载，请确认继续使用已选的 4 张工作表。」+「工作表勾选没有变动」，
+   并有主按钮「确认范围并继续」；**不要**去点「检查数据范围」。
+4. 点「确认范围并继续」→ 只继续这一次，原需求与澄清答案保留；**不要**取消勾选再勾回。
+5. 再发一句同类任务 → 不再询问（同会话范围未变）。
+6. 负向：把其中一张表改名或删一张 → 提示变成「工作表范围发生变化」，**且没有**
+   「确认范围并继续」（原样确认不能替"范围变了"背书）。
+
+只要第 3–6 步里有一步不符，就把当时那条 `excel-bro.wps.target-diag.v1` 留着（我按
+`branch`/`round`/`seq` 判读）；不需要反复刷新碰运气。
+
+**替身证据 ≠ 实机证据**：以上 7 步尚未在真实 WPS / Excel 上全部执行。
+
+**最短真机步骤（2026-11-01 另一起：只读查询被误判。与上面那条范围确认问题分开跑）**
+
+准备：工作簿里**四张表都加入授权范围**（例如 `来源`、`结果1`、`结果2`、`结果3`），
+**四张表的 B 列都放数字**（各 100 之类），`来源` 的 `A1:B5` 是没有表头的五对值（B 列 1~5），
+再在 `来源!B6` 写 100 作为区域外诱饵。
+
+1. 发送：「只读取工作簿里的来源表 A1:B5，按无表头处理，计算 B 列五个数的合计，
+   并告诉我参与计算的记录数。不修改任何工作表。」
+2. 预期：合计 **15**、记录数 **5**；**不是** 315（15+100×3，说明范围没收窄）。
+3. 预期：结果卡的「来源：」后面**只有「来源」**，没有「结果1/2/3」；
+   **不出现**任何「某某没有字段」的提示；**不出现**「结果不完整」「扫描已达上限」。
+4. 预期：**不出现**任何写入计划/写入预览/目标单元格，表格一格未变。
+5. 负向（有表头那一侧不许被改坏）：另起一张表首行写「数量」，下面三行写 1、2、3，
+   问合计 → 必须回 **6**（表头行不算数据）。
+6. 负向（显式声明压过按列名推断）：另起一张表首行真的就写「列1」「列2」，下面两行数据，
+   问笔数 → 必须回 **2**。
+7. 负向（不许把别的表混进来）：问「四张表里一共有多少条记录」→ 这次是**真跨表**，
+   模型必须把四张表都列进 `sheets`，结果卡的来源才该出现四张表。
+8. WPS 与 Excel 各跑 1–7。任一步不符，把当时的本地结果卡（含 `scannedRows`）与
+   工具调用参数留下；参数现在会落在进度事件的 `bridgeTool.bindings` 里
+   （模式/scope/表名/区域/表头口径），不需要再靠 `sourceSheets` 反推。
+
+只需注意：文件夹模式没有按区域裁剪这一步，`range` 在那里会被**明确拒绝**（不是静默忽略）；
+正确定位是"改用工作簿模式"，而不是改成写入去凑范围。
+
 ### 第一批 SDK 业务闭环实机验收（2026-10-19，**未执行**）
 
 自动化已完成：真实模型 + SDK + Docker 的结果核对，替身宿主上的执行/回读/确认/撤销，
@@ -3202,3 +3533,63 @@ npm run dev:server
 本轮没有重启用户运行中的服务、没有调用其 API、没有改用户的库文件，也没有打开真实 Excel/WPS。
 **A1-GATE 仍未通过，A2 未启动。** 证据见 `docs/SDK_WPS_RECOVERY_PACKAGE_2026-10-27.md` §21–§27
 与 `outputs/recovery-package-20261027/r4-*.log`。
+
+
+## 2026-11-02：审阅输入框最短检查
+
+Excel/WPS 已执行并回读后，输入框内显示「已完成，待你审阅」，上方无重复审阅卡、无空 textarea 或发送按钮；范围条保留。「查看详情」默认折叠；处理失败原因不折叠。确认只接受结果，放弃走原恢复，两者成功后普通输入恢复；标记清理失败保留独立重试。澄清或中文组合输入不被卸载。
+
+本轮自动化：Excel E2E/共享组件 120 passed；WPS 面板 244 passed、5 skipped；双端 build（含 tsc）通过。布局探针 scripts/check_recovery_composer_layout.mjs 覆盖 320/400/500px 审阅、长错误正文及既有恢复模式共 18 档，按钮完整可见。日志 outputs/review-composer-*.log。未操作真实工作簿、账本、材料，未提交推送。原生 Excel/WPS 各检查一次审阅布局和确认/放弃即可；不要重复整轮 B 恢复验收。
+
+
+## 2026-11-02：逐表双视图对比验证
+
+双端多表执行完成后，审阅输入框提供「对比工作表」。选择结果1、结果2、结果3，分别看该表执行前快照和当前结果；切换不新增原表写入。确认/放弃仍针对完整任务。副本有人工修改、关闭不明或身份变化时，保持现有保护并给原因。
+
+自动化：核心全量 1162 passed；Excel E2E/判据/组件 111 passed；WPS 面板+执行器 291 passed、5 skipped，原生副本/前态重建 55 passed。用不同表相同地址不同旧值检测串表；测试确认不重写、关闭失败保留旧句柄、排列失败后仍可收尾。两端构建含 tsc 通过，320/400/500px 浏览器布局通过。真实宿主窗口排列未验，不宣称实机通过。日志 outputs/multi-review-*.log。
+## 2026-11-02：审阅摘要与长表名切换
+
+Excel/WPS 共用 ResultReviewBar：输入区摘要为“待审阅”，有明确对比表清单时显示表数，不从任务标题推算单元格数。任务描述进入折叠详情；错误和无法对比原因保持可见。确认/放弃按钮明确作用于本次全部修改。
+
+ReviewSheetPicker 提供前后切表、当前位置、可搜索列表；长名称在常驻行省略，列表完整换行。列表在正文内展开，独立限高滚动，不覆盖底部操作。切表仍调用既有 comparison 请求，不确认或重复执行计划。原生 Excel/WPS 长表名、多表及键盘操作仍待实机检查。
+
+## 2026-11-05：底部结构 / 反馈归属的检查点
+
+结构契约（读源码，双端同一条）：`apps/excel-addin/src/composerDockParity.test.ts` —— `.composer-dock` 只许有 `scope-entry-row` 与 `composer-input-region` 两个子节点且相邻，`TargetScopeNotice` / `WorkDirectoryGuide` / `HistoryStorageNotice` / `ComposerActionDock` / `RecoveryPendingEntry` / `TaskExecutionNotice` / `composer-service-status` / `composer-pending` / 恢复探针一律不许回到两者之间；同时断言 `.message-stream` 仍 `min-height: 0; overflow-y: auto`、`.chat-shell` 仍是 `minmax(0, 1fr)`，以及短系统反馈的局部底色选择器。
+
+真实 DOM（默认态）：`WpsAgentPanel.test.tsx` 的「底部固定容器只放工具栏与输入框，通知不夹在两者之间」。变异自检：在 `<div className="composer-dock">` 后插入任意带 `composer-service-status` 的元素，该用例必须变红（本轮已实测）。
+
+判据单测：`packages/core/src/operationFeedback.test.ts`（按 executionId 归属、不同执行不合并、找不到执行保留原行、反馈行不能当 anchor、副本按身份去重、相同错误文本不同副本算两份、摘要不冒充恢复失败）、`packages/core/src/composerPending.test.ts`（决定类默认展开、纯状态默认收起、超两条只报数量）、`packages/core/src/resultReview.test.ts` 的「展示副本清理失败」四条（多入口重复触发只更新同一份清单、真关掉后清空、业务结论仍为 confirmed）。
+
+界面组件：`components/ComposerPendingBar.test.tsx`、`components/ExecutionFeedbackSummary.test.tsx`。`<details>` 的展开由 React 状态驱动并对 `summary` 的 click `preventDefault()` —— jsdom 不实现原生展开，只靠 `onToggle` 既测不到也控不住。
+
+运行：
+`npm run test:core`、`npm run test:addin`、`npm run test:wps`、`npm run build:addin`、`npm run build:wps`。
+本轮结果见下面「本轮最终数字」（这一节写完后又在真实 Chromium 上补了布局证据并修掉一处让位方向错误，数字以最终那次为准）。
+已知非本轮失败（记录时与最终状态的差别）：`excelWriteEndToEnd.test.tsx` 那两条断言旧文案「公式采用当时的值」的用例，在最终那次全量里已经通过（并行改动把实现与断言对齐了）；`wpsBeforeComparison.test.ts` 一条仍期望「授权快照」而实现抛「对比目标不属于本次执行。」，仍是并行改动尚未收口，未在本轮修 —— 修它需要动那条判据的措辞，属于另一处判据的所有权。
+另：`wpsContinuousPythonChain.test.tsx` 的 `./wpsNativeComparison` 替身缺 `saveWpsComparisonCopies` 等新出口，会在 `ResultReview.closeBefore()` 抛未处理拒绝；本轮补齐替身存根（不影响任何断言）。
+
+### 布局证据（真实 Chromium，不是 jsdom）
+
+`node scripts/check_recovery_composer_layout.mjs`（Excel 与 `PROBE_HOST=wps` 各一次）：320x640 / 400x720 / 500x760 三档下，审阅动作行与主操作完整落在视口内、详情折叠、长错误正文自己滚；`reconcile` / `resume` / `long` / `entry` 四态同样通过。
+
+`node scripts/check_scope_entry_layout.mjs` 本轮改了两件事，否则它量到的不是线上结构：
+
+1. **样式清单补齐**：原先只拼 `styles.css + chatScrollbars + composerPrimaryButton.css`，**没有 `conversation.css`** —— 底部两层结构全在那个文件里，等于没测。现按真实导入顺序拆成 `base`（styles + 组件 css）与 `late`（chatScrollbars + appearance + conversation），WPS 的 `styles.css` 仍插在 `base` 之后、`late` 之前；夹具页顶部加 `*{scroll-behavior:auto !important}`（否则量滚动位置量的是动画中间态）。
+2. **夹具换成新结构**：`<footer class="composer"><ComposerPendingBar>…</ComposerPendingBar><div class="composer-dock">工具栏 + 输入区</div></footer>`，消息区塞 24 条消息 + `#last-row`。
+
+新增断言（两端 × 三档宽度）：`.composer-dock` 恰好两个子节点且顺序为 `scope-entry-row` → `composer-input-region`；两者**紧贴**（`rowBottom` 与 `regionTop` 差 ≤ 1px，即中间没夹东西）；`.composer-pending` 整个在输入容器上方；发送按钮完整在视口内、页面无横向溢出；**展开长待办详情后**详情自己滚、摘要行仍在视口内、发送按钮仍完整可见；消息区可滚且滚到底后最后一条不被底部盖住。
+
+变异自检（本轮实跑）：把 `.chat-shell .composer-dock > .scope-entry-row { margin-bottom: 0 }` 改成 `12px`，探针报「工具栏与输入框之间不许夹别的东西: … rowBottom:514, regionTop:526」；还原后 sha256 与变异前一致。
+
+另一条反向证据来自真实缺陷：给 `.chat-shell .composer` 加 `min-height: 0`，`check_recovery_composer_layout.mjs` 在 320x640 直接报「审阅动作行 bottom=728.9 > 640」。已写进 `composerDockParity.test.ts` 的「让位的是常驻摘要，不是底部容器」（断言 `.composer` 规则不含 `min-height: 0`、`.composer-pending` 是 `flex: 0 1 auto`、`.composer-dock` 是 `flex: 0 0 auto`）。
+
+### 本轮最终数字
+
+`npm run test:core` 1261 passed / 81 files；`npx vitest run`（excel-addin）**1844 passed / 9 skipped / 0 failed**；`npx vitest run`（wps-addin）1331 passed / 8 skipped / **1 failed**；`npm run build:addin`、`npm run build:wps` 均 EXIT=0；`npx tsc --noEmit` WPS 0 错，Excel 1 错在 `src/excelUndoScope.test.ts(435)`（该文件 22:18 仍在被并行改动，不在本轮范围）。
+
+WPS 那 1 条是既有文案漂移：`wpsBeforeComparison.test.ts:298` 期望抛错含「授权快照」，实现抛「对比目标不属于本次执行。」。上一轮记录的两条 Excel 旧文案（「公式采用当时的值」）已随并行改动一并消失，本轮全量 0 失败。
+
+另：跑测试期间 `apps/excel-addin/src/excel.ts` 与 `excelWriteEndToEnd.test.tsx` 在 22:13:16 被并行改写，一度让「公式续跑完成后进入审阅收尾（discard）」报「恢复后回读不一致」而失败；文件稳定后单跑与全量均通过。**并行会话在写同一棵树时，中途失败要按 mtime 复核，别当成自己的回归。**
+
+实机未验：两端真实窗格里的底部间距、窄/宽窗格与缩放、多行草稿、刷新后恢复状态、正式待审阅的确认/放弃/双视图入口位置，以及本轮全部反馈归属（已撤销 / 已放弃并恢复 / 副本清理失败）与待办摘要展开，均只到「真实组件 + 真实服务端 + 替身宿主」、源码/DOM 契约与真实 Chromium 布局，未在原生 Excel/WPS 窗格点过。

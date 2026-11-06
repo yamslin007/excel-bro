@@ -16,7 +16,7 @@ from .capabilities import capability_int
 
 _READONLY_RETRY_ATTEMPTS = 6
 # 当前 schema 版本（与 _initialize_schema 里的 PRAGMA user_version 一致）。
-_SCHEMA_VERSION = 13
+_SCHEMA_VERSION = 14
 # `office_executions` 上"后加的列"清单：`_schema_is_current` 必须逐个确认它们**真的存在**。
 # 版本号只是意图，列才是事实 —— 版本号被写成最新而列没建时，早退会让补列永久跳过
 # （2026-10-27 真机：恢复包 PUT 因此 500）。新增列必须同时进这里与迁移。
@@ -29,6 +29,8 @@ _REQUIRED_OFFICE_COLUMNS = (
     "recovery_package_bytes",
     "recovery_package_retired_at",
     "recovery_package_removed_at",
+    "review_state",
+    "review_state_at",
 )
 # SQLite 只读相关错误码（用于按**准确类别**判定重试，而非匹配错误字符串）。
 # 见 https://www.sqlite.org/rescode.html ：SQLITE_READONLY(8) 及其扩展码。
@@ -181,6 +183,11 @@ class OfficeExecutionRecord:
     #: `None` 只表示"没有这条留痕"，不代表"用户没处置过"（上线前的处置没有留痕）。
     abandoned_at: float | None = None
     undone_at: float | None = None
+    #: 审阅生命周期的**持久状态**（2026-11-03）。`None` = 本能力上线前的记录，
+    #: 那是"无法判断"，既不是待审阅也不是已确认 —— 不许由 `status='completed'` 反推。
+    review_state: str | None = None
+    #: 该状态**首次成立**的时刻（epoch 秒）。只写一次；重复决定不改写。
+    review_state_at: float | None = None
 
 
 ManagedDirectoryStatus = Literal["active", "unavailable", "unsafe", "removed"]
@@ -577,6 +584,16 @@ class FolderOperationLedger:
             connection.execute(
                 "ALTER TABLE office_executions ADD COLUMN recovery_package_removed_at REAL"
             )
+        # 审阅生命周期（2026-11-03）：旧库补两列。**不**回填 —— 老记录没有审阅事实，
+        # 回填成 pending 会把它们批量推成"待审阅"，回填成 confirmed 更是伪造用户操作。
+        if "review_state" not in office_columns:
+            connection.execute(
+                "ALTER TABLE office_executions ADD COLUMN review_state TEXT"
+            )
+        if "review_state_at" not in office_columns:
+            connection.execute(
+                "ALTER TABLE office_executions ADD COLUMN review_state_at REAL"
+            )
         connection.execute("PRAGMA user_version = %d" % _SCHEMA_VERSION)
 
     @staticmethod
@@ -662,6 +679,14 @@ class FolderOperationLedger:
                 float(row["abandoned_at"]) if row["abandoned_at"] is not None else None
             ),
             undone_at=float(row["undone_at"]) if row["undone_at"] is not None else None,
+            review_state=(
+                str(row["review_state"]) if row["review_state"] is not None else None
+            ),
+            review_state_at=(
+                float(row["review_state_at"])
+                if row["review_state_at"] is not None
+                else None
+            ),
         )
 
     @classmethod
@@ -1889,7 +1914,13 @@ class FolderOperationLedger:
                 """
                 SELECT * FROM office_executions
                 WHERE workbook_identity = ?
-                    AND status IN ('running', 'needs_reconciliation', 'failed')
+                    AND (
+                        status IN ('running', 'needs_reconciliation', 'failed')
+                        -- 已完成但审阅没有收尾的，同样是"还要用户处理"（2026-11-03）。
+                        -- 只认**显式**的审阅状态：`review_state IS NULL` 是本能力上线前的
+                        -- 老记录，既不能推成待审阅，也不能推成已确认 —— 不在这里出现。
+                        OR (status = 'completed' AND review_state IN ('pending', 'blocked'))
+                    )
                     AND (discovery_dismissed_at IS NULL OR discovery_dismissed_at < updated_at)
                 ORDER BY
                     CASE
@@ -1898,6 +1929,8 @@ class FolderOperationLedger:
                         WHEN status = 'failed'
                             AND next_action_index = 0
                             AND in_flight_action_index IS NULL THEN 2
+                        -- 待续写排在待审阅之前：还有动作没写，比"写完了等人决定"更急。
+                        WHEN status = 'completed' THEN 3
                         ELSE 1
                     END,
                     updated_at DESC,
@@ -1931,6 +1964,80 @@ class FolderOperationLedger:
     #: 不放进数据库 CHECK：SQLite 的 `ADD COLUMN` 加不了带 CHECK 的列，两处各写一份
     #: 约束只会在迁移后不一致。合法取值只在这里判一次。
     DISPOSITION_COLUMNS = {"abandoned": "abandoned_at", "undone": "undone_at"}
+
+    #: 审阅决定的终态。`discarded` / `undone` 之后任何新决定都不算数。
+    REVIEW_TERMINAL = frozenset({"discarded", "undone"})
+
+    def apply_office_review_decision(
+        self, operation_id: str, decision: str
+    ) -> tuple[str, OfficeExecutionRecord | None]:
+        """把用户的一次审阅决定写进账本。返回 `(outcome, record)`。
+
+        `outcome` 只有四种，调用方据此决定 HTTP 与文案，**不许**合并：
+
+        - `applied`：这次决定生效了；
+        - `duplicate`：账本里已经是这个状态 —— 重试、双窗格各报一次都走这里，
+          幂等成功，**不**改写 `review_state_at`（它记的是"首次成立"）；
+        - `conflict`：与已成立的终态冲突（例如已放弃又收到确认、已确认又收到放弃）。
+          这不是"失败重试"，是"另一次处理已经生效"，必须让用户看见；
+        - `missing`：没有这条记录。
+
+        并发保护放在**一条**带条件的 UPDATE 里（`BEGIN IMMEDIATE` 事务内）：
+        两个窗格同时点确认/放弃，只有一个能改到行，另一个拿到 `conflict` 后重读，
+        不会出现"旧状态覆盖新状态"。
+        """
+
+        if decision not in {"confirmed", "discarded", "undone"}:
+            raise ValueError("未知的审阅决定")
+        now = time.time()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT status, review_state FROM office_executions WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                return "missing", None
+            current = str(row["review_state"]) if row["review_state"] is not None else None
+            if current == decision:
+                connection.rollback()
+                return "duplicate", self._office_record(
+                    connection.execute(
+                        "SELECT * FROM office_executions WHERE operation_id = ?",
+                        (operation_id,),
+                    ).fetchone()
+                )
+            changed = connection.execute(
+                """
+                UPDATE office_executions
+                SET review_state = ?, review_state_at = ?
+                WHERE operation_id = ?
+                    AND status = 'completed'
+                    AND (
+                        review_state IS NULL
+                        OR review_state IN ('pending', 'blocked')
+                        OR (review_state = 'confirmed' AND ? = 'undone')
+                    )
+                """,
+                (decision, now, operation_id, decision),
+            ).rowcount
+            if changed != 1:
+                connection.rollback()
+                return "conflict", self._office_record(
+                    connection.execute(
+                        "SELECT * FROM office_executions WHERE operation_id = ?",
+                        (operation_id,),
+                    ).fetchone()
+                )
+            record = self._office_record(
+                connection.execute(
+                    "SELECT * FROM office_executions WHERE operation_id = ?",
+                    (operation_id,),
+                ).fetchone()
+            )
+            connection.commit()
+        return "applied", record
 
     def record_office_disposition(
         self, operation_id: str, disposition: str
@@ -2446,7 +2553,19 @@ class FolderOperationLedger:
         expected_revision: int,
         owner_token: str,
         result: dict[str, Any],
+        review_state: str | None = None,
     ) -> OfficeExecutionRecord:
+        """提交完成回执，并在**同一个事务**里写审阅的初始状态。
+
+        为什么必须同事务（2026-11-03）：执行完成、回读通过、待审阅落盘这三步之间
+        曾经有一个窗口 —— 回执提交了（`status='completed'`）但审阅状态还没写，
+        此刻刷新窗格，界面既没有待审阅、也无法判断用户处理过没有。把它们放进一条
+        UPDATE，窗口就不存在了：要么两者都成立，要么都不成立。
+
+        `review_state` 由调用方按**回执里的验证结论**给：
+        `pending`（已验证，等用户决定）/ `blocked`（没能独立验证，要人核对但不能直接
+        接受）/ `None`（回执没带验证结论，如旧客户端 —— 记"无法判断"，不假装已确认）。
+        """
         encoded_result = self._encode(result)
         now = time.time()
         with self._connect() as connection:
@@ -2464,13 +2583,18 @@ class FolderOperationLedger:
                 """
                 UPDATE office_executions
                 SET status = 'completed', result_json = ?, error_json = NULL,
-                    updated_at = ?, revision = revision + 1
+                    updated_at = ?, revision = revision + 1,
+                    review_state = ?,
+                    review_state_at = CASE WHEN ? IS NULL THEN NULL ELSE ? END
                 WHERE operation_id = ? AND revision = ? AND owner_token = ?
                     AND status = 'running' AND next_action_index = ?
                     AND in_flight_action_index IS NULL
                 """,
                 (
                     encoded_result,
+                    now,
+                    review_state,
+                    review_state,
                     now,
                     operation_id,
                     expected_revision,

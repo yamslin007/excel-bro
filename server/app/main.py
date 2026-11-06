@@ -98,6 +98,8 @@ from .models import (
     OfficeExecutionFinishRequest,
     OfficeExecutionRegisterRequest,
     OfficeExecutionResumeRequest,
+    OfficeExecutionReviewRequest,
+    OfficeExecutionReviewState,
     OfficeExecutionStateResponse,
     OfficeExecutionSuspendRequest,
     WpsActionCompleteRequest,
@@ -122,6 +124,8 @@ from .models import (
     PlanningContinueRequest,
     PlanningPauseAck,
     PlanValidateRequest,
+    QueryIncompleteReason,
+    QueryTruncation,
     TestModelConnectionResponse,
     TestModelConnectionRequest,
     SetFormulaModelRequest,
@@ -175,7 +179,7 @@ from .rule_generator import (
 )
 from .turn_state import TurnStateError, turn_registry
 from .excel_window_layout import excel_window_layout, WindowLayoutError
-from .models import ExcelReviewLayoutPrepareRequest, ExcelReviewLayoutTicket, ExcelReviewLayoutResult, ExcelReviewLayoutArrangeRequest, ExcelReviewPaneMeasurement, ExcelReviewCopyCloseRequest, ExcelReviewCopyCloseResult
+from .models import ExcelReviewLayoutPrepareRequest, ExcelReviewLayoutTicket, ExcelReviewLayoutResult, ExcelReviewLayoutArrangeRequest, ExcelReviewPaneMeasurement, ExcelReviewCopyCloseRequest, ExcelReviewCopyCloseResult, ExcelReviewCopySuspendResult, ExcelReviewCopySelectResult
 from .models import (
     BridgeBindingRequest,
     BridgePollResponse,
@@ -329,6 +333,35 @@ async def arrange_excel_review_layout(payload: ExcelReviewLayoutArrangeRequest, 
     except Exception as exc:
         code = exc.code if isinstance(exc, WindowLayoutError) else "LAYOUT_UNAVAILABLE"
         raise HTTPException(409, detail={"code": code, "message": "自动窗口排列未完成；请手动并排查看。原表未因此写入。", "retryable": False}) from None
+
+
+
+
+@app.post("/api/office/review-layout/suspend", response_model=ExcelReviewCopySuspendResult)
+async def suspend_excel_review_copy(payload: ExcelReviewLayoutPrepareRequest, request: Request):
+    _review_layout_origin(request)
+    try:
+        return await run_in_threadpool(excel_window_layout.view_copy, payload, "suspend")
+    except Exception:
+        raise HTTPException(409, detail={"code": "LAYOUT_SUSPEND_UNAVAILABLE", "message": "未能收起比对窗口，副本仍保留。"}) from None
+
+
+@app.post("/api/office/review-layout/select-sheet", response_model=ExcelReviewCopySelectResult)
+async def select_excel_review_copy_sheet(payload: ExcelReviewLayoutPrepareRequest, request: Request):
+    _review_layout_origin(request)
+    try:
+        return await run_in_threadpool(excel_window_layout.select_copy_sheet, payload)
+    except Exception:
+        raise HTTPException(409, detail={"code": "LAYOUT_SELECT_UNAVAILABLE", "message": "未能核实对应子表，副本仍保留。"}) from None
+
+
+@app.post("/api/office/review-layout/resume", response_model=ExcelReviewLayoutResult)
+async def resume_excel_review_copy(payload: ExcelReviewLayoutPrepareRequest, request: Request):
+    _review_layout_origin(request)
+    try:
+        return await run_in_threadpool(excel_window_layout.view_copy, payload, "resume")
+    except Exception:
+        raise HTTPException(409, detail={"code": "LAYOUT_RESUME_UNAVAILABLE", "message": "未能重新排列已有副本，请核对窗口。"}) from None
 
 
 @app.post("/api/office/review-layout/close", response_model=ExcelReviewCopyCloseResult)
@@ -510,6 +543,16 @@ async def sdk_tool_bridge_result(payload: BridgeResultRequest, request: Request)
             sourceSheets=list(item.source_sheets),
             warnings=list(item.warnings),
             complete=bool(item.complete),
+            incomplete=[
+                QueryIncompleteReason.model_validate(reason)
+                for reason in item.incomplete
+            ],
+            truncated=bool(item.truncated),
+            truncation=(
+                QueryTruncation.model_validate(item.truncation)
+                if item.truncation is not None
+                else None
+            ),
             calculation=item.calculation,
             scannedRows=item.scanned_rows,
         ).model_dump(mode="json")
@@ -988,16 +1031,8 @@ async def check_model_connection(
             supports_vision=request.supportsVision,
             protocol=request.protocol,
         )
-        if request.purpose == "agent":
-            from .claude_sdk_agent import check_sdk_connection
-            await check_sdk_connection(connection)
-            message = "SDK Agent 连接测试通过：模型与受控工具已完成往返。"
-        else:
-            if connection.adapter != "openai_compatible":
-                raise ModelNotAvailableError("独立公式需要 OpenAI 兼容接口；此连接配置为 Anthropic 协议。")
-            await test_model_connection(connection)
-            message = "独立公式接口连接测试通过；本次未验证 SDK Agent。"
-        return TestModelConnectionResponse(ok=True, message=message, testedFor=request.purpose)
+        await test_model_connection(connection)
+        return TestModelConnectionResponse(ok=True, message="连接测试通过，模型已正常回复。")
     except ModelNotAvailableError as error:
         raise service_error(400, "MODEL_CONNECTION_INCOMPATIBLE", str(error), retryable=False) from error
     except ModelConnectionNotFoundError as error:
@@ -1731,6 +1766,22 @@ _WPS_RECOVERABLE_ACTION_TYPES = {
     "setFill", "setNumberFormat", "setBorders",
 }
 
+# 恢复描述里**可以带来源值证据**的动作类型。
+#
+# 与 `apps/wps-addin/src/wpsPlanExecutor.ts` 的 `isResumableValueAction` 是同一条
+# 判据的两端：`writeFormulas` 的恢复点结构与 `writeValues` 同构（行×列矩阵），差别
+# 只在"矩阵里装的是公式文本"；写后身份按**公式文本**算，不按计算值。
+#
+# 为什么单独一份而不是复用上面那张表：上面回答的是"这个动作能不能跨重启续跑"，
+# 这里回答的是"这个动作的续跑要不要来源值证据"。格式动作能续跑，但它的恢复点是
+# **属性快照**，语义上没有"来源值"，所以不在这一份里。
+#
+# 端上产出 `resumeContext` 而这里不认识，症状是**整份公式计划登记不了**：
+# 2026-11-01 真机三条 `writeFormulas` 被"不支持该动作组合"一句拒掉，看不出分支。
+# 漂移由 `server/tests/test_wps_formula_resume.py::test_resume_source_action_types_match_the_ts_criterion`
+# 钉住（TS 侧唯一出处 `isResumableValueAction`）。
+_WPS_RESUME_SOURCE_ACTION_TYPES = {"writeValues", "writeFormulas"}
+
 # 每个格式动作**可以声明**的属性名。
 #
 # 与 `apps/wps-addin/src/wpsFormatCapability.ts` 的已实现恢复属性白名单同口径：
@@ -1847,7 +1898,40 @@ def _office_state_payload(
         disposition=OfficeExecutionDispositionState(
             undoneAt=record.undone_at, abandonedAt=record.abandoned_at
         ),
+        review=_review_state_payload(record),
     )
+
+
+def _review_state_payload(record: OfficeExecutionRecord) -> OfficeExecutionReviewState:
+    """审阅状态的只读投影。`state=None` = 老记录，无法判断（不是"没审阅过"）。"""
+
+    return OfficeExecutionReviewState(
+        state=record.review_state,  # type: ignore[arg-type]
+        decidedAt=record.review_state_at,
+    )
+
+
+def _review_state_for_finish(result: Any) -> str | None:
+    """按完成回执里的**验证结论**给审阅初始状态。
+
+    三态，不许折成布尔：验证通过 = `pending`（等用户决定）；验证没通过 = `blocked`
+    （要人核对，但不能直接接受）；回执没带这份证据 = `None`（无法判断）。
+    把 `None` 当 `pending` 会把一批旧客户端的执行批量推成待审阅；当 `confirmed`
+    更是伪造用户操作。
+    """
+
+    verified = None
+    if isinstance(result, dict):
+        verification = result.get("verification")
+        if isinstance(verification, dict):
+            status = verification.get("status")
+            if status in {"verified", "executed_unverified", "failed"}:
+                verified = status == "verified"
+    else:  # WpsExecutionResult
+        verified = getattr(result, "verified", None)
+    if verified is None:
+        return None
+    return "pending" if verified else "blocked"
 
 
 def _wps_request_fingerprint(request: WpsExecutionRegisterRequest) -> str:
@@ -1864,18 +1948,69 @@ def _validate_wps_recovery_descriptor(request: WpsExecutionRegisterRequest) -> N
     if context is not None:
         from openpyxl.utils.cell import range_boundaries
         targets = {a.sheet.casefold() for a in request.descriptor.actions}
-        valid = all(a.type == "writeValues" for a in request.descriptor.actions)
+        # 来源证据**不限定**为值写入：`writeFormulas` 的依赖表证据与它同构（见
+        # `_WPS_RESUME_SOURCE_ACTION_TYPES`）。这里只挡"语义上不存在来源证据"的组合
+        # —— 格式动作的恢复点是属性快照，端上根本不会为它产出 `resumeContext`，
+        # 出现即是伪造或协议漂移。
+        for index, action in enumerate(request.descriptor.actions):
+            if action.type not in _WPS_RESUME_SOURCE_ACTION_TYPES:
+                raise service_error(
+                    422,
+                    "WPS_RESUME_ACTION_UNSUPPORTED",
+                    f"第 {index + 1} 步 {action.type} 不使用来源值证据，不能与续跑来源一起登记。",
+                    retryable=False,
+                )
         cells = 0
-        for source in context.sources:
+        # **一条拒绝原因一句话**（2026-11-01）：这四条以前被折叠进一个 `valid` 布尔，
+        # 任一条不成立都报"续跑来源越界、形状不符或不支持该动作组合"。真机上公式计划
+        # 命中的是第三条（动作组合），文案却把排查引向"来源越界/形状"，用户与日志都
+        # 分辨不出该改哪一处。判据一个字没放宽，只是不再合并陈述。
+        for index, source in enumerate(context.sources):
             try:
                 c1, r1, c2, r2 = range_boundaries(source.range)
-                valid = valid and r2 - r1 + 1 == source.rowCount and c2 - c1 + 1 == source.columnCount and r2 <= 1048576 and c2 <= 16384
             except (ValueError, TypeError):
-                valid = False
-            valid = valid and source.sheetName.casefold() in authorized and source.sheetName.casefold() not in targets
+                raise service_error(
+                    422,
+                    "WPS_RESUME_SOURCE_RANGE_INVALID",
+                    f"第 {index + 1} 块续跑来源的区域「{source.range}」无法解析。",
+                    retryable=False,
+                ) from None
+            if (
+                r2 - r1 + 1 != source.rowCount
+                or c2 - c1 + 1 != source.columnCount
+                or r2 > 1048576
+                or c2 > 16384
+            ):
+                raise service_error(
+                    422,
+                    "WPS_RESUME_SOURCE_SHAPE_MISMATCH",
+                    f"第 {index + 1} 块续跑来源声明的 {source.rowCount} 行 × {source.columnCount} 列"
+                    f"与区域「{source.range}」的实际形状不一致。",
+                    retryable=False,
+                )
+            if source.sheetName.casefold() not in authorized:
+                raise service_error(
+                    403,
+                    "WPS_RESUME_SOURCE_OUT_OF_SCOPE",
+                    f"第 {index + 1} 块续跑来源「{source.sheetName}」不在本次授权范围内。",
+                    retryable=False,
+                )
+            if source.sheetName.casefold() in targets:
+                raise service_error(
+                    422,
+                    "WPS_RESUME_SOURCE_TARGET_OVERLAP",
+                    f"第 {index + 1} 块续跑来源「{source.sheetName}」同时是本次写入目标，"
+                    "无法区分任务自身修改与恢复期间的外部修改。",
+                    retryable=False,
+                )
             cells += source.rowCount * source.columnCount
-        if not valid or cells > capability_int("taskRecovery", "wpsResumeMaxSourceCells"):
-            raise service_error(422, "WPS_RESUME_CONTEXT_INVALID", "续跑来源越界、形状不符或不支持该动作组合。", retryable=False)
+        if cells > capability_int("taskRecovery", "wpsResumeMaxSourceCells"):
+            raise service_error(
+                422,
+                "WPS_RESUME_SOURCE_LIMIT",
+                "续跑来源超过 WPS 来源证据单元格限额。",
+                retryable=False,
+            )
     if sum(action.cellCount for action in request.descriptor.actions) > capability_int("wpsWrite", "maxCells"):
         raise service_error(422, "WPS_RECOVERY_INVALID", "恢复目标超过 WPS 写入单元格限额。", retryable=False)
     for index, action in enumerate(request.descriptor.actions):
@@ -2002,7 +2137,9 @@ def _wps_state_payload(
         beforeSnapshot=record.before_snapshot,
         checkpoint=record.checkpoint,
         result=record.result,
-        error={"code": "WPS_WRITE_INTERRUPTED", "message": "WPS 写入中断，需要核对现场。"} if record.error else None,
+        # 账本里存的 error 就是**当时的真实原因**（见 `suspend_wps_execution`），原样下发，
+        # 不再写死成"WPS 写入中断"。写死会让恢复卡与状态查询都丢真实失败点。
+        error=record.error,
         canResume=not owner_active and record.status in {"running", "failed", "needs_reconciliation"},
         requiresReconciliation=record.in_flight_action_index is not None,
         ownerActive=owner_active,
@@ -2012,6 +2149,7 @@ def _wps_state_payload(
         disposition=OfficeExecutionDispositionState(
             undoneAt=record.undone_at, abandonedAt=record.abandoned_at
         ),
+        review=_review_state_payload(record),
     )
 
 
@@ -2101,11 +2239,23 @@ def _pending_execution_candidates(
             # 游标超出登记的动作数：形状自相矛盾，不猜到底是几步。
             continue
         owner_active = record.status == "running" and record.updated_at + lease > now
+        # 已完成 + 审阅未收尾 = 待审阅候选。它和"待续写"是两件不同的事：前者一步都
+        # 不能再写，只等用户决定；后者还有动作没跑完。合并成一种会让界面把已完成
+        # 的执行摆出"继续剩余动作"。
+        review_candidate = record.status == "completed" and record.review_state in {
+            "pending",
+            "blocked",
+        }
         candidates.append(
             PendingExecutionCandidate(
                 operationId=record.operation_id,
-                taskId=record.task_id or "",
+                # Office 的登记不带 `task_id`（那是 WPS 侧的加载项任务身份）。待审阅候选
+                # 也会走到这里，而 `taskId` 在协议里是非空的定位字段 —— 缺了就把执行
+                # 身份本身当任务身份：它是这次执行**唯一**的稳定标识，不是编一个新 ID。
+                taskId=record.task_id or record.operation_id,
                 status=record.status,
+                kind="review" if review_candidate else "resume",
+                reviewState=record.review_state if review_candidate else None,
                 createdAt=max(1, int(round(record.created_at * 1000))),
                 updatedAt=max(1, int(round(record.updated_at * 1000))),
                 nextActionIndex=record.next_action_index,
@@ -2113,8 +2263,11 @@ def _pending_execution_candidates(
                 inFlightActionIndex=record.in_flight_action_index,
                 ownerActive=owner_active,
                 requiresReconciliation=record.in_flight_action_index is not None,
-                canResume=not owner_active
-                and record.status in {"running", "failed", "needs_reconciliation"},
+                canResume=(
+                    not review_candidate
+                    and not owner_active
+                    and record.status in {"running", "failed", "needs_reconciliation"}
+                ),
             )
         )
     return candidates
@@ -2392,7 +2545,6 @@ def _planning_pause_payload(
         if isinstance(connection, dict)
         and str(connection.get("catalogModelId", ""))
         and str(connection.get("catalogModelId", "")) != record.current_model_id
-        and connection.get("agentAvailable") is not False
         and (not requires_vision or connection.get("supportsVision") is True)
     ]
     # 可继续 = 有可续跑的检查点现场 + 未达累计活跃执行总时限。
@@ -3309,6 +3461,9 @@ async def finish_office_execution(
             expected_revision=request.expectedRevision,
             owner_token=request.ownerToken,
             result=request.result,
+            # 审阅初始状态与完成回执**同一条 UPDATE**：中间没有"已完成的执行 + 没有
+            # 审阅事实"的窗口。回执没带验证结论时是 None（无法判断），不是 pending。
+            review_state=_review_state_for_finish(request.result),
         )
     except Exception as error:
         raise _office_conflict(error) from error
@@ -3675,7 +3830,13 @@ async def suspend_wps_execution(
             operation_id,
             expected_revision=request.expectedRevision,
             owner_token=request.ownerToken,
-            error={"code": "WPS_WRITE_INTERRUPTED", "message": "WPS 写入中断，需要核对现场。"},
+            # 请求体里的 `code` / `message` 就是**当时的真实原因**，原样落账。
+            # 这里曾写死成 `WPS_WRITE_INTERRUPTED` / "WPS 写入中断，需要核对现场。"，
+            # 于是 2026-11-01 WPS 公式 B 首轮在账本里只剩一句通用文案：事后查不出
+            # 最初失败点（`bindRecoveryProbe` 的可恢复性闸），也分不清零写入与写了一半。
+            # 判据一个字没变（仍要求 status=running + revision + ownerToken），只是不再
+            # 覆盖调用方已经说清楚的原因。
+            error={"code": request.code, "message": request.message},
         )
     except Exception as error:
         raise _wps_conflict(error) from error
@@ -3731,6 +3892,87 @@ async def record_wps_execution_disposition(
     operation_id: str, request: WpsExecutionDispositionRequest
 ) -> Response:
     return await _record_execution_disposition(operation_id, request, "wps-path:")
+
+
+async def _apply_execution_review_decision(
+    operation_id: str, request: OfficeExecutionReviewRequest, identity_prefix: str
+) -> tuple[str, OfficeExecutionRecord | None]:
+    """把一次审阅决定（确认 / 放弃 / 撤销）落成账本里的持久事实。
+
+    **这一层不做任何宿主动作**：不重放计划、不写单元格、不动恢复材料、不推进
+    `revision`、不改 `status`。它只回答"用户处理过这次审阅没有"，以及"是哪一种
+    处理"。这一点必须守住 —— 审阅决定的入口在刷新后会被重建，一旦在这里重放
+    写入，用户每刷新一次就会多执行一遍原计划。
+
+    与 `/disposition` 的分界：`review_state` 说**审阅处理完了没有**（待审阅 →
+    已确认 / 已放弃 / 已撤销），`abandoned_at`/`undone_at` 说**撤销入口是不是
+    已经被用掉了**。两件事各有各的写入点，互不代写：放弃/撤销的真实恢复流程在
+    宿主侧跑完之后才由 `onRestored` 上报处置留痕，那之前谁也证明不了"已经回退"。
+
+    记录不存在 / 身份前缀不属于本宿主 ⇒ 404：绝不为"留个审阅状态"补建账本，
+    也绝不让 Excel 的路径替 WPS 的记录作答。
+    """
+
+    record = await run_in_threadpool(
+        _folder_operation_ledger.office_execution, operation_id
+    )
+    if record is None or not record.workbook_identity.startswith(identity_prefix):
+        raise service_error(
+            404,
+            "EXECUTION_REVIEW_NOT_FOUND",
+            "未找到这次执行记录；审阅状态不会创建任何账本。",
+            retryable=False,
+        )
+    outcome, updated = await run_in_threadpool(
+        _folder_operation_ledger.apply_office_review_decision,
+        operation_id,
+        request.decision,
+    )
+    if outcome == "missing":
+        raise service_error(
+            404,
+            "EXECUTION_REVIEW_NOT_FOUND",
+            "未找到这次执行记录；审阅状态不会创建任何账本。",
+            retryable=False,
+        )
+    if outcome == "conflict":
+        # 不是"失败重试"，是"另一次处理已经生效"。把当前状态一起回给调用方，
+        # 让界面能直接显示"这次审阅已经被处理成 XX"，而不是笼统报错。
+        raise service_error(
+            409,
+            "EXECUTION_REVIEW_CONFLICT",
+            "这次审阅已经按另一种方式处理过，本次决定未生效。",
+            retryable=False,
+        )
+    # `applied` 与 `duplicate` 都是成功：重复上报（重试、双窗格各报一次）幂等，
+    # 且 `duplicate` 不改写 `review_state_at` —— 那一列记的是"首次成立"。
+    return outcome, updated or record
+
+
+@app.post(
+    "/api/office/executions/{operation_id}/review",
+    response_model=OfficeExecutionStateResponse,
+)
+async def decide_office_execution_review(
+    operation_id: str, request: OfficeExecutionReviewRequest
+) -> OfficeExecutionStateResponse:
+    _, record = await _apply_execution_review_decision(
+        operation_id, request, "url:"
+    )
+    return _office_state_payload(record, include_owner=True)
+
+
+@app.post(
+    "/api/wps/executions/{operation_id}/review",
+    response_model=WpsExecutionStateResponse,
+)
+async def decide_wps_execution_review(
+    operation_id: str, request: OfficeExecutionReviewRequest
+) -> WpsExecutionStateResponse:
+    _, record = await _apply_execution_review_decision(
+        operation_id, request, "wps-path:"
+    )
+    return _wps_state_payload(record)
 
 
 @app.post(
@@ -3837,6 +4079,8 @@ async def finish_wps_execution(
             expected_revision=request.expectedRevision,
             owner_token=request.ownerToken,
             result=request.result.model_dump(mode="json", exclude_none=True),
+            # 见 Office 侧同一条：审阅状态与回执同事务写入。
+            review_state=_review_state_for_finish(request.result),
         )
     except Exception as error:
         raise _wps_conflict(error) from error

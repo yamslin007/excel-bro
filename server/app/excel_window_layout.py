@@ -51,6 +51,7 @@ class WindowInfo:
     sheet_hash: str
     sheet_name: str
     unsaved: bool
+    review_copy_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -100,6 +101,16 @@ class ExcelWindowLayout:
         return bool(info and not info.unsaved and info.workbook_hash == request.workbookPathHash
                     and info.sheet_hash == request.worksheetNameHash)
 
+    @staticmethod
+    def _copy(info: WindowInfo | None, request) -> bool:
+        if not info:
+            return False
+        if info.review_copy_id:
+            return (request.copyIdentityVersion == 2 and info.review_copy_id == request.copySheetName
+                    and (info.sheet_hash == request.worksheetNameHash or info.sheet_name == request.copySheetName))
+        # Existing pending reviews remain addressable with their old visible nonce.
+        return info.sheet_name == request.copySheetName
+
     def measure(self, request: ExcelReviewLayoutPrepareRequest) -> ExcelReviewPaneMeasurement:
         # Read-only, no ticket creation/consumption, window mutation or persistence.
         # A unique saved original AND this unsaved nonce copy must still exist.
@@ -107,7 +118,7 @@ class ExcelWindowLayout:
             native = self._native()
             observations = [native.describe(key) for key in native.keys()]
             originals = [info for info in observations if self._original(info, request)]
-            copies = [info for info in observations if info and info.unsaved and info.sheet_name == request.copySheetName]
+            copies = [info for info in observations if info and info.unsaved and self._copy(info, request)]
             if len(originals) != 1 or len(copies) != 1:
                 raise WindowLayoutError("LAYOUT_MEASUREMENT_AMBIGUOUS")
             original, copy = originals[0], copies[0]
@@ -116,6 +127,60 @@ class ExcelWindowLayout:
             if native.describe(original.key) != original or native.describe(copy.key) != copy:
                 raise WindowLayoutError("LAYOUT_WINDOW_CHANGED")
             return ExcelReviewPaneMeasurement(clientWidthCssPx=width, workAreaWidthCssPx=work_area)
+
+    def view_copy(self, request: ExcelReviewLayoutPrepareRequest, action: str):
+        """Reuse or park an existing nonce copy. Never close, save or write cells."""
+        with self._lock:
+            native = self._native()
+            observations = [native.describe(key) for key in native.keys()]
+            originals = [info for info in observations if self._original(info, request)]
+            copies = [info for info in observations if self._copy(info, request)]
+            if len(originals) != 1 or len(copies) != 1 or not copies[0].unsaved:
+                raise WindowLayoutError("LAYOUT_COPY_AMBIGUOUS")
+            original, copy = originals[0], copies[0]
+            if native.describe(original.key) != original or native.describe(copy.key) != copy:
+                raise WindowLayoutError("LAYOUT_WINDOW_CHANGED")
+            if action == "resume":
+                if request.copyIdentityVersion == 2 and copy.sheet_name == request.copySheetName:
+                    if not hasattr(native, 'promote_copy_label'):
+                        raise WindowLayoutError("LAYOUT_UNAVAILABLE")
+                    native.promote_copy_label(original, copy, request.copySheetName)
+                    copy = native.describe(copy.key)
+                    if not self._copy(copy, request) or copy.sheet_hash != original.sheet_hash:
+                        raise WindowLayoutError("LAYOUT_COPY_CHANGED")
+                return native.position_pair(original.key, copy.key, original, copy)
+            if action != "suspend" or not hasattr(native, "suspend_pair"):
+                raise WindowLayoutError("LAYOUT_UNAVAILABLE")
+            native.suspend_pair(original, copy)
+            return {"status": "suspended", "copyRetained": True}
+
+    def select_copy_sheet(self, request: ExcelReviewLayoutPrepareRequest):
+        """Select a named snapshot tab in an owned workbook; never move windows or write cells."""
+        with self._lock:
+            native = self._native()
+            if request.copyIdentityVersion != 2:
+                raise WindowLayoutError("LAYOUT_COPY_CHANGED")
+            observations = [native.describe(key) for key in native.keys()]
+            originals = [info for info in observations if self._original(info, request)]
+            copies = [info for info in observations if info and info.review_copy_id == request.copySheetName]
+            if len(originals) != 1 or len(copies) != 1 or not copies[0].unsaved:
+                raise WindowLayoutError("LAYOUT_COPY_AMBIGUOUS")
+            original, copy = originals[0], copies[0]
+            if native.describe(original.key) != original or native.describe(copy.key) != copy:
+                raise WindowLayoutError("LAYOUT_WINDOW_CHANGED")
+            native.select_pair_sheet(original, copy)
+            selected = native.describe(copy.key)
+            if native.describe(original.key) != original or not self._copy(selected, request):
+                raise WindowLayoutError("LAYOUT_COPY_CHANGED")
+            return {"status": "selected"}
+
+    @staticmethod
+    def _copy_for_close(info: WindowInfo | None, request) -> bool:
+        if not info:
+            return False
+        if request.copyIdentityVersion == 2:
+            return info.review_copy_id == request.copySheetName
+        return not info.review_copy_id and info.sheet_name == request.copySheetName
 
     def close_copy(self, request: ExcelReviewLayoutPrepareRequest | ExcelReviewCopyCloseRequest) -> ExcelReviewCopyCloseResult:
         """Close only the identified copy; retain a recovery file before discarding it.
@@ -134,23 +199,33 @@ class ExcelWindowLayout:
         observations = [native.describe(key) for key in native.keys()]
         # A saved workbook whose active sheet carries this review's nonce is the user's
         # own "save as"/replace of the copy. That file is theirs: never auto-discard it.
-        if any(info and not info.unsaved and info.sheet_name == request.copySheetName for info in observations):
+        if any(info and not info.unsaved and self._copy_for_close(info, request) for info in observations):
             return ExcelReviewCopyCloseResult(status="user_saved", layoutVersion=4, copyClosed=False)
-        copies = [info for info in observations if info and info.unsaved and info.sheet_name == request.copySheetName]
+        copies = [info for info in observations if info and info.unsaved and self._copy_for_close(info, request)]
         if len(copies) > 1:
             # Two distinct windows claim this session's nonce: refusing is the only safe
             # answer (guessing which is ours could close an unrelated workbook).
             return ExcelReviewCopyCloseResult(status="ambiguous", layoutVersion=4, copyClosed=False)
         if not copies:
+            if request.copyIdentityVersion == 2 and any(info and info.unsaved and
+                    (info.review_copy_id == request.copySheetName or info.sheet_hash == request.worksheetNameHash)
+                    for info in observations):
+                return ExcelReviewCopyCloseResult(status="identity_lost", layoutVersion=4, copyClosed=False)
             # Idempotent: repeat cleanup, or the user already closed the copy themselves.
             return ExcelReviewCopyCloseResult(status="already_closed", layoutVersion=4, copyClosed=True)
-        originals = [info for info in observations if self._original(info, request)]
+        originals = [info for info in observations if bool(info and not info.unsaved and info.workbook_hash == request.workbookPathHash)]
         if len(originals) != 1:
             return ExcelReviewCopyCloseResult(status="identity_lost", layoutVersion=4, copyClosed=False)
         copy, original = copies[0], originals[0]
         # Re-verify both identities before handing the copy to the workbook adapter.
         if native.describe(copy.key) != copy or native.describe(original.key) != original:
             return ExcelReviewCopyCloseResult(status="identity_lost", layoutVersion=4, copyClosed=False)
+        if hasattr(native, "prepare_close_pair"):
+            # Restore the verified original window before the owned copy disappears.
+            # This activates the window, never changes either active worksheet.
+            native.prepare_close_pair(original, copy)
+            if native.describe(copy.key) != copy or native.describe(original.key) != original:
+                return ExcelReviewCopyCloseResult(status="identity_lost", layoutVersion=4, copyClosed=False)
         receipt = native.close_workbook(copy.key, copy)
         if not receipt.accepted:
             return ExcelReviewCopyCloseResult(status="failed", layoutVersion=4, copyClosed=False,
@@ -181,7 +256,7 @@ class ExcelWindowLayout:
                 candidates = []
                 for key in set(native.keys()) - ticket.baseline:
                     info = native.describe(key)
-                    if info and info.unsaved and info.sheet_name == ticket.request.copySheetName:
+                    if info and info.unsaved and self._copy(info, ticket.request):
                         candidates.append(key)
                 if len(candidates) > 1:
                     raise WindowLayoutError("LAYOUT_COPY_AMBIGUOUS")
@@ -192,7 +267,7 @@ class ExcelWindowLayout:
                     if not self._original(original_info, ticket.request):
                         raise WindowLayoutError("LAYOUT_ORIGINAL_CHANGED")
                     info = native.describe(copy)
-                    if not info or not info.unsaved or info.sheet_name != ticket.request.copySheetName:
+                    if not info or not info.unsaved or not self._copy(info, ticket.request):
                         raise WindowLayoutError("LAYOUT_COPY_CHANGED")
                     if self.clock() >= deadline:
                         raise WindowLayoutError("LAYOUT_TICKET_UNAVAILABLE")
@@ -221,6 +296,58 @@ class WindowsExcelWindows:
             raise WindowLayoutError("LAYOUT_DEPENDENCY_MISSING") from None
         self.api, self.con, self.gui, self.process = win32api, win32con, win32gui, win32process
         self.com, self.dynamic = pythoncom, dynamic
+        self._review_placements = {}
+        self._review_pairs = {}
+
+    def _only_review_windows(self, collection, original: WindowInfo, copy: WindowInfo) -> bool:
+        handles = {int(collection.Item(i).Hwnd) for i in range(1, int(collection.Count) + 1)}
+        if not {original.key.hwnd, copy.key.hwnd}.issubset(handles):
+            return False
+        owned = getattr(self, '_review_pairs', {})
+        for hwnd in handles - {original.key.hwnd, copy.key.hwnd}:
+            matches = [(key, info) for key, (workbook_hash, info) in owned.items()
+                       if key.hwnd == hwnd and workbook_hash == original.workbook_hash]
+            if len(matches) != 1 or self.describe(matches[0][0]) != matches[0][1]:
+                return False
+        return True
+
+    def suspend_pair(self, original: WindowInfo, copy: WindowInfo):
+        if self.describe(original.key) != original or self.describe(copy.key) != copy:
+            raise WindowLayoutError("LAYOUT_WINDOW_CHANGED")
+        # Break only this application's verified pair, never an unrelated comparison.
+        if original.key.pid == copy.key.pid:
+            children = []
+            self.gui.EnumChildWindows(original.key.hwnd, lambda h, _: children.append(h)
+                                      if self.gui.GetClassName(h) == "EXCEL7" else None, None)
+            if not children:
+                raise WindowLayoutError("LAYOUT_UNAVAILABLE")
+            self.com.CoInitialize()
+            try:
+                def leave(window):
+                    collection = window.Application.Windows
+                    if not self._only_review_windows(collection, original, copy):
+                        raise WindowLayoutError("LAYOUT_COMPARISON_AMBIGUOUS")
+                    if self._window_metadata(window, original.key) != original:
+                        raise WindowLayoutError("LAYOUT_WINDOW_CHANGED")
+                    collection.BreakSideBySide()
+                    window.Activate()
+                self._document_window(children[0], leave)
+            finally:
+                self.com.CoUninitialize()
+        if self.describe(original.key) != original or self.describe(copy.key) != copy:
+            raise WindowLayoutError("LAYOUT_WINDOW_CHANGED")
+        self.gui.ShowWindow(copy.key.hwnd, self.con.SW_MINIMIZE)
+        placement = getattr(self, '_review_placements', {}).get((original.key, copy.key))
+        if placement:
+            self.gui.SetWindowPlacement(original.key.hwnd, placement)
+        else:
+            self.gui.ShowWindow(original.key.hwnd, self.con.SW_MAXIMIZE)
+        if not self.gui.IsIconic(copy.key.hwnd):
+            raise WindowLayoutError("LAYOUT_POSITION_UNVERIFIED")
+
+    def prepare_close_pair(self, original: WindowInfo, copy: WindowInfo):
+        # Uses the same identity-checked break/placement restoration as explicit exit.
+        self.suspend_pair(original, copy)
 
     def _is_excel(self, hwnd: int) -> WindowKey | None:
         import ctypes as ct
@@ -257,13 +384,96 @@ class WindowsExcelWindows:
         raise WindowLayoutError("LAYOUT_WINDOW_CLOSE_PRIMITIVE_DISABLED")
 
     @staticmethod
+    def _book_review_id(book) -> str:
+        # A hidden constant string, never evaluated and never a Range/Cells read.
+        try:
+            marker = book.Names.Item("_EB_ReviewCopyId")
+            if bool(marker.Visible):
+                return ""
+            match = re.fullmatch(r'=\"(EB_[0-9a-f]{20})\"', str(marker.RefersTo))
+            return match.group(1) if match else ""
+        except Exception:
+            return ""
+
+    @staticmethod
     def _copy_book_matches(book, expected: WindowInfo) -> bool:
         # Read the retained Workbook itself, never reacquire ActiveWorkbook/Parent.
-        # Generated review copies contain exactly one worksheet and are not saved.
-        return (expected.unsaved and re.fullmatch(r"EB_[0-9a-f]{20}", expected.sheet_name) is not None
-                and str(book.Path) == "" and int(book.Sheets.Count) == 1
-                and str(book.Sheets.Item(1).Name) == expected.sheet_name
+        # New copies can contain multiple snapshot sheets; legacy unmarked copies remain single-sheet.
+        identity_matches = (WindowsExcelWindows._book_review_id(book) == expected.review_copy_id
+                            if expected.review_copy_id else re.fullmatch(r"EB_[0-9a-f]{20}", expected.sheet_name) is not None)
+        names = [str(book.Sheets.Item(i).Name) for i in range(1, int(book.Sheets.Count) + 1)]
+        return (expected.unsaved and identity_matches
+                and str(book.Path) == "" and (bool(expected.review_copy_id) or len(names) == 1)
+                and names.count(expected.sheet_name) == 1
                 and int(book.FileFormat) == 51)
+
+    def select_pair_sheet(self, original: WindowInfo, copy: WindowInfo):
+        if not copy.review_copy_id or self.describe(original.key) != original or self.describe(copy.key) != copy:
+            raise WindowLayoutError("LAYOUT_WINDOW_CHANGED")
+        def children_of(key):
+            children = []
+            self.gui.EnumChildWindows(key.hwnd, lambda h, _: children.append(h)
+                                      if self.gui.GetClassName(h) == "EXCEL7" else None, None)
+            if not children:
+                raise WindowLayoutError("LAYOUT_UNAVAILABLE")
+            return children
+        child, original_child = children_of(copy.key)[0], children_of(original.key)[0]
+        self.com.CoInitialize()
+        try:
+            book = self._document_workbook(child, copy.key)
+            if book is None or not self._copy_book_matches(book, copy):
+                raise WindowLayoutError("LAYOUT_COPY_CHANGED")
+            sheets = [book.Worksheets.Item(i) for i in range(1, int(book.Worksheets.Count) + 1)]
+            matches = [sheet for sheet in sheets if hashlib.sha256(str(sheet.Name).encode("utf-8")).hexdigest() == original.sheet_hash]
+            if len(matches) != 1 or self.describe(original.key) != original or self.describe(copy.key) != copy:
+                raise WindowLayoutError("LAYOUT_COPY_CHANGED")
+            matches[0].Activate()
+            def refocus(window):
+                if self._window_metadata(window, original.key) != original:
+                    raise WindowLayoutError("LAYOUT_WINDOW_CHANGED")
+                window.Activate()
+            self._document_window(original_child, refocus)
+            selected = self.describe(copy.key)
+            if not selected or selected.review_copy_id != copy.review_copy_id or selected.sheet_hash != original.sheet_hash:
+                raise WindowLayoutError("LAYOUT_COPY_CHANGED")
+            if hasattr(self, '_review_pairs'):
+                self._review_pairs[copy.key] = (original.workbook_hash, selected)
+        finally:
+            self.com.CoUninitialize()
+
+    def promote_copy_label(self, original: WindowInfo, copy: WindowInfo, nonce: str):
+        """Upgrade a retained legacy copy's label, without rebuilding or changing cells."""
+        if (not copy.unsaved or copy.sheet_name != nonce or original.unsaved
+                or self.describe(original.key) != original or self.describe(copy.key) != copy):
+            raise WindowLayoutError("LAYOUT_COPY_CHANGED")
+        children = []
+        self.gui.EnumChildWindows(copy.key.hwnd, lambda h, _: children.append(h)
+                                  if self.gui.GetClassName(h) == "EXCEL7" else None, None)
+        if not children:
+            raise WindowLayoutError("LAYOUT_UNAVAILABLE")
+        self.com.CoInitialize()
+        try:
+            book = self._document_workbook(children[0], copy.key)
+            if book is None or not self._copy_book_matches(book, copy):
+                raise WindowLayoutError("LAYOUT_COPY_CHANGED")
+            if self.describe(original.key) != original or self.describe(copy.key) != copy:
+                raise WindowLayoutError("LAYOUT_WINDOW_CHANGED")
+            self._promote_book_label(book, copy, original.sheet_name, nonce)
+        finally:
+            self.com.CoUninitialize()
+
+    @staticmethod
+    def _promote_book_label(book, expected: WindowInfo, sheet_name: str, nonce: str):
+        if expected.sheet_name != nonce or not WindowsExcelWindows._copy_book_matches(book, expected):
+            raise WindowLayoutError("LAYOUT_COPY_CHANGED")
+        # Add the nonce first. A rename failure retains an identifiable, retryable copy.
+        if not expected.review_copy_id:
+            book.Names.Add(Name="_EB_ReviewCopyId", RefersTo=f'="{nonce}"', Visible=False)
+        if WindowsExcelWindows._book_review_id(book) != nonce:
+            raise WindowLayoutError("LAYOUT_COPY_CHANGED")
+        book.Sheets.Item(1).Name = sheet_name
+        if str(book.Sheets.Item(1).Name) != sheet_name or str(book.Path):
+            raise WindowLayoutError("LAYOUT_COPY_CHANGED")
 
     @staticmethod
     def _archive_review_book(book) -> str:
@@ -310,6 +520,11 @@ class WindowsExcelWindows:
                 if self._is_excel(key.hwnd) != key or not self._copy_book_matches(book, expected):
                     return CopyCloseReceipt(False, recovery_path)
                 book.Close(False)
+                getattr(self, '_review_pairs', {}).pop(key, None)
+                placements = getattr(self, '_review_placements', {})
+                for pair in list(placements):
+                    if pair[1] == key:
+                        del placements[pair]
                 return CopyCloseReceipt(True, recovery_path)
             finally:
                 self.com.CoUninitialize()
@@ -390,7 +605,8 @@ class WindowsExcelWindows:
         book = sheet.Parent
         name, folder = str(sheet.Name), str(book.Path)
         full_name = str(book.FullName)
-        return WindowInfo(key, path_hash(full_name) if folder else "", hashlib.sha256(name.encode("utf-8")).hexdigest(), name, not folder)
+        return WindowInfo(key, path_hash(full_name) if folder else "", hashlib.sha256(name.encode("utf-8")).hexdigest(), name, not folder,
+                          WindowsExcelWindows._book_review_id(book))
 
     def enable_synchronous_comparison(self, original: WindowKey, copy: WindowKey,
                                      original_info: WindowInfo | None = None, copy_info: WindowInfo | None = None,
@@ -434,8 +650,7 @@ class WindowsExcelWindows:
         collection = original.Application.Windows
         # Comparing is application-wide. Do not replace an unrelated comparison
         # or affect a third workbook's view. More than this pair stays manual.
-        if int(collection.Count) != 2 or {int(collection.Item(i).Hwnd) for i in (1, 2)} != {
-                expected_original.key.hwnd, expected_copy.key.hwnd}:
+        if not self._only_review_windows(collection, expected_original, expected_copy):
             raise WindowLayoutError("LAYOUT_COMPARISON_AMBIGUOUS")
         caption = str(copy.Caption)
         row, column = int(original.ScrollRow), int(original.ScrollColumn)
@@ -558,6 +773,17 @@ class WindowsExcelWindows:
                        copy.hwnd: (x, y, x + copy_width, bottom)}
             for key in (original, copy):
                 placements[key.hwnd] = self.gui.GetWindowPlacement(key.hwnd)
+            if not hasattr(self, '_review_placements'):
+                self._review_placements = {}
+            # Every sheet copy shares the original window's pre-review placement.
+            # A later copy must not save the already split frame as the normal size.
+            baseline = next((placement for (source, _), placement in self._review_placements.items()
+                             if source == original), placements[original.hwnd])
+            self._review_placements.setdefault((original, copy), baseline)
+            if not hasattr(self, '_review_pairs'):
+                self._review_pairs = {}
+            if original_info and copy_info:
+                self._review_pairs[copy] = (original_info.workbook_hash, copy_info)
             synchronous_scrolling = self.enable_synchronous_comparison(original, copy, original_info, copy_info, may_mutate)
             for key in (original, copy):
                 if self._is_excel(key.hwnd) != key:

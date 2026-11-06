@@ -38,6 +38,19 @@ def test_build_script_stages_frontend_manifest_and_certificate() -> None:
     assert "catalog/manifest.xml" in script
     assert "localhost.*" in script
     assert "uninstall.sh" in script
+    assert "npm run build:wps" in script
+    assert 'apps/wps-addin/dist/' in script
+    assert 'wps-frontend' in script
+    assert '--collect-all claude_agent_sdk' in script
+    assert '--self-test' in script
+
+
+def test_mac_registration_and_uninstall_use_bundled_runtime_as_desktop_user() -> None:
+    assert 'sudo -u "$CONSOLE_USER" "$INSTALL_DIR/ExcelBro" --register-wps "$USER_HOME"' in _read(POSTINSTALL_PATH)
+    assert '--unregister-wps' in _read(UNINSTALL_PATH)
+    runtime = _read(RUNTIME_PATH)
+    assert '"wps-frontend", _wps_port(bundle_root), tls=False' in runtime
+    assert '"frontend", 3000, tls=True' in runtime
 
 
 def test_postinstall_sideloads_manifest_into_excel_container_as_console_user() -> None:

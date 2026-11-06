@@ -65,7 +65,7 @@ await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
 let browser;
 async function assertFits(page, description) {
   const failures = await page.evaluate(() => {
-    const selectors = ['.chat-shell','.chat-header','.brand-copy strong','.header-actions button','.model-picker-trigger','.model-menu',
+    const selectors = ['.chat-shell','.scope-utility-button','.model-picker-trigger','.model-menu',
       '.layout-fixture','.task-progress-timeline','.activity-step-body','.activity-step-trace',
       '.clarification-card','.local-mapping-resolution input','.local-mapping-resolution button','.composer'];
     return selectors.flatMap((selector) => Array.from(document.querySelectorAll(selector)).flatMap((element) => {
@@ -83,37 +83,22 @@ try {
     await context.route('http://127.0.0.1:8765/**', (route) => route.fulfill({
       contentType: 'application/json', headers: { 'Access-Control-Allow-Origin': '*' },
       body: JSON.stringify(route.request().url().endsWith('/api/models') ? {
-        models:[{id:'connection:layout',label,provider:'model',available:true,supportsVision:false}],
+        models:[{id:'connection:layout',modelId:label,label,provider:'model',available:true,supportsVision:false}],
         defaultModelId:'connection:layout'
       } : {status:'ok',configured:true,mode:'model',model:'layout'})
     }));
     const page = await context.newPage();
     page.on('pageerror', (error) => console.error('render error:', error.message));
     await page.goto(`http://127.0.0.1:${server.address().port}`);
-    await page.locator('.brand-copy').waitFor({state:'attached'});
-    try {
-      await page.waitForFunction(() => document.querySelector('.model-picker-trigger')?.title.includes('Layout-Test-Model'), null, {timeout: 5000});
-    } catch (error) {
-      console.error('mock header:', await page.locator('.brand-copy').innerText());
-      throw error;
-    }
-    await assertFits(page, `${width}px actual header`);
-    assert.equal(await page.locator('.brand-copy').innerText(), 'Excel Bro', `${width}px no model line`);
-    const headerRows = await page.locator('.chat-header').evaluate(header => {
-      const centers = [...header.querySelectorAll('.brand-mark,.brand-copy,.model-picker-trigger,.header-actions button')]
-        .map(item => { const box = item.getBoundingClientRect(); return box.top + box.height / 2; });
-      return Math.max(...centers) - Math.min(...centers);
-    });
-    if (width >= 400) assert.ok(headerRows <= 1, `${width}px header wraps despite available space: ${headerRows}`);
-    if (width === 320) assert.ok(headerRows > 1, '320px header should wrap instead of clipping or hiding controls');
+    await page.locator('.composer').waitFor({state:'attached'});
+    await page.waitForFunction(() => document.querySelector('.model-picker-trigger')?.title.includes('Layout-Test-Model'), null, {timeout:5000});
+    await assertFits(page, `${width}px headerless shell`);
+    assert.equal(await page.locator('.chat-header').count(), 0);
+    assert.equal(await page.locator('.composer .scope-entry-row-with-new-chat > .new-chat-entry').count(), 1);
     const directoryGuide = page.getByRole('button', { name: '以后再设置' });
     if (await directoryGuide.count()) await directoryGuide.click();
-    for (const [selector, glyph] of [
-      ['.model-picker-trigger', ''], ['.new-chat-entry', '＋'],
-      ['.tools-entry', ''], ['.folder-backup-entry', '↶']
-    ]) {
-      const button = page.locator('.chat-header ' + selector);
-      assert.equal(await button.textContent(), glyph, `${width}px ${selector}: no text label`);
+    for (const selector of ['.folder-backup-entry', '.history-entry']) {
+      const button = page.locator('.scope-entry-row ' + selector);
       assert.ok(await button.getAttribute('aria-label'), `${selector}: accessible name`);
       assert.ok(await button.getAttribute('title'), `${selector}: hover help`);
       const box = await button.boundingBox();
@@ -121,14 +106,9 @@ try {
       assert.equal(box.height, 32, `${width}px ${selector}: compact height`);
     }
     const modelButton = page.getByRole('button', {name:'选择或添加模型', exact:true});
-    const centerOffset = await modelButton.evaluate(button => {
-      const outer = button.getBoundingClientRect();
-      const icon = button.querySelector('svg').getBoundingClientRect();
-      return {x:(icon.left+icon.right-outer.left-outer.right)/2,
-        y:(icon.top+icon.bottom-outer.top-outer.bottom)/2};
-    });
-    assert.ok(Math.abs(centerOffset.x) <= 0.5 && Math.abs(centerOffset.y) <= 0.5,
-      `${width}px model glyph off-center: ${JSON.stringify(centerOffset)}`);
+    assert.equal(await page.locator('.chat-header .model-picker-trigger').count(), 0);
+    assert.equal(await page.locator('.composer-toolbar .model-picker-trigger').count(), 1);
+    assert.equal(await modelButton.textContent(), label);
     await modelButton.click();
     assert.equal(await modelButton.getAttribute('aria-expanded'), 'true');
     assert.ok((await page.getByRole('menuitemradio', {checked:true}).textContent()).includes(label),

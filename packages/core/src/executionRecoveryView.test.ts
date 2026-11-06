@@ -19,6 +19,7 @@ import {
   selectExecutionRecoveryEntry,
   type ExecutionRecoveryVerdict
 } from "./executionRecoveryView";
+import { FORMULA_SOURCE_CHANGED_MESSAGE } from "./formulaWriteback";
 
 describe("执行恢复结论的共享呈现契约", () => {
   it("核对与续跑是两个结论，不是一个按钮里的两步", () => {
@@ -123,6 +124,25 @@ describe("续跑结论必须被来源复核支撑（2026-10-31 真机）", () =>
     expect(detail).toContain("来源已变化，不能沿用旧结果续跑。");
     expect(detail).toContain("改回登记时的值");
     expect(detail).toContain("重新核对（只读）");
+  });
+
+  it("已知原因必须排在「材料缺失、过期」前面（不许被笼统原因盖住）", () => {
+    /*
+     * 2026-11-02：来源变了却看到"本机材料缺失、过期或不符合精确续跑条件"，用户会去
+     * 翻材料、等期限。`replan` 带 `reason` 时那句话就是**已知原因**，必须开头就说。
+     */
+    const known = executionRecoveryDetail({
+      kind: "replan",
+      remaining: 1,
+      reason: FORMULA_SOURCE_CHANGED_MESSAGE
+    });
+    expect(known.startsWith(FORMULA_SOURCE_CHANGED_MESSAGE)).toBe(true);
+    expect(known).toContain("来源数据已改变，不能继续原任务。");
+    expect(known).not.toContain("本机材料缺失、过期");
+    expect(known).toContain("还有 1 个动作没写");
+    // 没有原因时才退回那句默认猜测（它不是事实，是"没有原因可报"的说法）。
+    const unknown = executionRecoveryDetail({ kind: "replan", remaining: 1 });
+    expect(unknown).toContain("本机材料缺失、过期或不符合精确续跑条件");
   });
 
   it("一个动作都不剩时是完成，不是续跑（来源结论不再参与）", () => {
@@ -270,7 +290,13 @@ describe("恢复入口的唯一性（卡片搬到输入区上方之后）", () =
       { kind: "completed", recorded: true },
       { nextActionIndex: 3, totalActions: 3 }
     )).toBe("已完成 3 / 3 步");
-    expect(EXECUTION_RECOVERY_ENTRY_HINT).toContain("输入框上方");
+    /*
+     * 指路句必须指向**真的在那儿的**入口。2026-11-02 那次改版把核对/继续搬进了
+     * 输入框内部（恢复操作区），所以"上方"这个词就错了 —— 这句断言跟着改，
+     * 正是为了防止"位置变了、说明没变"。
+     */
+    expect(EXECUTION_RECOVERY_ENTRY_HINT).toContain("输入框里");
+    expect(EXECUTION_RECOVERY_ENTRY_HINT).not.toContain("上方");
   });
 });
 

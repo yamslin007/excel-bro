@@ -14,6 +14,7 @@ import {
   installOfficeTestHost,
   type TestOfficeHost
 } from "./officeTestHost";
+import { FORMULA_SOURCE_CHANGED_MESSAGE } from "@excel-bro/core/formulaWriteback";
 
 /**
  * U1a：`writeFormulas` 的精确恢复（Excel 端）。
@@ -324,7 +325,7 @@ describe("计算公式动作的精确续跑（U1a）", () => {
           onActionCompleted: async () => undefined
         }
       })
-    ).rejects.toThrow("来源已变化，不能沿用旧结果续跑。");
+    ).rejects.toThrow(FORMULA_SOURCE_CHANGED_MESSAGE);
     // 零写入：连"先把没跑过的写了再说"都不允许。
     expect(host.writes()).toEqual([]);
     expect(host.cell(TARGET, "A2")).toBe("");
@@ -407,7 +408,7 @@ describe("计算公式动作的精确续跑（U1a）", () => {
           onActionCompleted: async () => undefined
         }
       })
-    ).rejects.toThrow("来源已变化");
+    ).rejects.toThrow(FORMULA_SOURCE_CHANGED_MESSAGE);
 
     // 拒绝只挡"继续写"，不挡"退回去"：撤销点仍在，原公式照旧写回。
     await undoExecution(checkpoint);

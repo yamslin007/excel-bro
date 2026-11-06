@@ -34,8 +34,11 @@ const log: ActivityLog = {
 };
 
 describe("activityMessages", () => {
+  // 线上形状：完整性是三件事（complete / incomplete / truncated+truncation），
+  // 解析器会把缺省值补齐，所以夹具按线上形状写，比对才有意义。
   const card = { resultRef: "res_" + "a".repeat(32), title: "Python 分析结果",
-    headers: ["列1"], rowCount: 2, columnCount: 1, sourceSheets: ["Sheet1"], complete: true };
+    headers: ["列1"], rowCount: 2, columnCount: 1, sourceSheets: ["Sheet1"], complete: true,
+    incomplete: [], truncated: false, truncation: null };
   const binding = { taskId: "turn-python", hostId: "excel-office" as const,
     workbookName: "test.xlsx", workbookIdentity: "url:test.xlsx", sourceFingerprint: null };
 

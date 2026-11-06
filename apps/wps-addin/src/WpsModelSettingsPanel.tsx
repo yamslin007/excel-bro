@@ -7,7 +7,7 @@ type ModelManagement = ReturnType<typeof useModelManagement>;
 
 const SUCCESSFUL_SETTINGS_FEEDBACK = new Set([
   "API Key 已保存并立即生效。",
-  "模型连接已添加。用途与可用状态请见连接列表。",
+  "模型连接已添加。",
   "模型连接已更新。",
   "模型连接已删除。",
   "/function 公式模型已更新。",
@@ -289,21 +289,46 @@ export default function WpsModelSettingsPanel({
                 </section>
               )}
 
+              {!hasEnvironmentModel && !connectionDraft && (
+                <section
+                  className="settings-first-run"
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => {
+                    onAddConnection();
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      onAddConnection();
+                    }
+                  }}
+                >
+                  <div className="settings-first-run-icon">＋</div>
+                  <div>
+                    <strong>添加模型连接</strong>
+                    <span>填写服务地址、模型 ID 和自己的 API Key，即可添加一个模型连接。</span>
+                  </div>
+                </section>
+              )}
+
               <section className="model-settings-section">
                 <div className="model-settings-section-heading">
                   <div>
                     <strong>{hasEnvironmentModel ? "其他模型连接" : "模型连接"}</strong>
                     <span>点击模型即可切换；编辑会在所选连接下方展开。</span>
                   </div>
-                  <button type="button" disabled={settingsSaving || settingsTesting || Boolean(connectionDraft)} onClick={onAddConnection}>
-                    ＋ 添加
-                  </button>
+                  {hasEnvironmentModel && (
+                    <button type="button" disabled={settingsSaving || settingsTesting || Boolean(connectionDraft)} onClick={onAddConnection}>
+                      ＋ 添加
+                    </button>
+                  )}
                 </div>
 
                 {connectionDraft && !connectionDraft.id && connectionEditor}
                 {(modelSettings?.connections.length ?? 0) === 0 && !connectionDraft && (
                   <div className="model-connection-empty">
-                    还没有模型连接。请添加兼容 SDK Agent 的连接；OpenAI 兼容连接可单独用于公式。
+                    还没有模型连接。可以添加 OpenAI 或 Anthropic 兼容的模型连接。
                   </div>
                 )}
                 {modelSettings?.connections.some((connection) =>

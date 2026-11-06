@@ -1,3 +1,4 @@
+import { RecoveryTerminalRecord } from "./RecoveryTerminalRecord";
 import {
   EXECUTION_RECOVERY_ACTION_LABEL,
   EXECUTION_RECOVERY_ENTRY_HINT,
@@ -50,17 +51,40 @@ export function excelRecoveryActions(card: OfficeRecoveryCard): ExecutionRecover
 /**
  * 卡面上**保留**的次要动作。
  *
- * `reconcile` 与 `resume` 已搬到输入框右下角那颗主按钮（2026-11-01 决定）：
- * 同一个动作在 40px 内画两颗按钮，用户只能靠试。留在这里的是"补记完成回执"——
- * 它既不是核对也不是续跑，是一次独立的收尾动作。
+ * `reconcile` 与 `resume` 已搬进**输入框里的恢复操作区**（2026-11-02 决定，
+ * 前一版搬到了右下角那颗主按钮上）：同一个动作在 40px 内画两颗按钮，用户只能靠试。
+ * 留在这里的是"补记完成回执"—— 它既不是核对也不是续跑，是一次独立的收尾动作。
  */
 const OFFICE_RECOVERY_SECONDARY_ACTIONS: readonly ExecutionRecoveryAction[] = ["backfill"];
 
-/** 主按钮现在承接哪一步（`null` = 这一步不由主按钮承接）。 */
-const OFFICE_RECOVERY_PRIMARY_HINT: Partial<Record<ExecutionRecoveryKind, string>> = {
-  reconcile: "下一步「核对在途动作」在输入框右下角：只补记回执，不写任何单元格。",
-  resume: "下一步「继续剩余动作」在输入框右下角：只执行剩下的步骤，已写过的不会重写。"
-};
+/**
+ * 主操作现在承接哪一步（`null` = 这一步不由操作区承接）。
+ *
+ * 文案里的**按钮名**来自共享判据算出来的 `primaryLabel`（宿主按同一份 facts 算，
+ * 不在这里另写一遍"核对在途动作"）—— 按钮上写的是「检查已写入结果」，指路句却叫
+ * 另一个名字，等于让用户去找一颗不存在的按钮。位置也照实说：它在输入框里，不在卡片上。
+ */
+function officeRecoveryPrimaryHint(
+  kind: ExecutionRecoveryKind,
+  primaryLabel: string,
+  primaryEntryVisible: boolean
+): string | null {
+  if (kind !== "reconcile" && kind !== "resume") return null;
+  if (!primaryEntryVisible) {
+    /*
+     * 输入区归别的正事（审阅在等决定 / 澄清在等回答 / 正在跑）时，恢复操作区**不接管**
+     * 输入框，那里只剩一块普通 textarea —— 再说"在输入框里"就是让用户去点一颗不存在的
+     * 按钮。所以照实说"还没到、等上面收尾后出现"，**不给假入口，也不把恢复待办藏起来**
+     * （它仍在固定区域的 chip 里，点一下就能看到这张卡）。
+     */
+    return kind === "reconcile"
+      ? `下一步「${primaryLabel}」：等当前事项处理完后，入口会出现在输入框里 —— 它只读核对，不写任何单元格。`
+      : `下一步「${primaryLabel}」：等当前事项处理完后，入口会出现在输入框里 —— 它只执行剩下的步骤，已写过的不会重写。`;
+  }
+  return kind === "reconcile"
+    ? `下一步「${primaryLabel}」在输入框里：只读核对，不写任何单元格。`
+    : `下一步「${primaryLabel}」在输入框里：只执行剩下的步骤，已写过的不会重写。`;
+}
 
 /**
  * 「上次写入的恢复核对」—— **唯一**可点击的入口，住在输入区上方。
@@ -93,18 +117,31 @@ export function OfficeRecoveryPanel({
   card,
   busy,
   undo,
+  primaryLabel,
   onAction,
-  onReverify
+  onReverify,
+  primaryEntryVisible
 }: {
   card: OfficeRecoveryCard;
   busy: boolean;
   undo?: OfficeRecoveryUndoNotice;
+  /** 主操作此刻叫什么（宿主用同一份 facts 从共享判据算）。指路句里引用它，不另起名字。 */
+  primaryLabel: string;
   onAction: (action: ExecutionRecoveryAction) => void;
   onReverify: () => void;
+  /**
+   * 输入区此刻**真的**摆着那颗主操作吗（恢复模式，或至少留着那行待办入口）。
+   * `false` 时指路句改说"还没到"，不写一句用户点不到的话。
+   */
+  primaryEntryVisible: boolean;
 }) {
   const actions = excelRecoveryActions(card);
   const secondary = actions.filter((action) => OFFICE_RECOVERY_SECONDARY_ACTIONS.includes(action));
-  const primaryHint = OFFICE_RECOVERY_PRIMARY_HINT[card.verdict.kind] ?? null;
+  const primaryHint = officeRecoveryPrimaryHint(
+    card.verdict.kind,
+    primaryLabel,
+    primaryEntryVisible
+  );
   const acting = card.acting ?? null;
   return (
     <article
@@ -160,7 +197,7 @@ export function OfficeRecoveryPanel({
       </div>
       <div className="office-recovery-panel-actions">
         {/*
-          主按钮（核对 / 继续剩余动作）**不在这里**：它已经在输入框右下角，
+          主按钮（核对 / 继续执行）**不在这里**：它在输入框内部那块恢复操作区里，
           用同一份结论、同一个处理器。卡面只留一句"下一步去哪"，以及补记/重读这类
           次要动作 —— 否则同一个动作就有两个入口，而其中一颗不受输入框状态约束。
         */}
@@ -206,9 +243,9 @@ export function OfficeRecoveryPanel({
 /**
  * 历史消息里的**只读**执行记录：没有按钮、不重复结论 badge。
  *
- * 它是"这件事发生过"的证据，不是入口。可点击的那一份在输入区上方
- * （`OfficeRecoveryPanel`），所以 `selectExecutionRecoveryEntry` 挑中哪一条，
- * 哪一条才多一行"入口在输入框上方"的指路 —— 其余历史记录不给这句，
+ * 它是"这件事发生过"的证据，不是入口。可点击的那一份在输入框内部
+ * （`RecoveryComposer`），所以 `selectExecutionRecoveryEntry` 挑中哪一条，
+ * 哪一条才多一行"入口在输入框里"的指路 —— 其余历史记录不给这句，
  * 免得让人去找一个已经不在那儿的上方入口。
  *
  * **终态**（撤销确认 / 放弃 / 收尾）反过来：固定区域已经收走那张卡，这里改成
@@ -226,22 +263,13 @@ export function OfficeRecoveryRecord({
   const terminal = executionRecoveryTerminalReason(card.verdict);
   if (terminal) {
     return (
-      <details
-        className="office-recovery-record is-terminal"
-        aria-label="已结束的恢复记录"
-        data-operation-id={card.operationId}
-        data-recovery-terminal={terminal}
-      >
-        <summary>
-          <strong>{executionRecoveryBadge(card.verdict)}</strong>
-          <span className="office-recovery-record-summary">
-            {executionRecoveryTerminalSummary(card.verdict)}
-          </span>
-        </summary>
+      <RecoveryTerminalRecord className="office-recovery-record" kind={terminal} operationId={card.operationId}
+        title={executionRecoveryBadge(card.verdict)} summary={executionRecoveryTerminalSummary(card.verdict)}>
+
         <p>{executionRecoveryDetail(card.verdict)}</p>
         <p>{executionRecoveryProgress(card.verdict, card)}</p>
         <p>{executionRecoveryNote(card.verdict)}</p>
-      </details>
+      </RecoveryTerminalRecord>
     );
   }
   return (

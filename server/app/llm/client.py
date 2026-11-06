@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import random
+from urllib.parse import urlsplit
 from types import TracebackType
 from typing import Any
 
 import httpx
 
-from ..capabilities import capabilities, capability_float
+from ..capabilities import capabilities, capability_float, capability_int
+from . import anthropic
 from .config import ModelConnection, ModelNotAvailableError
 from .errors import (
     LLMConnectError,
@@ -38,7 +40,10 @@ def _capability_nonneg_int(section: str, key: str) -> int:
 
 
 class OpenAICompatibleClient:
-    """Minimal adapter for OpenAI-compatible chat/completions services."""
+    """Shared text client; keeps its historical name for existing callers/tests.
+
+    Routes by the saved protocol, normalizing Anthropic replies for formula callers.
+    """
 
     def __init__(
         self,
@@ -49,9 +54,9 @@ class OpenAICompatibleClient:
         retry_base_delay: float | None = None,
         retry_max_delay: float | None = None,
     ) -> None:
-        if connection.adapter != "openai_compatible":
+        if connection.adapter not in {"openai_compatible", "claude_agent_sdk"}:
             raise ModelNotAvailableError(
-                "当前功能尚未接入所选 SDK 后端；请切换到 OpenAI 兼容模型连接。"
+                "所选模型连接的接口协议不受支持。"
             )
         self.connection = connection
         self.timeout = timeout
@@ -73,7 +78,8 @@ class OpenAICompatibleClient:
         self._client: httpx.AsyncClient | None = None
 
     async def __aenter__(self) -> OpenAICompatibleClient:
-        self._client = httpx.AsyncClient(timeout=self.timeout)
+        self._client = httpx.AsyncClient(timeout=self.timeout, follow_redirects=False,
+            trust_env=urlsplit(self.connection.base_url).hostname not in {"127.0.0.1", "localhost", "::1"})
         return self
 
     async def __aexit__(
@@ -88,6 +94,11 @@ class OpenAICompatibleClient:
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
+        if self.connection.adapter == "claude_agent_sdk":
+            headers["anthropic-version"] = "2023-06-01"
+            if self.connection.api_key:
+                headers["x-api-key"] = self.connection.api_key
+            return headers
         if self.connection.api_key:
             headers["Authorization"] = f"Bearer {self.connection.api_key}"
         return headers
@@ -162,12 +173,24 @@ class OpenAICompatibleClient:
 
     async def _request_once(self, payload: dict[str, Any]) -> dict[str, Any]:
         assert self._client is not None
+        is_anthropic = self.connection.adapter == "claude_agent_sdk"
+        if is_anthropic:
+            url = anthropic.messages_url(self.connection.base_url)
+            payload = anthropic.request_payload(payload, supports_vision=self.connection.supports_vision,
+                default_max_tokens=capability_int("formula", "maxOutputTokens"))
+        else:
+            from ..openai_sdk_transport import completion_url, _parameter_fallback
+            url = completion_url(self.connection.base_url)
         try:
             response = await self._client.post(
-                f"{self.connection.base_url}/chat/completions",
+                url,
                 headers=self._headers(),
                 json=payload,
             )
+            # Share the SDK transport's explicit unsupported-parameter rule.
+            # Only a rejected request is retried; never change model or endpoint.
+            if not is_anthropic and response.status_code == 400 and _parameter_fallback(payload, response.text[:16384]):
+                response = await self._client.post(url, headers=self._headers(), json=payload)
             response.raise_for_status()
         except httpx.TimeoutException as error:
             raise LLMTimeoutError("模型响应超时") from error
@@ -193,7 +216,7 @@ class OpenAICompatibleClient:
             raise LLMResponseError("模型服务没有返回有效 JSON") from error
         if not isinstance(body, dict):
             raise LLMResponseError("模型服务返回的 JSON 顶层不是对象")
-        return body
+        return anthropic.response_payload(body) if is_anthropic else body
 
     @staticmethod
     def _is_retryable(error: LLMError) -> bool:

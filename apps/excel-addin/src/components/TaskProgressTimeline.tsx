@@ -194,7 +194,8 @@ export function TaskProgressTimeline({
   const expanded = processPanelExpanded({
     live,
     outcome: log.outcome ?? null,
-    userChoice
+    userChoice,
+    awaitingAnswer
   });
   /*
    * 「多显示一些」与「展开/收起」是**两个**意愿，不能共用同一个布尔：
@@ -226,6 +227,7 @@ export function TaskProgressTimeline({
     (trace) => !visibleTraceIds.has(trace.id)
   );
   const lastStep = log.steps.length > 0 ? log.steps[log.steps.length - 1] : undefined;
+  const activeStep = [...log.steps].reverse().find(step => !isTerminalStatus(step.status));
   const overallStatus: ActivityOutcome | TaskProgressStatus =
     log.outcome ?? (live ? "progress" : lastStep ? stepStatus(lastStep) : "progress");
   const overallLabel =
@@ -253,7 +255,8 @@ export function TaskProgressTimeline({
    */
   const headingText = expanded
     ? `${processLabel} · ${log.steps.length} 步 · ${formatElapsed(durations.activeMs)}`
-    : foldedProcessLine({ conclusion: overallLabel, activeMs: durations.activeMs });
+    : foldedProcessLine({ conclusion: live && !onContinue && activeStep
+      ? `${activeStep.label}…` : overallLabel, activeMs: durations.activeMs });
 
   useLayoutEffect(() => {
     if (!expanded) {
@@ -440,10 +443,10 @@ export function TaskProgressTimeline({
             className="task-progress-toggle"
             aria-expanded={expanded}
             aria-controls={contentId}
-            aria-label={expanded ? "收起" : "展开"}
+            aria-label={expanded ? "收起" : "查看过程"}
             onClick={() => applyExpanded(!expanded)}
           >
-            {expanded ? "收起" : "展开"}
+            {expanded ? "收起" : "查看过程"}
           </button>
         </div>
       </div>

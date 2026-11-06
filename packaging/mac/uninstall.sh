@@ -16,6 +16,7 @@ SYSTEM_KEYCHAIN="/Library/Keychains/System.keychain"
 CONSOLE_USER="$(stat -f %Su /dev/console 2>/dev/null || true)"
 if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != "root" ]; then
     CONSOLE_UID="$(id -u "$CONSOLE_USER")"
+    sudo -u "$CONSOLE_USER" "$INSTALL_DIR/ExcelBro" --unregister-wps "/Users/$CONSOLE_USER"
     launchctl bootout "gui/$CONSOLE_UID/$PLIST_LABEL" 2>/dev/null || true
     rm -f "/Users/$CONSOLE_USER/Library/LaunchAgents/$PLIST_LABEL.plist"
     rm -f "/Users/$CONSOLE_USER/Library/Containers/com.microsoft.Excel/Data/Documents/wef/manifest.xml"

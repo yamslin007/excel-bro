@@ -71,10 +71,18 @@ export interface FunctionPreview {
   externalFiles?: string[];
 }
 
+/** 归属到某次执行的操作反馈。类型来自共享层，两端不另写一份。 */
+export type ChatMessageFeedback = import("@excel-bro/core/operationFeedback").OperationFeedbackRecord;
+
 export interface ChatMessage {
   id: string;
   role: MessageRole;
   text?: string;
+  /**
+   * 非空 = 这是一条短操作反馈，渲染时按 `executionId` 挂到对应执行记录下面，
+   * 不再单独占一行。不同执行身份绝不合并（`groupOperationFeedback` 是唯一判据）。
+   */
+  feedback?: ChatMessageFeedback | null;
   attachmentNames?: string[];
   plan?: AnalysisPlan;
   resultContext?: ResultContext;
@@ -154,6 +162,25 @@ export interface ChatMessage {
     /** 服务端已推进到的下一步序号与动作总数：执行记录（详情）里要显示，不放进正文。 */
     nextActionIndex: number;
     totalActions: number;
+    /**
+     * 下一条要执行的动作目标 —— 就是 `plan.actions[nextActionIndex]` 的 `sheet`/`range`。
+     *
+     * 只给"写在哪"用的一句话（输入框里那句「继续后将写入「结果3!B2」」）。**不含
+     * `values` / `formulas` 矩阵**，也不是新的判定输入：拿不到就传 `null`，
+     * 界面改成说"还要执行剩余 N 步"，绝不拼一个假区域。
+     */
+    nextAction?: { type: string; sheet: string; range?: string | null } | null;
+    /**
+     * 这次计划的**全部动作目标**（顺序即执行顺序）—— 输入框里那两句
+     * 「已写入：结果1!B2、结果2!B2」「尚未写入：结果3!B2」的唯一来源。
+     *
+     * 仍然是"写在哪"的信息：**不含** `values` / `formulas` 矩阵，也不参与
+     * "能不能续跑"的判定。哪些算写入由账本游标与结论里的 `outcome` 决定
+     * （`recoveryComposerTargets` 读同一份判据），这里只提供位置。
+     *
+     * 早于本字段的历史消息没有它 ⇒ `undefined`，正文退回只说步数，绝不编位置。
+     */
+    targets?: { type: string; sheet: string; range?: string | null }[];
   };
   /** 规划达到本轮安全时长边界后保存的现场；刷新后仍可由用户明确继续。 */
   planningResume?: {

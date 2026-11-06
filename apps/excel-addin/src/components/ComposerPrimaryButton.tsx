@@ -72,7 +72,21 @@ export function ComposerPrimaryButton({
         onInvoke(action.invoke);
       }}
     >
-      {action.kind === "answer" ? "提交回答" : action.glyph}
+      {action.kind === "answer" ? (
+        "提交回答"
+      ) : action.glyph === "↑" ? (
+        /* 发送/补充：向上的实心箭头；操作判据和防双击行为保持不变。 */
+        <svg
+          className="composer-send-arrow"
+          viewBox="0 0 24 24"
+          aria-hidden="true"
+          focusable="false"
+        >
+          <path d="M10.7 3.9a1.45 1.45 0 0 1 2.6 0l7.1 15.3c.6 1.2-.7 2.5-1.9 1.9L12 17.9l-6.5 3.2c-1.2.6-2.5-.7-1.9-1.9Z" />
+        </svg>
+      ) : (
+        action.glyph
+      )}
     </button>
   );
 }

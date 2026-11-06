@@ -102,7 +102,17 @@ export default defineConfig({
     }
   },
   build: {
-    outDir: "dist"
+    outDir: "dist",
+    rollupOptions: {
+      // 多页构建：任务窗格 + 专注窗口 + 宽视图能力探针。
+      // `focus.html` 是专注窗口的独立入口（`ShowDialog("./focus.html?session=…")` 打开），
+      // `poc-dialog.html` 是只读能力探针，两者都必须进生产产物，否则部署后打开的是空页面。
+      input: {
+        taskpane: path.resolve(__dirname, "index.html"),
+        focus: path.resolve(__dirname, "focus.html"),
+        "poc-dialog": path.resolve(__dirname, "poc-dialog.html")
+      }
+    }
   },
   test: {
     environment: "jsdom",

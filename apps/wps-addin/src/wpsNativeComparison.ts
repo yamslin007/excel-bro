@@ -1,4 +1,6 @@
 import { isFormatActionType } from "./wpsPlanExecutor";
+import { parseExplicitA1Rect } from '../../excel-addin/src/planCore';
+import { saveReviewBefore, loadReviewBefore, deleteReviewBefore } from '../../excel-addin/src/utils/reviewBeforeStore';
 import capabilities from "../../../config/capabilities.json";
 import { readWpsRangeValues } from "./wpsRangeValues";
 import { writeWpsMatrix } from "./wpsWriteMatrix";
@@ -31,11 +33,18 @@ import {
 } from "./wpsPlanExecutor";
 import { captureWpsFormatSnapshot, restoreWpsFormatSnapshot, sameWpsFormatSnapshot, type WpsFormatSnapshot } from "./wpsFormatSnapshot";
 import { clearReviewMarksFromCopySheet, type WpsCopyMarkCleanup } from "./wpsResultReviewMarkers";
+import { bindWpsReviewTarget } from './wpsResultReviewTarget';
 
 export class WpsFormulaTrialError extends Error {}
 
 /** A disposable, unsaved workbook. Only the original plan can later be committed. */
 export type WpsNativeComparison = {
+  beforeSheets?: Array<Omit<WpsNativeComparison, 'original' | 'copy' | 'beforeSheets'>>;
+  suspended?: boolean;
+  constructionIssue?: string;
+  wholeCopyEvidence?: string;
+  snapshotNotice?: string;
+  snapshotScope?: string;
   original: WpsWorkbook;
   copy: WpsWorkbook;
   copyIdentity: WpsComparisonWorkbookIdentity;
@@ -191,6 +200,16 @@ function firstValueDifference(action: WpsPreparedAction, observed: CellValue[][]
   return "回读矩阵尺寸与计划不同。";
 }
 
+function sourceStateEvidence(sources: WpsPreparedPlan["sources"]): string {
+  return JSON.stringify(sources.map((source) => {
+    // coverageOnly records why evidence was captured, not worksheet state.
+    // Rebuilding from sourceSnapshots cannot preserve this provenance flag.
+    const evidence = {...source};
+    delete evidence.coverageOnly;
+    return evidence;
+  }));
+}
+
 function assertOriginalUnchanged(application: WpsApplication, prepared: WpsPreparedPlan): WpsWorkbook {
   assertWpsPreparedPlanUnchanged(prepared);
   const expected: WpsComparisonWorkbookIdentity = {
@@ -208,7 +227,7 @@ function assertOriginalUnchanged(application: WpsApplication, prepared: WpsPrepa
   const checked = prepareWpsPlan(application, indexes, prepared.plan, prepared.sourceSnapshots);
   if (checked.workbookIdentity !== prepared.workbookIdentity ||
       JSON.stringify(checked.actions) !== JSON.stringify(prepared.actions) ||
-      JSON.stringify(checked.sources) !== JSON.stringify(prepared.sources)) {
+      sourceStateEvidence(checked.sources) !== sourceStateEvidence(prepared.sources)) {
     throw new Error("原表或授权范围在预览后发生变化，请重新预览并确认。");
   }
   const confirmed = application.ActiveWorkbook;
@@ -252,10 +271,21 @@ function copyOwnershipVerdict(copy: WpsWorkbook, expected?: WpsComparisonWorkboo
  */
 export function wpsCopyContentVerdict(staged: WpsNativeComparison): ReviewCopyContentVerdict {
   try {
+    if (staged.beforeSheets) {
+      if (staged.copy.Worksheets.Count !== staged.beforeSheets.length) return 'changed';
+      for (const state of staged.beforeSheets) {
+        if (staged.beforeSheets.length > 1 && !state.wholeCopyEvidence) return 'unknown';
+        const verdict = wpsCopyContentVerdict({...state, original: staged.original, copy: staged.copy});
+        if (verdict !== 'unchanged') return verdict;
+      }
+      return 'unchanged';
+    }
     if (typeof staged.copy.Activate !== "function") return "unknown";
     staged.copy.Activate();
-    const sheet = staged.copy.Worksheets?.Item?.(1);
+    const sheet = Array.from({length: staged.copy.Worksheets.Count}, (_, i) => staged.copy.Worksheets.Item(i + 1))
+      .find(sheet => sheet.Name === staged.writeSheet.name);
     if (!sheet || sheet.Name !== staged.writeSheet.name) return "unknown";
+    if (staged.wholeCopyEvidence && wholeSheetEvidence(sheet) !== staged.wholeCopyEvidence) return 'changed';
     for (const [index, action] of staged.plan.actions.entries()) {
       const current = snapshot(target(sheet, action.range), action);
       if (!current.valuesCaptured) return "unknown";
@@ -306,10 +336,7 @@ function requestCopyClose(copy: WpsWorkbook): ReviewCopyCloseOutcome {
  * 复制出去。跨表**写入**依旧拒绝 —— 那种计划的副本预览无法自洽。
  */
 function writeSheetOf(prepared: WpsPreparedPlan): WpsAuthorizedSheet {
-  const written = new Set(prepared.actions.map((action) => action.sheetName));
-  if (written.size !== 1) {
-    throw new Error("原生并排审阅当前只支持单张工作表上的写入计划；跨表写入不会复制整本工作簿。");
-  }
+  if (new Set(prepared.actions.map(action => action.sheetName)).size !== 1) throw new Error("原生并排审阅当前只支持单张工作表上的写入计划；请先选择一张目标表。");
   const name = prepared.actions[0].sheetName;
   const authorized = prepared.authorization.sheets.find((sheet) => sheet.name === name);
   if (!authorized) {
@@ -335,6 +362,8 @@ function writeSheetOf(prepared: WpsPreparedPlan): WpsAuthorizedSheet {
  * 「双视图对比」时才由 `stageWpsNativeComparison(..., true)` 建立。
  */
 export type WpsBeforeResult = {
+  contextSheets?: Record<string, { address: string; values: CellValue[][]; format: WpsFormatSnapshot; widths: Array<number | null> }>;
+  contextUnavailable?: string;
   prepared: WpsPreparedPlan;
   /** 执行前目标区域的值/公式（与 `plan.actions` 对齐）；格式动作另取格式快照。 */
   values: WpsActionAfter[];
@@ -363,6 +392,33 @@ export function captureWpsBeforeResult(application: WpsApplication, prepared: Wp
       ? captureWpsFormatSnapshot(actionRange(action), action.rowCount, action.columnCount)
       : undefined
   );
+  const contextSheets: NonNullable<WpsBeforeResult['contextSheets']> = {};
+  let contextUnavailable: string | undefined;
+  try {
+    for (const name of new Set(prepared.actions.map(action => action.sheetName))) {
+      const authorized = prepared.authorization.sheets.find(sheet => sheet.name === name)!;
+      const sheet = original.Worksheets.Item(authorized.index);
+      const used = sheet.UsedRange;
+      const rects = prepared.actions.filter(action => action.sheetName === name).map(action => parseExplicitA1Rect(action.range)!);
+      if (!used || !Number.isInteger(used.Row) || !Number.isInteger(used.Column) || !used.Rows?.Count || !used.Columns?.Count)
+        throw new Error('宿主未提供完整已用区域坐标');
+      const usedRect = parseExplicitA1Rect(`${columnName(used.Column!)}${used.Row}:${columnName(used.Column! + used.Columns.Count - 1)}${used.Row! + used.Rows.Count - 1}`);
+      if (!usedRect) throw new Error('已用区域坐标无效');
+      rects.push(usedRect);
+      const row = Math.min(...rects.map(rect => rect.startRow)), col = Math.min(...rects.map(rect => rect.startColumn));
+      const endRow = Math.max(...rects.map(rect => rect.endRow)), endCol = Math.max(...rects.map(rect => rect.endColumn));
+      const rows = endRow - row + 1, columns = endCol - col + 1;
+      if (rows * columns > capabilities.excelNativeComparison.maxCells) throw new Error('整表快照超过展示限额');
+      const address = `${columnName(col)}${row}:${columnName(endCol)}${endRow}`;
+      const range = target(sheet, address), captured = readWpsRangeValues(range, rows, columns);
+      if (!captured.valuesCaptured) throw new Error('整表显示值未完整读取');
+      const widths = Array.from({length: columns}, (_, c) => {
+        const width = (rows === 1 && columns === 1 ? range : range.Item?.(1, c + 1))?.ColumnWidth;
+        return typeof width === 'number' && Number.isFinite(width) ? width : null;
+      });
+      contextSheets[name] = {address, values: captured.values.map(row => [...row]), format: captureWpsFormatSnapshot(range, rows, columns), widths};
+    }
+  } catch (reason) { contextUnavailable = reason instanceof Error ? reason.message : '整表快照不可用'; }
   /*
    * 格式采集不完整**不阻止执行**：双视图是可选的，为它拒绝写入等于把可选功能
    * 变成前置条件（正是本次要修的那类缺陷）。这里如实留下"哪些动作的格式没采到"，
@@ -372,6 +428,7 @@ export function captureWpsBeforeResult(application: WpsApplication, prepared: Wp
     prepared,
     values,
     formats: formats.map((format) => (format && format.captured ? format : undefined)),
+    contextSheets, contextUnavailable,
     workbookFullName: String(prepared.authorization.workbookFullName ?? "")
   };
 }
@@ -389,11 +446,52 @@ export function captureWpsBeforeResult(application: WpsApplication, prepared: Wp
  * `WpsBeforeResult` 里的值/公式与格式写回副本的目标区域。原表一格不动，
  * 也不靠"临时把原表还原再复制"这种会短暂破坏现场的写法。
  */
+/** Project all parallel snapshot arrays by the original action index, never by range alone. */
+export function wpsBeforeComparisonForSheet(before: WpsBeforeResult, sheetName?: string): WpsBeforeResult {
+  const names = [...new Set(before.prepared.actions.map(action => action.sheetName))];
+  const selected = sheetName ?? names[0];
+  if (!names.includes(selected) || !before.prepared.authorization.sheets.some(sheet => sheet.name === selected))
+    throw new Error('对比工作表不属于本次授权快照。');
+  const indices = before.prepared.actions.flatMap((action,index) => action.sheetName === selected ? [index] : []);
+  if (indices.some(index => !before.values[index]?.valuesCaptured)) throw new Error('该表执行前快照不完整，未创建对比副本。');
+  return {...before, prepared:{...before.prepared,
+    actions:indices.map(index => before.prepared.actions[index]),
+    plan:{...before.prepared.plan,actions:before.prepared.plan.actions.filter(action => action.sheet === selected)}},
+    values:indices.map(index => before.values[index]), formats:indices.map(index => before.formats[index])};
+}
+
 export function stageWpsBeforeComparison(
   application: WpsApplication,
   before: WpsBeforeResult,
-  reviewFormula?: string
+  reviewFormula?: string,
+  sheetName?: string
 ): WpsNativeComparison {
+  const names = [...new Set(before.prepared.actions.map(action => action.sheetName))];
+  const selected = sheetName ?? names[0];
+  if (!names.includes(selected)) throw new Error('对比目标不属于本次执行。');
+  if (names.length > 1 && (before.contextUnavailable || names.some(name => !before.contextSheets?.[name])))
+    throw new Error('缺少完整的执行前子表快照，不能生成多子表比对工作簿。');
+  if (names.reduce((sum, name) => sum + (before.contextSheets?.[name]?.values.reduce((n, row) => n + row.length, 0) ?? 0), 0) > capabilities.excelNativeComparison.maxCells)
+    throw new Error('执行前比对工作簿超过本机范围限额。');
+  const states: WpsNativeComparison[] = [];
+  let constructionIssue: string | undefined;
+  try {
+    for (const name of names) {
+      states[0]?.original.Activate?.();
+      states.push(stageWpsBeforeSheet(application, before, reviewFormula, name, states[0]));
+    }
+  } catch (reason) {
+    if (!states.length) throw reason;
+    constructionIssue = `比对工作簿未完整建立，已有副本仍保留，请手动核对：${reason instanceof Error ? reason.message : '宿主复制失败'}`;
+  }
+  const session = states.find(state => state.writeSheet.name === selected) ?? states[0];
+  return {...session, suspended: true, constructionIssue,
+    beforeSheets: states.map(({original: _original, copy: _copy, ...state}) => state)};
+}
+
+function stageWpsBeforeSheet(application: WpsApplication, before: WpsBeforeResult, reviewFormula?: string,
+  sheetName?: string, existing?: WpsNativeComparison): WpsNativeComparison {
+  before = wpsBeforeComparisonForSheet(before, sheetName);
   const prepared = before.prepared;
   const writeSheet = writeSheetOf(prepared);
   const active = application.ActiveWorkbook;
@@ -401,18 +499,45 @@ export function stageWpsBeforeComparison(
     throw new Error("当前工作簿已不是本次执行的那一本，未打开双视图；执行结果与撤销不受影响。");
   }
   const originalSheet = active.Worksheets.Item(writeSheet.index);
+  if (originalSheet.Name !== writeSheet.name) throw new Error('原工作表身份已变化，未建立比对副本。');
   if (typeof originalSheet.Copy !== "function" || typeof application.Windows?.CompareSideBySideWith !== "function") {
     throw new Error("当前 WPS 宿主未提供工作表副本或并排比较接口，未打开双视图；执行结果与撤销不受影响。");
   }
-  originalSheet.Copy();
-  const copy = application.ActiveWorkbook;
+  const expectedCount = existing ? existing.copy.Worksheets.Count + 1 : 1;
+  if (existing) {
+    if (copyOwnershipVerdict(existing.copy, existing.copyIdentity) || existing.original.FullName !== active.FullName)
+      throw new Error('已有比对副本身份发生变化，未添加子表。');
+    originalSheet.Copy(undefined, existing.copy.Worksheets.Item(existing.copy.Worksheets.Count));
+  } else originalSheet.Copy();
+  const copy = existing?.copy ?? application.ActiveWorkbook;
   const copyIdentity = copy ? comparisonWorkbookIdentity(copy) : null;
   if (!copy || !copyIdentity || !copyIdentity.name || copyIdentity.path ||
       copyIdentity.fullName === before.workbookFullName ||
-      copy.Worksheets.Count !== 1 || copy.Worksheets.Item(1).Name !== originalSheet.Name) {
-    throw new Error("WPS 未能确认新建了独立的单表副本；执行结果与撤销不受影响。请检查是否留下未保存副本。");
+      copy.Worksheets.Count !== expectedCount || copy.Worksheets.Item(copy.Worksheets.Count).Name !== originalSheet.Name) {
+    throw new Error("WPS 未能确认比对副本中的目标子表；执行结果与撤销不受影响。请检查是否留下未保存副本。");
   }
-  const sheet = copy.Worksheets.Item(1);
+  const sheet = copy.Worksheets.Item(copy.Worksheets.Count);
+  const contextBefore = before.contextSheets?.[writeSheet.name];
+  if (contextBefore) {
+    const range = target(sheet, contextBefore.address);
+    // Freeze ALL displayed values, including unchanged formulas and headers, at pre-execution time.
+    const rows = contextBefore.values.length, columns = contextBefore.values[0].length;
+    for (let r = 0; r < rows; r++) for (let c = 0; c < columns; c++) {
+      const cell = rows === 1 && columns === 1 ? range : range.Item?.(r + 1, c + 1);
+      if (!cell) throw new Error('副本不能逐格还原完整快照，已保留窗口供核对。');
+      const value = contextBefore.values[r][c];
+      if (typeof value === 'string' && /^[=+\-@]/.test(value)) cell.NumberFormat = '@';
+      cell.Value2 = value;
+    }
+    restoreWpsFormatSnapshot(range, contextBefore.format);
+    contextBefore.widths.forEach((width, c) => {
+      const cell = rows === 1 && columns === 1 ? range : range.Item?.(1, c + 1);
+      if (cell && width !== null) cell.ColumnWidth = width;
+    });
+    const readback = readWpsRangeValues(range, rows, columns);
+    if (!readback.valuesCaptured || JSON.stringify(readback.values) !== JSON.stringify(contextBefore.values))
+      throw new Error('完整副本快照回读不符，未声明比对成功。');
+  }
   /*
    * `Worksheet.Copy()` 复制的是**当前**原表，而原表此刻已经打上了本次审阅标记
    * （条件格式规则）。不清理，执行前副本也会高亮同样的区域，用户看到两边都黄，
@@ -479,7 +604,10 @@ export function stageWpsBeforeComparison(
     copyFormatFinal: before.formats,
     copyFingerprints,
     copyAfter,
-    ...(reviewMarks ? { reviewMarks } : {})
+    ...(reviewMarks ? { reviewMarks } : {}),
+    wholeCopyEvidence: wholeSheetEvidence(sheet) ?? undefined,
+    snapshotScope: contextBefore ? '执行前单元格值已固定，公式采用当时的值，不重新计算；可读取的基础格式与列宽已恢复。图表、条件格式等复杂对象来自打开副本时的原表，不作为历史对比依据。' : undefined,
+    snapshotNotice: contextBefore ? undefined : `本次仅保存了修改区域前态；其余内容来自当前表。${before.contextUnavailable ?? '旧记录没有完整表快照。'}`
   };
 }
 
@@ -754,11 +882,92 @@ export function verifyWpsNativeComparison(
 export function discardWpsNativeComparison(staged: WpsNativeComparison): ReviewCopyCloseOutcome {
   const ownership = copyOwnershipVerdict(staged.copy, staged.copyIdentity);
   if (ownership) return ownership;
+  const retained = staged.copy.Windows?.Item(1);
+  if (retained?.Visible === false) retained.Visible = true;
   const blocked = describeCopyDiscardSafety(wpsCopyContentVerdict(staged));
   if (blocked) return blocked;
   const outcome = requestCopyClose(staged.copy);
   try { staged.original.Activate?.(); } catch { /* 焦点归还失败不影响清理结果 */ }
   return outcome;
+}
+
+function wholeSheetEvidence(sheet: WpsWorksheet): string | null {
+  const range = sheet.UsedRange;
+  if (!range?.Rows?.Count || !range.Columns?.Count || range.Rows.Count * range.Columns.Count > capabilities.excelNativeComparison.maxCells) return null;
+  const values = readWpsRangeValues(range, range.Rows.Count, range.Columns.Count);
+  if (!values.valuesCaptured) return null;
+  return JSON.stringify([range.Row, range.Column, values.values, range.Formula,
+    captureWpsFormatSnapshot(range, range.Rows.Count, range.Columns.Count)]);
+}
+export async function saveWpsComparisonCopies(identity: string, executionId: string, copies: Array<[string, WpsNativeComparison]>): Promise<void> {
+  if (!copies.length) { await deleteReviewBefore('wps-copies', identity, executionId).catch(() => undefined); return; }
+  const records = copies.map(([name, {original, copy, ...state}]) => [name, {...state, originalFullName: original.FullName}]);
+  if (!await saveReviewBefore('wps-copies', identity, executionId, [], records))
+    for (const [, copy] of copies) {
+      const warning = '副本已保留，但本机未能持久保存窗口记录；刷新前请先完成审阅，避免遗留窗口。';
+      if (!copy.snapshotNotice?.includes(warning)) copy.snapshotNotice = [copy.snapshotNotice, warning].filter(Boolean).join(' ');
+    }
+}
+export async function loadWpsComparisonCopies(application: WpsApplication, identity: string, executionId: string): Promise<Array<[string, WpsNativeComparison]>> {
+  type Saved = Omit<WpsNativeComparison, 'original' | 'copy'> & {originalFullName: string};
+  const records = await loadReviewBefore<Array<[string, Saved]>>('wps-copies', identity, executionId, []) ?? [];
+  if (!records.length) return [];
+  if (!application.Workbooks) throw new Error('无法核实上次保留的比对副本，请回到原窗格或手动核对窗口。');
+  const books = Array.from({length: application.Workbooks.Count}, (_, i) => application.Workbooks!.Item(i + 1));
+  const result: Array<[string, WpsNativeComparison]> = [];
+  for (const [name, saved] of records) {
+    const originals = books.filter(book => book.FullName === saved.originalFullName);
+    const copies = books.filter(book => sameWorkbookIdentity(comparisonWorkbookIdentity(book), saved.copyIdentity));
+    if (!copies.length) continue; // User already closed this copy.
+    if (originals.length !== 1 || copies.length !== 1) throw new Error('上次比对副本身份不唯一，未重开或删除任何工作簿。');
+    result.push([name, {...saved, original: originals[0], copy: copies[0], suspended: true}]);
+  }
+  return result;
+}
+
+/** Hide only our owned copy, retain its content and scroll position for re-entry. */
+export function suspendWpsComparison(application: WpsApplication, staged: WpsNativeComparison): string | null {
+  const ownership = copyOwnershipVerdict(staged.copy, staged.copyIdentity);
+  if (ownership) return '比对副本身份已变化，未收起或删除，请手动核对。';
+  const window = staged.copy.Windows?.Item(1);
+  if (!window || typeof window.Visible !== 'boolean' || !application.Windows?.BreakSideBySide)
+    return '当前宿主无法收起副本，请手动切回原表；副本继续保留。';
+  if (application.Windows.BreakSideBySide() === false) return '宿主未退出并排，副本继续保留。';
+  staged.original.Activate?.();
+  window.Visible = false;
+  if (window.Visible === false) staged.suspended = true;
+  return window.Visible === false ? null : '宿主未隐藏副本，副本继续保留。';
+}
+
+export function activateWpsBeforeComparison(application: WpsApplication, staged: WpsNativeComparison): void {
+  if (staged.constructionIssue) throw new Error(staged.constructionIssue);
+  if (staged.beforeSheets && staged.suspended === false) return;
+  if (rearrangeWpsComparison(application, staged) !== 'arranged') throw new Error('未能排列已有副本，请手动核对。');
+  staged.suspended = false;
+}
+
+/** Same workbook pair, only matching worksheet tabs change. */
+export function switchWpsBeforeComparison(application: WpsApplication, staged: WpsNativeComparison, name: string): boolean {
+  if (staged.constructionIssue) throw new Error(staged.constructionIssue);
+  if (!staged.beforeSheets) return false;
+  const state = staged.beforeSheets.find(item => item.writeSheet.name === name);
+  if (!state || copyOwnershipVerdict(staged.copy, staged.copyIdentity)) throw new Error('对比副本或目标身份不符，未切换。');
+  const originalSheet = staged.original.Worksheets.Item(state.writeSheet.index);
+  const copies = Array.from({length: staged.copy.Worksheets.Count}, (_, i) => staged.copy.Worksheets.Item(i + 1))
+    .filter(sheet => sheet.Name === name);
+  if (originalSheet.Name !== name || copies.length !== 1 || !copies[0].Activate || !originalSheet.Activate)
+    throw new Error('无法核实两侧对应子表，未切换比对。');
+  copies[0].Activate();
+  staged.original.Activate?.();
+  originalSheet.Activate();
+  const suspended = staged.suspended;
+  Object.assign(staged, state, {suspended});
+  bindWpsReviewTarget({original: staged.original,
+    originalIdentity: {name: staged.original.Name, fullName: String(staged.original.FullName ?? ''), path: String(staged.original.Path ?? '') || null},
+    copyIdentity: {name: staged.copyIdentity.name, fullName: String(staged.copyIdentity.fullName ?? ''), path: staged.copyIdentity.path},
+    writeSheet: {index: staged.writeSheet.index, name}});
+  activateWpsBeforeComparison(application, staged);
+  return true;
 }
 
 /**
@@ -783,8 +992,24 @@ export function rearrangeWpsComparison(
       Number(staged.original.Worksheets?.Count ?? 0) > 0;
     if (!caption || typeof staged.original.Activate !== "function" ||
         typeof application.Windows?.CompareSideBySideWith !== "function" || !identityHolds()) return "unavailable";
+    bindWpsReviewTarget({ original: staged.original,
+      originalIdentity: {name: staged.original.Name, fullName: String(staged.original.FullName ?? ''), path: String(staged.original.Path ?? '') || null},
+      copyIdentity: {name: staged.copyIdentity.name, fullName: String(staged.copyIdentity.fullName ?? ''), path: staged.copyIdentity.path},
+      writeSheet: {index: staged.writeSheet.index, name: staged.writeSheet.name} });
+    const retainedWindow = staged.copy.Windows?.Item(1);
+    if (retainedWindow?.Visible === false) retainedWindow.Visible = true;
     application.Windows.ResetPositionsSideBySide?.();
     staged.original.Activate();
+    const targetSheet = staged.original.Worksheets.Item(staged.writeSheet.index);
+    if (targetSheet.Name !== staged.writeSheet.name) return "unavailable";
+    if (staged.beforeSheets && staged.beforeSheets.length > 1) {
+      const copySheet = Array.from({length: staged.copy.Worksheets.Count}, (_, i) => staged.copy.Worksheets.Item(i + 1))
+        .find(sheet => sheet.Name === staged.writeSheet.name);
+      if (!copySheet?.Activate) return 'unavailable';
+      copySheet.Activate();
+      staged.original.Activate();
+    }
+    targetSheet.Activate?.();
     if (application.Windows.CompareSideBySideWith(caption) !== true) return "unavailable";
     if (!identityHolds()) return "unavailable";
     // 同步滚动是独立能力：重新排列后尽力恢复，失败只影响联动，不影响排列结论。

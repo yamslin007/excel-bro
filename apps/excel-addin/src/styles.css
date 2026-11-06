@@ -264,17 +264,6 @@ textarea:focus-visible {
   font-size: var(--font-size-subtitle);
 }
 
-.tool-drawer-header > button.drawer-text-action,
-.tool-dialog-title > button.drawer-text-action {
-  width: auto;
-  height: 25px;
-  flex: 0 0 auto;
-  padding: 0 10px;
-  white-space: nowrap;
-  font-size: var(--font-size-caption);
-  cursor: pointer;
-}
-
 .tool-empty {
   display: grid;
   align-content: center;
@@ -2149,19 +2138,30 @@ textarea:focus-visible {
   gap: 6px;
 }
 
-.header-button.new-chat-entry {
+.scope-new-chat {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  min-height: 32px;
+  padding: 4px 8px;
+  border: 1px solid;
+  border-radius: var(--radius-md);
+  corner-shape: squircle;
+  white-space: nowrap;
+  font-size: var(--font-size-caption);
   border-color: var(--color-brand-text);
   background: var(--color-brand-text);
   color: var(--color-background);
 }
 
-.header-button.new-chat-entry:hover:not(:disabled) {
+.scope-new-chat:hover:not(:disabled) {
   border-color: var(--color-brand-text);
   background: var(--color-brand-text);
   filter: brightness(0.92);
 }
 
-.header-button.new-chat-entry > span[aria-hidden="true"] {
+.scope-new-chat > span[aria-hidden="true"] {
   font-size: var(--font-size-subtitle);
   line-height: 1;
 }
@@ -2170,6 +2170,41 @@ textarea:focus-visible {
   position: relative;
   display: flex;
 }
+
+.composer-app-trigger {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  flex: 0 0 32px;
+  padding: 2px;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  cursor: pointer;
+}
+
+.composer-app-trigger img { width: 28px; height: 28px; object-fit: contain; }
+.composer-app-menu { flex: 0 0 32px; }
+.composer-utility-toolbar { display: flex; margin-top: 4px; }
+.composer-app-trigger:hover,
+.composer-app-trigger[aria-expanded="true"] { background: var(--color-brand-bg); }
+.composer-app-trigger:focus-visible { outline: 2px solid var(--color-brand-text); outline-offset: 2px; }
+
+.composer-app-menu .view-menu {
+  top: auto;
+  bottom: calc(100% + 8px);
+  left: 0;
+  right: auto;
+  width: min(260px, calc(100vw - 40px));
+  max-height: min(460px, 65vh);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.composer-app-menu .view-menu > button { min-height: 40px; }
+.composer-app-menu .view-menu > button:disabled { opacity: .55; cursor: not-allowed; }
+.composer-app-menu [role="separator"] { height: 1px; margin: 3px 6px; background: var(--color-border); }
 
 .more-menu-backdrop {
   position: fixed;
@@ -2277,6 +2312,15 @@ textarea:focus-visible {
     var(--color-background)
   );
   padding: 12px;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+.settings-first-run:hover {
+  border-color: var(--color-brand-text);
+}
+.settings-first-run:focus-visible {
+  outline: 2px solid var(--color-brand-text);
+  outline-offset: 1px;
 }
 
 .settings-first-run-icon {
@@ -2587,11 +2631,14 @@ textarea:focus-visible {
 }
 
 .connection-editor > div:first-child button {
-  display: grid;
-  width: 24px;
-  height: 24px;
-  place-items: center;
-  padding: 0;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-md);
+  corner-shape: squircle;
+  background: var(--color-background);
+  color: var(--color-text-secondary);
+  padding: 4px 9px;
+  font-size: var(--font-size-caption);
+  cursor: pointer;
 }
 
 .connection-editor label {
@@ -2603,6 +2650,13 @@ textarea:focus-visible {
   color: var(--color-text-secondary);
   font-size: var(--font-size-caption);
   font-weight: 700;
+}
+
+.model-protocol-hint {
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-caption);
+  font-weight: 400;
+  line-height: 1.5;
 }
 
 .connection-editor input:not([type="checkbox"]) {
@@ -3028,12 +3082,31 @@ textarea:focus-visible {
   }
 }
 
+/*
+ * 消息流的四周留白（2026-11-03 收紧，同一天下午按「内容列」再定档）。
+ *
+ * 判据来自与 ExcelMaster 的并排对照：本面板是**平铺**消息（没有卡片外框），
+ * 分组全靠空隙，于是空隙会**叠加**成观感上的"到处是缝" ——
+ * 一条消息与下一条之间 = 行间距 + 下一条卡片自身 padding，
+ * 而参考实现用卡片边界分组，同位置的空白只有 10~20px，且所有内容共享一条左边界。
+ *
+ * 因此定下两件事：
+ * - **一条内容列**：左右各 16px（12 → 16）。正文、卡片边框、用户气泡都落在同一条
+ *   左边界上；卡片自己的内边距留在卡片**里面**。以前 12px 时卡片与正文虽然也
+ *   对齐，但贴得太近，读起来像"浮在面板上"而不是"排在一列里"。
+ *   上、下不动（12 / 8）：纵向已经靠 `.message-row` 的组内/组间两级间距解决。
+ * - **纵向两级间距**：组内 8（见 `.message-row`），组间再加 4。
+ *
+ * 卡片自身的水平 padding **不跟着收**：它与 `.activity-log-card` / 结果卡共用一条
+ * 对齐契约（`styles.test.ts`「运行态卡与已完成卡的水平内边距一致」），
+ * 两态切换时同一句话左右跳动比多 2px 留白难看得多。
+ */
 .message-stream {
   height: 100%;
   min-height: 0;
   overflow-x: hidden;
   overflow-y: auto;
-  padding: 16px 14px 4px;
+  padding: 12px 16px 8px;
   background: var(--color-background-subtle);
   scroll-behavior: smooth;
 }
@@ -3358,40 +3431,12 @@ textarea:focus-visible {
   transform: translateY(-2px);
 }
 
-.pet-jelly {
-  width: 50px;
-  height: 50px;
-  filter: drop-shadow(0 3px 5px rgba(60, 130, 85, 0.22));
-}
-
-/* 果冻晃动：idle 缓慢呼吸，busy 快一点像在使劲 */
-.pet-jelly-shape {
-  transform-origin: 36px 62px;
-  animation: pet-wobble 3.2s ease-in-out infinite;
-}
-
-.pet-companion.mood-busy .pet-jelly-shape {
-  animation-duration: 1.1s;
-}
-
-.pet-avatar:hover .pet-jelly-shape {
-  animation-duration: 0.7s;
-}
-
-@keyframes pet-wobble {
-  0%,
-  100% {
-    transform: scale(1, 1);
-  }
-  50% {
-    transform: scale(1.05, 0.93);
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .pet-jelly-shape {
-    animation: none;
-  }
+.pet-brand-logo {
+  display: block;
+  width: 48px;
+  height: 48px;
+  object-fit: contain;
+  user-select: none;
 }
 
 .pet-bubble {
@@ -3410,7 +3455,7 @@ textarea:focus-visible {
   animation: pet-bubble-in 0.16s ease;
 }
 
-/* 气泡左上角朝向格仔的小尖角 */
+/* 气泡左上角朝向EB 助手的小尖角 */
 .pet-bubble::after {
   content: "";
   position: absolute;
@@ -3496,10 +3541,32 @@ textarea:focus-visible {
 }
 
 
+/*
+ * 消息之间的行距：**组内 8 / 组间再 +4**（2026-11-03）。
+ *
+ * 这是"上下缝太大"的主因：平铺消息没有卡片外框，唯一的分组手段就是这个空隙；
+ * 而它还会**叠加**下一条自身的 padding（活动卡 11、结果卡 12）。
+ * 但一律收紧会把"一段回复"也拆散 —— 过程卡、结论、结果卡本来是**一件事**，
+ * 它们之间留 8 就够，留多了读起来像三件事。
+ *
+ * 所以间距分两级，级数由 `data-group` 标注：
+ * - `continue`：同一段回复的后续行（判据见 `packages/core/messageRows.ts`），只留 8；
+ * - `start`：一段回复的首行、以及每条用户消息，在 8 之上再垫 4（合计 12）。
+ *
+ * 组间那 4px 用 `padding-top` 而**不是** `margin-top`：相邻块级兄弟的外边距会
+ * 折叠（8 和 4 折叠成 8），垫上去等于没垫；内边距不折叠。
+ *
+ * 也不要顺手把它改成 `gap` 或负 margin：`.message-stream` 里还有 `.message-row` 之外的
+ * 兄弟节点（定位器、恢复入口），它们各自带外边距，换算成 gap 会改变这些节点的间距。
+ */
 .message-row {
   display: flex;
   align-items: flex-start;
-  margin-bottom: 16px;
+  margin-bottom: 8px;
+}
+
+.message-row[data-group="start"]:not(:first-child) {
+  padding-top: 4px;
 }
 
 .message-row.user {
@@ -4021,6 +4088,8 @@ textarea:focus-visible {
 }
 
 .assistant .message-content {
+  min-width: 0;
+  flex: 1 1 0;
   width: 100%;
 }
 
@@ -4053,6 +4122,7 @@ textarea:focus-visible {
   font-size: var(--font-size-body);
   line-height: 1.62;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
   box-shadow: none;
 }
 
@@ -5151,7 +5221,22 @@ textarea:focus-visible {
   min-width: 0;
   color: var(--color-text-primary);
   font-size: var(--font-size-caption);
-  line-height: 1.4;
+  line-height: 1.55;
+}
+
+/* Status glyphs keep their centre while pulsing; only their opacity changes. */
+.task-progress-heading .activity-pulse {
+  flex: 0 0 auto;
+  height: 1.55em;
+}
+
+.task-progress-heading .activity-pulse i {
+  animation-name: task-progress-pulse;
+}
+
+@keyframes task-progress-pulse {
+  0%, 100% { opacity: 0.25; }
+  50% { opacity: 1; }
 }
 
 .task-progress-overall {
@@ -5204,6 +5289,18 @@ textarea:focus-visible {
   flex: 0 0 auto;
   align-items: center;
   gap: 6px;
+}
+
+/* The standalone stop button has a top margin; an inline status action must not. */
+.task-progress-actions > button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  min-height: 30px;
+  margin: 0;
+  font-family: inherit;
+  line-height: 1.55;
 }
 
 .task-progress-toggle {
@@ -5521,7 +5618,7 @@ textarea:focus-visible {
 
 @media (max-width: 420px) {
   .task-progress-header {
-    align-items: flex-start;
+    align-items: center;
   }
 
   .task-progress-heading {
@@ -6159,6 +6256,42 @@ textarea:focus-visible {
   margin-bottom: 0;
 }
 
+.scope-entry-row-with-new-chat {
+  grid-template-columns: auto auto auto minmax(0, 1fr);
+}
+
+.scope-utility-button {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 32px;
+  min-height: 32px;
+  padding: 0;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-background);
+  color: var(--color-brand-text);
+}
+.scope-utility-button:hover:not(:disabled) { background: var(--color-brand-bg); }
+.scope-utility-button > svg { width: 19px; height: 19px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.scope-utility-button > .recovery-turn-icon { fill: currentColor; stroke: none; }
+.scope-utility-button > b { position: absolute; top: -4px; right: -3px; padding: 0 3px; border-radius: var(--radius-sm); background: var(--color-brand-text); color: var(--color-background); font-size: var(--font-size-caption); line-height: 16px; }
+.composer-service-status { margin: 0 0 4px; color: var(--color-text-secondary); font-size: var(--font-size-caption); }
+
+.chat-shell.chat-shell-headerless { grid-template-rows: minmax(0, 1fr) auto; }
+.chat-shell-headerless > .tool-drawer { top: 0; }
+.chat-shell-headerless > .wps-model-settings { top: 0; }
+.chat-shell-headerless > .widen-pane-guide { top: 8px; }
+
+.scope-entry-target {
+  display: grid;
+  min-width: 0;
+}
+
+.scope-entry-target .scope-entry-row {
+  grid-template-columns: minmax(0, 1fr);
+}
+
 .scope-trigger {
   display: flex;
   width: 100%;
@@ -6167,8 +6300,9 @@ textarea:focus-visible {
   gap: 7px;
   margin-bottom: 3px;
   border: 1px solid var(--color-border);
+  /* Same radius and corner shape as the recovery/history utility buttons. */
   border-radius: var(--radius-md);
-  corner-shape: squircle;
+  corner-shape: round;
   background: var(--color-surface);
   color: var(--color-text-primary);
   padding: 4px 9px;
@@ -6297,7 +6431,8 @@ textarea:focus-visible {
   z-index: 40;
   display: grid;
   grid-template-rows: minmax(0, 1fr);
-  background: var(--color-background, #ffffff);
+  min-width: 0;
+  min-height: 0;
 }
 
 /* 层里的面板不再是"浮在输入框上方的一张卡"，而是这一层的唯一内容：撑满，内部滚。 */
@@ -6306,7 +6441,11 @@ textarea:focus-visible {
   right: auto;
   bottom: auto;
   left: auto;
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
   max-height: 100%;
+  box-sizing: border-box;
 }
 
 
@@ -7806,6 +7945,68 @@ button.selected > .sheet-checkbox {
   display: flex;
   align-items: center;
   gap: 8px;
+  min-width: 0;
+  max-width: min(65vw, 300px);
+}
+
+/* 右侧：模型选择器 + 发送按钮并排，模型名显示在发送键左边。 */
+.composer-tools-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.composer .model-picker {
+  width: auto;
+  max-width: min(40vw, 240px);
+  flex: 0 1 auto;
+  margin-left: 0;
+}
+
+.composer-tools-right .model-picker {
+  max-width: min(40vw, 220px);
+}
+
+.composer .model-picker-trigger {
+  height: 32px;
+  min-width: 0;
+  gap: 6px;
+  padding: 0 5px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--color-text-primary);
+}
+
+.composer .model-picker-trigger > span { min-width: 0; }
+.composer .model-picker-trigger:hover:not(:disabled),
+.composer .model-picker-trigger[aria-expanded="true"] { background: var(--color-surface-hover); }
+.composer .model-picker-trigger > .model-picker-symbol { width: 18px; height: 18px; flex: 0 0 18px; }
+.composer .model-picker-trigger > .model-provider-logo {
+  display: inline-block;
+  background: currentColor;
+  mask-size: contain;
+  mask-repeat: no-repeat;
+  mask-position: center;
+  -webkit-mask-size: contain;
+  -webkit-mask-repeat: no-repeat;
+  -webkit-mask-position: center;
+}
+.composer .model-picker-trigger > .model-picker-chevron { width: 12px; height: 12px; flex: 0 0 12px; color: var(--color-text-secondary); }
+
+.composer .model-menu,
+.composer .first-model-guide {
+  top: auto;
+  bottom: calc(100% + 7px);
+  /* 模型选择器现在在输入框右侧，菜单右对齐，避免向左溢出屏幕。 */
+  left: auto;
+  right: 0;
+  margin-left: 0;
+  max-width: calc(100vw - 80px);
+  max-height: min(360px, 50vh);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  overflow-wrap: anywhere;
 }
 
 /*
@@ -8496,35 +8697,6 @@ button.selected > .sheet-checkbox {
   --custom-background-opacity: 0;
 }
 
-.app-logo {
-  transition:
-    filter 200ms ease,
-    transform 200ms ease,
-    opacity 200ms ease;
-  cursor: pointer;
-  user-select: none;
-  -webkit-user-select: none;
-}
-
-.app-logo.glow {
-  filter: drop-shadow(0 0 8px rgba(47, 107, 71, 0.5));
-  transform: scale(1.04);
-}
-
-.app-logo.trigger-success {
-  animation: logo-flash 0.4s ease;
-}
-
-@keyframes logo-flash {
-  0%,
-  100% {
-    opacity: 1;
-  }
-  50% {
-    opacity: 0.35;
-  }
-}
-
 .chat-shell {
   position: relative;
   overflow: hidden;
@@ -9192,7 +9364,7 @@ button.selected > .sheet-checkbox {
   }
 }
 
-/* 格仔互动动画，独立于主题面板。 */
+/* EB 助手互动动画，独立于主题面板。 */
 .turtle-spin {
   animation: turtle-spin 0.8s ease;
 }
@@ -9276,7 +9448,6 @@ button.selected > .sheet-checkbox {
 
 @media (prefers-reduced-motion: reduce) {
   .theme-panel,
-  .app-logo,
   .preset-button,
   .turtle-spin,
   .turtle-blink,
@@ -10718,6 +10889,8 @@ button.selected > .sheet-checkbox {
 .scope-admission-summary > .scope-admission-error, .scope-admission-summary > .scope-admission-detail { flex-basis: 100%; }
 .target-scope-notice button { border: 1px solid var(--color-border-strong); border-radius: var(--radius-sm); corner-shape: squircle; background: var(--color-background); color: var(--color-brand-text); padding: 4px 8px; font-size: inherit; cursor: pointer; }
 .target-scope-notice button:disabled { opacity: .5; cursor: default; }
+/* 原样确认是这一支的**主**动作：同一行里只有它需要被一眼看到。 */
+.target-scope-notice button.primary { background: var(--color-brand-text); border-color: var(--color-brand-text); color: var(--color-background); }
 .target-scope-notice { background: var(--color-warning-bg); border-color: var(--color-warning-border); }
 .target-scope-notice > strong, .target-scope-notice > span, .target-scope-notice > small { flex-basis: 100%; }
 .target-scope-notice > div { display: flex; flex-wrap: wrap; gap: 8px; }
@@ -10751,11 +10924,17 @@ button.selected > .sheet-checkbox {
 
 .local-result-card-source,
 .local-result-card-partial,
+.local-result-card-truncated,
 .local-result-card-status,
 .local-result-card-calculation {
   margin: 0;
   color: var(--color-text-secondary);
   font-size: var(--font-size-caption);
+}
+
+/* 不完整要比"只是截断"更显眼：前者意味着有数据没算进去。 */
+.local-result-card-partial {
+  color: var(--color-warning-text, var(--color-text-secondary));
 }
 
 .local-result-card-unavailable {
@@ -11006,4 +11185,45 @@ button.selected > .sheet-checkbox {
 .task-progress-jump:hover,
 .task-progress-inline-action:hover {
   text-decoration: underline;
+}
+
+/* Scope selection has one scroll owner on both hosts. The header and action
+   footer stay in the pane even with a tall composer or a long sheet list. */
+.scope-layer .scope-popover-scroll {
+  display: block;
+  min-width: 0;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+.scope-layer .scope-popover-scroll > * + * {
+  margin-top: var(--scope-popover-block-gap);
+}
+.scope-layer .workbook-sheet-list,
+.scope-layer .wps-sheet-picker-options,
+.scope-layer .folder-file-list,
+.scope-layer .folder-sheet-list {
+  max-height: none;
+  overflow: visible;
+}
+.scope-layer .scope-popover-header {
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--color-border);
+}
+.scope-layer .scope-mode-list {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.scope-layer .scope-mode-list > :not(button),
+.scope-layer .scope-mode-list > button:nth-of-type(n + 3) {
+  grid-column: 1 / -1;
+}
+.scope-layer .scope-mode-list > button {
+  min-width: 0;
+}
+@media (max-width: 380px) {
+  .scope-layer {
+    inset: 6px;
+  }
+  .scope-layer .scope-mode-list {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }

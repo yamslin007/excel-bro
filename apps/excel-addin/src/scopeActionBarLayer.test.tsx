@@ -133,6 +133,8 @@ describe("数据范围动作条的层：Excel 必须与 WPS 同层", () => {
   it("动作条是滚动容器的兄弟，不是它的内容", async () => {
     const view = await boot();
     const popover = openPicker(view);
+    expect(popover.closest(".composer")).toBeNull();
+    expect(popover.parentElement?.className).toBe("scope-layer");
     const scroll = popover.querySelector<HTMLElement>(".scope-popover-scroll");
     const bar = barOf(popover);
     expect(scroll).not.toBeNull();
@@ -255,4 +257,11 @@ describe("数据范围动作条的层：Excel 必须与 WPS 同层", () => {
     );
     expect(shared).toMatch(/\.folder-back-button\s*\{/);
   });
+});
+
+it('空闲时不登记空任务状态，其他真实事项不受影响', async () => {
+  const view = render(<App />);
+  await waitFor(() => expect(view.container.querySelector('.composer textarea')).not.toBeNull());
+  expect(view.container.querySelector('.task-execution-notice')).toBeNull();
+  expect(view.container.querySelector('.composer-pending-summary')?.textContent ?? '').not.toContain('任务状态');
 });

@@ -74,7 +74,7 @@ function deleteOwnedRules(rules: Rule[], formula: string): void {
   }
   for (const rule of rules) rule.Delete!();
 }
-export type WpsResultMarks = { workbook: WpsWorkbook; workbookFullName: string; formula: string; rules: Rule[] };
+export type WpsResultMarks = { workbook: WpsWorkbook; workbookFullName: string; formula: string; rules: Rule[]; ranges?: MarkRange[] };
 
 /**
  * 标记归属的**持久记录**（刷新/重载后用来认领遗留规则）。
@@ -287,6 +287,7 @@ export function markWpsResult(
     ranges.set(JSON.stringify([action.sheetName, action.range]), range.FormatConditions);
   }
   const tracked: Array<{ sheet: string; range: string }> = [];
+  marks.ranges = tracked;
   const handles = new Map<string, Rule>();
   try {
     for (const [key, conditions] of ranges.entries()) {
@@ -361,6 +362,13 @@ export function clearWpsResultMarks(application: WpsApplication, marks: WpsResul
   if (!marks.workbookFullName || String(wpsReadWorkbook(application)?.FullName ?? '') !== marks.workbookFullName ||
       String(marks.workbook.FullName ?? '') !== marks.workbookFullName) throw new Error('请返回本次执行的工作簿，再移除标记。');
   deleteOwnedRules(marks.rules, marks.formula);
+  const ranges = marks.ranges ?? readStored().find(record => record.formula === marks.formula && record.workbookFullName === marks.workbookFullName)?.ranges ?? [];
+  for (const entry of ranges) {
+    const range = marks.workbook.Worksheets.Item(entry.sheet).Range?.(entry.range) as unknown as { FormatConditions?: RuleCollection };
+    if (ownedRules(range?.FormatConditions, marks.formula).length)
+      throw new Error('审阅颜色标记尚未移除，可重试清理；不会再次恢复单元格。');
+  }
+
   // 只撤掉本次的归属记录：同一本簿里别的任务（新旧两轮）的记录必须留着。
   removeRecord(marks.formula);
 }
@@ -397,6 +405,7 @@ export function recoverWpsResultMarks(application: WpsApplication): string | nul
         };
         const matches = ownedRules(holder?.FormatConditions, record.formula);
         deleteOwnedRules(matches, record.formula);
+        if (ownedRules(holder?.FormatConditions, record.formula).length) throw new Error("审阅颜色标记尚未移除");
         removed += matches.length;
       } catch { remaining.push(entry); }
     }

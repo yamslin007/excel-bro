@@ -104,14 +104,59 @@ describe("LocalResultCard", () => {
     expect(ui.container.textContent).not.toContain("network down");
   });
 
-  it("结果不完整时给出明确提示", async () => {
+  /*
+   * 提示语必须**按真实原因**写。
+   *
+   * 2026-11-01 真机：用户只要求查「来源」表，结果卡却列出四张来源表、三张各报
+   * 「缺少列2」，提示语却是「结果不完整（扫描已达上限）」—— 三种完全不同的原因
+   * 共用一句最吓人的话，用户自然当成读表读崩了。下面三条分别钉住三种事实。
+   */
+  it("缺字段：说是哪张表缺哪一列，不说成扫描达上限", async () => {
+    const ui = render(
+      <LocalResultCard
+        card={pointer({
+          complete: false,
+          sourceSheets: ["来源", "结果1"],
+          incomplete: [
+            { kind: "missing_field", sheet: "结果1", fields: ["列2"] }
+          ]
+        })}
+        load={vi.fn(async () => payload({ complete: false }))}
+      />
+    );
+    await waitFor(() =>
+      expect(ui.getByText(/「结果1」没有字段：列2/)).toBeTruthy()
+    );
+    expect(ui.container.textContent).not.toContain("扫描");
+  });
+
+  it("展示截断：只说行数，不说成结果不完整", async () => {
+    const ui = render(
+      <LocalResultCard
+        card={pointer({
+          truncated: true,
+          truncation: { shownRows: 20, totalRows: 137, limit: 20 }
+        })}
+        load={vi.fn(async () => payload())}
+      />
+    );
+    await waitFor(() =>
+      expect(ui.getByText(/仅显示前 20 行，共 137 行/)).toBeTruthy()
+    );
+    expect(ui.container.textContent).not.toContain("结果不完整");
+  });
+
+  it("说了不完整却没有任何原因：如实说没记录到，不替它编一个", async () => {
     const ui = render(
       <LocalResultCard
         card={pointer({ complete: false })}
         load={vi.fn(async () => payload({ complete: false }))}
       />
     );
-    await waitFor(() => expect(ui.getByText(/结果不完整/)).toBeTruthy());
+    await waitFor(() =>
+      expect(ui.getByText(/没有记录到具体原因/)).toBeTruthy()
+    );
+    expect(ui.container.textContent).not.toContain("扫描已达上限");
   });
 
   /*

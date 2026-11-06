@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   assertAssistantResponse,
   assertIntentCheckResponse,
+  parseLocalResultCard,
   parseTaskProgressEvent
 } from "./contracts";
 
@@ -489,4 +490,75 @@ it("clarification accepts three options and rejects four without truncation", ()
   payload.clarification.options.push({ ...payload.clarification.options[0], id: "fourth" });
   expect(() => assertIntentCheckResponse(payload)).toThrow();
   expect(payload.clarification.options).toHaveLength(4);
+});
+
+/*
+ * 结果卡指针的解析**不许静默丢字段**。
+ *
+ * `complete` 单独一个布尔时，卡片只能把任何不完整都说成"扫描已达上限"；
+ * 原因与截断一旦在这一层被丢掉，界面就再也说不出真实原因 —— 而这一层恰好是
+ * 最容易被漏掉的一跳（解析器按字段重建对象）。
+ */
+describe("结果卡指针带上原因与截断", () => {
+  const base = {
+    resultRef: "res_" + "b".repeat(32),
+    title: "本地查询结果",
+    headers: ["合计"],
+    rowCount: 1,
+    columnCount: 1,
+    sourceSheets: ["来源", "结果1"]
+  };
+
+  it("缺字段原因原样保留", () => {
+    const card = parseLocalResultCard({
+      ...base,
+      complete: false,
+      incomplete: [{ kind: "missing_field", sheet: "结果1", fields: ["列2"] }],
+      truncated: false,
+      truncation: null
+    });
+    expect(card?.incomplete).toEqual([
+      { kind: "missing_field", sheet: "结果1", fields: ["列2"] }
+    ]);
+    expect(card?.truncated).toBe(false);
+    expect(card?.truncation).toBeNull();
+  });
+
+  it("截断计数原样保留，且与 complete 分开", () => {
+    const card = parseLocalResultCard({
+      ...base,
+      complete: true,
+      truncated: true,
+      truncation: { shownRows: 20, totalRows: 137, limit: 20 }
+    });
+    expect(card?.complete).toBe(true);
+    expect(card?.truncation).toEqual({ shownRows: 20, totalRows: 137, limit: 20 });
+  });
+
+  it("形状不对整张卡判为不可用，不交半成品给渲染器", () => {
+    expect(
+      parseLocalResultCard({
+        ...base,
+        complete: false,
+        incomplete: [{ kind: "missing_field", sheet: "结果1" }]
+      })
+    ).toBeNull();
+    expect(
+      parseLocalResultCard({
+        ...base,
+        complete: false,
+        incomplete: [{ kind: "empty_sheet", sheet: "汇总表", fields: ["列2"] }]
+      })
+    ).toBeNull();
+    expect(
+      parseLocalResultCard({ ...base, complete: true, truncated: true })
+    ).toBeNull();
+  });
+
+  it("旧载荷（没有这三个字段）仍按完整解析，不因升级而不可用", () => {
+    const card = parseLocalResultCard({ ...base, complete: true });
+    expect(card).not.toBeNull();
+    expect(card?.incomplete).toEqual([]);
+    expect(card?.truncated).toBe(false);
+  });
 });

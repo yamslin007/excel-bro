@@ -1,4 +1,5 @@
 import { valueCopyReviewGeometry } from './excelValueCopyPlan';
+import { saveReviewBefore, loadReviewBefore, deleteReviewBefore } from './utils/reviewBeforeStore';
 import capabilities from "../../../config/capabilities.json";
 import type { AnalysisPlan, CellValue, ExcelAction, ExecutionUndoSnapshot } from "./contracts";
 import { assertRectangularValues, parseExplicitA1Rect, writeMatrixShapeIssue } from "./planCore";
@@ -8,8 +9,8 @@ import { applyFormatAction, captureWorkbookSourceFingerprint, captureWorkbookStr
   isToolSchemaFingerprint, missingSchemaRequirements, planLiveness, toolSchemaFingerprintForSnapshot, valuesEqual } from "./excel";
 import { excelFormatActionFields, expectedDirectFormat, formatDirectValueMatches } from "./excelFormatCapability";
 import { nativeColumnName, nativeReviewSeed } from "./nativeReviewFile";
-import { buildManualReviewFile } from "./manualReviewFile";
-import { prepareLocalExcelWindows, arrangeLocalExcelWindows, closeLocalExcelWindows } from "./excelWindowLayout";
+import { buildManualReviewFile, buildBeforeReviewWorkbook } from "./manualReviewFile";
+import { prepareLocalExcelWindows, arrangeLocalExcelWindows, closeLocalExcelWindows, setLocalExcelCopyViewing, selectLocalExcelCopySheet } from "./excelWindowLayout";
 import { ExcelReviewLayoutVersionError } from "./api";
 import type { ReviewCopyCloseOutcome, ReviewCopyContentVerdict } from "@excel-bro/core/reviewCopyLifecycle";
 import { describeCopyDiscardSafety } from "@excel-bro/core/reviewCopyLifecycle";
@@ -40,6 +41,9 @@ export function isNativeReviewFormatAction(action: ExcelAction): action is Nativ
 }
 export type SheetSnapshot = {
   id: string; name: string; address: string;
+  /** Focus is the changed area, independent of the complete captured canvas. */
+  focusAddress?: string;
+  mergedAreas?: string[];
   startRow: number; startColumn: number;
   values: CellValue[][]; formulas: CellValue[][]; numberFormat: string[][];
   properties: Excel.CellProperties[][];
@@ -57,6 +61,8 @@ type ActionSnapshot = {
   numberFormat?: string[][];
 };
 export type ExcelNativeComparison = {
+  beforeSheets?: SheetSnapshot[];
+  suspended?: boolean;
   recoveryCopyPath?: string | null;
   mode?: "native" | "manual";
   windowLayout?: "arranged" | "manual" | "service_outdated";
@@ -64,6 +70,9 @@ export type ExcelNativeComparison = {
   plan: AnalysisPlan; authorization: readonly string[]; workbookIdentity: string;
   original: SheetSnapshot; originalWindowName: string;
   comparisonNotice?: string;
+  comparisonScope?: string;
+  comparisonLayoutHelp?: string;
+  closeFailure?: string;
   copyWindowName: string; copySheetName: string; copySheetId: string;
   copyEvidence: string; actionEvidence: string; changedCells: number;
   /**
@@ -78,7 +87,7 @@ const error = (message: string) => new Error(message);
 // Copy fidelity is not write/undo safety. Only this explicit capability failure
 // may degrade optional comparison; authorization and host failures still propagate.
 class ComparisonUnavailableError extends Error {}
-export type ExcelBeforeResult = SheetSnapshot | { comparisonUnavailable: string };
+export type ExcelBeforeResult = SheetSnapshot | { sheets: SheetSnapshot[] } | { comparisonUnavailable: string };
 const LIMITS = capabilities.excelNativeComparison;
 
 export function nativeComparisonPlanIssue(plan: AnalysisPlan, authorization: readonly string[]): string | null {
@@ -224,32 +233,55 @@ export function planExecutionBoundaryIssue(plan: AnalysisPlan, authorization: re
 /** A read-only pre-write image for optional comparison after execution. */
 export function resultReviewPlanIssue(plan: AnalysisPlan, authorization: readonly string[]): string | null {
   const targets = [...new Set(plan.actions.map(action => action.sheet))];
-  if (targets.length !== 1 || !targets[0] || !authorization.includes(targets[0])) {
-    return '结果审阅需要单张已授权写入目标表。';
-  }
-  if (plan.sourceFingerprintSheets?.some(name => !authorization.includes(name)) ||
-      plan.sourceDependencySheets?.some(name => !authorization.includes(name))) {
-    return '计划来源超出本次授权，未执行。';
-  }
-  // Reuse action/shape limits only; source checks still use the full original plan.
+  const boundary = planExecutionBoundaryIssue(plan, authorization);
+  if (boundary) return boundary;
+  if (!targets.length || targets.some(name => !name)) return '没有可对比的写入目标表。';
   try {
     const geometry = valueCopyReviewGeometry(plan, authorization);
-    return nativeComparisonPlanIssue({ ...geometry, sourceFingerprintSheets: [targets[0]] }, targets);
+    // BEFORE copies contain cached values; formulas are never trial-executed here.
+    for (const sheet of targets) {
+      const actions = geometry.actions.filter(action => action.sheet === sheet).map(action =>
+        action.type === 'writeFormulas' ? {type:'clearRange' as const, sheet, range:action.range, applyTo:'contents' as const} : action);
+      const issue = nativeComparisonPlanIssue({...geometry, actions, sourceFingerprintSheets:[sheet]}, [sheet]);
+      if (issue) return issue;
+    }
+    return null;
   } catch (reason) { return reason instanceof Error ? reason.message : '复制范围无法验证，未执行。'; }
+}
+
+export function excelBeforeComparisonSheets(before: ExcelBeforeResult): string[] {
+  return 'comparisonUnavailable' in before ? [] : 'sheets' in before ? before.sheets.map(sheet => sheet.name) : [before.name];
 }
 
 export async function captureExcelBeforeResult(plan: AnalysisPlan, authorization: readonly string[]): Promise<ExcelBeforeResult> {
   const issue = resultReviewPlanIssue(plan, authorization);
   if (issue) throw error(issue);
-  const rects = valueCopyReviewGeometry(plan, authorization).actions.map(action => parseExplicitA1Rect('range' in action ? action.range : '')!);
+  const names = [...new Set(plan.actions.map(action => action.sheet))];
+  if (names.length > 1) {
+    const sheets: SheetSnapshot[] = [];
+    for (const name of names) {
+      const before = await captureExcelBeforeResult({...plan, actions:plan.actions.filter(action => action.sheet === name)}, authorization);
+      if ('comparisonUnavailable' in before) return before;
+      if ('sheets' in before) throw error('执行前快照分组错误。');
+      sheets.push(before);
+    }
+    return {sheets};
+  }
+  let rects = valueCopyReviewGeometry(plan, authorization).actions.map(action => parseExplicitA1Rect('range' in action ? action.range : '')!);
+  const focusAddress = `${nativeColumnName(rects[0].startColumn)}${rects[0].startRow}`;
+  return Excel.run(async context => {
+    const sheet = context.workbook.worksheets.getItem(plan.actions[0].sheet);
+    const used = sheet.getUsedRangeOrNullObject();
+    used.load('isNullObject,rowIndex,columnIndex,rowCount,columnCount');
+    await context.sync();
+    if (!used.isNullObject) rects.push(parseExplicitA1Rect(exactAddress(used))!);
   const startRow = Math.min(...rects.map(r => r.startRow)), endRow = Math.max(...rects.map(r => r.endRow));
   const startColumn = Math.min(...rects.map(r => r.startColumn)), endColumn = Math.max(...rects.map(r => r.endColumn));
   const height = endRow - startRow + 1, width = endColumn - startColumn + 1;
   if (height * width > LIMITS.maxCells) return { comparisonUnavailable: '本次修改区域跨度超过双视图快照限额；请在主表审阅结果。' };
-  return Excel.run(async context => {
-    const sheet = context.workbook.worksheets.getItem(plan.actions[0].sheet);
+    // Capture the whole authorized target's used canvas before any write, including unchanged context.
+    rects = [parseExplicitA1Rect(`${nativeColumnName(startColumn)}${startRow}:${nativeColumnName(endColumn)}${endRow}`)!];
     sheet.load('id,name'); sheet.protection.load('protected');
-    // Read only action rectangles. Gaps in the display canvas remain blank.
     const reads = rects.map(rect => {
       const range = sheet.getRange(`${nativeColumnName(rect.startColumn)}${rect.startRow}:${nativeColumnName(rect.endColumn)}${rect.endRow}`);
       range.load('values,numberFormat');
@@ -259,7 +291,15 @@ export async function captureExcelBeforeResult(plan: AnalysisPlan, authorization
       rows.forEach(row => row.load('rowHeight')); columns.forEach(column => column.load('columnWidth'));
       return { range, properties, rows, columns, rect };
     });
+    const merges = reads[0].range.getMergedAreasOrNullObject();
+    merges.load('isNullObject');
     await context.sync();
+    const mergedAreas: string[] = [];
+    if (!merges.isNullObject) {
+      merges.areas.load('items/rowIndex,items/columnIndex,items/rowCount,items/columnCount');
+      await context.sync();
+      for (const area of merges.areas.items) mergedAreas.push(exactAddress(area));
+    }
     if (sheet.protection.protected) throw error('原表已保护，不能执行。');
     const values: CellValue[][] = Array.from({ length: height }, () => Array(width).fill(''));
     const numberFormat: string[][] = Array.from({ length: height }, () => Array(width).fill('General'));
@@ -282,8 +322,8 @@ export async function captureExcelBeforeResult(plan: AnalysisPlan, authorization
     }
     // No formulas are exported: cached values cannot acquire new dependencies or recalculate.
     return JSON.parse(JSON.stringify({ id: sheet.id, name: sheet.name,
-      address: `${nativeColumnName(startColumn)}${startRow}:${nativeColumnName(endColumn)}${endRow}`,
-      startRow, startColumn, values, formulas: values, formulaCells: [], numberFormat, properties, rowHeights, columnWidths
+      address: `${nativeColumnName(startColumn)}${startRow}:${nativeColumnName(endColumn)}${endRow}`, focusAddress,
+      startRow, startColumn, values, formulas: values, formulaCells: [], numberFormat, properties, rowHeights, columnWidths, mergedAreas
     })) as SheetSnapshot;
   });
 }
@@ -295,8 +335,23 @@ export async function captureExcelBeforeResult(plan: AnalysisPlan, authorization
 export function excelRecoveryBeforeResult(plan: AnalysisPlan, undo: ExecutionUndoSnapshot, authorization: readonly string[]): ExcelBeforeResult {
   const unavailable = {comparisonUnavailable: '恢复记录不足以重建完整执行前对比；请在主表审阅结果。'};
   if (undo.planId !== plan.id || resultReviewPlanIssue(plan, authorization)) return unavailable;
+  const names = [...new Set(plan.actions.map(action => action.sheet))];
+  if (names.length > 1) {
+    const sheets: SheetSnapshot[] = [];
+    for (const name of names) {
+      const indices = plan.actions.flatMap((action,index) => action.sheet === name ? [index] : []);
+      const projected = {...plan, actions:indices.map(index => plan.actions[index])};
+      const before = excelRecoveryBeforeResult(projected, {...undo, ranges:undo.ranges
+        .filter(range => indices.includes(range.actionIndex))
+        .map(range => ({...range,actionIndex:indices.indexOf(range.actionIndex)}))}, authorization);
+      if ('comparisonUnavailable' in before) return before;
+      if ('sheets' in before) return unavailable;
+      sheets.push(before);
+    }
+    return {sheets};
+  }
   const ranges = plan.actions.map((a,index) => {
-    if (a.type !== 'writeValues') return null;
+    if (a.type !== 'writeValues' && a.type !== 'writeFormulas') return null;
     const rect = parseExplicitA1Rect(a.range);
     const before = undo.ranges.find(b => b.actionIndex === index && b.sheet === a.sheet &&
       JSON.stringify(parseExplicitA1Rect(b.range)) === JSON.stringify(rect));
@@ -320,26 +375,51 @@ export function excelRecoveryBeforeResult(plan: AnalysisPlan, undo: ExecutionUnd
 
 /** Open the saved BEFORE image, never re-run the plan to manufacture a comparison. */
 export async function showExcelBeforeResult(original: ExcelBeforeResult, identity: string, plan: AnalysisPlan,
-  authorization: readonly string[]): Promise<ExcelNativeComparison> {
+  authorization: readonly string[], sheetName?: string): Promise<ExcelNativeComparison> {
   if (currentOfficeWorkbookIdentity() !== identity) throw error('原工作簿已变化，未打开对比副本。');
   if ('comparisonUnavailable' in original) throw error(original.comparisonUnavailable);
+  const beforeSheets = 'sheets' in original ? original.sheets : [original];
+  if (beforeSheets.some(sheet => !authorization.includes(sheet.name))) throw error('对比快照包含未授权工作表。');
+  const names = excelBeforeComparisonSheets(original);
+  const selected = sheetName ?? names[0];
+  if (!names.includes(selected) || !authorization.includes(selected)) throw error('对比工作表不属于本次授权快照。');
+  if ('sheets' in original) original = original.sheets.find(sheet => sheet.name === selected)!;
+  if (original.name !== selected) throw error('对比工作表与执行前快照不一致。');
+  plan = {...plan, actions:plan.actions.filter(action => action.sheet === selected)};
+
+  // The native bridge identifies the original by workbook AND active worksheet.
+  // A multi-sheet task may finish on another tab; compare the chosen target, not
+  // whatever tab happened to be visible. Navigation never writes workbook data.
+  const snapshot = original;
+  await Excel.run(async context => {
+    const sheet = context.workbook.worksheets.getItem(selected);
+    sheet.load('id,name');
+    await context.sync();
+    if (currentOfficeWorkbookIdentity() !== identity || sheet.name !== selected ||
+        (snapshot.id && sheet.id !== snapshot.id)) throw error('原工作表已变化，未打开对比副本。');
+    sheet.activate();
+    sheet.getRange(snapshot.focusAddress ?? snapshot.address.split(':')[0]).select();
+    await context.sync();
+  });
+  if (currentOfficeWorkbookIdentity() !== identity) throw error('原工作簿已变化，未打开对比副本。');
   const copySheetName = `EB_${crypto.randomUUID().replace(/-/g, '').slice(0, 20)}`;
-  const artifact = buildManualReviewFile(copySheetName, original, { ...plan, actions: [] }, LIMITS.maxCells, LIMITS.maxBytes);
+  // Keep the user's worksheet name visible; the bridge claims a hidden workbook-level nonce.
+  const artifact = buildBeforeReviewWorkbook(beforeSheets, plan, LIMITS.maxCells, LIMITS.maxBytes, copySheetName, selected);
   let ticket: Awaited<ReturnType<typeof prepareLocalExcelWindows>> | null = null;
-  let comparisonNotice: string | undefined;
+  let comparisonLayoutHelp: string | undefined;
   const layoutFailure = (reason: unknown) => `执行前副本已打开，但未能自动并排：${reason instanceof Error ? reason.message : '本机窗口排列不可用'}。可手动排列窗口；确认变更和放弃变更仍可使用。`;
   try { ticket = await prepareLocalExcelWindows(identity, original.name, copySheetName); }
-  catch (reason) { comparisonNotice = layoutFailure(reason); }
+  catch (reason) { comparisonLayoutHelp = layoutFailure(reason); }
   if (currentOfficeWorkbookIdentity() !== identity) throw error('原工作簿已变化，未打开对比副本。');
   await Excel.createWorkbook(artifact.base64);
   const session: ExcelNativeComparison = { mode: 'manual', plan, authorization: [...authorization], workbookIdentity: identity,
-    original, originalWindowName: '', copyWindowName: '', copySheetName, copySheetId: '',
-    copyEvidence: '', actionEvidence: '', changedCells: 0, windowLayout: 'manual', comparisonNotice };
+    original, beforeSheets, originalWindowName: '', copyWindowName: '', copySheetName, copySheetId: '',
+    copyEvidence: '', actionEvidence: '', changedCells: 0, windowLayout: 'manual', suspended: false, comparisonScope: '执行前单元格值、基础格式与合并区域的静态快照；公式采用执行前的值，不重新计算，不包含图表及条件格式等对象。', comparisonLayoutHelp };
   if (ticket) {
     try {
       const layout = await arrangeLocalExcelWindows(ticket);
       session.windowLayout = 'arranged'; session.synchronousScrolling = layout.synchronousScrolling;
-    } catch (reason) { session.comparisonNotice = layoutFailure(reason); }
+    } catch (reason) { session.comparisonLayoutHelp = layoutFailure(reason); }
   }
   return session;
 }
@@ -706,15 +786,72 @@ export async function compareExcelNativeCommittedResult(session: ExcelNativeComp
   } catch { return "unavailable"; }
 }
 /** v4 bridge archives the retained Workbook before closing it. No WM_CLOSE fallback. */
+export async function suspendExcelBeforeComparison(session: ExcelNativeComparison): Promise<string | null> {
+  await setLocalExcelCopyViewing(session.workbookIdentity, session.original.name, session.copySheetName, false);
+  session.suspended = true;
+  return null;
+}
+export async function saveExcelComparisonCopies(identity: string, executionId: string, copies: Array<[string, ExcelNativeComparison]>): Promise<void> {
+  if (!copies.length) { await deleteReviewBefore('office-copies', identity, executionId).catch(() => undefined); return; }
+  if (!await saveReviewBefore('office-copies', identity, executionId, [], copies))
+    for (const [, copy] of copies) {
+      const warning = '副本已保留，但本机未能持久保存窗口记录；刷新前请先完成审阅，避免遗留窗口。';
+      if (!copy.comparisonNotice?.includes(warning)) copy.comparisonNotice = [copy.comparisonNotice, warning].filter(Boolean).join(' ');
+    }
+}
+export async function loadExcelComparisonCopies(identity: string, executionId: string): Promise<Array<[string, ExcelNativeComparison]>> {
+  const copies = await loadReviewBefore<Array<[string, ExcelNativeComparison]>>('office-copies', identity, executionId, []) ?? [];
+  return copies.filter(([name, copy]) => copy.workbookIdentity === identity &&
+    (copy.beforeSheets
+      ? copy.beforeSheets.some(sheet => sheet.name === name.replace(/^__legacy__:\d+:/, '')) &&
+        copy.beforeSheets.some(sheet => sheet.name === copy.original.name) &&
+        copy.beforeSheets.every(sheet => copy.authorization.includes(sheet.name))
+      : copy.original.name === name.replace(/^__legacy__:\d+:/, '')) && /^EB_[a-f0-9]{20}$/.test(copy.copySheetName))
+    .map(([name, copy]) => [name, {...copy, suspended: true}]);
+}
+export async function activateExcelBeforeComparison(session: ExcelNativeComparison): Promise<void> {
+  if (!session.suspended) return;
+  if (currentOfficeWorkbookIdentity() !== session.workbookIdentity) throw error('原工作簿已变化，副本保留。');
+  await Excel.run(async context => {
+    const sheet = context.workbook.worksheets.getItem(session.original.name);
+    sheet.load('id'); await context.sync();
+    if (session.original.id && sheet.id !== session.original.id) throw error('原工作表已变化，副本保留。');
+    sheet.activate(); await context.sync();
+  });
+  const result = await setLocalExcelCopyViewing(session.workbookIdentity, session.original.name, session.copySheetName, true);
+  if (result.status !== 'arranged') throw error('未能重新排列副本。');
+  session.suspended = false;
+}
+/** Navigate the retained workbook, without creating, suspending or arranging windows. */
+export async function switchExcelBeforeComparison(session: ExcelNativeComparison, name: string): Promise<boolean> {
+  if (!session.beforeSheets) return false;
+  const target = session.beforeSheets.find(sheet => sheet.name === name);
+  if (!target || !session.authorization.includes(name)) throw error('对比目标不属于本次授权快照。');
+  if (currentOfficeWorkbookIdentity() !== session.workbookIdentity) throw error('原工作簿已变化，副本保留。');
+  await Excel.run(async context => {
+    const sheet = context.workbook.worksheets.getItem(name);
+    sheet.load('id'); await context.sync();
+    if (target.id && sheet.id !== target.id) throw error('原工作表身份已变化，未切换比对。');
+    sheet.activate(); await context.sync();
+  });
+  await selectLocalExcelCopySheet(session.workbookIdentity, name, session.copySheetName);
+  session.original = target;
+  await activateExcelBeforeComparison(session);
+  return true;
+}
 export async function closeCompatReviewCopy(session: ExcelNativeComparison): Promise<ReviewCopyCloseOutcome> {
+  session.closeFailure = undefined;
   try {
+    // Closing the owned workbook must not navigate either workbook's active tab.
+    if (currentOfficeWorkbookIdentity() !== session.workbookIdentity) return 'identity_lost';
     const result = await closeLocalExcelWindows(session.workbookIdentity, session.original.name, session.copySheetName);
     session.recoveryCopyPath = result.recoveryCopyPath;
     // Only claim a close when the receipt also says the copy is gone (the bridge polled
     // for the window to disappear; a still-visible window is `close_unconfirmed`).
     if (result.status === "closed" || result.status === "already_closed") return result.copyClosed ? result.status : "failed";
     return result.status;
-  } catch {
+  } catch (reason) {
+    session.closeFailure = reason instanceof Error ? reason.message : String(reason);
     // 服务过旧或不可达：没有可核实的答复，一律降级为手动关闭，绝不宣称已关闭。
     return "unsupported";
   }

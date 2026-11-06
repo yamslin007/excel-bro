@@ -31,6 +31,11 @@ import {
   type ExecutionRecoveryPackage
 } from "@excel-bro/core/executionRecoveryPackage";
 import { parseExplicitA1Rect } from "../../excel-addin/src/planCore";
+import {
+  wpsAppliedActionEvidence,
+  wpsCheckpointAfterFingerprint,
+  type WpsAppliedActionEvidence
+} from "./wpsAppliedActions";
 import type { WpsApplication } from "./wpsHost";
 import { wpsReadWorkbook } from "./wpsResultReviewTarget";
 import {
@@ -155,6 +160,80 @@ export function retireWpsRecoveryPackage(executionId: string): void {
   });
 }
 
+/** 账本里与"这次到底写了哪些动作"有关的三件事。 */
+type WpsLedgerProgressFacts = {
+  nextActionIndex: number;
+  inFlightActionIndex?: number | null;
+  checkpoint?: Record<string, unknown> | null;
+};
+
+function wpsLedgerProgress(
+  facts: WpsLedgerProgressFacts,
+  action: {
+    actionIndex: number;
+    rowCount: number;
+    sheetName: string;
+    range: string;
+    /** 登记的**目标**指纹。水合时来自恢复包；给已存在的记录补进度时不传。 */
+    expectedFingerprint?: string | null;
+  }
+): WpsAppliedActionEvidence {
+  return wpsAppliedActionEvidence(
+    {
+      nextActionIndex: facts.nextActionIndex,
+      inFlightActionIndex: facts.inFlightActionIndex ?? null,
+      // 归属按"表名 + 矩形"认，不按"离谁近"猜：`checkpoint` 只带定位与指纹。
+      checkpointAfterFingerprint: wpsCheckpointAfterFingerprint(facts.checkpoint, action)
+    },
+    {
+      actionIndex: action.actionIndex,
+      rowCount: action.rowCount,
+      expectedFingerprint: action.expectedFingerprint
+    }
+  );
+}
+
+/**
+ * 把**账本进度**重新投影到已经存在的宿主缓存记录上（只补不撤）。
+ *
+ * 为什么要重投影（2026-11-02 WPS 公式 B 真机）：缓存是在重开那一刻按当时的游标建的。
+ * 之后用户点「核对」、账本把丢失的完成回执补上（`nextActionIndex` 前进），缓存没有任何
+ * 人更新 —— 撤销于是继续以为"那一步没写过"，跳过它、把"漏了一格"报成"已全部恢复"。
+ *
+ * **只补不撤**：执行器在进入 setter 之前就把 `appliedRows` 记成了"尝试写入的行数"，
+ * 那是执行期事实；账本这边只负责补上"完成回执缺失但确实写了"的那一步。
+ * 若反过来允许把 `appliedRows` 抹回 0，一次"回执还没送到"的时序就会让撤销悄悄漏掉
+ * 一格 —— 正是这个缺陷本身。
+ */
+export function wpsRecordWithLedgerProgress(
+  record: WpsUndoRecord,
+  state: WpsExecutionState
+): WpsUndoRecord {
+  const facts: WpsLedgerProgressFacts = {
+    nextActionIndex: state.nextActionIndex,
+    inFlightActionIndex: state.inFlightActionIndex ?? null,
+    checkpoint: state.checkpoint
+  };
+  let changed = false;
+  const actions = record.actions.map((action) => {
+    /*
+     * 只补"矩阵类值动作"：恢复包只装 `writeValues` / `writeFormulas`（`buildWpsRecoveryPackage`
+     * 会拒绝别的形状），所以只有这两种可能来自"重开后水合出来的缓存"。
+     * 格式动作的"已写入"由逐格格式快照证明，`clearRange` 不进恢复包、执行期已按
+     * 实际影响记进记录 —— 两者都不在这里补算。
+     */
+    if (action.type !== "writeValues" && action.type !== "writeFormulas") return action;
+    const evidence = wpsLedgerProgress(facts, action);
+    const appliedRows = Math.max(action.appliedRows, evidence.appliedRows);
+    // 写后指纹只补空缺：已有的是执行期回读的真实现场，不被"账本里的登记值"顶替。
+    const afterFingerprint = action.afterFingerprint ?? evidence.afterFingerprint;
+    if (appliedRows === action.appliedRows && afterFingerprint === action.afterFingerprint) return action;
+    changed = true;
+    return { ...action, appliedRows, afterFingerprint };
+  });
+  return changed ? { ...record, actions } : record;
+}
+
 function sheetIndexByName(application: WpsApplication, name: string): number {
   const workbook = wpsReadWorkbook(application);
   const count = Number(workbook?.Worksheets?.Count ?? 0);
@@ -211,9 +290,10 @@ function recoveryMaterialFailure(error: unknown): string {
  * `prepareWpsCompletedReview` / `inspectWpsUndoRecord` / `undoWpsExecution`
  * 全部按原样工作 —— 不另开一套"从包里读"的并行实现（两套判据必然漂移）。
  *
- * 进度不取自恢复包：`appliedRows` 与 `state` 一律按**账本**给出的游标推导。完整退出
- * 未保存时原表可能已回到旧值，因此这里只描述"账本认为写了哪些"，真正的现场核对仍由
- * `inspectWpsRecoveryState` 读宿主完成。
+ * 进度不取自恢复包：`appliedRows` 与 `state` 一律按**账本**给出的进度事实推导 ——
+ * 游标 + 在途动作的写后证据（见 `wpsAppliedActions.ts`），不按包里的"当时写到第几步"。
+ * 完整退出未保存时原表可能已回到旧值，因此这里只描述"账本认为写了哪些"，真正的现场
+ * 核对仍由 `inspectWpsRecoveryState` 读宿主完成。
  */
 export async function ensureWpsRecoveryMaterial(
   application: WpsApplication,
@@ -263,11 +343,18 @@ export async function ensureWpsRecoveryMaterial(
     return { kind: "unavailable", detail: "恢复包与账本登记的计划不是同一版。" };
 
   if (existing) {
-    // 宿主缓存还在：只补上"持久材料的到期时间"，让长会话/跨天也能续跑。
+    // 宿主缓存还在：补上"持久材料的到期时间"，让长会话/跨天也能续跑。
     // 这不是延长有效期 —— 时间点来自服务端记录的原始保留期。
-    if (existing.resumeExpiresAt !== material.expiresAt) {
-      adoptWpsUndoRecord(application, { ...existing, resumeExpiresAt: material.expiresAt });
-    }
+    //
+    // 顺带把**账本进度**重新投影一次（2026-11-02 真机）：这份缓存可能是重开那一刻
+    // 按"当时"的游标建起来的，之后用户点了核对、账本 `nextActionIndex` 前进了，
+    // 缓存却没人更新 —— 于是撤销仍以为"第二步没写过"，跳过它并把漏掉一格报成成功。
+    const refreshed = wpsRecordWithLedgerProgress(existing, state);
+    const next =
+      refreshed.resumeExpiresAt !== material.expiresAt
+        ? { ...refreshed, resumeExpiresAt: material.expiresAt }
+        : refreshed;
+    if (next !== existing) adoptWpsUndoRecord(application, next);
     return { kind: "host" };
   }
   const actions = packageJson.actions.map(action => {
@@ -280,6 +367,15 @@ export async function ensureWpsRecoveryMaterial(
      */
     const target = action.type === "writeFormulas" ? action.formulas : action.values;
     if (!target) throw new Error(`恢复包动作 ${action.actionIndex} 缺少目标矩阵。`);
+    const evidence = wpsLedgerProgress(
+      {
+        nextActionIndex: state.nextActionIndex,
+        inFlightActionIndex: state.inFlightActionIndex ?? null,
+        checkpoint: state.checkpoint
+      },
+      { actionIndex: action.actionIndex, rowCount: action.rowCount, sheetName: action.sheet, range: action.range,
+        expectedFingerprint: action.expectedFingerprint }
+    );
     return {
       actionIndex: action.actionIndex,
       type: action.type === "writeFormulas" ? ("writeFormulas" as const) : ("writeValues" as const),
@@ -297,9 +393,14 @@ export async function ensureWpsRecoveryMaterial(
       previewFingerprint: action.previewFingerprint,
       beforeFingerprint: action.previewFingerprint,
       expectedFingerprint: action.expectedFingerprint,
-      // 账本游标是唯一进度真相：它说写过的动作，撤销时才需要恢复。
-      afterFingerprint: action.actionIndex < state.nextActionIndex ? action.expectedFingerprint : null,
-      appliedRows: action.actionIndex < state.nextActionIndex ? action.rowCount : 0,
+      /*
+       * 进度取自**账本**，但账本要比"游标"多一点：第 N 步写完、完成回执没落时，
+       * 游标仍停在 N、`inFlightActionIndex === N`，而账本 `checkpoint` 里留着这一步的
+       * 写后指纹。只按游标算就会把这一步当成"没写过"，撤销随即漏掉它。
+       * 判据只此一份：`wpsAppliedActions.ts`。
+       */
+      afterFingerprint: evidence.afterFingerprint,
+      appliedRows: evidence.appliedRows,
       rect
     };
   });

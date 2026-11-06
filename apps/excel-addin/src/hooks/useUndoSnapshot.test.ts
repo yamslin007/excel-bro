@@ -421,4 +421,62 @@ describe("useUndoSnapshot", () => {
     });
     expect(undoExecutionMock.mock.calls.map((call) => call[0])).toEqual([complete]);
   });
+  it('restores the bound receipt from an empty stack in the same tick', async () => {
+    const onRestored = vi.fn(), onMessage = vi.fn();
+    const {result} = renderHook(() => useUndoSnapshot({isBusy:false,onStatusChange:vi.fn(),onMessage,onRestored}));
+    const saved = makeSnapshot('p','e');
+    await act(async () => { expect(await result.current.undoReviewedExecution('e',saved)).toBe(true); });
+    expect(undoExecutionMock).toHaveBeenCalledExactlyOnceWith(saved);
+    expect(onRestored).toHaveBeenCalledExactlyOnceWith(saved);
+    expect(onMessage).not.toHaveBeenCalled();
+    expect(result.current.undoStack).toEqual([]);
+  });
+  it('never inserts an old receipt above another task or cascades through it, even with the same plan ID', async () => {
+    const {result} = renderHook(() => useUndoSnapshot({isBusy:false,onStatusChange:vi.fn(),onMessage:vi.fn()}));
+    const old = makeSnapshot('p','old'), newer = makeSnapshot('p','new');
+    act(() => { result.current.pushUndoSnapshot(old); result.current.pushUndoSnapshot(newer); });
+    await act(async () => { await expect(result.current.undoReviewedExecution('old',old)).rejects.toThrow('不是当前恢复栈顶'); });
+    expect(undoExecutionMock).not.toHaveBeenCalled();
+    expect(result.current.undoStack).toEqual([old,newer]);
+  });
+  it('rejects mismatched and missing material without adding an entry', async () => {
+    const {result} = renderHook(() => useUndoSnapshot({isBusy:false,onStatusChange:vi.fn(),onMessage:vi.fn()}));
+    await act(async () => {
+      await expect(result.current.undoReviewedExecution('e',makeSnapshot('p','other'))).rejects.toThrow('执行身份不一致');
+      await expect(result.current.undoReviewedExecution('e',null)).rejects.toThrow('缺少恢复材料');
+    });
+    expect(undoExecutionMock).not.toHaveBeenCalled();
+    expect(result.current.undoStack).toEqual([]);
+  });
+  it('rechecks the stack after the asynchronous target guard, before any restoration', async () => {
+    let release!: (allowed:boolean)=>void;
+    const beforeOperation = vi.fn(() => new Promise<boolean>(resolve => {release=resolve;}));
+    const {result} = renderHook(() => useUndoSnapshot({isBusy:false,beforeOperation,onStatusChange:vi.fn(),onMessage:vi.fn()}));
+    const saved = makeSnapshot('p','e'), other = makeSnapshot('q','other');
+    await act(async () => {
+      const pending = result.current.undoReviewedExecution('e',saved);
+      result.current.pushUndoSnapshot(other);
+      release(true);
+      await expect(pending).rejects.toThrow('恢复栈已变化');
+    });
+    expect(undoExecutionMock).not.toHaveBeenCalled();
+    expect(result.current.undoStack).toEqual([saved,other]);
+  });
+
+});
+
+it('撤销成功反馈等待本次标记清理回调，不再次恢复',async()=>{
+ vi.clearAllMocks();
+ isRunningInExcelMock.mockReturnValue(true);
+ undoExecutionMock.mockResolvedValue(undefined);
+ let release!:()=>void;
+ const cleaning=new Promise<void>(resolve=>{release=resolve;});
+ const onRestored=vi.fn(()=>cleaning),onMessage=vi.fn();
+ const {result}=renderHook(()=>useUndoSnapshot({isBusy:false,onStatusChange:vi.fn(),onMessage,onRestored}));
+ act(()=>result.current.pushUndoSnapshot(makeSnapshot('p','e')));
+ let undo!:Promise<boolean>;
+ await act(async()=>{undo=result.current.undoExecutionTo('e',true);await Promise.resolve();});
+ expect(onRestored).toHaveBeenCalledTimes(1);expect(onMessage).not.toHaveBeenCalled();
+ await act(async()=>{release();expect(await undo).toBe(true);});
+ expect(onMessage).toHaveBeenCalledTimes(1);expect(undoExecutionMock).toHaveBeenCalledTimes(1);
 });

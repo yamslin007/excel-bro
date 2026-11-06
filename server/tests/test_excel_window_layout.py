@@ -48,6 +48,17 @@ class FakeWindows:
     def keys(self):
         return list(self.windows)
 
+    def select_pair_sheet(self, original, copy):
+        assert self.describe(original.key) == original
+        assert self.describe(copy.key) == copy
+        self.windows[copy.key] = WindowInfo(copy.key, copy.workbook_hash, original.sheet_hash,
+                                           original.sheet_name, copy.unsaved, copy.review_copy_id)
+
+    def suspend_pair(self, original, copy):
+        assert self.describe(original.key) == original
+        assert self.describe(copy.key) == copy
+        self.moves.append(('suspend', original.key, copy.key))
+
     def describe(self, key):
         if self.inspect:
             self.inspect(key)
@@ -90,6 +101,10 @@ class FakeWindows:
             raise self.error
         self.moves.append((original, copy))
         return ExcelReviewLayoutResult(status='arranged', layoutVersion=3, copySide='left', originalSide='right', synchronousScrolling='different_instance')
+
+    def promote_copy_label(self, original, copy, nonce):
+        assert copy.unsaved and copy.sheet_name == nonce
+        self.windows[copy.key] = WindowInfo(copy.key, '', original.sheet_hash, original.sheet_name, True, nonce)
 
     def add_copy(self, key=COPY, *, name=NONCE, saved=False):
         self.windows[key] = WindowInfo(key, '', '', name, not saved)
@@ -387,6 +402,13 @@ def test_native_positioning_exact_pair_geometry_and_rollback(monkeypatch, failur
         assert rects[10][2] - rects[10][0] > rects[20][2] - rects[20][0]
         assert rects[10][2] - rects[10][0] == 650 and rects[20][2] - rects[20][0] == 350
     assert dpi.call_count == 2  # restore the worker thread's previous DPI context
+    if not failure and not invalid_size:
+        # Switching to another sheet copy must retain the first normal placement.
+        previous_copy = WindowKey(30, SOURCE.pid)
+        backend._review_placements = {(SOURCE, previous_copy): 'normal before review'}
+        placements[10] = 'already split'
+        backend.position_pair(SOURCE, COPY)
+        assert backend._review_placements[(SOURCE, COPY)] == 'normal before review'
 
 
 def test_unavailable_dpi_context_never_mutates_windows(monkeypatch):
@@ -811,3 +833,169 @@ def test_close_api_transport_failure_degrades_to_failed_never_to_a_write_result(
     assert response.status_code == 200
     assert response.json() == {'status':'failed', 'layoutVersion':4, 'copyClosed':False, 'recoveryCopyPath': None}
     assert 'SECRET_PATH_AND_CELL_VALUE' not in response.text
+
+
+def test_suspend_keeps_copy_and_resume_reuses_existing_window():
+    native = FakeWindows()
+    native.add_copy()
+    layout = ExcelWindowLayout(native)
+    assert layout.view_copy(REQUEST, 'suspend') == {'status': 'suspended', 'copyRetained': True}
+    assert COPY in native.windows
+    assert native.close_posted == []
+    assert layout.view_copy(REQUEST, 'resume').status == 'arranged'
+    assert COPY in native.windows
+    assert native.close_posted == []
+
+
+def test_hidden_copy_identity_keeps_original_sheet_label_through_full_lifecycle():
+    native = FakeWindows()
+    request = REQUEST.model_copy(update={'copyIdentityVersion': 2})
+    layout = ExcelWindowLayout(native)
+    token = layout.prepare(request, ORIGIN)
+    native.windows[COPY] = WindowInfo(COPY, '', HASH, 'Ledger', True, NONCE)
+    assert layout.arrange(token, ORIGIN).status == 'arranged'
+    assert layout.view_copy(request, 'suspend')['copyRetained'] is True
+    assert layout.view_copy(request, 'resume').status == 'arranged'
+    assert native.windows[COPY].sheet_name == native.windows[SOURCE].sheet_name == 'Ledger'
+    result = layout.close_copy(ExcelReviewCopyCloseRequest(**request.model_dump(), closeVersion=4))
+    assert result.status == 'closed'
+    assert closed_handles(native) == [COPY]
+    assert SOURCE in native.windows
+
+
+def test_v2_reuses_and_upgrades_retained_v1_copy_instead_of_creating_another():
+    native = FakeWindows()
+    native.add_copy()
+    request = REQUEST.model_copy(update={'copyIdentityVersion': 2})
+    layout = ExcelWindowLayout(native)
+    assert layout.view_copy(request, 'resume').status == 'arranged'
+    assert set(native.windows) == {SOURCE, COPY}
+    assert native.windows[COPY].sheet_name == 'Ledger'
+    assert native.windows[COPY].review_copy_id == NONCE
+    assert native.close_posted == []
+
+
+def test_legacy_copy_promotion_only_changes_label_and_hidden_constant():
+    names = {}
+    sheet = SimpleNamespace(Name=NONCE)
+    def add(**kwargs):
+        assert kwargs == {'Name': '_EB_ReviewCopyId', 'RefersTo': f'="{NONCE}"', 'Visible': False}
+        names[kwargs['Name']] = SimpleNamespace(RefersTo=kwargs['RefersTo'], Visible=kwargs['Visible'])
+    book = SimpleNamespace(Path='', FileFormat=51, Sheets=SimpleNamespace(Count=1, Item=lambda _: sheet),
+                           Names=SimpleNamespace(Add=add, Item=lambda name: names[name]))
+    expected = WindowInfo(COPY, '', '', NONCE, True)
+    WindowsExcelWindows._promote_book_label(book, expected, '结果1', NONCE)
+    assert sheet.Name == '结果1' and book.Path == ''
+    assert WindowsExcelWindows._book_review_id(book) == NONCE
+    # A saved-as copy belongs to the user and must never be relabelled.
+    sheet.Name = NONCE
+    book.Path = 'E:/User'
+    with pytest.raises(WindowLayoutError):
+        WindowsExcelWindows._promote_book_label(book, expected, '结果2', NONCE)
+    assert sheet.Name == NONCE
+
+
+@pytest.mark.parametrize('problem', ['missing', 'wrong_id', 'wrong_sheet', 'saved', 'duplicate'])
+def test_hidden_copy_identity_never_trusts_a_visible_sheet_name_alone(problem):
+    native = FakeWindows()
+    request = REQUEST.model_copy(update={'copyIdentityVersion': 2})
+    nonce = '' if problem == 'missing' else 'EB_' + 'b' * 20 if problem == 'wrong_id' else NONCE
+    sheet_hash = hashlib.sha256(b'Other').hexdigest() if problem == 'wrong_sheet' else HASH
+    native.windows[COPY] = WindowInfo(COPY, 'saved-path' if problem == 'saved' else '', sheet_hash, 'Ledger', problem != 'saved', nonce)
+    if problem == 'duplicate':
+        native.windows[OTHER] = WindowInfo(OTHER, '', HASH, 'Ledger', True, NONCE)
+    layout = ExcelWindowLayout(native)
+    with pytest.raises(WindowLayoutError):
+        layout.view_copy(request, 'suspend')
+    result = layout.close_copy(ExcelReviewCopyCloseRequest(**request.model_dump(), closeVersion=4))
+    if problem == 'wrong_sheet':
+        # Viewing remains tab-specific; closing uses the verified workbook nonce.
+        assert result.status == 'closed'
+        assert closed_handles(native) == [COPY]
+    else:
+        assert result.status in {'identity_lost', 'user_saved', 'ambiguous'}
+        assert native.close_posted == []
+    assert native.moves == []
+
+
+def test_native_hidden_marker_is_a_hidden_constant_and_rechecked_before_close():
+    marker = SimpleNamespace(Visible=False, RefersTo=f'="{NONCE}"')
+    def name_item(name):
+        assert name == '_EB_ReviewCopyId'
+        return marker
+    book = SimpleNamespace(Path='', FullName='Book1', FileFormat=51, Names=SimpleNamespace(Item=name_item),
+                           Sheets=SimpleNamespace(Count=1, Item=lambda index: SimpleNamespace(Name='Ledger')))
+    expected = WindowInfo(COPY, '', HASH, 'Ledger', True, NONCE)
+    window = SimpleNamespace(ActiveSheet=SimpleNamespace(Name='Ledger', Parent=book))
+    assert WindowsExcelWindows._window_metadata(window, COPY) == expected
+    assert WindowsExcelWindows._copy_book_matches(book, expected)
+    marker.RefersTo = '=SUM(A1:A5)'
+    assert WindowsExcelWindows._book_review_id(book) == ''
+    assert not WindowsExcelWindows._copy_book_matches(book, expected)
+    marker.RefersTo = f'="{NONCE}"'
+    marker.Visible = True
+    assert not WindowsExcelWindows._copy_book_matches(book, expected)
+
+
+@pytest.mark.parametrize('problem', ['saved', 'duplicate', 'original_missing'])
+def test_view_copy_rejects_ambiguous_or_user_owned_windows(problem):
+    native = FakeWindows()
+    native.add_copy(saved=problem == 'saved')
+    if problem == 'duplicate':
+        native.add_copy(OTHER)
+    if problem == 'original_missing':
+        native.windows.pop(SOURCE)
+    with pytest.raises(WindowLayoutError):
+        ExcelWindowLayout(native).view_copy(REQUEST, 'suspend')
+    assert native.moves == []
+    assert native.close_posted == []
+
+
+@pytest.mark.parametrize('action', ['suspend', 'resume'])
+def test_retained_copy_endpoints_keep_origin_and_payload_guards(monkeypatch, action):
+    native = FakeWindows()
+    native.add_copy()
+    monkeypatch.setattr(main, 'excel_window_layout', ExcelWindowLayout(native))
+    response = client().post(f'/api/office/review-layout/{action}', json=REQUEST.model_dump())
+    assert response.status_code == 200
+    assert native.close_posted == []
+    assert client(origin='http://localhost:3889').post(f'/api/office/review-layout/{action}', json=REQUEST.model_dump()).status_code == 403
+    assert client().post(f'/api/office/review-layout/{action}', json={**REQUEST.model_dump(), 'script': 'forbidden'}).status_code == 422
+
+
+def test_close_owned_multi_sheet_copy_ignores_both_active_tabs():
+    native = FakeWindows()
+    request = REQUEST.model_copy(update={"copyIdentityVersion": 2})
+    native.windows[SOURCE] = WindowInfo(SOURCE, request.workbookPathHash, path_hash("结果1"), "结果1", False)
+    native.windows[COPY] = WindowInfo(COPY, "", path_hash("结果3"), "结果3", True, NONCE)
+    result = ExcelWindowLayout(native).close_copy(request)
+    assert result.status == "closed"
+    assert result.copyClosed
+    assert closed_handles(native) == [COPY]
+    assert native.windows[SOURCE].sheet_name == "结果1"
+
+
+def test_close_saved_multi_sheet_copy_on_other_tab_never_discards_it():
+    native = FakeWindows()
+    request = REQUEST.model_copy(update={"copyIdentityVersion": 2})
+    native.windows[COPY] = WindowInfo(COPY, path_hash("E:/UserSaved.xlsx"), path_hash("结果3"), "结果3", False, NONCE)
+    result = ExcelWindowLayout(native).close_copy(request)
+    assert result.status == "user_saved"
+    assert not closed_handles(native)
+
+
+def test_close_restores_verified_original_window_before_copy_close_without_tab_navigation():
+    native = FakeWindows()
+    request = REQUEST.model_copy(update={"copyIdentityVersion": 2})
+    native.windows[COPY] = WindowInfo(COPY, "", path_hash("结果3"), "结果3", True, NONCE)
+    calls = []
+    def prepare(original, copy):
+        assert original == native.windows[SOURCE]
+        assert copy == native.windows[COPY]
+        assert not native.close_posted
+        calls.append((original.key, copy.key))
+    native.prepare_close_pair = prepare
+    result = ExcelWindowLayout(native).close_copy(request)
+    assert result.status == "closed"
+    assert calls == [(SOURCE, COPY)]
+    assert native.windows[SOURCE].sheet_name == "Ledger"

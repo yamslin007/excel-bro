@@ -13,17 +13,17 @@ export interface SelectableModel {
   formulaAvailable?: boolean;
 }
 
-/** Older catalogues lack purpose metadata; the server remains the final guard. */
+/** Select connections independently of legacy per-feature capability metadata. */
 export function agentModelAvailable(model: SelectableModel | undefined): boolean {
-  return Boolean(model?.available && model.agentAvailable !== false);
+  return Boolean(model?.available);
 }
 
 export function formulaModelAvailable(model: SelectableModel): boolean {
-  return model.available && model.formulaAvailable !== false;
+  return model.available;
 }
 
 export function agentModelUnavailableReason(model: SelectableModel): string {
-  return model.agentUnavailableReason || "此连接暂不可用于 SDK Agent，请检查连接配置。";
+  return "此模型连接暂不可用，请检查连接配置。";
 }
 
 export function canonicalModelId(id: string): string {
@@ -32,7 +32,7 @@ export function canonicalModelId(id: string): string {
 }
 
 export function keepUnavailableSelection(models: SelectableModel[], id: string): boolean {
-  return models.some((model) => model.id === canonicalModelId(id) && model.agentAvailable === false);
+  return models.some((model) => model.id === canonicalModelId(id) && !model.available);
 }
 
 /** 同一模型 ID 的多条连接按保存顺序编号；编号只用于展示，选择仍使用唯一连接 ID。 */

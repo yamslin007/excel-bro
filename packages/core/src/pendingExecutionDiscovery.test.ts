@@ -27,7 +27,9 @@ function candidate(overrides: Partial<PendingExecutionCandidate> = {}): PendingE
   return {
     operationId: "wps-execution-1fd938fd",
     taskId: "task-1",
+    kind: "resume",
     status: "needs_reconciliation",
+    reviewState: null,
     createdAt: 1_760_000_000_000,
     updatedAt: 1_760_000_100_000,
     nextActionIndex: 1,
@@ -184,5 +186,81 @@ describe("pending execution discovery", () => {
     if (selection.kind !== "choose") throw new Error("必须要求用户选择");
     expect(selection.candidates).toHaveLength(PENDING_DISCOVERY_LIMIT);
     expect(selection.truncated).toBe(true);
+  });
+});
+
+describe('待审阅也是"还没处理完"，但不是"待续写"（2026-11-03）', () => {
+  /** 写完、回读通过、用户还没点确认的那一次执行。 */
+  function reviewCandidate(overrides: Partial<PendingExecutionCandidate> = {}): PendingExecutionCandidate {
+    return candidate({
+      kind: 'review',
+      status: 'completed',
+      reviewState: 'pending',
+      nextActionIndex: 3,
+      totalActions: 3,
+      inFlightActionIndex: null,
+      requiresReconciliation: false,
+      canResume: false,
+      ...overrides
+    });
+  }
+
+  function response(
+    withCandidates: PendingExecutionCandidate[],
+    truncated = false
+  ): PendingExecutionDiscoveryResponse {
+    return {
+      schemaVersion: PENDING_DISCOVERY_SCHEMA_VERSION,
+      namespace: 'wps' as const,
+      workbookIdentity: WPS_IDENTITY,
+      limit: 5,
+      truncated,
+      candidates: withCandidates
+    };
+  }
+
+  it('已完成 + 显式待审阅 ⇒ 一条可用的审阅入口（不会被当成"没有未完成任务"）', () => {
+    const selection = pendingExecutionSelection(response([reviewCandidate()]), WPS_IDENTITY);
+    expect(selection.kind).toBe('single');
+    if (selection.kind !== 'single') return;
+    expect(selection.candidate.kind).toBe('review');
+    expect(selection.candidate.reviewState).toBe('pending');
+    // 待审阅**没有**续跑资格：一步都不能再写。
+    expect(selection.candidate.canResume).toBe(false);
+  });
+
+  it('已完成但没有显式审阅状态 ⇒ 一律丢弃（老记录不许批量变成待审阅）', () => {
+    // `kind: 'resume'` 却 `completed`：自相矛盾，两张皮都不认。
+    const contradictory = reviewCandidate({ kind: 'resume', reviewState: null });
+    expect(pendingExecutionSelection(response([contradictory]), WPS_IDENTITY)).toEqual({ kind: 'none' });
+    // `kind: 'review'` 却没有审阅状态：不是"待审阅"，是"不知道"。
+    const unknown = reviewCandidate({ reviewState: null });
+    expect(pendingExecutionSelection(response([unknown]), WPS_IDENTITY)).toEqual({ kind: 'none' });
+  });
+
+  it('准入闸拒绝自相矛盾的候选，且不会把 completed 混进待续写', () => {
+    expect(() => assertPendingExecutionDiscovery(response([reviewCandidate({ kind: 'resume' })])))
+      .toThrow(/待续写/);
+    expect(() => assertPendingExecutionDiscovery(response([reviewCandidate({ reviewState: null })])))
+      .toThrow(/待审阅/);
+    // 缺少性质标记：既不能当续写也不能当审阅。
+    const missingKind = { ...reviewCandidate() } as Record<string, unknown>;
+    delete missingKind.kind;
+    expect(() => assertPendingExecutionDiscovery(response([missingKind as never])))
+      .toThrow(/性质标记/);
+  });
+
+  it('待审阅与"有在途动作"同档最前：内容已经落表，必须先看见', () => {
+    const failedBeforeWrite = candidate({ operationId: 'zzz', status: 'failed', nextActionIndex: 0, inFlightActionIndex: null, updatedAt: 1 });
+    const ordered = orderPendingExecutionCandidates([failedBeforeWrite, reviewCandidate({ operationId: 'aaa', updatedAt: 1 })]);
+    expect(ordered[0].kind).toBe('review');
+  });
+
+  it('候选行的说明不许用续跑口径（那会让人以为还能"继续执行"）', () => {
+    const text = pendingExecutionCandidateLabel(reviewCandidate());
+    expect(text).toContain('等待你确认或放弃');
+    expect(text).not.toContain('已写 3 步');
+    expect(pendingExecutionCandidateLabel(reviewCandidate({ reviewState: 'blocked' })))
+      .toContain('未通过独立验证');
   });
 });

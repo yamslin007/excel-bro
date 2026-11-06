@@ -183,7 +183,7 @@ describe("WPS 恢复登记的隐私边界", () => {
     await reconcileWpsActionReceipt("wps-execution-privacy", { expectedRevision: 2, actionIndex: 0,
       outcome: "applied", checkpoint: { ...evidence, afterFingerprint: "4:11111111" }, ...extra });
     await suspendWpsExecution("wps-execution-privacy", { expectedRevision: 3, ownerToken: "owner",
-      code: SENTINEL, message: SENTINEL, ...extra });
+      code: "WPS_EXECUTION_INTERRUPTED", message: "WPS 写入中断，需要核对现场。", ...extra });
     await finishWpsExecution("wps-execution-privacy", { expectedRevision: 4, ownerToken: "owner",
       result: { actionCount: 1, cellCount: 4 }, ...extra });
     expect(fetchMock).toHaveBeenCalledTimes(6);

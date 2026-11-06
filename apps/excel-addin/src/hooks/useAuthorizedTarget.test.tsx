@@ -10,7 +10,7 @@ const original: AuthorizedTarget = { fileKey: "PRIVATE_PATH_A", name: "Original.
   sheets: [{ id: "1", name: "Sheet1" }, { id: "2", name: "Other" }], selected: ["1"] };
 const other: AuthorizedTarget = { ...original, fileKey: "PRIVATE_PATH_B", name: "Other.xlsx" };
 afterEach(cleanup);
-function mount(options: Partial<Pick<Parameters<typeof useAuthorizedTarget>[0], "reviewActive" | "isReviewCopy" | "analysisEvidence" | "selectionPending">> = {}) {
+function mount(options: Partial<Pick<Parameters<typeof useAuthorizedTarget>[0], "reviewActive" | "isReviewCopy" | "analysisEvidence" | "selectionPending" | "onTargetDiagnostic">> = {}) {
   let current: AuthorizedTarget | null = original;
   const inspect = vi.fn(async () => { if (!current) throw new Error("PRIVATE_FAILURE"); return current; });
   const adopt = vi.fn((target: AuthorizedTarget) => { current = target; });
@@ -367,6 +367,44 @@ describe("pre-operation target confirmation shared by both hosts", () => {
     await waitFor(() => expect(h.operation).toHaveBeenCalledTimes(1));
     expect(h.ui.queryByRole("dialog")).toBeNull();
     expect(h.adopt).not.toHaveBeenCalled();
+  });
+  /*
+   * 刷新（重载任务窗格）场景：内存里的 analysisConsent 必然为空。
+   * 文档级证据（路径身份 + 宿主声明的工作表稳定 ID）跨刷新成立，与 Excel 的
+   * 文档身份同强度 —— 不该再要求"重新确认范围"。
+   */
+  it("文档级证据成立时刷新后直接分析，不再要求重新确认范围", async () => {
+    const h = mount({ analysisEvidence: vi.fn(async () => ({
+      key: "doc-bound", conclusive: false, documentBound: true })) });
+    await initialized(h);
+    fireEvent.click(h.ui.getByText("分析需求"));
+    await waitFor(() => expect(h.operation).toHaveBeenCalledTimes(1));
+    expect(h.ui.queryByRole("dialog")).toBeNull();
+    expect(h.adopt).not.toHaveBeenCalled();
+  });
+  it("只有对象级弱证据时刷新后仍确认一次，确认原样范围后只继续一次", async () => {
+    const h = mount({ analysisEvidence: vi.fn(async () => ({
+      key: "weak", conclusive: false, documentBound: false })) });
+    await initialized(h);
+    fireEvent.click(h.ui.getByText("分析需求"));
+    await waitFor(() => expect(h.ui.getByRole("dialog")).toBeTruthy());
+    expect(h.operation).not.toHaveBeenCalled();
+    // 确认的就是**当前原样范围**，不要求先取消勾选再勾回。
+    fireEvent.click(h.ui.getByText("确认范围并继续"));
+    await waitFor(() => expect(h.operation).toHaveBeenCalledOnce());
+    expect((h.ui.getByRole("textbox") as HTMLTextAreaElement).value).toContain("original request");
+    // 不会因为确认而重复发消息/重复执行。
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+    expect(h.operation).toHaveBeenCalledOnce();
+  });
+  it("文档级证据也不能掩盖身份键冲突（三份读数不一致仍拦下）", async () => {
+    const evidence = vi.fn(async () => ({ key: "doc-b", conclusive: false, documentBound: true }));
+    const h = mount({ analysisEvidence: evidence }); await initialized(h);
+    evidence.mockResolvedValueOnce({ key: "doc-a", conclusive: false, documentBound: true });
+    await act(async () => { expect(await h.guard().checkForAnalysis()).toBe(false); });
+    expect(h.guard().notice?.reason).toBe("unavailable");
+    expect(h.operation).not.toHaveBeenCalled();
+    expect(h.guard().hasAnalysisConsent("doc-b")).toBe(false);
   });
   it("用户取消前置确认后不分析，保留输入；重新提交仍需确认", async () => {
     const h = mount({ analysisEvidence: vi.fn(async () => ({ key: "identity", conclusive: false })) });
@@ -796,5 +834,94 @@ describe("已确认范围的证据冲突判据（真实适配器 + 真实守卫�
     committed = ["Sheet1", "Sheet10"];
     await act(async () => { expect(await guard.checkForAnalysis()).toBe(false); });
     expect(guard.notice?.reason).toBe("scope_changed");
+  });
+});
+
+/*
+ * 2026-11-01 真机复测后的三件事，各自独立钉住：
+ *
+ * 1. `requireExplicitConsent` 的**真实语义**：它只禁止"用文档级证据替调用方跳过
+ *    显式确认"，不是"无条件再问一次"。恢复挂起任务卡的调用方要的是前者。
+ * 2. 判定**通过**之后，先前那条提示必须被清掉 —— 否则界面挂着的旧提示和
+ *    "又被拦了一次"长得一模一样。
+ * 3. 每条判定交出一条**只有布尔值/原因码**的诊断，用来在真机上区分这几种情况。
+ */
+describe("证据分级与提示生命周期（2026-11-01 真机复测后）", () => {
+  it("requireExplicitConsent 不阻挡对象级证明：能证明还是那个对象就直接读", async () => {
+    const h = mount({ analysisEvidence: vi.fn(async () => ({ key: "k", conclusive: true })) });
+    await initialized(h);
+    await act(async () => { expect(await h.guard().checkForAnalysis(() => {}, { requireExplicitConsent: true })).toBe(true); });
+    expect(h.guard().notice).toBeNull();
+  });
+  it("requireExplicitConsent 不阻挡本会话同键同意：用户刚确认过就不该再问一次", async () => {
+    const h = mount({ analysisEvidence: vi.fn(async () => ({ key: "k", conclusive: false, documentBound: true })) });
+    await initialized(h);
+    await act(async () => { expect(await h.guard().confirmScope(original)).toBe(true); });
+    expect(h.guard().hasAnalysisConsent("k")).toBe(true);
+    await act(async () => { expect(await h.guard().checkForAnalysis(() => {}, { requireExplicitConsent: true })).toBe(true); });
+    expect(h.guard().notice).toBeNull();
+  });
+  it("requireExplicitConsent 只挡文档级捷径：只有 documentBound 时仍要显式确认一次", async () => {
+    const h = mount({ analysisEvidence: vi.fn(async () => ({ key: "k", conclusive: false, documentBound: true })) });
+    await initialized(h);
+    await act(async () => { expect(await h.guard().checkForAnalysis(() => {}, { requireExplicitConsent: true })).toBe(false); });
+    expect(h.guard().notice?.reason).toBe("confirmation_required");
+  });
+  it("范围恢复原样后旧提示会被清掉，且被拦下的旧请求不会被重放", async () => {
+    const h = mount(); await initialized(h);
+    // 同一份文件、授权集合多出一张：元数据闸判 `scope_changed`。
+    h.current({ ...original, selected: ["1", "2"] });
+    fireEvent.click(h.ui.getByText("操作"));
+    await waitFor(() => expect(h.guard().notice?.reason).toBe("scope_changed"));
+    expect(h.operation).not.toHaveBeenCalled();
+    // 目标自己回到原样（用户把表名改回去、或在别处撤销了那一步）：判定会通过。
+    h.current(original);
+    fireEvent.click(h.ui.getByText("操作"));
+    await waitFor(() => expect(h.operation).toHaveBeenCalledOnce());
+    // 旧提示不再挂着 —— 它已经不再成立。
+    expect(h.guard().notice).toBeNull();
+    // 清提示时那条"待继续"的闭包也一起作废：不会再被下一次确认重放。
+    await act(async () => { await h.guard().confirm("original", []); });
+    expect(h.operation).toHaveBeenCalledOnce();
+  });
+  it("拦下时交出的诊断只有布尔值与原因码，没有路径/表名/证据键", async () => {
+    const seen: unknown[] = [];
+    const h = mount({
+      analysisEvidence: vi.fn(async () => ({ key: "PRIVATE_EVIDENCE_KEY", conclusive: false, documentBound: false })),
+      onTargetDiagnostic: (diagnostic) => seen.push(diagnostic)
+    });
+    await initialized(h);
+    await act(async () => { expect(await h.guard().checkForAnalysis()).toBe(false); });
+    const last = seen.at(-1) as Record<string, unknown>;
+    expect(last).toMatchObject({
+      stage: "target", outcome: "blocked", gate: "analysis", branch: "weak_evidence",
+      conclusive: false, documentBound: false, hasConsent: false, explicitRequired: false
+    });
+    const text = JSON.stringify(seen);
+    expect(text).not.toContain("PRIVATE_EVIDENCE_KEY");
+    expect(text).not.toContain("PRIVATE_PATH_A");
+    expect(text).not.toContain("Sheet1");
+  });
+  it("被拦下的那条诊断带的是**这一轮**的 round，先落提示再写诊断", async () => {
+    const seen: { round: number; seq: number }[] = [];
+    const h = mount({
+      analysisEvidence: vi.fn(async () => ({ key: "k", conclusive: false, documentBound: false })),
+      onTargetDiagnostic: (diagnostic) => seen.push({ round: diagnostic.round, seq: diagnostic.seq })
+    });
+    await initialized(h);
+    await act(async () => { expect(await h.guard().checkForAnalysis()).toBe(false); });
+    // 提示轮次从 1 开始；诊断必须报 1，不能报 0（那是"还没开轮"）。
+    expect(h.guard().notice?.round).toBe(1);
+    expect(seen.at(-1)?.round).toBe(1);
+  });
+  it("文档级证据成立但调用方要求显式确认时，诊断说的是 document_bound_rejected", async () => {
+    const seen: unknown[] = [];
+    const h = mount({
+      analysisEvidence: vi.fn(async () => ({ key: "k", conclusive: false, documentBound: true })),
+      onTargetDiagnostic: (diagnostic) => seen.push(diagnostic)
+    });
+    await initialized(h);
+    await act(async () => { await h.guard().checkForAnalysis(() => {}, { requireExplicitConsent: true }); });
+    expect(seen.at(-1)).toMatchObject({ outcome: "blocked", branch: "document_bound_rejected", documentBound: true, explicitRequired: true });
   });
 });

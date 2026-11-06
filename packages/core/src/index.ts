@@ -30,7 +30,41 @@ export {
   startColumnOfRange,
   suggestWriteTarget
 } from "./range";
-export { normalizeField, detectHeaderIndex, detectSheetFields } from "./tableSchema";
+export {
+  normalizeField,
+  detectHeaderIndex,
+  detectSheetFields,
+  looksLikeHeaderRow,
+  isSyntheticField,
+  syntheticFields
+} from "./tableSchema";
+// `query_table` 的显式只读区域：写法判定、交集与裁剪三件事只在这里定。
+export type { AbsoluteRect, QueryRect } from "./queryRange";
+export {
+  parseQueryRange,
+  queryRangeIssue,
+  intersectQueryRect,
+  sliceForQueryRange,
+  queryRectAddress
+} from "./queryRange";
+// 「这次查哪几张表」的唯一判据：授权集合是上限，不是本次查询范围。
+export type {
+  QueryTargetRequest,
+  QueryTargetResolution
+} from "./queryTarget";
+export { resolveQueryTarget } from "./queryTarget";
+// 结果"为什么不完整"的唯一出处：原因由生产它的代码写下，文案只负责复述。
+export type {
+  QueryCompleteness,
+  QueryIncompleteReason,
+  QueryTruncation
+} from "./queryCompleteness";
+export {
+  completenessOf,
+  describeIncompleteReason,
+  describeIncompleteReasons,
+  describeTruncation
+} from "./queryCompleteness";
 // 表格区域变换（排序 / 去重）的确定性判据：两端读同一份，避免顺序语义漂移。
 export type { SortKeySpec } from "./tableTransforms";
 export {
@@ -487,3 +521,44 @@ export {
   rebuildExecutionUndo,
   undoRecoveryDetail
 } from "./executionUndoRebuild";
+
+// 专注窗口跨窗口协议（Excel DialogApi / WPS WebDialog 共用）
+export type {
+  FocusCellValue,
+  FocusPlanSummary,
+  FocusResultTable,
+  FocusMessage,
+  FocusConversation,
+  FocusTool,
+  FocusWorkbookRef,
+  FocusSnapshot,
+  FocusMessageKind,
+  FocusEnvelope,
+  FocusRejectReason,
+  FocusExpectation,
+  FocusReadResult,
+  FocusChildStatus,
+  FocusChildState,
+  FocusChildEvent
+} from "./focusProtocol";
+export {
+  FOCUS_PROTOCOL_CHANNEL,
+  FOCUS_PROTOCOL_VERSION,
+  FOCUS_HEARTBEAT_INTERVAL_MS,
+  FOCUS_SYNC_TTL_MS,
+  FOCUS_HELLO_RETRY_MS,
+  FOCUS_HANDSHAKE_TIMEOUT_MS,
+  FOCUS_CACHE_KEY_PREFIX,
+  FOCUS_CACHE_TTL_MS,
+  FOCUS_SNAPSHOT_LIMITS,
+  FOCUS_REJECT_TEXT,
+  createFocusSessionId,
+  focusCacheKey,
+  parseFocusEnvelope,
+  sanitizeFocusSnapshot,
+  readFocusMessage,
+  initialFocusChildState,
+  reduceFocusChild,
+  nextFocusSeq,
+  createFocusEnvelope
+} from "./focusProtocol";

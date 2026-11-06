@@ -39,6 +39,7 @@ mkdir -p "$APP_STAGE_DIR" "$CERT_STAGE_DIR" "$PKG_SCRIPTS_DIR" "$OUTPUT_DIR"
 cd "$PROJECT_ROOT"
 npm ci
 npm run build:addin
+npm run build:wps
 python3 packaging/generate_certificate.py "$CERT_STAGE_DIR"
 python3 -m PyInstaller \
     --noconfirm \
@@ -50,6 +51,7 @@ python3 -m PyInstaller \
     --specpath "$PYINSTALLER_DIR/spec" \
     --add-data "$PROJECT_ROOT/server:server" \
     --add-data "$PROJECT_ROOT/config:config" \
+    --collect-all claude_agent_sdk \
     --hidden-import tkinter \
     --hidden-import tkinter.filedialog \
     --exclude-module cv2 \
@@ -65,14 +67,22 @@ python3 -m PyInstaller \
     packaging/runtime.py
 
 INSTALL_ROOT="$APP_STAGE_DIR/Applications/Excel Bro"
-mkdir -p "$INSTALL_ROOT/frontend" "$INSTALL_ROOT/catalog"
+mkdir -p "$INSTALL_ROOT/frontend" "$INSTALL_ROOT/wps-frontend" "$INSTALL_ROOT/catalog"
 cp -R "$PYINSTALLER_DIR/dist/ExcelBro/"* "$INSTALL_ROOT/"
 cp -R "$PROJECT_ROOT/apps/excel-addin/dist/"* "$INSTALL_ROOT/frontend/"
+cp -R "$PROJECT_ROOT/apps/wps-addin/dist/"* "$INSTALL_ROOT/wps-frontend/"
 cp "$MANIFEST_PATH" "$INSTALL_ROOT/manifest.xml"
 cp "$MANIFEST_PATH" "$INSTALL_ROOT/catalog/manifest.xml"
 cp "$CERT_STAGE_DIR"/localhost.* "$INSTALL_ROOT/"
 cp "$PROJECT_ROOT/packaging/mac/uninstall.sh" "$INSTALL_ROOT/uninstall.sh"
 chmod +x "$INSTALL_ROOT/ExcelBro" "$INSTALL_ROOT/uninstall.sh"
+
+# Exercise the frozen imports, both frontend payloads and SDK CLI without
+# starting localhost services or touching any user workbook.
+EXCEL_BRO_CONFIG_DIR="$WORK_DIR/smoke-data" "$INSTALL_ROOT/ExcelBro" --self-test
+mkdir -p "$WORK_DIR/smoke-home"
+"$INSTALL_ROOT/ExcelBro" --register-wps "$WORK_DIR/smoke-home"
+"$INSTALL_ROOT/ExcelBro" --unregister-wps "$WORK_DIR/smoke-home"
 
 cp "$PROJECT_ROOT/packaging/mac/pkg-scripts/"* "$PKG_SCRIPTS_DIR/"
 chmod +x "$PKG_SCRIPTS_DIR/"*
@@ -88,5 +98,6 @@ pkgbuild \
 productbuild \
     --package "$WORK_DIR/excel-bro-component.pkg" \
     "$INSTALLER_PATH"
+shasum -a 256 "$INSTALLER_PATH" > "$INSTALLER_PATH.sha256"
 
 echo "已生成：$INSTALLER_PATH"

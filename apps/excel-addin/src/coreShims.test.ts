@@ -29,6 +29,9 @@ describe("阶段 2 兼容 shim", () => {
     expect(tableSchemaShim.normalizeField).toBe(core.normalizeField);
     expect(tableSchemaShim.detectHeaderIndex).toBe(core.detectHeaderIndex);
     expect(tableSchemaShim.detectSheetFields).toBe(core.detectSheetFields);
+    expect(tableSchemaShim.looksLikeHeaderRow).toBe(core.looksLikeHeaderRow);
+    expect(tableSchemaShim.isSyntheticField).toBe(core.isSyntheticField);
+    expect(tableSchemaShim.syntheticFields).toBe(core.syntheticFields);
   });
 
   it("shim 没有遗漏 core 的对应导出", () => {
@@ -48,7 +51,10 @@ describe("阶段 2 兼容 shim", () => {
     expect(Object.keys(tableSchemaShim).sort()).toEqual([
       "detectHeaderIndex",
       "detectSheetFields",
-      "normalizeField"
+      "isSyntheticField",
+      "looksLikeHeaderRow",
+      "normalizeField",
+      "syntheticFields"
     ]);
   });
 });

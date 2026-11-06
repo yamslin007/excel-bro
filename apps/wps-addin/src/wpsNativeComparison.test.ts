@@ -8,6 +8,11 @@ import {
   discardWpsNativeComparison,
   rearrangeWpsComparison,
   stageWpsNativeComparison,
+  captureWpsBeforeResult,
+  stageWpsBeforeComparison,
+  suspendWpsComparison,
+  switchWpsBeforeComparison,
+  activateWpsBeforeComparison,
   verifyWpsNativeComparison,
   wpsCopyContentVerdict,
   WpsFormulaTrialError
@@ -150,6 +155,8 @@ function multiSheetHost(transformWrittenValue: (value: unknown, format: string) 
     汇总表: []
   };
   const copiedSheets: string[] = [];
+  const copyBooks: WpsWorkbook[] = [];
+  const copyTabs = new WeakMap<WpsWorkbook, WpsWorksheet[]>();
   const storage = new Map<string, unknown>();
   let active: WpsWorkbook;
   let copyClosed = false;
@@ -171,6 +178,7 @@ function multiSheetHost(transformWrittenValue: (value: unknown, format: string) 
         )
       );
     const range: Record<string, unknown> = {
+      Row: rect.startRow, Column: rect.startColumn,
       Rows: { Count: rows },
       Columns: { Count: columns },
       MergeCells: false,
@@ -222,7 +230,7 @@ function multiSheetHost(transformWrittenValue: (value: unknown, format: string) 
     return { startRow: from.row, startColumn: from.column, endRow: to.row, endColumn: to.column };
   }
 
-  function buildSheet(name: string, read: () => MultiMatrix, onCopy?: () => void): WpsWorksheet {
+  function buildSheet(name: string, read: () => MultiMatrix, onCopy?: (before?: WpsWorksheet, after?: WpsWorksheet) => void): WpsWorksheet {
     const sheet: Record<string, unknown> = {
       Name: name,
       CodeName: `Code_${name}`,
@@ -247,19 +255,29 @@ function multiSheetHost(transformWrittenValue: (value: unknown, format: string) 
   function sheet(name: string): WpsWorksheet {
     const cached = sheets.get(name);
     if (cached) return cached;
-    const built = buildSheet(name, () => grids[name] ?? [], () => {
+    const built = buildSheet(name, () => grids[name] ?? [], (_before, after) => {
       copiedSheets.push(name);
       const snapshot = (grids[name] ?? []).map((row) => [...row]);
       const copyName = name;
       const copySheet = buildSheet(copyName, () => snapshot);
+      if (after) {
+        const destination = copyBooks.find(book => copyTabs.get(book)?.includes(after));
+        if (!destination) throw new Error('unknown copy destination');
+        copyTabs.get(destination)!.push(copySheet);
+        copySheet.Activate = () => { active = destination; destination.ActiveSheet = copySheet; };
+        copySheet.Activate();
+        return;
+      }
+      const tabs = [copySheet];
+      const copyWindow = {Caption: 'Book1', Visible: true};
       const copy: WpsWorkbook = {
         Name: "Book1",
         FullName: "",
         Path: "",
         ReadOnly: false,
-        Worksheets: { Count: 1, Item: () => copySheet },
+        Worksheets: { get Count() {return tabs.length;}, Item: (i: number | string) => typeof i === 'number' ? tabs[i-1] : tabs.find(s => s.Name === i)! },
         ActiveSheet: copySheet,
-        Windows: { Count: 1, Item: () => ({ Caption: "Book1" }) },
+        Windows: { Count: 1, Item: () => copyWindow },
         Activate: () => {
           active = copy;
         },
@@ -270,9 +288,12 @@ function multiSheetHost(transformWrittenValue: (value: unknown, format: string) 
           return true;
         }
       };
+      copyBooks.push(copy); copyTabs.set(copy, tabs);
+      copySheet.Activate = () => { active = copy; copy.ActiveSheet = copySheet; };
       active = copy;
     });
     sheets.set(name, built);
+    built.Activate = () => { active = original; original.ActiveSheet = built; };
     return built;
   }
 
@@ -340,6 +361,72 @@ function multiSheetHost(transformWrittenValue: (value: unknown, format: string) 
 }
 
 describe("WPS 原生双窗口的隔离审阅", () => {
+  it('三张目标表只建立一个副本；往返切表不重排，非当前子表有人工修改就保留', () => {
+    const host = multiSheetHost(), app = host.application;
+    const original = app.ActiveWorkbook!;
+    original.Worksheets.Item(3).Range!('A1').Value2 = '旧汇总';
+    const plan = {...host.plan, actions: ['会员表', '订单表', '汇总表'].map(sheet => ({
+      type: 'writeValues' as const, sheet, range: 'A1', values: [['新值']]}))};
+    const before = captureWpsBeforeResult(app, prepareWpsPlan(app, [1,2,3], plan));
+    const oldValues = [1,2,3].map(i => original.Worksheets.Item(i).Range!('A1').Value2);
+    [1,2,3].forEach(i => { original.Worksheets.Item(i).Range!('A1').Value2 = '新值'; });
+    const session = stageWpsBeforeComparison(app, before, undefined, '会员表');
+    const copy = session.copy;
+    expect(copy.Worksheets.Count).toBe(3);
+    expect([1,2,3].map(i => copy.Worksheets.Item(i).Name)).toEqual(['会员表', '订单表', '汇总表']);
+    expect([1,2,3].map(i => copy.Worksheets.Item(i).Range!('A1').Value2)).toEqual(oldValues);
+    activateWpsBeforeComparison(app, session);
+    for (const name of ['汇总表', '会员表', '订单表']) {
+      expect(switchWpsBeforeComparison(app, session, name)).toBe(true);
+      expect(copy.ActiveSheet!.Name).toBe(name);
+      expect(original.ActiveSheet!.Name).toBe(name);
+      expect(session.copy).toBe(copy);
+    }
+    expect(app.Windows!.CompareSideBySideWith).toHaveBeenCalledTimes(1);
+    app.Windows!.BreakSideBySide = vi.fn(() => true);
+    expect(suspendWpsComparison(app, session)).toBeNull();
+    expect(switchWpsBeforeComparison(app, session, '汇总表')).toBe(true);
+    expect(app.Windows!.CompareSideBySideWith).toHaveBeenCalledTimes(2);
+    expect(host.copiedSheets()).toHaveLength(3);
+    expect(wpsCopyContentVerdict(session)).toBe('unchanged');
+    copy.Worksheets.Item(1).Range!('B1').Value2 = '副本人工修改';
+    expect(discardWpsNativeComparison(session)).toBe('extra_edits');
+    expect(host.copyClosed()).toBe(false);
+    expect([1,2,3].map(i => original.Worksheets.Item(i).Range!('A1').Value2)).toEqual([[['新值']],[['新值']],[['新值']]]);
+  });
+  it('执行前保存整表上下文，执行后其他区域变化不会混入副本', () => {
+    const host = multiSheetHost();
+    const sheet = host.application.ActiveWorkbook!.Worksheets.Item(3);
+    sheet.Range!('A1:B1').Value2 = [['旧目标', '旧表头']];
+    const plan = {...host.plan, actions:[{type:'writeValues' as const, sheet:'汇总表',range:'A1',values:[['新目标']]}]};
+    const before = captureWpsBeforeResult(host.application, prepareWpsPlan(host.application, [1,2,3], plan));
+    expect(before.contextSheets?.['汇总表'].values).toEqual([['旧目标','旧表头']]);
+    sheet.Range!('A1:B1').Value2 = [['新目标', '后来改的表头']];
+    const staged = stageWpsBeforeComparison(host.application, before);
+    expect(staged.snapshotNotice).toBeUndefined();
+    expect(staged.snapshotScope).toContain('不作为历史对比依据');
+    expect(staged.copy.Worksheets.Item(1).Range!('A1:B1').Value2).toEqual([['旧目标','旧表头']]);
+    expect(sheet.Range!('A1:B1').Value2).toEqual([['新目标','后来改的表头']]);
+    staged.copy.Worksheets.Item(1).Range!('B1').Value2 = '副本人工修改';
+    expect(discardWpsNativeComparison(staged)).toBe('extra_edits');
+    expect(host.copyClosed()).toBe(false);
+  });
+
+  it('退出隐藏而不关闭，重开复用同一副本', () => {
+    const host = fakeHost();
+    const window = {Caption:'Book1', Visible:true};
+    host.copy.Windows = {Count:1, Item:()=>window};
+    host.application.Windows!.BreakSideBySide = vi.fn(() => true);
+    const before = captureWpsBeforeResult(host.application, prepareWpsPlan(host.application, [1], host.plan));
+    const staged = stageWpsBeforeComparison(host.application, before);
+    expect(suspendWpsComparison(host.application,staged)).toBeNull();
+    expect(window.Visible).toBe(false);
+    expect(host.copyClosed()).toBe(false);
+    expect(rearrangeWpsComparison(host.application, staged)).toBe('arranged');
+    expect(window.Visible).toBe(true);
+    expect(host.originalSheet.Copy).toHaveBeenCalledTimes(1);
+    expect(host.originalCell.value).toBe('原值');
+  });
   it("数字文本在副本、原表写回与撤销中保持类型和原数字格式", async () => {
     const host = multiSheetHost((value, format) =>
       typeof value === "string" && /^\d+$/.test(value) && format !== "@" ? Number(value) : value);

@@ -153,6 +153,31 @@ export function composerPrimaryAction(
     };
   }
 
+  if (input.taskRunning && input.uninterruptible) {
+    return {
+      kind: "pause",
+      glyph: "…",
+      label: PRIMARY_PAUSE_UNINTERRUPTIBLE,
+      title: PRIMARY_PAUSE_UNINTERRUPTIBLE,
+      disabled: true,
+      busy: false,
+      invoke: null,
+      reason: PRIMARY_PAUSE_UNINTERRUPTIBLE
+    };
+  }
+  if (input.taskRunning && !input.controllerAlive) {
+    return {
+      kind: "pause",
+      glyph: "…",
+      label: PRIMARY_PAUSE_UNAVAILABLE,
+      title: PRIMARY_PAUSE_UNAVAILABLE,
+      disabled: true,
+      busy: false,
+      invoke: null,
+      reason: PRIMARY_PAUSE_UNAVAILABLE
+    };
+  }
+
   /* ② 有字 + 在跑：发送（语义是打断并补充）。 */
   if (input.hasInput && input.taskRunning) {
     return {
@@ -274,18 +299,6 @@ export function composerPrimaryAction(
    * 写入/回读期间画一颗可点的 ■，是在承诺一件做不到的事：已经提交给宿主的
    * 写入不会因为按了按钮就立刻停。这里如实给禁用态与原因。
    */
-  if (input.taskRunning && input.uninterruptible) {
-    return {
-      kind: "pause",
-      glyph: "…",
-      label: PRIMARY_PAUSE_UNINTERRUPTIBLE,
-      title: PRIMARY_PAUSE_UNINTERRUPTIBLE,
-      disabled: true,
-      busy: false,
-      invoke: null,
-      reason: PRIMARY_PAUSE_UNINTERRUPTIBLE
-    };
-  }
   if (input.taskRunning && input.controllerAlive) {
     return {
       kind: "pause",
@@ -298,18 +311,7 @@ export function composerPrimaryAction(
       reason: null
     };
   }
-  if (input.taskRunning) {
-    return {
-      kind: "pause",
-      glyph: "…",
-      label: PRIMARY_PAUSE_UNAVAILABLE,
-      title: PRIMARY_PAUSE_UNAVAILABLE,
-      disabled: true,
-      busy: false,
-      invoke: null,
-      reason: PRIMARY_PAUSE_UNAVAILABLE
-    };
-  }
+
 
   /* 任务结束（或从未开始）：发送。 */
   return {

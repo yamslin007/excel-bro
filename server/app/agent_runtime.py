@@ -13,10 +13,18 @@ def sdk_agent_connection(connection: ModelConnection) -> ModelConnection:
     # Anthropic URL for an arbitrary OpenAI gateway or change model/credentials.
     endpoint = _deepseek_anthropic_url(connection.base_url)
     if endpoint is None:
+        if connection.adapter == "openai_compatible":
+            from .openai_sdk_transport import completion_url
+            from .openai_sdk_protocol import ProtocolError
+            try:
+                completion_url(connection.base_url)
+            except (ValueError, ProtocolError) as error:
+                raise ModelNotAvailableError("OpenAI 兼容接口地址无效。") from error
+            # The SDK query creates a task-local protocol bridge; no endpoint or
+            # credential is guessed or replaced by another saved connection.
+            return connection
         raise ModelNotAvailableError(
-            "表格 Agent 已统一使用 Claude Agent SDK；此连接尚未配置兼容的 SDK 端点。"
-            "请选择 Agent SDK 连接。原连接仍可用于独立公式等非 Agent 功能；"
-            "本次没有改用其他模型，也没有读取或修改工作表。"
+            "此模型连接的接口协议不受支持，请选择 OpenAI 或 Anthropic 兼容协议。"
         )
     return replace(connection, base_url=endpoint, adapter="claude_agent_sdk")
 

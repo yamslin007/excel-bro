@@ -57,13 +57,11 @@ expectedFingerprint` 三个指纹。类型不对或矩阵形状不对一律"拒�
 - 显式不做：`removeDuplicates`（875-880 现在直接拒，理由是 `EntireRow.Insert` 恢复链路没实机取证）、
   以及任何需要行插入/删除的结构动作。
 
-### U1c `copyRange` —— **可能已经支持，但没有任何用例证明**
+### U1c copyRange —— values 子集已有精确续跑自动化
 
-- `copyRange` 在 939-961 被展开成 `writeValues` + 来源快照，形状上**满足**门槛一；
-  244 行的注释则说明它的固定值在 `planHasBakedValues` 眼里"没有本机依据"。
-- 所以它到底是"已支持"还是"形状像但被来源锚点挡住"，**现在没有证据**。
-- 动作：先补**一条**用例（copyRange 计划中断 → 续跑），绿了就把它从"不支持"里划掉，
-  红了再看拒因落在哪一条判据上。不要先写实现。
+2026-11-01 核对实际用例：`wpsExecutionResume.test.ts` 的「copyRange 的精确续跑（能力证据）」通过准备链把三个 values 复制动作展开为 writeValues；第二步写后中断，resume 后断言真实替身写调用仅 `Target!A3`、最终三格 111/222/333。本轮命令 `npx vitest run src/wpsExecutionResume.test.ts -t "copyRange 的精确续跑"` 为 1 passed / 65 未选中。
+
+这是生产执行器＋替身宿主的证据；不证明格式复制、link、任意复制变体或原生跨进程验收。既有用例已存在，不新增同款测试、不把它记成新功能。
 
 ## 3. U2：缺来源快照的 SDK Python 结果计划
 

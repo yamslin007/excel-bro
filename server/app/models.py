@@ -141,6 +141,8 @@ class ExcelReviewLayoutPrepareRequest(BaseModel):
     workbookPathHash: str = Field(pattern=r"^[0-9a-f]{64}$")
     worksheetNameHash: str = Field(pattern=r"^[0-9a-f]{64}$")
     copySheetName: str = Field(pattern=r"^EB_[0-9a-f]{20}$")
+    # v2 supports the hidden workbook name; v1 identifies legacy nonce-named sheets.
+    copyIdentityVersion: Literal[1, 2] = 1
 
 
 class ExcelReviewPaneMeasurement(BaseModel):
@@ -156,6 +158,15 @@ class ExcelReviewLayoutTicket(BaseModel):
     model_config = ConfigDict(extra="forbid")
     token: str = Field(pattern=r"^[A-Za-z0-9_-]{43}$")
     layoutVersion: Literal[3]
+
+
+class ExcelReviewCopySuspendResult(BaseModel):
+    status: Literal["suspended"] = "suspended"
+    copyRetained: Literal[True] = True
+
+
+class ExcelReviewCopySelectResult(BaseModel):
+    status: Literal["selected"] = "selected"
 
 
 class ExcelReviewLayoutArrangeRequest(BaseModel):
@@ -179,6 +190,7 @@ class ExcelReviewCopyCloseRequest(BaseModel):
     workbookPathHash: str = Field(pattern=r"^[0-9a-f]{64}$")
     worksheetNameHash: str = Field(pattern=r"^[0-9a-f]{64}$")
     copySheetName: str = Field(pattern=r"^EB_[0-9a-f]{20}$")
+    copyIdentityVersion: Literal[1, 2] = 1
 
 
 class ExcelReviewCopyCloseResult(BaseModel):
@@ -760,6 +772,47 @@ class DataCombine(BaseModel):
 class QueryTableArguments(BaseModel):
     mode: Literal["rows", "aggregate", "profile"]
     scope: Literal["selected", "active"] = "selected"
+    # 源区域有没有表头。null = 由本地按内容判断（既有行为）；false = 无表头，
+    # 列名用合成名「列1、列2……」，**所有行都是数据（含首行）**；true = 首行是表头。
+    #
+    # 为什么必须能显式说：纯内容判据分不清「文本列 + 数字列」的数据区与
+    # 「文本表头 + 数字列」的表 —— `[["甲", 1], ["乙", 2]]` 两种解释都成立。
+    # 用户说过「五个数」「第一行也算」时，模型必须能用参数把这件事说清楚，
+    # 而不是让执行侧猜、猜错就静默少算一行（2026-11-01 现场：合计成了 14）。
+    #
+    # 显式 `true` **优先于**「字段名是 列N ⇒ 判无表头」那条旁证：真实表头恰好叫
+    # 「列1/列2」时，只有显式声明能纠正它。
+    hasHeaders: bool | None = Field(
+        default=None,
+        description=(
+            "源区域有没有表头。省略/null = 本地按内容判断；"
+            "false = 无表头（列名是 列1/列2……，所有行含首行都是数据）；"
+            "true = 首行是表头。用户说过“五个数/第一行也算”时传 false；"
+            "真实表头就叫 列1/列2 时传 true（显式声明优先于按列名推断）。"
+        ),
+    )
+    # 只读区域。给了它，**只有这个矩形内的数据参与计算**，区域外的行不参与。
+    # 带工作表名时那张表必须已授权，否则整条请求按越权拒绝。
+    # 规则与 `packages/core/src/queryRange.ts` 逐条对应（执行侧唯一判据在那边）。
+    range: str | None = Field(
+        default=None,
+        max_length=40,
+        description=(
+            "只读区域，如 A1:B5 或 来源!A1:B5。省略 = 整张已授权表的已用区域。"
+            "指定后区域外的单元格不参与计算；带工作表名时该表必须已授权。"
+            "只支持单个 A1 矩形（整列/整行/命名区域/多区域都不行）。"
+        ),
+    )
+    sheets: list[str] = Field(
+        default_factory=list,
+        max_length=30,
+        description=(
+            "本次要查的工作表名，如 [\"来源\"]。授权范围只是可访问的上限，**不是本次查询范围**："
+            "可查范围有多张表却没绑定时，执行器会拒绝并列出可选表名，不会退成"
+            "「把全部已选表都查一遍」。三种绑定方式（优先级从高到低）：range 带表名"
+            "（来源!A1:B5）→ sheets → scope=\"active\"。"
+        ),
+    )
     fields: list[str] = Field(default_factory=list, max_length=30)
     filters: list[DataFilter] = Field(default_factory=list, max_length=20)
     groupBy: list[str] = Field(default_factory=list, max_length=10)
@@ -769,6 +822,14 @@ class QueryTableArguments(BaseModel):
     sortBy: str | None = Field(default=None, max_length=200)
     sortDirection: Literal["asc", "desc"] = "desc"
     limit: int = Field(default=20, ge=1, le=200)
+
+    @field_validator("range")
+    @classmethod
+    def validate_region(cls, value: str | None) -> str | None:
+        # 判据在模块底部的 `validate_query_range`（与 core 的 `queryRange.ts` 镜像）。
+        if value is None:
+            return None
+        return validate_query_range(value)
 
     @model_validator(mode="after")
     def validate_mode_requirements(self) -> "QueryTableArguments":
@@ -1155,6 +1216,58 @@ def _range_dimensions(address: str) -> tuple[int, int] | None:
     if end_column < start_column or end_row < start_row:
         return None
     return end_row - start_row + 1, end_column - start_column + 1
+
+
+# `query_table` 的只读区域写法判定。**执行侧的唯一判据在**
+# `packages/core/src/queryRange.ts`（`queryRangeIssue` / `parseQueryRange`），
+# 这里逐条镜像，只负责在协议层把不合法的请求挡在宿主之外。改一处必须同步另一处，
+# 否则会出现"协议放行、执行器拒"（用户看到两个说法）或反过来（区域被悄悄忽略）。
+QUERY_RANGE_MAX_ROW = 1_048_576
+QUERY_RANGE_MAX_COLUMN = 16_384
+_QUERY_RANGE_ADDRESS = re.compile(
+    r"\$?([A-Za-z]{1,3})\$?([1-9]\d*)(?::\$?([A-Za-z]{1,3})\$?([1-9]\d*))?"
+)
+_QUERY_RANGE_FORBIDDEN_SHEET_CHARS = re.compile(r"[!:/\\?*\[\]]")
+
+
+def validate_query_range(value: str) -> str:
+    """校验 `A1:B5` / `来源!A1:B5` 形态的只读区域，返回去空白后的原写法。
+
+    只接受**单个矩形**：列字母 + 行号都要写。整列（`A:A`）、整行（`1:5`）、
+    命名区域、多区域一律拒绝 —— 它们会让"区域外数据不参与计算"这条承诺失效。
+    """
+    text = (value or "").strip()
+    if not text:
+        raise ValueError("区域不能为空字符串；不限定区域时请省略 range")
+    if len(text) > 40:
+        raise ValueError("区域写法过长（最多 40 个字符）")
+    parts = text.split("!")
+    if len(parts) > 2:
+        raise ValueError("区域只能是一个矩形，且只能带一个工作表名")
+    address = (parts[1] if len(parts) == 2 else parts[0]).strip()
+    match = _QUERY_RANGE_ADDRESS.fullmatch(address)
+    if match is None:
+        raise ValueError(
+            "区域必须是单个 A1 矩形（如 A1:B5）；整列 A:A、整行 1:5、"
+            "命名区域和多区域都不支持"
+        )
+    start_column = _column_number(match.group(1))
+    start_row = int(match.group(2))
+    end_column = _column_number(match.group(3) or match.group(1))
+    end_row = int(match.group(4) or match.group(2))
+    if end_row < start_row or end_column < start_column:
+        raise ValueError("区域的结束行列不能小于起始行列")
+    if end_row > QUERY_RANGE_MAX_ROW or end_column > QUERY_RANGE_MAX_COLUMN:
+        raise ValueError("区域超出工作表边界")
+    if len(parts) == 2:
+        sheet = parts[0].strip()
+        if len(sheet) >= 2 and sheet.startswith("'") and sheet.endswith("'"):
+            sheet = sheet[1:-1]
+        if not sheet:
+            raise ValueError("区域里的工作表名为空")
+        if _QUERY_RANGE_FORBIDDEN_SHEET_CHARS.search(sheet):
+            raise ValueError("工作表名包含不允许的字符")
+    return text
 
 
 class AnalysisPlan(BaseModel):
@@ -2174,6 +2287,35 @@ class DeterministicQueryTemplate(BaseModel):
     expectedHeaders: list[str] = Field(default_factory=list, max_length=50)
 
 
+class QueryIncompleteReason(BaseModel):
+    """结果**内容**不完整的真实原因。
+
+    只有两种 kind 是因为另外两种根本到不了结果卡：读失败与扫描超限会让整条请求
+    按错误返回，不会产出"只含其余表"的部分结果。要加新 kind，必须同时加一个
+    真实的生产者（见 `packages/core/src/queryCompleteness.ts` 的注释）。
+    """
+
+    kind: Literal["missing_field", "empty_sheet"]
+    sheet: str = Field(min_length=1, max_length=200)
+    fields: list[str] = Field(default_factory=list, max_length=50)
+
+    @model_validator(mode="after")
+    def validate_kind_payload(self) -> "QueryIncompleteReason":
+        if self.kind == "missing_field" and not self.fields:
+            raise ValueError("missing_field 必须给出缺失的字段名")
+        if self.kind == "empty_sheet" and self.fields:
+            raise ValueError("empty_sheet 不带字段名")
+        return self
+
+
+class QueryTruncation(BaseModel):
+    """展示截断：数据完整，只是按 limit 只显示了前若干行。"""
+
+    shownRows: int = Field(ge=0)
+    totalRows: int = Field(ge=0)
+    limit: int = Field(ge=1)
+
+
 class DataToolResult(BaseModel):
     requestId: str = Field(min_length=1, max_length=100)
     tool: Literal["query_table"] = "query_table"
@@ -2185,12 +2327,25 @@ class DataToolResult(BaseModel):
     complete: bool
     calculation: str = Field(min_length=1, max_length=1000)
     warnings: list[str] = Field(default_factory=list, max_length=20)
+    # 原因与截断分开记：`complete` 只由 incomplete 决定。
+    incomplete: list[QueryIncompleteReason] = Field(
+        default_factory=list, max_length=50
+    )
+    truncated: bool = False
+    truncation: QueryTruncation | None = None
 
     @model_validator(mode="after")
     def validate_result_rows(self) -> "DataToolResult":
         width = len(self.headers)
         if any(len(row) != width for row in self.rows):
             raise ValueError("数据工具结果的每一行必须与 headers 等宽")
+        # 完整性与原因不许各说一套：说了不完整就必须有原因，反之亦然。
+        if self.complete and self.incomplete:
+            raise ValueError("complete 为真时不能带不完整原因")
+        if not self.complete and not self.incomplete:
+            raise ValueError("complete 为假时必须给出不完整原因")
+        if self.truncated and self.truncation is None:
+            raise ValueError("truncated 为真时必须给出截断计数")
         return self
 
 
@@ -2319,6 +2474,11 @@ class BridgeResultResponse(BaseModel):
     sourceSheets: list[str] = Field(default_factory=list, max_length=100)
     warnings: list[str] = Field(default_factory=list, max_length=20)
     complete: bool
+    incomplete: list[QueryIncompleteReason] = Field(
+        default_factory=list, max_length=50
+    )
+    truncated: bool = False
+    truncation: QueryTruncation | None = None
     calculation: str = Field(min_length=1, max_length=1000)
     scannedRows: int = Field(ge=0)
 
@@ -2511,19 +2671,40 @@ class PythonCodeResponse(BaseModel):
     chars: int = Field(ge=0)
 
 
+class BridgeQueryBindings(BaseModel):
+    """一次 `query_table` 调用的**绑定事实**：查了哪些表、哪个区域、什么口径。
+
+    只放结构（模式 / scope / 表名 / A1 区域 / 表头三态），**不含任何单元格值**，
+    也不含筛选值 —— 值仍然只走本机回环。存在的理由：2026-11-01 那台真机上
+    "用户说只查来源表、结果却扫了四张表"，账本里只有 `tool` 与 `operationId`，
+    只能靠 `sourceSheets` 反推，无法回答"到底是模型没传表名还是执行器忽略了它"。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    mode: str | None = Field(default=None, max_length=20)
+    scope: str | None = Field(default=None, max_length=20)
+    sheets: list[str] = Field(default_factory=list, max_length=30)
+    range: str | None = Field(default=None, max_length=40)
+    hasHeaders: bool | None = None
+
+
 class BridgeToolPointer(BaseModel):
     """Opaque pointer persisted with a progress event.
-    Only the operation id and tool name — never the request arguments, which
-    stay in the volatile bridge store and are fetched by the host adapter.
+
+    Only the operation id, tool name and (for queries) the binding facts — never
+    the request's values, which stay in the volatile bridge store and are
+    fetched by the host adapter.
     """
 
     model_config = ConfigDict(extra="forbid")
     operationId: str = Field(pattern=r"^op_[0-9a-f]{32}$")
     tool: BridgeToolName
+    bindings: BridgeQueryBindings | None = None
 
 
 class ModelOptionResponse(BaseModel):
     id: str
+    modelId: str | None = None
     label: str
     provider: Literal["model"] = "model"
     available: bool
@@ -2621,12 +2802,12 @@ class SetFormulaModelRequest(BaseModel):
 
 
 class TestModelConnectionRequest(UpsertModelConnectionRequest):
-    # Older clients test only chat connectivity; new clients choose explicitly.
-    purpose: Literal["agent", "formula"] = "formula"
+    # Accepted for old clients only; all requests now test text connectivity.
+    purpose: Literal["connection", "agent", "formula"] = "connection"
 
 
 class TestModelConnectionResponse(BaseModel):
-    testedFor: Literal["agent", "formula"] = "formula"
+    testedFor: Literal["connection", "agent", "formula"] = "connection"
     ok: bool
     message: str
 
@@ -2931,6 +3112,8 @@ class OfficeExecutionStateResponse(BaseModel):
     requiresReconciliation: bool
     ownerToken: str | None = None
     disposition: OfficeExecutionDispositionState | None = None
+    # 审阅生命周期（2026-11-03）：与 WPS 侧同一份语义。
+    review: OfficeExecutionReviewState | None = None
 
 
 # WPS 格式动作**可以声明**的属性名（= 端上 `declaredFormatFields` 的输出集合，也是
@@ -3170,6 +3353,11 @@ class WpsExecutionResult(BaseModel):
     actionCount: int = Field(ge=0)
     cellCount: int | None = Field(default=None, ge=0)
     backfilled: bool = False
+    #: 端上动作回读是否全部通过。**三态**，不许折成布尔：
+    #: `True` = 已验证（审阅初始状态 `pending`）；`False` = 有动作没通过回读
+    #: （`blocked`：要人核对，但不得直接当"确认过的结果"接受）；`None` = 旧客户端
+    #: 没带这份证据（记"无法判断"，不假装已确认）。
+    verified: bool | None = None
 
 
 class WpsExecutionFinishRequest(BaseModel):
@@ -3205,6 +3393,8 @@ class WpsExecutionStateResponse(BaseModel):
     # 找不到"已撤销"的依据，可能把一次已经回退的执行重新开放续跑。投影这两列，
     # 客户端才能在续跑判据里先判终态（与 `officeExecutionTerminalReason` 同一条纪律）。
     disposition: OfficeExecutionDispositionState | None = None
+    # 审阅生命周期（2026-11-03）：`status` 说动作跑完没有，这里说用户处理过没有。
+    review: OfficeExecutionReviewState | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -3231,7 +3421,12 @@ class PendingExecutionCandidate(BaseModel):
 
     operationId: str = Field(min_length=8, max_length=200)
     taskId: str = Field(min_length=1, max_length=200)
-    status: Literal["running", "needs_reconciliation", "failed"]
+    status: Literal["running", "needs_reconciliation", "failed", "completed"]
+    #: `resume` = 还有动作没写；`review` = 写完了、审阅没有收尾。
+    #: 两者都"还要用户处理"，但可做的操作完全不同，界面不许混着显示。
+    kind: Literal["resume", "review"] = "resume"
+    #: 仅 `kind == "review"` 时有值：`pending`（等决定）/ `blocked`（结果未通过独立验证）。
+    reviewState: Literal["pending", "blocked"] | None = None
     # epoch 毫秒：账本里是秒，换算只在这一层做，客户端不猜单位。
     createdAt: int = Field(gt=0)
     updatedAt: int = Field(gt=0)
@@ -3241,6 +3436,35 @@ class PendingExecutionCandidate(BaseModel):
     ownerActive: bool
     requiresReconciliation: bool
     canResume: bool
+
+
+class OfficeExecutionReviewState(BaseModel):
+    """这次执行的**审阅生命周期**（只读投影）。
+
+    与 `status` 是两件事：`status` 说"动作跑完了没有"，这里说"用户处理过没有"。
+    合并会让所有已完成执行都变成待审阅 —— 那正是 2026-11-03 之前界面丢失待审阅
+    之后又反向猜错的根源。
+
+    `state` 为 `null` 只有一个含义：**本能力上线前的记录，无法判断**。既不是待审阅，
+    也不是已确认；调用方不得据 `status == "completed"` 补一个。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    state: Literal["pending", "blocked", "confirmed", "discarded", "undone"] | None = None
+    decidedAt: float | None = None
+
+
+class OfficeExecutionReviewRequest(BaseModel):
+    """用户对已完成结果的一次审阅决定（`confirmed` / `discarded` / `undone`）。
+
+    没有 `expectedRevision` / `ownerToken`：审阅不是写进度，不该因为"别人刚推进了
+    游标"而失败。并发保护靠账本里的终态条件更新（重复决定幂等、冲突 409）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    decision: Literal["confirmed", "discarded", "undone"]
 
 
 class PendingExecutionsResponse(BaseModel):
@@ -3632,6 +3856,13 @@ class LocalResultCard(BaseModel):
     columnCount: int = Field(ge=1)
     sourceSheets: list[str] = Field(default_factory=list, max_length=100)
     complete: bool = True
+    # 不完整原因与截断计数：卡片的提示语**按原因渲染**，不再把任何 `complete=false`
+    # 都说成"扫描已达上限"。这里只放结构化字段名（请求本身就带着），不放告警自由文本。
+    incomplete: list[QueryIncompleteReason] = Field(
+        default_factory=list, max_length=50
+    )
+    truncated: bool = False
+    truncation: QueryTruncation | None = None
 
 
 class AnswerResponse(BaseModel):

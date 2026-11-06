@@ -33,7 +33,7 @@ import secrets
 import threading
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from .capabilities import capability_int
@@ -100,6 +100,10 @@ class RegisteredResult:
     source_fingerprint: str | None
     created_at: float
     fingerprint: str
+    # 结果卡与模型回执必须读同一份事实：不完整原因 + 展示截断（与 complete 分开）。
+    incomplete: list[dict[str, Any]] = field(default_factory=list)
+    truncated: bool = False
+    truncation: dict[str, Any] | None = None
     # 登记时的授权版本。授权一变，旧结果立刻不可解析（不靠 TTL 兜底）。
     claim_revision: int | None = None
 
@@ -304,6 +308,15 @@ class LocalResultRegistry:
             complete=result.complete,
             calculation=result.calculation,
             warnings=list(result.warnings),
+            incomplete=[
+                reason.model_dump(mode="json") for reason in result.incomplete
+            ],
+            truncated=bool(result.truncated),
+            truncation=(
+                result.truncation.model_dump(mode="json")
+                if result.truncation is not None
+                else None
+            ),
             source_fingerprint=source_fingerprint,
             created_at=time.monotonic(),
             fingerprint=digest,
@@ -415,7 +428,11 @@ local_results = LocalResultRegistry()
 
 
 def structure_of(item: RegisteredResult, *, truncated: bool = False) -> dict[str, Any]:
-    """The only shape of a result that may be shown to the model."""
+    """The only shape of a result that may be shown to the model.
+
+    `complete` / `truncated` / `incomplete` 三个字段直接来自结果本身，模型看到的
+    与结果卡上写的是同一份事实 —— 否则模型会替界面编一个原因（"扫描已达上限"）。
+    """
     return {
         "headers": [
             header if isinstance(header, str) else str(header)
@@ -424,5 +441,7 @@ def structure_of(item: RegisteredResult, *, truncated: bool = False) -> dict[str
         "rowCount": item.row_count,
         "columnCount": item.column_count,
         "complete": bool(item.complete) and not truncated,
-        "truncated": bool(truncated),
+        "truncated": bool(truncated) or bool(item.truncated),
+        "incomplete": list(item.incomplete),
+        "truncation": item.truncation,
     }

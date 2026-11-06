@@ -6355,6 +6355,30 @@ export async function undoExecution(
       // 数字格式放在**格式恢复之后**：兼容路径的 `clear(Formats)` 会把直接设置的数字格式
       // 一并清掉（Excel 的"清除格式"就包含数字格式），写在它前面会被清没。
       if (scope.numberFormat) range.numberFormat = saved.numberFormat;
+      await context.sync();
+      range.load('formulas,numberFormat');
+      await context.sync();
+      if ((scope.formulas && !sameMatrix(range.formulas.map(row => row.map(value => value ?? "")), saved.formulas.map(row => row.map(value => value ?? "")))) ||
+          (scope.numberFormat && !sameMatrix(range.numberFormat, saved.numberFormat))) {
+        throw new Error(`恢复后回读不一致：「${saved.sheet}」${saved.range}。部分恢复可能已完成，请保留现场核对。`);
+      }
+      if (saved.format && (scope.cellFormat || scope.rowHeight || scope.columnWidth)) {
+        const observed = await captureRangeFormat(context, range,
+          saved.formulas.length * (saved.formulas[0]?.length ?? 0), saved.formulas.length,
+          saved.formulas[0]?.length ?? 0, (saved.formatFields ?? ALL_DIRECT_FORMAT_FIELDS) as ExcelFormatField[], scope);
+        if (!observed) throw new Error('恢复后无法核实格式，部分恢复可能已完成，请保留现场核对。');
+        const fields = saved.formatFields ?? ALL_DIRECT_FORMAT_FIELDS;
+        const direct = Boolean(saved.format.directCells);
+        const keys = asKeySet(direct ? directKeysOfFields(fields) : displayedKeysOfFields(fields));
+        const project = (matrix: unknown[][] | null | undefined) => matrix?.map(row => row.map(cell => cell ? projectKeys(cell as Record<string, unknown>, keys) : null));
+        const expectedCells = direct ? saved.format.directCells : saved.format.cells;
+        const actualCells = direct ? observed.directCells : observed.cells;
+        if ((scope.cellFormat && expectedCells && localStateFingerprint(project(expectedCells)) !== localStateFingerprint(project(actualCells))) ||
+            (scope.rowHeight && localStateFingerprint(observed.rowHeights ?? observed.rowHeight) !== localStateFingerprint(saved.format.rowHeights ?? saved.format.rowHeight)) ||
+            (scope.columnWidth && localStateFingerprint(observed.columnWidths ?? observed.columnWidth) !== localStateFingerprint(saved.format.columnWidths ?? saved.format.columnWidth))) {
+          throw new Error(`恢复后格式回读不一致：「${saved.sheet}」${saved.range}。部分恢复可能已完成，请保留现场核对。`);
+        }
+      }
     }
     // 最后移除本次执行新建的工作表。
     for (const name of snapshot.createdWorksheets) {

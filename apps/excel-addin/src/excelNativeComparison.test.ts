@@ -1,14 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AnalysisPlan, CellValue } from "./contracts";
-import { assertExcelNativeComparisonUnchanged, closeCompatReviewCopy, closeExcelNativeComparison, compareExcelNativeCommittedResult, excelNativeReviewMode, nativeComparisonPlanIssue, stageExcelNativeComparison } from "./excelNativeComparison";
+import { captureExcelBeforeResult, showExcelBeforeResult, switchExcelBeforeComparison, assertExcelNativeComparisonUnchanged, closeCompatReviewCopy, closeExcelNativeComparison, compareExcelNativeCommittedResult, excelNativeReviewMode, nativeComparisonPlanIssue, stageExcelNativeComparison } from "./excelNativeComparison";
 import { nativeColumnName } from "./nativeReviewFile";
 import { parseExplicitA1Rect } from "./planCore";
 import { readSeedEntries as unzipSeed } from "./nativeReviewTestHelpers";
-import { captureWorkbookSourceFingerprint, executePlan } from "./excel";
+import { currentOfficeWorkbookIdentity, captureWorkbookSourceFingerprint, executePlan } from "./excel";
 import { ExcelReviewLayoutVersionError } from "./api";
 
-const layout = vi.hoisted(() => ({prepare: vi.fn(), arrange: vi.fn(), close: vi.fn()}));
-vi.mock('./excelWindowLayout', () => ({prepareLocalExcelWindows: layout.prepare, arrangeLocalExcelWindows: layout.arrange, closeLocalExcelWindows: layout.close}));
+const layout = vi.hoisted(() => ({prepare: vi.fn(), arrange: vi.fn(), close: vi.fn(), select: vi.fn(), viewing: vi.fn()}));
+vi.mock('./excelWindowLayout', () => ({prepareLocalExcelWindows: layout.prepare, arrangeLocalExcelWindows: layout.arrange, closeLocalExcelWindows: layout.close,
+  selectLocalExcelCopySheet: layout.select, setLocalExcelCopyViewing: layout.viewing}));
 beforeEach(() => { layout.prepare.mockReset().mockRejectedValue(new Error('unavailable')); layout.arrange.mockReset().mockResolvedValue({status:'arranged',layoutVersion:3,copySide:'left',originalSide:'right',synchronousScrolling:'enabled'});
   layout.close.mockReset().mockResolvedValue({status:'closed', layoutVersion:4, copyClosed:true, recoveryCopyPath:'E:/recovery/review-copy.xlsx'}); });
 
@@ -425,5 +426,74 @@ describe("native plan boundaries", () => {
     for (const formula of ['=WEBSERVICE("https://example.invalid")', '=Other!A1', '=INDIRECT("A1")', '=SUM(Table1[Amount])', 'text']) {
       expect(nativeComparisonPlanIssue(plan([{ type: "writeFormulas", sheet: "Ledger", range: "C2", formulas: [[formula]] }]), ["Ledger"])).not.toBeNull();
     }
+  });
+});
+
+
+describe('executed-result comparison navigation', () => {
+  it('activates the selected original before layout, and opens its saved BEFORE values without rewriting', async () => {
+    const h = host();
+    const before = await captureExcelBeforeResult(plan(), ['Ledger']);
+    if ('comparisonUnavailable' in before || 'sheets' in before) throw new Error('Expected sheet snapshot');
+    // The task completed while another worksheet is visible; the original is now different.
+    h.original.getRange('C2:C3').values = [[12345], [67890]];
+    h.writes.length = 0;
+    h.windows[0].activeWorksheet = {name:'Another target'};
+    const order: string[] = [];
+    h.original.activate = vi.fn(() => { h.windows[0].activeWorksheet = h.original; order.push('activate'); });
+    const getRange = h.original.getRange;
+    h.original.getRange = (address: string) => ({...getRange(address), select: () => order.push(`select:${address}`)});
+    layout.prepare.mockImplementation(async () => {
+      expect(h.windows[0].activeWorksheet.name).toBe('Ledger');
+      order.push('prepare'); return {token:'ticket'};
+    });
+    h.createWorkbook.mockImplementation(async () => { order.push('open'); });
+    const other = {...before, id:'other', name:'Other', values:[[4321], [4321]]};
+    const session = await showExcelBeforeResult({sheets:[other,before]}, currentOfficeWorkbookIdentity()!,
+      plan(), ['Ledger','Other'], 'Ledger');
+    expect(order).toEqual(['activate','select:C2','prepare','open']);
+    expect(session.original).toEqual(before);
+    expect(session.comparisonNotice).toBeUndefined();
+    expect(session.comparisonScope).toContain('不包含图表及条件格式');
+    expect(session.windowLayout).toBe('arranged');
+    const files = unzipSeed(h.createWorkbook.mock.calls[0][0]);
+    expect(files['xl/workbook.xml']).toContain('name="Other"');
+    expect(files['xl/workbook.xml']).toContain('activeTab="1"');
+    const xml = files['xl/worksheets/sheet2.xml'];
+    expect(xml).toContain('<v>99</v>');
+    expect(xml).not.toContain('12345');
+    expect(xml).not.toContain('4321');
+    expect(xml).not.toContain('LOCAL_PRIVATE_SENTINEL');
+    expect(xml).toContain('selection activeCell="C2" sqref="C2"');
+    expect(h.writes).toEqual([]);
+    layout.select.mockReset().mockResolvedValue({status:'selected'});
+    layout.viewing.mockReset().mockResolvedValue({status:'arranged'});
+    await switchExcelBeforeComparison(session, 'Ledger');
+    expect(layout.select).toHaveBeenCalledWith(currentOfficeWorkbookIdentity(), 'Ledger', session.copySheetName);
+    expect(layout.viewing).not.toHaveBeenCalled();
+    expect(layout.arrange).toHaveBeenCalledTimes(1);
+    expect(h.createWorkbook).toHaveBeenCalledTimes(1);
+    session.suspended = true;
+    await switchExcelBeforeComparison(session, 'Ledger');
+    expect(layout.viewing).toHaveBeenCalledTimes(1);
+    expect(h.createWorkbook).toHaveBeenCalledTimes(1);
+    await expect(switchExcelBeforeComparison(session, 'Unauthorized')).rejects.toThrow('授权');
+    const navigationCount = order.length;
+    layout.close.mockResolvedValueOnce({status:'closed', layoutVersion:4, copyClosed:true});
+    expect(await closeCompatReviewCopy(session)).toBe('closed');
+    expect(order).toHaveLength(navigationCount); // Closing must not activate the saved original tab.
+
+  });
+  it('refuses a replaced same-named sheet before navigation or copy creation', async () => {
+    const h = host();
+    const before = await captureExcelBeforeResult(plan(), ['Ledger']);
+    h.original.id = 'replacement';
+    h.original.activate = vi.fn();
+    await expect(showExcelBeforeResult(before, currentOfficeWorkbookIdentity()!, plan(), ['Ledger']))
+      .rejects.toThrow('原工作表已变化');
+    expect(h.original.activate).not.toHaveBeenCalled();
+    expect(h.createWorkbook).not.toHaveBeenCalled();
+    expect(layout.prepare).not.toHaveBeenCalled();
+    expect(h.writes).toEqual([]);
   });
 });

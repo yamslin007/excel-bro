@@ -18,9 +18,9 @@ import {
   recoverExcelResultMarks
 } from "./resultReviewMarkers";
 
-type RuleState = { id: string; type: string; formula: string; deleted: boolean; borderColor: string; fillColor: string | null };
+type RuleState = { id: string; type: string; formula: string; deleted: boolean; borderColor: string; fillColor: string | null; sheet?: string; range?: string };
 
-function installExcel(options: { failOnAdd?: number; failOnDelete?: boolean } = {}) {
+function installExcel(options: { failOnAdd?: number; failOnDelete?: boolean; ignoreDelete?: boolean } = {}) {
   const rules: RuleState[] = [];
   let seq = 0;
   const makeRule = (state: RuleState) => ({
@@ -45,7 +45,7 @@ function installExcel(options: { failOnAdd?: number; failOnDelete?: boolean } = 
     load: () => {},
     delete: () => {
       if (options.failOnDelete) throw new Error("删除被宿主拒绝");
-      state.deleted = true;
+      if (!options.ignoreDelete) state.deleted = true;
     }
   });
   const contexts = {
@@ -58,7 +58,7 @@ function installExcel(options: { failOnAdd?: number; failOnDelete?: boolean } = 
               add: () => {
                 seq += 1;
                 if (options.failOnAdd === seq) throw new Error("第 2 处标记创建失败");
-                const state: RuleState = { id: `rule-${seq}`, type: "Custom", formula: "", deleted: false, borderColor: "", fillColor: null };
+                const state: RuleState = { id: `rule-${seq}`, type: "Custom", formula: "", deleted: false, borderColor: "", fillColor: null, sheet, range };
                 rules.push(state);
                 // 规则对象需要可写 formula（调用方随后设置）。
                 const rule = makeRule(state);
@@ -70,7 +70,7 @@ function installExcel(options: { failOnAdd?: number; failOnDelete?: boolean } = 
                 return rule;
               },
               get items() {
-                return rules.filter(rule => !rule.deleted).map(makeRule);
+                return rules.filter(rule => !rule.deleted && (!rule.sheet || rule.sheet === sheet) && (!rule.range || rule.range === range)).map(makeRule);
               },
               load: () => {}
             },
@@ -244,4 +244,24 @@ it("does not overlay business borders, and skips overlays when border and fill o
  await clearExcelResultMarks(marks);
  const combined=await markExcelResult({actions:[border,{type:"setFill",sheet:"Sheet1",range:"A1:B1",color:"#FF0000"}]} as never,identity.value);
  expect(host.live()).toHaveLength(0);expect(combined.entries).toHaveLength(0);
+});
+
+it('规则 ID 变化时只按记录区域内唯一的完整随机公式移除本次标记',async()=>{
+ const host=installExcel();const marks=await markExcelResult(plan,identity.value);
+ for(const rule of host.rules) rule.id += '-recreated';
+ host.rules.push({id:'user',type:'Custom',formula:'=A1>0',deleted:false,borderColor:'#B8860B',fillColor:'#FFF3B0'});
+ await clearExcelResultMarks(marks);
+ expect(host.live().map(rule=>rule.id)).toEqual(['user']);
+ expect(loadExcelResultMarks()).toBeNull();
+});
+it('宿主静默不删除标记时回读拒绝宣告清理成功，保留归属记录',async()=>{
+ const host=installExcel({ignoreDelete:true});const marks=await markExcelResult(plan,identity.value);
+ await expect(clearExcelResultMarks(marks)).rejects.toThrow('尚未移除');
+ expect(host.live()).toHaveLength(2);expect(loadExcelResultMarks()).not.toBeNull();
+});
+it('ID 丢失且同区域出现多个完全相同的归属公式时拒绝猜测',async()=>{
+ const host=installExcel();const marks=await markExcelResult(plan,identity.value);
+ host.rules[0].id='recreated';host.rules.push({...host.rules[0],id:'duplicate'});
+ await expect(clearExcelResultMarks(marks)).rejects.toThrow('归属不唯一');
+ expect(host.live()).toHaveLength(3);expect(loadExcelResultMarks()).not.toBeNull();
 });

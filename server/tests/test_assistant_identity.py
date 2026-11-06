@@ -51,7 +51,7 @@ def test_identity_questions_still_use_model_and_both_backends_receive_same_ident
     fake_sdk = SimpleNamespace(ClaudeAgentOptions=lambda **kwargs: SimpleNamespace(**kwargs))
     monkeypatch.setattr(claude_sdk_agent, "_sdk", lambda: fake_sdk)
     monkeypatch.setattr(claude_sdk_agent, "_state_dir", lambda: "synthetic-outside-repo")
-    async def sdk_result(_sdk, prompt, options, _timeout):
+    async def sdk_result(_sdk, prompt, options, _timeout, *, connection=None):
         captured.append((prompt, options))
         return json.dumps(reply)
     monkeypatch.setattr(claude_sdk_agent, "_result", sdk_result)

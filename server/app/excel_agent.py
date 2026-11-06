@@ -52,6 +52,7 @@ from .agent_tools import (
     SUBMIT_RESULT_PLAN_TOOL,
     local_terminal_tool_definitions,
     prepare_python_data_tool_definition,
+    query_bindings_of,
 )
 from .result_submission import (
     ResultSubmissionError,
@@ -1654,7 +1655,8 @@ def open_planning_bridge(
         operation_id: str, tool: str, arguments: dict[str, Any], fingerprint: str
     ) -> None:
         # 只发一个不透明指针事件；请求参数留在易失桥里由宿主拉取，不写进
-        # 会落盘的进度事件/账本。
+        # 会落盘的进度事件/账本。**例外是查询的绑定事实**（不含值），
+        # 它决定了"到底查了哪几张表"能否事后复盘。
         if on_event is None:
             return
         await on_event({
@@ -1664,7 +1666,11 @@ def open_planning_bridge(
             "status": "started",
             "title": "正在本机执行数据查询",
             "toolName": tool,
-            "bridgeTool": {"operationId": operation_id, "tool": tool},
+            "bridgeTool": {
+                "operationId": operation_id,
+                "tool": tool,
+                "bindings": query_bindings_of(arguments),
+            },
         })
 
     async def on_bridge_complete(

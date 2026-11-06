@@ -172,6 +172,57 @@ async function send(text: string) {
 }
 
 describe("Excel actual composer: message first", () => {
+  it("opens EB utilities from the composer logo and places recovery and history beside new conversation without a header", async () => {
+    const view = render(<App />);
+    expect(view.container.querySelector('.chat-header')).toBeNull();
+    expect(view.container.querySelector('.scope-entry-row .folder-backup-entry')).not.toBeNull();
+    expect(view.container.querySelector('.chat-header .brand-mark')).toBeNull();
+    expect(view.container.querySelector('.attach-image-button')).toBeNull();
+    const logo = view.getByRole('button', { name: 'EB 菜单' });
+    fireEvent.click(logo);
+    expect([...view.container.querySelectorAll('.composer-app-menu .view-menu > button > strong')].slice(0, 5).map(item => item.textContent)).toEqual(['工具', '宠物', '壁纸', 'EB 函数说明', '专注窗口']);
+    fireEvent.click(view.getByRole('menuitemcheckbox'));
+    fireEvent.click(logo);
+    expect(view.getByRole('menuitemcheckbox').getAttribute('aria-checked')).toBe('false');
+    fireEvent.click(view.getByRole('menuitem', { name: /^壁纸/ }));
+    expect(document.querySelector('.appearance-dialog')).not.toBeNull();
+    expect(document.querySelector('.appearance-preview')).not.toBeNull();
+    fireEvent.click(view.getByRole('button', { name: '关闭壁纸设置' }));
+    expect(document.querySelector('.appearance-dialog')).toBeNull();
+    expect(vi.mocked(understandMessage)).not.toHaveBeenCalled();
+  });
+
+  it("keeps the model picker in the toolbar and displays the configured model ID when switching", async () => {
+    const models = [
+      { id: "connection:one", modelId: "model-one", label: "连接一", provider: "model" as const, available: true, supportsVision: true },
+      { id: "connection:two", modelId: "model-two", label: "连接二", provider: "model" as const, available: true, supportsVision: false }
+    ];
+    vi.mocked(historyApi.listModels).mockResolvedValueOnce({ defaultModelId: models[0].id, models });
+    const view = render(<App />);
+    const picker = () => view.container.querySelector<HTMLButtonElement>(".composer-toolbar .model-picker-trigger");
+    await waitFor(() => expect(picker()?.textContent).toBe("model-one"));
+    expect(view.container.querySelector(".chat-header .model-picker")).toBeNull();
+    fireEvent.click(picker()!);
+    fireEvent.click(view.getByRole("menuitemradio", { name: "连接二" }));
+    expect(picker()?.textContent).toBe("model-two");
+    expect(localStorage.getItem("excel-bro.model.v2")).toBe("connection:two");
+    expect(vi.mocked(understandMessage)).not.toHaveBeenCalled();
+  });
+
+  it.each(["openai", "anthropic"])("routes %s connections despite legacy Agent capability metadata", async (protocol) => {
+    const model = { id: `connection:generic-${protocol}`, modelId: "custom-model", label: "自定义接口", provider: "model" as const,
+      available: true, supportsVision: false, agentAvailable: false, formulaAvailable: false };
+    vi.mocked(historyApi.listModels).mockResolvedValueOnce({ defaultModelId: model.id, models: [model] });
+    vi.mocked(understandMessage).mockResolvedValue({ kind: "conversation", message: "连接已响应", provider: "model" });
+    const view = render(<App />);
+    await waitFor(() => expect(view.container.querySelector(".model-picker-trigger")?.textContent).toBe("custom-model"));
+    fireEvent.change(view.container.querySelector(".composer textarea")!, { target: { value: "你好" } });
+    fireEvent.click(view.getByRole("button", { name: /^发送$/ }));
+    await waitFor(() => expect(view.container.textContent).toContain("连接已响应"));
+    expect(vi.mocked(understandMessage).mock.calls[0][0].modelId).toBe(model.id);
+    expect(streamAssistantResponse).not.toHaveBeenCalled();
+  });
+
   it("history alignment: cancel/confirm deletion preserves other guards and navigation never writes", async () => {
     const host = createOfficeTestHost({ url: "file:///C:/Data/book.xlsx", sheets: [{ name: "Sheet1", values: [["合成数据"]] }] }); vi.stubGlobal("Excel", host.Excel);
     const mutations = [
@@ -188,9 +239,7 @@ describe("Excel actual composer: message first", () => {
         messages: [{ id: `m-${id}`, role: "user", text: `普通聊天 ${id}`, createdAt: "2026-10-01T00:00:00Z" }] })) }));
     const view = render(<App />);
     await waitFor(() => expect(view.container.textContent).toContain("普通聊天 alpha"));
-    fireEvent.click(view.getByRole("button", { name: "更多" }));
-    expect(view.container.textContent).toContain("查看并打开已保存的对话");
-    fireEvent.click(view.getByRole("menuitem", { name: /^历史对话/ }));
+    fireEvent.click(view.getByRole("button", { name: "历史对话" }));
     const saved = () => JSON.parse(localStorage.getItem(key)!);
     fireEvent.click(view.getByRole("button", { name: "删除「beta」" }));
     fireEvent.click(view.getByRole("button", { name: /^取消$/ }));
@@ -458,8 +507,7 @@ describe("Excel actual composer: message first", () => {
 
     if (navigation === "new") fireEvent.click(view.getByRole("button", { name: "新对话" }));
     else {
-      fireEvent.click(view.getByRole("button", { name: "更多" }));
-      fireEvent.click(view.getByRole("menuitem", { name: /^历史对话/ }));
+      fireEvent.click(view.getByRole("button", { name: "历史对话" }));
       const history = Array.from(view.container.querySelectorAll<HTMLButtonElement>(".history-open-button"))
         .find((button) => button.textContent?.includes("历史问题"))!;
       fireEvent.click(history);
@@ -867,7 +915,16 @@ describe("Excel actual composer: message first", () => {
     expect([...view.container.querySelectorAll("button")]
       .filter((button) => button.textContent?.trim() === "继续分析")).toHaveLength(0);
     // 续跑段不从"步骤 1"重开：它是一条"继续分析"的承接行。
-    expect(after[after.length - 1].steps[0]).toMatch(/继续分析|已理解消息/);
+    /*
+     * 进行中的卡片默认**收起成一行**（`processPanelExpanded` 对 `live` 直接返回收起：
+     * 那一行显示的是"当前正在做的事"）。收起是呈现，不是内容被删 —— 所以先展开再读，
+     * 与本文件另一处（"收起之后仍要能证明带来了新动作"）用同一手法。
+     */
+    const newSegmentCard = view.container
+      .querySelectorAll<HTMLElement>(".task-progress-timeline")[after.length - 1];
+    expect(newSegmentCard?.getAttribute("data-expanded")).toBe("false");
+    fireEvent.click(newSegmentCard!.querySelector<HTMLButtonElement>(".task-progress-toggle")!);
+    expect(segmentSnapshots(view.container)[after.length - 1].steps[0]).toMatch(/继续分析|已理解消息/);
 
     // 判别点 5：已经完成的模型阶段不重做 —— 只有暂停在**那一阶段本身**才会重跑它。
     // · 消息理解阶段没跑完 ⇒ 重跑一次；跑完了 ⇒ 一次都不再调（复用原始理解结果）。
@@ -1098,12 +1155,22 @@ describe("Excel actual composer: message first", () => {
     expect(checkIntent).not.toHaveBeenCalled();
     expect(inspectOfficeAuthorizedTarget).not.toHaveBeenCalled();
     expect(view.container.textContent).not.toContain("读取已授权表结构");
-    expect(view.getByRole("button", { name: "展开" }).getAttribute("aria-expanded")).toBe("false");
-    fireEvent.click(view.getByRole("button", { name: "展开" }));
+    // 结束的过程框收起成一行，展开入口的措辞是「查看过程」（不再是「展开」）。
+    expect(view.getByRole("button", { name: "查看过程" }).getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(view.getByRole("button", { name: "查看过程" }));
     // 完成后的普通聊天只保留真实完成说明，不重复准备阶段文案。
     expect(view.container.textContent).toContain("已理解并直接回复；未读取工作表");
     expect(view.container.textContent).not.toContain("本次没有需要你处理的后续操作");
     expect(view.container.querySelector(".task-progress-timeline")?.closest(".message-row")?.querySelector(".message-author")).toBeNull();
+    // 名字让给了结论行，而且**这句问话之后**的回复只印一次：过程行与结论行各印一次时，
+    // 一段回复会读成两件事（对标的 ExcelMaster 是一段一个抬头）。欢迎语是独立一组，
+    // 所以只能按"最后一条用户消息之后"计数。
+    const userRow = Array.from(view.container.querySelectorAll(".message-row.user")).pop()!;
+    const replyRows = Array.from(view.container.querySelectorAll(".message-row")).filter(
+      (row) => userRow.compareDocumentPosition(row) & Node.DOCUMENT_POSITION_FOLLOWING
+    );
+    expect(replyRows.filter((row) => row.querySelector(".message-author"))).toHaveLength(1);
+    expect(replyRows.at(-1)?.querySelector(".message-author")).not.toBeNull();
     expect(view.container.textContent).not.toContain("先判断是否需要工作簿上下文");
     expect(captureWorkbookStructure).not.toHaveBeenCalled();
   });

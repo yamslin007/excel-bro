@@ -123,16 +123,19 @@ export class ExcelReviewLayoutVersionError extends Error {
   }
 }
 
-async function reviewLayoutRequest(path: "prepare" | "arrange" | "measure" | "close", body: ExcelReviewCopyCloseRequest | ExcelReviewLayoutPrepareRequest | Pick<ExcelReviewLayoutTicket, 'token'>): Promise<unknown> {
+async function reviewLayoutRequest(path: "prepare" | "arrange" | "measure" | "close" | "suspend" | "resume" | "select-sheet", body: ExcelReviewCopyCloseRequest | ExcelReviewLayoutPrepareRequest | Pick<ExcelReviewLayoutTicket, 'token'>): Promise<unknown> {
   const endpoint = new URL(API_BASE_URL);
   if (!['localhost', '127.0.0.1', '[::1]'].includes(endpoint.hostname) || !['http:', 'https:'].includes(endpoint.protocol)) {
     throw new Error('自动窗口排列仅能连接本机服务，请手动并排查看。');
   }
   const response = await fetch(`${API_BASE_URL}/api/office/review-layout/${path}`, {
-    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body),
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify('copySheetName' in body ? {...body, copyIdentityVersion: 2} : body),
     signal: AbortSignal.timeout(capabilities.excelWindowLayout.requestTimeoutMs), redirect: 'error'
   });
-  if (!response.ok) throw new Error('自动窗口排列未完成，请重启新版本地服务或手动并排查看。');
+  if (!response.ok) {
+    if (response.status === 404 || response.status === 422) throw new Error('本机服务版本不匹配，请重启新版 Excel Bro 本机服务后再试；对比副本已保留。');
+    throw new Error('未能核实或调整本次对比窗口，副本已保留；请核对原工作簿与对比窗口后再试。');
+  }
   return response.json();
 }
 export async function measureExcelReviewPane(request: ExcelReviewLayoutPrepareRequest): Promise<ExcelReviewPaneMeasurement> {
@@ -164,6 +167,9 @@ export async function prepareExcelReviewLayout(request: ExcelReviewLayoutPrepare
 export async function arrangeExcelReviewLayout(ticket: ExcelReviewLayoutTicket): Promise<ExcelReviewLayoutResult> {
   if (ticket.layoutVersion !== 3) throw new ExcelReviewLayoutVersionError();
   const value = await reviewLayoutRequest('arrange', {token: ticket.token});
+  return validateReviewLayout(value);
+}
+function validateReviewLayout(value: unknown): ExcelReviewLayoutResult {
   if (value && typeof value === 'object' && (!('layoutVersion' in value) || value.layoutVersion !== 3)) throw new ExcelReviewLayoutVersionError();
   if (!value || typeof value !== 'object' || Object.keys(value).length !== 5 ||
       !('status' in value) || value.status !== 'arranged' ||
@@ -171,6 +177,23 @@ export async function arrangeExcelReviewLayout(ticket: ExcelReviewLayoutTicket):
       !('originalSide' in value) || value.originalSide !== 'right' ||
       !('synchronousScrolling' in value) || typeof value.synchronousScrolling !== 'string' || !['enabled', 'different_instance', 'unavailable'].includes(value.synchronousScrolling)) throw new Error('窗口排列结果未核实，请手动并排查看。');
   return value as ExcelReviewLayoutResult;
+}
+export async function setExcelReviewCopyViewing(request: ExcelReviewLayoutPrepareRequest, viewing: boolean) {
+  const value = await reviewLayoutRequest(viewing ? 'resume' : 'suspend', {
+    workbookPathHash: request.workbookPathHash, worksheetNameHash: request.worksheetNameHash, copySheetName: request.copySheetName
+  });
+  if (viewing) return validateReviewLayout(value);
+  if (!value || typeof value !== 'object' || Object.keys(value).length !== 2 ||
+      !('status' in value) || value.status !== 'suspended' || !('copyRetained' in value) || value.copyRetained !== true)
+    throw new Error('未能核实比对窗口已收起，副本仍保留。');
+  return value as import('./contracts').ExcelReviewCopySuspendResult;
+}
+export async function selectExcelReviewCopySheet(request: ExcelReviewLayoutPrepareRequest): Promise<import('./contracts').ExcelReviewCopySelectResult> {
+  const value = await reviewLayoutRequest('select-sheet', {workbookPathHash: request.workbookPathHash,
+    worksheetNameHash: request.worksheetNameHash, copySheetName: request.copySheetName});
+  if (!value || typeof value !== 'object' || Object.keys(value).length !== 1 || !('status' in value) || value.status !== 'selected')
+    throw new Error('未能核实副本已切换到对应子表。');
+  return {status: 'selected'};
 }
 const CLOSE_STATUSES: readonly ExcelReviewCopyCloseStatus[] =
   ['closed', 'already_closed', 'close_unconfirmed', 'user_saved', 'identity_lost', 'ambiguous', 'unsupported', 'failed'];
@@ -764,11 +787,27 @@ async function responseJson<T>(response: Response): Promise<T> {
 
 export async function listModels(): Promise<ModelCatalog> {
   const response = await fetch(`${API_BASE_URL}/api/models`);
-  return responseJson<ModelCatalog>(response);
+  const catalog = await responseJson<ModelCatalog>(response);
+  // Older services omit modelId for managed connections. Resolve by the exact
+  // catalog key, never by a user-editable nickname or by changing the route ID.
+  if (!catalog.models.some((model) => model.id.startsWith("connection:") && !model.modelId?.trim())) {
+    return catalog;
+  }
+  try {
+    const settings = await getModelSettings(AbortSignal.timeout(3000));
+    const upstreamIds = new Map(settings.connections.map((connection) => [connection.catalogModelId, connection.modelId]));
+    return { ...catalog, models: catalog.models.map((model) => {
+      const modelId = upstreamIds.get(model.id)?.trim();
+      return !model.modelId?.trim() && modelId ? { ...model, modelId } : model;
+    }) };
+  } catch {
+    // A display-only metadata failure must not discard a usable model catalog.
+    return catalog;
+  }
 }
 
-export async function getModelSettings(): Promise<ModelSettings> {
-  const response = await fetch(`${API_BASE_URL}/api/settings/model`);
+export async function getModelSettings(signal?: AbortSignal): Promise<ModelSettings> {
+  const response = await fetch(`${API_BASE_URL}/api/settings/model`, signal ? { signal } : undefined);
   const value: unknown = await responseJson(response);
   assertModelSettings(value);
   return value;
@@ -1207,6 +1246,39 @@ export async function recordExecutionDisposition(
 }
 
 /**
+ * 把一次**审阅决定**写进执行账本（`review_state`）。
+ *
+ * 与 `recordExecutionDisposition` 的分界：那个记"撤销入口是不是用掉了"，这个记
+ * "这次审阅处理完了没有、处理成了哪一种"。两件事各有各的写入点，互不代写。
+ *
+ * **这一层不触发任何宿主动作**：不重放计划、不写单元格、不动恢复材料。所以它可以在
+ * 刷新后被重复调用（`duplicate` 幂等），也可以安全地重试。
+ *
+ * 409 = 另一次处理已经生效（双窗格并发、或本地状态过期）。它是**结论**而不是
+ * 传输故障：必须让用户看见"这次审阅已经是另一种结局"，不能静默重试成自己想要的答案。
+ */
+export async function sendExecutionReview(
+  namespace: "wps" | "office",
+  operationId: string,
+  decision: "confirmed" | "discarded" | "undone"
+): Promise<void> {
+  const response = await fetch(
+    `${API_BASE_URL}/api/${namespace}/executions/${encodeURIComponent(operationId)}/review`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ decision })
+    }
+  );
+  if (response.status === 409) {
+    throw new Error("这次审阅已经按另一种方式处理过（可能来自另一个窗口），本次决定未生效。");
+  }
+  if (!response.ok) {
+    throw await requestError(response, "无法记录这次审阅的结果");
+  }
+}
+
+/**
  * 写前落盘：把**不可变的原始恢复材料**存到本机后端应用数据目录。
  *
  * 这里不传摘要：摘要由服务端按收到的字节算。浏览器侧 `crypto.subtle` 只在安全上下文
@@ -1320,13 +1392,22 @@ export async function suspendWpsExecution(
     message: string;
   }
 ): Promise<WpsExecutionState> {
+  /*
+   * `code` / `message` 必须**原样上送**。
+   *
+   * 2026-11-01 真机（WPS 公式 B 首轮）：这里曾把两者写死成
+   * `WPS_WRITE_INTERRUPTED` / "WPS 写入中断，需要核对现场。"，调用方传的真实原因
+   * （例如"恢复验收已取消：本次计划未登记可恢复的执行"）被整条丢弃。账本因此只剩
+   * 一句通用文案，事后既查不出最初失败点，也分不清"零写入"与"写到一半"。
+   * 服务端 `WpsExecutionSuspendRequest` 本来就要求这两个字段必填，丢弃是实现缺陷。
+   */
   const response = await fetch(
     `${API_BASE_URL}/api/wps/executions/${encodeURIComponent(operationId)}/suspend`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ expectedRevision: input.expectedRevision, ownerToken: input.ownerToken,
-        code: "WPS_WRITE_INTERRUPTED", message: "WPS 写入中断，需要核对现场。" })
+        code: input.code, message: input.message })
     }
   );
   return wpsExecutionResponse(response, "无法挂起 WPS 写入现场");

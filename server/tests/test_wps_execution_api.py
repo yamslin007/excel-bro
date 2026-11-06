@@ -92,6 +92,44 @@ def test_wps_execution_register_grants_owner_and_persists_task_id() -> None:
     assert "plan" not in status
 
 
+def test_wps_suspend_persists_caller_supplied_error() -> None:
+    """挂起落账的是调用方给的真实原因，不是服务端写死的通用文案。
+
+    2026-11-01 真机（WPS 公式 B 首轮）账本里只剩"WPS 写入中断，需要核对现场。"，
+    事后既查不出最初失败点，也分不清零写入与写到一半。请求体本就要求 `code` /
+    `message` 必填，服务端不该覆盖它。
+    """
+    client = TestClient(app)
+    registered = client.post("/api/wps/executions/register", json=_wps_register_payload()).json()
+    suspended = client.post(
+        "/api/wps/executions/wps-execution-0001/suspend",
+        json={
+            "expectedRevision": registered["revision"],
+            "ownerToken": registered["ownerToken"],
+            "code": "WPS_RECOVERY_PROBE_CANCELLED",
+            "message": "恢复验收已取消：本次计划未登记可恢复的执行。",
+        },
+    )
+    assert suspended.status_code == 200, suspended.text
+    body = suspended.json()
+    assert body["status"] == "failed"
+    # 挂起后不泄露写入权。
+    assert body["ownerToken"] is None
+    # 真实原因原样进入下发的 error。
+    assert body["error"]["code"] == "WPS_RECOVERY_PROBE_CANCELLED"
+    assert body["error"]["message"] == "恢复验收已取消：本次计划未登记可恢复的执行。"
+
+    # 落库的 error_json 同样是调用方给的那份（不是通用文案）。
+    database = Path(os.environ["EXCEL_BRO_CONFIG_DIR"]) / "tasks" / "state.sqlite3"
+    with sqlite3.connect(database) as connection:
+        stored = connection.execute(
+            "select error_json from office_executions where operation_id = ?",
+            ("wps-execution-0001",),
+        ).fetchone()[0]
+    assert json.loads(stored)["code"] == "WPS_RECOVERY_PROBE_CANCELLED"
+    assert json.loads(stored)["message"] == "恢复验收已取消：本次计划未登记可恢复的执行。"
+
+
 def test_wps_execution_persists_no_cell_values(tmp_path: Path) -> None:
     """落盘的 `office_executions.plan_json` 里**没有**单元格内容。
 
@@ -864,8 +902,16 @@ def test_wps_resume_context_roundtrip_is_value_free(version: int) -> None:
     assert "values" not in json.dumps(fetched["descriptor"])
 
 
-@pytest.mark.parametrize("issue", ["raw", "unauthorized", "overlap", "shape", "formula", "fingerprint", "limit"])
+@pytest.mark.parametrize("issue", ["raw", "unauthorized", "overlap", "shape", "format", "fingerprint", "limit"])
 def test_wps_resume_context_rejects_unsafe_metadata(issue: str) -> None:
+    """来源证据带"不该出站"或"说不通"的内容一律拒绝。
+
+    `formula` 这一档在 2026-11-01 改成 `format`：`writeFormulas` **可以**带来源证据
+    （依赖表证据与值写入同构，端上 `isResumableValueAction` 的判据），把它当成不安全
+    元数据拒掉正是"WPS 公式计划一律登记不了"的真机故障。这里要守的是另一半——
+    格式动作的恢复点是属性快照，语义上没有来源值，出现这种组合就是伪造或协议漂移。
+    正面锚点见 `test_wps_formula_resume.py`。
+    """
     payload = _resume_payload()
     source = payload["descriptor"]["resumeContext"]["sources"][0]
     if issue == "raw":
@@ -876,12 +922,15 @@ def test_wps_resume_context_rejects_unsafe_metadata(issue: str) -> None:
         source["sheetName"] = "Sheet1"
     elif issue == "shape":
         source["rowCount"] = 3
-    elif issue == "formula":
-        payload["descriptor"]["actions"][0]["type"] = "writeFormulas"
+    elif issue == "format":
+        payload["descriptor"]["actions"][0]["type"] = "setFont"
+        payload["descriptor"]["actions"][0]["formatFields"] = ["bold"]
     elif issue == "fingerprint":
         source["valueFingerprint"] = "raw-data"
     elif issue == "limit":
         source["range"] = "A1:A1048576"
         source["rowCount"] = 1048576
     response = TestClient(app).post("/api/wps/executions/register", json=payload)
-    assert response.status_code == 422, response.text
+    # 授权类越界沿用 403（与"目标表不在授权内"同一口径），其余是 422。
+    expected = 403 if issue == "unauthorized" else 422
+    assert response.status_code == expected, response.text

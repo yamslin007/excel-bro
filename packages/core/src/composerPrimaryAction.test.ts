@@ -222,3 +222,15 @@ describe("composerPrimaryAction 的可辨识性", () => {
     }
   });
 });
+
+
+describe("running draft safety", () => {
+  it.each([false, true])("write/readback blocks dispatch even with draft=%s", (hasInput) => {
+    const action = composerPrimaryAction({hasInput, taskRunning:true, controllerAlive:true, uninterruptible:true});
+    expect(action.disabled).toBe(true); expect(action.invoke).toBeNull();
+  });
+  it("a draft cannot restart a task whose controller is already gone", () => {
+    const action = composerPrimaryAction({hasInput:true, taskRunning:true, controllerAlive:false});
+    expect(action.disabled).toBe(true); expect(action.invoke).toBeNull();
+  });
+});

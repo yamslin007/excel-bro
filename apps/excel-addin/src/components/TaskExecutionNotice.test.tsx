@@ -5,7 +5,7 @@ import {
   composerPrimaryAction,
   type ComposerPrimaryInput
 } from "@excel-bro/core/composerPrimaryAction";
-import { TaskExecutionNotice } from "./TaskExecutionNotice";
+import { TaskExecutionNotice, taskExecutionNoticeText } from "./TaskExecutionNotice";
 
 afterEach(cleanup);
 
@@ -81,4 +81,16 @@ it("没有可恢复状态时不冒充「已暂停」", () => {
   );
   // 现场不明 ⇒ 是"去核对"，不是"已暂停"。这里不说话，说明在恢复卡上。
   expect(container.firstChild).toBeNull();
+});
+
+it('父容器只登记实际有文字的任务状态，普通聊天不产生空待办', () => {
+  for (const input of [{}, {hasInput:true}, {taskRunning:true,controllerAlive:true}, {needsReconcile:true}]) {
+    const current = action(input);
+    expect(taskExecutionNoticeText(current)).toBeNull();
+    const {container,unmount}=render(<TaskExecutionNotice action={current}/>);
+    expect(container.firstChild).toBeNull();unmount();
+  }
+  expect(taskExecutionNoticeText(action({paused:true}))).toContain('已暂停');
+  expect(taskExecutionNoticeText(action({pausing:true,taskRunning:true}))).toContain('正在停止');
+  expect(taskExecutionNoticeText(action(),true)).toBe('等待审阅结果');
 });

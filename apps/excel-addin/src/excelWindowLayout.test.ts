@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createHash, webcrypto } from 'node:crypto';
 import { localWindowsPath, prepareLocalExcelWindows, arrangeLocalExcelWindows, closeLocalExcelWindows } from './excelWindowLayout';
-import { prepareExcelReviewLayout, measureExcelReviewPane, ExcelReviewLayoutVersionError } from './api';
+import { prepareExcelReviewLayout, measureExcelReviewPane, selectExcelReviewCopySheet, ExcelReviewLayoutVersionError } from './api';
 import type { AnalysisPlan, ExcelReviewLayoutPrepareRequest, ExcelReviewLayoutTicket } from './contracts';
 
 beforeEach(() => vi.stubGlobal('crypto', webcrypto));
@@ -12,6 +12,17 @@ const ticket: ExcelReviewLayoutTicket = {token, layoutVersion:3};
 const arranged = {status:'arranged', layoutVersion:3, copySide:'left', originalSide:'right', synchronousScrolling:'enabled'};
 
 describe('local-only window bridge', () => {
+  it('switching a copy tab sends only scoped hashes and ownership nonce', async () => {
+    const request = {workbookPathHash:hash('e:/original.xlsx'), worksheetNameHash:hash('结果3'), copySheetName,
+      values:[['PRIVATE']], fullPath:'E:/private.xlsx', script:'must never send'};
+    const fetch = vi.fn(async (_url:string, _init:RequestInit) => ({ok:true,json:async()=>({status:'selected'})}));
+    vi.stubGlobal('fetch', fetch);
+    expect(await selectExcelReviewCopySheet(request)).toEqual({status:'selected'});
+    expect(fetch.mock.calls[0][0]).toMatch(/review-layout\/select-sheet$/);
+    expect(JSON.parse(String(fetch.mock.calls[0][1].body))).toEqual({
+      workbookPathHash:request.workbookPathHash, worksheetNameHash:request.worksheetNameHash, copySheetName, copyIdentityVersion:2});
+    expect(JSON.stringify(fetch.mock.calls)).not.toMatch(/PRIVATE|fullPath|script|values/);
+  });
   it('measurement request sends metadata only, never the local plan or full path', async () => {
     const privatePlan = {actions:[{values:[['LOCAL_PRIVATE_SENTINEL']]}]};
     expect(JSON.stringify(privatePlan)).toContain('LOCAL_PRIVATE_SENTINEL');
@@ -20,7 +31,7 @@ describe('local-only window bridge', () => {
     const fetch=vi.fn(async (_url:string,_init:RequestInit)=>({ok:true,json:async()=>({clientWidthCssPx:1200,workAreaWidthCssPx:2000})}));
     vi.stubGlobal('fetch',fetch);
     expect(await measureExcelReviewPane(request)).toEqual({clientWidthCssPx:1200,workAreaWidthCssPx:2000});
-    expect(JSON.parse(String(fetch.mock.calls[0][1].body))).toEqual({workbookPathHash:request.workbookPathHash,worksheetNameHash:request.worksheetNameHash,copySheetName});
+    expect(JSON.parse(String(fetch.mock.calls[0][1].body))).toEqual({workbookPathHash:request.workbookPathHash,worksheetNameHash:request.worksheetNameHash,copySheetName,copyIdentityVersion:2});
     expect(fetch.mock.calls[0][0]).toMatch(/review-layout\/measure$/);
     expect(fetch.mock.calls[0][1].redirect).toBe('error');
     expect(JSON.stringify(fetch.mock.calls)).not.toMatch(/LOCAL_PRIVATE_SENTINEL|SECRET|hwnd|plan|values/);
@@ -51,7 +62,7 @@ describe('local-only window bridge', () => {
     const fetch = vi.fn(async (_url: string, _init: RequestInit) => ({ok:true, json:async () => ticket})); vi.stubGlobal('fetch', fetch);
     await prepareLocalExcelWindows(identity, 'Ledger', copySheetName);
     const body = JSON.parse(String(fetch.mock.calls[0][1]?.body));
-    expect(body).toEqual({workbookPathHash:hash(canonical),worksheetNameHash:hash('Ledger'),copySheetName});
+    expect(body).toEqual({workbookPathHash:hash(canonical),worksheetNameHash:hash('Ledger'),copySheetName,copyIdentityVersion:2});
   });
   it.each(['url:https://example.com/a.xlsx', 'unsaved', 'url:relative.xlsx', 'url:E:/file.xlsx?secret'])('does not send unsupported identity %s', async identity => {
     const fetch = vi.fn(); vi.stubGlobal('fetch', fetch);
@@ -66,7 +77,7 @@ describe('local-only window bridge', () => {
     const request = {workbookPathHash:hash('e:/original.xlsx'),worksheetNameHash:hash('Ledger'),copySheetName,plan,values:plan.actions,fullPath:'E:/SECRET/Original.xlsx'};
     const preparedTicket = await prepareExcelReviewLayout(request as ExcelReviewLayoutPrepareRequest);
     await arrangeLocalExcelWindows({...preparedTicket, plan} as typeof preparedTicket);
-    expect(JSON.parse(String(fetch.mock.calls[0][1].body))).toEqual({workbookPathHash:request.workbookPathHash,worksheetNameHash:request.worksheetNameHash,copySheetName});
+    expect(JSON.parse(String(fetch.mock.calls[0][1].body))).toEqual({workbookPathHash:request.workbookPathHash,worksheetNameHash:request.worksheetNameHash,copySheetName,copyIdentityVersion:2});
     expect(JSON.parse(String(fetch.mock.calls[1][1].body))).toEqual({token});
     expect(fetch.mock.calls.every(([,init]) => init.redirect === 'error')).toBe(true);
     expect(JSON.stringify(fetch.mock.calls)).not.toMatch(/LOCAL_PRIVATE_SENTINEL|PRIVATE_TITLE|SECRET|writeValues|values/);
@@ -122,7 +133,7 @@ describe('review copy close bridge', () => {
     expect(await closeLocalExcelWindows('url:file:///E:/Original.xlsx','Ledger',copySheetName))
       .toEqual({status:'closed', layoutVersion:4, copyClosed:true, recoveryCopyPath:'E:/recovery/review-copy.xlsx'});
     expect(JSON.parse(String(fetch.mock.calls[0][1].body)))
-      .toEqual({closeVersion:4,workbookPathHash:hash('e:/original.xlsx'), worksheetNameHash:hash('Ledger'), copySheetName});
+      .toEqual({closeVersion:4,workbookPathHash:hash('e:/original.xlsx'), worksheetNameHash:hash('Ledger'), copySheetName,copyIdentityVersion:2});
     expect(fetch.mock.calls[0][0]).toMatch(/review-layout\/close$/);
     expect(fetch.mock.calls[0][1].redirect).toBe('error');
     expect(JSON.stringify(fetch.mock.calls)).not.toMatch(/LOCAL_PRIVATE_SENTINEL|SECRET|plan|values|hwnd/);
@@ -135,7 +146,7 @@ describe('review copy close bridge', () => {
     const api = await import('./api');
     await api.closeExcelReviewCopy(request);
     expect(JSON.parse(String(fetch.mock.calls[0][1].body)))
-      .toEqual({closeVersion:4,workbookPathHash:hash('e:/original.xlsx'),worksheetNameHash:hash('Ledger'),copySheetName});
+      .toEqual({closeVersion:4,workbookPathHash:hash('e:/original.xlsx'),worksheetNameHash:hash('Ledger'),copySheetName,copyIdentityVersion:2});
     expect(JSON.stringify(fetch.mock.calls)).not.toMatch(/LOCAL_PRIVATE_SENTINEL|PRIVATE_TITLE|SECRET|writeValues/);
   });
   it.each(CLOSE_STATUSES)('preserves the real close outcome %s and its copyClosed flag', async status => {

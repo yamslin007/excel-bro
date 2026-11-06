@@ -799,7 +799,7 @@ describe("local_plan_rule 的真实出站请求体", () => {
       await typeInput(container.querySelector<HTMLInputElement>('.wps-local-mapping-values input[type="text"]'), "旧值目标-4J2H");
       await click(findButton(container, "按补充映射重新生成预览"));
       await until(() => textOf(container).includes("新的私有来源-8F2H"), "应读取当前数据并在原卡询问新缺口");
-      expect(findButton(container, "确认变更")).toBeNull();
+      expect(findButton(container, "确认全部变更")).toBeNull();
       expect(planCalls().length).toBe(count);
       expect(host.writeCount()).toBe(0);
       expect(allBodies()).not.toContain("新的私有来源-8F2H");
@@ -829,7 +829,7 @@ describe("local_plan_rule 的真实出站请求体", () => {
       // 正向锚点 2：**没有任何写入预览**（没有"生成右侧副本并排审阅"按钮，也没有目标区域）。
       // 这正是"拒绝而非兜底"的可观测后果 —— 若生产代码把未命中值兜成 blankLabel，
       // 这里会冒出一个预览，用例立刻变红。
-      expect(findButton(container, "确认变更")).toBeNull();
+      expect(findButton(container, "确认全部变更")).toBeNull();
       expect(textOf(container)).not.toContain(RULE_TARGET_RANGE);
       expect(textOf(container)).not.toContain(TARGET_VALUE);
       expect(textOf(container)).not.toContain("已按映射处理");
@@ -844,7 +844,7 @@ describe("local_plan_rule 的真实出站请求体", () => {
       await click(findButton(container, "按补充映射重新生成预览"));
       await until(() => textOf(container).includes("本次执行计划"), "补充后应生成新的写入预览");
       expect(textOf(container)).toContain(target);
-      expect(findButton(container, "确认变更")).not.toBeNull();
+      expect(findButton(container, "确认全部变更")).not.toBeNull();
       expect(host.wholeReads()).toBeGreaterThan(sourceReadsBeforeAnswer);
       expect(planCalls().length).toBe(fetchesBeforeAnswer);
       expect(localStorage.getItem("excel-bro.wps.chat.v1") ?? "").not.toContain(PRIVATE_SENTINEL);
@@ -880,7 +880,7 @@ describe("local_plan_rule 的真实出站请求体", () => {
       await typeInput(container.querySelector<HTMLInputElement>(".wps-local-mapping-values input"), "原值的目标");
       await click(findButton(container, "按补充映射重新生成预览"));
       await until(() => textOf(container).includes("新出现的本地值-5D8T"), "应询问重新读取后发现的新值");
-      expect(findButton(container, "确认变更")).toBeNull();
+      expect(findButton(container, "确认全部变更")).toBeNull();
       expect(allBodies()).not.toContain("新出现的本地值-5D8T");
       expect(localStorage.getItem("excel-bro.wps.chat.v1") ?? "").not.toContain("新出现的本地值-5D8T");
     });
@@ -897,7 +897,7 @@ describe("local_plan_rule 的真实出站请求体", () => {
       await until(() => container.querySelector<HTMLButtonElement>(".model-picker-trigger")?.title.includes("当前模型：第一个连接") ?? false, "应加载模型");
       await ask(container);
       await until(() => textOf(container).includes(compound), "应展示无法归因的整格值");
-      expect(findButton(container, "确认变更")).toBeNull();
+      expect(findButton(container, "确认全部变更")).toBeNull();
       const fetchesBefore = planCalls().length;
       await click(findButton(container, "改为说明拆分规则"));
       expect(container.querySelector<HTMLInputElement>('input[aria-label="拆分符"]')?.value).toBe("，");
@@ -933,7 +933,7 @@ describe("local_plan_rule 的真实出站请求体", () => {
       expect(planCalls().length).toBe(fetchesBefore);
       expect(allBodies()).not.toContain(target);
       expect(localStorage.getItem("excel-bro.wps.chat.v1") ?? "").not.toContain(target);
-      expect(findButton(container, "确认变更")).not.toBeNull();
+      expect(findButton(container, "确认全部变更")).not.toBeNull();
       expect(allBodies()).not.toContain(PRIVATE_SENTINEL);
     });
   });
@@ -1047,7 +1047,7 @@ describe("local_plan_rule 的真实出站请求体", () => {
         regenerateRequests.filter((item) => item.url.includes("/api/plans/validate")).length
       ).toBe(0);
       // 锚点 2：新计划确实被重建了（否则上面一条会因"什么都没做"而空过）。
-      expect(findButton(container, "确认变更")).not.toBeNull();
+      expect(findButton(container, "确认全部变更")).not.toBeNull();
       expect(textOf(container)).toContain(target);
       // 锚点 3：重新生成期间产生的任何请求都不带源值、源快照或完整矩阵。
       for (const item of regenerateRequests) {
@@ -1164,7 +1164,7 @@ describe("local_plan_rule 的真实出站请求体", () => {
       expect(outbound).not.toContain(RULE_SOURCE_RANGE);
       expect(outbound).not.toContain('"mapping"');
       // 零写入：没有预览、没有确认按钮、也不走校验接口。
-      expect(findButton(container, "确认变更")).toBeNull();
+      expect(findButton(container, "确认全部变更")).toBeNull();
       expect(captured.some((item) => item.url.includes("/api/plans/validate"))).toBe(false);
     });
   });
@@ -1202,7 +1202,7 @@ describe("local_plan_rule 的真实出站请求体", () => {
       // 计数来自真实读取，不是一句"可能有空白"：源列确实被读过。
       expect(host.wholeReads()).toBeGreaterThan(0);
       // 停在澄清卡上：没有预览、没有确认写入的入口。
-      expect(findButton(container, "确认变更")).toBeNull();
+      expect(findButton(container, "确认全部变更")).toBeNull();
     }
 
     it("保留目标原值：那一格不进任何写入动作，且全程零新增出站", async () => {

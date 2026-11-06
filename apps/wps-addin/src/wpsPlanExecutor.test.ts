@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { compileControlledScript } from "@excel-bro/core/controlledScript";
 import { assertEditablePlan } from "../../excel-addin/src/contracts";
-import { captureWpsBeforeResult, stageWpsBeforeComparison } from "./wpsNativeComparison";
+import { captureWpsBeforeResult, stageWpsBeforeComparison, wpsBeforeComparisonForSheet } from "./wpsNativeComparison";
 import {
   canClaimWriteSuccess,
   cellDisplayText,
@@ -14,6 +14,9 @@ import {
   WPS_SUPPORTED_ACTION_KEYS,
   executeWpsPlan,
   latestWpsUndo,
+  adoptWpsUndoRecord,
+  inspectWpsConfirmedResult,
+  inspectWpsUndoRecord,
   matrixFingerprintV2,
   prepareWpsPlan,
   toChangeFormulas,
@@ -119,6 +122,32 @@ function hostWithSource() {
 }
 
 describe("WPS guarded plan executor", () => {
+  it('确认已验证的相同公式结果不猜写入历史；篡改、未完成和缺记录仍拒绝', async () => {
+    const target = host([['=1+1', '=2+2']]);
+    const prepared = prepareWpsPlan(target.application, [1], plan([
+      {type:'writeFormulas', sheet:'明细', range:'A1:B1', formulas:[['=1+1', '=3+3']]}
+    ]));
+    const record = await executeWpsPlan(target.application, prepared);
+    expect(record.state).toBe('verified');
+    expect(inspectWpsUndoRecord(target.application, record.executionId).kind).toBe('unknown');
+    const before = JSON.stringify(target.storedRecords());
+    expect(inspectWpsConfirmedResult(target.application, record.executionId).kind).toBe('completed');
+    expect(JSON.stringify(target.storedRecords())).toBe(before);
+    expect(target.values()).toEqual([['=1+1', '=3+3']]);
+    target.overwrite([['=1+1', '=2+2']]);
+    expect(inspectWpsConfirmedResult(target.application, record.executionId).kind).not.toBe('completed');
+    target.overwrite([['=1+1', '=99']]);
+    expect(inspectWpsConfirmedResult(target.application, record.executionId).kind).not.toBe('completed');
+    target.overwrite([['=1+1', '=3+3']]);
+    const records = target.storedRecords();
+    records[0].state = 'partial_write_recoverable';
+    target.replaceRecords(records);
+    expect(inspectWpsConfirmedResult(target.application, record.executionId).kind).toBe('unknown');
+    records[0].state = 'verified'; records[0].actions[0].appliedRows = 0;
+    target.replaceRecords(records);
+    expect(inspectWpsConfirmedResult(target.application, record.executionId).kind).toBe('unknown');
+    expect(inspectWpsConfirmedResult(target.application, 'missing').kind).toBe('unknown');
+  });
   it("controlled JS executes and restores two selected sheets; optional comparison does not block capture", async () => {
     const one = host([["before1"]]), two = host([["before2"]]), secret = host([["private"]]);
     const sheets = [one, two, secret].map((fixture, i) => {
@@ -139,7 +168,9 @@ describe("WPS guarded plan executor", () => {
     expect(one.values()).toEqual([["One"]]);
     expect(two.values()).toEqual([["Two"]]);
     expect(secret.values()).toEqual([["private"]]);
-    expect(() => stageWpsBeforeComparison(one.application, before)).toThrow("单张工作表");
+    expect(wpsBeforeComparisonForSheet(before, 'Two').values[0].values).toEqual([['before2']]);
+    expect(wpsBeforeComparisonForSheet(before, 'One').values[0].values).toEqual([['before1']]);
+    expect(() => wpsBeforeComparisonForSheet(before, 'Secret')).toThrow('授权快照');
     await undoWpsExecution(one.application, record.executionId);
     expect(one.values()).toEqual([["before1"]]);
     expect(two.values()).toEqual([["before2"]]);
@@ -158,6 +189,20 @@ describe("WPS guarded plan executor", () => {
     target.application.Version = "12.0";
     const record = await executeWpsPlan(target.application, prepared);
     expect(record.state).toBe("verified");
+    expect(target.values()).toEqual([["新值"]]);
+  });
+
+  it("水合旧恢复材料不越过另一任务，更新已有材料也保留原栈位置", async () => {
+    const target = host([["旧值"]]);
+    const record = await executeWpsPlan(target.application, prepareWpsPlan(target.application, [1], plan([
+      { type: "writeValues", sheet: "明细", range: "A1", values: [["新值"]] }
+    ])));
+    const older = { ...record, executionId: 'older-execution', createdAt: '2020-01-01T00:00:00.000Z' };
+    adoptWpsUndoRecord(target.application, older);
+    expect(latestWpsUndo(target.application)?.executionId).toBe(record.executionId);
+    adoptWpsUndoRecord(target.application, { ...older, error: 'refreshed material' });
+    expect(latestWpsUndo(target.application)?.executionId).toBe(record.executionId);
+    expect(target.storedRecords()).toHaveLength(2);
     expect(target.values()).toEqual([["新值"]]);
   });
 

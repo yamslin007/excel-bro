@@ -205,8 +205,14 @@ export function executionRecoveryProgress(
   return head;
 }
 
-/** 历史消息里的只读记录要指向**唯一**入口，否则用户会以为按钮丢了。 */
-export const EXECUTION_RECOVERY_ENTRY_HINT = "操作入口在输入框上方，这条消息只保留执行记录。";
+/**
+ * 历史消息里的只读记录要指向**唯一**入口，否则用户会以为按钮丢了。
+ *
+ * 2026-11-02：那颗主操作从"输入框右下角"搬进了**输入框内部**（恢复操作区
+ * 置换普通输入，见 `recoveryComposer.ts`），所以这句指路跟着改位置 ——
+ * 指错方向的说明比不说更糟。
+ */
+export const EXECUTION_RECOVERY_ENTRY_HINT = "操作入口在输入框里，这条消息只保留执行记录。";
 
 /** badge 文案：`completed` 且账本本来就有完成结果时，别说成"仅缺回执"。 */
 export function executionRecoveryBadge(verdict: ExecutionRecoveryVerdict): string {
@@ -257,7 +263,7 @@ export function executionRecoveryResumeVerdict(
   return {
     kind: "blocked",
     detail:
-      `${source.reason}还有 ${remaining} 个动作没跑，不能沿用旧结果继续。` +
+      `${source.reason}（还有 ${remaining} 个动作没跑。）` +
       "把来源改回登记时的值之后，点「重新核对（只读）」会按当时的现场重新判断，不会自动重新规划，也不会放宽。"
   };
 }
@@ -296,12 +302,21 @@ export function executionRecoveryDetail(verdict: ExecutionRecoveryVerdict): stri
         : `原计划与当前授权和目标已核对（这份计划不读其他工作表作为来源），可继续剩余 ${verdict.remaining} 个动作；已完成动作不会重写，完成后审阅结果。`;
     case "undone":
       return verdict.detail ?? EXECUTION_RECOVERY_UNDONE_DETAIL;
-    case "replan":
-      return (
-        `还有 ${verdict.remaining} 个动作没写。本机材料缺失、过期或不符合精确续跑条件。` +
-        (verdict.reason ? `具体原因：${verdict.reason} ` : "") +
-        "可在当前授权范围内重新读取并规划；通过校验后先执行，再审阅。"
-      );
+    case "replan": {
+      /*
+       * 已知原因**先说**（2026-11-02）。
+       *
+       * 这句话以前把「本机材料缺失、过期或不符合精确续跑条件」放在最前面 —— 而它只是
+       * **没有原因可报时的默认猜测**。来源变了的时候 `reason` 里明明写着"来源数据已
+       * 改变"，用户看到的却是"材料缺失、过期"，于是去翻恢复材料、等期限，而真正该做
+       * 的是把来源改回去或按最新数据重新发起。已知原因不许被笼统原因掩盖。
+       */
+      const head = `还有 ${verdict.remaining} 个动作没写。`;
+      const tail = "可在当前授权范围内重新读取并规划；通过校验后先执行，再审阅。";
+      return verdict.reason
+        ? `${verdict.reason}${head}${tail}`
+        : `${head}本机材料缺失、过期或不符合精确续跑条件。${tail}`;
+    }
     default:
       return verdict.detail;
   }

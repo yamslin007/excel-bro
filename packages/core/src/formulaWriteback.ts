@@ -450,7 +450,12 @@ export function formulaSourceEvidenceRequirement(plan: {
  * 三种成因不同，用户要做的事也不同 —— 值真变了要重新读数据；没证据要去核对；
  * 读不出来先恢复读取能力。合并成一句"不能续跑"等于把处置方法也藏起来。
  */
-export const FORMULA_SOURCE_CHANGED_MESSAGE = "来源已变化，不能沿用旧结果续跑。";
+/*
+ * 2026-11-02：这句话改写成"说清是哪一类事实 + 不能做什么"，因为它在恢复卡上曾被
+ * 一句「本机材料缺失、过期或不符合精确续跑条件」盖住 —— 已知原因被笼统原因埋掉，
+ * 用户会去翻材料和期限，而真正要做的是把来源改回去或重新发起。
+ */
+export const FORMULA_SOURCE_CHANGED_MESSAGE = "来源数据已改变，不能继续原任务。";
 export const FORMULA_SOURCE_EVIDENCE_MISSING_MESSAGE =
   "这次执行没有登记公式来源的证据，无法确认来源未变，不能续跑。";
 export const FORMULA_SOURCE_UNVERIFIABLE_MESSAGE =

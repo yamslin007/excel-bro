@@ -1,4 +1,4 @@
-import { prepareExcelReviewLayout, arrangeExcelReviewLayout, measureExcelReviewPane, closeExcelReviewCopy } from './api';
+import { prepareExcelReviewLayout, arrangeExcelReviewLayout, measureExcelReviewPane, closeExcelReviewCopy, setExcelReviewCopyViewing, selectExcelReviewCopySheet } from './api';
 import type { ExcelReviewLayoutTicket, ExcelReviewCopyCloseResult } from './contracts';
 
 const sha256 = async (text: string) => [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text)))].map(x => x.toString(16).padStart(2, '0')).join('');
@@ -31,6 +31,14 @@ export async function prepareLocalExcelWindows(identity: string, sourceSheetName
     worksheetNameHash: await sha256(sourceSheetName), copySheetName});
 }
 export { arrangeExcelReviewLayout as arrangeLocalExcelWindows };
+export async function setLocalExcelCopyViewing(identity: string, sourceSheetName: string, copySheetName: string, viewing: boolean) {
+  return setExcelReviewCopyViewing({workbookPathHash: await sha256(localWindowsPath(identity)),
+    worksheetNameHash: await sha256(sourceSheetName), copySheetName}, viewing);
+}
+export async function selectLocalExcelCopySheet(identity: string, sourceSheetName: string, copySheetName: string) {
+  return selectExcelReviewCopySheet({workbookPathHash: await sha256(localWindowsPath(identity)),
+    worksheetNameHash: await sha256(sourceSheetName), copySheetName});
+}
 export async function measureLocalExcelWindow(identity: string, sourceSheetName: string, copySheetName: string) {
   return measureExcelReviewPane({workbookPathHash: await sha256(localWindowsPath(identity)),
     worksheetNameHash: await sha256(sourceSheetName), copySheetName});

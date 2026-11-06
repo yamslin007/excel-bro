@@ -31,7 +31,7 @@ type RuleState = {
 };
 
 function installHost(options: {
-  failOnAdd?: number; failOnDelete?: boolean; ranges?: string[];
+  failOnAdd?: number; failOnDelete?: boolean; ignoreDelete?: boolean; ranges?: string[];
   /** 宿主"建出来了却回空句柄"：规则真的在集合里，`Add` 的返回值是 null。 */
   addReturnsNull?: boolean;
 } = {}) {
@@ -65,7 +65,7 @@ function installHost(options: {
     },
     Delete: () => {
       if (options.failOnDelete) throw new Error("删除被宿主拒绝");
-      state.deleted = true;
+      if (!options.ignoreDelete) state.deleted = true;
     }
   });
 
@@ -124,6 +124,15 @@ const prepared = {
 beforeEach(() => { localStorage.clear(); });
 
 describe("WPS 审阅标记", () => {
+  it("删除调用静默失效时保留归属记录，重载清理也不得报告成功", () => {
+    const host = installHost({ ignoreDelete: true });
+    const marks = markWpsResult(host.application, single("A1:B1"));
+    expect(() => clearWpsResultMarks(host.application, marks)).toThrow("审阅颜色标记尚未移除");
+    expect(host.live()).toContain(marks.formula);
+    expect(storedRecords()).toHaveLength(1);
+    expect(recoverWpsResultMarks(host.application)).toContain("未清理");
+    expect(storedRecords()).toHaveLength(1);
+  });
   it("逐条落盘：创建部分成功后失败，已创建的可追踪并清理", () => {
     const host = installHost({ ranges: ["A1:B1", "C1:D1"], failOnAdd: 2 });
     expect(() => markWpsResult(host.application, prepared)).toThrow(/第 2 处标记创建失败/);

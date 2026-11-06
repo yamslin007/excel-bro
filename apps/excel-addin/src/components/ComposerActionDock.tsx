@@ -49,6 +49,7 @@ export function ComposerActionDock({
    */
   const others = currentActionSwitchTargets(selection);
   if (primary === null && others.length === 0) return null;
+  if (primary !== null && !views[primary] && others.length === 0) return null;
 
   const switchable = (kind: CurrentActionView): boolean =>
     Boolean(onSwitch) && (kind === "review" || kind === "recovery");

@@ -1,0 +1,249 @@
+/*
+ * 输入框内部的「恢复待办」操作区（两端共用）。
+ *
+ * 结构与澄清问卷一致：标题固定、正文自己滚、动作行留在原地。
+ * 窄窗格（320px）下三颗按钮允许换行，但**不压缩主操作**——`flex-wrap` 只换行，
+ * 主操作 `flex: 0 0 auto` 不参与收缩，所以它永远是可点的完整文字。
+ */
+
+.recovery-composer {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  box-sizing: border-box;
+  padding: 4px 6px;
+  /* 与澄清问卷同一个上限：输入区不被这一块整个吃掉。 */
+  max-height: min(300px, 40vh);
+}
+
+.recovery-composer-heading {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--color-border, #e5e5e3);
+}
+
+.recovery-composer-mode {
+  flex: 0 0 auto;
+  color: var(--color-brand-text, #2f6b47);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.recovery-composer-headline {
+  min-width: 0;
+  margin: 0;
+  color: var(--color-text-primary);
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+/* 正文是滚动容器的**唯一**子层：动作行是它的兄弟，永远留在原地。 */
+.recovery-composer-scroll {
+  display: grid;
+  gap: 4px;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+.recovery-composer-line {
+  margin: 0;
+  color: var(--color-text-secondary, #787975);
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.recovery-composer-details {
+  display: grid;
+  gap: 4px;
+  margin-top: 2px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--color-border, #e5e5e3);
+}
+
+.recovery-composer-progress,
+.recovery-composer-detail,
+.recovery-composer-note {
+  margin: 0;
+  color: var(--color-text-secondary, #787975);
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.recovery-composer-dismiss {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+}
+
+/* 撤销行：与「清除提示」同一档（都在详情里），但语义相反，所以单独一行。 */
+.recovery-composer-undo-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.recovery-composer-undo {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.recovery-composer-undo.is-done {
+  color: var(--color-brand-text, #2f6b47);
+}
+
+.recovery-composer-undo.is-blocked {
+  color: var(--color-text-secondary, #787975);
+}
+
+.recovery-composer-diagnostics {
+  font-size: 12px;
+  color: var(--color-text-secondary, #787975);
+}
+
+.recovery-composer-diagnostics summary {
+  cursor: pointer;
+}
+
+.recovery-composer-diagnostics pre {
+  margin: 4px 0 0;
+  max-height: 120px;
+  overflow: auto;
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.recovery-composer-dismiss-hint {
+  color: var(--color-text-secondary, #787975);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.recovery-composer-actions {
+  flex: 0 0 auto;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.recovery-composer-ghost,
+.recovery-composer-secondary {
+  padding: 0 10px;
+  min-height: 30px;
+  border: 1px solid var(--color-border, #dededb);
+  border-radius: 10px;
+  background: transparent;
+  color: var(--color-text-primary);
+  font: inherit;
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.recovery-composer-ghost:disabled,
+.recovery-composer-secondary:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.recovery-composer-primary {
+  flex: 0 0 auto;
+  margin-left: auto;
+  padding: 0 14px;
+  min-height: 32px;
+  border: 1px solid var(--color-brand-text, #2f6b47);
+  border-radius: 10px;
+  background: var(--color-brand-text, #2f6b47);
+  color: #fff;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.recovery-composer-primary:disabled {
+  /* 等待态：仍占位、仍可读，只是不可点（消失会让人以为点错了）。 */
+  opacity: 0.7;
+  cursor: default;
+}
+
+.recovery-composer-primary:focus-visible,
+.recovery-composer-ghost:focus-visible,
+.recovery-composer-secondary:focus-visible,
+.recovery-pending-entry-button:focus-visible {
+  outline: 2px solid var(--color-brand-text, #2f6b47);
+  outline-offset: 2px;
+}
+
+/* 进入恢复模式时输入框内部不再需要 textarea 的间隙。 */
+.composer-box.is-recovery {
+  gap: 4px;
+}
+
+/* 「另提需求」之后的那一枚紧凑待办入口（固定区域里，不占输入框）。 */
+.recovery-pending-entry {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  margin: 0;
+  padding: 2px 6px;
+  color: var(--color-text-secondary, #787975);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.recovery-pending-entry-button {
+  padding: 0 10px;
+  min-height: 28px;
+  border: 1px solid var(--color-border, #dededb);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--color-brand-text, #2f6b47);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.recovery-pending-entry-button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+/* 窄窗格：三颗按钮各自成行时也不许把输入区挤空。 */
+@media (max-width: 360px) {
+  .recovery-composer {
+    padding: 2px 2px;
+    max-height: min(260px, 44vh);
+  }
+
+  .recovery-composer-actions {
+    justify-content: flex-start;
+    gap: 6px;
+  }
+
+  .recovery-composer-primary {
+    flex: 1 1 auto;
+    margin-left: 0;
+  }
+}

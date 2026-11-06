@@ -10,6 +10,26 @@
   position: relative;
 }
 
+/* 紧凑圆钮使用主题主色，实心箭头反白显示。 */
+.composer .composer-primary[data-primary-action="send"],
+.composer .composer-primary[data-primary-action="send-supplement"] {
+  width: 32px;
+  height: 32px;
+  flex: 0 0 32px;
+  padding: 0;
+  border-radius: 50%;
+  corner-shape: round;
+  background: var(--color-brand-text);
+  color: white;
+}
+
+.composer-primary .composer-send-arrow {
+  width: 18px;
+  height: 18px;
+  fill: currentColor;
+  stroke: none;
+}
+
 .composer-box.is-answering .composer-primary[data-primary-action="answer"] {
   width: auto;
   min-width: 88px;

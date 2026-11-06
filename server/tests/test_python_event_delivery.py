@@ -19,8 +19,11 @@ def test_python_card_survives_real_http_sse_serialization(monkeypatch, tmp_path)
     from server.app.task_ledger import FolderOperationLedger
     from server.tests.test_main import _STREAM_PAYLOAD, _parse_sse
 
+    # 线上形状：完整性事实是**三个**字段（complete / incomplete / truncated+truncation），
+    # 不是一个布尔 —— 卡片与模型回执都读它们，缺一项就只剩"猜原因"。
     card = dict(resultRef="res_" + "a" * 32, title="Python 分析结果", headers=["列1"],
-                rowCount=2, columnCount=1, sourceSheets=["Sheet1"], complete=True)
+                rowCount=2, columnCount=1, sourceSheets=["Sheet1"], complete=True,
+                incomplete=[], truncated=False, truncation=None)
 
     async def plan(request, *, on_event, **kwargs):
         await on_event(dict(phase="planning", stepId="python.completed", status="completed",

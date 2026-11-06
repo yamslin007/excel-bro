@@ -15,7 +15,9 @@ function candidate(overrides: Partial<PendingExecutionDiscoveryResponse["candida
   return {
     operationId: "ea6a0f0d-1111-4a4a-8a8a-111111111111",
     taskId: "task-1111",
+    kind: "resume" as const,
     status: "needs_reconciliation" as const,
+    reviewState: null,
     createdAt: 1_790_000_000_000,
     updatedAt: 1_790_000_600_000,
     nextActionIndex: 1,

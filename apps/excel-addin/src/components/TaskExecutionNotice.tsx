@@ -19,6 +19,14 @@ import "./taskExecutionNotice.css";
  *
  * 换句话说：**状态留在这里，动作全在右下角。**
  */
+/** Parent registration and rendering must use the same visible-text criterion. */
+export function taskExecutionNoticeText(action: ComposerPrimaryAction, reviewing = false): string | null {
+  if (reviewing) return '等待审阅结果';
+  return action.kind === 'pausing' ? '正在停止当前处理…'
+    : action.kind === 'pause' && action.disabled ? action.reason || null
+    : action.kind === 'continue' ? '已暂停，可从右下角继续' : null;
+}
+
 export function TaskExecutionNotice({
   action,
   reviewing
@@ -26,24 +34,10 @@ export function TaskExecutionNotice({
   action: ComposerPrimaryAction;
   reviewing?: boolean;
 }) {
-  if (reviewing) {
-    return (
-      <p className="task-execution-notice" role="status" data-notice="reviewing">
-        等待审阅结果
-      </p>
-    );
-  }
-  const text =
-    action.kind === "pausing"
-      ? "正在停止当前处理…"
-      : action.kind === "pause" && action.disabled
-        ? action.reason
-        : action.kind === "continue"
-          ? "已暂停，可从右下角继续"
-          : null;
+  const text = taskExecutionNoticeText(action, reviewing);
   if (!text) return null;
   return (
-    <p className="task-execution-notice" role="status" data-notice={action.kind}>
+    <p className="task-execution-notice" role="status" data-notice={reviewing ? "reviewing" : action.kind}>
       {text}
     </p>
   );

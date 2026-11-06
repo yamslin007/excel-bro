@@ -107,7 +107,6 @@ export async function markExcelResult(plan: AnalysisPlan, identity: string): Pro
     if (marks.entries.length) {
       try {
         await clearExcelResultMarks(marks);
-        forgetExcelResultMarks();
       } catch {
         /*
          * 清理也失败：**保留**持久记录，让下一次打开面板/开始新审阅时还能认领它们。
@@ -123,30 +122,51 @@ export async function markExcelResult(plan: AnalysisPlan, identity: string): Pro
 export async function clearExcelResultMarks(marks: ExcelResultMarks): Promise<void> {
   if (currentOfficeWorkbookIdentity() !== marks.identity) throw new Error('请返回本次执行的工作簿，再清除审阅标记。');
   await Excel.run(async context => {
-    const removals: Excel.ConditionalFormat[] = [];
-    for (const entry of marks.entries) {
+    const removals = new Map<string, Excel.ConditionalFormat>();
+    const inRecordedRange = async (entry: ExcelResultMarks['entries'][number]) => {
       const rules = context.workbook.worksheets.getItem(entry.sheet).getRange(entry.range).conditionalFormats;
       rules.load('items/id,items/type'); await context.sync();
-      const rule = rules.items.find(item => item.id === entry.id);
-      if (!rule) continue; // The user already removed this mark.
-      if (rule.type !== 'Custom') throw new Error('审阅标记已被修改，未删除该规则。');
-      rule.custom.load('rule'); await context.sync();
-      if (rule.custom.rule.formula !== marks.formula) throw new Error('审阅标记已被修改，未删除该规则。');
-      removals.push(rule);
+      for (const rule of rules.items) if (rule.type === 'Custom') rule.custom.load('rule');
+      await context.sync();
+      return rules.items;
+    };
+    for (const entry of marks.entries) {
+      const rules = await inRecordedRange(entry);
+      let rule = rules.find(item => item.id === entry.id);
+      if (!rule) {
+        // A stale ID is not evidence that the mark disappeared. Claim only a unique,
+        // exact per-review nonce in its recorded range, never by colour or prefix.
+        if (!/^=N\("EB_REVIEW_[a-f0-9]{32}"\)=0$/.test(marks.formula))
+          throw new Error('审阅标记归属公式无效，未删除任何规则。');
+        const matches = rules.filter(item => item.type === 'Custom' && item.custom.rule.formula === marks.formula);
+        if (matches.length > 1) throw new Error('审阅标记归属不唯一，保留规则等待核对。');
+        rule = matches[0];
+        if (!rule) continue;
+      }
+      if (rule.type !== 'Custom' || rule.custom.rule.formula !== marks.formula)
+        throw new Error('审阅标记已被修改，未删除该规则。');
+      removals.set(`${entry.sheet}\u0000${rule.id}`, rule);
     }
     if (currentOfficeWorkbookIdentity() !== marks.identity) throw new Error('标记目标工作簿已变化。');
     removals.forEach(rule => rule.delete());
     await context.sync();
+    for (const entry of marks.entries) {
+      if (currentOfficeWorkbookIdentity() !== marks.identity) throw new Error('标记目标工作簿已变化。');
+      const remaining = await inRecordedRange(entry);
+      if (remaining.some(rule => rule.type === 'Custom' && rule.custom.rule.formula === marks.formula))
+        throw new Error('审阅颜色标记尚未移除，可重试清理；不会再次恢复单元格。');
+    }
   });
-  forgetExcelResultMarks();
+  // A concurrent newer review must not lose its ownership record.
+  if (loadExcelResultMarks()?.formula === marks.formula) forgetExcelResultMarks();
 }
 
 /**
  * 刷新/重载后处理**上一次**遗留的标记。
  *
  * 三条纪律：
- *  1. 只按记录的 **规则 id + 随机公式** 认领，绝不按颜色/区域/前缀批量删；
- *     对不上的一律不碰（可能是别的任务的标记，或用户自己新建的规则）。
+ *  1. 优先按记录的规则 id + 完整随机公式认领；id 缺失时，仅接受原记录区域内
+ *     唯一的完整随机公式匹配。绝不按颜色/前缀批量删，归属歧义一律保留。
  *  2. 工作簿身份不符 ⇒ **什么都不做**，只如实说明"是另一本工作簿的标记"。
  *  3. 清理失败 ⇒ 保留记录，返回可读原因；下一次仍可重试。
  *

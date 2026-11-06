@@ -1,5 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import { checkAuthorizedTarget, type AuthorizedTarget, type TargetNoticeReason } from "@excel-bro/core/authorizedTarget";
+import {
+  targetDiagnostic,
+  type TargetDiagnostic,
+  type TargetDiagnosticHost,
+  type TargetDiagnosticInput
+} from "@excel-bro/core/targetDiagnostics";
 import capabilities from "../../../../config/capabilities.json";
 
 export function useAuthorizedTarget(options: {
@@ -13,8 +19,22 @@ export function useAuthorizedTarget(options: {
   isReviewCopy?: (target: AuthorizedTarget) => boolean;
   /** Host evidence for analysis/read authorization only, never permission to write.
    * Keys are private memory bindings. Consistent weak evidence requires consent;
-   * missing or conflicting evidence remains blocked until a successful recheck. */
-  analysisEvidence?: (target: AuthorizedTarget) => Promise<{ key: string; conclusive: boolean } | null>;
+   * missing or conflicting evidence remains blocked until a successful recheck.
+   * `documentBound` is a second grade for hosts that cannot keep object wrappers
+   * stable across a reload (WPS): same file path + host-declared sheet ids. It is
+   * accepted here only — write/recovery/data-read gates still read `conclusive`. */
+  analysisEvidence?: (target: AuthorizedTarget) => Promise<{
+    key: string; conclusive: boolean; documentBound?: boolean;
+    /** 只用于诊断的宿主观测事实（稳定 ID 可读程度 / 有无路径身份），不参与判定。 */
+    diagnostic?: TargetDiagnosticHost;
+  } | null>;
+  /**
+   * 每次范围判定把**为什么**交出去一次（只有布尔值/原因码）。
+   *
+   * 不是判据：拿掉它，行为一字不变。存在是因为真机上提示标题只有几种，
+   * 分不清"证据不足""键冲突""调用方强制确认"，而 WPS 任务窗格开不了 devtools。
+   */
+  onTargetDiagnostic?: (diagnostic: TargetDiagnostic) => void;
 }) {
   const live = useRef(options);
   live.current = options;
@@ -50,6 +70,41 @@ export function useAuthorizedTarget(options: {
   const noticeRef = useRef(notice);
   noticeRef.current = notice;
   const roundRef = useRef(0);
+  /** 本页面内第几次判定（单调递增）。用来区分"新请求又被拦了一次"与"旧提示没清掉"。 */
+  const diagnosticSeq = useRef(0);
+  /**
+   * 交出一条诊断。**任何异常都不许影响判定** —— 它不是判据的一部分。
+   * `round` 取当前提示轮次：同一轮里反复判定说明还是同一条提示，没有开新轮。
+   */
+  const emitDiagnostic = (input: Omit<TargetDiagnosticInput, "round" | "seq">) => {
+    const sink = live.current.onTargetDiagnostic;
+    if (!sink) return;
+    diagnosticSeq.current += 1;
+    try {
+      sink(targetDiagnostic({ ...input, round: roundRef.current, seq: diagnosticSeq.current }));
+    } catch {
+      // 诊断永远不许打断守卫。
+    }
+  };
+  /**
+   * 判定**通过**之后，把"已经不再成立"的提示清掉。
+   *
+   * 不清的后果实测过：先前留下的提示只由 `bind()` / 确认 / 取消清除，而定时巡检
+   * 在提示存在时又主动跳过 —— 于是目标早已恢复正常，界面还挂着那条提示，
+   * 用户看到的是"又拦了我一次"，实际是`旧提示没人清`。这两件事在界面上长得一样。
+   *
+   * 只清**本道闸能解释**的提示（理由由调用方给）：分析闸通过不能替元数据闸的
+   * "换了文件"背书，反之亦然。
+   */
+  const clearStaleNotice = (reasons: readonly TargetNoticeReason[]) => {
+    const shown = noticeRef.current;
+    if (!shown || !reasons.includes(shown.reason)) return;
+    noticeRef.current = null;
+    setNotice(null);
+    setError("");
+    // 提示没了，它挂着的"待继续请求"也不再有入口：留着只会在下一次确认时被重放。
+    retry.current = undefined;
+  };
   const read = () => {
     if (!flight.current) {
       flight.current = live.current.inspect().catch(() => null).finally(() => { flight.current = null; });
@@ -88,6 +143,20 @@ export function useAuthorizedTarget(options: {
     else { roundRef.current += 1; setNotice({ bound: bound.current ?? missing, current, reason, round: roundRef.current }); }
     return false;
   };
+  /**
+   * 拦下并记录。
+   *
+   * 顺序不能反过来：`pause` 才是"这一轮提示"的起点（它可能沿用旧轮、也可能开新轮），
+   * 先 emit 再 pause 会把**上一轮**的编号写进诊断，于是"同一 round = 同一条提示"
+   * 这个判读规则当场失效。
+   */
+  const stop = (current: AuthorizedTarget | null, reason: TargetNoticeReason,
+    diagnostic: Omit<TargetDiagnosticInput, "round" | "seq">,
+    onRetry?: () => void, revokeConsent?: boolean) => {
+    const blocked = pause(current, reason, onRetry, revokeConsent);
+    emitDiagnostic(diagnostic);
+    return blocked;
+  };
   const check = async (onRetry?: () => void, requireConfirmation = false): Promise<boolean> => {
     if (live.current.selectionPending?.()) return false;
     if (!live.current.enabled) return true;
@@ -112,23 +181,37 @@ export function useAuthorizedTarget(options: {
         if (bindGeneration.current !== generation) continue;
         if (!bound.current && current) bind(current);
         if (!bound.current) {
-          return pause(current, "unavailable", onRetry);
+          return stop(current, "unavailable",
+            { outcome: "blocked", gate: "metadata", branch: "metadata_unavailable" }, onRetry);
         }
         // Only a positively identified owned copy is exempt, never an arbitrary active file.
         if (current && !onRetry && !requireConfirmation && live.current.isReviewCopy?.(current)) return true;
         const detected = checkAuthorizedTarget(bound.current, current);
         const reason = requireConfirmation && detected === "same" ? "confirmation_required" : detected;
-        if (reason === "same") return true;
-        return pause(current, reason, onRetry);
+        if (reason === "same") {
+          emitDiagnostic({ outcome: "allowed", gate: "metadata", pathIdentity: Boolean(current?.fileKey) });
+          // 元数据闸通过：由**它**产生的旧提示现在不成立了，清掉。
+          clearStaleNotice(["file_changed", "scope_changed", "unavailable"]);
+          return true;
+        }
+        return stop(current, reason, {
+          outcome: "blocked", gate: "metadata",
+          branch: reason === "confirmation_required" ? "forced_confirmation"
+            : reason === "file_changed" ? "metadata_file_changed"
+            : reason === "scope_changed" ? "metadata_scope_changed"
+            : "metadata_unavailable",
+          pathIdentity: Boolean(current?.fileKey)
+        }, onRetry);
       }
       if (!mounted.current) return false;
-      return pause(lastCurrent, "unavailable", onRetry);
+      return stop(lastCurrent, "unavailable",
+        { outcome: "blocked", gate: "metadata", branch: "metadata_unavailable" }, onRetry);
     } finally {
       checksInFlight.current -= 1;
       if (mounted.current && checksInFlight.current === 0) setChecking(false);
     }
   };
-  const checkForAnalysis = async (onRetry?: () => void): Promise<boolean> => {
+  const checkForAnalysis = async (onRetry?: () => void, options: { requireExplicitConsent?: boolean } = {}): Promise<boolean> => {
     if (onRetry) analysisRetries.current.add(onRetry);
     checksInFlight.current += 1;
     setChecking(true);
@@ -143,9 +226,17 @@ export function useAuthorizedTarget(options: {
           if (!mounted.current || live.current.selectionPending?.()) return false;
           if (generation !== bindGeneration.current) continue;
           lastCurrent = current;
-          if (!bound.current) return pause(current, "unavailable", onRetry);
+          if (!bound.current) {
+            return stop(current, "unavailable",
+              { outcome: "blocked", gate: "analysis", branch: "evidence_missing" }, onRetry);
+          }
           const detected = checkAuthorizedTarget(bound.current, current);
-          if (detected === "file_changed" || detected === "scope_changed") return pause(current, detected, onRetry);
+          if (detected === "file_changed" || detected === "scope_changed") {
+            return stop(current, detected, {
+              outcome: "blocked", gate: "analysis",
+              branch: detected === "file_changed" ? "metadata_file_changed" : "metadata_scope_changed"
+            }, onRetry);
+          }
           if (detected !== "same") continue;
           const boundEvidence = await live.current.analysisEvidence(bound.current);
           const evidence = current && await live.current.analysisEvidence(current);
@@ -157,24 +248,76 @@ export function useAuthorizedTarget(options: {
           if (generation !== bindGeneration.current) continue;
           lastCurrent = after;
           const afterCheck = checkAuthorizedTarget(bound.current, after);
-          if (afterCheck === "file_changed" || afterCheck === "scope_changed") return pause(after, afterCheck, onRetry);
+          if (afterCheck === "file_changed" || afterCheck === "scope_changed") {
+            return stop(after, afterCheck, {
+              outcome: "blocked", gate: "analysis",
+              branch: afterCheck === "file_changed" ? "metadata_file_changed" : "metadata_scope_changed"
+            }, onRetry);
+          }
           if (!current || afterCheck !== "same" || checkAuthorizedTarget(current, after) !== "same") continue;
           const repeated = after && await live.current.analysisEvidence(after);
           if (!mounted.current || live.current.selectionPending?.()) return false;
           if (generation !== bindGeneration.current) continue;
           // A missing third proof must not erase a conflict already established by two.
           const keys = [boundEvidence?.key, evidence?.key, repeated?.key].filter((key) => key !== undefined);
-          if (new Set(keys).size > 1) return pause(after, "unavailable", onRetry, true);
+          if (new Set(keys).size > 1) {
+            return stop(after, "unavailable", {
+              outcome: "blocked", gate: "analysis", branch: "evidence_conflict",
+              conclusive: evidence?.conclusive === true,
+              documentBound: evidence?.documentBound === true,
+              stableId: evidence?.diagnostic?.stableId ?? "unknown",
+              pathIdentity: evidence?.diagnostic?.pathIdentity === true
+            }, onRetry, true);
+          }
           if (!boundEvidence || !evidence || !repeated) continue;
-          if ((evidence.conclusive && repeated.conclusive) || analysisConsent.current === evidence.key) return true;
+          /*
+           * 这一处的事实摊平成布尔值，供诊断与判定共用 —— 诊断里写的必须是
+           * **判定真正读到的那几个值**，不是另算一份"看起来一样"的结论。
+           */
+          const facts = {
+            conclusive: evidence.conclusive && repeated.conclusive,
+            documentBound: evidence.documentBound === true && repeated.documentBound === true,
+            hasConsent: analysisConsent.current === evidence.key,
+            explicitRequired: options.requireExplicitConsent === true,
+            stableId: evidence.diagnostic?.stableId ?? "unknown" as const,
+            pathIdentity: evidence.diagnostic?.pathIdentity === true
+          };
+          if (facts.conclusive || facts.hasConsent) {
+            emitDiagnostic({
+              outcome: "allowed", gate: "analysis",
+              via: facts.conclusive ? "conclusive" : "consent", ...facts
+            });
+            // 分析闸通过：`confirmation_required` 这条提示已经不成立，清掉它。
+            clearStaleNotice(["confirmation_required"]);
+            return true;
+          }
+          /*
+           * 文档级证据（路径身份 + 宿主声明的工作表稳定 ID）**只在宿主当次真的给出
+           * 稳定 ID 时**才成立 —— 它不假设 `CodeName`/`SId` 可读，读不到就是 false。
+           * 成立时它跨刷新仍有效，因此不必再让用户确认一次；它**只**用在这道分析闸，
+           * 写入、恢复与数据读取仍各自只认 `conclusive`（对象级）。
+           *
+           * `requireExplicitConsent`：只**禁止用文档级证据替调用方跳过显式确认**
+           * （恢复一张挂起的任务卡时，调用方自己判定旧授权不再适用）。它**不**是
+           * "无条件再问一次" —— 对象级证明或本会话同键同意已经放行的话，走不到这里。
+           */
+          if (!facts.explicitRequired && facts.documentBound) {
+            emitDiagnostic({ outcome: "allowed", gate: "analysis", via: "documentBound", ...facts });
+            clearStaleNotice(["confirmation_required"]);
+            return true;
+          }
           // Consistent weak evidence permits explicit fresh-read consent, not automatic access.
-          return pause(after, "confirmation_required", onRetry);
+          return stop(after, "confirmation_required", {
+            outcome: "blocked", gate: "analysis",
+            branch: facts.documentBound ? "document_bound_rejected" : "weak_evidence", ...facts
+          }, onRetry);
         } catch {
           // Retry transient host failures, without clearing the consent between attempts.
         }
       }
       if (!mounted.current) return false;
-      return pause(lastCurrent, "unavailable", onRetry);
+      return stop(lastCurrent, "unavailable",
+        { outcome: "blocked", gate: "analysis", branch: "evidence_missing" }, onRetry);
     } finally {
       checksInFlight.current -= 1;
       if (mounted.current && checksInFlight.current === 0) setChecking(false);

@@ -37,9 +37,27 @@ export function fixture(options: {
   extraSheet?: boolean;
   /** 公式文本 → 计算值。没登记的公式算 `null`（替身不做真实求值，也不猜）。 */
   formulaValues?: Record<string, CellValue>;
+  /**
+   * 自定义表名（默认 `Source` / `Target`；`extraSheet` 再补一张 `Extra`）。
+   *
+   * 存在理由（2026-11-01）：真机场景是**四张表** —— 来源 `来源!A1:B5` 只读，三张
+   * 结果表各接一个公式动作。表名是判据的一部分（"来源即目标"、授权集合、来源证据
+   * 按表名归属），固定成两张表就让"三个独立动作写三张不同的表"在测试里表达不出来。
+   */
+  sheetNames?: readonly string[];
 } = {}) {
   const storage = new Map<string, unknown>(), writes: string[] = [];
-  const cells = new Map<string, FixtureCell>([["Source!A1", "private-source"], ["Target!A1", "old1"], ["Target!A2", "old2"], ["Target!A3", "old3"]]);
+  const names = options.sheetNames
+    ? [...options.sheetNames]
+    : options.extraSheet
+      ? ["Source", "Target", "Extra"]
+      : ["Source", "Target"];
+  const sourceName = names[0];
+  const targetName = names[1] ?? names[0];
+  const cells = new Map<string, FixtureCell>([
+    [`${sourceName}!A1`, "private-source"],
+    [`${targetName}!A1`, "old1"], [`${targetName}!A2`, "old2"], [`${targetName}!A3`, "old3"]
+  ]);
   const computed = (formula: string): CellValue => options.formulaValues?.[formula] ?? null;
   const physical = (cell: FixtureCell | undefined): { formula: string | null; value: CellValue } => {
     if (cell && typeof cell === "object") return { formula: cell.formula, value: cell.value };
@@ -133,7 +151,7 @@ export function fixture(options: {
     const endColumn = typeof last === "object" ? Number(last.Column) : startColumn + Number(first.Columns?.Count ?? 1) - 1;
     return {startRow, startColumn, endRow: Math.max(startRow, endRow), endColumn: Math.max(startColumn, endColumn)};
   };
-  const sheetNames = options.extraSheet ? ["Source", "Target", "Extra"] : ["Source", "Target"];
+  const sheetNames = names;
   const sheets: WpsWorksheet[] = sheetNames.map(Name => {
     const sheet: WpsWorksheet = {Name, ProtectContents: false,
       Range: (first: WpsRange | string, last?: WpsRange | string) => makeRange(Name, rectOf(first, last))};
@@ -145,11 +163,17 @@ export function fixture(options: {
     ActiveSheet:sheets[1], PluginStorage:{getItem:k=>storage.get(k),setItem:(k,v)=>{storage.set(k,v);}},
     CreateTaskPane:()=>({ID:1,Visible:true}),GetTaskPane:()=>undefined};
   const plan: AnalysisPlan = {id:"plan-resume",title:"Update",summary:"Update",assumptions:[],warnings:[],acceptanceCriteria:[],
-    sourceDependencySheets:["Source"], actions:[1,2,3].map(i=>({type:"writeValues",sheet:"Target",range:`A${i}:A${i}`,values:[[i*10]]}))};
-  const prepared = prepareWpsPlan(application,[1,2],plan,[{sheetName:"Source",range:"A1:A1",values:[["private-source"]]}]);
+    sourceDependencySheets:[sourceName], actions:[1,2,3].map(i=>({type:"writeValues",sheet:targetName,range:`A${i}:A${i}`,values:[[i*10]]}))};
+  /*
+   * 授权集合跟着表名走：默认仍是 `Source`+`Target`（`extraSheet` 时仍然只授权前两张，
+   * 因为"授权比登记多一张表"正是那条用例的前提）；自定义表名时全部授权。
+   */
+  const authorizedIndexes = options.sheetNames ? sheetNames.map((_, index) => index + 1) : [1, 2];
+  const prepared = prepareWpsPlan(application, authorizedIndexes, plan,
+    [{sheetName:sourceName,range:"A1:A1",values:[["private-source"]]}]);
   const state: WpsExecutionState = {operationId,taskId:"task-1",status:"running",revision:5,
     workbookIdentity:"wps-path:c:\\data\\test.xlsx", descriptor:ledger.wpsRecoveryDescriptor(prepared),
-    authorizedSheetNames:["Source","Target"],totalActions:3,nextActionIndex:2,inFlightActionIndex:null,
+    authorizedSheetNames:authorizedIndexes.map(index => sheetNames[index - 1]),totalActions:3,nextActionIndex:2,inFlightActionIndex:null,
     ownerActive:false,canResume:true,requiresReconciliation:false};
   return {application,prepared,state,cells,writes,storage};
 }

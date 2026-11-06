@@ -15,7 +15,7 @@ it("普通聊天展开后只显示完成说明，不重复阶段和过时的准�
       detail: "先判断是否需要工作簿上下文；尚未读取字段或数据。" }]
   };
   const view = render(<TaskProgressTimeline log={log} />);
-  fireEvent.click(screen.getByRole("button", { name: "展开" }));
+  fireEvent.click(screen.getByRole("button", { name: "查看过程" }));
   expect(screen.getByText("已理解并直接回复；未读取工作表")).toBeTruthy();
   expect(screen.queryByText("理解消息")).toBeNull();
   expect(screen.queryByText(log.steps[0].detail!)).toBeNull();
@@ -53,6 +53,16 @@ function sampleLog(): ActivityLog {
 }
 
 describe("TaskProgressTimeline", () => {
+  it("keeps an explicit question compact without hiding pause or recovery controls", () => {
+    const log = { ...sampleLog(), outcome: "awaiting_input" as const };
+    const view = render(<TaskProgressTimeline log={log} awaitingAnswer />);
+    expect(screen.getByRole("button", { name: "查看过程" }).getAttribute("aria-expanded")).toBe("false");
+    expect(view.container.querySelector('.task-progress-heading strong')?.textContent).toContain("等待你的回答");
+    fireEvent.click(screen.getByRole("button", { name: "查看过程" }));
+    expect(screen.getByText("read_range")).toBeTruthy();
+    view.rerender(<TaskProgressTimeline log={log} awaitingAnswer />);
+    expect(screen.getByRole("button", { name: "收起" }).getAttribute("aria-expanded")).toBe("true");
+  });
   it("freezes the entire stopped segment even while backend status is unknown", () => {
     vi.useFakeTimers();
     try {
@@ -71,6 +81,8 @@ describe("TaskProgressTimeline", () => {
     const { container } = render(<TaskProgressTimeline log={sampleLog()} live />);
     expect(container.querySelector(".task-progress-timeline")?.getAttribute("data-status")).toBe("progress");
     expect(container.querySelector(".task-progress-overall")?.textContent).toBe("进行中");
+    expect(container.querySelector(".activity-steps")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "查看过程" }));
     expect(container.querySelector(".activity-steps > li")?.getAttribute("data-status")).toBe("completed");
   });
 
@@ -85,7 +97,7 @@ describe("TaskProgressTimeline", () => {
     // 分账明细留在折叠区**外**：收起不该把"暂停/等待各多久"一起藏起来。
     expect(screen.getByText("暂停 2.0s · 等待进度 3.0s")).toBeTruthy();
 
-    fireEvent.click(screen.getByRole("button", { name: "展开" }));
+    fireEvent.click(screen.getByRole("button", { name: "查看过程" }));
     expect(screen.getByText("执行过程 · 1 步 · 5.0s")).toBeTruthy();
   });
 
@@ -114,11 +126,11 @@ describe("TaskProgressTimeline", () => {
   it("folds completed ordinary chat after its live phase, but keeps details expandable", () => {
     const log = { ...sampleLog(), defaultCollapsed: true, outcome: "completed" as const };
     const view = render(<TaskProgressTimeline log={log} live />);
-    expect(screen.getByText("read_range")).toBeTruthy();
-    view.rerender(<TaskProgressTimeline log={log} />);
-    expect(screen.getByRole("button", { name: "展开" }).getAttribute("aria-expanded")).toBe("false");
     expect(screen.queryByText("read_range")).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "展开" }));
+    view.rerender(<TaskProgressTimeline log={log} />);
+    expect(screen.getByRole("button", { name: "查看过程" }).getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByText("read_range")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "查看过程" }));
     view.rerender(<TaskProgressTimeline log={{ ...log, totalMs: 12000 }} />);
     expect(screen.getByText("read_range")).toBeTruthy();
   });
@@ -153,7 +165,7 @@ describe("TaskProgressTimeline", () => {
     fireEvent.click(screen.getByRole("button", { name: "收起" }));
 
     expect(
-      screen.getByRole("button", { name: "展开" }).getAttribute("aria-expanded")
+      screen.getByRole("button", { name: "查看过程" }).getAttribute("aria-expanded")
     ).toBe("false");
     expect(screen.queryByText("read_range")).toBeNull();
   });
@@ -173,6 +185,7 @@ describe("TaskProgressTimeline", () => {
     };
 
     render(<TaskProgressTimeline log={log} live />);
+    fireEvent.click(screen.getByRole("button", { name: "查看过程" }));
 
     expect(screen.getByText("基础步骤")).toBeTruthy();
     expect(screen.getAllByText("进行中").length).toBeGreaterThan(0);
@@ -209,7 +222,7 @@ describe("TaskProgressTimeline", () => {
       );
 
       expect(
-        screen.getByRole("button", { name: "展开" }).getAttribute(
+        screen.getByRole("button", { name: "查看过程" }).getAttribute(
           "aria-expanded"
         )
       ).toBe("false");
@@ -248,6 +261,7 @@ it("identifies the model stage without reordering its completed tool calls", () 
     { id: "tool-1", label: "查询完成", status: "completed", elapsedMs: 30 }
   ] };
   const view = render(<TaskProgressTimeline log={log} live />);
+  fireEvent.click(screen.getByRole("button", { name: "查看过程" }));
   expect(screen.getByText("正在生成操作方案（整体阶段，包含工具调用）")).toBeTruthy();
   expect([...view.container.querySelectorAll(".activity-step-label")].map(el => el.textContent)).toEqual([
     "正在生成操作方案（整体阶段，包含工具调用）", "查询完成"
@@ -270,6 +284,7 @@ describe("限高与内部滚动（A 批）", () => {
 
   it("进行中默认 160px，靠内部滚动而不是把输入框挤出窗格", () => {
     const { container } = render(<TaskProgressTimeline log={sampleLog()} live />);
+    fireEvent.click(screen.getByRole("button", { name: "查看过程" }));
     const body = scrollableBody(container);
     expect(body.style.getPropertyValue("--process-panel-max-height")).toBe("160px");
     // 限高必须真的由 CSS 执行，不能只写在变量里没人读。
@@ -294,6 +309,7 @@ describe("限高与内部滚动（A 批）", () => {
     });
     try {
       const { container } = render(<TaskProgressTimeline log={sampleLog()} live />);
+      fireEvent.click(screen.getByRole("button", { name: "查看过程" }));
       const body = scrollableBody(container);
       fireEvent.click(screen.getByRole("button", { name: "多显示几行" }));
       expect(body.style.getPropertyValue("--process-panel-max-height")).toBe("420px");
@@ -324,6 +340,7 @@ describe("限高与内部滚动（A 批）", () => {
       });
       try {
         render(<TaskProgressTimeline log={{ ...sampleLog(), outcome: "completed" }} live />);
+        fireEvent.click(screen.getByRole("button", { name: "查看过程" }));
         fireEvent.click(screen.getByRole("button", { name: "收起" }));
         expect(screen.getByText("已完成 · 10.8s")).toBeTruthy();
         // 关键：收起**不许**替用户决定"现在该看哪"。
@@ -342,6 +359,7 @@ describe("限高与内部滚动（A 批）", () => {
 
   it("用户上翻内部日志后给出回到最新步骤的入口，贴底时不出现", () => {
     const { container } = render(<TaskProgressTimeline log={sampleLog()} live />);
+    fireEvent.click(screen.getByRole("button", { name: "查看过程" }));
     const body = scrollableBody(container);
     Object.defineProperties(body, {
       scrollHeight: { configurable: true, value: 900 },

@@ -7,6 +7,9 @@ import { ribbon } from "./ribbon";
 // 写入适配器中，不再通过另一套产品样式制造两个界面。
 import "../../excel-addin/src/styles.css";
 import "./styles.css";
+import "../../excel-addin/src/chatScrollbars.css";
+import "../../excel-addin/src/appearance.css";
+import "../../excel-addin/src/conversation.css";
 
 window.ribbon = ribbon;
 reportDevProbe("bootstrap", {

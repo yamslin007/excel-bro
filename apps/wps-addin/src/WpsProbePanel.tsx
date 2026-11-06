@@ -55,6 +55,13 @@ export default function WpsProbePanel() {
   /** 当前已核实的授权。勾选、取消勾选或切换模式自动核验并提交，期间阻止读写。 */
   const [selectedIndexes, setSelectedIndexes] = useState<number[]>([]);
   const [scopeMode, setScopeMode] = useState<"auto" | "manual">("auto");
+  /**
+   * 本次打开窗格时，勾选是从本地固定范围**恢复**的。
+   *
+   * 只用来决定"需要确认"那一支的文案：重载后确需确认时要说清"窗格已重新加载、
+   * 勾选没有变动"。用户自己改过勾选（走 adopt / 面板确认）就置回 false。
+   */
+  const [scopeRestored, setScopeRestored] = useState(false);
   /** 界面选择与核验结果分开，避免异步读数覆盖最新勾选；关闭面板不回退。 */
   const [draftIndexes, setDraftIndexes] = useState<number[]>([]);
   const [draftMode, setDraftMode] = useState<"auto" | "manual">("auto");
@@ -151,9 +158,12 @@ export default function WpsProbePanel() {
       setMetadata(nextMetadata);
       const restored = loadWpsPinnedSelection(nextMetadata);
       if (restored.kind === "none") {
+        setScopeRestored(false);
         setSelectedIndexes(nextMetadata.sheets.filter((sheet) => sheet.isActive).map((sheet) => sheet.index));
       } else {
         const indexes = restored.kind === "fixed" ? restored.indexes : [];
+        // 固定范围是从本地恢复的：这正是"重载窗格后需要再确认一次"的场景。
+        setScopeRestored(restored.kind === "fixed");
         manualScopeMetadata.current = nextMetadata;
         setScopeMode("manual"); setDraftMode("manual");
         setSelectedIndexes(indexes); setDraftIndexes(indexes);
@@ -1000,9 +1010,12 @@ export default function WpsProbePanel() {
             : null
         }
         onOpenScope={openScope}
+        scopeRestored={scopeRestored}
         scopePickerOpen={scopeOpen}
         onScopeConfirmationReady={registerScopeConfirmation}
         onAuthorizeTarget={(indexes) => {
+          // 用户已经明确确认过一份范围：之后不再是"重载后待确认"的场景。
+          setScopeRestored(false);
           const nextMetadata = listWpsWorksheets(getWpsApplication());
           setMetadata(nextMetadata);
           setProbe(runProbe());

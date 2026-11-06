@@ -1,3 +1,5 @@
+import { useSyncExternalStore } from 'react';
+import { ResultReview } from '@excel-bro/core/resultReview';
 // @vitest-environment jsdom
 import { act, cleanup, renderHook } from '@testing-library/react';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
@@ -32,6 +34,15 @@ it('derives the ratio from the whole monitor work area, never the original windo
   expect(result.current).toBe(true); // requested != accepted
   resize(360); await tick(); expect(result.current).toBe(false);
   expect(setWidth).toHaveBeenCalledTimes(1); // own resize is not a loop
+});
+it('changing tabs in the same copy preserves the pane sizing session', async () => {
+  const {rerender} = renderHook(({value}) => useReviewPaneRatio(value), {initialProps:{value:scope}});
+  await tick(0); resize(360); await tick();
+  const count = setWidth.mock.calls.length;
+  rerender({value:{...scope, original:{name:'结果3'}}});
+  await tick();
+  expect(setWidth).toHaveBeenCalledTimes(count);
+  expect(measureLocalExcelWindow).toHaveBeenLastCalledWith(scope.workbookIdentity, '结果3', scope.copySheetName);
 });
 it('follows host-only work-area changes even when the iframe stays fixed, debounces pane resize', async () => {
   renderHook(()=>useReviewPaneRatio(scope)); await tick(0); resize(360); await tick();
@@ -132,4 +143,29 @@ it('keeps 35/35/30 of the whole work area and never 30% of the right window', ()
   expect(plan.originalSheetWidth).toBe(700);
   expect(plan.aiPaneWidth).not.toBe(Math.round(plan.originalWidth * 0.3)); // 390 would squeeze the original to 910
   expect(plan.degraded).toBe(false);
+});
+
+it('sizes the executed-result copy and restores normal chat width after leaving comparison', async () => {
+  localStorage.setItem(TASK_PANE_WIDTH_STORAGE_KEY, '800');
+  const review = new ResultReview<string, {executionId:string;verified:boolean;undoable:boolean}, string, typeof scope>();
+  const execute = vi.fn(async () => ({executionId:'e',verified:true,undoable:true}));
+  const {result} = renderHook(() => {
+    const state = useSyncExternalStore(review.subscribe,review.getSnapshot,review.getSnapshot);
+    return useUIState(state.comparing || (state.phase === 'reviewing' && state.pending),review.getComparisonCopy());
+  });
+  await act(async () => { await review.start('r', {
+    isCurrent:()=>true,prepare:async()=> 'before',execute,mark:async()=> 'marker',clearMarker:async()=>{},
+    showBefore:async()=>scope,closeBefore:async()=>null,restore:async()=>{},accepted:()=>{}
+  }); });
+  setWidth.mockClear();
+  await act(async () => { await review.compare('r'); }); await tick(0);
+  expect(setWidth).toHaveBeenCalledWith(360);
+  resize(360); await tick(); setWidth.mockClear();
+  act(()=>window.dispatchEvent(new Event('focus'))); await tick(0);
+  expect(setWidth).not.toHaveBeenCalledWith(800);
+  expect(localStorage.getItem(TASK_PANE_WIDTH_STORAGE_KEY)).toBe('800');
+  expect(result.current.comparisonPaneNeedsResize).toBe(false);
+  await act(async () => { await review.exitComparison('r'); }); await tick(0);
+  expect(setWidth).toHaveBeenCalledWith(800);
+  expect(execute).toHaveBeenCalledTimes(1);
 });

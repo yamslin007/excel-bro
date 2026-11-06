@@ -14,8 +14,7 @@ import {
 import type {
   ModelSettings,
   UpsertModelConnectionRequest,
-  ModelConnectionProtocol,
-  ModelConnectionPurpose
+  ModelConnectionProtocol
 } from "../contracts";
 import { emptyModelConnectionDraft } from "../utils";
 import { MODEL_STORAGE_KEY } from "../conversation";
@@ -27,7 +26,6 @@ import {
 
 export interface ModelConnectionDraft {
   protocol?: ModelConnectionProtocol;
-  purpose?: ModelConnectionPurpose;
   id: string | null;
   label: string;
   baseUrl: string;
@@ -275,7 +273,6 @@ export function useModelManagement(options: UseModelManagementOptions) {
       apiKey: "",
       clearApiKey: false,
       protocol: connection.protocol ?? "openai_compatible",
-      purpose: connection.agentAvailable === false ? "formula" : "agent",
       supportsVision: connection.supportsVision
     });
     setSettingsFeedback("");
@@ -322,13 +319,12 @@ export function useModelManagement(options: UseModelManagementOptions) {
     setSettingsFeedback("");
     setConnectionTestFeedback(null);
     try {
-      const purpose = connectionDraft?.purpose ?? "agent";
-      const result = await testModelConnection({ ...request, purpose });
+      const result = await testModelConnection(request);
       if (connectionDraftVersionRef.current !== draftVersion) return;
-      const verified = result.ok && result.testedFor === purpose;
+      const verified = result.ok;
       setConnectionTestFeedback({
         kind: verified ? "success" : "error",
-        message: verified ? result.message : "服务未验证所选用途，请更新后台后重新测试连接。"
+        message: result.message
       });
       if (verified) {
         verifiedDraftVersionRef.current = draftVersion;
@@ -351,7 +347,7 @@ export function useModelManagement(options: UseModelManagementOptions) {
     } finally {
       setSettingsTesting(false);
     }
-  }, [connectionRequest, connectionDraft?.purpose, refreshServiceHealth]);
+  }, [connectionRequest, refreshServiceHealth]);
 
   /**
    * 保存连接
@@ -384,13 +380,13 @@ export function useModelManagement(options: UseModelManagementOptions) {
         : null;
       await refreshModelsAfterSettings(
         saved,
-        (connectionDraft.purpose ?? "agent") === "agent" ? createdConnection?.catalogModelId : undefined
+        createdConnection?.catalogModelId
       );
       setShowApiKey(false);
       setConnectionDraft(null);
       setSettingsFeedback(
         wasCreating
-          ? "模型连接已添加。用途与可用状态请见连接列表。"
+          ? "模型连接已添加。"
           : "模型连接已更新。"
       );
     } catch (reason) {

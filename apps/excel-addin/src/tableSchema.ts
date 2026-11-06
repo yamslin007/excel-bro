@@ -3,5 +3,8 @@
 export {
   normalizeField,
   detectHeaderIndex,
-  detectSheetFields
+  detectSheetFields,
+  looksLikeHeaderRow,
+  isSyntheticField,
+  syntheticFields
 } from "@excel-bro/core/tableSchema";

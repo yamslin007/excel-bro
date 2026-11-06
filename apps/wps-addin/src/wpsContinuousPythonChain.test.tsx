@@ -199,7 +199,17 @@ vi.mock("./wpsNativeComparison", () => ({
   })),
   compareCommittedWpsResultToCopy: vi.fn(() => "matched"),
   verifyWpsNativeComparison: vi.fn(),
-  discardWpsNativeComparison: vi.fn(() => "closed")
+  discardWpsNativeComparison: vi.fn(() => "closed"),
+  /*
+   * 副本登记/切表适配层后来新增了这些出口；这里的替身只需保证"调用不炸"，
+   * 真实持久化与并排行为由 wpsNativeComparison 自己的单测覆盖。
+   * 缺一个就会在 `ResultReview.closeBefore()` 里抛未处理的拒绝。
+   */
+  suspendWpsComparison: vi.fn(async () => null),
+  switchWpsBeforeComparison: vi.fn(async () => true),
+  activateWpsBeforeComparison: vi.fn(),
+  saveWpsComparisonCopies: vi.fn(async () => {}),
+  loadWpsComparisonCopies: vi.fn(async () => [])
 }));
 
 async function mount(element: React.ReactElement): Promise<HTMLElement> {
@@ -733,11 +743,11 @@ describe("WPS 连续链路：同一次任务从宿主读取到撤销", () => {
 
     // 3) 计划就绪即执行（先执行、后审阅）→ 结果回到主表并由固定操作条承接确认。
     await until(
-      () => findButton(container, "确认变更") !== null || (container.textContent ?? "").includes("本次执行需要核对"),
+      () => findButton(container, "确认全部变更") !== null || (container.textContent ?? "").includes("本次执行需要核对"),
       "应自动执行并进入结果审阅：" + (container.textContent ?? "").slice(-160)
     );
     // 执行已经发生；这里确认的是"执行结果已就绪"，下面用回读与撤销验证业务结果。
-    expect(findButton(container, "确认变更")).not.toBeNull();
+    expect(findButton(container, "确认全部变更")).not.toBeNull();
 
     await until(
       () => container.querySelector(".wps-verification-card") !== null,
@@ -752,7 +762,7 @@ describe("WPS 连续链路：同一次任务从宿主读取到撤销", () => {
 
     // 4) 确认变更 → 撤销：确认只移除审阅标记，不重放计划；
     //    撤销走真实恢复点，把目标区回到执行前（空表）。
-    await click(findButton(container, "确认变更"));
+    await click(findButton(container, "确认全部变更"));
     await until(() => (container.textContent ?? "").includes("已确认变更"), "应确认本次结果");
     const undo = cardUndoButton(container);
     expect(undo, "执行结果卡里必须挂可用的撤销按钮").not.toBeNull();

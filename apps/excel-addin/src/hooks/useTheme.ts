@@ -1,17 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  clearBackgroundImage,
   loadBackgroundImage,
   loadThemeSettings,
-  saveBackgroundImage,
-  saveThemeSettings,
-  type ThemePreset,
-  type ThemeSettings
+  saveThemeSnapshot,
+  type ThemePreset
 } from "../utils/imageStorage";
 import {
   convertToJPEG,
   validateImageFile
 } from "../utils/imageProcessing";
+
+import { APPEARANCE_DEFAULTS, normalizeAppearance, type AppearanceSettings } from "../utils/appearanceSettings";
 
 interface PresetPalette {
   background: string;
@@ -131,13 +130,6 @@ const PRESETS: Record<ThemePreset, PresetPalette> = {
   }
 };
 
-const DEFAULT_SETTINGS: ThemeSettings = {
-  preset: "default",
-  opacity: 100,
-  autoMask: false,
-  hasCustomBackground: false
-};
-
 function rootStyle(): CSSStyleDeclaration {
   return document.documentElement.style;
 }
@@ -164,178 +156,215 @@ export function applyThemePalette(preset: ThemePreset): void {
   style.setProperty("--theme-pattern", palette.pattern);
 }
 
-function applyBackground(url: string | null, opacity: number): void {
-  const style = rootStyle();
-  const container = document.querySelector<HTMLElement>(".chat-shell");
-  if (!url) {
-    style.setProperty("--custom-background-image", "none");
-    style.setProperty("--custom-background-opacity", "0");
-    container?.removeAttribute("data-has-background");
-    return;
-  }
-  style.setProperty("--custom-background-image", `url("${url}")`);
-  style.setProperty("--custom-background-opacity", String(opacity / 100));
-  container?.setAttribute("data-has-background", "true");
+function rgba(hex: string, alpha: number): string {
+  const n = parseInt(hex.slice(1), 16);
+  return `rgba(${n >> 16}, ${(n >> 8) & 255}, ${n & 255}, ${alpha})`;
 }
 
-function applyMask(enabled: boolean): void {
-  const container = document.querySelector<HTMLElement>(".chat-shell");
-  if (!container) return;
-  if (enabled && container.hasAttribute("data-has-background")) {
-    container.setAttribute("data-auto-mask", "true");
-  } else {
-    container.removeAttribute("data-auto-mask");
-  }
+function lighten(hex: string): string {
+  const n = parseInt(hex.slice(1), 16);
+  return "#" + [n >> 16, (n >> 8) & 255, n & 255]
+    .map((channel) => Math.round(channel * 0.55 + 255 * 0.45).toString(16).padStart(2, "0")).join("");
 }
+
+/** Keep accent hue while ensuring small links remain readable on the paper. */
+function readingLinkColor(hex: string, background: string, dark: boolean): string {
+  const channels = (color: string) => [1, 3, 5].map(index => parseInt(color.slice(index, index + 2), 16));
+  const light = (rgb: number[]) => rgb.map(value => {
+    const c = value / 255;
+    return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+  }).reduce((sum, value, index) => sum + value * [0.2126, 0.7152, 0.0722][index], 0);
+  let rgb = channels(hex);
+  const base = light(channels(background));
+  for (let i = 0; i < 32; i++) {
+    const ink = light(rgb);
+    if ((Math.max(ink, base) + 0.05) / (Math.min(ink, base) + 0.05) >= 5) break;
+    rgb = rgb.map(value => Math.round(value * 0.9 + (dark ? 255 : 0) * 0.1));
+  }
+  return '#' + rgb.map(value => value.toString(16).padStart(2, '0')).join('');
+}
+
+export function applyAppearance(settings: AppearanceSettings, url: string | null, systemDark = false): void {
+  applyThemePalette(settings.preset);
+  const style = rootStyle();
+  const dark = settings.colorMode === "dark" || (settings.colorMode === "system" && systemDark);
+  const palette = PRESETS[settings.preset];
+  const surface = dark ? "#202824" : palette.background;
+  const selectedAccent = settings.accentColor ?? palette.brandText;
+  const accent = dark ? lighten(selectedAccent) : selectedAccent;
+  document.documentElement.dataset.ebAppearance = dark ? "dark" : "light";
+  if (dark) {
+    for (const [name, value] of Object.entries({
+      "background": "#161c19", "background-subtle": "#1b231f", "surface": "#242e28", "surface-hover": "#303d34",
+      "text-primary": "#edf3ef", "text-secondary": "#b8c7bd", "text-tertiary": "#9aac9f",
+      "border": "#3b4a40", "border-strong": "#56685b", "brand-bg": "#263f30", "brand-hover": "#34523f"
+    })) style.setProperty(`--color-${name}`, value);
+  }
+  style.setProperty("--color-brand-text", accent);
+  style.setProperty("--appearance-accent", accent);
+  // Controls use a contrasting foreground even for a very light custom accent.
+  const n = parseInt(accent.slice(1), 16);
+  const luminance = (0.2126 * (n >> 16) + 0.7152 * ((n >> 8) & 255) + 0.0722 * (n & 255)) / 255;
+  style.setProperty("--appearance-accent-ink", luminance > 0.62 ? "#18231b" : "#ffffff");
+  style.setProperty("--appearance-card-bg", rgba(surface, settings.cardOpacity / 100));
+  // Only local text surfaces get a readability floor; empty space stays transparent.
+  style.setProperty("--appearance-reading-bg", rgba(surface, Math.max(0.90, settings.cardOpacity / 100)));
+  style.setProperty("--appearance-dock-bg", rgba(surface, 0.72));
+  style.setProperty("--appearance-reading-secondary", dark ? "#b8c7bd" : "#535b57");
+  style.setProperty("--appearance-reading-link", readingLinkColor(accent, surface, dark));
+  style.setProperty("--appearance-input-bg", rgba(surface, Math.max(0.94, settings.cardOpacity / 100)));
+  // Keep the selected theme hue; darken light accents until white text is readable.
+  const userSurface = readingLinkColor(selectedAccent, "#ffffff", false);
+  style.setProperty("--appearance-user-bg", userSurface);
+  style.setProperty("--appearance-user-ink", "#ffffff");
+  style.setProperty("--appearance-user-border", userSurface);
+  style.setProperty("--appearance-card-blur", `${settings.cardBlur}px`);
+  style.setProperty("--appearance-radius", `${settings.cardRadius}px`);
+  style.setProperty("--appearance-fit", settings.fit);
+  style.setProperty("--appearance-zoom", String(settings.zoom / 100));
+  style.setProperty("--appearance-position", `${settings.positionX}% ${settings.positionY}%`);
+  style.setProperty("--appearance-filter", `brightness(${settings.brightness / 100}) blur(${settings.blur}px)`);
+  style.setProperty("--appearance-image-bleed", `${settings.blur}px`);
+  if (dark) style.setProperty("--color-progress-glyph", accent);
+  style.setProperty("--appearance-mask", settings.autoMask ? "0.38" : "0");
+  style.setProperty("--custom-background-image", url ? `url("${url}")` : "none");
+  style.setProperty("--custom-background-opacity", url ? String(settings.opacity / 100) : "0");
+  document.querySelectorAll<HTMLElement>(".chat-shell").forEach((shell) => {
+    if (url) shell.setAttribute("data-has-background", "true");
+    else shell.removeAttribute("data-has-background");
+    if (url && settings.autoMask) shell.setAttribute("data-auto-mask", "true");
+    else shell.removeAttribute("data-auto-mask");
+  });
+}
+
+type Snapshot = { settings: AppearanceSettings; image: Blob | null };
 
 export function useTheme() {
-  const [settings, setSettings] = useState<ThemeSettings>(DEFAULT_SETTINGS);
+  const [snapshot, setSnapshot] = useState<Snapshot>({ settings: APPEARANCE_DEFAULTS, image: null });
   const [backgroundUrl, setBackgroundUrl] = useState<string | null>(null);
   const [ready, setReady] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [editing, setEditing] = useState(false);
   const [error, setError] = useState("");
-  const objectUrlRef = useRef<string | null>(null);
+  const saved = useRef(snapshot);
+  const current = useRef(snapshot);
+  const editingRef = useRef(false);
+  const savingRef = useRef(false);
+  const uploadVersion = useRef(0);
+  const uploadInFlight = useRef(false);
+  const active = useRef(true);
+  const [systemDark, setSystemDark] = useState(false);
+  const replace = useCallback((next: Snapshot) => { current.current = next; setSnapshot(next); }, []);
 
-  const persist = useCallback(async (next: ThemeSettings) => {
-    setSettings(next);
-    try {
-      await saveThemeSettings(next);
-    } catch {
-      // IndexedDB 不可用时仍允许本次会话使用主题。
-    }
+  useEffect(() => {
+    const query = window.matchMedia?.("(prefers-color-scheme: dark)");
+    if (!query) return;
+    const update = () => setSystemDark(query.matches);
+    update();
+    if (query.addEventListener) query.addEventListener("change", update);
+    else query.addListener?.(update);
+    return () => { if (query.removeEventListener) query.removeEventListener("change", update); else query.removeListener?.(update); };
   }, []);
 
   useEffect(() => {
-    let active = true;
-    async function initialize() {
+    active.current = true;
+    let cancelled = false;
+    void (async () => {
       try {
-        const stored = await loadThemeSettings();
-        const next = stored ?? DEFAULT_SETTINGS;
-        applyThemePalette(next.preset);
-        applyMask(next.autoMask);
-        setSettings(next);
-
-        if (next.hasCustomBackground) {
-          const blob = await loadBackgroundImage();
-          if (active && blob) {
-            const url = URL.createObjectURL(blob);
-            objectUrlRef.current = url;
-            setBackgroundUrl(url);
-            applyBackground(url, next.opacity);
-          }
-        }
+        const stored = normalizeAppearance(await loadThemeSettings());
+        const image = stored.hasCustomBackground ? await loadBackgroundImage() : null;
+        if (cancelled) return;
+        const next = { settings: { ...stored, hasCustomBackground: Boolean(image) }, image };
+        saved.current = next;
+        replace(next);
+        if (stored.hasCustomBackground && !image) setError("已保存的壁纸无法读取，请重新选择图片。");
       } catch {
-        // 降级为默认主题。
-      } finally {
-        if (active) setReady(true);
-      }
-    }
-    void initialize();
-    return () => {
-      active = false;
-      if (objectUrlRef.current) {
-        URL.revokeObjectURL(objectUrlRef.current);
-        objectUrlRef.current = null;
-      }
-    };
+        if (!cancelled) setError("无法读取已保存的外观；可以预览，应用时将重新尝试保存。");
+      } finally { if (!cancelled) setReady(true); }
+    })();
+    return () => { cancelled = true; active.current = false; uploadVersion.current++; };
+  }, [replace]);
+
+  useEffect(() => {
+    const url = snapshot.image ? URL.createObjectURL(snapshot.image) : null;
+    setBackgroundUrl(url);
+    return () => { if (url) URL.revokeObjectURL(url); };
+  }, [snapshot.image]);
+
+  useEffect(() => { applyAppearance(snapshot.settings, backgroundUrl, systemDark); }, [snapshot.settings, backgroundUrl, systemDark]);
+  useEffect(() => {
+    document.documentElement.toggleAttribute("data-appearance-editing", editing);
+    return () => document.documentElement.removeAttribute("data-appearance-editing");
+  }, [editing]);
+
+  const beginEdit = useCallback(() => {
+    if (editingRef.current || savingRef.current) return;
+    editingRef.current = true;
+    setEditing(true);
+    replace(saved.current);
+  }, [replace]);
+  const cancelEdit = useCallback(() => {
+    if (savingRef.current || !editingRef.current) return;
+    uploadVersion.current++;
+    uploadInFlight.current = false;
+    editingRef.current = false;
+    setEditing(false);
+    setUploading(false);
+    setError("");
+    replace(saved.current);
+  }, [replace]);
+  const updateSettings = useCallback((patch: Partial<AppearanceSettings>) => {
+    if (!editingRef.current || savingRef.current) return;
+    replace({ ...current.current, settings: normalizeAppearance({ ...current.current.settings, ...patch }) });
+  }, [replace]);
+  const uploadBackground = useCallback(async (file: File) => {
+    if (!editingRef.current || savingRef.current) return;
+    const version = ++uploadVersion.current;
+    uploadInFlight.current = true;
+    setError("");
+    try {
+      validateImageFile(file);
+      setUploading(true);
+      const image = await convertToJPEG(file, 0.9);
+      if (!active.current || version !== uploadVersion.current || !editingRef.current) return;
+      replace({ settings: { ...current.current.settings, hasCustomBackground: true }, image });
+    } catch (reason) {
+      if (active.current && version === uploadVersion.current) setError(reason instanceof Error ? reason.message : "图片处理失败");
+    } finally { if (active.current && version === uploadVersion.current) { uploadInFlight.current = false; setUploading(false); } }
+  }, [replace]);
+  const removeBackground = useCallback(() => {
+    if (!editingRef.current || savingRef.current) return;
+    uploadVersion.current++;
+    uploadInFlight.current = false;
+    setUploading(false);
+    replace({ settings: { ...current.current.settings, hasCustomBackground: false }, image: null });
+  }, [replace]);
+  const resetTheme = useCallback(() => {
+    if (!editingRef.current || savingRef.current) return;
+    uploadVersion.current++;
+    uploadInFlight.current = false;
+    setUploading(false);
+    replace({ settings: { ...APPEARANCE_DEFAULTS }, image: null });
+  }, [replace]);
+  const applyChanges = useCallback(async () => {
+    if (!editingRef.current || savingRef.current || uploadInFlight.current) return false;
+    savingRef.current = true;
+    setSaving(true);
+    setError("");
+    const next = current.current;
+    try {
+      await saveThemeSnapshot(next.settings, next.image);
+      saved.current = next;
+      editingRef.current = false;
+      if (active.current) setEditing(false);
+      return true;
+    } catch {
+      if (active.current) setError("外观未保存，请检查可用存储空间后重试；当前仍是临时预览。");
+      return false;
+    } finally { savingRef.current = false; if (active.current) setSaving(false); }
   }, []);
 
-  const applyPreset = useCallback(
-    async (preset: ThemePreset) => {
-      applyThemePalette(preset);
-      await persist({ ...settings, preset });
-    },
-    [persist, settings]
-  );
-
-  const uploadBackground = useCallback(
-    async (file: File) => {
-      setError("");
-      try {
-        console.log("[Theme] 上传开始:", file.name, file.size, file.type);
-        validateImageFile(file);
-        setUploading(true);
-        const blob = await convertToJPEG(file, 0.9);
-        await saveBackgroundImage(blob);
-        if (objectUrlRef.current) {
-          URL.revokeObjectURL(objectUrlRef.current);
-        }
-        const url = URL.createObjectURL(blob);
-        objectUrlRef.current = url;
-        setBackgroundUrl(url);
-        applyBackground(url, settings.opacity);
-        applyMask(settings.autoMask);
-        await persist({
-          ...settings,
-          hasCustomBackground: true
-        });
-      } catch (reason) {
-        setError(reason instanceof Error ? reason.message : "图片上传失败");
-      } finally {
-        setUploading(false);
-      }
-    },
-    [persist, settings]
-  );
-
-  const removeBackground = useCallback(async () => {
-    if (objectUrlRef.current) {
-      URL.revokeObjectURL(objectUrlRef.current);
-      objectUrlRef.current = null;
-    }
-    setBackgroundUrl(null);
-    applyBackground(null, 0);
-    applyMask(false);
-    try {
-      await clearBackgroundImage();
-    } catch {
-      // 即使删除失败，本次会话仍应恢复默认。
-    }
-    await persist({
-      ...settings,
-      hasCustomBackground: false
-    });
-  }, [persist, settings]);
-
-  const setOpacity = useCallback(
-    async (opacity: number) => {
-      const next = { ...settings, opacity };
-      setSettings(next);
-      if (backgroundUrl) {
-        applyBackground(backgroundUrl, opacity);
-      }
-      await persist(next);
-    },
-    [backgroundUrl, persist, settings]
-  );
-
-  const setAutoMask = useCallback(
-    async (autoMask: boolean) => {
-      const next = { ...settings, autoMask };
-      setSettings(next);
-      applyMask(autoMask);
-      await persist(next);
-    },
-    [persist, settings]
-  );
-
-  const resetTheme = useCallback(async () => {
-    applyThemePalette("default");
-    await removeBackground();
-    await persist({ ...DEFAULT_SETTINGS });
-  }, [persist, removeBackground]);
-
-  return {
-    ready,
-    settings,
-    backgroundUrl,
-    uploading,
-    error,
-    applyPreset,
-    uploadBackground,
-    removeBackground,
-    setOpacity,
-    setAutoMask,
-    resetTheme
-  };
+  return { ready, settings: snapshot.settings, backgroundUrl, uploading, saving, editing, error,
+    beginEdit, cancelEdit, updateSettings, uploadBackground, removeBackground, resetTheme, applyChanges };
 }

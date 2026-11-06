@@ -2,17 +2,19 @@ import {reportWpsHostWrites} from "../../excel-addin/src/api";
 import {armRecoveryProbe,bindRecoveryProbe,interruptRecoveryProbe} from "@excel-bro/core/recoveryProbe";
 import {inspectWpsRecoveryState} from "./wpsRecoveryInspection";
 import {fixture, operationId, recoveryChannel} from "./wpsResume.testHost";
+import {captureWpsBeforeResult} from "./wpsNativeComparison";
 import {backendRecovery, resetBackendRecovery} from "./wpsRecoveryStore.testHost";
 import {buildWpsRecoveryPackage, ensureWpsRecoveryMaterial, retireWpsRecoveryPackage} from "./wpsRecoveryPackage";
 import {beforeEach, describe, expect, it, vi} from "vitest";
 import type {WpsExecutionState} from "../../excel-addin/src/contracts";
 import {assertWpsRecoveryDescriptor, assertWpsExecutionResult} from "../../excel-addin/src/contracts";
-import {adoptWpsUndoRecord, executeWpsPlan, inspectWpsUndoRecord, latestWpsUndo, matrixFingerprintV2, prepareWpsPlan, prepareWpsResume, undoWpsExecution, wpsResumeWindow, wpsUndoRecordFor, wpsResumeContext} from "./wpsPlanExecutor";
+import {adoptWpsUndoRecord, executeWpsPlan, inspectWpsUndoRecord, latestWpsUndo, matrixFingerprintV2, prepareWpsPlan, prepareWpsResume, undoWpsExecution, WpsUndoResidualError, wpsResumeWindow, wpsUndoRecordFor, wpsResumeContext} from "./wpsPlanExecutor";
 import {canResumeWpsExecution, resumeWpsExecution, wpsResumeUnavailableReason} from "./wpsExecutionResume";
 import {wpsReconcileVerdict, wpsReconcileActions} from "./wpsExecutionReconcile";
 import * as ledger from "./wpsExecutionLedger";
 import capabilities from "../../../config/capabilities.json";
 import {stampLiteralPlanOrigin} from "@excel-bro/core/literalPlanOrigin";
+import {FORMULA_SOURCE_CHANGED_MESSAGE} from "@excel-bro/core/formulaWriteback";
 
 vi.mock("../../excel-addin/src/api", async original => {
   const actual = await original<typeof import("../../excel-addin/src/api")>();
@@ -56,6 +58,22 @@ function wire(state: WpsExecutionState, onClaim?:()=>void, onStart?:()=>void) {
 }
 beforeEach(()=>{vi.clearAllMocks();resetBackendRecovery();});
 describe("WPS exact remaining action recovery",()=>{
+  it("formula coverage-only evidence survives the result-review preflight without false source change", () => {
+    const f = fixture();
+    const prepared = prepareWpsPlan(f.application, [1, 2], {...f.prepared.plan,
+      actions: [1, 2, 3].map(row => ({type: "writeFormulas" as const, sheet: "Target", range: `A${row}`, formulas: [["=Source!A1"]]}))});
+    expect(prepared.sources.some(source => source.coverageOnly)).toBe(true);
+    const baseline = JSON.stringify(prepared);
+    expect(() => captureWpsBeforeResult(f.application, prepared)).not.toThrow();
+    expect(JSON.stringify(prepared)).toBe(baseline);
+    expect(f.writes).toEqual([]);
+    f.cells.set("Target!A1", "external edit");
+    expect(() => captureWpsBeforeResult(f.application, prepared)).toThrow("原表或授权范围");
+    f.cells.set("Target!A1", "old1");
+    f.cells.set("Source!A1", "changed source");
+    expect(() => captureWpsBeforeResult(f.application, prepared)).toThrow("在计算后发生变化");
+    expect(f.writes).toEqual([]);
+  });
   it("ordered trusted literals survive lost host cache and resume only third without reattesting JSON", async()=>{
     const f=fixture();
     const plan=stampLiteralPlanOrigin({...f.prepared.plan,sourceDependencySheets:[],
@@ -809,18 +827,22 @@ describe("公式写入的精确续跑（U1a）", () => {
     expect(() => prepareWpsResume(f.application, f.state, [1, 2])).toThrow("不是公式文本");
   });
 
-  it("公式读了没有读取记录的表：**登记阶段**就不给精确续跑资格", () => {
+  /*
+   * 公式依赖的**授权口径**（2026-11-01 核验补齐）：动作只声明写入目标，跨表读藏在
+   * 文本里。`Extra` 存在但没有被勾选 ⇒ 这条公式会把一张没授权的表的值算进已授权
+   * 目标格，等于把授权边界放大。结论必须是**写入前拒绝、一格都不写**，而不是
+   * "照写、只是不登记精确续跑材料"（后者只回答恢复资格，不回答授权）。
+   *
+   * 之前这里断言的是 `wpsResumeContext` 为 null —— 那条判据本身没变，但它只在
+   * "表已授权、证据采不到"时才有意义（见下面"有效区域大到无法登记证据"）。
+   */
+  it("公式读了未授权的表：写入前拒绝整份计划，一格都不写", () => {
     const f = fixture({ extraSheet: true });
     f.cells.set("Source!A1", 10);
     f.cells.set("Extra!A1", 1);
-    const prepared = prepareFormula(f, ["=Source!A1+1", "=Source!A1+2", "=Extra!A1+3"]);
-    /*
-     * `Extra` 既不在可信记账（`sourceDependencySheets`，只有 Source）里，也没有
-     * 读过的区域 —— 于是没有"它当时是什么值"的基线。按产品规则（公式恢复要求登记的
-     * 来源证据仍然一致），这种情况**不能**声称能精确续跑：连材料都不登记，
-     * 而不是等到续跑时才拦。
-     */
-    expect(wpsResumeContext(prepared)).toBeNull();
+    expect(() => prepareFormula(f, ["=Source!A1+1", "=Source!A1+2", "=Extra!A1+3"]))
+      .toThrow("未授权");
+    expect(f.writes).toEqual([]);
   });
 
   /*
@@ -845,7 +867,7 @@ describe("公式写入的精确续跑（U1a）", () => {
 
     // 拒绝点必须在拿到执行权之前：`prepareWpsResume` 就是这个入口。
     await expect(resumeWpsExecution(f.application, f.state, () => [1, 2]))
-      .rejects.toThrow("来源已变化");
+      .rejects.toThrow(FORMULA_SOURCE_CHANGED_MESSAGE);
     expect(f.writes).toEqual([]);
     expect(f.cells.get("Target!A3")).toBe("old3");
   });
@@ -887,7 +909,7 @@ describe("公式写入的精确续跑（U1a）", () => {
     f.cells.delete("Source!B10");
 
     await expect(resumeWpsExecution(f.application, f.state, () => [1, 2]))
-      .rejects.toThrow("来源已变化");
+      .rejects.toThrow(FORMULA_SOURCE_CHANGED_MESSAGE);
     expect(f.writes).toEqual([]);
   });
 
@@ -922,7 +944,7 @@ describe("公式写入的精确续跑（U1a）", () => {
     f.cells.set("Source!B10", 5);
 
     await expect(resumeWpsExecution(f.application, f.state, () => [1, 2]))
-      .rejects.toThrow("来源已变化");
+      .rejects.toThrow(FORMULA_SOURCE_CHANGED_MESSAGE);
     expect(f.writes).toEqual([]);
   });
 
@@ -939,16 +961,30 @@ describe("公式写入的精确续跑（U1a）", () => {
     expect(f.cells.get("Target!A1")).toEqual({ formula: "=Source!A1+1", value: null });
   });
 
-  it("动态引用的公式：不登记精确续跑材料（解析不出读哪张表，就没有证据口径）", () => {
+  it("动态引用的公式：不启用验收探针也在首写前拒绝整份计划，一格都不写", () => {
+    /*
+     * 边界与 Excel 端 `validatePlan` 的 `references.dynamic` **同一条**：
+     * `INDIRECT` / `OFFSET` 解析不出它读哪张表 ⇒ 无法核对依赖是否在授权内 ⇒ 先拒再说。
+     *
+     * 这里曾经只取消精确恢复资格、普通执行照写。那是把两件事混了：恢复口径管
+     * "能不能精确回滚"，授权口径管"能不能读"。读不出依赖就意味着这道闸**无法判定**，
+     * 无法判定不等于通过 —— 放行等于让公式自己去挑一张表来读。
+     *
+     * 本用例**不启用验收探针**（没有 arm、不带恢复通道）：这条拒绝与探针无关，
+     * 也不该靠"探针刚好拦住了"来解释。
+     */
     const f = fixture({ extraSheet: true });
     f.cells.set("Source!A1", 10);
-    const prepared = prepareFormula(f, [
+    // 正向锚点：同一份计划只差那条动态公式就能准备 —— 拒绝确实来自这一条。
+    expect(() => prepareFormula(f, ["=Source!A1+1", "=Source!A1+2", "=Source!A1+3"])).not.toThrow();
+    expect(() => prepareFormula(f, [
       "=Source!A1+1",
       "=Source!A1+2",
       '=INDIRECT("Source!A1")+3'
-    ]);
-    // 同一份计划只差这一条公式：`INDIRECT` 解析不出依赖表 ⇒ 没有可比对的证据。
-    expect(wpsResumeContext(prepared)).toBeNull();
+    ])).toThrow("动态引用");
+    // 零写入：拒绝发生在任何宿主读取/写入之前。
+    expect(f.writes).toEqual([]);
+    expect([1, 2, 3].map(row => f.cells.get(`Target!A${row}`))).toEqual(["old1", "old2", "old3"]);
   });
 
   it("公式引用了授权之外的表：续跑时拒绝，不放大写入边界", async () => {
@@ -968,7 +1004,14 @@ describe("公式写入的精确续跑（U1a）", () => {
       [["=Extra!A1+3"]],
       [["=Extra!A1+3"]]
     );
+    /*
+     * 判据读的是**公式文本解析出的实际依赖**，不是 `sourceDependencySheets` 声明：
+     * 材料的来源声明一直只有 `Source`（Extra 从没被登记），如果授权闸照着声明走，
+     * 这条就会被放行。断言点连同"零写入"一起钉住。
+     */
+    expect(record.resume?.context.sources.map(source => source.sheetName)).toEqual(["Source"]);
     expect(() => prepareWpsResume(f.application, f.state, [1, 2])).toThrow("授权之外");
+    expect(f.writes).toEqual([]);
   });
 
   it("来源表变了：公式计划同样拒绝续跑（来源校验没有为公式放宽）", async () => {
@@ -977,7 +1020,7 @@ describe("公式写入的精确续跑（U1a）", () => {
     const prepared = prepareFormula(f);
     await interruptAfterFirstFormula(f, prepared);
     f.cells.set("Source!A1", 99);
-    expect(() => prepareWpsResume(f.application, f.state, [1, 2])).toThrow("来源已变化");
+    expect(() => prepareWpsResume(f.application, f.state, [1, 2])).toThrow(FORMULA_SOURCE_CHANGED_MESSAGE);
   });
 
   it("核对与续跑资格判断只读：一个单元格都不写", async () => {
@@ -1091,7 +1134,7 @@ describe("公式覆盖证据的持久化往返（重启后只用恢复包）", (
     const { reopened } = await reopen(f);
     f.cells.set("Source!B10", 99);
 
-    await expect(resumeWpsExecution(reopened, f.state, () => [1, 2])).rejects.toThrow("来源已变化");
+    await expect(resumeWpsExecution(reopened, f.state, () => [1, 2])).rejects.toThrow(FORMULA_SOURCE_CHANGED_MESSAGE);
     expect(f.writes).toEqual([]);
     expect(f.cells.get("Target!A3")).toBe("old3");
   });
@@ -1103,7 +1146,7 @@ describe("公式覆盖证据的持久化往返（重启后只用恢复包）", (
     // 有效区域缩回 `A1:A3`，仍被登记矩形包含 ⇒ 区域核对放行，只有**持久化的整块指纹**能发现它变了。
     f.cells.delete("Source!B10");
 
-    await expect(resumeWpsExecution(reopened, f.state, () => [1, 2])).rejects.toThrow("来源已变化");
+    await expect(resumeWpsExecution(reopened, f.state, () => [1, 2])).rejects.toThrow(FORMULA_SOURCE_CHANGED_MESSAGE);
     expect(f.writes).toEqual([]);
   });
 
@@ -1114,7 +1157,7 @@ describe("公式覆盖证据的持久化往返（重启后只用恢复包）", (
     // 新增的 C1 让有效区域从 A1:B10 长到 A1:C10 —— 登记矩形盖不住了。
     f.cells.set("Source!C1", 7);
 
-    await expect(resumeWpsExecution(reopened, f.state, () => [1, 2])).rejects.toThrow("来源已变化");
+    await expect(resumeWpsExecution(reopened, f.state, () => [1, 2])).rejects.toThrow(FORMULA_SOURCE_CHANGED_MESSAGE);
     expect(f.writes).toEqual([]);
   });
 
@@ -1190,5 +1233,169 @@ describe("copyRange 的精确续跑（能力证据）", () => {
 
     expect(f.writes).toEqual(["Target!A3"]);
     expect([1, 2, 3].map(row => f.cells.get(`Target!A${row}`))).toEqual([111, 222, 333]);
+  });
+});
+
+/*
+ * 2026-11-02 WPS 公式 B 真机的**撤销不完整**（四张表、三步公式、第二步写完之后
+ * 完成回执没落）。真机现场：`结果1!B2` 已空、`结果2!B2` 仍是 8、`结果3!B2` 为空，
+ * 而卡面写着"已撤销并回读确认恢复成功"，并把恢复材料回收了。
+ *
+ * 根因不在撤销算法本身，而在"这次到底写了哪些动作"的输入：缓存是在**重开那一刻**
+ * 按当时的游标建的（`nextActionIndex = 1`、`inFlightActionIndex = 1`），第二步因此
+ * 被判成 `appliedRows = 0`；之后用户点「核对」，账本把丢失的回执补上（`next = 2`），
+ * 缓存却没人更新 —— 撤销于是继续跳过第二步，只恢复第一步。
+ *
+ * 这一组用例把"同形状的完整链条"钉住：第二步写入后、回执前中断 → 丢插件存储重挂载
+ * （只从恢复包水合）→ 核对把进度补进账本 → 来源变了拒绝续跑 → 撤销。
+ * 断言点不是"撤销返回成功"，而是**每一个应恢复的格子**真的回到执行前，且来源没被碰。
+ */
+describe("公式 B 真机形状：第二步回执缺失后的撤销（四表）", () => {
+  const SHEETS = ["来源", "结果1", "结果2", "结果3"] as const;
+  const SOURCE_FORMULA = "=来源!B5";
+
+  /** 来源 `B5` 有值 8；三张结果表要各接一条引用它的公式。 */
+  function fourSheets() {
+    const f = fixture({ sheetNames: SHEETS, formulaValues: { [SOURCE_FORMULA]: 8 } });
+    f.cells.set("来源!B5", 8);
+    return f;
+  }
+
+  /** 三步公式计划：每步写一张结果表的 `B2`，公式都指向同一格来源。 */
+  async function preparedFourSheetPlan(f: ReturnType<typeof fixture>) {
+    const prepared = prepareWpsPlan(f.application, [1, 2, 3, 4], {
+      ...f.prepared.plan,
+      sourceDependencySheets: ["来源"],
+      actions: ["结果1", "结果2", "结果3"].map(sheet => ({
+        type: "writeFormulas" as const,
+        sheet,
+        range: "B2:B2",
+        formulas: [[SOURCE_FORMULA]]
+      }))
+    }, [{ sheetName: "来源", range: "B5:B5", values: [[8]] }]);
+    f.state.descriptor = ledger.wpsRecoveryDescriptor(prepared);
+    f.state.totalActions = 3;
+    return prepared;
+  }
+
+  /** 第二步写完之后、完成回执之前中断（回执丢失，账本仍停在 1 且在途 = 1）。 */
+  async function interruptAfterSecond(
+    f: ReturnType<typeof fixture>,
+    prepared: Awaited<ReturnType<typeof preparedFourSheetPlan>>
+  ) {
+    await expect(executeWpsPlan(f.application, prepared, undefined, undefined, async (phase, checkpoint) => {
+      if (phase === "after" && checkpoint.actionIndex === 1) throw new Error("lost receipt on 结果2");
+    }, operationId, { taskId: "task-1", ...recoveryChannel })).rejects.toThrow("lost receipt on 结果2");
+    f.state.nextActionIndex = 1;
+    f.state.inFlightActionIndex = 1;
+    /*
+     * 关键前提：此刻账本里**没有** checkpoint。检查点只在"完成回执"或"核对"时落库，
+     * 而这两件都没发生 —— 所以水合时这一步没有任何写后证据可用。
+     */
+    f.state.checkpoint = null;
+    f.writes.length = 0;
+  }
+
+  /** 丢掉宿主插件存储（完整退出宿主），只从持久恢复包水合。 */
+  async function reopen(f: ReturnType<typeof fixture>) {
+    f.storage.clear();
+    const reopened = { ...f.application };
+    expect(wpsUndoRecordFor(reopened, operationId)).toBeNull();
+    const material = await ensureWpsRecoveryMaterial(reopened, f.state);
+    return { reopened, material };
+  }
+
+  /** 核对（outcome = applied）：账本前进一格，并把这一步的检查点写进账本。 */
+  function reconcileLedger(f: ReturnType<typeof fixture>) {
+    const action = f.state.descriptor.actions[1];
+    f.state.nextActionIndex = 2;
+    f.state.inFlightActionIndex = null;
+    f.state.checkpoint = {
+      sheetName: action.sheet,
+      range: action.range,
+      type: action.type,
+      beforeFingerprint: action.previewFingerprint,
+      afterFingerprint: action.expectedFingerprint
+    };
+    return action;
+  }
+
+  it("撤销恢复前两格、第三格没写过、来源的 500 保持不动", async () => {
+    const f = fourSheets();
+    const prepared = await preparedFourSheetPlan(f);
+    await interruptAfterSecond(f, prepared);
+    // 正向锚点：第二步确实写进去了（否则下面的"恢复"没有意义）。
+    expect(f.cells.get("结果1!B2")).toEqual({ formula: SOURCE_FORMULA, value: 8 });
+    expect(f.cells.get("结果2!B2")).toEqual({ formula: SOURCE_FORMULA, value: 8 });
+    expect(f.cells.has("结果3!B2")).toBe(false);
+
+    const { reopened, material } = await reopen(f);
+    expect(material.kind).toBe("package");
+    /*
+     * 重开那一刻账本只知道第一步有回执；第二步"写过没回执"，且没有 checkpoint 可用。
+     * 这里**只**断言"至少第一步算已写入" —— 第二步能否算已写入，取决于核对之后
+     * 账本有没有把检查点补上（下一步骤就是核对）。
+     */
+    expect(wpsUndoRecordFor(reopened, operationId)!.actions.map(action => action.appliedRows))
+      .toEqual([1, 0, 0]);
+
+    const verified = reconcileLedger(f);
+    // 面板在核对之后会重算一次恢复结论，`ensureWpsRecoveryMaterial` 就在这里把账本
+    // 进度重新投影到缓存记录上（以前它只补到期时间，缓存永远停在重开那一刻）。
+    const again = await ensureWpsRecoveryMaterial(reopened, f.state);
+    expect(again.kind).toBe("host");
+    const record = wpsUndoRecordFor(reopened, operationId)!;
+    expect(record.actions.map(action => action.appliedRows)).toEqual([1, 1, 0]);
+    expect(record.actions[1].afterFingerprint).toBe(verified.expectedFingerprint);
+
+    f.cells.set("来源!B5", 500);
+    await expect(resumeWpsExecution(reopened, f.state, () => [1, 2, 3, 4]))
+      .rejects.toThrow(FORMULA_SOURCE_CHANGED_MESSAGE);
+    expect(f.writes).toEqual([]);
+
+    const undone = await undoWpsExecution(reopened, operationId);
+    expect(undone.state).toBe("restored");
+    // 逆序恢复：先第二步，再第一步。
+    expect(f.writes).toEqual(["结果2!B2", "结果1!B2"]);
+    // 前两格的**公式与计算值**都得没了，不是"值空了公式还在"。
+    expect(f.cells.get("结果1!B2")).toBeNull();
+    expect(f.cells.get("结果2!B2")).toBeNull();
+    // 第三步从没写过：一个单元格都不该被碰。
+    expect(f.cells.has("结果3!B2")).toBe(false);
+    // 来源是用户自己的改动，撤销不许动它。
+    expect(f.cells.get("来源!B5")).toBe(500);
+  });
+
+  it("缺证据的那一步不会被冒充恢复：报残留、保留材料、不置终态", async () => {
+    /*
+     * 同样的中断，但**不做核对**：账本停在 1、在途 1、没有 checkpoint。
+     * 撤销无从判断第二步到底写过没有 —— 唯一安全的做法是：已经能证明的照常恢复，
+     * 不能证明的那一块**不覆盖**（那可能是用户自己的内容），并如实报"没有全部恢复"。
+     *
+     * 这条用例守的是"不许把漏了一格报成已撤销成功"：判据若退回"只回读自己恢复过
+     * 的那几格"，它会绿；只有"全目标回读"能发现 结果2!B2 仍是执行后的内容。
+     */
+    const f = fourSheets();
+    const prepared = await preparedFourSheetPlan(f);
+    await interruptAfterSecond(f, prepared);
+
+    const { reopened, material } = await reopen(f);
+    expect(material.kind).toBe("package");
+    const before = wpsUndoRecordFor(reopened, operationId)!;
+    expect(before.actions.map(action => action.appliedRows)).toEqual([1, 0, 0]);
+
+    await expect(undoWpsExecution(reopened, operationId)).rejects.toBeInstanceOf(WpsUndoResidualError);
+    expect(f.writes).toEqual(["结果1!B2"]);
+
+    const record = wpsUndoRecordFor(reopened, operationId)!;
+    expect(record.state).toBe("undo_conflict");
+    expect(record.error).toContain("结果2!B2");
+    expect(record.error).toContain("恢复资料已保留");
+    // 不能证明的那一格保持用户/执行后的内容，不被清空。
+    expect(f.cells.get("结果2!B2")).toEqual({ formula: SOURCE_FORMULA, value: 8 });
+    expect(f.cells.get("来源!B5")).toBe(8);
+    // 记录仍是"可撤销"的：材料没回收，用户可以在现场确认后再试。
+    expect(latestWpsUndo(reopened)?.executionId).toBe(operationId);
+    expect(backendRecovery().ids()).toContain(operationId);
   });
 });

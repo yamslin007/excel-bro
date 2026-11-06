@@ -1,4 +1,11 @@
 {
+  "openaiSdkTransport": {
+    "maxRequestBytes": 16777216,
+    "maxResponseBytes": 8388608,
+    "maxOutputTokens": 16384,
+    "maxRequests": 128,
+    "requestTimeoutSeconds": 120
+  },
   "clarification": { "maxOptions": 3 },
   "worksheetCheckpoint": {
     "allowedActions": ["deleteWorksheet", "restoreWorksheet"],
@@ -596,7 +603,8 @@
     "maxItems": 50
   },
   "modelConnectionTest": {
-    "timeoutSeconds": 60,
+    "timeoutSeconds": 120,
+    "maxOutputTokens": 2048,
     "maxTurns": 3
   },
   "agent": {

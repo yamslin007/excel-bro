@@ -210,8 +210,96 @@ WPS 的来源**清空**（有效区域缩回 ⇒ 指纹变化）、有效区域*
 
 - **公式计划的真机 A/B**：**Excel 侧已执行并通过**（2026-10-31）—— A 分支 `execution-9875c898…`（三格公式、`verified`、
   写序证明只续第三步）、B 分支 `execution-6d29e377…`（来源变化被拒、零第三次写入、重开后撤销 `undone_at` 有值）；
-  文件只读核验 `公式来源证据验收-Excel-A/B.xlsx`。**WPS 侧仍未做**（`docs/WPS_ACCEPTANCE_FIXTURE_2026-10-31.md` 未执行）。
-  逐项台账（实机/文件/账本/自动化/缺口）见 `docs/CONVERSATION_UX_REFACTOR_2026-11-01.md` §8.5。
-- 5.B-2 里"中断执行跨重启后没有撤销入口"目前是**读代码得出的预期**，本次真机就是要确认它；
-  确认后无论结果如何都写回 §8，不要用"看起来能撤销"替代实际点击。
+  文件只读核验 `公式来源证据验收-Excel-A/B.xlsx`。**WPS A 分支已通过**（2026-11-01 21:46–22:10，`wps-execution-304e6eee…`：
+  登记 → 前两步写入 → 第二步回执前中断 → 完整退出重开 → 核对 → 续跑只写第三步 → 确认；写序证据 = `office_host_writes` 恰好 3 行、
+  `idx0/idx1`@`21:46:09` 与 `idx2`@`22:10:10`，保存文件三格公式 + 缓存值 `2/8/15`）；**WPS B 分支已复测通过（撤销分支，2026-11-02）**
+  —— `wps-execution-de145e3a…`：前两步写入（第 2 步 `failed_after_write`）→ 核对完成（`next_action_index` 1→2、
+  `WPS_RECOVERY_RECHECK_REQUIRED`、checkpoint=结果2 写后指纹）→ 改 `来源!B5=500` → 续跑被拒 → 撤销（`undone_at`，
+  恢复材料 retired/removed，磁盘无包）。**注意：该轮拒绝文案是旧串「来源已变化，不能沿用旧结果续跑。」，
+  说明当时窗格仍是合并前构建**；新文案的实机复测待回流加载后进行。逐项五类证据（用户确认/截图/账本/保存文件/自动化）
+  与证据不足项见 `docs/WPS_FORMULA_B_RETEST_2026-11-02.md`。注意 `WPS_ACCEPTANCE_FIXTURE_2026-10-31.md` 是两表值复制终态夹具，不能替代。
+  逐项台账（实机/文件/账本/自动化/缺口）见 `docs/CONVERSATION_UX_REFACTOR_2026-11-01.md` §8.5 D/E/F。
+- 5.B-2 的旧“重开没有撤销入口”已被 10-31 Excel 实机修复与成功撤销取代，见 OFFICE_UNDO_AFTER_RESTART_2026-10-31.md §8。WPS 对应分支仍须单独验收。
 - 并排审阅布局、审阅副本生命周期、WPS 工作目录服务端链路等仍有各自的未验收项，与本包无关。
+
+### 2026-11-01 WPS 公式写入前误阻断修复
+
+自动化复现了同一错误：公式来源覆盖记录含 `coverageOnly`，从 `sourceSnapshots` 重建时不保留该用途标记；`assertOriginalUnchanged` 比较完整记录，误判现场变化。现仅从现场证据比较中排除 `coverageOnly`，保留原准备计划完整性检查、工作簿身份、授权范围、来源值及目标动作指纹检查，不修改执行器中该标记的用途。
+
+新增回归先红后绿：无现场变化时可捕获审阅基线，原准备计划不被修改；目标或来源发生真实变化仍拒绝，全程零写入。`wpsExecutionResume.test.ts` 与 `wpsNativeComparison.test.ts` 合计 110 passed。日志：`outputs/wps-formula-preflight-red.log`、`outputs/wps-formula-preflight-green.log`。
+
+**同日 21:46–22:10 真机复测结果**：加载新前端后，WPS 公式 **A 分支通过** —— 三个 `writeFormulas` 不再被写入前误阻断，走完「前两步写入 → 第二步回执前中断 → 完整退出重开 → 核对 → 续跑只写第三步 → 确认」，`wps-execution-304e6eee…`，写序见 §10 与 UX 台账 §8.5 F。**B 分支仍未验**；A 侧「确认变更」只有界面证据，账本无独立确认留痕。
+
+### 2026-11-01 夜 WPS 公式 B 复测前核验（三处判据补齐）
+
+B 首轮真机（`wps-execution-4998b190-82ee-4b68-b667-3d5a0e326041`，只读核过：`status=failed`、`nextActionIndex=0`、
+`in_flight_action_index=null`、`resumeContext=null`）暴露的不是写入缺陷，而是**登记与收尾各缺一条判据**：
+
+| 问题 | 事实 | 现在 |
+| --- | --- | --- |
+| 依赖只读声明 | 声明为空时 `wpsResumeContext` 直接返回 null，而解析结果早就有 `来源` | 声明为空 ⇒ 退到 `formulaSourceEvidenceRequirement` 的解析结果；声明非空但漏了实际依赖 ⇒ **拒绝登记**并点名那张表（不放行、也不静默降级）。`wpsResumeContextOutcome` 同步返回**同源原因**（原来只有 null） |
+| 未授权依赖可写 | `=其它!A1` 只出现在公式文本里，`selectedSheet` 的授权闸看不到 | `prepareWpsPlan` 在任何宿主读取/写入之前拒整份计划（只拒**已存在且未授权**的表；动态引用当时按既有口径只取消恢复资格 —— **该残差已于同日第二轮补齐，见下节**） |
+| 首写前失败被报成"需要核对" | 探针/恢复准备在首写前失败时找不到宿主记录 ⇒ 归成 unknown | 三个**互不冒充**的零写入证明：`!executorEntered`、宿主记录 `restored`+账本零游标、`unknown`+账本零游标（读取失败时不采信）。任一成立 ⇒ 「未执行」+ 具体原因 + 清掉待办与恢复入口；挂起失败/有在途/游标已推进仍保留核对流程 |
+
+自动化（定向，未跑无关全量）：新增 3 条（声明漏项、未授权依赖、探针首写前取消），改写 1 条（原「公式读了没有读取记录的表」→ 现在由授权闸在写入前拒），补强 2 条（续跑未授权依赖加零写入断言；恢复准备失败加「未执行」断言）。
+
+| 检查 | 结果 |
+| --- | --- |
+| `apps/wps-addin` `npx tsc --noEmit` | 退出码 0 |
+| `npm run build:wps` | 成功（3.6s） |
+| 执行器/恢复 7 个测试文件 | **162 passed** |
+| 公式相关 6 个测试文件 | **177 passed** |
+| `WpsAgentPanel.test.tsx` | **238 passed + 5 skipped**（合计 243） |
+
+合计 **14 个文件、577 passed、5 skipped**（三次分批去重相加，无重复计数）。
+
+
+### 2026-11-01 夜（第二轮）两条边界收口：动态引用拒写 / 零写入只认两种证明
+
+上一轮留下的两处"看起来已修、其实只是换了个口径"在这里收掉。两条都只改判据本身，不动执行流程、不碰真机记录。
+
+**① 动态引用（`INDIRECT` / `OFFSET`）：从"只取消恢复资格"改成"首写前拒绝"**
+
+- 出处：`apps/wps-addin/src/wpsPlanExecutor.ts#assertWpsFormulaDependenciesAuthorized`，在 `prepareWpsPlan` 里、任何宿主读取/写入之前调用。
+- 判据与 Excel 端 `apps/excel-addin/src/excel.ts#validatePlan` **同一条**（同一份 `@excel-bro/core/formulaWriteback#formulaSheetReferences` 的 `dynamic`），顺序也一致：先动态、再未授权。
+- 文案："第 N 步公式含动态引用（INDIRECT / OFFSET），无法核对依赖的工作表，已拒绝整份计划；原表未被修改。"
+- 为什么不能沿用旧口径：恢复口径回答"能不能精确回滚"，授权口径回答"能不能读"。动态引用解析不出目标表 ⇒ 授权闸在这条公式上**无法判定**，而"无法判定 ≠ 通过" —— 放行等于把"读哪张表"的决定权交给公式自己。
+- 与探针无关：不 arm 验收探针、不带恢复通道同样拒绝（有专门用例钉这一点）。
+- 续跑侧原有 `prepareWpsResume` 的动态拒绝保留（那条是"拒绝续跑"的独立出口，不是同一道闸的副本）。
+
+**② `zeroWriteProven`：删掉 `unknown + 账本零游标` 这第三种"证明"**
+
+- 现在只有两种，读的是两件不同的事实：
+  1. `neverEnteredExecutor`（`!executorEntered`）：`executeWpsPlan` 没被调用过 → 本端亲眼看到"没进入写入阶段"；
+  2. `restoredOnHost`：宿主恢复记录 `restored`（执行器结论：没有动作报过写入、现场已放回写前）**且**账本零游标/无在途/执行权已释放。
+- 被删掉的那种为什么不算：账本游标记的是"服务端开始了第几个动作"，而宿主写入发生在**动作回执之前**。首格写成功、回执还没落盘就失败时，账本同样是零游标、无在途、执行权已释放 —— 原表第一格却已经变了。证据读取失败同理（读不到 ≠ 没写过）。
+- 两种证明的说法不同（`notExecutedNote`）：一种说"没有进入写入阶段"，一种说"恢复记录显示区域已回到写入前状态"；都不再借用对方的措辞。
+- 其余一律保留核对入口与恢复材料（`resumability: "reconcile"`、待办索引、`.wps-write-recovery` 入口）。
+
+**反向用例与变异（每条都先改坏机制、确认变红、再还原并比对 sha256）**
+
+| 变异 | 改坏什么 | 变红的用例 |
+| --- | --- | --- |
+| M1 | `if (references.dynamic) return;`（退回旧口径） | 恰好 2 条：`wpsFormulaResumeRegistration`「动态引用解析不出依赖：写入前拒绝整份计划，零写入」、`wpsExecutionResume`「动态引用的公式：不启用验收探针也在首写前拒绝整份计划，一格都不写」 |
+| M2 | 把 `unknown + 零游标` 加回 `zeroWriteProven` | 恰好 1 条：`WpsAgentPanel`「marks the before column as unknown …」（该用例已改为断言结论是"需要核对"、且不出现"原表未被修改"） |
+| M3 | 把 `needs_review` 也算成零写入 | 8 条，含本轮新增「首格写入成功但回执未落盘就失败：结论不是「未执行」，核对入口与恢复材料都要留住」 |
+
+本轮新增反向用例的现场：`bridgeRoundTripHost` 增加 `onWrite` 回调（写入**落地后**触发），在第一格写入成功的那一刻抛错 ⇒ 断言 ① 第一格真的变成 111、后两格未动；② 结论是"本次执行需要核对"、不出现"原表未被修改"；③ `.wps-write-recovery` 入口、待办索引、`reconcile` 都在。
+
+**因这两条边界而改写的既有用例（不是放宽，是口径变了）**
+
+- `wpsExecutionResume`「动态引用的公式：不登记精确续跑材料」→「不启用验收探针也在首写前拒绝整份计划，一格都不写」（含正向锚点：只把第三条换成静态引用就能准备）。
+- `wpsFormulaResumeRegistration`「wpsResumeContextOutcome：给出原因」→ 改用**允许写但不可精确恢复**的形状（`=B1*3` 同表引用，原因"写入目标表自身"），因为动态引用现在走不到"求原因"那一步。
+- `WpsAgentPanel`「探针在首写前判定不可恢复」→ 第三条公式从 `=INDIRECT("A1")+3` 换成 `=A1+3`（同表引用），原因断言同步改成"写入目标表自身"；否则这条用例会在测另一道闸。
+- `WpsAgentPanel`「marks the before column as unknown」→ 结论从"未执行"改为"本次执行需要核对"（宿主 `PluginStorage` 是空实现，`restored` 也存不进去 ⇒ 没有"现场已恢复"的证据）。
+
+**结果**
+
+| 检查 | 结果 |
+| --- | --- |
+| `apps/wps-addin` `npx tsc --noEmit` | 退出码 0 |
+| `npm run build:wps` | 成功（3.62s，产物 `index-CCcA3FVt.js`） |
+| `apps/wps-addin` 全量 `vitest run` | **72 passed / 2 skipped 文件，1290 passed / 8 skipped 用例** |
+| 三个受影响文件 | `WpsAgentPanel` 239+5 skipped、`wpsExecutionResume` 67、`wpsFormulaResumeRegistration` 9 ⇒ **315 passed + 5 skipped** |
+
+未做：B 分支真机复测、A2、Docker/真实模型链路。旧记录 `wps-execution-4998b190-…` 未读未改。

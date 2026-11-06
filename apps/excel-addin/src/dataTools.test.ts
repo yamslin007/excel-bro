@@ -425,30 +425,54 @@ describe("readSheetIntoAccumulator", () => {
     return rows;
   }
 
-  /** 只实现 readSheetIntoAccumulator 用到的那点 Office.js 表面。 */
+  /**
+   * 只实现 readSheetIntoAccumulator 用到的那点 Office.js 表面。
+   *
+   * 里面**带一只写入探针**：`values`/`text`/`numberFormat` 是只读访问器，
+   * 真正的数据放在 `store` 里（`sync` 写 store，不写区域对象）。生产代码若出现
+   * `range.values = ...`，会落进 Proxy 的 `set` 陷阱并被记下来 —— 「只读查询
+   * 零写入」才有可断言的证据，而不是靠"我读了一遍源码"。
+   */
   function fakeContext(sheet: CellValue[][]) {
     const pendingLoads: { start: number; count: number; box: FakeRange }[] = [];
-    interface FakeRange {
+    const store = new Map<FakeRange, {
       values: CellValue[][];
       text: string[][];
       numberFormat: string[][];
+    }>();
+    const writes: string[] = [];
+    interface FakeRange {
+      readonly values: CellValue[][];
+      readonly text: string[][];
+      readonly numberFormat: string[][];
       load(properties: string): void;
     }
+    function makeRange(rowIndex: number, rowCount: number): FakeRange {
+      const box = {
+        get values() {
+          return store.get(box)?.values ?? [];
+        },
+        get text() {
+          return store.get(box)?.text ?? [];
+        },
+        get numberFormat() {
+          return store.get(box)?.numberFormat ?? [];
+        },
+        load() {
+          pendingLoads.push({ start: rowIndex, count: rowCount, box });
+        }
+      } as unknown as FakeRange;
+      store.set(box, { values: [], text: [], numberFormat: [] });
+      return new Proxy(box, {
+        set(target, property, value) {
+          writes.push(String(property));
+          return Reflect.set(target, property, value);
+        }
+      });
+    }
     const worksheet = {
-      getRangeByIndexes(
-        rowIndex: number,
-        _columnIndex: number,
-        rowCount: number
-      ) {
-        const box: FakeRange = {
-          values: [],
-          text: [],
-          numberFormat: [],
-          load() {
-            pendingLoads.push({ start: rowIndex, count: rowCount, box });
-          }
-        };
-        return box;
+      getRangeByIndexes(rowIndex: number, _columnIndex: number, rowCount: number) {
+        return makeRange(rowIndex, rowCount);
       }
     };
     let syncCount = 0;
@@ -456,16 +480,20 @@ describe("readSheetIntoAccumulator", () => {
       sync: async () => {
         syncCount += 1;
         for (const { start, count, box } of pendingLoads.splice(0)) {
-          box.values = sheet.slice(start, start + count);
-          box.text = box.values.map((row) => row.map(() => ""));
-          box.numberFormat = box.values.map((row) => row.map(() => "General"));
+          const values = sheet.slice(start, start + count);
+          store.set(box, {
+            values,
+            text: values.map((row) => row.map(() => "")),
+            numberFormat: values.map((row) => row.map(() => "General"))
+          });
         }
       }
     };
     return {
       context: context as unknown as Excel.RequestContext,
       worksheet: worksheet as unknown as Excel.Worksheet,
-      syncCount: () => syncCount
+      syncCount: () => syncCount,
+      writes: () => writes
     };
   }
 
@@ -610,5 +638,232 @@ describe("readSheetIntoAccumulator", () => {
     );
     expect(total).toBe(3);
     expect(result.rows).toHaveLength(2);
+  });
+
+  /*
+   * A1:B5 无表头、B 列五个数字（2026-11-01 现场）。
+   * 走**真实分块读取**（宿主侧唯一会碰工作簿的路径），两只断言：
+   * 合计是 15（不是 14），且写入探针为空 —— 只读查询一次写入都没有。
+   */
+  it("无表头数字区域：五个数全参与，且零写入", async () => {
+    const sheet: CellValue[][] = [
+      ["甲", 1],
+      ["乙", 2],
+      ["丙", 3],
+      ["丁", 4],
+      ["戊", 5]
+    ];
+    const fake = fakeContext(sheet);
+    const request: DataToolRequest = {
+      id: "read-only-sum",
+      tool: "query_table",
+      arguments: {
+        mode: "aggregate",
+        scope: "selected",
+        hasHeaders: false,
+        metrics: [{ operation: "sum", field: "列2", outputName: "合计" }],
+        limit: 10
+      }
+    };
+    const accumulator = createQueryTableAccumulator(request);
+
+    await readSheetIntoAccumulator(
+      fake.context,
+      {
+        name: "来源",
+        worksheet: fake.worksheet,
+        rowIndex: 0,
+        columnIndex: 0,
+        rowCount: sheet.length,
+        columnCount: 2
+      },
+      accumulator,
+      { queryArguments: request.arguments }
+    );
+
+    const result = accumulator.finish();
+    expect(result.rows).toEqual([[15]]);
+    expect(result.scannedRows).toBe(5);
+    // 唯一会写单元格的方式是给区域赋值；一次都没发生。
+    expect(fake.writes()).toEqual([]);
+  });
+
+  it("无表头区域跨分块时不把合成表头当数据、也不丢行", async () => {
+    // 纯数字单列，行数跨三块：每块都会自己合成「列1」，不能因此多算行。
+    const dataRows = CHUNK_ROWS * 2 + 7;
+    const sheet: CellValue[][] = Array.from(
+      { length: dataRows },
+      (_unused, index) => [index + 1]
+    );
+    const fake = fakeContext(sheet);
+    const request: DataToolRequest = {
+      id: "chunked-no-header",
+      tool: "query_table",
+      arguments: {
+        mode: "aggregate",
+        scope: "selected",
+        metrics: [
+          { operation: "countRows", outputName: "笔数" },
+          { operation: "sum", field: "列1", outputName: "合计" }
+        ],
+        limit: 10
+      }
+    };
+    const accumulator = createQueryTableAccumulator(request);
+
+    await readSheetIntoAccumulator(
+      fake.context,
+      {
+        name: "来源",
+        worksheet: fake.worksheet,
+        rowIndex: 0,
+        columnIndex: 0,
+        rowCount: sheet.length,
+        columnCount: 1
+      },
+      accumulator,
+      { queryArguments: request.arguments }
+    );
+
+    const result = accumulator.finish();
+    expect(result.scannedRows).toBe(dataRows);
+    // 笔数必须正好等于行数：合成表头行若被当成数据，笔数会多出「块数」。
+    expect(Number(result.rows[0]?.[0] ?? 0)).toBe(dataRows);
+    expect(fake.writes()).toEqual([]);
+  });
+});
+
+/**
+ * 现场（2026-11-01，与「刷新后重复要求确认范围」**分开记录**）：
+ *
+ * 用户原话：「只读取来源表 A1:B5，告诉我 B 列五个数的合计，不修改任何工作表。」
+ * 实际却问了「B1 是否参与计算」，并声称算这五个数需要写入目标单元格。
+ *
+ * 两条真实成因：
+ * 1. 执行侧：`A1:B5` 没有表头时，首行被当成表头吞掉，合计变成 14；
+ * 2. 只读路径没有「按区域 + 无表头」的表达方式，模型只能借会写入的
+ *    computeValues 去表达「算进某个单元格」。
+ *
+ * 这一组钉住第 1 条与「只读不写入」：五个数全部参与，且一次写入都没有。
+ */
+describe("无表头数字区域的只读求和（2026-11-01 现场）", () => {
+  /** A1:B5：A 列标签、B 列五个数字 —— 没有任何表头。 */
+  const labelledNumbers: CellValue[][] = [
+    ["甲", 1],
+    ["乙", 2],
+    ["丙", 3],
+    ["丁", 4],
+    ["戊", 5]
+  ];
+
+  function sumOfColumn(overrides: Partial<DataToolRequest["arguments"]>): DataToolRequest {
+    return {
+      id: "sum-no-header",
+      tool: "query_table",
+      arguments: {
+        mode: "aggregate",
+        scope: "selected",
+        metrics: [{ operation: "sum", field: "列2", outputName: "合计" }],
+        limit: 10,
+        ...overrides
+      }
+    };
+  }
+
+  it("声明 hasHeaders=false 时五个数全部参与，合计 15", () => {
+    const result = executeQueryTableData(
+      sumOfColumn({ hasHeaders: false }),
+      [{ name: "来源", values: labelledNumbers }]
+    );
+
+    expect(result.rows).toEqual([[15]]);
+    // 一行都不能少：少一行就是 14，而且界面上看不出来少的是哪一行。
+    expect(result.scannedRows).toBe(5);
+    expect(result.complete).toBe(true);
+  });
+
+  it("点名合成列名时也按无表头处理，不要求再声明一次", () => {
+    const result = executeQueryTableData(sumOfColumn({}), [
+      { name: "来源", values: labelledNumbers }
+    ]);
+
+    expect(result.rows).toEqual([[15]]);
+    expect(result.scannedRows).toBe(5);
+  });
+
+  it("纯数字单列区域不会因为「首行像表头」丢行", () => {
+    // 没有声明，也没有字段名可用（rows 模式取全部列），只能靠内容判据。
+    const result = executeQueryTableData(
+      {
+        id: "rows-no-header",
+        tool: "query_table",
+        arguments: { mode: "rows", scope: "selected", limit: 10 }
+      },
+      [{ name: "来源", values: [[1], [2], [3], [4], [5]] }]
+    );
+
+    expect(result.rows).toEqual([
+      ["来源", 1],
+      ["来源", 2],
+      ["来源", 3],
+      ["来源", 4],
+      ["来源", 5]
+    ]);
+    expect(result.scannedRows).toBe(5);
+  });
+
+  it("rows 模式没有字段名可依据，只能靠 hasHeaders=false 把首行留在数据里", () => {
+    // 文本标签 + 数字列：内容判据分不清「数据区」和「文本表头的表」，
+    // 这里没有字段名可以点名合成列名，`hasHeaders` 是唯一能说清的方式。
+    const withDeclaration = executeQueryTableData(
+      {
+        id: "rows-declared",
+        tool: "query_table",
+        arguments: {
+          mode: "rows",
+          scope: "selected",
+          hasHeaders: false,
+          limit: 10
+        }
+      },
+      [{ name: "来源", values: labelledNumbers }]
+    );
+    expect(withDeclaration.rows).toHaveLength(5);
+    expect(withDeclaration.scannedRows).toBe(5);
+
+    // 不声明时保持既有行为（首行当表头被跳过）—— 这条不是"想要的行为"，
+    // 而是把「必须显式声明」这件事钉住：需要的场景别指望本地猜。
+    const withoutDeclaration = executeQueryTableData(
+      {
+        id: "rows-undeclared",
+        tool: "query_table",
+        arguments: { mode: "rows", scope: "selected", limit: 10 }
+      },
+      [{ name: "来源", values: labelledNumbers }]
+    );
+    expect(withoutDeclaration.scannedRows).toBe(4);
+  });
+
+  it("有表头查询的既有行为不变：表头行不进指标", () => {
+    const values: CellValue[][] = [["数量"], [1], [2], [3]];
+
+    for (const hasHeaders of [undefined, true] as const) {
+      const result = executeQueryTableData(
+        {
+          id: "sum-with-header",
+          tool: "query_table",
+          arguments: {
+            mode: "aggregate",
+            scope: "selected",
+            hasHeaders,
+            metrics: [{ operation: "sum", field: "数量", outputName: "合计" }],
+            limit: 10
+          }
+        },
+        [{ name: "来源", values }]
+      );
+      expect(result.rows).toEqual([[6]]);
+      expect(result.scannedRows).toBe(3);
+    }
   });
 });

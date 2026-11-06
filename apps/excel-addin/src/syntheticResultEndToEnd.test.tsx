@@ -176,6 +176,9 @@ vi.mock("./api", async (importOriginal) => ({
   getOfficeExecutionStatus: vi.fn(),
   /* 用户处置留痕（放弃/撤销）：真实网络出口，必须替身 —— 否则等于测试往用户服务端发请求。 */
   recordExecutionDisposition: vi.fn(async () => undefined),
+  /* 审阅决定落账（审阅生命周期）：也是真实网络出口（POST /api/{ns}/executions/{id}/review）。
+     不替身就会让结果审阅的确认/放弃真的发到用户服务端。 */
+  sendExecutionReview: vi.fn(async () => undefined),
   /* 发现未完成执行：默认"这个工作簿没有待续写的执行"。
      未替身时产品会真发 GET，测试的网络闸门会直接让用例失败 —— 也就是说，
      每条挂载 App 的用例都必须显式表态"这个簿有没有未完成执行"。 */
@@ -793,7 +796,7 @@ const text = (view: ReturnType<typeof render>) => view.container.textContent ?? 
 async function clickRunOnExcel(view: ReturnType<typeof render>) {
   const button = await waitFor(() => {
     const found = [...view.container.querySelectorAll("button")].find(
-      (candidate) => candidate.textContent === "确认变更"
+      (candidate) => candidate.textContent === "确认全部变更"
     ) as HTMLButtonElement | undefined;
     if (!found) throw new Error("结果审阅的确认按钮尚未出现");
     return found;

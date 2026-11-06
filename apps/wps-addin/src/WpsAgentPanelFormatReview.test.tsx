@@ -83,6 +83,10 @@ vi.mock("../../excel-addin/src/api", async (importOriginal) => {
     recordExecutionDisposition: vi.fn(
       async (_namespace: string, _operationId: string, _disposition: string) => undefined
     ),
+    /* 审阅决定落账（`/review`）：同样是真实网络出口，不替身就会打到用户服务端。 */
+    sendExecutionReview: vi.fn(
+      async (_namespace: string, _operationId: string, _decision: string) => undefined
+    ),
     finishWpsExecution: vi.fn(async (operationId: string) => ({
       ...wpsRunningState(operationId),
       status: "completed" as const
@@ -509,7 +513,7 @@ async function mountPreview(plan: AnalysisPlan, task: string) {
   const textarea = container.querySelector("textarea");
   await type(textarea, task);
   await submit(textarea);
-  await until(() => findButton(container, "确认变更") !== null, "应显示主表执行结果：" + textOf(container));
+  await until(() => findButton(container, "确认全部变更") !== null, "应显示主表执行结果：" + textOf(container));
   return container;
 }
 
@@ -529,11 +533,11 @@ describe("WPS 面板 · 格式动作点击链路（真实面板 + 真实审阅/�
   it("新流程在主表显示结果，确认不重复执行，放弃真正恢复", async () => {
     const host = installFormatHost();
     const container = await mountPreview(boldPlan, "把 A2:B3 加粗");
-    await until(() => findButton(container, "确认变更") !== null,
+    await until(() => findButton(container, "确认全部变更") !== null,
       `应自动执行并显示固定确认入口：${textOf(container)}`);
     expect(host.cell(2, 1).bold).toBe(true);
     expect(host.cell(2, 1).value).toBe("甲");
-    await click(findButton(container, "放弃变更"));
+    await click(findButton(container, "放弃全部变更"));
     await until(() => textOf(container).includes("已放弃并恢复"), "应真正恢复主表");
     expect(host.cell(2, 1).bold).toBe(false);
   });
@@ -544,7 +548,7 @@ describe("WPS 面板 · 格式动作点击链路（真实面板 + 真实审阅/�
     // 首屏格式描述：真实 `buildPlanChangePreview` + 真实 `describeWpsFormatAction`。
     expect(host.cell(2, 1).bold).toBe(true);
     expect(host.cell(2, 1).value).toBe("甲");
-    await click(findButton(container, "确认变更"));
+    await click(findButton(container, "确认全部变更"));
     await until(
       () => container.querySelector(".wps-verification-card.verified") !== null,
       "写入成功应给出回读核对结果"
@@ -579,7 +583,7 @@ describe("WPS 面板 · 格式动作点击链路（真实面板 + 真实审阅/�
     };
     const container = await mountPreview(comboPlan, "把 A2:B3 加粗并居中");
 
-    await click(findButton(container, "确认变更"));
+    await click(findButton(container, "确认全部变更"));
     await until(
       () => container.querySelector(".wps-verification-card.verified") !== null,
       "组合格式动作应能通过真实审阅并写回"
@@ -602,8 +606,8 @@ describe("WPS 面板 · 格式动作点击链路（真实面板 + 真实审阅/�
     // 双视图是执行前状态的副本：真的建了出来（不是拿执行后的原表顶替）。
     expect(host.copyCreated()).toBe(true);
     // 确认入口始终在固定操作条上，不随对话滚走。
-    expect(findButton(container, "确认变更")).not.toBeNull();
-    await click(findButton(container, "确认变更"));
+    expect(findButton(container, "确认全部变更")).not.toBeNull();
+    await click(findButton(container, "确认全部变更"));
     await until(() => textOf(container).includes("已确认变更"), "应确认结果");
     expect(host.cell(2, 1).bold).toBe(true);
     expect(host.cell(2, 1).value).toBe("甲");

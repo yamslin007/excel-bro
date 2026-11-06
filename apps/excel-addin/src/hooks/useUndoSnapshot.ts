@@ -11,7 +11,7 @@ interface UseUndoSnapshotOptions {
   onStatusChange: (status: "executing" | "idle") => void;
   onMessage: (text: string) => void;
   onAfterUndo?: () => Promise<void> | void;
-  onRestored?: (snapshot: ExecutionUndoSnapshot) => void;
+  onRestored?: (snapshot: ExecutionUndoSnapshot) => Promise<void> | void;
   beforeOperation?: () => Promise<boolean>;
 }
 
@@ -132,7 +132,7 @@ export function useUndoSnapshot({
 
   /** 撤销到指定 executionId；旧消息没有 executionId 时兼容 planId。 */
   const undoExecutionTo = useCallback(
-    async (executionIdOrPlanId?: string) => {
+    async (executionIdOrPlanId?: string, onlyThisExecution = false, silentSuccess = false) => {
       if (isBusy || !isRunningInExcel()) return false;
       // 读 ref 而不是闭包里的 state：同一 tick 里刚 `ensureUndoSnapshot` 的那一条也要算数。
       const stack = stackRef.current;
@@ -145,7 +145,13 @@ export function useUndoSnapshot({
                 entry.planId === executionIdOrPlanId
             );
       if (index < 0) return false;
+      if (onlyThisExecution && (index !== stack.length - 1 || stack[index].executionId !== executionIdOrPlanId)) {
+        throw new Error('本次执行不是当前恢复栈顶，未撤销其他任务。');
+      }
       if (beforeOperation && !(await beforeOperation())) return false;
+      if (onlyThisExecution && stackRef.current !== stack) {
+        throw new Error('核对期间恢复栈已变化，未撤销任何任务，请重新核对。');
+      }
       // 逆序撤销：先撤最近的，再往前退，保证每一步的上下文都是它执行完的状态。
       const targets = stack.slice(index).reverse();
 
@@ -156,10 +162,10 @@ export function useUndoSnapshot({
         for (const snapshot of targets) {
           await undoExecution(snapshot);
           undone += 1;
-          onRestored?.(snapshot);
+          await onRestored?.(snapshot);
         }
         restored = true;
-        onMessage(
+        if (!silentSuccess) onMessage(
           undone > 1
             ? `已撤销最近 ${undone} 次执行中记录的单元格值、公式和格式。`
             : "已撤销上一次执行中记录的单元格值、公式和格式。"
@@ -181,6 +187,27 @@ export function useUndoSnapshot({
     [isBusy, onStatusChange, onMessage, onAfterUndo, onRestored, beforeOperation, commitStack]
   );
 
+  /** Discard one reviewed execution. A remounted pane may have no in-memory
+   * stack: attach only its bound recovery receipt, never step over another task. */
+  const undoReviewedExecution = useCallback(
+    async (executionId: string, recoverySnapshot?: ExecutionUndoSnapshot | null) => {
+      if (isBusy || !isRunningInExcel()) return false;
+      if (!executionId || (recoverySnapshot && recoverySnapshot.executionId !== executionId)) {
+        throw new Error('本次审阅与恢复材料的执行身份不一致，未撤销任何任务。');
+      }
+      const top = stackRef.current.at(-1);
+      if (top && top.executionId !== executionId) {
+        throw new Error('本次执行不是当前恢复栈顶，未撤销其他任务。');
+      }
+      if (!top) {
+        if (!recoverySnapshot) throw new Error('本次执行缺少恢复材料，未放弃变更。');
+        ensureUndoSnapshot(recoverySnapshot);
+      }
+      return undoExecutionTo(executionId, true, true);
+    },
+    [isBusy, ensureUndoSnapshot, undoExecutionTo]
+  );
+
   const undoLastExecution = useCallback(
     () => undoExecutionTo(),
     [undoExecutionTo]
@@ -193,6 +220,7 @@ export function useUndoSnapshot({
     ensureUndoSnapshot,
     clearUndoSnapshot,
     undoLastExecution,
+    undoReviewedExecution,
     undoExecutionTo
   };
 }

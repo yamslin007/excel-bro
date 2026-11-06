@@ -16,7 +16,10 @@
  * - **发现只恢复入口，不恢复写入资格**：认领、核对、续跑仍走既有状态查询与材料水合。
  * - **多候选不自动选**：多于一条（或结果被截断）时只提供选择入口，界面与判据都不得
  *   替用户挑"最新的一条"。
- * - **已完成不是待续写**：`completed` 一律排除。
+ * - **已完成不是待续写**：`completed` 不能作为 `resume` 候选出现；它只有在账本里
+ *   **显式**记着 `review_state = pending/blocked` 时才以 `kind: "review"` 出现
+ *   （2026-11-03：此前"执行完了但没确认，刷新后待审阅整段消失"，根因就是把
+ *   `completed` 一刀切排除，而审阅状态那时只活在前端内存里）。
  * - **响应只许带定位与计数**：执行权令牌、单元格内容、恢复包正文、完整值计划出现即拒绝。
  * - **查不到 ≠ 没有**：失败与"没有未完成任务"是两个结论，调用方必须分开表达。
  */
@@ -36,8 +39,29 @@ export const PENDING_DISCOVERY_MAX_IDENTITY_CHARS =
 /** 两个宿主的身份命名空间。前缀不同即不同命名空间，互不冒充。 */
 export type PendingExecutionNamespace = "wps" | "office";
 
-/** 未完成执行的状态。`completed` 刻意不在此列 —— 它不该作为待续写任务出现。 */
-export type PendingExecutionStatus = "running" | "needs_reconciliation" | "failed";
+/**
+ * 执行状态。`completed` 只允许出现在 `kind: "review"` 的候选上 ——
+ * 它不是"待续写"，而是"写完了、审阅没有收尾"。
+ */
+export type PendingExecutionStatus =
+  | "running"
+  | "needs_reconciliation"
+  | "failed"
+  | "completed";
+
+/**
+ * 候选的**性质**，决定用户能做什么：
+ *
+ * - `resume`：还有动作没写，入口是"核对 → 继续执行"；
+ * - `review`：动作写完了，等用户确认或放弃；入口是结果审阅，**不许**再执行任何动作。
+ *
+ * 混着显示会让一条"已写完等确认"的记录被当成"还没写完"，于是有人点了继续、
+ * 把最后一步重写一遍。
+ */
+export type PendingExecutionKind = "resume" | "review";
+
+/** 待审阅的两种档位：验证通过 / 验证没通过（要人核对但不能直接接受）。 */
+export type PendingReviewState = "pending" | "blocked";
 
 /**
  * 一条未完成执行的**最小**元数据。
@@ -49,7 +73,14 @@ export type PendingExecutionStatus = "running" | "needs_reconciliation" | "faile
 export interface PendingExecutionCandidate {
   operationId: string;
   taskId: string;
+  kind: PendingExecutionKind;
   status: PendingExecutionStatus;
+  /**
+   * 仅 `kind === "review"` 时有值。这是服务端账本 `review_state` 的原样投影，
+   * **不是**由 `status === "completed"` 推出来的：老记录没有这一列的值，就不该出现
+   * 在这里（宁可发现不出来，也不许凭"跑完了"认定"有人等着确认"）。
+   */
+  reviewState: PendingReviewState | null;
   /** 登记时间（epoch 毫秒）。 */
   createdAt: number;
   /** 最后一次账本变动（epoch 毫秒）。 */
@@ -97,7 +128,9 @@ const RESPONSE_KEYS = [
 const CANDIDATE_KEYS = [
   "operationId",
   "taskId",
+  "kind",
   "status",
+  "reviewState",
   "createdAt",
   "updatedAt",
   "nextActionIndex",
@@ -176,8 +209,36 @@ function assertPendingExecutionCandidate(value: unknown): asserts value is Pendi
   if (!isNonEmptyText(candidate.operationId, 200) || !isNonEmptyText(candidate.taskId, 200)) {
     throw new Error("未完成执行候选缺少执行身份");
   }
-  if (!["running", "needs_reconciliation", "failed"].includes(String(candidate.status))) {
-    throw new Error("已完成或未知状态的执行不能作为待续写任务");
+  const kind = candidate.kind;
+  if (kind !== "resume" && kind !== "review") {
+    throw new Error("未完成执行候选缺少性质标记（resume / review）");
+  }
+  const status = candidate.status;
+  if (!["running", "needs_reconciliation", "failed", "completed"].includes(String(status))) {
+    throw new Error("未知状态的执行不能作为待处理任务");
+  }
+  // 服务端可能按 `exclude_none` 省掉这个键：缺键与 `null` 同义（"不是待审阅"），
+  // 但对 `review` 候选两者都不够 —— 见下面的交叉一致性。
+  const reviewState = candidate.reviewState ?? null;
+  if (reviewState !== null && reviewState !== "pending" && reviewState !== "blocked") {
+    throw new Error("待审阅候选的审阅状态无效");
+  }
+  /*
+   * 交叉一致性 —— 这一段是"不许把 completed 一律当待审阅"的运行时防线，
+   * 光靠类型挡不住（同一份响应还会被 JS 调用方直接读）：
+   * - `resume` 必须是"没写完"的状态，且**不许**带审阅状态；
+   * - `review` 必须是 `completed`，且**必须**带显式审阅状态。
+   * 任何一边不成立都说明这行不是账本原样，宁可报错也不要猜。
+   */
+  if (kind === "resume") {
+    if (status === "completed") {
+      throw new Error("已完成的执行不能作为待续写任务");
+    }
+    if (reviewState !== null) {
+      throw new Error("待续写任务不该带审阅状态");
+    }
+  } else if (status !== "completed" || reviewState === null) {
+    throw new Error("待审阅候选必须是已完成且带显式审阅状态的执行");
   }
   if (!isTimestamp(candidate.createdAt) || !isTimestamp(candidate.updatedAt)) {
     throw new Error("未完成执行候选的时间无效");
@@ -207,6 +268,9 @@ function assertPendingExecutionCandidate(value: unknown): asserts value is Pendi
  * 如果排在真正的在途执行前面，用户会先看到那条、以为没写，而实际有一步已经落表。
  * 所以写前失败固定排最后；有在途动作（现场可能已被改过）的固定排最前。这里也不替
  * 用户选，只保证最危险的那条不会被名单尾部或截断盖住。
+ *
+ * 待审阅（`kind: "review"`）与"有在途动作"同档最前：它的内容**已经写进表了**，
+ * 而用户还没接受 —— 和"可能写了一半"一样，是必须马上看见的一条。
  */
 export function orderPendingExecutionCandidates(
   candidates: readonly PendingExecutionCandidate[]
@@ -214,6 +278,8 @@ export function orderPendingExecutionCandidates(
   const rank = (candidate: PendingExecutionCandidate): number => {
     // 第一档：有在途动作 —— 现场可能已经被改过，必须先核对。
     if (candidate.inFlightActionIndex != null || candidate.status === "needs_reconciliation") return 0;
+    // 第一档（并列）：内容已经落表、用户还没接受 —— 同样必须先看见。
+    if (candidate.kind === "review") return 0;
     // 第三档：写前失败，一个动作都没推进 —— 最不该挡住别的记录。
     if (candidate.status === "failed" &&
         candidate.nextActionIndex === 0 &&
@@ -231,7 +297,9 @@ export function orderPendingExecutionCandidates(
  * 由发现响应得出"接下来怎么处理"。
  *
  * 纪律：**只有恰好一条且没有被截断**时才直接采用；其余情况一律交给用户选择。
- * 去重按 `operationId`（同一条被带回两次不该变成"两个任务"），已完成的一律丢弃。
+ * 去重按 `operationId`（同一条被带回两次不该变成"两个任务"）；形态自相矛盾的
+ * （`completed` 却不是 `review`、`review` 却没有显式审阅状态）一律丢弃 ——
+ * 宁可少一条入口，也不许把"跑完了"读成"有人等着确认"。
  */
 export function pendingExecutionSelection(
   response: PendingExecutionDiscoveryResponse,
@@ -247,12 +315,17 @@ export function pendingExecutionSelection(
   const visible: PendingExecutionCandidate[] = [];
   for (const candidate of response.candidates) {
     /*
-     * `completed` 在类型上已经进不来（`PendingExecutionStatus` 不含它，准入闸也拒绝），
-     * 但选择函数可能被"还没过闸"的调用方直接用 —— 运行时这一句让它照样不许出现在
-     * 待续写名单里，而不是只靠类型保证。
+     * 类型与准入闸都会挡下自相矛盾的候选，但选择函数可能被"还没过闸"的调用方
+     * 直接用 —— 运行时这一句让它照样不许被采用，而不是只靠类型保证。
      */
-    const completed = (candidate as { status: string }).status === "completed";
-    if (completed || seen.has(candidate.operationId)) continue;
+    const kind = (candidate as { kind?: string }).kind;
+    const status = (candidate as { status: string }).status;
+    const reviewState = (candidate as { reviewState?: string | null }).reviewState ?? null;
+    const consistent =
+      kind === "review"
+        ? status === "completed" && (reviewState === "pending" || reviewState === "blocked")
+        : kind === "resume" && status !== "completed" && reviewState === null;
+    if (!consistent || seen.has(candidate.operationId)) continue;
     seen.add(candidate.operationId);
     visible.push(candidate);
   }
@@ -265,6 +338,16 @@ export function pendingExecutionSelection(
 
 /** 候选行的一句话说明：只有进度与状态，没有任何单元格内容。 */
 export function pendingExecutionCandidateLabel(candidate: PendingExecutionCandidate): string {
+  if (candidate.kind === "review") {
+    /*
+     * 待审阅**不是**待续写：一个动作都不剩，说明里不能再出现"共 N 步 / 已写 N 步"
+     * 那种续跑口径，否则用户会以为还能"继续执行"。
+     */
+    const parts = [`${candidate.totalActions} 个动作已写完，等待你确认或放弃`];
+    if (candidate.reviewState === "blocked") parts.push("结果未通过独立验证");
+    if (candidate.ownerActive) parts.push("另一个窗口仍持执行权");
+    return parts.join(" · ");
+  }
   const inFlight = candidate.inFlightActionIndex;
   const parts = [
     inFlight != null ? `第 ${inFlight + 1} 步待核对` : `已写 ${candidate.nextActionIndex} 步`,

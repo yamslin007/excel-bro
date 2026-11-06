@@ -21,9 +21,9 @@ describe('result review authorization', () => {
   it('refuses an unauthorized output', () => {
     expect(resultReviewPlanIssue(plan, ['来源甲', '来源乙'])).not.toBeNull();
   });
-  it('does not expand to multiple output sheets', () => {
+  it('accepts multiple authorized output sheets', () => {
     expect(resultReviewPlanIssue({ ...plan, actions: [...plan.actions,
       { type: 'writeValues', sheet: '来源甲', range: 'A1:B1', values: [['a', 1]] }]
-    }, ['来源甲', '来源乙', '汇总'])).not.toBeNull();
+    }, ['来源甲', '来源乙', '汇总'])).toBeNull();
   });
 });

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { act, renderHook } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { UIEvent } from "react";
 import {
   isNearScrollBottom,
@@ -24,6 +24,50 @@ function scrollEvent(element: HTMLElement, scrollTop: number): UIEvent<HTMLEleme
 }
 
 describe("useMessageAutoFollow", () => {
+  it("eases between positions, ignores new progress mid-flight and yields to the wheel", () => {
+    const callbacks = new Map<number, FrameRequestCallback>();
+    let serial = 0;
+    vi.stubGlobal("matchMedia", () => ({ matches: false }));
+    vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => { callbacks.set(++serial, callback); return serial; });
+    vi.stubGlobal("cancelAnimationFrame", (id: number) => callbacks.delete(id));
+    const now = vi.spyOn(performance, "now").mockReturnValue(0);
+    const { result, rerender, unmount } = renderHook(({ signal }) => useMessageAutoFollow(signal, "chat"),
+      { initialProps: { signal: "1" } });
+    try {
+      const element = scrollElement();
+      const row = document.createElement("article"); row.dataset.messageId = "old";
+      row.getBoundingClientRect = () => ({ top: -684 } as DOMRect);
+      element.append(row); result.current.containerRef.current = element;
+      act(() => result.current.scrollToMessage("old"));
+      expect(element.scrollTop).toBe(700);
+      act(() => { const callback = callbacks.get(1)!; callbacks.delete(1); callback(160); });
+      expect(element.scrollTop).toBe(350);
+      rerender({ signal: "new progress" });
+      expect(element.scrollTop).toBe(350);
+      act(() => element.dispatchEvent(new Event("wheel")));
+      expect(callbacks.size).toBe(0);
+      expect(element.style.scrollBehavior).toBe("");
+      rerender({ signal: "more progress" });
+      expect(element.scrollTop).toBe(350);
+    } finally { unmount(); now.mockRestore(); vi.unstubAllGlobals(); }
+  });
+  it("navigation holds even inside the usual bottom threshold, until explicitly returning", () => {
+    const { result, rerender } = renderHook(({ signal }) => useMessageAutoFollow(signal, "chat"),
+      { initialProps: { signal: "1" } });
+    const element = scrollElement();
+    const row = document.createElement("article"); row.dataset.messageId = "old";
+    row.getBoundingClientRect = () => ({ top: -84 } as DOMRect);
+    element.append(row); result.current.containerRef.current = element;
+    act(() => result.current.scrollToMessage("old"));
+    expect(element.scrollTop).toBe(600);
+    act(() => result.current.handleScroll(scrollEvent(element, 600)));
+    rerender({ signal: "new progress" });
+    expect(element.scrollTop).toBe(600);
+    expect(result.current.awayFromBottom).toBe(true);
+    act(() => result.current.scrollToLatest());
+    expect(element.scrollTop).toBe(1000);
+    expect(result.current.awayFromBottom).toBe(false);
+  });
   it("recognizes the configured near-bottom area", () => {
     expect(
       isNearScrollBottom({ scrollHeight: 1000, scrollTop: 590, clientHeight: 300 })

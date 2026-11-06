@@ -17,6 +17,8 @@ USER_HOME="/Users/$CONSOLE_USER"
 for required in \
     "$INSTALL_DIR/ExcelBro" \
     "$INSTALL_DIR/manifest.xml" \
+    "$INSTALL_DIR/wps-frontend/index.html" \
+    "$INSTALL_DIR/wps-frontend/ribbon.xml" \
     "$INSTALL_DIR/localhost.cer"; do
     if [ ! -f "$required" ]; then
         echo "安装文件不完整：$required" >&2
@@ -85,3 +87,7 @@ if [ -z "$healthy" ]; then
         sed -n 's/^SHA-256 hash: //p')
     exit 1
 fi
+
+# Merge only our WPS ET plugin; run as the desktop user to preserve ownership.
+sudo -u "$CONSOLE_USER" "$INSTALL_DIR/ExcelBro" --register-wps "$USER_HOME"
+echo "Excel Bro 已为 Excel 与 WPS 表格安装。请退出并重新打开两款应用。"

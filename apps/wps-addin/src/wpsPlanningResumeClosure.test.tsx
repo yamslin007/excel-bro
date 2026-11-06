@@ -639,7 +639,14 @@ describe("CAP-02 续跑结果闭环：三分支接回正常处理链", () => {
     expect(before).toHaveLength(paused.length + 1);
     expect(before.slice(0, paused.length).map((segment) => segment.steps))
       .toEqual(paused.map((segment) => segment.steps));
-    const resumed = before[before.length - 1];
+    /*
+     * 进行中的过程框**收起成一行**（`processPanelExpanded` 对 `live` 直接返回收起，
+     * 那一行显示"当前正在做什么"）。收起是呈现，不是内容被删 —— 先展开再数步骤。
+     */
+    expect(lastSegment(container)?.getAttribute("data-expanded")).toBe("false");
+    await act(async () => lastSegment(container)!
+      .querySelector<HTMLButtonElement>(".task-progress-toggle")!.click());
+    const resumed = segmentSnapshots(container)[before.length - 1];
     expect(resumed.steps.length).toBe(2);
     expect(resumed.steps[0]).toContain("接回原任务进度");
     expect(resumed.steps[1]).toContain("步骤7继续");
@@ -650,11 +657,11 @@ describe("CAP-02 续跑结果闭环：三分支接回正常处理链", () => {
     await act(async () => finish());
     await until(() => (container.textContent ?? "").includes("接续完成"), "完成");
     /*
-     * 正常结束 ⇒ 过程框收起成一行；要看"第八步真的追加了"，得先展开。
-     * 收起是呈现，步骤没有被删。
+     * 这一段已经被**用户手动展开**过：按判据"用户表过态就不再让自动收起改回去"，
+     * 任务结束后仍保持展开。自动收起只针对没表过态的卡片（那一路由下一条用例
+     * "原任务仍在运行时把后续进度接到新的回复段"负责）。
      */
-    expect(lastSegment(container)?.getAttribute("data-expanded")).toBe("false");
-    await act(async () => lastSegment(container)!.querySelector<HTMLButtonElement>(".task-progress-toggle")!.click());
+    expect(lastSegment(container)?.getAttribute("data-expanded")).toBe("true");
     const done = segmentSnapshots(container);
     expect(done).toHaveLength(paused.length + 1);
     expect(done[0].steps).toEqual(paused[0].steps);
@@ -753,6 +760,10 @@ describe("CAP-02 续跑结果闭环：三分支接回正常处理链", () => {
     expect(container.querySelectorAll(".task-progress-jump")).toHaveLength(after.length - 1);
     expect(liveSegmentCount(container)).toBeLessThanOrEqual(1);
     // 判别点 3：新段的第一行已经跑完（不是把旧段的 warning 搬过来）。
+    // 进行中的卡收起成一行 ⇒ 先展开再读步骤（收起是呈现，不是内容被删）。
+    expect(lastSegment(container)?.getAttribute("data-expanded")).toBe("false");
+    await act(async () => lastSegment(container)!
+      .querySelector<HTMLButtonElement>(".task-progress-toggle")!.click());
     const resumedStep = lastSegment(container)?.querySelector(".activity-steps > li");
     expect(resumedStep?.getAttribute("data-status")).toBe("completed");
     expect(resumedStep?.textContent).toContain("理解消息");

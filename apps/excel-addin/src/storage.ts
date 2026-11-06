@@ -164,10 +164,24 @@ export function analyzeQueryToolCompatibility(
 }
 
 export function instantiateQueryTool(tool: SavedQueryTool): DataToolRequest {
-  return {
+  const request: DataToolRequest = {
     ...structuredClone(tool.request),
     id: `saved-query-${tool.id}-${Date.now()}`
   };
+  /*
+   * 固化工具的"数据来源"就是保存时那几张表（`sourceSheetNames`），它**本身就是
+   * 绑定**。把它写进请求的 `sheets`，让执行器看到同一个事实 —— 否则多表工作簿上
+   * 会被"没指明要查哪几张表"挡掉，等于把已经保存过的工具弄坏。
+   * 文件夹模式不加：那边的表由文件夹会话决定，加进来会被误解成工作簿表名。
+   */
+  if (
+    tool.sourceMode === "workbook" &&
+    (request.arguments.sheets ?? []).length === 0 &&
+    tool.sourceSheetNames.length > 0
+  ) {
+    request.arguments.sheets = [...tool.sourceSheetNames];
+  }
+  return request;
 }
 
 interface LegacySavedTool {

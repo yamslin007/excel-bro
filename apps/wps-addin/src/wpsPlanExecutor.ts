@@ -54,11 +54,13 @@ import { wpsReadWorkbook } from "./wpsResultReviewTarget";
 import {
   assertWpsAuthorization,
   authorizeWpsSheets,
+  listWpsWorksheets,
   normalizeWpsMatrix,
   wpsAuthorizedSourceFingerprint,
   type WpsReadAuthorization
 } from "./wpsWorkbookReader";
 import { wpsWriteVersionStatus } from "./wpsWriteVersionGate";
+import { wpsUndoReadbackTargets } from "./wpsAppliedActions";
 import {
   assertWpsVerifiedSetAlignment,
   assertWpsVerifiedResizeRange,
@@ -636,6 +638,65 @@ function selectedSheet(
   };
 }
 
+/**
+ * 公式文本里点名的**已存在**工作表必须都在本次授权范围内 —— 写入前拒绝整份计划。
+ *
+ * 为什么需要这一条：`writeFormulas` 的动作只声明**写入目标**，跨表依赖藏在文本里
+ * （`=其他!A1*2`）。`selectedSheet` 的授权闸只看 `action.sheet`，于是这条公式会把
+ * 一张**没被勾选**的表的值算进已授权目标格 —— 用户没有授权的数据被读出来并留在
+ * 表里，等于把授权边界从"勾选的那几张"放大到"任何一张"。所以这里的结论是
+ * **拒绝，零写入**，而不是"照写、只是不登记精确恢复"（后者是恢复口径，不是授权口径）。
+ *
+ * 判据与 Excel 端 `validatePlan` 的公式引用闸**逐条同口径**（同一份
+ * `formulaSheetReferences`，`apps/excel-addin/src/excel.ts` 的 `references.dynamic` /
+ * `isUnauthorizedExistingSheet`），顺序也一致：先动态、再未授权。
+ * - **动态引用**（`INDIRECT` / `OFFSET`）解析不出它读哪张表 ⇒ 无法核对依赖是否在
+ *   授权内 ⇒ **先拒再说**。这里不能退成"照写、只是不登记精确恢复"：恢复口径管的是
+ *   "能不能精确回滚"，授权口径管的是"能不能读"。读不出依赖就意味着这条闸**无法
+ *   判定**，而无法判定不等于通过 —— 放行等于让公式自己去读任何一张表。
+ *   与 Excel 端文案同源（"公式含动态引用（INDIRECT / OFFSET），无法核对依赖的工作表"）。
+ * - 只拒**已存在且未授权**的表。WPS 没有建表动作，计划引用的新表此刻不存在，
+ *   不按越界处理（真写下去宿主会给 `#REF!`，那是公式问题，不是授权问题）；
+ * - 外部工作簿引用（`[Book.xlsx]Sheet1`）不是本工作簿的表，交给
+ *   `assertSafeFormula` 外部引用策略，不在这里重复一套。
+ *
+ * 两条都在 `prepareWpsPlan` 里、任何宿主读取/写入之前调用，所以拒绝时是零写入；
+ * 也**不依赖恢复验收探针是否启用** —— 探针只管中断点，不管授权。
+ */
+function assertWpsFormulaDependenciesAuthorized(
+  application: WpsApplication,
+  authorization: WpsReadAuthorization,
+  actions: readonly ExcelAction[]
+): void {
+  if (!actions.some((action) => action.type === "writeFormulas")) return;
+  const authorized = new Set(
+    authorization.sheets.map((sheet) => sheet.name.toLocaleLowerCase())
+  );
+  const existing = new Set(
+    listWpsWorksheets(application).sheets.map((sheet) => sheet.name.toLocaleLowerCase())
+  );
+  actions.forEach((action, index) => {
+    if (action.type !== "writeFormulas") return;
+    const references = formulaSheetReferences(action.formulas ?? []);
+    if (references.dynamic) {
+      throw new Error(
+        `第 ${index + 1} 步公式含动态引用（INDIRECT / OFFSET），无法核对依赖的工作表，` +
+          "已拒绝整份计划；原表未被修改。"
+      );
+    }
+    const unauthorized = references.sheets.filter((raw) => {
+      const key = String(raw ?? "").trim().toLocaleLowerCase();
+      return Boolean(key) && existing.has(key) && !authorized.has(key);
+    });
+    if (unauthorized.length) {
+      throw new Error(
+        `第 ${index + 1} 步公式引用了未授权的工作表「${unauthorized.join("、")}」，` +
+          "已拒绝整份计划；原表未被修改。"
+      );
+    }
+  });
+}
+
 
 /* ------------------------------------------------------------------------- *
  * 排序（sortRange）：值重排，格式/公式/表格对象三类影响必须先核对
@@ -966,6 +1027,11 @@ export function prepareWpsPlan(
     selectedSheet(application, authorization, action.sheet);
     if (action.type === "copyRange" || action.type === "computeValues") selectedSheet(application, authorization, action.sourceSheet);
   }
+  /*
+   * 公式的**跨表读**也受授权边界约束：动作只声明写入目标，依赖藏在公式文本里。
+   * 必须在这里（任何宿主读取/写入之前）拒，见函数注释。
+   */
+  assertWpsFormulaDependenciesAuthorized(application, authorization, plan.actions);
   const computedSources: WpsSourceSnapshot[] = [];
   const computationEvidence = new Map<string, string>();
   if (plan.actions.some(action => action.type === "computeValues")) plan = { ...plan, actions: plan.actions.flatMap((action, index): ExcelAction[] => {
@@ -1235,14 +1301,28 @@ function isResumableValueAction(type: string): type is "writeValues" | "writeFor
 }
 
 /** Only complete, disjoint source evidence qualifies; no cell matrix leaves this host. */
-export function wpsResumeContext(prepared: WpsPreparedPlan): WpsResumeContext | null {
+export interface WpsResumeContextOutcome {
+  context: WpsResumeContext | null;
+  /** `context` 为 null 时给出**同源**原因；成功时为 null。原因里只出现表名，不含单元格值。 */
+  reason: string | null;
+}
+
+/**
+ * 精确恢复资格的唯一判据，**一份分支、两个出口**：
+ * `wpsResumeContext` 只要结果，`wpsResumeContextOutcome` 连"为什么不行"一起给。
+ *
+ * 为什么要原因：2026-11-01 真机（WPS 公式 B 首轮）在上游就丢了资格，界面与账本都只剩
+ * "没有恢复材料"，事后分不清是公式不可分离、证据没盖住、还是计划没声明依赖 —— 三种
+ * 成因要用户做的事完全不同。判据一个字没放宽，只是不再把原因合并成 null。
+ */
+export function wpsResumeContextOutcome(prepared: WpsPreparedPlan): WpsResumeContextOutcome {
+  const fail = (reason: string): WpsResumeContextOutcome => ({context: null, reason});
   /*
    * **公式依赖面**（与 Excel 读同一份判据，产品规则 2026-10-30）：
    * `writeFormulas` 写的是公式文本，宿主执行时自己求值，所以它不会出现在下面
    * "读写重叠"的判断里（依赖表≠读过的表）。要求是三条，缺一条都不登记：
    * - 依赖面必须可分离（同表引用／动态／外部工作簿／名称／引用表=写入目标 ⇒ 不登记）；
-   * - 公式读的那几张表必须都在 `sourceDependencySheets` 里，从而在 `sources` 里
-   *   有对应的值指纹（下面那条 `deps.some(...)` 保证 dep ⊆ sources）；
+   * - 公式读的那几张表必须都有值指纹证据（下面每一条保证 dep ⊆ sources）；
    * - **证据必须真的盖住那块表**：只有"表名出现在读取记录里"不算数 —— 读取记录
    *   可能只盖到 `A1:A3`，公式却读 `B10`。`formulaSourceCoverage` 是准备阶段
    *   按依赖表整张有效区域补证据时留下的记账（见 `captureWpsFormulaSourceCoverage`）。
@@ -1252,26 +1332,54 @@ export function wpsResumeContext(prepared: WpsPreparedPlan): WpsResumeContext | 
    * （`assertWpsFormulaSourceCoverage`：现场有效区域必须仍落在登记的那块矩形里）。
    */
   const formulaRequirement = formulaSourceEvidenceRequirement(prepared.plan);
-  if (!formulaRequirement.ok) return null;
+  if (!formulaRequirement.ok) return fail(formulaRequirement.reason);
   // Only a live trusted compiler seal can create this context. Missing read
   // evidence on an ordinary calculated plan never becomes a literal context.
-  if (prepared.hostVersion && isTrustedLiteralPlan(prepared.plan) && prepared.actions.every(a => isResumableValueAction(a.type)))
-    return formulaRequirement.sheets.length === 0
-      ? {version:2,hostVersion:prepared.hostVersion,sources:[]}
-      // 公式要证据：不能走"没有来源"的 version 2 通道。
-      : null;
-  const deps = prepared.plan.sourceDependencySheets;
+  if (prepared.hostVersion && isTrustedLiteralPlan(prepared.plan) && prepared.actions.every(a => isResumableValueAction(a.type))) {
+    if (formulaRequirement.sheets.length === 0)
+      return {context: {version:2,hostVersion:prepared.hostVersion,sources:[]}, reason: null};
+    // 公式要证据：不能走"没有来源"的 version 2 通道。
+    return fail("这份计划的可信编译凭据只覆盖字面值；公式要从来源表重新求值，需要来源证据而不是字面上下文");
+  }
+  /*
+   * 依赖表的**权威来源是公式文本的解析结果**，`plan.sourceDependencySheets` 只是声明。
+   *
+   * 2026-11-01 真机（WPS 公式 B 首轮，`wps-execution-4998b190…`）：`prepareWpsPlan`
+   * 已经从 `=来源!B2*1` 解析出 `来源`，也把 `来源!A1:B5` 的证据采进了 `sources`
+   * （`formulaSourceCoverage` 有值），唯独 `sourceDependencySheets` 为空 —— 判据读声明，
+   * `!deps?.length` 直接返回 null，于是登记不带 `resumeContext`、恢复包不生成，恢复卡
+   * 只能说"本机没有这次执行的恢复材料"。**声明缺失不等于"没有依赖"**：解析结果就是
+   * 同一份事实，而且它是从公式本身读出来的，比声明更贴近现场。
+   *
+   * 边界没有放宽：解析结果为空仍返回 null；声明存在时照旧按声明逐条校验（两份事实
+   * 冲突时保守拒绝）；后面每一条"证据必须盖住、不得是目标表、不超限额"全部保留。
+   */
+  const declaredDeps = prepared.plan.sourceDependencySheets;
+  const deps = declaredDeps?.length ? declaredDeps : formulaRequirement.sheets;
   const coverage = prepared.formulaSourceCoverage ?? {};
-  if (formulaRequirement.sheets.some(name => {
+  const uncovered = formulaRequirement.sheets.find(name => {
     const range = coverage[name];
     return !range || !prepared.sources.some(source => source.sheetName === name && source.range === range);
-  })) return null;
-  if (!deps?.length || !prepared.hostVersion || !prepared.sources.length ||
-      formulaRequirement.sheets.some(name => !deps.includes(name)) ||
-      prepared.actions.some(a => !isResumableValueAction(a.type)) ||
-      deps.some(name => prepared.actions.some(a => a.sheetName === name) || !prepared.sources.some(s => s.sheetName === name)) ||
-      prepared.sources.some(s => s.presentationFingerprint !== undefined || !deps.includes(s.sheetName)) ||
-      prepared.sources.reduce((n, s) => n + s.rowCount * s.columnCount, 0) > capabilities.taskRecovery.wpsResumeMaxSourceCells) return null;
+  });
+  if (uncovered)
+    return fail(`来源表「${uncovered}」没有"整张有效区域"的值证据，续跑时无法判断外部有没有改过它`);
+  if (deps.length === 0) return fail("计划与公式都没有给出依赖表，续跑时不知道该核对哪张来源表");
+  if (!prepared.hostVersion) return fail("没有读到宿主版本，登记后无法核对是不是同一个宿主");
+  if (!prepared.sources.length) return fail("这份计划没有读过任何来源区域，没有可核对的值基线");
+  const undeclared = formulaRequirement.sheets.find(name => !deps.includes(name));
+  if (undeclared)
+    return fail(`公式读了「${undeclared}」，但计划的来源依赖里没有声明它（两份事实不一致）`);
+  if (prepared.actions.some(a => !isResumableValueAction(a.type)))
+    return fail("计划里有不支持精确恢复的动作类型，只有值写入与公式写入可以登记");
+  const depIsTarget = deps.find(name => prepared.actions.some(a => a.sheetName === name));
+  if (depIsTarget) return fail(`来源表「${depIsTarget}」同时是本次写入目标，无法把本次写入与外部修改分开核对`);
+  const depWithoutEvidence = deps.find(name => !prepared.sources.some(s => s.sheetName === name));
+  if (depWithoutEvidence) return fail(`依赖表「${depWithoutEvidence}」没有读到任何值证据`);
+  if (prepared.sources.some(s => s.presentationFingerprint !== undefined || !deps.includes(s.sheetName)))
+    return fail("来源证据里混入了非依赖表或「计算展示」指纹，恢复时不核对这两类东西");
+  const sourceCells = prepared.sources.reduce((n, s) => n + s.rowCount * s.columnCount, 0);
+  if (sourceCells > capabilities.taskRecovery.wpsResumeMaxSourceCells)
+    return fail(`来源证据共 ${sourceCells} 格，超过精确恢复的 ${capabilities.taskRecovery.wpsResumeMaxSourceCells} 格限额`);
   const sources = prepared.sources.map(source => {
     const snapshot = prepared.sourceSnapshots.find(s => s.sheetName === source.sheetName && s.range === source.range);
     if (!snapshot) return null;
@@ -1279,8 +1387,16 @@ export function wpsResumeContext(prepared: WpsPreparedPlan): WpsResumeContext | 
       columnCount: source.columnCount, previewFingerprint: source.previewFingerprint,
       valueFingerprint: matrixFingerprintV2(snapshot.values, snapshot.values.map(row => row.map(() => null)))};
   });
-  if (sources.some(s => !s)) return null;
-  return {version: 1, hostVersion: prepared.hostVersion, sources: sources as WpsResumeContext["sources"]};
+  if (sources.some(s => !s))
+    return fail("来源证据缺少对应的值快照，算不出值指纹");
+  return {
+    context: {version: 1, hostVersion: prepared.hostVersion, sources: sources as WpsResumeContext["sources"]},
+    reason: null
+  };
+}
+
+export function wpsResumeContext(prepared: WpsPreparedPlan): WpsResumeContext | null {
+  return wpsResumeContextOutcome(prepared).context;
 }
 
 /** Check authorization and ALL descriptors before reading any source cells. */
@@ -1327,7 +1443,7 @@ export function assertWpsResumeSources(application: WpsApplication, state: WpsEx
     const current = readMatrices(range, source.rowCount, source.columnCount);
     if (current.fingerprint !== source.previewFingerprint ||
         matrixFingerprintV2(current.values, current.values.map(row => row.map(() => null))) !== source.valueFingerprint)
-      throw new Error("来源已变化，不能沿用旧结果续跑。");
+      throw new Error(FORMULA_SOURCE_CHANGED_MESSAGE);
   }
 }
 
@@ -2734,7 +2850,17 @@ export function wpsUndoRecordFor(
  * `createdAt` 必须保持**原始执行时间**；这里不刷新它，也不延长任何有效期。
  */
 export function adoptWpsUndoRecord(application: WpsApplication, record: WpsUndoRecord): void {
-  upsertRecord(application, record);
+  // 水合不是一次新执行：更新已有记录不得移到栈顶，补回缺失记录按原执行时间插入。
+  const records = readRecords(application);
+  const existing = records.findIndex(item => item.executionId === record.executionId);
+  if (existing >= 0) {
+    records[existing] = record;
+  } else {
+    const createdAt = Date.parse(record.createdAt);
+    const older = records.findIndex(item => Date.parse(item.createdAt) < createdAt);
+    records.splice(older >= 0 ? older : records.length, 0, record);
+  }
+  writeRecords(application, records);
 }
 
 /**
@@ -2766,11 +2892,24 @@ export function inspectWpsUndoRecord(
   application: WpsApplication,
   executionId: string
 ): WpsUndoInspection {
+  return inspectWpsRecord(application, executionId, false);
+}
+
+/** Review accepts an already verified execution's current result, not evidence of a write event. */
+export function inspectWpsConfirmedResult(application: WpsApplication, executionId: string): WpsUndoInspection {
+  return inspectWpsRecord(application, executionId, true);
+}
+
+function inspectWpsRecord(application: WpsApplication, executionId: string, confirming: boolean): WpsUndoInspection {
   const record = readRecords(application).find((item) => item.executionId === executionId);
   if (!record) {
     return { kind: "unknown", detail: "找不到这次执行的恢复记录。" };
   }
   const applicable = record.actions.filter((action) => action.appliedRows > 0);
+  if (confirming && (record.state !== 'verified' || record.actions.length === 0 ||
+      record.actions.some(action => action.appliedRows !== action.rowCount))) {
+    return { kind: 'unknown', detail: '本次执行尚无全部动作完成并回读通过的记录，不能确认结果。' };
+  }
   if (applicable.length === 0) {
     // 一个动作都没报过写入：执行器若明确说区域已回到写前，才敢说"未开始"。
     if (record.state === "restored") return { kind: "not_started" };
@@ -2832,6 +2971,13 @@ export function inspectWpsUndoRecord(
         toChangeFormulas(current.formulas)
       );
       const gate = formulaResumeGate(site);
+      // Same before/after formulas are acceptable only for a verified result. Every cell
+      // must still match the expected formula; indeterminate mixed with before is not enough.
+      if (confirming && site.kind === 'indeterminate' && site.cells.length > 0 &&
+          site.cells.every(row => row.every(cell => cell === 'written' || cell === 'indeterminate'))) {
+        atAfter += 1;
+        continue;
+      }
       // `write` = 现场仍是写前（这个动作没落地）；`skip` = 现场已是写后（已落地，跳过不重写）。
       if (gate === "write") { atBefore += 1; continue; }
       if (gate === "skip") { atAfter += 1; continue; }
@@ -2882,6 +3028,27 @@ export function inspectWpsUndoRecord(
     kind: "conflict",
     detail: "一部分区域与写后一致、一部分仍是写前，属于只写了一部分的现场。"
   };
+}
+
+/**
+ * 撤销**没有**把所有应恢复的目标带回执行前。
+ *
+ * 单独一种错误，因为它与"条件不满足、一格都没动"是两件事：这里的现场是**部分恢复**，
+ * 恢复资料必须保留（续跑/重试都还要用它），界面也必须说清是哪几块没回去，
+ * 不许再出现一句笼统的"已撤销并回读确认恢复成功"。
+ */
+export class WpsUndoResidualError extends Error {
+  readonly regions: string[];
+  readonly unreadable: string[];
+  constructor(regions: string[], unreadable: string[]) {
+    super([
+      regions.length ? `撤销没有把「${regions.join("、")}」恢复到执行前` : "",
+      unreadable.length ? `「${unreadable.join("、")}」无法回读核对` : ""
+    ].filter(Boolean).join("；") + "；恢复资料已保留，可以重试。");
+    this.name = "WpsUndoResidualError";
+    this.regions = regions;
+    this.unreadable = unreadable;
+  }
 }
 
 export async function undoWpsExecution(  application: WpsApplication,
@@ -2990,6 +3157,45 @@ export async function undoWpsExecution(  application: WpsApplication,
       throw new Error(record.error);
     }
     await yieldControl();
+  }
+  /*
+   * 收尾：把**全部**应恢复目标再读一遍，而不是只看刚刚写回去的那几格（2026-11-02 真机）。
+   *
+   * 真机上出现过"结果1!B2 已空、结果2!B2 仍是 8"，而这次撤销只恢复了一个动作 ——
+   * 因为另一个动作在记录里是 `appliedRows === 0`，两处 `continue` 都跳过了它。
+   * 逐动作回读只能证明"我做过的都对了"，证明不了"没有漏"。所以这里按
+   * `wpsUndoReadbackTargets`（所有值动作，与 `appliedRows` 无关）逐块核对：
+   * 任何一块没回到写前，就**不能说**撤销成功，也不能置终态、回收材料。
+   *
+   * 宁可报"这次没能全部恢复"并留下材料让人重试，也不替用户断言一个没被证明的"已恢复"。
+   */
+  const residual: string[] = [];
+  const unreadable: string[] = [];
+  for (const action of wpsUndoReadbackTargets(record.actions)) {
+    try {
+      const sheet = getStoredSheet(application, record, action);
+      const current = readMatrices(
+        rangeFor(sheet, action.range),
+        action.rowCount,
+        action.columnCount,
+        record.version
+      );
+      if (current.fingerprint !== action.beforeFingerprint)
+        residual.push(`${action.sheetName}!${action.range}`);
+    } catch {
+      // 读不出来 ≠ 已恢复：不猜。
+      unreadable.push(`${action.sheetName}!${action.range}`);
+    }
+  }
+  if (residual.length || unreadable.length) {
+    const parts = [
+      residual.length ? `「${residual.join("、")}」没有回到执行前` : "",
+      unreadable.length ? `「${unreadable.join("、")}」无法回读核对` : ""
+    ].filter(Boolean);
+    record.state = "undo_conflict";
+    record.error = `撤销未完成：${parts.join("；")}；恢复资料已保留，可以重试。`;
+    upsertRecord(application, record);
+    throw new WpsUndoResidualError(residual, unreadable);
   }
   record.state = "restored";
   upsertRecord(application, record);

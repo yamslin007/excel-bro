@@ -170,10 +170,10 @@ describe("header popup layering", () => {
   it("keeps both hosts' header labels accessible without taking layout space", () => {
     for (const name of ["./App.tsx", "../../wps-addin/src/WpsAgentPanel.tsx"]) {
       const component = css(name);
-      expect(component).toContain("<ModelPickerIcon />");
-      expect(component).toContain('aria-label="新对话"');
+      expect(component).toContain("<ModelPickerLabel model={selectedModel} />");
+      expect(component).toContain('<NewConversationButton disabled={busy}');
       expect(component).toContain('aria-label="我的工具"');
-      expect(component).toContain('aria-label="备份与恢复"');
+      expect(component).toContain('<ConversationUtilityButtons disabled={busy}');
       expect(component).not.toContain('className="header-button labeled-header-button');
       expect(component).not.toContain('<span>新对话</span>');
       expect(component).not.toContain('<span>备份</span>');
@@ -189,16 +189,10 @@ describe("header popup layering", () => {
     expect(compact).toContain("position: absolute");
   });
 
-  it("raises the header stacking context while a model or more menu is open", () => {
-    const source = css("./styles.css");
-    const component = css("./App.tsx");
-
-    expect(source).toMatch(
-      /\.chat-header\.menu-open\s*\{[\s\S]*?z-index:\s*50;/
-    );
-    expect(component).toContain(
-      'className={`chat-header${modelMenuOpen || moreMenuOpen ? " menu-open" : ""}`}'
-    );
+  it("removes the header row while keeping the scope utility actions", () => {
+    expect(css("./App.tsx")).not.toContain('className={`chat-header');
+    expect(css("./styles.css")).toContain('.chat-shell.chat-shell-headerless { grid-template-rows: minmax(0, 1fr) auto; }');
+    expect(css("./components/ConversationUtilityButtons.tsx")).toContain('aria-label="备份与恢复"');
   });
 });
 
@@ -539,39 +533,19 @@ describe("natural organic style", () => {
     expect(confirm).toContain("color: white");
   });
 
-  it("keeps the image entry icon-only and marks the file chip with a paperclip", () => {
+  it("uses the EB logo menu and marks the file chip with a paperclip", () => {
     const source = css("./styles.css");
     const excelApp = css("./App.tsx");
     const wpsAgent = css("../../wps-addin/src/WpsAgentPanel.tsx");
     const wpsPanel = css("../../wps-addin/src/WpsProbePanel.tsx");
 
-    // ① 图片入口：两端都必须是纯图标按钮，不再带「图片」文字标签。
-    // 背景：按钮里的 `<span>图片</span>` 与图标并肩，在窄工具条里把按钮撑宽、
-    // 且与旁边的文字提示抢视线。去掉文字后按钮要能独立表达语义（`aria-label` 仍在）。
-    for (const [name, src] of [
-      ["App.tsx", excelApp],
-      ["WpsAgentPanel.tsx", wpsAgent]
-    ] as const) {
-      const marker = src.indexOf('className="attach-image-button"');
-      expect(marker, `${name} 找不到图片入口`).toBeGreaterThan(-1);
-      // 取该按钮起始标签到 `</button>` 的整段 JSX。
-      const button = src.slice(marker, src.indexOf("</button>", marker));
-      expect(button, `${name} 图片入口仍带「图片」文字`).not.toContain(">图片<");
-      // 正向锚点：图标 svg 还在，否则上面的负向断言可能是把按钮整个删了。
-      expect(button, `${name} 图片入口丢了图标`).toContain("<svg");
-      // 无障碍名不能随文字一起消失。
-      expect(button, `${name} 图片入口丢了 aria-label`).toContain('aria-label="添加图片"');
+    for (const src of [excelApp, wpsAgent]) {
+      expect(src).not.toContain('className="attach-image-button"');
+      expect(src).toContain('<ComposerAppMenu logoSrc={brandLogoUrl}');
     }
-
-    // ② 图标按钮的几何：正方形 + 无内边距，图标靠 flex 居中。
-    const iconRule = [...source.matchAll(/\.attach-image-button\s*\{([^}]*)\}/g)]
-      .map((m) => m[1])
-      .join("\n");
-    expect(iconRule).toContain("width: 31px");
-    expect(iconRule).toContain("height: 31px");
-    expect(iconRule).toContain("padding: 0");
-    // 已无文字，`gap` 只会留下错位空隙 —— 不许回潮。
-    expect(iconRule).not.toContain("gap:");
+    const trigger = css("./components/ComposerAppMenu.tsx");
+    expect(trigger).toContain('aria-label="EB 菜单"');
+    expect(trigger).toContain('<img src={logoSrc}');
 
     // ③ 文件选择 chip：图标必须是**线性描边回形针 SVG**，而不是 emoji `▦`/`📎`。
     // emoji 是彩色位图字形，不吃 `color`，放在绿色底片上观感割裂、跨系统字形还不一致；
@@ -970,5 +944,35 @@ describe("执行过程卡与结果展示卡同宽", () => {
     // 否则同一句话在切换状态时左右跳动。
     expect(live).toMatch(/padding:\s*[\d.]+px\s+var\(--spacing-md\)|padding:\s*[\d.]+px\s+12px/);
     expect(done).toMatch(/padding:\s*[\d.]+px\s+12px/);
+  });
+});
+
+describe("消息流的内容列与两级行距", () => {
+  /** 取单条 `选择器 { ... }` 的声明体（与本文件另一处同名工具同口径）。 */
+  function body(source: string, selector: string): string {
+    const start = source.indexOf(`${selector} {`);
+    expect(start, `找不到规则 ${selector}`).toBeGreaterThanOrEqual(0);
+    const end = source.indexOf("}", start);
+    return source.slice(start, end);
+  }
+
+  it("正文与卡片共享一条左右 16px 的内容列", () => {
+    const stream = body(css("./styles.css"), ".message-stream");
+
+    // 左右同值（否则内容列是歪的），且不小于 16 —— 12px 时内容"浮"在面板上。
+    expect(stream).toMatch(/padding:\s*12px\s+16px\s+8px/);
+  });
+
+  it("组间多垫的那 4px 用内边距而不是外边距", () => {
+    const source = css("./styles.css");
+    const start = body(source, '.message-row[data-group="start"]:not(:first-child)');
+
+    // 关键：相邻块级兄弟的外边距会**折叠**（8 与 4 折成 8），垫上去等于没垫。
+    // 写成 margin-top 的地方必须没有 —— 这是"组间 12 / 组内 8"唯一能被观察到的差别。
+    expect(start).toContain("padding-top");
+    expect(start).not.toContain("margin-top");
+
+    // 组内间距本身仍是行距，不随组首规则变。
+    expect(body(source, ".message-row")).toMatch(/margin-bottom:\s*8px/);
   });
 });

@@ -2,7 +2,7 @@
 import { describe, expect, it } from 'vitest';
 import type { AnalysisPlan } from './contracts';
 import type { SheetSnapshot } from './excelNativeComparison';
-import { buildManualReviewFile } from './manualReviewFile';
+import { buildManualReviewFile, buildBeforeReviewWorkbook } from './manualReviewFile';
 import { readSeedEntries } from './nativeReviewTestHelpers';
 
 const source = (): SheetSnapshot => ({id:'original',name:'Ledger',address:'B5:D6',startRow:5,startColumn:2,
@@ -20,6 +20,36 @@ function read(plan: AnalysisPlan, snapshot=source()) {
   return {output,files,sheet,styles};
 }
 describe('compatibility OOXML projection', () => {
+  it('packs three named before-sheets into one workbook with shared styles and no live formulas', () => {
+    const snapshots = ['结果1','结果2','结果3'].map((name, i) => ({...source(), name,
+      values: [[`before-${i}`, 7, 8], ['=literal', 9, 99]]}));
+    const result = buildBeforeReviewWorkbook(snapshots, p([]), 20000, 8388608, 'EB_' + 'b'.repeat(20), '结果3');
+    const files = readSeedEntries(result.base64), parser = new DOMParser();
+    const book = parser.parseFromString(files['xl/workbook.xml'], 'application/xml');
+    expect([...book.querySelectorAll('sheet')].map(s => s.getAttribute('name'))).toEqual(['结果1','结果2','结果3']);
+    expect(book.querySelector('workbookView')?.getAttribute('activeTab')).toBe('2');
+    expect(book.querySelectorAll('definedName')).toHaveLength(1);
+    for (let i = 0; i < 3; i++) {
+      const sheet = parser.parseFromString(files[`xl/worksheets/sheet${i+1}.xml`], 'application/xml');
+      expect(sheet.querySelector('parsererror')).toBeNull();
+      expect(sheet.querySelector('c[r="B5"] t')?.textContent).toBe(`before-${i}`);
+      expect(sheet.querySelectorAll('f')).toHaveLength(0);
+      expect(sheet.querySelector('c[r="B6"] t')?.textContent).toBe('=literal');
+    }
+    expect(() => buildBeforeReviewWorkbook(snapshots, p([]), 10, 8388608, 'EB_'+'b'.repeat(20), '结果1')).toThrow('限额');
+  });
+  it.each(['结果1', '结果2', '结果3', '结果 & 对照'])('keeps the visible sheet name %s and hides the ownership nonce', name => {
+    const nonce = 'EB_' + 'a'.repeat(20);
+    const result = buildManualReviewFile(name, {...source(), name}, p([]), 20000, 8388608, nonce);
+    const files = readSeedEntries(result.base64);
+    const workbook = new DOMParser().parseFromString(files['xl/workbook.xml'], 'application/xml');
+    expect(workbook.querySelector('parsererror')).toBeNull();
+    expect(workbook.querySelector('sheet')?.getAttribute('name')).toBe(name);
+    expect(workbook.querySelectorAll('sheet')).toHaveLength(1);
+    expect(workbook.querySelector('definedName')?.getAttribute('name')).toBe('_EB_ReviewCopyId');
+    expect(workbook.querySelector('definedName')?.getAttribute('hidden')).toBe('1');
+    expect(workbook.querySelector('definedName')?.textContent).toBe(`"${nonce}"`);
+  });
   it('keeps real formulas as formulas, constants as constants and requests actual Excel recalculation without fake cached values', () => {
     const {files,sheet,output}=read(p([{type:'writeFormulas',sheet:'Ledger',range:'D6',formulas:[['=C6+1']]}]));
     expect(JSON.stringify(source())).toContain('LOCAL_PRIVATE_SENTINEL');

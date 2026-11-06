@@ -1,0 +1,78 @@
+// @vitest-environment jsdom
+import { afterEach, expect, it, vi } from 'vitest';
+import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { matchesReviewSheetName, ReviewSheetPicker } from './ReviewSheetPicker';
+afterEach(cleanup);
+it('按顺序模糊匹配非连续字符，忽略大小写、全半角与空格，不颠倒顺序', () => {
+  expect(matchesReviewSheetName('华东销售2026年汇总', '华 汇')).toBe(true);
+  expect(matchesReviewSheetName('Sales-Report 2026', 'ｓｒ２６')).toBe(true);
+  expect(matchesReviewSheetName('华东销售2026年汇总', '汇华')).toBe(false);
+  expect(matchesReviewSheetName('华东销售2026年汇总', '不存在')).toBe(false);
+  expect(matchesReviewSheetName('结果1', '   ')).toBe(true);
+});
+it('模糊查询仅筛选已有目标，不自动对比，点击才使用完整表名', () => {
+  const onSelect = vi.fn();
+  const names = ['华东销售2026年汇总', '华南库存明细', '华东预算明细', '西区销售汇总'];
+  render(<ReviewSheetPicker sheets={names} pending={false} onSelect={onSelect}/>);
+  fireEvent.change(screen.getByRole('textbox'), {target:{value:'华汇'}});
+  expect(screen.getByRole('button',{name:'华东销售2026年汇总'})).toBeTruthy();
+  expect(screen.queryByRole('button',{name:'华东预算明细'})).toBeNull();
+  expect(onSelect).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole('button',{name:'华东销售2026年汇总'}));
+  expect(onSelect).toHaveBeenCalledExactlyOnceWith('华东销售2026年汇总');
+});
+const sheets = Array.from({length:8}, (_, i) => `结果${i + 1}`);
+it('搜索结果全部就地列出，精确连续匹配靠前，不显示分页或自动切表', () => {
+  const onSelect = vi.fn();
+  const names = ['结算果', '结果1', '结果2', '结果3', '结果4', '不匹配'];
+  const view = render(<ReviewSheetPicker sheets={names} selected="结果1" pending={false} onSelect={onSelect}/>);
+  fireEvent.change(screen.getByRole('textbox'), {target:{value:'结果'}});
+  const options = Array.from(view.container.querySelectorAll('.review-sheet-list button')).map(b => b.getAttribute('aria-label'));
+  expect(options).toEqual(['结果1','结果2','结果3','结果4','结算果']);
+  expect(screen.queryByRole('button', {name:'下一页 ›'})).toBeNull();
+  expect(screen.getByText('找到 5 张')).toBeTruthy();
+  expect(onSelect).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole('button',{name:'结果4'}));
+  expect(onSelect).toHaveBeenCalledExactlyOnceWith('结果4');
+});
+it('8 张表按 3/3/2 分页，搜索和翻页不发起对比，点击才发起', () => {
+  const onSelect = vi.fn();
+  const view = render(<ReviewSheetPicker sheets={sheets} selected="结果1" pending={false} onSelect={onSelect}/>);
+  const names = () => Array.from(view.container.querySelectorAll('.review-sheet-list button')).map(b => b.getAttribute('aria-label'));
+  expect(names()).toEqual(['结果1','结果2','结果3']);
+  expect(screen.getByRole('button',{name:'结果1'}).textContent).toContain('✓');
+  expect(screen.getByRole('button',{name:'结果1'}).textContent).toContain('正在对比');
+  expect((screen.getByRole('button',{name:'‹ 上一页'}) as HTMLButtonElement).disabled).toBe(true);
+  fireEvent.click(screen.getByRole('button',{name:'下一页 ›'}));
+  expect(names()).toEqual(['结果4','结果5','结果6']);
+  fireEvent.click(screen.getByRole('button',{name:'下一页 ›'}));
+  expect(names()).toEqual(['结果7','结果8']);
+  expect((screen.getByRole('button',{name:'下一页 ›'}) as HTMLButtonElement).disabled).toBe(true);
+  expect(onSelect).not.toHaveBeenCalled();
+  fireEvent.click(screen.getByRole('button',{name:'结果8'}));
+  expect(onSelect).toHaveBeenCalledExactlyOnceWith('结果8');
+  view.rerender(<ReviewSheetPicker sheets={sheets} selected="结果8" pending={false} onSelect={onSelect}/>);
+  fireEvent.change(screen.getByRole('textbox'),{target:{value:'不存在'}});
+  expect(screen.getByRole('status').textContent).toContain('未找到');
+  fireEvent.click(screen.getByRole('button',{name:'清空工作表搜索'}));
+  expect(names()).toEqual(['结果7','结果8']);
+  expect(view.container.querySelectorAll('.review-sheet-picker')).toHaveLength(1);
+});
+it('输入法组合期间不筛选，结束后筛选；少量表隐藏搜索分页，忙碌时不可选择', () => {
+  const onSelect = vi.fn();
+  const view = render(<ReviewSheetPicker sheets={sheets} pending={false} onSelect={onSelect}/>);
+  const input = screen.getByRole('textbox');
+  fireEvent.compositionStart(input);
+  fireEvent.change(input,{target:{value:'结果8'}});
+  expect(screen.getByRole('button',{name:'结果1'})).toBeTruthy();
+  fireEvent.compositionEnd(input,{data:'结果8'});
+  expect(screen.queryByRole('button',{name:'结果1'})).toBeNull();
+  expect(screen.getByRole('button',{name:'结果8'})).toBeTruthy();
+  expect(onSelect).not.toHaveBeenCalled();
+  view.unmount();
+  render(<ReviewSheetPicker sheets={sheets.slice(0,3)} pending onSelect={onSelect}/>);
+  expect(screen.queryByRole('textbox')).toBeNull();
+  expect(screen.queryByRole('button',{name:'下一页 ›'})).toBeNull();
+  fireEvent.click(screen.getByRole('button',{name:'结果1'}));
+  expect(onSelect).not.toHaveBeenCalled();
+});

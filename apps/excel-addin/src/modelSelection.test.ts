@@ -118,7 +118,7 @@ describe("chooseAvailableModel", () => {
     ).toBe("connection:live");
   });
 
-  it("ignores an unavailable preferred or current model", () => {
+  it("does not silently change providers when the selected connection is unavailable", () => {
     expect(
       chooseAvailableModel(
         [
@@ -129,7 +129,7 @@ describe("chooseAvailableModel", () => {
         null,
         "connection:offline"
       )
-    ).toBe("connection:live");
+    ).toBe("");
   });
 });
 
@@ -178,17 +178,17 @@ describe("resolveDisplayedModelId", () => {
 });
 
 
-describe("SDK purpose-aware selection", () => {
+describe("Unified connection selection", () => {
   const catalogue = [
     { id: "connection:old", available: true, agentAvailable: false, formulaAvailable: true },
     { id: "connection:sdk", available: true, agentAvailable: true, formulaAvailable: false }
   ];
-  it("does not silently replace an existing formula-only choice with another provider", () => {
-    expect(chooseAvailableModel(catalogue, "connection:old", "connection:sdk")).toBe("");
+  it("keeps a connection even when legacy metadata reports no Agent support", () => {
+    expect(chooseAvailableModel(catalogue, "connection:old", "connection:sdk")).toBe("connection:old");
   });
-  it("allows an explicit compatible selection and excludes formula-only defaults", () => {
+  it("allows explicit selection and respects the configured default regardless of purpose", () => {
     expect(chooseAvailableModel(catalogue, "connection:old", null, "connection:sdk")).toBe("connection:sdk");
-    expect(chooseAvailableModel(catalogue, "", "connection:old")).toBe("connection:sdk");
+    expect(chooseAvailableModel(catalogue, "", "connection:old")).toBe("connection:old");
   });
   it("migrates the old SDK alias to the exact same connection", () => {
     expect(chooseAvailableModel(catalogue, "claude-agent-sdk:sdk", null)).toBe("connection:sdk");

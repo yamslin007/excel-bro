@@ -50,11 +50,20 @@ def test_deepseek_connection_keeps_model_key_and_vision():
     assert old.adapter == "openai_compatible"
 
 
-def test_unmapped_connection_does_not_fall_back_to_old_agent(monkeypatch):
-    old = replace(_connection(), adapter="openai_compatible", base_url="https://gateway.invalid/v1")
+@pytest.mark.parametrize("host", ["excel-office", "wps-et"])
+@pytest.mark.parametrize("adapter", ["openai_compatible", "claude_agent_sdk"])
+def test_generic_connection_reaches_same_sdk_without_vendor_substitution(monkeypatch, host, adapter):
+    old = replace(_connection(), adapter=adapter, base_url="https://gateway.invalid/v1")
     monkeypatch.setattr(planner, "selected_model_config", lambda _: old)
-    with pytest.raises(ModelNotAvailableError, match="已统一使用"):
-        asyncio.run(planner.create_plan(plan_request("清空 A1")))
+    calls = []
+    sentinel = object()
+    async def run(request, connection, **kwargs):
+        calls.append((request, connection))
+        return sentinel
+    monkeypatch.setattr(sdk, "run_sdk_plan", run)
+    assert asyncio.run(planner.create_plan(plan_request("清空 A1", hostId=host))) is sentinel
+    assert len(calls) == 1 and calls[0][1] is old
+    assert calls[0][0].hostId == host and calls[0][0].planningReadPolicy == "none"
 
 
 @pytest.mark.parametrize("prompt", ["清空 A1", "删除sheet1之外的子表"])

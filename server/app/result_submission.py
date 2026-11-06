@@ -42,7 +42,14 @@ from typing import Any, Literal
 
 from . import dev_result_ref_fault
 from .local_results import RegisteredResult, local_results
-from .models import AnswerResponse, LocalResultCard, PlanRequest, PlanResponse
+from .models import (
+    AnswerResponse,
+    LocalResultCard,
+    PlanRequest,
+    PlanResponse,
+    QueryIncompleteReason,
+    QueryTruncation,
+)
 from .result_plan import ResultPlanError, compile_result_plan
 
 # 引用不可解析：未知句柄、已过期、属于别的任务、或登记时的授权已被替换。
@@ -105,6 +112,11 @@ def local_result_card(item: RegisteredResult) -> LocalResultCard:
     the source data, so they are not copied into the response DTO (which is
     persisted to the ledger); the local renderer fetches the full payload over
     the loopback result endpoint.
+
+    `incomplete` / `truncated` 是例外，且是故意的：它们是**结构化**的表名与字段名
+    （字段名来自本次请求自己带的列表，表名与 `sourceSheets` 同类），不含任何单元格
+    值。卡片与聊天历史必须能说清"为什么不完整"，否则界面只能把任何 `complete=false`
+    都说成"扫描已达上限"——那正是要修的那个错。
     """
     headers = [
         header if isinstance(header, str) else str(header) for header in item.headers
@@ -117,6 +129,13 @@ def local_result_card(item: RegisteredResult) -> LocalResultCard:
         columnCount=max(1, item.column_count),
         sourceSheets=[str(sheet)[:100] for sheet in item.source_sheets][:100],
         complete=bool(item.complete),
+        incomplete=[QueryIncompleteReason.model_validate(reason) for reason in item.incomplete],
+        truncated=bool(item.truncated),
+        truncation=(
+            QueryTruncation.model_validate(item.truncation)
+            if item.truncation is not None
+            else None
+        ),
     )
 
 

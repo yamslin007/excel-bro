@@ -115,15 +115,3 @@ export function diagnosticReport(): {
     progressEvents: progressDiagnosticEvents()
   };
 }
-
-export function exportDiagnosticReport(): void {
-  const blob = new Blob([JSON.stringify(diagnosticReport(), null, 2)], {
-    type: "application/json"
-  });
-  const url = URL.createObjectURL(blob);
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = `excel-bro-diagnostics-${Date.now()}.json`;
-  anchor.click();
-  URL.revokeObjectURL(url);
-}

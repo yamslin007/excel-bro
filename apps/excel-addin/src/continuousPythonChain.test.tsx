@@ -451,7 +451,7 @@ describe("Excel 连续链路：同一次任务从宿主读取到撤销", () => {
     // 真实点击「执行到 Excel」：产品执行器写回 + 回读核对。
     const runButton = await waitFor(() => {
       const found = [...view.container.querySelectorAll("button")].find(
-        (c) => c.textContent === "确认变更"
+        (c) => c.textContent === "确认全部变更"
       ) as HTMLButtonElement | undefined;
       if (!found) throw new Error("结果审阅确认按钮尚未出现");
       return found;

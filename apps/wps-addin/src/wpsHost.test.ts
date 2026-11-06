@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   getWpsApplication,
+  maxFocusWindowSize,
   readWpsHostProbe,
   WpsHostUnavailableError,
   type WpsApplication,
@@ -73,5 +74,19 @@ describe("WPS host probe", () => {
     expect(() => readWpsHostProbe(fakeApplication({ ActiveWorkbook: undefined }))).toThrow(
       "当前没有打开的工作簿"
     );
+  });
+});
+
+describe("maxFocusWindowSize", () => {
+  it("uses the full available screen area when the WebView reports it", () => {
+    expect(maxFocusWindowSize({ availWidth: 1920, availHeight: 1040 })).toEqual({
+      width: 1920,
+      height: 1040
+    });
+  });
+
+  it("falls back to the conservative target when screen metrics are unavailable", () => {
+    expect(maxFocusWindowSize({ availWidth: 0, availHeight: 0 })).toEqual({ width: 1280, height: 860 });
+    expect(maxFocusWindowSize({ availWidth: NaN, availHeight: NaN })).toEqual({ width: 1280, height: 860 });
   });
 });

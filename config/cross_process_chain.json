@@ -6,9 +6,9 @@
   "memberSheet": "会员表",
   "orderSheet": "订单表",
   "targetSheet": "汇总表",
-  "resultRef": "res_6bf21305b159cdbef9beec7c8f0ac434",
+  "resultRef": "res_93ba4582c55cf87832c58e81faf5ed7a",
   "result": {
-    "resultRef": "res_6bf21305b159cdbef9beec7c8f0ac434",
+    "resultRef": "res_93ba4582c55cf87832c58e81faf5ed7a",
     "title": "Python 分析结果",
     "headers": [
       "列1",
@@ -58,11 +58,14 @@
     ],
     "warnings": [],
     "complete": true,
+    "incomplete": [],
+    "truncated": false,
+    "truncation": null,
     "calculation": "隔离 Python 分析得到的固定值结果",
     "scannedRows": 7
   },
   "plan": {
-    "id": "result-write-01aeba7ff5",
+    "id": "result-write-a27cfbd947",
     "title": "写入 汇总表!A1:C8",
     "summary": "把本地结果「Python 分析结果」写入「汇总表」A1:C8（8 行 × 3 列）。",
     "sourceFingerprint": null,
@@ -71,6 +74,7 @@
       "会员表",
       "订单表"
     ],
+    "sourceDependencyFingerprint": null,
     "assumptions": [],
     "warnings": [
       "执行后目标区域的现有内容会被覆盖。"
@@ -177,6 +181,6 @@
         ]
       }
     ],
-    "localResultRef": "res_6bf21305b159cdbef9beec7c8f0ac434"
+    "localResultRef": "res_93ba4582c55cf87832c58e81faf5ed7a"
   }
 }

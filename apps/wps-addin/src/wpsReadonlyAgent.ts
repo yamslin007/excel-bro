@@ -45,9 +45,12 @@ import type {
   WorkbookSnapshot
 } from "../../excel-addin/src/contracts";
 import {
+  DataToolExecutionError,
   executeQueryTableData,
   type SheetValues
 } from "../../excel-addin/src/dataTools";
+import { parseQueryRange } from "@excel-bro/core/queryRange";
+import { resolveQueryTarget } from "@excel-bro/core";
 import { detectSheetFields } from "../../excel-addin/src/tableSchema";
 import { isSdkPlanningModel } from "../../excel-addin/src/modelSelection";
 import {
@@ -515,16 +518,50 @@ export function sheetsForRequest(
   results: WpsSheetReadResult[],
   activeWorksheet: string
 ): SheetValues[] {
-  const selected =
-    request.arguments.scope === "active"
-      ? results.filter((result) => result.sheet.name === activeWorksheet)
-      : results;
-  if (selected.length === 0) {
-    throw new Error("查询要求读取当前工作表，但当前表不在已授权范围内。");
+  /*
+   * 目标表由 **core 的 `resolveQueryTarget`** 算（与 Excel 执行器同一份判据）：
+   * 授权集合只是可访问的上限，多张表却没绑定 ⇒ 拒绝，而不是把全部已选表当成
+   * 本次任务目标。`sheets` / `range 里的表名` / `scope:"active"` 三种绑定方式
+   * 的优先级也由那一处决定，这里不重排。
+   */
+  const target = resolveQueryTarget({
+    sheets: request.arguments.sheets,
+    rangeSheet: parseQueryRange(request.arguments.range)?.sheet ?? null,
+    scope: request.arguments.scope ?? null,
+    candidates: results.map((result) => result.sheet.name),
+    activeWorksheet
+  });
+  if (target.issue !== null) {
+    throw new DataToolExecutionError(
+      target.issueKind === "unbound" ? "UNSUPPORTED_TOOL" : "SCOPE_VIOLATION",
+      target.issue,
+      target.issueKind === "unbound"
+    );
   }
-  return selected.map((result) => ({
+  /*
+   * 收窄到这里只决定"哪几张表进得来"。为什么要在这里做而不是留给执行器：
+   * `recordTrustedToolReads` 记的是"确定性执行器实际取用的工作表"，账本上的来源
+   * 依赖要跟真正参与计算的表一致。真正的**裁剪**（只让矩形内的格参与计算）仍只在
+   * `executeQueryTableData` 里做一处。
+   */
+  const scoped = target.sheets
+    .map((name) => results.find((result) => result.sheet.name === name))
+    .filter((result): result is WpsSheetReadResult => result !== undefined);
+  if (scoped.length !== target.sheets.length) {
+    const missing = target.sheets.filter(
+      (name) => !results.some((result) => result.sheet.name === name)
+    );
+    throw new DataToolExecutionError(
+      "SCOPE_VIOLATION",
+      `本次要查的工作表「${missing.join("、")}」不在本次查询范围内`,
+      false
+    );
+  }
+  return scoped.map((result) => ({
     name: result.sheet.name,
-    values: result.values
+    values: result.values,
+    // 矩阵从哪开始：没有这个，区域参数落不成裁剪（执行器会因此拒绝，而不是整表读）。
+    origin: { row: result.startRow, column: result.startColumn }
   }));
 }
 

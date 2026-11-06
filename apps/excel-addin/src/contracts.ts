@@ -8,7 +8,12 @@ export interface PlanningPauseAck {
 import type { CellValue } from "@excel-bro/core/contracts";
 // 空白策略的权威定义在 packages/core/src/blankPolicy.ts（L2）。协议层只是转发，
 // 不另起一份 —— 四种意图一旦在两处各写一遍，就会悄悄漂移。
-import type { BlankPolicy } from "@excel-bro/core";
+import type {
+  BlankPolicy,
+  // 结果不完整的原因与截断口径在 core（唯一出处），协议层只转发。
+  QueryIncompleteReason,
+  QueryTruncation
+} from "@excel-bro/core";
 import type {
   PythonCodeEvent,
   PythonCodeLimits,
@@ -40,7 +45,14 @@ export interface ExcelReviewLayoutPrepareRequest {
   workbookPathHash: string;
   worksheetNameHash: string;
   copySheetName: string;
+  /** Wire name retained for compatibility: this is the internal nonce, not the visible tab label. */
+  copyIdentityVersion?: 1 | 2;
 }
+export interface ExcelReviewCopySuspendResult {
+  status: 'suspended';
+  copyRetained: true;
+}
+export interface ExcelReviewCopySelectResult { status: 'selected' }
 export interface ExcelReviewLayoutTicket { token: string; layoutVersion: 3 }
 export interface ExcelReviewPaneMeasurement {
   /** 原表窗口内容区宽度（Win32 client rect；诊断/兼容用，不用于计算 AI 比例）。 */
@@ -65,6 +77,7 @@ export interface ExcelReviewCopyCloseRequest {
   workbookPathHash: string;
   worksheetNameHash: string;
   copySheetName: string;
+  copyIdentityVersion?: 1 | 2;
 }
 export type ExcelReviewCopyCloseStatus =
   | "closed" | "already_closed" | "close_unconfirmed" | "user_saved"
@@ -851,6 +864,32 @@ export interface DataMetric {
 export interface QueryTableArguments {
   mode: "rows" | "aggregate" | "profile";
   scope?: "selected" | "active";
+  /**
+   * 源区域有没有表头。
+   *
+   * 省略/null = 由本地按内容判断（既有行为）；`false` = 无表头，列名用合成名
+   * 「列1、列2……」，**所有行都是数据（含首行）**；`true` = 首行是表头。
+   * 用户说过“五个数/第一行也算”时必须显式传 `false` —— 内容判据分不清
+   * 「文本列 + 数字列」的数据区与「文本表头 + 数字列」的表。
+   */
+  hasHeaders?: boolean | null;
+  /**
+   * 只读区域，如 `A1:B5` 或 `来源!A1:B5`。省略 = 整张已授权表的已用区域。
+   *
+   * 指定后**只有这个矩形内的数据参与计算**，区域外的单元格不参与；带工作表名时那张表
+   * 必须已授权（否则 `SCOPE_VIOLATION`）。判据与写法在 `@excel-bro/core` 的
+   * `queryRange` 里，服务端 `models.py` 按同一套规则校验。
+   */
+  range?: string | null;
+  /**
+   * 本次要查的工作表名（如 `["来源"]`）。**授权集合只是允许访问的上限，不是本次
+   * 查询范围**：可查范围有多张表而这里没绑定时，执行器会拒绝并列出可选表名，
+   * 而不是把全部已授权表当成任务目标。
+   *
+   * 三种合法绑定（优先级从高到低）：`range` 带表名 → `sheets` → `scope: "active"`。
+   * 判据唯一出处 `@excel-bro/core` 的 `resolveQueryTarget`。
+   */
+  sheets?: string[] | null;
   fields?: string[];
   filters?: DataFilter[];
   groupBy?: string[];
@@ -893,6 +932,8 @@ export interface IntentMemory {
 }
 
 export interface ModelOption {
+  /** Upstream model ID for display; id remains the unique connection routing key. */
+  modelId?: string | null;
   agentAvailable?: boolean;
   agentUnavailableReason?: string | null;
   formulaAvailable?: boolean;
@@ -919,7 +960,8 @@ export interface ModelSettings {
 }
 
 export type ModelConnectionProtocol = "openai_compatible" | "anthropic";
-export type ModelConnectionPurpose = "agent" | "formula";
+/** Legacy purpose values are accepted only for compatibility with older servers. */
+export type ModelConnectionPurpose = "connection" | "agent" | "formula";
 
 export interface ManagedModelConnection {
   protocol?: ModelConnectionProtocol;
@@ -973,7 +1015,7 @@ export function assertTestModelConnectionResponse(
   }
   const result = value as Partial<TestModelConnectionResponse>;
   if (result.ok !== true || typeof result.message !== "string" ||
-      (result.testedFor !== undefined && result.testedFor !== "agent" && result.testedFor !== "formula")) {
+      (result.testedFor !== undefined && result.testedFor !== "connection" && result.testedFor !== "agent" && result.testedFor !== "formula")) {
     throw new Error("服务返回的连接测试结果缺少必要字段");
   }
 }
@@ -1028,6 +1070,14 @@ export interface DataToolResult {
   complete: boolean;
   calculation: string;
   warnings: string[];
+  /**
+   * 结果**内容**不完整的真实原因。`complete===false` 必须能在这里找到对应的一条；
+   * 没有原因就说明结果是完整的。类型与文案在 `@excel-bro/core` 的 `queryCompleteness`。
+   */
+  incomplete?: QueryIncompleteReason[];
+  /** 展示截断（按 `limit` 只显示前若干行）。与 `complete` 是两件事。 */
+  truncated?: boolean;
+  truncation?: QueryTruncation | null;
 }
 
 export function assertDataToolResult(
@@ -1146,6 +1196,11 @@ export interface SdkBridgeResultResponse {
   sourceSheets: string[];
   warnings: string[];
   complete: boolean;
+  /** 结果**内容**不完整的真实原因（与 `complete===false` 一一对应）。 */
+  incomplete?: QueryIncompleteReason[];
+  /** 展示截断（按 limit 只显示前若干行）：与"不完整"是两件事。 */
+  truncated?: boolean;
+  truncation?: QueryTruncation | null;
   calculation: string;
   scannedRows: number;
 }
@@ -1183,6 +1238,10 @@ export interface LocalResultCard {
   columnCount: number;
   sourceSheets: string[];
   complete: boolean;
+  /** 与结果卡上那句提示一一对应：说是"缺字段"就真的是缺字段。 */
+  incomplete?: QueryIncompleteReason[];
+  truncated?: boolean;
+  truncation?: QueryTruncation | null;
 }
 
 export interface ClarificationField {
@@ -1985,6 +2044,22 @@ export interface OfficeExecutionDispositionState {
   abandonedAt?: number | null;
 }
 
+/**
+ * 审阅生命周期的持久投影（服务端 `office_executions.review_state`，schema v14）。
+ *
+ * `state` 三态，别把两种"没有"混成一件事：
+ * - `"pending"` / `"blocked"`：这次执行**等着用户处理**（分档：验证通过 / 验证没通过）；
+ * - `"confirmed"` / `"discarded"` / `"undone"`：已经有结论，刷新后不许再当待审阅；
+ * - `null`：**老记录**，账本里根本没有这一列的值 —— 既不是待审阅，也不是已确认。
+ *   它只意味着"无法判断"，不许回填成任何一种（那是在虚构用户操作历史）。
+ *
+ * `decidedAt` 是首次成立的时刻；重复上报（重试、双窗格各报一次）不改写它。
+ */
+export interface OfficeExecutionReviewState {
+  state: "pending" | "blocked" | "confirmed" | "discarded" | "undone" | null;
+  decidedAt?: number | null;
+}
+
 export interface OfficeExecutionState {
   operationId: string;
   status: "running" | "needs_reconciliation" | "completed" | "failed";
@@ -2003,6 +2078,11 @@ export interface OfficeExecutionState {
   requiresReconciliation: boolean;
   ownerToken?: string | null;
   disposition?: OfficeExecutionDispositionState | null;
+  /**
+   * 审阅状态只读投影：刷新/重开窗格后靠它把"还没处理的审阅"找回来
+   * （见 `pendingExecutionDiscovery` / `reviewLifecycle`）。
+   */
+  review?: OfficeExecutionReviewState | null;
 }
 
 export function assertOfficeExecutionState(
@@ -2251,6 +2331,8 @@ export interface WpsExecutionState {
    * 重开后缓存没了，续跑会被重新开放）。
    */
   disposition?: OfficeExecutionDispositionState | null;
+  /** 与 `OfficeExecutionState.review` 同口径（同一张表、同一段判据）。 */
+  review?: OfficeExecutionReviewState | null;
 }
 
 export function assertWpsExecutionState(
@@ -3902,9 +3984,67 @@ export function parseLocalResultCard(value: unknown): LocalResultCard | null {
       !Array.isArray(card.sourceSheets) || card.sourceSheets.length > 100 ||
       !card.sourceSheets.every((sheet) => typeof sheet === "string") ||
       typeof card.complete !== "boolean") return null;
+  /*
+   * 原因与截断必须一起带过来：漏了下面几行，卡片上就只剩 `complete=false`，
+   * 于是又只能写一句"结果不完整" —— 那正是这次要修的形状。
+   * 形状不对就当没有（整张卡判为不可用），不把半成品交给渲染器。
+   */
+  const incomplete = parseIncompleteReasons(card.incomplete);
+  if (incomplete === null) return null;
+  const truncation = parseTruncation(card.truncation);
+  if (truncation === undefined) return null;
+  if (card.truncated === true && truncation === null) return null;
   return { resultRef: card.resultRef, title: card.title, headers: [...card.headers],
     rowCount: card.rowCount!, columnCount: card.columnCount!,
-    sourceSheets: [...card.sourceSheets], complete: card.complete };
+    sourceSheets: [...card.sourceSheets], complete: card.complete,
+    incomplete, truncated: card.truncated === true, truncation };
+}
+
+/** 不完整原因：缺字段必须给出字段名，"没有数据行"不许带字段名。 */
+function parseIncompleteReasons(value: unknown): QueryIncompleteReason[] | null {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value) || value.length > 50) return null;
+  const reasons: QueryIncompleteReason[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") return null;
+    const reason = item as Partial<QueryIncompleteReason> & { fields?: unknown };
+    if (typeof reason.sheet !== "string" || !reason.sheet) return null;
+    if (reason.kind === "missing_field") {
+      const fields = reason.fields;
+      if (
+        !Array.isArray(fields) ||
+        fields.length === 0 ||
+        !fields.every((field) => typeof field === "string" && field)
+      ) {
+        return null;
+      }
+      reasons.push({ kind: "missing_field", sheet: reason.sheet, fields: [...fields] });
+      continue;
+    }
+    if (reason.kind === "empty_sheet") {
+      if (Array.isArray(reason.fields) && reason.fields.length > 0) return null;
+      reasons.push({ kind: "empty_sheet", sheet: reason.sheet });
+      continue;
+    }
+    return null;
+  }
+  return reasons;
+}
+
+/** `undefined` = 字段非法（调用方判为不可用）；`null` = 没有截断。 */
+function parseTruncation(value: unknown): QueryTruncation | null | undefined {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "object") return undefined;
+  const item = value as Partial<QueryTruncation>;
+  const { shownRows, totalRows, limit } = item;
+  if (
+    typeof shownRows !== "number" || !Number.isInteger(shownRows) || shownRows < 0 ||
+    typeof totalRows !== "number" || !Number.isInteger(totalRows) || totalRows < 0 ||
+    typeof limit !== "number" || !Number.isInteger(limit) || limit < 1
+  ) {
+    return undefined;
+  }
+  return { shownRows, totalRows, limit };
 }
 
 /** 严格解析桥指针：形状不符就当没有，绝不把半成品指针交给宿主。 */
